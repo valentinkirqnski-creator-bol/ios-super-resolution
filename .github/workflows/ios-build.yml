@@ -23,14 +23,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen (prebuilt binary, no Homebrew)
+        run: |
+          set -e
+          curl -fsSL -o xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+          unzip -q xcodegen.zip
+          chmod +x xcodegen/bin/xcodegen
+          echo "XCODEGEN=$PWD/xcodegen/bin/xcodegen" >> "$GITHUB_ENV"
+          "$PWD/xcodegen/bin/xcodegen" --version
 
       - name: Vendor LibRaw
         run: bash scripts/fetch_libraw.sh
 
       - name: Generate Xcode project
-        run: xcodegen generate
+        run: "$XCODEGEN" generate --spec project.yml
 
       - name: Build (unsigned)
         run: |
