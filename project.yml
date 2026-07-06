@@ -1,0 +1,67 @@
+# XcodeGen spec — generates HandheldSRCamera.xcodeproj from these sources.
+# Run `xcodegen generate` (CI does this) after `scripts/fetch_libraw.sh`.
+name: HandheldSRCamera
+options:
+  bundleIdPrefix: com.handheldsr
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    ENABLE_BITCODE: NO
+    # Bridge Swift <-> Objective-C++.
+    SWIFT_OBJC_BRIDGING_HEADER: "Sources/Bridge/HandheldSR-Bridging-Header.h"
+    # Portable C++ core (vendored into this repo) + vendored LibRaw headers.
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)"
+      - "$(SRCROOT)/vendor/LibRaw"
+      - "$(SRCROOT)/vendor/LibRaw/libraw"
+    GCC_PREPROCESSOR_DEFINITIONS:
+      - "$(inherited)"
+      - "HAVE_LIBRAW=1"
+      - "LIBRAW_NODLL=1"
+    # LibRaw emits many benign warnings; don't fail the build on them.
+    OTHER_CFLAGS: "-w"
+    OTHER_CPLUSPLUSFLAGS: "-w"
+
+targets:
+  HandheldSRCamera:
+    type: application
+    platform: iOS
+    sources:
+      # App (Swift) + Objective-C++ bridge.
+      - path: Sources
+      # Portable pipeline (vendored copy of the desktop/Android core).
+      - path: core
+        includes:
+          - "grey_pyramid.cpp"
+          - "align.cpp"
+          - "robustness.cpp"
+          - "kernels.cpp"
+          - "merge.cpp"
+          - "pipeline.cpp"
+          - "raw_io.cpp"
+          - "dng_writer.cpp"
+      # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
+      - path: vendor/LibRaw/src
+        includes:
+          - "**/*.cpp"
+        optional: true
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Handheld SR
+        NSCameraUsageDescription: "The camera is used to capture a short RAW burst for multi-frame super-resolution."
+        NSPhotoLibraryAddUsageDescription: "Used to save the final 48 MP DNG to your photo library."
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.handheldsr.camera
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UIApplicationSupportsIndoorMaps: NO

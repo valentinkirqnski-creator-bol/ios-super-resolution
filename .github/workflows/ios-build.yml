@@ -1,0 +1,57 @@
+name: iOS unsigned build
+
+# Builds an UNSIGNED .ipa on a free GitHub-hosted macOS runner. Download it from
+# the run's Artifacts, then sign+install with your free Apple ID via
+# AltStore / Sideloadly (no $99 account needed for personal use).
+#
+# This assumes the repository root IS this iOS project (project.yml at the root).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Vendor LibRaw
+        run: bash scripts/fetch_libraw.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project HandheldSRCamera.xcodeproj \
+            -scheme HandheldSRCamera \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Package unsigned .ipa
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/HandheldSRCamera.app"
+          if [ ! -d "$APP_PATH" ]; then echo "App not found at $APP_PATH"; exit 1; fi
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr HandheldSRCamera-unsigned.ipa Payload
+          echo "Built HandheldSRCamera-unsigned.ipa"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HandheldSRCamera-unsigned-ipa
+          path: HandheldSRCamera-unsigned.ipa
+          if-no-files-found: error

@@ -1,0 +1,15 @@
+# Generated Xcode project (created by `xcodegen generate` in CI)
+*.xcodeproj
+
+# LibRaw is fetched by scripts/fetch_libraw.sh (in CI); don't commit it
+vendor/
+
+# Build outputs
+build/
+Payload/
+*.ipa
+DerivedData/
+
+# macOS / Xcode noise
+.DS_Store
+xcuserdata/
