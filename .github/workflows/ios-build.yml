@@ -45,7 +45,7 @@ jobs:
         run: bash scripts/fetch_libraw.sh
 
       - name: Generate Xcode project
-        run: "$XCODEGEN" generate --spec project.yml
+        run: $XCODEGEN generate --spec project.yml
 
       - name: Build (unsigned)
         run: |
