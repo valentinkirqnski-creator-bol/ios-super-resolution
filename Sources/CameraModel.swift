@@ -239,7 +239,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = 0
         }
 
-        let ok = SRBridge.processDNGs(paths, to: outURL.path, scale: 2.0) { [weak self] stage, frac in
+        let ok = SRBridge.processDNGs(paths, toPath: outURL.path, scale: 2.0) { [weak self] stage, frac in
             DispatchQueue.main.async {
                 self?.progress = frac
                 self?.statusText = stage
