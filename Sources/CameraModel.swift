@@ -162,15 +162,31 @@ final class CameraModel: NSObject, ObservableObject {
         applyShutter()
     }
 
-    private func playShutterSoundOnce() {
+    private func configureAudioSessionForCapture() {
+        session.automaticallyConfiguresApplicationAudioSession = false
+        let audio = AVAudioSession.sharedInstance()
+        try? audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.mixWithOthers, .duckOthers])
+        try? audio.setActive(true)
+    }
+
+    private func beginBurstAudio() {
+        let audio = AVAudioSession.sharedInstance()
+        try? audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.mixWithOthers, .duckOthers])
+        try? audio.setActive(true)
+        // Must be false before any capturePhoto call so iOS does not play per-frame shutter sounds.
+        try? audio.setAllowHapticsAndSystemSoundsDuringRecording(false)
         AudioServicesPlaySystemSound(1108)
     }
 
-    private func suppressSystemShutterSounds(_ suppress: Bool) {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .videoRecording, options: [.mixWithOthers])
-        // false = suppress system sounds during capture (one custom shutter click instead).
-        try? session.setAllowHapticsAndSystemSoundsDuringRecording(!suppress)
+    private func endBurstAudio() {
+        let audio = AVAudioSession.sharedInstance()
+        try? audio.setAllowHapticsAndSystemSoundsDuringRecording(true)
+    }
+
+    private func setResponsiveCaptureEnabled(_ enabled: Bool) {
+        if #available(iOS 17.0, *) {
+            photoOutput.isResponsiveCaptureEnabled = enabled
+        }
     }
 
     func setCamera(_ selection: CameraSelection) {
@@ -246,6 +262,7 @@ final class CameraModel: NSObject, ObservableObject {
         }
         photoOutput.maxPhotoQualityPrioritization = .balanced
         setResponsiveCaptureEnabled(false)
+        configureAudioSessionForCapture()
         configureRawCaptureLimits()
         refreshExposureRange()
         applyDefaultDeviceModes()
@@ -394,12 +411,6 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func setResponsiveCaptureEnabled(_ enabled: Bool) {
-        if #available(iOS 17.0, *) {
-            photoOutput.isResponsiveCaptureEnabled = enabled
-        }
-    }
-
     private func startPreviewIfNeeded() {
         guard isAppActive, !previewSuspended, !session.isRunning else { return }
         session.startRunning()
@@ -432,9 +443,22 @@ final class CameraModel: NSObject, ObservableObject {
 
     func captureBurst() {
         guard !isBusy else { return }
+
+        let total = frameCount
+        let lens = cameraSelection.label
+        isBusy = true
+        isCapturing = true
+        isProcessing = false
+        progress = 0
+        statusText = "Capturing \(total) frames · \(lens)"
+        beginBurstAudio()
+
         sessionQueue.async {
             guard self.photoOutput.availableRawPhotoPixelFormatTypes.first != nil else {
                 DispatchQueue.main.async {
+                    self.endBurstAudio()
+                    self.isBusy = false
+                    self.isCapturing = false
                     self.statusText = "RAW capture not supported on this camera"
                 }
                 return
@@ -448,17 +472,6 @@ final class CameraModel: NSObject, ObservableObject {
             self.currentBurstTotal = self.activeFrameCount
             self.pendingCaptures = self.currentBurstTotal
 
-            DispatchQueue.main.async {
-                self.isBusy = true
-                self.isCapturing = true
-                self.isProcessing = false
-                self.progress = 0
-                let lens = self.cameraSelection.label
-                self.statusText = "Capturing \(self.currentBurstTotal) frames · \(lens)"
-                self.suppressSystemShutterSounds(true)
-                self.playShutterSoundOnce()
-            }
-
             self.photoOutput.maxPhotoQualityPrioritization = .speed
             self.setResponsiveCaptureEnabled(true)
             self.lockForBurst()
@@ -471,7 +484,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.pendingCaptures = 0
             self.capturedDNGs.removeAll()
             self.restoreCaptureQuality()
-            DispatchQueue.main.async { self.suppressSystemShutterSounds(false) }
+            DispatchQueue.main.async { self.endBurstAudio() }
             if let d = self.device, (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
@@ -668,27 +681,12 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func finish(success: Bool, message: String) {
         DispatchQueue.main.async {
-            self.suppressSystemShutterSounds(false)
+            self.endBurstAudio()
             self.isBusy = false
             self.isCapturing = false
             self.isProcessing = false
             self.progress = success ? 1 : 0
             self.statusText = message
-        }
-        sessionQueue.async {
-            if self.isAppActive && !self.previewSuspended {
-                self.startPreviewIfNeeded()
-            }
-        }
-    }
-
-    private func stopSessionForProcessing(completion: @escaping () -> Void) {
-        sessionQueue.async {
-            if self.session.isRunning {
-                self.session.stopRunning()
-                DispatchQueue.main.async { self.isSessionRunning = false }
-            }
-            completion()
         }
     }
 }
@@ -734,10 +732,8 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             }
         } else {
             unlockAfterBurst()
-            stopSessionForProcessing { [weak self] in
-                guard let self = self else { return }
-                self.processingQueue.async { self.processBurst() }
-            }
+            DispatchQueue.main.async { self.endBurstAudio() }
+            processingQueue.async { self.processBurst() }
         }
     }
 }
