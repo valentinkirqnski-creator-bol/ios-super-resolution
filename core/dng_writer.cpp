@@ -79,29 +79,42 @@ struct IFD {
         for (uint32_t v : nd) w32(p, v);
         e.push_back({tag, T_RATIONAL, (uint32_t)(nd.size() / 2), 0, p});
     }
+    void longs(uint16_t tag, std::vector<uint32_t> vals) {
+        if (vals.size() == 1) { longv(tag, vals[0]); return; }
+        // Multi-value LONG tags (crop size, active area) need external storage
+        // because image dimensions exceed the 4-byte inline limit.
+        std::vector<uint8_t> p;
+        for (uint32_t v : vals) w32(p, v);
+        e.push_back({tag, T_LONG, (uint32_t)vals.size(), 0, p});
+    }
 };
 
 } // namespace
 
 // Builds the DNG header + IFD + heap bytes for a W x H, 3-sample image and
 // returns them plus the file offset at which the strip data begins.
-static std::vector<uint8_t> build_dng_prefix(int W, int H, const std::string& camera_model,
+static std::vector<uint8_t> build_dng_prefix(int W, int H,
+                                             const std::string& camera_make,
+                                             const std::string& camera_model,
                                              int orientation,
                                              const float* cm /*9, XYZ->cam*/,
-                                             const float* wb /*3, green-norm*/,
+                                             const float* wb /*3, green-norm, WB in pixels*/,
                                              bool baked_srgb,
                                              uint32_t& strip_offset_out) {
     const uint32_t strip_bytes = (uint32_t)W * H * 3 * 2;
 
     IFD ifd;
     ifd.longv(254, 0);                 // NewSubfileType
+    ifd.ascii(271, camera_make.empty() ? "HandheldSR" : camera_make); // Make
+    ifd.ascii(272, camera_model.empty() ? "HandheldSR-x2" : camera_model); // Model
     ifd.longv(256, (uint32_t)W);       // ImageWidth
     ifd.longv(257, (uint32_t)H);       // ImageLength
     ifd.shorts(258, {16, 16, 16});     // BitsPerSample
     ifd.shortv(259, 1);                // Compression = none
-    // Baked path: plain RGB image (viewer shows pixels as-is, sRGB). Raw path:
-    // LinearRaw so a raw processor develops color via ColorMatrix/AsShotNeutral.
-    ifd.shortv(262, baked_srgb ? 2 : 34892); // PhotometricInterpretation
+    if (baked_srgb)
+        ifd.shortv(262, 2);            // PhotometricInterpretation = RGB (sRGB baked)
+    else
+        ifd.shortv(262, 34892);        // PhotometricInterpretation = LinearRaw
     ifd.longv(273, 0);                 // StripOffsets (patched after layout)
     if (orientation >= 1 && orientation <= 8)
         ifd.shortv(274, (uint16_t)orientation); // Orientation
@@ -111,28 +124,27 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H, const std::string& ca
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned int
 
+    // Crop / active area — required by iOS Photos to show non-zero dimensions.
+    ifd.longs(50719, {0, 0});                      // DefaultCropOrigin
+    ifd.longs(50720, {(uint32_t)W, (uint32_t)H});  // DefaultCropSize
+    ifd.longs(50829, {0, 0, (uint32_t)H, (uint32_t)W}); // ActiveArea
+
+    // DNG identity tags — always written so viewers (incl. iOS Photos) recognize
+    // the file as DNG, not a generic RGB TIFF.
+    ifd.bytes4(50706, 1, 4, 0, 0);     // DNGVersion 1.4.0.0
+    ifd.bytes4(50707, 1, 3, 0, 0);     // DNGBackwardVersion 1.3.0.0
+    ifd.ascii(50708, camera_model.empty() ? "HandheldSR-x2" : camera_model); // UniqueCameraModel
+    ifd.shorts(50714, {0, 0, 0});      // BlackLevel (per channel)
+    ifd.longs(50717, {65535, 65535, 65535}); // WhiteLevel (per channel)
+
     if (!baked_srgb) {
-        ifd.bytes4(50706, 1, 4, 0, 0);     // DNGVersion 1.4.0.0
-        ifd.bytes4(50707, 1, 3, 0, 0);     // DNGBackwardVersion 1.3.0.0
-        ifd.ascii(50708, camera_model);    // UniqueCameraModel
-        ifd.longv(50717, 65535);           // WhiteLevel
         ifd.shortv(50778, 21);             // CalibrationIlluminant1 = D65
-        // ColorMatrix1 (XYZ D65 -> camera). SRATIONAL, denominator 10000.
-        std::vector<int32_t> nd;
-        for (int i = 0; i < 9; ++i) {
-            float v = cm ? cm[i] : (i % 4 == 0 ? 1.f : 0.f); // identity if absent
-            nd.push_back((int32_t)std::lround(v * 10000.0)); nd.push_back(10000);
-        }
-        ifd.srational(50721, nd);
-        // AsShotNeutral: camera-neutral = 1 / WB gain (green-normalized).
-        if (wb) {
-            std::vector<uint32_t> rn;
-            for (int i = 0; i < 3; ++i) {
-                float g = (wb[i] > 1e-6f) ? wb[i] : 1.f;
-                rn.push_back((uint32_t)std::lround((1.0 / g) * 10000.0)); rn.push_back(10000);
-            }
-            ifd.rational(50728, rn);
-        }
+        // Identity ColorMatrix1. Merged pixels already include camera WB; writing
+        // the real matrix plus AsShotNeutral/AnalogBalance makes iOS and Lightroom
+        // Mobile re-develop color and produces a magenta cast. This matches the
+        // first working build (Lightroom import OK).
+        ifd.srational(50721, {1,1, 0,1, 0,1,  0,1, 1,1, 0,1,  0,1, 0,1, 1,1});
+        // Do NOT write AsShotNeutral or AnalogBalance — WB is in the pixel data.
     }
 
     // IFD entries must be sorted by tag.
@@ -195,11 +207,12 @@ bool write_linear_dng(const std::string& path, const Image& rgb, const std::stri
 // --- Streaming writer ---
 bool DngStreamWriter::open(const std::string& path, int W, int H, const std::string& camera_model,
                            int orientation, const float* colorMatrixXYZtoCam,
-                           const float* wbGainsGreenNorm, bool bakedSrgb) {
+                           const float* wbGainsGreenNorm, bool bakedSrgb,
+                           const std::string& camera_make) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
     uint32_t strip_offset = 0;
-    std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_model, orientation,
+    std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
                                                    bakedSrgb, strip_offset);
     f_ = fopen(path.c_str(), "wb");

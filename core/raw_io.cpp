@@ -49,93 +49,110 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed) {
     return burst;
 }
 
+#ifdef HAVE_LIBRAW
+static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
+                             int crop_h, int crop_w) {
+    Image img;
+    if (raw.imgdata.rawdata.raw_image == nullptr) return img;
+
+    auto& S = raw.imgdata.sizes;
+    auto& C = raw.imgdata.color;
+    int stride = S.raw_width;
+    int top = S.top_margin & ~1, left = S.left_margin & ~1;
+    int vw = S.width & ~1, vh = S.height & ~1;
+    img = Image(vh, vw, 1);
+
+    float maxv = (float)C.maximum > 0 ? (float)C.maximum : 65535.f;
+    float black = (float)C.black;
+    float denom = std::max(1.f, maxv - black);
+    for (int y = 0; y < img.h; ++y)
+        for (int x = 0; x < img.w; ++x)
+            img.at(y, x) = clampf(
+                ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - black) / denom,
+                0.f, 1.f);
+
+    if (is_reference) {
+        if (raw.imgdata.idata.make[0])
+            cfg.camera_make = raw.imgdata.idata.make;
+        if (raw.imgdata.idata.model[0])
+            cfg.camera_model = raw.imgdata.idata.model;
+        for (int i = 0; i < 3; ++i)
+            if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i] / C.cam_mul[1];
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                int c = raw.COLOR(i, j);
+                cfg.cfa.p[i][j] = (c == 3) ? 1 : (uint8_t)c;
+            }
+        bool any = false;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                if (C.cam_xyz[i][j] != 0.f) any = true;
+        if (any) {
+            cfg.has_color_matrix = true;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    cfg.color_matrix[i * 3 + j] = C.cam_xyz[i][j];
+        }
+        bool any_rc = false;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                if (C.rgb_cam[i][j] != 0.f) any_rc = true;
+        if (any_rc) {
+            cfg.has_cam_to_srgb = true;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    cfg.cam_to_srgb[i * 3 + j] = C.rgb_cam[i][j];
+        }
+        switch (S.flip) {
+            case 3:  cfg.orientation = 3; break;
+            case 5:  cfg.orientation = 8; break;
+            case 6:  cfg.orientation = 6; break;
+            default: cfg.orientation = 1; break;
+        }
+    }
+
+    if (crop_h > 0 && crop_w > 0 && (img.h > crop_h || img.w > crop_w)) {
+        int mh = std::min(img.h, crop_h) & ~1;
+        int mw = std::min(img.w, crop_w) & ~1;
+        Image c(mh, mw, 1);
+        for (int y = 0; y < mh; ++y)
+            for (int x = 0; x < mw; ++x)
+                c.at(y, x) = img.at(y, x);
+        img = std::move(c);
+    }
+    return img;
+}
+#endif
+
+Image load_raw_frame(const std::string& path, Config& cfg, bool is_reference,
+                     int crop_h, int crop_w) {
+#ifdef HAVE_LIBRAW
+    LibRaw raw;
+    if (raw.open_file(path.c_str()) != LIBRAW_SUCCESS) return Image();
+    if (raw.unpack() != LIBRAW_SUCCESS) { raw.recycle(); return Image(); }
+    Image img = decode_raw_file(raw, cfg, is_reference, crop_h, crop_w);
+    raw.recycle();
+    return img;
+#else
+    (void)path; (void)cfg; (void)is_reference; (void)crop_h; (void)crop_w;
+    return Image();
+#endif
+}
+
 std::vector<Image> load_raw_burst(const std::vector<std::string>& paths, Config& cfg) {
     std::vector<Image> burst;
 #ifdef HAVE_LIBRAW
+    int crop_h = 0, crop_w = 0;
     for (const auto& p : paths) {
-        LibRaw raw;
-        if (raw.open_file(p.c_str()) != LIBRAW_SUCCESS) continue;
-        if (raw.unpack() != LIBRAW_SUCCESS) { raw.recycle(); continue; }
-        auto& S = raw.imgdata.sizes;
-        auto& C = raw.imgdata.color;
-        if (raw.imgdata.rawdata.raw_image == nullptr) { raw.recycle(); continue; } // not a bayer raw
-
-        int stride = S.raw_width;               // full row stride incl. margins
-        int top = S.top_margin, left = S.left_margin;
-        int vw = S.width, vh = S.height;        // visible (active) area
-        // Keep CFA phase consistent: align crop to even pixels.
-        top &= ~1; left &= ~1;
-        Image img(vh & ~1, vw & ~1, 1);
-        float maxv = (float)C.maximum > 0 ? (float)C.maximum : 65535.f;
-        float black = (float)C.black;
-        float denom = std::max(1.f, maxv - black);
-        for (int y = 0; y < img.h; ++y)
-            for (int x = 0; x < img.w; ++x)
-                img.at(y, x) = clampf(((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - black) / denom,
-                                      0.f, 1.f);
+        bool is_ref = burst.empty();
+        Image img = load_raw_frame(p, cfg, is_ref, crop_h, crop_w);
+        if (img.h <= 0 || img.w <= 0) continue;
+        if (is_ref) { crop_h = img.h; crop_w = img.w; }
         burst.push_back(std::move(img));
-
-        if (&p == &paths.front()) {
-            // Populate metadata-driven config from the reference frame.
-            for (int i = 0; i < 3; ++i)
-                if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i] / C.cam_mul[1];
-            // libraw CFA index -> our 2x2 (0=R,1=G,2=B).
-            for (int i = 0; i < 2; ++i)
-                for (int j = 0; j < 2; ++j) {
-                    int c = raw.COLOR(i, j);
-                    cfg.cfa.p[i][j] = (c == 3) ? 1 : (uint8_t)c; // second green -> green
-                }
-            // ColorMatrix1 (XYZ D65 -> camera RGB) straight from the file.
-            bool any = false;
-            for (int i = 0; i < 3; ++i)
-                for (int j = 0; j < 3; ++j)
-                    if (C.cam_xyz[i][j] != 0.f) any = true;
-            if (any) {
-                cfg.has_color_matrix = true;
-                for (int i = 0; i < 3; ++i)
-                    for (int j = 0; j < 3; ++j)
-                        cfg.color_matrix[i * 3 + j] = C.cam_xyz[i][j];
-            }
-            // camera-RGB -> linear sRGB (D65), used to bake display-ready color.
-            bool any_rc = false;
-            for (int i = 0; i < 3; ++i)
-                for (int j = 0; j < 3; ++j)
-                    if (C.rgb_cam[i][j] != 0.f) any_rc = true;
-            if (any_rc) {
-                cfg.has_cam_to_srgb = true;
-                for (int i = 0; i < 3; ++i)
-                    for (int j = 0; j < 3; ++j)
-                        cfg.cam_to_srgb[i * 3 + j] = C.rgb_cam[i][j];
-            }
-            // Sensor orientation -> EXIF orientation for the output DNG.
-            switch (S.flip) {
-                case 3:  cfg.orientation = 3; break; // 180
-                case 5:  cfg.orientation = 8; break; // 90 CCW
-                case 6:  cfg.orientation = 6; break; // 90 CW
-                default: cfg.orientation = 1; break; // none
-            }
-        }
-        raw.recycle();
     }
 #else
     (void)paths; (void)cfg;
 #endif
-
-    // The pipeline requires all frames to share the reference dimensions.
-    // Crop every frame to the common (min) even size, preserving CFA phase.
-    if (burst.size() > 1) {
-        int mh = burst[0].h, mw = burst[0].w;
-        for (const auto& im : burst) { mh = std::min(mh, im.h); mw = std::min(mw, im.w); }
-        mh &= ~1; mw &= ~1;
-        for (auto& im : burst) {
-            if (im.h == mh && im.w == mw) continue;
-            Image c(mh, mw, 1);
-            for (int y = 0; y < mh; ++y)
-                for (int x = 0; x < mw; ++x)
-                    c.at(y, x) = im.at(y, x);
-            im = std::move(c);
-        }
-    }
     return burst;
 }
 

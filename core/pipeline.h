@@ -34,4 +34,10 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                            const std::string& dng_path, const ProgressFn& progress,
                            int maxPreviewDim = 1536);
 
+// Low-memory mobile path: reads frames from disk one at a time, caches per-frame
+// analysis to temp files, streams the output DNG. Peak RAM ≈ 1 ref + 1 comp frame.
+Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
+                                 const std::string& dng_path, const ProgressFn& progress,
+                                 int maxPreviewDim = 512);
+
 } // namespace hhsr

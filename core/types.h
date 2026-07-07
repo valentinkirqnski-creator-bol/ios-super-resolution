@@ -98,36 +98,28 @@ struct Config {
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;
-    // ---- Sharpness control ----
-    // k_detail is the master "softness" knob: it scales the merge-kernel width.
-    //   LARGER k_detail  -> wider kernels -> SOFTER  output (less sharpening)
-    //   SMALLER k_detail -> tighter kernels -> SHARPER output (more detail/aliasing)
-    // Reference default is 0.33 -> sub-pixel kernels that ALIAS (harsh, crunchy,
-    // "over-sharpened"). 0.42 brings kernels to ~1px = correct reconstruction:
-    // removes aliasing/halos WITHOUT blurring real merged detail.
-    // Detail is only lost above ~0.70. Try 0.55 for softer, 0.36 for crisper.
+    bool  snr_auto_tune = true;
     float k_detail  = 0.42f;
-    float k_denoise = 3.0f;
+    float k_denoise = 3.5f;
     float D_th      = 0.005f;
     float D_tr      = 0.014f;
-    // k_stretch elongates kernels along edges (edge over-sharpening). Lowering
-    // it from 4.0 -> 3.0 reduces harsh edge crispening.
-    float k_stretch = 3.0f;
+    float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
+    float aniso_detail_floor = 1.65f;
+    float color_saturation = 1.0f;
 
     CFA cfa;
-    float white_balance[3] = {1.f, 1.f, 1.f}; // green-normalized camera WB gains
+    float white_balance[3] = {1.f, 1.f, 1.f};
 
-    // Color / orientation metadata read from the reference DNG.
-    int   orientation = 1;                 // EXIF orientation (1=normal,6/8=90deg)
-    bool  has_color_matrix = false;        // true once populated from the file
-    float color_matrix[9] = {1,0,0, 0,1,0, 0,0,1}; // ColorMatrix1: XYZ(D65) -> camera
-    // camera-RGB -> linear sRGB (LibRaw rgb_cam). Used to bake display-ready color.
+    int   orientation = 1;
+    bool  has_color_matrix = false;
+    float color_matrix[9] = {1,0,0, 0,1,0, 0,0,1};
     bool  has_cam_to_srgb = false;
     float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
-    // When true the output is a fully-developed sRGB image (looks correct in any
-    // viewer). When false a camera-native linear "raw" DNG is written instead.
-    bool  bake_srgb = true;
+    bool  bake_srgb = false;
+
+    std::string camera_make;
+    std::string camera_model;
 
     int num_threads = 0;      // 0 => hardware_concurrency
     bool use_gpu = false;     // opt-in Vulkan compute merge (experimental)

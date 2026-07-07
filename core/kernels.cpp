@@ -21,6 +21,9 @@ static void compute_k(f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
     f32 A = 1.f + std::sqrt(std::max((l1 - l2) / (sum == 0.f ? 1e-12f : sum), 0.f));
     f32 D = clampf(1.f - std::sqrt(std::max(l1, 0.f)) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
 
+    if (D < 0.55f && cfg.aniso_detail_floor > 1.f)
+        A = std::max(A, cfg.aniso_detail_floor);
+
     f32 kk1, kk2;
     if (cfg.selection == SelectionLaw::HardThreshold) {
         if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }

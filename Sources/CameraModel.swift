@@ -32,8 +32,8 @@ enum ShutterSetting: Identifiable, Hashable {
     ]
 }
 
-/// Owns the capture session, performs an 8-frame RAW burst, then runs the
-/// multi-frame super-resolution pipeline and saves the resulting DNG.
+/// Owns the capture session, performs a 4-frame RAW burst, then runs the
+/// multi-frame super-resolution pipeline on a background queue and saves the DNG.
 final class CameraModel: NSObject, ObservableObject {
 
     // Published UI state.
@@ -48,11 +48,12 @@ final class CameraModel: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
+    private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .userInitiated)
     private let photoOutput = AVCapturePhotoOutput()
     private var device: AVCaptureDevice?
 
-    // Burst bookkeeping.
-    private let burstCount = 8
+    // Burst bookkeeping — 4 frames keeps peak RAM low on device.
+    private let burstCount = 4
     private var pendingCaptures = 0
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
@@ -182,10 +183,9 @@ final class CameraModel: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isBusy = true
                 self.progress = 0
-                self.statusText = "Capturing 8 RAW frames…"
+                self.statusText = "Capturing \(self.burstCount) RAW frames…"
             }
-            // Lock AF/AE/WB so all 8 frames share identical settings (clean merge)
-            // and so we don't wait for metering to re-settle between shots.
+            // Lock AF/AE/WB so all frames share identical settings (clean merge)
             self.lockForBurst()
             self.captureNextRaw()
         }
@@ -227,6 +227,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func processBurst() {
         let paths = capturedDNGs.map { $0.path }
+        let burstDir = self.burstDir
         guard paths.count >= 2 else {
             finish(success: false, message: "Not enough frames captured")
             return
@@ -236,34 +237,41 @@ final class CameraModel: NSObject, ObservableObject {
 
         DispatchQueue.main.async {
             self.statusText = "Processing…"
-            self.progress = 0
+            self.progress = 0.15
         }
 
-        let ok = SRBridge.processDNGs(paths, toPath: outURL.path, scale: 2.0) { [weak self] stage, frac in
-            DispatchQueue.main.async {
-                self?.progress = frac
-                self?.statusText = stage
-            }
-        }
+        var preview: UIImage?
+        let ok = SRBridge.processDNGs(
+            paths,
+            toPath: outURL.path,
+            scale: 2.0,
+            progress: { [weak self] stage, frac in
+                DispatchQueue.main.async {
+                    self?.progress = 0.15 + frac * 0.85
+                    self?.statusText = stage
+                }
+            },
+            previewImage: &preview
+        )
+
+        capturedDNGs.removeAll()
 
         if ok {
-            saveToPhotos(url: outURL)
+            saveToPhotos(url: outURL, preview: preview, burstDir: burstDir)
         } else {
             finish(success: false, message: "Processing failed")
         }
     }
 
-    private func saveToPhotos(url: URL) {
-        // Thumbnail for the on-screen gallery button.
-        let thumb = Self.makeThumbnail(from: url)
-
+    private func saveToPhotos(url: URL, preview: UIImage?, burstDir: URL?) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {
-                    self.lastThumbnail = thumb
+                    self.lastThumbnail = preview
                     self.lastSavedURL = url
                     self.finish(success: true, message: "Saved to app storage (grant Photos access to save to library)")
                 }
+                self.cleanupBurstDir(burstDir, keep: url)
                 return
             }
             PHPhotoLibrary.shared().performChanges({
@@ -273,12 +281,27 @@ final class CameraModel: NSObject, ObservableObject {
                 req.addResource(with: .photo, fileURL: url, options: opts)
             }, completionHandler: { success, _ in
                 DispatchQueue.main.async {
-                    self.lastThumbnail = thumb
+                    self.lastThumbnail = preview
                     self.lastSavedURL = url
                     self.finish(success: success,
                                 message: success ? "Saved 48 MP DNG to Photos" : "Saved to app storage")
                 }
+                self.cleanupBurstDir(burstDir, keep: url)
             })
+        }
+    }
+
+    /// Removes intermediate burst RAWs and analysis cache; keeps the output DNG.
+    private func cleanupBurstDir(_ dir: URL?, keep output: URL) {
+        guard let dir = dir else { return }
+        processingQueue.async {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+            for name in names {
+                let url = dir.appendingPathComponent(name)
+                if url.path != output.path {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
         }
     }
 
@@ -288,11 +311,6 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = success ? 1 : 0
             self.statusText = message
         }
-    }
-
-    static func makeThumbnail(from url: URL) -> UIImage? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return UIImage(data: data)
     }
 }
 
@@ -328,7 +346,10 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             sessionQueue.async { self.captureNextRaw() }
         } else {
             unlockAfterBurst()
-            sessionQueue.async { self.processBurst() }
+            // All frames are on disk — hand off to the processing queue.
+            processingQueue.async { [weak self] in
+                self?.processBurst()
+            }
         }
     }
 }

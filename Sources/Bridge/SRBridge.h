@@ -1,19 +1,20 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
 // Thin Objective-C facade over the portable C++ Handheld MFSR core.
-// Swift talks to this; this talks to hhsr::process_burst_to_dng.
 @interface SRBridge : NSObject
 
-// Decodes the given DNG burst (first == reference), runs the algorithm and
-// writes a fully-developed 2x (e.g. 48 MP) DNG/image to `outPath`.
+// Decodes the given DNG burst paths from disk (first == reference), runs the
+// low-memory pipeline and writes a 2x (e.g. 48 MP) DNG to `outPath`.
 // `progress` is invoked on an arbitrary thread with (stageName, 0..1).
-// Returns YES on success.
+// On success, optionally returns a small sRGB preview UIImage (not the full DNG).
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
              toPath:(NSString *)outPath
               scale:(float)scale
-           progress:(nullable void (^)(NSString *stage, float fraction))progress;
+           progress:(nullable void (^)(NSString *stage, float fraction))progress
+        previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 
 @end
 

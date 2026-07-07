@@ -18,8 +18,12 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed = 1234);
 
 // Loads a burst of DNG/RAW files (first path == reference). Fills `cfg` fields
 // read from metadata (CFA, white balance, alpha/beta) when available.
-// Returns empty vector if libraw is not compiled in.
 std::vector<Image> load_raw_burst(const std::vector<std::string>& paths, Config& cfg);
+
+// Loads a single DNG/RAW frame. When `is_reference`, populates `cfg` metadata.
+// If crop_h/crop_w > 0, crops to that even size (top-left) for burst consistency.
+Image load_raw_frame(const std::string& path, Config& cfg, bool is_reference,
+                     int crop_h = 0, int crop_w = 0);
 
 // Convert a normalized RGB float image [H,W,3] (0..1) to packed 8-bit RGBA
 // (for handing back to Android Bitmap). Applies sRGB gamma.

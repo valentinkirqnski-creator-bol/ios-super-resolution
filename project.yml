@@ -44,8 +44,10 @@ targets:
           - "kernels.cpp"
           - "merge.cpp"
           - "pipeline.cpp"
+          - "pipeline_paths.cpp"
           - "raw_io.cpp"
           - "dng_writer.cpp"
+          - "snr_tuning.cpp"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.
