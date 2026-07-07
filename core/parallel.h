@@ -1,14 +1,16 @@
 #pragma once
 //
-// Minimal std::thread parallel-for used to fan the per-pixel kernels across
-// the mobile CPU cores. This replaces the CUDA grid launches of the reference
-// implementation. A Vulkan compute backend would replace these loops with
-// shader dispatches behind the same call sites.
+// Row-parallel for loops. On Apple platforms uses GCD (reuses a worker pool);
+// std::thread per call was spawning hundreds of threads during band merge.
 //
-#include <thread>
-#include <vector>
 #include <functional>
 #include <algorithm>
+#include <thread>
+#include <vector>
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 
 namespace hhsr {
 
@@ -18,8 +20,14 @@ inline int resolve_threads(int requested) {
     return hc == 0 ? 4 : (int)hc;
 }
 
-// Splits the row range [0, rows) across worker threads; body(y) runs per row.
 inline void parallel_rows(int rows, int num_threads, const std::function<void(int)>& body) {
+    if (rows <= 0) return;
+#ifdef __APPLE__
+    (void)num_threads;
+    dispatch_apply((size_t)rows,
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t y) { body((int)y); });
+#else
     int nt = resolve_threads(num_threads);
     if (nt <= 1 || rows <= 1) {
         for (int y = 0; y < rows; ++y) body(y);
@@ -38,6 +46,7 @@ inline void parallel_rows(int rows, int num_threads, const std::function<void(in
         });
     }
     for (auto& th : pool) th.join();
+#endif
 }
 
 } // namespace hhsr
