@@ -32,8 +32,9 @@ enum ShutterSetting: Identifiable, Hashable {
     ]
 }
 
-/// Owns the capture session, performs a 4-frame RAW burst, then runs the
-/// multi-frame super-resolution pipeline on a background queue and saves the DNG.
+/// Owns the capture session, performs a 4-frame Bayer RAW (DNG) burst, then runs
+/// the multi-frame super-resolution pipeline on a background queue.
+/// iPhone 15 (non-Pro) delivers ~12 MP sensor DNGs via AVFoundation — not ProRAW.
 final class CameraModel: NSObject, ObservableObject {
 
     // Published UI state.
@@ -184,7 +185,7 @@ final class CameraModel: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isBusy = true
                 self.progress = 0
-                self.statusText = "Capturing \(self.burstCount) RAW frames…"
+                self.statusText = "Capturing \(self.burstCount) RAW DNG frames…"
             }
             // Lock AF/AE/WB so all frames share identical settings (clean merge)
             self.lockForBurst()
@@ -225,34 +226,40 @@ final class CameraModel: NSObject, ObservableObject {
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
-    /// ProRAW defaults to 48 MP on modern iPhones — far too large to decode in RAM.
-    /// Cap burst capture to ~12 MP so LibRaw + the merge pipeline stay within budget.
+    /// On iPhone 15 the camera already outputs ~12 MP Bayer DNG (not ProRAW).
+    /// These settings are a safety net on Pro models that might otherwise request
+    /// a larger RAW/ProRAW size; they are effectively a no-op on non-Pro phones.
     private func configureRawCaptureLimits() {
         if #available(iOS 16.0, *) {
             photoOutput.isHighResolutionCaptureEnabled = false
-            photoOutput.maxPhotoDimensions = cappedRawDimensions()
+            if let dims = preferredRawDimensions() {
+                photoOutput.maxPhotoDimensions = dims
+            }
         }
     }
 
     private func applyRawCaptureLimits(to settings: AVCapturePhotoSettings) {
         if #available(iOS 16.0, *) {
             settings.isHighResolutionPhotoEnabled = false
-            settings.maxPhotoDimensions = cappedRawDimensions()
+            if let dims = preferredRawDimensions() {
+                settings.maxPhotoDimensions = dims
+            }
         }
     }
 
+    /// Pick ~12 MP (4032×3024) when the active format supports it; otherwise the
+    /// largest supported size that still fits in ~15 MP.
     @available(iOS 16.0, *)
-    private func cappedRawDimensions() -> CMVideoDimensions {
-        let preferred = CMVideoDimensions(width: 4032, height: 3024) // ~12 MP binned RAW
+    private func preferredRawDimensions() -> CMVideoDimensions? {
+        let preferred = CMVideoDimensions(width: 4032, height: 3024)
         let supported = device?.activeFormat.supportedMaxPhotoDimensions ?? []
-        if supported.isEmpty { return preferred }
+        if supported.isEmpty { return nil }
         for d in supported where d.width == preferred.width && d.height == preferred.height {
             return preferred
         }
-        // Fall back to the largest supported size still under ~15 MP.
         let maxPixels: Int64 = 15_000_000
-        var best = supported[0]
-        var bestPixels = Int64(best.width) * Int64(best.height)
+        var best: CMVideoDimensions?
+        var bestPixels: Int64 = 0
         for d in supported {
             let px = Int64(d.width) * Int64(d.height)
             if px <= maxPixels && px >= bestPixels {
@@ -324,7 +331,7 @@ final class CameraModel: NSObject, ObservableObject {
                     self.lastThumbnail = preview
                     self.lastSavedURL = url
                     self.finish(success: success,
-                                message: success ? "Saved 48 MP DNG to Photos" : "Saved to app storage")
+                                message: success ? "Saved super-res DNG to Photos" : "Saved to app storage")
                 }
                 self.cleanupBurstDir(burstDir, keep: url)
             })
