@@ -47,14 +47,6 @@ enum CameraSelection: String, CaseIterable, Identifiable {
         case .front: return "Front"
         }
     }
-
-    /// Front uses more frames for hand-shake; rear cameras stay at 4 for speed/RAM.
-    var burstCount: Int {
-        switch self {
-        case .front: return 8
-        default: return 4
-        }
-    }
 }
 
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
@@ -63,7 +55,9 @@ final class CameraModel: NSObject, ObservableObject {
 
     // Published UI state.
     @Published var isSessionRunning = false
-    @Published var isBusy = false            // capturing or processing
+    @Published var isBusy = false
+    @Published var isCapturing = false
+    @Published var isProcessing = false
     @Published var statusText = ""
     @Published var progress: Float = 0
     @Published var lastThumbnail: UIImage?
@@ -72,6 +66,19 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var availableCameras: [CameraSelection] = [.wide]
+    @Published var frameCount: Int = 4 {
+        didSet {
+            let clamped = min(Self.maxFrameCount, max(Self.minFrameCount, frameCount))
+            if frameCount != clamped {
+                frameCount = clamped
+                return
+            }
+            sessionQueue.async { self.activeFrameCount = clamped }
+        }
+    }
+
+    static let minFrameCount = 2
+    static let maxFrameCount = 8
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
@@ -81,8 +88,8 @@ final class CameraModel: NSObject, ObservableObject {
     private var videoInput: AVCaptureDeviceInput?
     private var activeCameraSelection: CameraSelection = .wide
 
-    // Burst bookkeeping — count depends on selected camera.
-    private var burstCount = 4
+    private var activeFrameCount = 4
+    private var currentBurstTotal = 4
     private var pendingCaptures = 0
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
@@ -112,9 +119,9 @@ final class CameraModel: NSObject, ObservableObject {
     func setCamera(_ selection: CameraSelection) {
         guard !isBusy, availableCameras.contains(selection) else { return }
         sessionQueue.async {
-            guard selection != self.cameraSelection else { return }
+            guard selection != self.activeCameraSelection else { return }
+            self.activeCameraSelection = selection
             DispatchQueue.main.async { self.cameraSelection = selection }
-            self.burstCount = selection.burstCount
             self.switchCameraDevice(to: selection)
         }
     }
@@ -144,13 +151,7 @@ final class CameraModel: NSObject, ObservableObject {
             videoInput = nil
         }
 
-        let selection: CameraSelection
-        if Thread.isMainThread {
-            selection = cameraSelection
-        } else {
-            selection = DispatchQueue.main.sync { self.cameraSelection }
-        }
-        burstCount = selection.burstCount
+        let selection = activeCameraSelection
 
         guard let dev = device(for: selection),
               let input = try? AVCaptureDeviceInput(device: dev),
@@ -203,7 +204,6 @@ final class CameraModel: NSObject, ObservableObject {
         session.addInput(input)
         videoInput = input
         device = dev
-        burstCount = selection.burstCount
 
         configureRawCaptureLimits()
         applyDefaultDeviceModes()
@@ -305,13 +305,16 @@ final class CameraModel: NSObject, ObservableObject {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             self.burstDir = dir
             self.capturedDNGs.removeAll()
-            self.pendingCaptures = self.burstCount
+            self.currentBurstTotal = self.activeFrameCount
+            self.pendingCaptures = self.currentBurstTotal
 
             DispatchQueue.main.async {
                 self.isBusy = true
+                self.isCapturing = true
+                self.isProcessing = false
                 self.progress = 0
                 let lens = self.cameraSelection.label
-                self.statusText = "Capturing \(self.burstCount) RAW DNG frames (\(lens))…"
+                self.statusText = "Capturing \(self.currentBurstTotal) frames · \(lens)"
             }
             self.lockForBurst()
             self.captureNextRaw()
@@ -401,6 +404,8 @@ final class CameraModel: NSObject, ObservableObject {
             .appendingPathComponent("handheld_sr_x2.dng")
 
         DispatchQueue.main.async {
+            self.isCapturing = false
+            self.isProcessing = true
             self.statusText = "Processing…"
             self.progress = 0.15
         }
@@ -472,26 +477,41 @@ final class CameraModel: NSObject, ObservableObject {
     private func finish(success: Bool, message: String) {
         DispatchQueue.main.async {
             self.isBusy = false
+            self.isCapturing = false
+            self.isProcessing = false
             self.progress = success ? 1 : 0
             self.statusText = message
         }
-        resumeSessionAfterProcessing()
+        restorePhotoPreview()
     }
 
-    private func pauseSessionForProcessing(completion: @escaping () -> Void) {
+    /// Drop preview to a lighter preset but keep the viewfinder alive during merge.
+    private func enterLowResPreviewForProcessing(completion: @escaping () -> Void) {
         sessionQueue.async {
-            if self.session.isRunning {
-                self.session.stopRunning()
-                DispatchQueue.main.async { self.isSessionRunning = false }
+            if self.session.sessionPreset != .medium {
+                self.session.beginConfiguration()
+                self.session.sessionPreset = .medium
+                self.session.commitConfiguration()
             }
-            completion()
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+            DispatchQueue.main.async {
+                self.isSessionRunning = self.session.isRunning
+                completion()
+            }
         }
     }
 
-    private func resumeSessionAfterProcessing() {
+    private func restorePhotoPreview() {
         sessionQueue.async {
-            guard !self.session.isRunning else { return }
-            self.session.startRunning()
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
+            self.configureRawCaptureLimits()
+            self.session.commitConfiguration()
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
             DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
         }
     }
@@ -521,15 +541,15 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
 
         pendingCaptures -= 1
         DispatchQueue.main.async {
-            let done = self.burstCount - self.pendingCaptures
-            self.progress = Float(done) / Float(self.burstCount) * 0.15
+            let done = self.currentBurstTotal - self.pendingCaptures
+            self.progress = Float(done) / Float(self.currentBurstTotal) * 0.15
         }
 
         if pendingCaptures > 0 {
             sessionQueue.async { self.captureNextRaw() }
         } else {
             unlockAfterBurst()
-            pauseSessionForProcessing { [weak self] in
+            enterLowResPreviewForProcessing { [weak self] in
                 guard let self = self else { return }
                 self.processingQueue.async { self.processBurst() }
             }
