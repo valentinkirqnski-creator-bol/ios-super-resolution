@@ -10,7 +10,7 @@ struct CameraView: View {
     var body: some View {
         GeometryReader { geo in
             let bottomH: CGFloat = 96
-            let topH: CGFloat = 40
+            let topH: CGFloat = 72
             let vfWidth = geo.size.width
             let maxVFHeight = geo.size.height - topH - bottomH - geo.safeAreaInsets.bottom
             // Slightly taller than square (4:3) — uses more screen without ultra-wide chrome.
@@ -112,12 +112,47 @@ struct CameraView: View {
     // MARK: - Top strip
 
     private var topStrip: some View {
-        HStack(spacing: 16) {
-            frameCountControl
-            Spacer()
-            shutterMenu
+        VStack(spacing: 8) {
+            HStack(spacing: 16) {
+                frameCountControl
+                Spacer()
+                Text(cam.shutterLabel)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(minWidth: 44, alignment: .trailing)
+            }
+            shutterSliderRow
         }
         .padding(.horizontal, 20)
+    }
+
+    private var shutterSliderRow: some View {
+        HStack(spacing: 10) {
+            Button {
+                cam.setShutterAuto(true)
+            } label: {
+                Text("A")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(cam.shutterIsAuto ? .black : .white)
+                    .frame(width: 28, height: 28)
+                    .background(cam.shutterIsAuto ? Color.yellow : Color.white.opacity(0.15))
+                    .clipShape(Circle())
+            }
+            .disabled(cam.isBusy)
+
+            Slider(
+                value: Binding(
+                    get: { cam.shutterSlider },
+                    set: { cam.shutterSlider = $0 }
+                ),
+                in: 0...1
+            ) { editing in
+                if !editing { cam.applyManualShutterFromSlider() }
+            }
+            .tint(.yellow)
+            .disabled(cam.isBusy || cam.shutterIsAuto)
+            .opacity(cam.shutterIsAuto ? 0.35 : 1)
+        }
     }
 
     private var frameCountControl: some View {
@@ -146,46 +181,6 @@ struct CameraView: View {
                 .frame(width: 26, height: 26)
         }
         .disabled(!enabled)
-    }
-
-    private var shutterMenu: some View {
-        Menu {
-            Button {
-                cam.shutter = .auto
-            } label: {
-                if case .auto = cam.shutter {
-                    Label("Auto", systemImage: "checkmark")
-                } else {
-                    Text("Auto")
-                }
-            }
-            Divider()
-            ForEach(ShutterSetting.choices.filter {
-                if case .auto = $0 { return false }
-                return true
-            }) { s in
-                Button { cam.shutter = s } label: {
-                    if cam.shutter == s {
-                        Label(s.label, systemImage: "checkmark")
-                    } else {
-                        Text(s.label)
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "camera.aperture")
-                    .font(.system(size: 15, weight: .medium))
-                Text(cam.shutter.label)
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-            }
-            .foregroundColor(.white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.white.opacity(0.12))
-            .clipShape(Capsule())
-        }
-        .disabled(cam.isBusy)
     }
 
     // MARK: - Lens picker (over viewfinder)

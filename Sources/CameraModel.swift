@@ -3,35 +3,6 @@ import Photos
 import UIKit
 import Combine
 
-/// Available shutter (exposure duration) choices. `.auto` lets the camera pick
-/// based on the light; the others force a manual duration.
-enum ShutterSetting: Identifiable, Hashable {
-    case auto
-    case manual(seconds: Double)   // e.g. 1/125 -> 1.0/125.0
-
-    var id: String { label }
-
-    var label: String {
-        switch self {
-        case .auto: return "Auto"
-        case .manual(let s):
-            if s >= 1 { return "\(Int(s))\"" }
-            return "1/\(Int((1.0 / s).rounded()))"
-        }
-    }
-
-    static let choices: [ShutterSetting] = [
-        .auto,
-        .manual(seconds: 1.0 / 1000.0),
-        .manual(seconds: 1.0 / 500.0),
-        .manual(seconds: 1.0 / 250.0),
-        .manual(seconds: 1.0 / 125.0),
-        .manual(seconds: 1.0 / 60.0),
-        .manual(seconds: 1.0 / 30.0),
-        .manual(seconds: 1.0 / 15.0),
-    ]
-}
-
 /// Back wide (1×), ultra-wide (0.5×), or front selfie camera.
 enum CameraSelection: String, CaseIterable, Identifiable {
     case wide
@@ -62,7 +33,6 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var progress: Float = 0
     @Published var lastThumbnail: UIImage?
     @Published var lastSavedURL: URL?
-    @Published var shutter: ShutterSetting = .auto { didSet { applyShutter() } }
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var availableCameras: [CameraSelection] = [.wide]
@@ -76,6 +46,12 @@ final class CameraModel: NSObject, ObservableObject {
             sessionQueue.async { self.activeFrameCount = clamped }
         }
     }
+
+    // Shutter: Auto, or manual via log-scaled slider (0…1).
+    @Published var shutterIsAuto = true
+    @Published var shutterSlider: Double = 0.5
+    @Published var exposureMinSec: Double = 1.0 / 8000.0
+    @Published var exposureMaxSec: Double = 1.0 / 15.0
 
     static let minFrameCount = 2
     static let maxFrameCount = 8
@@ -97,9 +73,13 @@ final class CameraModel: NSObject, ObservableObject {
     private var isAppActive = true
     private var previewSuspended = false
 
-    /// Preview frame rate while idle (lower = less ISP / battery draw).
-    private let idlePreviewFPS: Int32 = 15
-    private let capturePreviewFPS: Int32 = 30
+    var shutterLabel: String {
+        if shutterIsAuto { return "Auto" }
+        let sec = durationFromSlider(shutterSlider)
+        if sec >= 1.0 { return "\(Int(sec.rounded()))s" }
+        let denom = max(1, Int((1.0 / sec).rounded()))
+        return "1/\(denom)"
+    }
 
     // MARK: - Setup
 
@@ -108,7 +88,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.isAppActive = active
             guard !self.isBusy else { return }
             if active && !self.previewSuspended {
-                self.enterIdlePreviewMode(startIfNeeded: true)
+                self.startPreviewIfNeeded()
             } else if self.session.isRunning {
                 self.session.stopRunning()
                 DispatchQueue.main.async { self.isSessionRunning = false }
@@ -126,7 +106,7 @@ final class CameraModel: NSObject, ObservableObject {
                     DispatchQueue.main.async { self.isSessionRunning = false }
                 }
             } else if self.isAppActive {
-                self.enterIdlePreviewMode(startIfNeeded: true)
+                self.startPreviewIfNeeded()
             }
         }
     }
@@ -149,6 +129,16 @@ final class CameraModel: NSObject, ObservableObject {
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
         }
+    }
+
+    func setShutterAuto(_ auto: Bool) {
+        shutterIsAuto = auto
+        applyShutter()
+    }
+
+    func applyManualShutterFromSlider() {
+        shutterIsAuto = false
+        applyShutter()
     }
 
     func setCamera(_ selection: CameraSelection) {
@@ -183,25 +173,19 @@ final class CameraModel: NSObject, ObservableObject {
         switchCameraDevice(to: selection)
     }
 
-    /// List lenses after the live session is configured (no extra probe sessions).
     private func discoverCamerasAfterSetup() {
         var found: [CameraSelection] = []
-        if device(for: .wide) != nil {
-            found.append(.wide)
-        }
-        if device(for: .ultraWide) != nil {
-            found.append(.ultraWide)
-        }
-        if device(for: .front) != nil {
-            found.append(.front)
-        }
+        if device(for: .wide) != nil { found.append(.wide) }
+        if device(for: .ultraWide) != nil { found.append(.ultraWide) }
+        if device(for: .front) != nil { found.append(.front) }
         if found.isEmpty { found = [.wide] }
         DispatchQueue.main.async { self.availableCameras = found }
     }
 
     private func configureSession() {
         session.beginConfiguration()
-        session.sessionPreset = .medium
+        // .photo is required for Bayer RAW capture on iOS.
+        session.sessionPreset = .photo
 
         if let input = videoInput {
             session.removeInput(input)
@@ -231,14 +215,12 @@ final class CameraModel: NSObject, ObservableObject {
         photoOutput.maxPhotoQualityPrioritization = .balanced
         setResponsiveCaptureEnabled(false)
         configureRawCaptureLimits()
+        refreshExposureRange()
         applyDefaultDeviceModes()
         applyShutterOnSessionQueue()
-        applyPreviewFrameRate(reduced: true)
 
         session.commitConfiguration()
-        if isAppActive {
-            session.startRunning()
-        }
+        startPreviewIfNeeded()
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
             if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
@@ -267,9 +249,9 @@ final class CameraModel: NSObject, ObservableObject {
         device = dev
 
         configureRawCaptureLimits()
+        refreshExposureRange()
         applyDefaultDeviceModes()
         applyShutterOnSessionQueue()
-        applyPreviewFrameRate(reduced: !isBusy)
 
         session.commitConfiguration()
         DispatchQueue.main.async {
@@ -281,24 +263,37 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// Apply shutter/exposure on the session queue (caller must already be on sessionQueue).
+    private func refreshExposureRange() {
+        guard let d = device else { return }
+        let minS = max(CMTimeGetSeconds(d.activeFormat.minExposureDuration), 1e-6)
+        let maxS = max(CMTimeGetSeconds(d.activeFormat.maxExposureDuration), minS * 1.01)
+        DispatchQueue.main.async {
+            self.exposureMinSec = minS
+            self.exposureMaxSec = maxS
+        }
+    }
+
+    private func durationFromSlider(_ t: Double) -> Double {
+        let clamped = min(1.0, max(0.0, t))
+        let logMin = log(exposureMinSec)
+        let logMax = log(exposureMaxSec)
+        return exp(logMin + clamped * (logMax - logMin))
+    }
+
     private func applyShutterOnSessionQueue() {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
-        switch shutter {
-        case .auto:
+        if shutterIsAuto {
             if d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
-        case .manual(let seconds):
-            if d.isExposureModeSupported(.custom) {
-                let minD = d.activeFormat.minExposureDuration
-                let maxD = d.activeFormat.maxExposureDuration
-                var t = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000_000)
-                if CMTimeCompare(t, minD) < 0 { t = minD }
-                if CMTimeCompare(t, maxD) > 0 { t = maxD }
-                let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
-                d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
-            }
+        } else if d.isExposureModeSupported(.custom) {
+            let minD = d.activeFormat.minExposureDuration
+            let maxD = d.activeFormat.maxExposureDuration
+            var t = CMTimeMakeWithSeconds(durationFromSlider(shutterSlider), preferredTimescale: 1_000_000_000)
+            if CMTimeCompare(t, minD) < 0 { t = minD }
+            if CMTimeCompare(t, maxD) > 0 { t = maxD }
+            let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
+            d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
         }
         d.unlockForConfiguration()
     }
@@ -317,21 +312,12 @@ final class CameraModel: NSObject, ObservableObject {
     private func applyDefaultDeviceModes() {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
         if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
-        if d.isExposureModeSupported(.continuousAutoExposure) { d.exposureMode = .continuousAutoExposure }
         if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
         }
         d.isSubjectAreaChangeMonitoringEnabled = false
         d.unlockForConfiguration()
-    }
-
-    private func applyPreviewFrameRate(reduced: Bool) {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
-        let fps = reduced ? idlePreviewFPS : capturePreviewFPS
-        let dur = CMTime(value: 1, timescale: fps)
-        d.activeVideoMinFrameDuration = dur
-        d.activeVideoMaxFrameDuration = dur
-        d.unlockForConfiguration()
+        applyShutterOnSessionQueue()
     }
 
     private func setResponsiveCaptureEnabled(_ enabled: Bool) {
@@ -340,20 +326,14 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// Full-quality pipeline only for the short RAW burst window.
-    private func promoteSessionForCapture() {
-        session.beginConfiguration()
-        session.sessionPreset = .photo
-        configureRawCaptureLimits()
-        session.commitConfiguration()
-        applyPreviewFrameRate(reduced: false)
-        setResponsiveCaptureEnabled(true)
-        photoOutput.maxPhotoQualityPrioritization = .speed
+    private func startPreviewIfNeeded() {
+        guard isAppActive, !previewSuspended, !session.isRunning else { return }
+        session.startRunning()
+        DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
     }
 
     // MARK: - Focus / exposure controls
 
-    /// Tap-to-focus at a normalized device point (0..1, from the preview layer).
     func focus(at devicePoint: CGPoint) {
         sessionQueue.async {
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
@@ -363,17 +343,12 @@ final class CameraModel: NSObject, ObservableObject {
             }
             if d.isExposurePointOfInterestSupported {
                 d.exposurePointOfInterest = devicePoint
-                if self.isAutoShutter, d.isExposureModeSupported(.continuousAutoExposure) {
+                if self.shutterIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
                     d.exposureMode = .continuousAutoExposure
                 }
             }
             d.unlockForConfiguration()
         }
-    }
-
-    private var isAutoShutter: Bool {
-        if case .auto = shutter { return true }
-        return false
     }
 
     private func applyShutter() {
@@ -386,9 +361,12 @@ final class CameraModel: NSObject, ObservableObject {
         guard !isBusy else { return }
         sessionQueue.async {
             guard self.photoOutput.availableRawPhotoPixelFormatTypes.first != nil else {
-                DispatchQueue.main.async { self.statusText = "RAW capture not supported on this camera" }
+                DispatchQueue.main.async {
+                    self.statusText = "RAW capture not supported on this camera"
+                }
                 return
             }
+
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("burst_\(Int(Date().timeIntervalSince1970))")
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -405,9 +383,37 @@ final class CameraModel: NSObject, ObservableObject {
                 let lens = self.cameraSelection.label
                 self.statusText = "Capturing \(self.currentBurstTotal) frames · \(lens)"
             }
-            self.promoteSessionForCapture()
+
+            self.photoOutput.maxPhotoQualityPrioritization = .speed
+            self.setResponsiveCaptureEnabled(true)
             self.lockForBurst()
-            self.captureNextRaw()
+            guard self.captureNextRaw() else { return }
+        }
+    }
+
+    private func abortBurst(_ message: String) {
+        sessionQueue.async {
+            self.pendingCaptures = 0
+            self.capturedDNGs.removeAll()
+            self.restoreCaptureQuality()
+            if let d = self.device, (try? d.lockForConfiguration()) != nil {
+                if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
+                if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    d.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+                self.applyShutterOnSessionQueue()
+                d.unlockForConfiguration()
+            }
+            if self.isAppActive && !self.previewSuspended {
+                self.startPreviewIfNeeded()
+            }
+            DispatchQueue.main.async {
+                self.isBusy = false
+                self.isCapturing = false
+                self.isProcessing = false
+                self.progress = 0
+                self.statusText = message
+            }
         }
     }
 
@@ -415,7 +421,7 @@ final class CameraModel: NSObject, ObservableObject {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-        if isAutoShutter, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+        if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
         d.unlockForConfiguration()
     }
 
@@ -427,21 +433,24 @@ final class CameraModel: NSObject, ObservableObject {
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 d.whiteBalanceMode = .continuousAutoWhiteBalance
             }
-            if self.isAutoShutter, d.isExposureModeSupported(.continuousAutoExposure) {
-                d.exposureMode = .continuousAutoExposure
-            }
+            self.applyShutterOnSessionQueue()
             d.unlockForConfiguration()
         }
     }
 
-    private func captureNextRaw() {
-        guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else { return }
+    @discardableResult
+    private func captureNextRaw() -> Bool {
+        guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else {
+            abortBurst("RAW capture unavailable")
+            return false
+        }
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         settings.flashMode = .off
         settings.photoQualityPrioritization = .speed
         settings.isAutoStillImageStabilizationEnabled = false
         applyRawCaptureLimits(to: settings)
         photoOutput.capturePhoto(with: settings, delegate: self)
+        return true
     }
 
     private func restoreCaptureQuality() {
@@ -449,7 +458,6 @@ final class CameraModel: NSObject, ObservableObject {
         setResponsiveCaptureEnabled(false)
     }
 
-    /// Target ~12 MP (4032×3024) when supported; otherwise the largest size under ~15 MP.
     private func configureRawCaptureLimits() {
         if #available(iOS 16.0, *) {
             photoOutput.isHighResolutionCaptureEnabled = false
@@ -580,10 +588,13 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = success ? 1 : 0
             self.statusText = message
         }
-        restorePhotoPreview()
+        sessionQueue.async {
+            if self.isAppActive && !self.previewSuspended {
+                self.startPreviewIfNeeded()
+            }
+        }
     }
 
-    /// Turn off the sensor during CPU-heavy merge — preview shows black until done.
     private func stopSessionForProcessing(completion: @escaping () -> Void) {
         sessionQueue.async {
             if self.session.isRunning {
@@ -592,26 +603,6 @@ final class CameraModel: NSObject, ObservableObject {
             }
             completion()
         }
-    }
-
-    private func enterIdlePreviewMode(startIfNeeded: Bool = true) {
-        sessionQueue.async {
-            self.session.beginConfiguration()
-            self.session.sessionPreset = .medium
-            self.configureRawCaptureLimits()
-            self.session.commitConfiguration()
-            self.photoOutput.maxPhotoQualityPrioritization = .balanced
-            self.setResponsiveCaptureEnabled(false)
-            self.applyPreviewFrameRate(reduced: true)
-            if startIfNeeded && self.isAppActive && !self.previewSuspended && !self.session.isRunning {
-                self.session.startRunning()
-            }
-            DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
-        }
-    }
-
-    private func restorePhotoPreview() {
-        enterIdlePreviewMode(startIfNeeded: true)
     }
 }
 
@@ -622,17 +613,24 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         if let error = error {
-            DispatchQueue.main.async { self.statusText = "Capture error: \(error.localizedDescription)" }
-        } else if photo.isRawPhoto, let dir = burstDir {
+            abortBurst("Capture error: \(error.localizedDescription)")
+            return
+        }
+
+        if photo.isRawPhoto, let dir = burstDir {
             autoreleasepool {
-                guard let data = photo.fileDataRepresentation() else { return }
+                guard let data = photo.fileDataRepresentation() else {
+                    abortBurst("Could not read RAW data")
+                    return
+                }
                 let idx = capturedDNGs.count
                 let url = dir.appendingPathComponent("frame_\(idx).dng")
                 do {
                     try data.write(to: url, options: .atomic)
                     capturedDNGs.append(url)
                 } catch {
-                    DispatchQueue.main.async { self.statusText = "Write error: \(error.localizedDescription)" }
+                    abortBurst("Write error: \(error.localizedDescription)")
+                    return
                 }
             }
         }
@@ -644,7 +642,9 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
         }
 
         if pendingCaptures > 0 {
-            sessionQueue.async { self.captureNextRaw() }
+            sessionQueue.async {
+                guard self.captureNextRaw() else { return }
+            }
         } else {
             unlockAfterBurst()
             stopSessionForProcessing { [weak self] in
