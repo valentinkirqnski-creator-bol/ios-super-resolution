@@ -58,7 +58,9 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
-    cfg.num_threads = 0;     // all CPU cores (LibRaw is heap-allocated; safe on stack)
+    // Use half the performance cores — less heat and battery during merge.
+    const unsigned cores = [[NSProcessInfo processInfo] activeProcessorCount];
+    cfg.num_threads = (int)MAX(2, MIN(6, (int)cores / 2));
 
     ProgressFn cb = nullptr;
     if (progress) {

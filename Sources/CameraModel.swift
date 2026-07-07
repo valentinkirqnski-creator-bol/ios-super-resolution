@@ -82,7 +82,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
-    private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .userInitiated)
+    private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .utility)
     private let photoOutput = AVCapturePhotoOutput()
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
@@ -94,8 +94,42 @@ final class CameraModel: NSObject, ObservableObject {
     private var pendingCaptures = 0
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
+    private var isAppActive = true
+    private var previewSuspended = false
+
+    /// Preview frame rate while idle (lower = less ISP / battery draw).
+    private let idlePreviewFPS: Int32 = 15
+    private let capturePreviewFPS: Int32 = 30
 
     // MARK: - Setup
+
+    func setAppActive(_ active: Bool) {
+        sessionQueue.async {
+            self.isAppActive = active
+            guard !self.isBusy else { return }
+            if active && !self.previewSuspended {
+                self.enterIdlePreviewMode(startIfNeeded: true)
+            } else if self.session.isRunning {
+                self.session.stopRunning()
+                DispatchQueue.main.async { self.isSessionRunning = false }
+            }
+        }
+    }
+
+    func setPreviewSuspended(_ suspended: Bool) {
+        sessionQueue.async {
+            self.previewSuspended = suspended
+            guard !self.isBusy else { return }
+            if suspended {
+                if self.session.isRunning {
+                    self.session.stopRunning()
+                    DispatchQueue.main.async { self.isSessionRunning = false }
+                }
+            } else if self.isAppActive {
+                self.enterIdlePreviewMode(startIfNeeded: true)
+            }
+        }
+    }
 
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
@@ -167,7 +201,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func configureSession() {
         session.beginConfiguration()
-        session.sessionPreset = .photo
+        session.sessionPreset = .medium
 
         if let input = videoInput {
             session.removeInput(input)
@@ -194,16 +228,17 @@ final class CameraModel: NSObject, ObservableObject {
             }
             session.addOutput(photoOutput)
         }
-        photoOutput.maxPhotoQualityPrioritization = .quality
-        if #available(iOS 17.0, *) {
-            photoOutput.isResponsiveCaptureEnabled = true
-        }
+        photoOutput.maxPhotoQualityPrioritization = .balanced
+        setResponsiveCaptureEnabled(false)
         configureRawCaptureLimits()
         applyDefaultDeviceModes()
         applyShutterOnSessionQueue()
+        applyPreviewFrameRate(reduced: true)
 
         session.commitConfiguration()
-        session.startRunning()
+        if isAppActive {
+            session.startRunning()
+        }
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
             if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
@@ -234,6 +269,7 @@ final class CameraModel: NSObject, ObservableObject {
         configureRawCaptureLimits()
         applyDefaultDeviceModes()
         applyShutterOnSessionQueue()
+        applyPreviewFrameRate(reduced: !isBusy)
 
         session.commitConfiguration()
         DispatchQueue.main.async {
@@ -285,7 +321,34 @@ final class CameraModel: NSObject, ObservableObject {
         if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
         }
+        d.isSubjectAreaChangeMonitoringEnabled = false
         d.unlockForConfiguration()
+    }
+
+    private func applyPreviewFrameRate(reduced: Bool) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+        let fps = reduced ? idlePreviewFPS : capturePreviewFPS
+        let dur = CMTime(value: 1, timescale: fps)
+        d.activeVideoMinFrameDuration = dur
+        d.activeVideoMaxFrameDuration = dur
+        d.unlockForConfiguration()
+    }
+
+    private func setResponsiveCaptureEnabled(_ enabled: Bool) {
+        if #available(iOS 17.0, *) {
+            photoOutput.isResponsiveCaptureEnabled = enabled
+        }
+    }
+
+    /// Full-quality pipeline only for the short RAW burst window.
+    private func promoteSessionForCapture() {
+        session.beginConfiguration()
+        session.sessionPreset = .photo
+        configureRawCaptureLimits()
+        session.commitConfiguration()
+        applyPreviewFrameRate(reduced: false)
+        setResponsiveCaptureEnabled(true)
+        photoOutput.maxPhotoQualityPrioritization = .speed
     }
 
     // MARK: - Focus / exposure controls
@@ -342,8 +405,8 @@ final class CameraModel: NSObject, ObservableObject {
                 let lens = self.cameraSelection.label
                 self.statusText = "Capturing \(self.currentBurstTotal) frames · \(lens)"
             }
+            self.promoteSessionForCapture()
             self.lockForBurst()
-            self.photoOutput.maxPhotoQualityPrioritization = .speed
             self.captureNextRaw()
         }
     }
@@ -382,7 +445,8 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func restoreCaptureQuality() {
-        photoOutput.maxPhotoQualityPrioritization = .quality
+        photoOutput.maxPhotoQualityPrioritization = .balanced
+        setResponsiveCaptureEnabled(false)
     }
 
     /// Target ~12 MP (4032×3024) when supported; otherwise the largest size under ~15 MP.
@@ -519,35 +583,35 @@ final class CameraModel: NSObject, ObservableObject {
         restorePhotoPreview()
     }
 
-    /// Drop preview to a lighter preset but keep the viewfinder alive during merge.
-    private func enterLowResPreviewForProcessing(completion: @escaping () -> Void) {
+    /// Turn off the sensor during CPU-heavy merge — preview shows black until done.
+    private func stopSessionForProcessing(completion: @escaping () -> Void) {
         sessionQueue.async {
-            if self.session.sessionPreset != .medium {
-                self.session.beginConfiguration()
-                self.session.sessionPreset = .medium
-                self.session.commitConfiguration()
+            if self.session.isRunning {
+                self.session.stopRunning()
+                DispatchQueue.main.async { self.isSessionRunning = false }
             }
-            if !self.session.isRunning {
-                self.session.startRunning()
-            }
-            DispatchQueue.main.async {
-                self.isSessionRunning = self.session.isRunning
-                completion()
-            }
+            completion()
         }
     }
 
-    private func restorePhotoPreview() {
+    private func enterIdlePreviewMode(startIfNeeded: Bool = true) {
         sessionQueue.async {
             self.session.beginConfiguration()
-            self.session.sessionPreset = .photo
+            self.session.sessionPreset = .medium
             self.configureRawCaptureLimits()
             self.session.commitConfiguration()
-            if !self.session.isRunning {
+            self.photoOutput.maxPhotoQualityPrioritization = .balanced
+            self.setResponsiveCaptureEnabled(false)
+            self.applyPreviewFrameRate(reduced: true)
+            if startIfNeeded && self.isAppActive && !self.previewSuspended && !self.session.isRunning {
                 self.session.startRunning()
             }
             DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
         }
+    }
+
+    private func restorePhotoPreview() {
+        enterIdlePreviewMode(startIfNeeded: true)
     }
 }
 
@@ -583,7 +647,7 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             sessionQueue.async { self.captureNextRaw() }
         } else {
             unlockAfterBurst()
-            enterLowResPreviewForProcessing { [weak self] in
+            stopSessionForProcessing { [weak self] in
                 guard let self = self else { return }
                 self.processingQueue.async { self.processBurst() }
             }

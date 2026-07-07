@@ -2,6 +2,7 @@ import SwiftUI
 
 struct CameraView: View {
     @StateObject private var cam = CameraModel()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showViewer = false
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
@@ -28,8 +29,21 @@ struct CameraView: View {
                 }
             }
         }
-        .onAppear { cam.start() }
+        .onAppear {
+            cam.start()
+            NotificationCenter.default.addObserver(
+                forName: .handheldSRScenePhaseChanged,
+                object: nil,
+                queue: .main
+            ) { note in
+                guard let phase = note.object as? ScenePhase else { return }
+                cam.setAppActive(phase == .active)
+            }
+        }
         .onDisappear { cam.stop() }
+        .onChange(of: showViewer) { open in
+            cam.setPreviewSuspended(open)
+        }
         .sheet(isPresented: $showViewer) { resultViewer }
     }
 
