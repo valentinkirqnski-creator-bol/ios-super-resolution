@@ -79,6 +79,27 @@ struct CachedCompFrame {
     Image comp;
 };
 
+struct CachedCompMeta {
+    FlowField flow;
+    Image rob;
+    CovField covs;
+    int index = 0;
+};
+
+static bool load_cached_comp_meta(const fs::path& cache, int k, CachedCompMeta& out) {
+    std::string idx = std::to_string(k);
+    fs::path fflow = cache / ("f" + idx + ".flow");
+    if (!fs::exists(fflow)) return false;
+    out.index = k;
+    return load_flow(fflow, out.flow) &&
+           load_image(cache / ("f" + idx + ".rob"), out.rob) &&
+           load_covs(cache / ("f" + idx + ".cov"), out.covs);
+}
+
+static bool load_cached_comp_raw(const fs::path& cache, int k, Image& comp) {
+    return load_image(cache / ("f" + std::to_string(k) + ".raw"), comp) && comp.h > 0;
+}
+
 static bool load_cached_comp(const fs::path& cache, int k, CachedCompFrame& out) {
     std::string idx = std::to_string(k);
     fs::path fflow = cache / ("f" + idx + ".flow");
@@ -235,16 +256,33 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
 
     std::vector<CachedCompFrame> cached;
-    cached.reserve(n - 1);
-    for (int k = 1; k < n; ++k) {
-        CachedCompFrame fc;
-        if (load_cached_comp(cache, k, fc))
-            cached.push_back(std::move(fc));
-    }
-    if (cached.empty()) {
-        fs::remove_all(cache, ec);
-        report("Error: could not load cached frames", 1.f);
-        return Image();
+    std::vector<CachedCompMeta> cached_meta;
+    const bool stream_comp_raw = (n - 1) > 3; // 5+ frames: load one comp raw at a time per band
+
+    if (stream_comp_raw) {
+        cached_meta.reserve(n - 1);
+        for (int k = 1; k < n; ++k) {
+            CachedCompMeta meta;
+            if (load_cached_comp_meta(cache, k, meta))
+                cached_meta.push_back(std::move(meta));
+        }
+        if (cached_meta.empty()) {
+            fs::remove_all(cache, ec);
+            report("Error: could not load cached frames", 1.f);
+            return Image();
+        }
+    } else {
+        cached.reserve(n - 1);
+        for (int k = 1; k < n; ++k) {
+            CachedCompFrame fc;
+            if (load_cached_comp(cache, k, fc))
+                cached.push_back(std::move(fc));
+        }
+        if (cached.empty()) {
+            fs::remove_all(cache, ec);
+            report("Error: could not load cached frames", 1.f);
+            return Image();
+        }
     }
 
     const int Hs = (int)std::lround(work.scale * ref.h);
@@ -276,9 +314,19 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         const int bh = std::min(band_rows, Hs - y0);
         Image num_band(bh, Ws, nch), den_band(bh, Ws, nch);
 
-        for (const CachedCompFrame& fc : cached)
-            merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
-                            num_band, den_band, y0, work);
+        if (stream_comp_raw) {
+            for (const CachedCompMeta& meta : cached_meta) {
+                Image comp;
+                if (!load_cached_comp_raw(cache, meta.index, comp)) continue;
+                merge_comp_band(comp, meta.flow, meta.covs, meta.rob, tile_size,
+                                num_band, den_band, y0, work);
+                comp = Image();
+            }
+        } else {
+            for (const CachedCompFrame& fc : cached)
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
+                                num_band, den_band, y0, work);
+        }
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work);
 
@@ -289,6 +337,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     writer.close();
     cached.clear();
+    cached_meta.clear();
     ref = Image();
     ref_covs = CovField();
     fs::remove_all(cache, ec);

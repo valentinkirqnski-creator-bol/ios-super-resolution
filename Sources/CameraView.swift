@@ -12,7 +12,7 @@ struct CameraView: View {
             if cam.permissionDenied {
                 permissionView
             } else {
-                CameraPreview(session: cam.session) { devicePoint in
+                CameraPreview(session: cam.session, mirrorFront: cam.cameraSelection == .front) { devicePoint in
                     cam.focus(at: devicePoint)
                 }
                 .ignoresSafeArea()
@@ -69,9 +69,14 @@ struct CameraView: View {
             }
             .disabled(cam.isBusy)
 
-            // Gallery thumbnail to the right of the shutter.
             HStack {
+                // Lens switcher (left).
+                cameraSwitcher
+                    .padding(.leading, 20)
+
                 Spacer()
+
+                // Gallery thumbnail (right).
                 Button(action: { if cam.lastSavedURL != nil { showViewer = true } }) {
                     Group {
                         if let thumb = cam.lastThumbnail {
@@ -89,6 +94,24 @@ struct CameraView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var cameraSwitcher: some View {
+        HStack(spacing: 6) {
+            ForEach(cam.availableCameras) { lens in
+                Button {
+                    cam.setCamera(lens)
+                } label: {
+                    Text(lens.label)
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(cam.cameraSelection == lens ? Color.yellow : Color.white.opacity(0.18))
+                        .foregroundColor(cam.cameraSelection == lens ? .black : .white)
+                        .clipShape(Capsule())
+                }
+                .disabled(cam.isBusy)
+            }
+        }
     }
 
     // MARK: - Processing overlay

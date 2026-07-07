@@ -32,9 +32,33 @@ enum ShutterSetting: Identifiable, Hashable {
     ]
 }
 
-/// Owns the capture session, performs a 4-frame Bayer RAW (DNG) burst, then runs
+/// Back wide (1×), ultra-wide (0.5×), or front selfie camera.
+enum CameraSelection: String, CaseIterable, Identifiable {
+    case wide
+    case ultraWide
+    case front
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .wide: return "1×"
+        case .ultraWide: return "0.5×"
+        case .front: return "Front"
+        }
+    }
+
+    /// Front uses more frames for hand-shake; rear cameras stay at 4 for speed/RAM.
+    var burstCount: Int {
+        switch self {
+        case .front: return 8
+        default: return 4
+        }
+    }
+}
+
+/// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
 /// the multi-frame super-resolution pipeline on a background queue.
-/// iPhone 15 (non-Pro) delivers ~12 MP sensor DNGs via AVFoundation — not ProRAW.
 final class CameraModel: NSObject, ObservableObject {
 
     // Published UI state.
@@ -46,15 +70,18 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var lastSavedURL: URL?
     @Published var shutter: ShutterSetting = .auto { didSet { applyShutter() } }
     @Published var permissionDenied = false
+    @Published var cameraSelection: CameraSelection = .wide
+    @Published var availableCameras: [CameraSelection] = [.wide]
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
     private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .userInitiated)
     private let photoOutput = AVCapturePhotoOutput()
     private var device: AVCaptureDevice?
+    private var videoInput: AVCaptureDeviceInput?
 
-    // Burst bookkeeping — 4 frames keeps peak RAM low on device.
-    private let burstCount = 4
+    // Burst bookkeeping — count depends on selected camera.
+    private var burstCount = 4
     private var pendingCaptures = 0
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
@@ -68,7 +95,10 @@ final class CameraModel: NSObject, ObservableObject {
                 DispatchQueue.main.async { self.permissionDenied = true }
                 return
             }
-            self.sessionQueue.async { self.configureSession() }
+            self.sessionQueue.async {
+                self.discoverCameras()
+                self.configureSession()
+            }
         }
     }
 
@@ -78,11 +108,44 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    func setCamera(_ selection: CameraSelection) {
+        guard !isBusy, availableCameras.contains(selection) else { return }
+        sessionQueue.async {
+            guard selection != self.cameraSelection else { return }
+            DispatchQueue.main.async { self.cameraSelection = selection }
+            self.burstCount = selection.burstCount
+            self.switchCameraDevice(to: selection)
+        }
+    }
+
+    private func discoverCameras() {
+        var found: [CameraSelection] = []
+        if let wide = device(for: .wide), supportsRawPhotoCapture(device: wide) {
+            found.append(.wide)
+        }
+        if let uw = device(for: .ultraWide), supportsRawPhotoCapture(device: uw) {
+            found.append(.ultraWide)
+        }
+        if let front = device(for: .front), supportsRawPhotoCapture(device: front) {
+            found.append(.front)
+        }
+        if found.isEmpty { found = [.wide] }
+        DispatchQueue.main.async { self.availableCameras = found }
+    }
+
     private func configureSession() {
         session.beginConfiguration()
         session.sessionPreset = .photo
 
-        guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+        if let input = videoInput {
+            session.removeInput(input)
+            videoInput = nil
+        }
+
+        let selection = cameraSelection
+        burstCount = selection.burstCount
+
+        guard let dev = device(for: selection),
               let input = try? AVCaptureDeviceInput(device: dev),
               session.canAddInput(input) else {
             session.commitConfiguration()
@@ -90,29 +153,97 @@ final class CameraModel: NSObject, ObservableObject {
             return
         }
         session.addInput(input)
+        videoInput = input
         device = dev
 
-        guard session.canAddOutput(photoOutput) else {
-            session.commitConfiguration()
-            return
+        if !session.outputs.contains(photoOutput) {
+            guard session.canAddOutput(photoOutput) else {
+                session.commitConfiguration()
+                return
+            }
+            session.addOutput(photoOutput)
         }
-        session.addOutput(photoOutput)
         photoOutput.maxPhotoQualityPrioritization = .quality
         configureRawCaptureLimits()
-
-        // Light-driven defaults: continuous autofocus + auto exposure.
-        if let d = device, (try? d.lockForConfiguration()) != nil {
-            if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
-            if d.isExposureModeSupported(.continuousAutoExposure) { d.exposureMode = .continuousAutoExposure }
-            if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                d.whiteBalanceMode = .continuousAutoWhiteBalance
-            }
-            d.unlockForConfiguration()
-        }
+        applyDefaultDeviceModes()
 
         session.commitConfiguration()
         session.startRunning()
-        DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
+        DispatchQueue.main.async {
+            self.isSessionRunning = self.session.isRunning
+            if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+                self.statusText = "RAW capture not supported on this camera"
+            }
+        }
+    }
+
+    private func switchCameraDevice(to selection: CameraSelection) {
+        session.beginConfiguration()
+
+        if let input = videoInput {
+            session.removeInput(input)
+            videoInput = nil
+        }
+
+        guard let dev = device(for: selection),
+              let input = try? AVCaptureDeviceInput(device: dev),
+              session.canAddInput(input) else {
+            session.commitConfiguration()
+            DispatchQueue.main.async { self.statusText = "Camera unavailable" }
+            return
+        }
+        session.addInput(input)
+        videoInput = input
+        device = dev
+        burstCount = selection.burstCount
+
+        configureRawCaptureLimits()
+        applyDefaultDeviceModes()
+
+        session.commitConfiguration()
+        DispatchQueue.main.async {
+            if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+                self.statusText = "RAW not supported on \(selection.label)"
+            } else {
+                self.statusText = ""
+            }
+        }
+    }
+
+    private func device(for selection: CameraSelection) -> AVCaptureDevice? {
+        switch selection {
+        case .wide:
+            return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        case .ultraWide:
+            return AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back)
+        case .front:
+            return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+        }
+    }
+
+    /// Probe whether a device can deliver Bayer RAW through AVCapturePhotoOutput.
+    private func supportsRawPhotoCapture(device: AVCaptureDevice) -> Bool {
+        let probe = AVCapturePhotoOutput()
+        let probeSession = AVCaptureSession()
+        probeSession.beginConfiguration()
+        defer { probeSession.commitConfiguration() }
+        guard let input = try? AVCaptureDeviceInput(device: device),
+              probeSession.canAddInput(input),
+              probeSession.canAddOutput(probe) else { return false }
+        probeSession.addInput(input)
+        probeSession.addOutput(probe)
+        return !probe.availableRawPhotoPixelFormatTypes.isEmpty
+    }
+
+    private func applyDefaultDeviceModes() {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+        if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
+        if d.isExposureModeSupported(.continuousAutoExposure) { d.exposureMode = .continuousAutoExposure }
+        if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+            d.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+        d.unlockForConfiguration()
+        applyShutter()
     }
 
     // MARK: - Focus / exposure controls
@@ -150,13 +281,11 @@ final class CameraModel: NSObject, ObservableObject {
                 }
             case .manual(let seconds):
                 if d.isExposureModeSupported(.custom) {
-                    // Clamp the requested duration to the device's supported range.
                     let minD = d.activeFormat.minExposureDuration
                     let maxD = d.activeFormat.maxExposureDuration
                     var t = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000_000)
                     if CMTimeCompare(t, minD) < 0 { t = minD }
                     if CMTimeCompare(t, maxD) > 0 { t = maxD }
-                    // Keep ISO on auto by using the current value as a starting point.
                     let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
                     d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
                 }
@@ -171,10 +300,9 @@ final class CameraModel: NSObject, ObservableObject {
         guard !isBusy else { return }
         sessionQueue.async {
             guard self.photoOutput.availableRawPhotoPixelFormatTypes.first != nil else {
-                DispatchQueue.main.async { self.statusText = "RAW capture not supported on this device" }
+                DispatchQueue.main.async { self.statusText = "RAW capture not supported on this camera" }
                 return
             }
-            // Fresh temp directory for this burst.
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("burst_\(Int(Date().timeIntervalSince1970))")
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -185,25 +313,22 @@ final class CameraModel: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isBusy = true
                 self.progress = 0
-                self.statusText = "Capturing \(self.burstCount) RAW DNG frames…"
+                let lens = self.cameraSelection.label
+                self.statusText = "Capturing \(self.burstCount) RAW DNG frames (\(lens))…"
             }
-            // Lock AF/AE/WB so all frames share identical settings (clean merge)
             self.lockForBurst()
             self.captureNextRaw()
         }
     }
 
-    /// Freezes focus, exposure and white balance for the duration of the burst.
     private func lockForBurst() {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-        // Keep a user-chosen manual shutter; otherwise lock the current auto value.
         if isAutoShutter, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
         d.unlockForConfiguration()
     }
 
-    /// Restores light-driven continuous behavior after the burst.
     private func unlockAfterBurst() {
         sessionQueue.async {
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
@@ -226,9 +351,7 @@ final class CameraModel: NSObject, ObservableObject {
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
-    /// On iPhone 15 the camera already outputs ~12 MP Bayer DNG (not ProRAW).
-    /// These settings are a safety net on Pro models that might otherwise request
-    /// a larger RAW/ProRAW size; they are effectively a no-op on non-Pro phones.
+    /// Target ~12 MP (4032×3024) when supported; otherwise the largest size under ~15 MP.
     private func configureRawCaptureLimits() {
         if #available(iOS 16.0, *) {
             photoOutput.isHighResolutionCaptureEnabled = false
@@ -247,8 +370,6 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// Pick ~12 MP (4032×3024) when the active format supports it; otherwise the
-    /// largest supported size that still fits in ~15 MP.
     @available(iOS 16.0, *)
     private func preferredRawDimensions() -> CMVideoDimensions? {
         let preferred = CMVideoDimensions(width: 4032, height: 3024)
@@ -338,7 +459,6 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// Removes intermediate burst RAWs and analysis cache; keeps the output DNG.
     private func cleanupBurstDir(_ dir: URL?, keep output: URL) {
         guard let dir = dir else { return }
         processingQueue.async {
@@ -361,7 +481,6 @@ final class CameraModel: NSObject, ObservableObject {
         resumeSessionAfterProcessing()
     }
 
-    /// Stop the live preview pipeline during heavy processing to reclaim its buffers.
     private func pauseSessionForProcessing(completion: @escaping () -> Void) {
         sessionQueue.async {
             if self.session.isRunning {
@@ -406,12 +525,10 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
         pendingCaptures -= 1
         DispatchQueue.main.async {
             let done = self.burstCount - self.pendingCaptures
-            self.progress = Float(done) / Float(self.burstCount) * 0.15  // capture ~ first 15%
+            self.progress = Float(done) / Float(self.burstCount) * 0.15
         }
 
         if pendingCaptures > 0 {
-            // Fire the next RAW immediately — as fast as the sensor allows. Settings
-            // are locked for the burst, so there's no metering delay between frames.
             sessionQueue.async { self.captureNextRaw() }
         } else {
             unlockAfterBurst()

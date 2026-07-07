@@ -5,6 +5,7 @@ import AVFoundation
 /// (already converted to normalized device coordinates 0..1).
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
+    var mirrorFront: Bool = false
     var onFocus: (CGPoint) -> Void
 
     func makeUIView(context: Context) -> PreviewUIView {
@@ -12,11 +13,19 @@ struct CameraPreview: UIViewRepresentable {
         v.videoPreviewLayer.session = session
         v.videoPreviewLayer.videoGravity = .resizeAspectFill
         v.onFocus = onFocus
+        applyMirroring(to: v)
         return v
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
         uiView.onFocus = onFocus
+        applyMirroring(to: uiView)
+    }
+
+    private func applyMirroring(to view: PreviewUIView) {
+        guard let conn = view.videoPreviewLayer.connection, conn.isVideoMirroringSupported else { return }
+        conn.automaticallyAdjustsVideoMirroring = !mirrorFront
+        conn.isVideoMirrored = mirrorFront
     }
 
     final class PreviewUIView: UIView {
