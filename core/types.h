@@ -19,6 +19,8 @@ namespace hhsr {
 
 using f32 = float;
 
+inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
 // Row-major image / tensor with an arbitrary number of interleaved channels.
 struct Image {
     int h = 0;
@@ -140,7 +142,5 @@ struct Config {
     int num_threads = 0;      // 0 => hardware_concurrency
     bool use_gpu = false;     // opt-in Vulkan compute merge (experimental)
 };
-
-inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 } // namespace hhsr
