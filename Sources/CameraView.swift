@@ -9,6 +9,13 @@ struct CameraView: View {
 
     var body: some View {
         GeometryReader { geo in
+            let bottomH: CGFloat = 96
+            let topH: CGFloat = 40
+            let vfWidth = geo.size.width
+            let maxVFHeight = geo.size.height - topH - bottomH - geo.safeAreaInsets.bottom
+            // Slightly taller than square (4:3) — uses more screen without ultra-wide chrome.
+            let vfHeight = min(maxVFHeight, vfWidth * 4 / 3)
+
             ZStack {
                 Color.black.ignoresSafeArea()
 
@@ -16,40 +23,47 @@ struct CameraView: View {
                     permissionView
                 } else {
                     VStack(spacing: 0) {
-                        topStrip
-                            .frame(height: 52)
-                            .background(Color.black)
+                        Color.clear.frame(height: topH)
 
-                        viewfinder(side: geo.size.width)
+                        viewfinder(width: vfWidth, height: vfHeight)
 
                         bottomPanel
-                            .frame(maxHeight: .infinity)
+                            .frame(height: bottomH + geo.safeAreaInsets.bottom)
+                            .padding(.bottom, geo.safeAreaInsets.bottom)
                             .background(Color.black)
                     }
                 }
             }
         }
-        .onAppear {
-            cam.start()
-            NotificationCenter.default.addObserver(
-                forName: .handheldSRScenePhaseChanged,
-                object: nil,
-                queue: .main
-            ) { note in
-                guard let phase = note.object as? ScenePhase else { return }
-                cam.setAppActive(phase == .active)
-            }
-        }
+        .onAppear { cam.start() }
         .onDisappear { cam.stop() }
+        .onChange(of: scenePhase) { phase in
+            cam.setAppActive(phase == .active)
+        }
         .onChange(of: showViewer) { open in
             cam.setPreviewSuspended(open)
         }
         .sheet(isPresented: $showViewer) { resultViewer }
+        .overlay(alignment: .top) {
+            if !cam.permissionDenied {
+                topStrip
+                    .padding(.top, 6)
+                    .background(
+                        LinearGradient(
+                            colors: [.black.opacity(0.55), .clear],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .ignoresSafeArea(edges: .top)
+                        .allowsHitTesting(false)
+                    )
+            }
+        }
     }
 
-    // MARK: - Square viewfinder
+    // MARK: - Viewfinder
 
-    private func viewfinder(side: CGFloat) -> some View {
+    private func viewfinder(width: CGFloat, height: CGFloat) -> some View {
         ZStack {
             CameraPreview(
                 session: cam.session,
@@ -59,12 +73,12 @@ struct CameraView: View {
                 cam.focus(at: devicePoint)
                 showFocusIndicator(at: localPoint)
             }
-            .frame(width: side, height: side)
+            .frame(width: width, height: height)
             .clipped()
 
             if cam.isProcessing {
                 Color.black.opacity(0.08)
-                    .frame(width: side, height: side)
+                    .frame(width: width, height: height)
                     .allowsHitTesting(false)
             }
 
@@ -81,9 +95,9 @@ struct CameraView: View {
                         .padding(.bottom, 14)
                 }
             }
-            .frame(width: side, height: side)
+            .frame(width: width, height: height)
         }
-        .frame(width: side, height: side)
+        .frame(width: width, height: height)
         .background(Color.black)
     }
 
@@ -209,14 +223,12 @@ struct CameraView: View {
 
     private var bottomPanel: some View {
         VStack(spacing: 0) {
-            Spacer(minLength: 8)
-
             if cam.isProcessing, !cam.statusText.isEmpty {
                 Text(cam.statusText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
                     .lineLimit(1)
-                    .padding(.bottom, 12)
+                    .padding(.bottom, 6)
             }
 
             HStack(alignment: .center) {
@@ -233,9 +245,8 @@ struct CameraView: View {
                     .frame(width: 72)
             }
             .padding(.horizontal, 28)
-
-            Spacer(minLength: 24)
         }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var flipCameraButton: some View {
