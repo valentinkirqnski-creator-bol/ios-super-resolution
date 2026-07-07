@@ -51,6 +51,22 @@ struct FlowField {
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
 };
 
+// Bilinear sample of a per-tile flow field (reduces blocky merge seams).
+inline void sample_flow_bilinear(const FlowField& flow, f32 ty, f32 tx, f32& dx, f32& dy) {
+    if (flow.nx <= 0 || flow.ny <= 0) { dx = dy = 0.f; return; }
+    tx = clampf(tx, 0.f, (f32)(flow.nx - 1));
+    ty = clampf(ty, 0.f, (f32)(flow.ny - 1));
+    int x0 = (int)std::floor(tx), y0 = (int)std::floor(ty);
+    int x1 = std::min(x0 + 1, flow.nx - 1), y1 = std::min(y0 + 1, flow.ny - 1);
+    f32 fx = tx - (f32)x0, fy = ty - (f32)y0;
+    f32 w00 = (1.f - fx) * (1.f - fy), w10 = fx * (1.f - fy);
+    f32 w01 = (1.f - fx) * fy,         w11 = fx * fy;
+    dx = w00 * flow.dx(y0, x0) + w10 * flow.dx(y0, x1)
+       + w01 * flow.dx(y1, x0) + w11 * flow.dx(y1, x1);
+    dy = w00 * flow.dy(y0, x0) + w10 * flow.dy(y0, x1)
+       + w01 * flow.dy(y1, x0) + w11 * flow.dy(y1, x1);
+}
+
 // Per-grey-pixel 2x2 covariance field (steerable kernels): [h, w, 4] = xx,xy,yx,yy.
 struct CovField {
     int h = 0;

@@ -63,12 +63,15 @@ static FlowField block_match_level(const Image& ref, const Image& moving,
 // vectors by `mul` (the pixel-size ratio between the two levels).
 static FlowField upscale_flow(const FlowField& in, int ny, int nx, f32 mul) {
     FlowField out(ny, nx);
+    if (in.nx <= 0 || in.ny <= 0) return out;
     for (int ty = 0; ty < ny; ++ty) {
         for (int tx = 0; tx < nx; ++tx) {
-            int sy = in.ny > 0 ? std::min((int)((f32)ty / ny * in.ny), in.ny - 1) : 0;
-            int sx = in.nx > 0 ? std::min((int)((f32)tx / nx * in.nx), in.nx - 1) : 0;
-            out.dx(ty, tx) = in.dx(sy, sx) * mul;
-            out.dy(ty, tx) = in.dy(sy, sx) * mul;
+            f32 sy = (ny <= 1) ? 0.f : (f32)ty / (f32)(ny - 1) * (f32)(in.ny - 1);
+            f32 sx = (nx <= 1) ? 0.f : (f32)tx / (f32)(nx - 1) * (f32)(in.nx - 1);
+            f32 dx, dy;
+            sample_flow_bilinear(in, sy, sx, dx, dy);
+            out.dx(ty, tx) = dx * mul;
+            out.dy(ty, tx) = dy * mul;
         }
     }
     return out;
@@ -134,7 +137,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[lvl];
         const Image& m = mov_pyr.levels[lvl];
-        int ts = std::max(4, tile_size); // tile size in this level's pixels
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size())
+                     ? std::max(4, cfg.bm_tile_sizes[lvl])
+                     : std::max(4, tile_size);
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
         bool use_l1 = (lvl == 0); // reference uses L1 at the finest scale
 

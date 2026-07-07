@@ -52,12 +52,13 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
 
             f32 flowx = 0.f, flowy = 0.f;
             if (flow) {
-                // Index the flow tile in grey coordinates.
-                int px = std::min((int)((lr_x / up) / tile_size), flow->nx - 1);
-                int py = std::min((int)((lr_y / up) / tile_size), flow->ny - 1);
-                // Grey-pixel displacement -> raw-pixel displacement.
-                flowx = flow->dx(py, px) * up;
-                flowy = flow->dy(py, px) * up;
+                f32 gxf = lr_x / (f32)up;
+                f32 gyf = lr_y / (f32)up;
+                f32 ftx = gxf / (f32)tile_size;
+                f32 fty = gyf / (f32)tile_size;
+                sample_flow_bilinear(*flow, fty, ftx, flowx, flowy);
+                flowx *= (f32)up;
+                flowy *= (f32)up;
             }
 
             f32 local_r = ref_rob;
