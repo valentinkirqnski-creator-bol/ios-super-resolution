@@ -97,6 +97,7 @@ final class CameraModel: NSObject, ObservableObject {
         }
         session.addOutput(photoOutput)
         photoOutput.maxPhotoQualityPrioritization = .quality
+        configureRawCaptureLimits()
 
         // Light-driven defaults: continuous autofocus + auto exposure.
         if let d = device, (try? d.lockForConfiguration()) != nil {
@@ -220,7 +221,47 @@ final class CameraModel: NSObject, ObservableObject {
         guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else { return }
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         settings.flashMode = .off
+        applyRawCaptureLimits(to: settings)
         photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    /// ProRAW defaults to 48 MP on modern iPhones — far too large to decode in RAM.
+    /// Cap burst capture to ~12 MP so LibRaw + the merge pipeline stay within budget.
+    private func configureRawCaptureLimits() {
+        if #available(iOS 16.0, *) {
+            photoOutput.isHighResolutionCaptureEnabled = false
+            if photoOutput.isMaxPhotoDimensionsSupported {
+                photoOutput.maxPhotoDimensions = Self.cappedRawDimensions(from: photoOutput)
+            }
+        }
+    }
+
+    private func applyRawCaptureLimits(to settings: AVCapturePhotoSettings) {
+        if #available(iOS 16.0, *) {
+            settings.isHighResolutionPhotoEnabled = false
+            settings.maxPhotoDimensions = Self.cappedRawDimensions(from: photoOutput)
+        }
+    }
+
+    @available(iOS 16.0, *)
+    private static func cappedRawDimensions(from output: AVCapturePhotoOutput) -> CMVideoDimensions {
+        let preferred = CMVideoDimensions(width: 4032, height: 3024) // ~12 MP binned RAW
+        let supported = output.supportedMaxPhotoDimensions
+        for d in supported where d.width == preferred.width && d.height == preferred.height {
+            return preferred
+        }
+        // Fall back to the largest supported size still under ~15 MP.
+        let maxPixels: Int64 = 15_000_000
+        var best = supported.first ?? preferred
+        var bestPixels = Int64(best.width) * Int64(best.height)
+        for d in supported {
+            let px = Int64(d.width) * Int64(d.height)
+            if px <= maxPixels && px >= bestPixels {
+                best = d
+                bestPixels = px
+            }
+        }
+        return best
     }
 
     // MARK: - Processing
@@ -311,6 +352,26 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = success ? 1 : 0
             self.statusText = message
         }
+        resumeSessionAfterProcessing()
+    }
+
+    /// Stop the live preview pipeline during heavy processing to reclaim its buffers.
+    private func pauseSessionForProcessing(completion: @escaping () -> Void) {
+        sessionQueue.async {
+            if self.session.isRunning {
+                self.session.stopRunning()
+                DispatchQueue.main.async { self.isSessionRunning = false }
+            }
+            completion()
+        }
+    }
+
+    private func resumeSessionAfterProcessing() {
+        sessionQueue.async {
+            guard !self.session.isRunning else { return }
+            self.session.startRunning()
+            DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
+        }
     }
 }
 
@@ -322,15 +383,17 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                      error: Error?) {
         if let error = error {
             DispatchQueue.main.async { self.statusText = "Capture error: \(error.localizedDescription)" }
-        } else if photo.isRawPhoto, let data = photo.fileDataRepresentation(),
-                  let dir = burstDir {
-            let idx = capturedDNGs.count
-            let url = dir.appendingPathComponent("frame_\(idx).dng")
-            do {
-                try data.write(to: url)
-                capturedDNGs.append(url)
-            } catch {
-                DispatchQueue.main.async { self.statusText = "Write error: \(error.localizedDescription)" }
+        } else if photo.isRawPhoto, let dir = burstDir {
+            autoreleasepool {
+                guard let data = photo.fileDataRepresentation() else { return }
+                let idx = capturedDNGs.count
+                let url = dir.appendingPathComponent("frame_\(idx).dng")
+                do {
+                    try data.write(to: url, options: .atomic)
+                    capturedDNGs.append(url)
+                } catch {
+                    DispatchQueue.main.async { self.statusText = "Write error: \(error.localizedDescription)" }
+                }
             }
         }
 
@@ -346,9 +409,9 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             sessionQueue.async { self.captureNextRaw() }
         } else {
             unlockAfterBurst()
-            // All frames are on disk — hand off to the processing queue.
-            processingQueue.async { [weak self] in
-                self?.processBurst()
+            pauseSessionForProcessing { [weak self] in
+                guard let self = self else { return }
+                self.processingQueue.async { self.processBurst() }
             }
         }
     }

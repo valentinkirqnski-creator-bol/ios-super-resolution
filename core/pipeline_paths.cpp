@@ -153,6 +153,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);
 
+    // Reference Bayer not needed during comparison analysis — reload for merge pass.
+    ref = Image();
+
     fs::path cache = fs::path(dng_path).parent_path() /
                      (fs::path(dng_path).stem().string() + "_cache");
     std::error_code ec;
@@ -197,6 +200,15 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     // Release reference-side helpers not needed during merge.
     ref_grey = Image();
     ref_pyr = Pyramid();
+    ref_stats = RefStats();
+
+    report("Loading reference for merge", 0.44f);
+    ref = load_raw_frame(paths[0], work, false, ref_h, ref_w);
+    if (ref.h <= 0) {
+        fs::remove_all(cache, ec);
+        report("Error: could not reload reference frame", 1.f);
+        return Image();
+    }
 
     const int Hs = (int)std::lround(work.scale * ref.h);
     const int Ws = (int)std::lround(work.scale * ref.w);
@@ -216,8 +228,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // ~24 MB band budget on mobile (half desktop).
-    const size_t band_budget = 24u * 1024u * 1024u;
+    // ~12 MB band budget on mobile.
+    const size_t band_budget = 12u * 1024u * 1024u;
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2;
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);

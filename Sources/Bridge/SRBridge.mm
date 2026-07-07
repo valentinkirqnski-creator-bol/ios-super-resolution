@@ -58,7 +58,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // WB in pixels + identity ColorMatrix (Lightroom-safe)
     cfg.use_gpu = false;
-    cfg.num_threads = 0;
+    cfg.num_threads = 2;     // limit worker stacks / peak RAM on device
 
     ProgressFn cb = nullptr;
     if (progress) {
@@ -69,8 +69,11 @@ static UIImage* UIImageFromPreview(const Image& preview) {
         };
     }
 
-    Image preview = process_burst_paths_to_dng(
-        vpaths, cfg, std::string(outPath.UTF8String), cb, 512);
+    Image preview;
+    @autoreleasepool {
+        preview = process_burst_paths_to_dng(
+            vpaths, cfg, std::string(outPath.UTF8String), cb, 256);
+    }
 
     if (preview.w <= 0) return NO;
 
