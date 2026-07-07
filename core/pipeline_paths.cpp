@@ -72,6 +72,24 @@ static bool load_image(const fs::path& p, Image& im) {
     return (bool)in.read((char*)im.data.data(), (std::streamsize)(im.data.size() * sizeof(f32)));
 }
 
+struct CachedCompFrame {
+    FlowField flow;
+    Image rob;
+    CovField covs;
+    Image comp;
+};
+
+static bool load_cached_comp(const fs::path& cache, int k, CachedCompFrame& out) {
+    std::string idx = std::to_string(k);
+    fs::path fflow = cache / ("f" + idx + ".flow");
+    if (!fs::exists(fflow)) return false;
+    return load_flow(fflow, out.flow) &&
+           load_image(cache / ("f" + idx + ".rob"), out.rob) &&
+           load_covs(cache / ("f" + idx + ".cov"), out.covs) &&
+           load_image(cache / ("f" + idx + ".raw"), out.comp) &&
+           out.comp.h > 0;
+}
+
 static void encode_band_rows(const Image& num_band, const Image& den_band, int y0, int bh,
                              const Config& work, int nch, Image& preview, float pscale,
                              int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
@@ -179,7 +197,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         std::string idx = std::to_string(k);
         if (!save_flow(cache / ("f" + idx + ".flow"), flow) ||
             !save_image(cache / ("f" + idx + ".rob"), rob) ||
-            !save_covs(cache / ("f" + idx + ".cov"), covs)) {
+            !save_covs(cache / ("f" + idx + ".cov"), covs) ||
+            !save_image(cache / ("f" + idx + ".raw"), comp)) {
             comp = Image();
             continue;
         }
@@ -202,11 +221,24 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     ref_pyr = Pyramid();
     ref_stats = RefStats();
 
-    report("Loading reference for merge", 0.44f);
+    report("Loading frames for merge", 0.44f);
     ref = load_raw_frame(paths[0], work, false, ref_h, ref_w);
     if (ref.h <= 0) {
         fs::remove_all(cache, ec);
         report("Error: could not reload reference frame", 1.f);
+        return Image();
+    }
+
+    std::vector<CachedCompFrame> cached;
+    cached.reserve(n - 1);
+    for (int k = 1; k < n; ++k) {
+        CachedCompFrame fc;
+        if (load_cached_comp(cache, k, fc))
+            cached.push_back(std::move(fc));
+    }
+    if (cached.empty()) {
+        fs::remove_all(cache, ec);
+        report("Error: could not load cached frames", 1.f);
         return Image();
     }
 
@@ -228,8 +260,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // ~12 MB band budget on mobile.
-    const size_t band_budget = 12u * 1024u * 1024u;
+    // ~24 MB band budget — fewer bands, less loop overhead.
+    const size_t band_budget = 24u * 1024u * 1024u;
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2;
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
@@ -239,28 +271,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         const int bh = std::min(band_rows, Hs - y0);
         Image num_band(bh, Ws, nch), den_band(bh, Ws, nch);
 
-        for (int k = 1; k < n; ++k) {
-            std::string idx = std::to_string(k);
-            fs::path fflow = cache / ("f" + idx + ".flow");
-            if (!fs::exists(fflow)) continue;
-
-            FlowField flow;
-            Image rob;
-            CovField covs;
-            if (!load_flow(fflow, flow) ||
-                !load_image(cache / ("f" + idx + ".rob"), rob) ||
-                !load_covs(cache / ("f" + idx + ".cov"), covs))
-                continue;
-
-            Image comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
-            if (comp.h > 0)
-                merge_comp_band(comp, flow, covs, rob, tile_size, num_band, den_band, y0, work);
-
-            comp = Image();
-            flow = FlowField();
-            rob = Image();
-            covs = CovField();
-        }
+        for (const CachedCompFrame& fc : cached)
+            merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
+                            num_band, den_band, y0, work);
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work);
 
@@ -270,6 +283,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
 
     writer.close();
+    cached.clear();
     ref = Image();
     ref_covs = CovField();
     fs::remove_all(cache, ec);

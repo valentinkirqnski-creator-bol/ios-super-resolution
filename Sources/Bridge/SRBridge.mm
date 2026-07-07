@@ -58,7 +58,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // WB in pixels + identity ColorMatrix (Lightroom-safe)
     cfg.use_gpu = false;
-    cfg.num_threads = 2;     // limit worker stacks / peak RAM on device
+    cfg.num_threads = 0;     // all CPU cores (LibRaw is heap-allocated; safe on stack)
 
     ProgressFn cb = nullptr;
     if (progress) {
