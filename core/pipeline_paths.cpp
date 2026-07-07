@@ -5,6 +5,7 @@
 #include "dng_writer.h"
 #include "snr_tuning.h"
 #include "raw_io.h"
+#include "parallel.h"
 #include <vector>
 #include <array>
 #include <filesystem>
@@ -119,7 +120,7 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
         return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
     };
     const int x_step = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
-    for (int i = 0; i < bh; ++i) {
+    parallel_rows(bh, work.num_threads, [&](int i) {
         int gy = y0 + i;
         int py = std::min(ph - 1, (int)(gy * pscale));
         for (int x = 0; x < Ws; ++x) {
@@ -147,7 +148,6 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
                 f32 v = work.bake_srgb ? to_srgb(outc[k]) : clampf(outc[k], 0.f, 1.f);
                 row16[base + k] = (uint16_t)(v * 65535.f + 0.5f);
             }
-            // Preview is tiny (~256 px) — sample columns, don't sRGB every 8064-wide row.
             if ((x % x_step) == 0) {
                 f32 preview_lin[3] = {outc[0], outc[1], outc[2]};
                 if (!work.bake_srgb && nch >= 3) {
@@ -168,7 +168,7 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
                     preview.at(py, px, k) = to_srgb(clampf(preview_lin[k], 0.f, 1.f));
             }
         }
-    }
+    });
 }
 
 } // namespace
@@ -257,7 +257,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     std::vector<CachedCompFrame> cached;
     std::vector<CachedCompMeta> cached_meta;
-    const bool stream_comp_raw = (n - 1) > 3; // 5+ frames: load one comp raw at a time per band
+    const bool stream_comp_raw = (n - 1) > 4; // 6+ frames: stream; ≤5 uses fast preload
 
     if (stream_comp_raw) {
         cached_meta.reserve(n - 1);
@@ -303,8 +303,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // ~48 MB band budget (same as desktop) — fewer bands, better row-parallel chunks.
-    const size_t band_budget = 48u * 1024u * 1024u;
+    // ~64 MB band budget — fewer merge passes, still safe on device.
+    const size_t band_budget = 64u * 1024u * 1024u;
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2;
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);

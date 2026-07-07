@@ -58,9 +58,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
-    // Use half the performance cores — less heat and battery during merge.
-    const unsigned cores = [[NSProcessInfo processInfo] activeProcessorCount];
-    cfg.num_threads = (int)MAX(2, MIN(6, (int)cores / 2));
+    cfg.num_threads = 0;     // all CPU cores during active processing
 
     ProgressFn cb = nullptr;
     if (progress) {

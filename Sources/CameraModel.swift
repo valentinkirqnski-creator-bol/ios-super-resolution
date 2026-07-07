@@ -82,7 +82,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
-    private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .utility)
+    private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .userInitiated)
     private let photoOutput = AVCapturePhotoOutput()
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
