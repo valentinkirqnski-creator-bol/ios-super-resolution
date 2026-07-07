@@ -2,6 +2,7 @@ import AVFoundation
 import Photos
 import UIKit
 import Combine
+import AudioToolbox
 
 /// Back wide (1×), ultra-wide (0.5×), or front selfie camera.
 enum CameraSelection: String, CaseIterable, Identifiable {
@@ -47,8 +48,8 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    // Shutter: Auto, or manual via log-scaled slider (0…1).
-    @Published var shutterIsAuto = true
+    // Shutter: Auto (A), or manual via log-scaled slider (0…1).
+    @Published var shutterIsAuto = false
     @Published var shutterSlider: Double = 0.5
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
@@ -72,6 +73,7 @@ final class CameraModel: NSObject, ObservableObject {
     private var burstDir: URL?
     private var isAppActive = true
     private var previewSuspended = false
+    private var exposureSyncTimer: Timer?
 
     var shutterLabel: String {
         if shutterIsAuto { return "Auto" }
@@ -89,9 +91,15 @@ final class CameraModel: NSObject, ObservableObject {
             guard !self.isBusy else { return }
             if active && !self.previewSuspended {
                 self.startPreviewIfNeeded()
-            } else if self.session.isRunning {
-                self.session.stopRunning()
-                DispatchQueue.main.async { self.isSessionRunning = false }
+            } else {
+                DispatchQueue.main.async {
+                    self.exposureSyncTimer?.invalidate()
+                    self.exposureSyncTimer = nil
+                }
+                if self.session.isRunning {
+                    self.session.stopRunning()
+                    DispatchQueue.main.async { self.isSessionRunning = false }
+                }
             }
         }
     }
@@ -101,6 +109,10 @@ final class CameraModel: NSObject, ObservableObject {
             self.previewSuspended = suspended
             guard !self.isBusy else { return }
             if suspended {
+                DispatchQueue.main.async {
+                    self.exposureSyncTimer?.invalidate()
+                    self.exposureSyncTimer = nil
+                }
                 if self.session.isRunning {
                     self.session.stopRunning()
                     DispatchQueue.main.async { self.isSessionRunning = false }
@@ -126,9 +138,17 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     func stop() {
+        DispatchQueue.main.async {
+            self.exposureSyncTimer?.invalidate()
+            self.exposureSyncTimer = nil
+        }
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
         }
+    }
+
+    func toggleShutterAuto() {
+        setShutterAuto(!shutterIsAuto)
     }
 
     func setShutterAuto(_ auto: Bool) {
@@ -137,8 +157,20 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     func applyManualShutterFromSlider() {
-        shutterIsAuto = false
+        guard !isBusy else { return }
+        if shutterIsAuto { shutterIsAuto = false }
         applyShutter()
+    }
+
+    private func playShutterSoundOnce() {
+        AudioServicesPlaySystemSound(1108)
+    }
+
+    private func suppressSystemShutterSounds(_ suppress: Bool) {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .videoRecording, options: [.mixWithOthers])
+        // false = suppress system sounds during capture (one custom shutter click instead).
+        try? session.setAllowHapticsAndSystemSoundsDuringRecording(!suppress)
     }
 
     func setCamera(_ selection: CameraSelection) {
@@ -217,12 +249,12 @@ final class CameraModel: NSObject, ObservableObject {
         configureRawCaptureLimits()
         refreshExposureRange()
         applyDefaultDeviceModes()
-        applyShutterOnSessionQueue()
 
         session.commitConfiguration()
         startPreviewIfNeeded()
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
+            self.startAutoExposureSyncIfNeeded()
             if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
                 self.statusText = "RAW capture not supported on this camera"
             }
@@ -251,10 +283,10 @@ final class CameraModel: NSObject, ObservableObject {
         configureRawCaptureLimits()
         refreshExposureRange()
         applyDefaultDeviceModes()
-        applyShutterOnSessionQueue()
 
         session.commitConfiguration()
         DispatchQueue.main.async {
+            self.startAutoExposureSyncIfNeeded()
             if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
                 self.statusText = "RAW not supported on \(selection.label)"
             } else {
@@ -273,27 +305,49 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func durationFromSlider(_ t: Double) -> Double {
+    private func durationFromSlider(_ t: Double, minSec: Double? = nil, maxSec: Double? = nil) -> Double {
         let clamped = min(1.0, max(0.0, t))
-        let logMin = log(exposureMinSec)
-        let logMax = log(exposureMaxSec)
+        let logMin = log(minSec ?? exposureMinSec)
+        let logMax = log(maxSec ?? exposureMaxSec)
         return exp(logMin + clamped * (logMax - logMin))
     }
 
-    private func applyShutterOnSessionQueue() {
+    private func sliderFromDuration(_ sec: Double) -> Double {
+        let clamped = min(exposureMaxSec, max(exposureMinSec, sec))
+        let logMin = log(exposureMinSec)
+        let logMax = log(exposureMaxSec)
+        guard logMax > logMin else { return 0.5 }
+        return min(1.0, max(0.0, (log(clamped) - logMin) / (logMax - logMin)))
+    }
+
+    private func applyShutter() {
+        let isAuto = shutterIsAuto
+        let slider = shutterSlider
+        let minSec = exposureMinSec
+        let maxSec = exposureMaxSec
+        sessionQueue.async {
+            self.applyShutterOnSessionQueue(isAuto: isAuto, slider: slider, minSec: minSec, maxSec: maxSec)
+        }
+    }
+
+    private func applyShutterOnSessionQueue(isAuto: Bool, slider: Double, minSec: Double, maxSec: Double) {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
-        if shutterIsAuto {
+        if isAuto {
             if d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
         } else if d.isExposureModeSupported(.custom) {
             let minD = d.activeFormat.minExposureDuration
             let maxD = d.activeFormat.maxExposureDuration
-            var t = CMTimeMakeWithSeconds(durationFromSlider(shutterSlider), preferredTimescale: 1_000_000_000)
+            var t = CMTimeMakeWithSeconds(durationFromSlider(slider, minSec: minSec, maxSec: maxSec), preferredTimescale: 1_000_000_000)
             if CMTimeCompare(t, minD) < 0 { t = minD }
             if CMTimeCompare(t, maxD) > 0 { t = maxD }
             let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
             d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
+        } else {
+            DispatchQueue.main.async {
+                self.statusText = "Manual shutter not supported on this camera"
+            }
         }
         d.unlockForConfiguration()
     }
@@ -317,7 +371,27 @@ final class CameraModel: NSObject, ObservableObject {
         }
         d.isSubjectAreaChangeMonitoringEnabled = false
         d.unlockForConfiguration()
-        applyShutterOnSessionQueue()
+        applyShutter()
+    }
+
+    private func startAutoExposureSyncIfNeeded() {
+        exposureSyncTimer?.invalidate()
+        guard isAppActive, !previewSuspended else { return }
+        exposureSyncTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            self?.pollAutoExposureForSlider()
+        }
+    }
+
+    private func pollAutoExposureForSlider() {
+        guard shutterIsAuto, !isBusy else { return }
+        sessionQueue.async {
+            guard let d = self.device else { return }
+            let sec = CMTimeGetSeconds(d.exposureDuration)
+            guard sec.isFinite, sec > 0 else { return }
+            DispatchQueue.main.async {
+                self.shutterSlider = self.sliderFromDuration(sec)
+            }
+        }
     }
 
     private func setResponsiveCaptureEnabled(_ enabled: Bool) {
@@ -329,7 +403,10 @@ final class CameraModel: NSObject, ObservableObject {
     private func startPreviewIfNeeded() {
         guard isAppActive, !previewSuspended, !session.isRunning else { return }
         session.startRunning()
-        DispatchQueue.main.async { self.isSessionRunning = self.session.isRunning }
+        DispatchQueue.main.async {
+            self.isSessionRunning = self.session.isRunning
+            self.startAutoExposureSyncIfNeeded()
+        }
     }
 
     // MARK: - Focus / exposure controls
@@ -349,10 +426,6 @@ final class CameraModel: NSObject, ObservableObject {
             }
             d.unlockForConfiguration()
         }
-    }
-
-    private func applyShutter() {
-        sessionQueue.async { self.applyShutterOnSessionQueue() }
     }
 
     // MARK: - Capture burst
@@ -382,6 +455,8 @@ final class CameraModel: NSObject, ObservableObject {
                 self.progress = 0
                 let lens = self.cameraSelection.label
                 self.statusText = "Capturing \(self.currentBurstTotal) frames · \(lens)"
+                self.suppressSystemShutterSounds(true)
+                self.playShutterSoundOnce()
             }
 
             self.photoOutput.maxPhotoQualityPrioritization = .speed
@@ -396,12 +471,18 @@ final class CameraModel: NSObject, ObservableObject {
             self.pendingCaptures = 0
             self.capturedDNGs.removeAll()
             self.restoreCaptureQuality()
+            DispatchQueue.main.async { self.suppressSystemShutterSounds(false) }
             if let d = self.device, (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                     d.whiteBalanceMode = .continuousAutoWhiteBalance
                 }
-                self.applyShutterOnSessionQueue()
+                self.applyShutterOnSessionQueue(
+                    isAuto: self.shutterIsAuto,
+                    slider: self.shutterSlider,
+                    minSec: self.exposureMinSec,
+                    maxSec: self.exposureMaxSec
+                )
                 d.unlockForConfiguration()
             }
             if self.isAppActive && !self.previewSuspended {
@@ -433,7 +514,12 @@ final class CameraModel: NSObject, ObservableObject {
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 d.whiteBalanceMode = .continuousAutoWhiteBalance
             }
-            self.applyShutterOnSessionQueue()
+            self.applyShutterOnSessionQueue(
+                isAuto: self.shutterIsAuto,
+                slider: self.shutterSlider,
+                minSec: self.exposureMinSec,
+                maxSec: self.exposureMaxSec
+            )
             d.unlockForConfiguration()
         }
     }
@@ -582,6 +668,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func finish(success: Bool, message: String) {
         DispatchQueue.main.async {
+            self.suppressSystemShutterSounds(false)
             self.isBusy = false
             self.isCapturing = false
             self.isProcessing = false

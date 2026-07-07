@@ -58,7 +58,11 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
-    cfg.num_threads = 0;     // all CPU cores during active processing
+    cfg.num_threads = 0;
+    // Handheld mobile: robustness is on; slightly stricter t rejects misaligned
+    // patches near motion/occlusion edges (see default.yaml robustness.tuning.t).
+    cfg.robustness_enabled = true;
+    cfg.r_t = 0.17f;
 
     ProgressFn cb = nullptr;
     if (progress) {

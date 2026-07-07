@@ -9,10 +9,10 @@ struct CameraView: View {
 
     var body: some View {
         GeometryReader { geo in
+            let topBarH: CGFloat = 88
             let bottomH: CGFloat = 96
-            let topH: CGFloat = 72
             let vfWidth = geo.size.width
-            let maxVFHeight = geo.size.height - topH - bottomH - geo.safeAreaInsets.bottom
+            let maxVFHeight = geo.size.height - topBarH - bottomH - geo.safeAreaInsets.bottom
             // Slightly taller than square (4:3) — uses more screen without ultra-wide chrome.
             let vfHeight = min(maxVFHeight, vfWidth * 4 / 3)
 
@@ -23,7 +23,10 @@ struct CameraView: View {
                     permissionView
                 } else {
                     VStack(spacing: 0) {
-                        Color.clear.frame(height: topH)
+                        topStrip
+                            .padding(.top, geo.safeAreaInsets.top + 4)
+                            .frame(height: topBarH + geo.safeAreaInsets.top)
+                            .background(Color.black)
 
                         viewfinder(width: vfWidth, height: vfHeight)
 
@@ -44,21 +47,6 @@ struct CameraView: View {
             cam.setPreviewSuspended(open)
         }
         .sheet(isPresented: $showViewer) { resultViewer }
-        .overlay(alignment: .top) {
-            if !cam.permissionDenied {
-                topStrip
-                    .padding(.top, 6)
-                    .background(
-                        LinearGradient(
-                            colors: [.black.opacity(0.55), .clear],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                        .ignoresSafeArea(edges: .top)
-                        .allowsHitTesting(false)
-                    )
-            }
-        }
     }
 
     // MARK: - Viewfinder
@@ -129,30 +117,38 @@ struct CameraView: View {
     private var shutterSliderRow: some View {
         HStack(spacing: 10) {
             Button {
-                cam.setShutterAuto(true)
+                cam.toggleShutterAuto()
             } label: {
-                Text("A")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(cam.shutterIsAuto ? .black : .white)
-                    .frame(width: 28, height: 28)
-                    .background(cam.shutterIsAuto ? Color.yellow : Color.white.opacity(0.15))
-                    .clipShape(Circle())
+                VStack(spacing: 1) {
+                    Text("A")
+                        .font(.system(size: 13, weight: .bold))
+                    Text("Auto")
+                        .font(.system(size: 8, weight: .medium))
+                }
+                .foregroundColor(cam.shutterIsAuto ? .black : .white)
+                .frame(width: 36, height: 36)
+                .background(cam.shutterIsAuto ? Color.yellow : Color.white.opacity(0.15))
+                .clipShape(Circle())
             }
+            .buttonStyle(.plain)
             .disabled(cam.isBusy)
 
             Slider(
                 value: Binding(
                     get: { cam.shutterSlider },
-                    set: { cam.shutterSlider = $0 }
+                    set: { value in
+                        guard !cam.isBusy else { return }
+                        cam.shutterSlider = value
+                        cam.applyManualShutterFromSlider()
+                    }
                 ),
                 in: 0...1
-            ) { editing in
-                if !editing { cam.applyManualShutterFromSlider() }
-            }
+            )
             .tint(.yellow)
-            .disabled(cam.isBusy || cam.shutterIsAuto)
-            .opacity(cam.shutterIsAuto ? 0.35 : 1)
+            .opacity(cam.isBusy ? 0.4 : 1)
+            .allowsHitTesting(!cam.isBusy)
         }
+        .contentShape(Rectangle())
     }
 
     private var frameCountControl: some View {
