@@ -116,13 +116,10 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     // R at grey resolution.
     Image R(gh, gw, 1);
     parallel_rows(gh, cfg.num_threads, [&](int y) {
+        int ty = std::min(y / gts, tny - 1);
         for (int x = 0; x < gw; ++x) {
-            f32 fty = ((f32)y + 0.5f) / (f32)gts - 0.5f;
-            f32 ftx = ((f32)x + 0.5f) / (f32)gts - 0.5f;
-            int ty = std::min(std::max(0, (int)std::floor(fty)), tny - 1);
-            int tx = std::min(std::max(0, (int)std::floor(ftx)), tnx - 1);
-            f32 fx, fy;
-            sample_flow_bilinear(flow, fty, ftx, fx, fy);
+            int tx = std::min(x / gts, tnx - 1);
+            f32 fx = flow.dx(ty, tx), fy = flow.dy(ty, tx);
 
             f32 d_sq = 0.f, sigma_sq = 0.f;
             for (int c = 0; c < nc; ++c) {

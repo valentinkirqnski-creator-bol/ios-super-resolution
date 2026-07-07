@@ -58,10 +58,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
-    cfg.num_threads = 0;
-    cfg.snr_auto_tune = true;
-    cfg.robustness_enabled = true;
-    // r_t, tile sizes, and merge softness are tuned per burst in tune_config_snr().
+    cfg.num_threads = 0;     // all CPU cores during active processing
 
     ProgressFn cb = nullptr;
     if (progress) {

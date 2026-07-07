@@ -18,23 +18,13 @@ void tune_config_snr(const Image& ref_raw, Config& cfg) {
     f32 snr = (sigma > 1e-8f) ? brightness / sigma : 15.f;
     snr = clampf(snr, 6.f, 30.f);
 
-    // Softer merge kernels in low light reduce ghosting from misaligned patches.
-    cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.48f, 0.38f);
-    cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.5f, 3.0f);
+    cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.44f, 0.38f);
+    cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.0f, 3.0f);
     cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
     cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
 
-    // Handheld mobile: cap tiles at 32 in low light. Large (64 px) tiles create
-    // visible block misalignment when motion breaks piecewise-constant flow.
-    int Ts = (snr <= 14.f) ? 32 : (snr <= 22.f) ? 24 : 16;
+    int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;
     cfg.bm_tile_sizes = {Ts, Ts, Ts, std::max(4, Ts / 2)};
-
-    if (cfg.robustness_enabled) {
-        // Reject more mismatched / motion-occluded patches as SNR drops.
-        cfg.r_t = lerpf(snr, 6.f, 30.f, 0.22f, 0.12f);
-        cfg.r_s1 = lerpf(snr, 6.f, 30.f, 1.4f, 2.0f);
-        cfg.r_Mt = lerpf(snr, 6.f, 30.f, 0.55f, 0.8f);
-    }
 }
 
 } // namespace hhsr
