@@ -2,6 +2,7 @@
 #include <random>
 #include <cmath>
 #include <algorithm>
+#include <memory>
 
 #ifdef HAVE_LIBRAW
 // LibRaw pulls in <windows.h> on Windows, which defines min/max macros that
@@ -127,11 +128,13 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
 Image load_raw_frame(const std::string& path, Config& cfg, bool is_reference,
                      int crop_h, int crop_w) {
 #ifdef HAVE_LIBRAW
-    LibRaw raw;
-    if (raw.open_file(path.c_str()) != LIBRAW_SUCCESS) return Image();
-    if (raw.unpack() != LIBRAW_SUCCESS) { raw.recycle(); return Image(); }
-    Image img = decode_raw_file(raw, cfg, is_reference, crop_h, crop_w);
-    raw.recycle();
+    // LibRaw embeds a multi-MB libraw_data_t — must not live on the small GCD
+    // worker stack (~512 KB) or iOS kills the thread (SIGBUS / stack guard).
+    std::unique_ptr<LibRaw> raw(new LibRaw());
+    if (raw->open_file(path.c_str()) != LIBRAW_SUCCESS) return Image();
+    if (raw->unpack() != LIBRAW_SUCCESS) { raw->recycle(); return Image(); }
+    Image img = decode_raw_file(*raw, cfg, is_reference, crop_h, crop_w);
+    raw->recycle();
     return img;
 #else
     (void)path; (void)cfg; (void)is_reference; (void)crop_h; (void)crop_w;
