@@ -35,6 +35,7 @@ targets:
     sources:
       # App (Swift) + Objective-C++ bridge.
       - path: Sources
+      - path: Resources
       # Portable pipeline (vendored copy of the desktop/Android core).
       - path: core
         includes:
@@ -70,4 +71,5 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.handheldsr.camera
         TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_UIApplicationSupportsIndoorMaps: NO

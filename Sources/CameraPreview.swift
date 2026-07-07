@@ -1,24 +1,23 @@
 import SwiftUI
 import AVFoundation
 
-/// Wraps an AVCaptureVideoPreviewLayer and reports tap-to-focus points
-/// (already converted to normalized device coordinates 0..1).
+/// Square-clipped live preview; reports device + view-local tap points for focus.
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     var mirrorFront: Bool = false
-    var onFocus: (CGPoint) -> Void
+    var onFocusTap: (CGPoint, CGPoint) -> Void
 
     func makeUIView(context: Context) -> PreviewUIView {
         let v = PreviewUIView()
         v.videoPreviewLayer.session = session
         v.videoPreviewLayer.videoGravity = .resizeAspectFill
-        v.onFocus = onFocus
+        v.onFocusTap = onFocusTap
         applyMirroring(to: v)
         return v
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
-        uiView.onFocus = onFocus
+        uiView.onFocusTap = onFocusTap
         applyMirroring(to: uiView)
     }
 
@@ -33,13 +32,14 @@ struct CameraPreview: UIViewRepresentable {
     }
 
     final class PreviewUIView: UIView {
-        var onFocus: ((CGPoint) -> Void)?
+        var onFocusTap: ((CGPoint, CGPoint) -> Void)?
 
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
         override init(frame: CGRect) {
             super.init(frame: frame)
+            backgroundColor = .black
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             addGestureRecognizer(tap)
         }
@@ -48,7 +48,7 @@ struct CameraPreview: UIViewRepresentable {
         @objc private func handleTap(_ g: UITapGestureRecognizer) {
             let p = g.location(in: self)
             let devicePoint = videoPreviewLayer.captureDevicePointConverted(fromLayerPoint: p)
-            onFocus?(devicePoint)
+            onFocusTap?(devicePoint, p)
         }
     }
 }

@@ -87,6 +87,7 @@ final class CameraModel: NSObject, ObservableObject {
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
     private var activeCameraSelection: CameraSelection = .wide
+    private var lastBackSelection: CameraSelection = .wide
 
     private var activeFrameCount = 4
     private var currentBurstTotal = 4
@@ -120,10 +121,32 @@ final class CameraModel: NSObject, ObservableObject {
         guard !isBusy, availableCameras.contains(selection) else { return }
         sessionQueue.async {
             guard selection != self.activeCameraSelection else { return }
+            if selection != .front { self.lastBackSelection = selection }
             self.activeCameraSelection = selection
             DispatchQueue.main.async { self.cameraSelection = selection }
             self.switchCameraDevice(to: selection)
         }
+    }
+
+    func toggleFrontCamera() {
+        guard !isBusy else { return }
+        sessionQueue.async {
+            if self.activeCameraSelection == .front {
+                self.setCameraOnSessionQueue(self.lastBackSelection)
+            } else {
+                self.lastBackSelection = self.activeCameraSelection
+                self.setCameraOnSessionQueue(.front)
+            }
+        }
+    }
+
+    private func setCameraOnSessionQueue(_ selection: CameraSelection) {
+        guard availableCameras.contains(selection) else { return }
+        guard selection != activeCameraSelection else { return }
+        if selection != .front { lastBackSelection = selection }
+        activeCameraSelection = selection
+        DispatchQueue.main.async { self.cameraSelection = selection }
+        switchCameraDevice(to: selection)
     }
 
     /// List lenses after the live session is configured (no extra probe sessions).
@@ -172,6 +195,9 @@ final class CameraModel: NSObject, ObservableObject {
             session.addOutput(photoOutput)
         }
         photoOutput.maxPhotoQualityPrioritization = .quality
+        if #available(iOS 17.0, *) {
+            photoOutput.isResponsiveCaptureEnabled = true
+        }
         configureRawCaptureLimits()
         applyDefaultDeviceModes()
         applyShutterOnSessionQueue()
@@ -317,6 +343,7 @@ final class CameraModel: NSObject, ObservableObject {
                 self.statusText = "Capturing \(self.currentBurstTotal) frames · \(lens)"
             }
             self.lockForBurst()
+            self.photoOutput.maxPhotoQualityPrioritization = .speed
             self.captureNextRaw()
         }
     }
@@ -331,6 +358,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func unlockAfterBurst() {
         sessionQueue.async {
+            self.restoreCaptureQuality()
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
             if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
@@ -347,8 +375,14 @@ final class CameraModel: NSObject, ObservableObject {
         guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else { return }
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         settings.flashMode = .off
+        settings.photoQualityPrioritization = .speed
+        settings.isAutoStillImageStabilizationEnabled = false
         applyRawCaptureLimits(to: settings)
         photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    private func restoreCaptureQuality() {
+        photoOutput.maxPhotoQualityPrioritization = .quality
     }
 
     /// Target ~12 MP (4032×3024) when supported; otherwise the largest size under ~15 MP.

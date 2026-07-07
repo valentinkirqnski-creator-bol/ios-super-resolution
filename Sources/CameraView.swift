@@ -3,42 +3,28 @@ import SwiftUI
 struct CameraView: View {
     @StateObject private var cam = CameraModel()
     @State private var showViewer = false
+    @State private var focusPoint: CGPoint?
+    @State private var focusVisible = false
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        GeometryReader { geo in
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-            if cam.permissionDenied {
-                permissionView
-            } else {
-                CameraPreview(session: cam.session, mirrorFront: cam.cameraSelection == .front) { devicePoint in
-                    guard !cam.isBusy else { return }
-                    cam.focus(at: devicePoint)
-                }
-                .ignoresSafeArea()
+                if cam.permissionDenied {
+                    permissionView
+                } else {
+                    VStack(spacing: 0) {
+                        topStrip
+                            .frame(height: 52)
+                            .background(Color.black)
 
-                if cam.isProcessing {
-                    Color.black.opacity(0.12).ignoresSafeArea().allowsHitTesting(false)
-                }
+                        viewfinder(side: geo.size.width)
 
-                vignette
-
-                VStack(spacing: 0) {
-                    topBar
-                        .padding(.top, 8)
-                    shutterPicker
-                        .padding(.top, 10)
-                    Spacer()
-                    if cam.isProcessing, !cam.statusText.isEmpty {
-                        Text(cam.statusText)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white.opacity(0.75))
-                            .lineLimit(1)
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 10)
+                        bottomPanel
+                            .frame(maxHeight: .infinity)
+                            .background(Color.black)
                     }
-                    bottomBar
-                        .padding(.bottom, 34)
                 }
             }
         }
@@ -47,118 +33,219 @@ struct CameraView: View {
         .sheet(isPresented: $showViewer) { resultViewer }
     }
 
-    // MARK: - Chrome
+    // MARK: - Square viewfinder
 
-    private var vignette: some View {
-        VStack {
-            LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom)
-                .frame(height: 120)
-            Spacer()
-            LinearGradient(colors: [.clear, .black.opacity(0.65)], startPoint: .top, endPoint: .bottom)
-                .frame(height: 200)
+    private func viewfinder(side: CGFloat) -> some View {
+        ZStack {
+            CameraPreview(
+                session: cam.session,
+                mirrorFront: cam.cameraSelection == .front
+            ) { devicePoint, localPoint in
+                guard !cam.isBusy else { return }
+                cam.focus(at: devicePoint)
+                showFocusIndicator(at: localPoint)
+            }
+            .frame(width: side, height: side)
+            .clipped()
+
+            if cam.isProcessing {
+                Color.black.opacity(0.08)
+                    .frame(width: side, height: side)
+                    .allowsHitTesting(false)
+            }
+
+            if focusVisible, let p = focusPoint {
+                FocusIndicator()
+                    .position(p)
+                    .allowsHitTesting(false)
+            }
+
+            VStack {
+                Spacer()
+                if cam.cameraSelection != .front {
+                    backLensPicker
+                        .padding(.bottom, 14)
+                }
+            }
+            .frame(width: side, height: side)
         }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
+        .frame(width: side, height: side)
+        .background(Color.black)
     }
 
-    private var topBar: some View {
-        HStack(alignment: .center, spacing: 12) {
+    private func showFocusIndicator(at point: CGPoint) {
+        focusPoint = point
+        withAnimation(.easeOut(duration: 0.12)) { focusVisible = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            withAnimation(.easeOut(duration: 0.25)) { focusVisible = false }
+        }
+    }
+
+    // MARK: - Top strip
+
+    private var topStrip: some View {
+        HStack(spacing: 16) {
             frameCountControl
-            Spacer(minLength: 8)
-            cameraSwitcher
+            Spacer()
+            shutterMenu
         }
         .padding(.horizontal, 20)
     }
 
     private var frameCountControl: some View {
-        HStack(spacing: 0) {
-            stepperButton(systemName: "minus", enabled: cam.frameCount > 2 && !cam.isBusy) {
+        HStack(spacing: 2) {
+            miniStepper("minus", enabled: cam.frameCount > CameraModel.minFrameCount && !cam.isBusy) {
                 cam.frameCount -= 1
             }
             Text("\(cam.frameCount)")
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
                 .foregroundColor(.white)
-                .frame(minWidth: 22)
-            stepperButton(systemName: "plus", enabled: cam.frameCount < 8 && !cam.isBusy) {
+                .frame(minWidth: 18)
+            Text("frames")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white.opacity(0.45))
+            miniStepper("plus", enabled: cam.frameCount < CameraModel.maxFrameCount && !cam.isBusy) {
                 cam.frameCount += 1
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial.opacity(0.85))
-        .clipShape(Capsule())
-        .overlay(
-            Capsule().stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-        )
-        .overlay(alignment: .bottom) {
-            Text("frames")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(.white.opacity(0.45))
-                .offset(y: 18)
-        }
-        .padding(.bottom, 10)
     }
 
-    private func stepperButton(systemName: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+    private func miniStepper(_ symbol: String, enabled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 12, weight: .bold))
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .bold))
                 .foregroundColor(enabled ? .white : .white.opacity(0.25))
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
+                .frame(width: 26, height: 26)
         }
         .disabled(!enabled)
     }
 
-    private var shutterPicker: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(ShutterSetting.choices) { s in
-                    Button { cam.shutter = s } label: {
-                        Text(s.label)
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                            .padding(.horizontal, 11).padding(.vertical, 6)
-                            .background(cam.shutter == s ? Color.white : Color.white.opacity(0.12))
-                            .foregroundColor(cam.shutter == s ? .black : .white.opacity(0.9))
-                            .clipShape(Capsule())
-                    }
-                    .disabled(cam.isBusy)
+    private var shutterMenu: some View {
+        Menu {
+            Button {
+                cam.shutter = .auto
+            } label: {
+                if case .auto = cam.shutter {
+                    Label("Auto", systemImage: "checkmark")
+                } else {
+                    Text("Auto")
                 }
             }
-            .padding(.horizontal, 20)
+            Divider()
+            ForEach(ShutterSetting.choices.filter {
+                if case .auto = $0 { return false }
+                return true
+            }) { s in
+                Button { cam.shutter = s } label: {
+                    if cam.shutter == s {
+                        Label(s.label, systemImage: "checkmark")
+                    } else {
+                        Text(s.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "camera.aperture")
+                    .font(.system(size: 15, weight: .medium))
+                Text(cam.shutter.label)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.white.opacity(0.12))
+            .clipShape(Capsule())
+        }
+        .disabled(cam.isBusy)
+    }
+
+    // MARK: - Lens picker (over viewfinder)
+
+    private var backLensPicker: some View {
+        HStack(spacing: 18) {
+            if cam.availableCameras.contains(.ultraWide) {
+                lensChip(title: "0.5×", selected: cam.cameraSelection == .ultraWide) {
+                    cam.setCamera(.ultraWide)
+                }
+            }
+            if cam.availableCameras.contains(.wide) {
+                lensChip(title: "1×", selected: cam.cameraSelection == .wide) {
+                    cam.setCamera(.wide)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.45))
+        .clipShape(Capsule())
+    }
+
+    private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 14, weight: selected ? .bold : .medium))
+                .foregroundColor(selected ? .yellow : .white.opacity(0.85))
+                .frame(minWidth: 36)
+        }
+        .disabled(cam.isBusy)
+    }
+
+    // MARK: - Bottom panel (Apple-style)
+
+    private var bottomPanel: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 8)
+
+            if cam.isProcessing, !cam.statusText.isEmpty {
+                Text(cam.statusText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.5))
+                    .lineLimit(1)
+                    .padding(.bottom, 12)
+            }
+
+            HStack(alignment: .center) {
+                flipCameraButton
+                    .frame(width: 72)
+
+                Spacer()
+
+                shutterButton
+
+                Spacer()
+
+                galleryButton
+                    .frame(width: 72)
+            }
+            .padding(.horizontal, 28)
+
+            Spacer(minLength: 24)
         }
     }
 
-    private var bottomBar: some View {
-        HStack(alignment: .center) {
-            Color.clear.frame(width: 72, height: 72)
-
-            Spacer()
-
-            shutterButton
-
-            Spacer()
-
-            galleryButton
-                .frame(width: 72, height: 72)
+    private var flipCameraButton: some View {
+        Button(action: { cam.toggleFrontCamera() }) {
+            Image(systemName: "arrow.triangle.2.circlepath.camera")
+                .font(.system(size: 22, weight: .regular))
+                .foregroundColor(cam.availableCameras.contains(.front) ? .white : .white.opacity(0.2))
         }
-        .padding(.horizontal, 24)
+        .disabled(cam.isBusy || !cam.availableCameras.contains(.front))
     }
 
     private var shutterButton: some View {
         Button(action: { cam.captureBurst() }) {
             ZStack {
                 Circle()
-                    .strokeBorder(Color.white.opacity(0.9), lineWidth: 3)
-                    .frame(width: 76, height: 76)
+                    .strokeBorder(Color.white, lineWidth: 4)
+                    .frame(width: 74, height: 74)
                 Circle()
-                    .fill(cam.isBusy ? Color.white.opacity(0.35) : Color.white)
-                    .frame(width: cam.isCapturing ? 58 : 64, height: cam.isCapturing ? 58 : 64)
-                    .animation(.easeInOut(duration: 0.15), value: cam.isCapturing)
+                    .fill(Color.white.opacity(cam.isBusy ? 0.35 : 1))
+                    .frame(width: cam.isCapturing ? 56 : 62, height: cam.isCapturing ? 56 : 62)
+                    .animation(.easeInOut(duration: 0.12), value: cam.isCapturing)
             }
         }
         .disabled(cam.isBusy)
-        .accessibilityLabel("Capture burst")
     }
 
     private var galleryButton: some View {
@@ -168,56 +255,31 @@ struct CameraView: View {
                     if let thumb = cam.lastThumbnail {
                         Image(uiImage: thumb).resizable().scaledToFill()
                     } else {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color.white.opacity(0.08))
-                            Image(systemName: "photo")
-                                .font(.system(size: 20, weight: .light))
-                                .foregroundColor(.white.opacity(0.55))
-                        }
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.white.opacity(0.1))
+                            .overlay(
+                                Image(systemName: "photo")
+                                    .font(.system(size: 18, weight: .light))
+                                    .foregroundColor(.white.opacity(0.5))
+                            )
                     }
                 }
-                .frame(width: 50, height: 50)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .frame(width: 46, height: 46)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
 
                 if cam.isBusy {
                     Circle()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 2.5)
-                        .frame(width: 58, height: 58)
+                        .stroke(Color.white.opacity(0.25), lineWidth: 2)
+                        .frame(width: 54, height: 54)
                     Circle()
                         .trim(from: 0, to: CGFloat(max(0.02, Double(cam.progress))))
-                        .stroke(Color.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                        .frame(width: 58, height: 58)
-                        .rotationEffect(.degrees(-90))
-                        .animation(.linear(duration: 0.12), value: cam.progress)
-                } else {
-                    RoundedRectangle(cornerRadius: 14)
-                        .stroke(Color.white.opacity(0.35), lineWidth: 1)
+                        .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                         .frame(width: 54, height: 54)
+                        .rotationEffect(.degrees(-90))
                 }
             }
         }
         .disabled(cam.isBusy && cam.lastSavedURL == nil)
-    }
-
-    private var cameraSwitcher: some View {
-        HStack(spacing: 4) {
-            ForEach(cam.availableCameras) { lens in
-                Button { cam.setCamera(lens) } label: {
-                    Text(lens.label)
-                        .font(.system(size: 13, weight: .semibold))
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(cam.cameraSelection == lens ? Color.white : Color.clear)
-                        .foregroundColor(cam.cameraSelection == lens ? .black : .white.opacity(0.85))
-                        .clipShape(Capsule())
-                }
-                .disabled(cam.isBusy)
-            }
-        }
-        .padding(4)
-        .background(.ultraThinMaterial.opacity(0.85))
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 0.5))
     }
 
     // MARK: - Sheets
@@ -227,10 +289,7 @@ struct CameraView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 if let thumb = cam.lastThumbnail {
-                    Image(uiImage: thumb)
-                        .resizable()
-                        .scaledToFit()
-                        .padding()
+                    Image(uiImage: thumb).resizable().scaledToFit().padding()
                 }
             }
             .navigationTitle("Last capture")
@@ -260,6 +319,29 @@ struct CameraView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.white)
+        }
+    }
+}
+
+// MARK: - Focus reticle
+
+private struct FocusIndicator: View {
+    @State private var scale: CGFloat = 1.35
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 2)
+                .stroke(Color.yellow, lineWidth: 1.5)
+                .frame(width: 72, height: 72)
+            RoundedRectangle(cornerRadius: 1)
+                .stroke(Color.yellow.opacity(0.5), lineWidth: 1)
+                .frame(width: 6, height: 6)
+        }
+        .scaleEffect(scale)
+        .onAppear {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.62)) {
+                scale = 1.0
+            }
         }
     }
 }
