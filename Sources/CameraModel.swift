@@ -2,7 +2,6 @@ import AVFoundation
 import Photos
 import UIKit
 import Combine
-import AudioToolbox
 
 /// Back wide (1×), ultra-wide (0.5×), or front selfie camera.
 enum CameraSelection: String, CaseIterable, Identifiable {
@@ -162,25 +161,12 @@ final class CameraModel: NSObject, ObservableObject {
         applyShutter()
     }
 
-    private func configureAudioSessionForCapture() {
-        session.automaticallyConfiguresApplicationAudioSession = false
-        let audio = AVAudioSession.sharedInstance()
-        try? audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.mixWithOthers, .duckOthers])
-        try? audio.setActive(true)
-    }
-
-    private func beginBurstAudio() {
-        let audio = AVAudioSession.sharedInstance()
-        try? audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.mixWithOthers, .duckOthers])
-        try? audio.setActive(true)
-        // Must be false before any capturePhoto call so iOS does not play per-frame shutter sounds.
-        try? audio.setAllowHapticsAndSystemSoundsDuringRecording(false)
-        AudioServicesPlaySystemSound(1108)
-    }
-
-    private func endBurstAudio() {
-        let audio = AVAudioSession.sharedInstance()
-        try? audio.setAllowHapticsAndSystemSoundsDuringRecording(true)
+    private func applyShutterSoundSuppression(to settings: AVCapturePhotoSettings) {
+        if #available(iOS 18.0, *) {
+            if photoOutput.isShutterSoundSuppressionSupported {
+                settings.isShutterSoundSuppressionEnabled = true
+            }
+        }
     }
 
     private func setResponsiveCaptureEnabled(_ enabled: Bool) {
@@ -232,6 +218,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func configureSession() {
         session.beginConfiguration()
+        session.automaticallyConfiguresApplicationAudioSession = false
         // .photo is required for Bayer RAW capture on iOS.
         session.sessionPreset = .photo
 
@@ -262,7 +249,6 @@ final class CameraModel: NSObject, ObservableObject {
         }
         photoOutput.maxPhotoQualityPrioritization = .balanced
         setResponsiveCaptureEnabled(false)
-        configureAudioSessionForCapture()
         configureRawCaptureLimits()
         refreshExposureRange()
         applyDefaultDeviceModes()
@@ -451,12 +437,10 @@ final class CameraModel: NSObject, ObservableObject {
         isProcessing = false
         progress = 0
         statusText = "Capturing \(total) frames · \(lens)"
-        beginBurstAudio()
 
         sessionQueue.async {
             guard self.photoOutput.availableRawPhotoPixelFormatTypes.first != nil else {
                 DispatchQueue.main.async {
-                    self.endBurstAudio()
                     self.isBusy = false
                     self.isCapturing = false
                     self.statusText = "RAW capture not supported on this camera"
@@ -487,7 +471,6 @@ final class CameraModel: NSObject, ObservableObject {
             self.capturedDNGs.removeAll()
             self.restoreCaptureQuality()
             self.removeBurstDir(dir)
-            DispatchQueue.main.async { self.endBurstAudio() }
             if let d = self.device, (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
@@ -551,6 +534,7 @@ final class CameraModel: NSObject, ObservableObject {
         settings.photoQualityPrioritization = .speed
         settings.isAutoStillImageStabilizationEnabled = false
         applyRawCaptureLimits(to: settings)
+        applyShutterSoundSuppression(to: settings)
         photoOutput.capturePhoto(with: settings, delegate: self)
         return true
     }
@@ -713,7 +697,6 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func finish(success: Bool, message: String) {
         DispatchQueue.main.async {
-            self.endBurstAudio()
             self.isBusy = false
             self.isCapturing = false
             self.isProcessing = false
@@ -764,7 +747,6 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             }
         } else {
             unlockAfterBurst()
-            DispatchQueue.main.async { self.endBurstAudio() }
             processingQueue.async { self.processBurst() }
         }
     }
