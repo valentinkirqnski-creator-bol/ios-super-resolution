@@ -108,18 +108,15 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
                 f32 d = den_band.at(i, x, ch);
                 cn[ch] = (d > 1e-8f) ? num_band.at(i, x, ch) / d : 0.f;
             }
-            // Match desktop: bake WB into DNG pixels (identity ColorMatrix in header).
-            if (work.bayer_mode && nch >= 3) {
-                cn[0] *= work.white_balance[0];
-                cn[1] *= work.white_balance[1];
-                cn[2] *= work.white_balance[2];
-            }
             f32 outc[3];
             if (work.bake_srgb && nch >= 3) {
+                f32 wr = cn[0] * work.white_balance[0];
+                f32 wg = cn[1] * work.white_balance[1];
+                f32 wb = cn[2] * work.white_balance[2];
                 const f32* m = work.cam_to_srgb;
-                outc[0] = m[0] * cn[0] + m[1] * cn[1] + m[2] * cn[2];
-                outc[1] = m[3] * cn[0] + m[4] * cn[1] + m[5] * cn[2];
-                outc[2] = m[6] * cn[0] + m[7] * cn[1] + m[8] * cn[2];
+                outc[0] = m[0] * wr + m[1] * wg + m[2] * wb;
+                outc[1] = m[3] * wr + m[4] * wg + m[5] * wb;
+                outc[2] = m[6] * wr + m[7] * wg + m[8] * wb;
             } else if (nch >= 3) {
                 outc[0] = cn[0]; outc[1] = cn[1]; outc[2] = cn[2];
             } else {
@@ -132,11 +129,18 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
             // Preview is tiny (~256 px) — sample columns, don't sRGB every 8064-wide row.
             if ((x % x_step) == 0) {
                 f32 preview_lin[3] = {outc[0], outc[1], outc[2]};
-                if (!work.bake_srgb && nch >= 3 && work.has_cam_to_srgb) {
-                    const f32* m = work.cam_to_srgb;
-                    preview_lin[0] = m[0] * outc[0] + m[1] * outc[1] + m[2] * outc[2];
-                    preview_lin[1] = m[3] * outc[0] + m[4] * outc[1] + m[5] * outc[2];
-                    preview_lin[2] = m[6] * outc[0] + m[7] * outc[1] + m[8] * outc[2];
+                if (!work.bake_srgb && nch >= 3) {
+                    f32 wr = cn[0] * work.white_balance[0];
+                    f32 wg = cn[1] * work.white_balance[1];
+                    f32 wb = cn[2] * work.white_balance[2];
+                    if (work.has_cam_to_srgb) {
+                        const f32* m = work.cam_to_srgb;
+                        preview_lin[0] = m[0] * wr + m[1] * wg + m[2] * wb;
+                        preview_lin[1] = m[3] * wr + m[4] * wg + m[5] * wb;
+                        preview_lin[2] = m[6] * wr + m[7] * wg + m[8] * wb;
+                    } else {
+                        preview_lin[0] = wr; preview_lin[1] = wg; preview_lin[2] = wb;
+                    }
                 }
                 int px = std::min(pw - 1, (int)(x * pscale));
                 for (int k = 0; k < 3; ++k)

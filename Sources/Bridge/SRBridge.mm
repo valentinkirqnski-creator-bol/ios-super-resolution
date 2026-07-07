@@ -56,7 +56,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     Config cfg;
     cfg.scale = scale;
     cfg.bayer_mode = true;
-    cfg.bake_srgb = false;   // WB in pixels + identity ColorMatrix (Lightroom-safe)
+    cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
     cfg.num_threads = 0;     // all CPU cores (LibRaw is heap-allocated; safe on stack)
 
