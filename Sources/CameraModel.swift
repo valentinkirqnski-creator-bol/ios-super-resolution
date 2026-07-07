@@ -230,29 +230,28 @@ final class CameraModel: NSObject, ObservableObject {
     private func configureRawCaptureLimits() {
         if #available(iOS 16.0, *) {
             photoOutput.isHighResolutionCaptureEnabled = false
-            if photoOutput.isMaxPhotoDimensionsSupported {
-                photoOutput.maxPhotoDimensions = Self.cappedRawDimensions(from: photoOutput)
-            }
+            photoOutput.maxPhotoDimensions = cappedRawDimensions()
         }
     }
 
     private func applyRawCaptureLimits(to settings: AVCapturePhotoSettings) {
         if #available(iOS 16.0, *) {
             settings.isHighResolutionPhotoEnabled = false
-            settings.maxPhotoDimensions = Self.cappedRawDimensions(from: photoOutput)
+            settings.maxPhotoDimensions = cappedRawDimensions()
         }
     }
 
     @available(iOS 16.0, *)
-    private static func cappedRawDimensions(from output: AVCapturePhotoOutput) -> CMVideoDimensions {
+    private func cappedRawDimensions() -> CMVideoDimensions {
         let preferred = CMVideoDimensions(width: 4032, height: 3024) // ~12 MP binned RAW
-        let supported = output.supportedMaxPhotoDimensions
+        let supported = device?.activeFormat.supportedMaxPhotoDimensions ?? []
+        if supported.isEmpty { return preferred }
         for d in supported where d.width == preferred.width && d.height == preferred.height {
             return preferred
         }
         // Fall back to the largest supported size still under ~15 MP.
         let maxPixels: Int64 = 15_000_000
-        var best = supported.first ?? preferred
+        var best = supported[0]
         var bestPixels = Int64(best.width) * Int64(best.height)
         for d in supported {
             let px = Int64(d.width) * Int64(d.height)
