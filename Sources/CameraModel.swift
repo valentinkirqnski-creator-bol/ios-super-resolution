@@ -33,7 +33,6 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var statusText = ""
     @Published var progress: Float = 0
     @Published var lastThumbnail: UIImage?
-    @Published var lastSavedURL: URL?
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var availableCameras: [CameraSelection] = [.wide]
@@ -133,6 +132,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.sessionQueue.async {
                 self.configureSession()
                 self.discoverCamerasAfterSetup()
+                self.purgeStaleCaptureFiles()
             }
         }
     }
@@ -481,9 +481,12 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func abortBurst(_ message: String) {
         sessionQueue.async {
+            let dir = self.burstDir
+            self.burstDir = nil
             self.pendingCaptures = 0
             self.capturedDNGs.removeAll()
             self.restoreCaptureQuality()
+            self.removeBurstDir(dir)
             DispatchQueue.main.async { self.endBurstAudio() }
             if let d = self.device, (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
@@ -598,10 +601,47 @@ final class CameraModel: NSObject, ObservableObject {
 
     // MARK: - Processing
 
+    /// Remove leftover burst folders (~500 MB each) from tmp after crashes or older builds.
+    private func purgeStaleCaptureFiles() {
+        processingQueue.async {
+            let fm = FileManager.default
+            let tmp = fm.temporaryDirectory
+            if let entries = try? fm.contentsOfDirectory(
+                at: tmp, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                for url in entries {
+                    let name = url.lastPathComponent
+                    if name.hasPrefix("burst_") || name.hasSuffix("_cache") {
+                        try? fm.removeItem(at: url)
+                    }
+                }
+            }
+            if let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first,
+               let entries = try? fm.contentsOfDirectory(
+                at: caches, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                for url in entries {
+                    let name = url.lastPathComponent
+                    if name.hasPrefix("burst_") || name.hasSuffix("_cache") {
+                        try? fm.removeItem(at: url)
+                    }
+                }
+            }
+        }
+    }
+
+    private func removeBurstDir(_ dir: URL?) {
+        guard let dir else { return }
+        let path = dir.path
+        processingQueue.async {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+    }
+
     private func processBurst() {
         let paths = capturedDNGs.map { $0.path }
         let burstDir = self.burstDir
         guard paths.count >= 2 else {
+            removeBurstDir(burstDir)
+            self.burstDir = nil
             finish(success: false, message: "Not enough frames captured")
             return
         }
@@ -634,6 +674,8 @@ final class CameraModel: NSObject, ObservableObject {
         if ok {
             saveToPhotos(url: outURL, preview: preview, burstDir: burstDir)
         } else {
+            removeBurstDir(burstDir)
+            self.burstDir = nil
             finish(success: false, message: "Processing failed")
         }
     }
@@ -643,10 +685,11 @@ final class CameraModel: NSObject, ObservableObject {
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {
                     self.lastThumbnail = preview
-                    self.lastSavedURL = url
-                    self.finish(success: true, message: "Saved to app storage (grant Photos access to save to library)")
+                    self.finish(success: false,
+                                message: "Grant Photos access to save captures")
                 }
-                self.cleanupBurstDir(burstDir, keep: url)
+                self.removeBurstDir(burstDir)
+                self.burstDir = nil
                 return
             }
             PHPhotoLibrary.shared().performChanges({
@@ -657,25 +700,14 @@ final class CameraModel: NSObject, ObservableObject {
             }, completionHandler: { success, _ in
                 DispatchQueue.main.async {
                     self.lastThumbnail = preview
-                    self.lastSavedURL = url
                     self.finish(success: success,
-                                message: success ? "Saved super-res DNG to Photos" : "Saved to app storage")
+                                message: success
+                                    ? "Saved super-res DNG to Photos"
+                                    : "Could not save to Photos")
                 }
-                self.cleanupBurstDir(burstDir, keep: url)
+                self.removeBurstDir(burstDir)
+                self.burstDir = nil
             })
-        }
-    }
-
-    private func cleanupBurstDir(_ dir: URL?, keep output: URL) {
-        guard let dir = dir else { return }
-        processingQueue.async {
-            guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
-            for name in names {
-                let url = dir.appendingPathComponent(name)
-                if url.path != output.path {
-                    try? FileManager.default.removeItem(at: url)
-                }
-            }
         }
     }
 

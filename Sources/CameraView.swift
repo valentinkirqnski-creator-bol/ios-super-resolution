@@ -265,7 +265,7 @@ struct CameraView: View {
     }
 
     private var galleryButton: some View {
-        Button(action: { if cam.lastSavedURL != nil && !cam.isBusy { showViewer = true } }) {
+        Button(action: { if cam.lastThumbnail != nil && !cam.isBusy { showViewer = true } }) {
             ZStack {
                 Group {
                     if let thumb = cam.lastThumbnail {
@@ -295,7 +295,7 @@ struct CameraView: View {
                 }
             }
         }
-        .disabled(cam.isBusy && cam.lastSavedURL == nil)
+        .disabled(cam.isBusy && cam.lastThumbnail == nil)
     }
 
     // MARK: - Sheets
