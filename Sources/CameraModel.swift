@@ -79,6 +79,7 @@ final class CameraModel: NSObject, ObservableObject {
     private let photoOutput = AVCapturePhotoOutput()
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
+    private var activeCameraSelection: CameraSelection = .wide
 
     // Burst bookkeeping — count depends on selected camera.
     private var burstCount = 4
@@ -96,8 +97,8 @@ final class CameraModel: NSObject, ObservableObject {
                 return
             }
             self.sessionQueue.async {
-                self.discoverCameras()
                 self.configureSession()
+                self.discoverCamerasAfterSetup()
             }
         }
     }
@@ -118,15 +119,16 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func discoverCameras() {
+    /// List lenses after the live session is configured (no extra probe sessions).
+    private func discoverCamerasAfterSetup() {
         var found: [CameraSelection] = []
-        if let wide = device(for: .wide), supportsRawPhotoCapture(device: wide) {
+        if device(for: .wide) != nil {
             found.append(.wide)
         }
-        if let uw = device(for: .ultraWide), supportsRawPhotoCapture(device: uw) {
+        if device(for: .ultraWide) != nil {
             found.append(.ultraWide)
         }
-        if let front = device(for: .front), supportsRawPhotoCapture(device: front) {
+        if device(for: .front) != nil {
             found.append(.front)
         }
         if found.isEmpty { found = [.wide] }
@@ -142,7 +144,12 @@ final class CameraModel: NSObject, ObservableObject {
             videoInput = nil
         }
 
-        let selection = cameraSelection
+        let selection: CameraSelection
+        if Thread.isMainThread {
+            selection = cameraSelection
+        } else {
+            selection = DispatchQueue.main.sync { self.cameraSelection }
+        }
         burstCount = selection.burstCount
 
         guard let dev = device(for: selection),
@@ -166,6 +173,7 @@ final class CameraModel: NSObject, ObservableObject {
         photoOutput.maxPhotoQualityPrioritization = .quality
         configureRawCaptureLimits()
         applyDefaultDeviceModes()
+        applyShutterOnSessionQueue()
 
         session.commitConfiguration()
         session.startRunning()
@@ -199,6 +207,7 @@ final class CameraModel: NSObject, ObservableObject {
 
         configureRawCaptureLimits()
         applyDefaultDeviceModes()
+        applyShutterOnSessionQueue()
 
         session.commitConfiguration()
         DispatchQueue.main.async {
@@ -208,6 +217,28 @@ final class CameraModel: NSObject, ObservableObject {
                 self.statusText = ""
             }
         }
+    }
+
+    /// Apply shutter/exposure on the session queue (caller must already be on sessionQueue).
+    private func applyShutterOnSessionQueue() {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+        switch shutter {
+        case .auto:
+            if d.isExposureModeSupported(.continuousAutoExposure) {
+                d.exposureMode = .continuousAutoExposure
+            }
+        case .manual(let seconds):
+            if d.isExposureModeSupported(.custom) {
+                let minD = d.activeFormat.minExposureDuration
+                let maxD = d.activeFormat.maxExposureDuration
+                var t = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000_000)
+                if CMTimeCompare(t, minD) < 0 { t = minD }
+                if CMTimeCompare(t, maxD) > 0 { t = maxD }
+                let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
+                d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
+            }
+        }
+        d.unlockForConfiguration()
     }
 
     private func device(for selection: CameraSelection) -> AVCaptureDevice? {
@@ -221,20 +252,6 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// Probe whether a device can deliver Bayer RAW through AVCapturePhotoOutput.
-    private func supportsRawPhotoCapture(device: AVCaptureDevice) -> Bool {
-        let probe = AVCapturePhotoOutput()
-        let probeSession = AVCaptureSession()
-        probeSession.beginConfiguration()
-        defer { probeSession.commitConfiguration() }
-        guard let input = try? AVCaptureDeviceInput(device: device),
-              probeSession.canAddInput(input),
-              probeSession.canAddOutput(probe) else { return false }
-        probeSession.addInput(input)
-        probeSession.addOutput(probe)
-        return !probe.availableRawPhotoPixelFormatTypes.isEmpty
-    }
-
     private func applyDefaultDeviceModes() {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
         if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
@@ -243,7 +260,6 @@ final class CameraModel: NSObject, ObservableObject {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
         }
         d.unlockForConfiguration()
-        applyShutter()
     }
 
     // MARK: - Focus / exposure controls
@@ -272,26 +288,7 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func applyShutter() {
-        sessionQueue.async {
-            guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
-            switch self.shutter {
-            case .auto:
-                if d.isExposureModeSupported(.continuousAutoExposure) {
-                    d.exposureMode = .continuousAutoExposure
-                }
-            case .manual(let seconds):
-                if d.isExposureModeSupported(.custom) {
-                    let minD = d.activeFormat.minExposureDuration
-                    let maxD = d.activeFormat.maxExposureDuration
-                    var t = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000_000)
-                    if CMTimeCompare(t, minD) < 0 { t = minD }
-                    if CMTimeCompare(t, maxD) > 0 { t = maxD }
-                    let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
-                    d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
-                }
-            }
-            d.unlockForConfiguration()
-        }
+        sessionQueue.async { self.applyShutterOnSessionQueue() }
     }
 
     // MARK: - Capture burst

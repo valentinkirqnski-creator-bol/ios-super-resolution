@@ -24,8 +24,12 @@ struct CameraPreview: UIViewRepresentable {
 
     private func applyMirroring(to view: PreviewUIView) {
         guard let conn = view.videoPreviewLayer.connection, conn.isVideoMirroringSupported else { return }
-        conn.automaticallyAdjustsVideoMirroring = !mirrorFront
-        conn.isVideoMirrored = mirrorFront
+        if mirrorFront {
+            conn.automaticallyAdjustsVideoMirroring = false
+            conn.isVideoMirrored = true
+        } else {
+            conn.automaticallyAdjustsVideoMirroring = true
+        }
     }
 
     final class PreviewUIView: UIView {
