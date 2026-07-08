@@ -27,6 +27,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     report("Reference: local stats", 0.05f);
     RefStats ref_stats = init_robustness(ref, cfg);
     CovField ref_covs = estimate_kernels(ref, cfg);
+    Image edge_map = compute_edge_strength_map(ref_grey);
+    const Image* edge_map_ptr = &edge_map;
 
     Image rob_min;
     bool have_rob_min = false;
@@ -65,7 +67,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         }
         CovField covs = estimate_kernels(comp, cfg);
         merge_comp(comp, flow, covs, ref_covs, rob, have_rob_min ? &rob_min : nullptr,
-                   tile_size, num, den, cfg);
+                   edge_map_ptr, tile_size, num, den, cfg);
     }
 
     const Image* acc_rob_ptr = (have_acc_rob && cfg.accumulated_robustness_merge_enabled)
@@ -73,7 +75,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     // --- Merge the reference frame itself (Alg. 11) ---
     report("Reference: merge", 0.92f);
-    merge_ref(ref, ref_covs, num, den, cfg, acc_rob_ptr, have_rob_min ? &rob_min : nullptr);
+    merge_ref_band(ref, ref_covs, num, den, 0, cfg, acc_rob_ptr,
+                   have_rob_min ? &rob_min : nullptr, edge_map_ptr);
 
     // --- Normalize num/den (and apply white balance for bayer) ---
     report("Normalizing", 0.96f);
@@ -108,6 +111,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     Pyramid ref_pyr = build_pyramid(ref_grey, cfg.bm_factors);
     RefStats ref_stats = init_robustness(ref, cfg);
     CovField ref_covs = estimate_kernels(ref, cfg);
+    Image edge_map = compute_edge_strength_map(ref_grey);
+    const Image* edge_map_ptr = &edge_map;
 
     // --- Precompute per comparison frame (align + robustness + kernels) ---
     std::vector<FrameData> frames(n - 1);
@@ -193,9 +198,10 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
             for (int k = 1; k < n; ++k) {
                 const FrameData& fd = frames[k - 1];
                 merge_comp_band(burst[k], fd.flow, fd.covs, ref_covs, fd.robustness, rob_min_ptr,
-                                tile_size, num_band, den_band, y0, cfg);
+                                edge_map_ptr, tile_size, num_band, den_band, y0, cfg);
             }
-            merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg, acc_rob_ptr, rob_min_ptr);
+            merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg, acc_rob_ptr, rob_min_ptr,
+                           edge_map_ptr);
         }
 
         auto to_srgb = [](f32 v) {

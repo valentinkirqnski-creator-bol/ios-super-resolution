@@ -65,6 +65,27 @@ Image compute_gradients(const Image& grey) {
     return grad;
 }
 
+Image compute_edge_strength_map(const Image& grey) {
+    Image grad = compute_gradients(grey);
+    Image edge(grey.h, grey.w, 1);
+    for (int y = 0; y < grey.h; ++y) {
+        for (int x = 0; x < grey.w; ++x) {
+            f32 mag = 0.f;
+            for (int dy = 0; dy <= 1; ++dy) {
+                for (int dx = 0; dx <= 1; ++dx) {
+                    int gy = std::min(y + dy, grad.h - 1);
+                    int gx = std::min(x + dx, grad.w - 1);
+                    f32 gxv = grad.at(gy, gx, 0);
+                    f32 gyv = grad.at(gy, gx, 1);
+                    mag = std::max(mag, std::sqrt(gxv * gxv + gyv * gyv));
+                }
+            }
+            edge.at(y, x) = mag;
+        }
+    }
+    return edge;
+}
+
 Image gaussian_blur(const Image& src, float sigma) {
     if (sigma <= 0.f) return src;
     int radius = std::max(1, (int)std::ceil(3.f * sigma));

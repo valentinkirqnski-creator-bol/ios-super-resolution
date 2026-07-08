@@ -105,25 +105,6 @@ static f32 sample_tile_map_bilinear(const std::vector<f32>& map, int tny, int tn
     return top + wy * (bot - top);
 }
 
-// Light 3x3 blur softens tile/block boundaries in the robustness mask.
-static Image blur_robustness_3x3(const Image& src) {
-    Image out(src.h, src.w, 1);
-    for (int y = 0; y < src.h; ++y) {
-        for (int x = 0; x < src.w; ++x) {
-            f32 s = 0.f;
-            for (int i = -1; i <= 1; ++i) {
-                int yy = (int)clampf((f32)(y + i), 0.f, (f32)(src.h - 1));
-                for (int j = -1; j <= 1; ++j) {
-                    int xx = (int)clampf((f32)(x + j), 0.f, (f32)(src.w - 1));
-                    s += src.at(yy, xx);
-                }
-            }
-            out.at(y, x) = s / 9.f;
-        }
-    }
-    return out;
-}
-
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     RefStats st;
     if (!cfg.robustness_enabled) return st;
@@ -221,7 +202,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             r_grey.at(y, x) = mn;
         }
     }
-    return blur_robustness_3x3(r_grey);
+    return r_grey;
 }
 
 } // namespace hhsr

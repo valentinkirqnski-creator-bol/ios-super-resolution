@@ -20,6 +20,10 @@ Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 // Central-difference gradients of a grey image -> [h-? , w-?, 2] packed image.
 Image compute_gradients(const Image& grey);
 
+// Per-grey-pixel gradient magnitude (max over 2x2 grad cells). Used to gate comp
+// merge on high-contrast edges where partial alignment causes zippering/fringing.
+Image compute_edge_strength_map(const Image& grey);
+
 // Separable Gaussian blur (used for robustness guide + optional smoothing).
 Image gaussian_blur(const Image& src, float sigma);
 
@@ -49,16 +53,21 @@ CovField estimate_kernels(const Image& raw, const Config& cfg);
 // bounded-memory horizontal bands.
 void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const CovField& ref_covs, const Image& robustness, const Image* rob_min,
-                     int tile_size, Image& num_band, Image& den_band, int y0, const Config& cfg);
+                     const Image* edge_map, int tile_size, Image& num_band, Image& den_band,
+                     int y0, const Config& cfg);
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
-                    const Image* acc_rob = nullptr, const Image* rob_min = nullptr);
+                    const Image* acc_rob = nullptr, const Image* rob_min = nullptr,
+                    const Image* edge_map = nullptr);
+
+void merge_ref_only_band(const Image& ref_raw, const CovField& covs,
+                         Image& num_band, Image& den_band, int y0, const Config& cfg);
 
 // Whole-image convenience wrappers (num/den are full [Hs, Ws, nch]).
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                 const CovField& ref_covs, const Image& robustness, const Image* rob_min,
-                int tile_size, Image& num, Image& den, const Config& cfg);
+                const Image* edge_map, int tile_size, Image& num, Image& den, const Config& cfg);
 void merge_ref(const Image& ref_raw, const CovField& covs,
                Image& num, Image& den, const Config& cfg,
                const Image* acc_rob = nullptr, const Image* rob_min = nullptr);

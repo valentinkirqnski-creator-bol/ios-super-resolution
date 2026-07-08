@@ -93,14 +93,14 @@ struct Config {
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
-    float r_Mt = 0.80f;
+    float r_Mt = 0.55f;
     // Smooth comp-frame weight feather: 0 below low, 1 above high (smoothstep).
-    float motion_feather_low  = 0.18f;
-    float motion_feather_high = 0.52f;
+    float motion_feather_low  = 0.55f;
+    float motion_feather_high = 0.85f;
     // Below this gate_r (min of frame R and rob_min), comp contributes nothing.
-    float motion_comp_hard_cutoff = 0.35f;
+    float motion_comp_hard_cutoff = 0.52f;
     // Use isotropic kernels when alignment confidence is uncertain (motion borders).
-    float motion_iso_threshold = 0.72f;
+    float motion_iso_threshold = 0.88f;
     // Widen steerable kernels up to this factor in uncertain/motion border regions.
     float motion_kernel_widen_max = 6.0f;
     // Use reference gradient structure for comp accumulation (paper edge tolerance).
@@ -109,7 +109,20 @@ struct Config {
     // Paper §5 / §6.2: when few frames contribute at a pixel, enforce single-frame
     // steerable upsampling (Python accumulated_robustness_denoiser.merge).
     bool  accumulated_robustness_merge_enabled = true;
-    float acc_rob_frame_threshold = 1.25f;
+    float acc_rob_frame_threshold = 0.95f;
+
+    // Edge-aware comp gating: high-gradient pixels need higher alignment confidence
+    // to avoid zippering and chromatic fringing at shadow/highlight boundaries.
+    float edge_strength_threshold = 0.008f;
+    float edge_comp_min_confidence = 0.84f;
+    float flat_comp_min_confidence = 0.72f;
+    float edge_ref_only_cutoff = 0.78f;
+    float edge_acc_rob_frame_threshold = 2.5f;
+
+    // Encode-time safety: blend toward pure ref upscale when comp strength is low.
+    float encode_comp_strength_floor = 0.72f;
+    float encode_comp_blend_width = 0.18f;
+    float encode_rob_min_floor = 0.62f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;

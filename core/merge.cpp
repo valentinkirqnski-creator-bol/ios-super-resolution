@@ -44,9 +44,15 @@ static void sample_flow_bilinear(const FlowField& flow, int tile_size, f32 grey_
 }
 
 static f32 comp_merge_weight(f32 frame_r, f32 gate_r, const Config& cfg) {
-    if (gate_r < cfg.motion_comp_hard_cutoff) return 0.f;
+    if (gate_r < cfg.motion_comp_hard_cutoff || frame_r < cfg.motion_comp_hard_cutoff) return 0.f;
     const f32 feather = smoothstepf(cfg.motion_feather_low, cfg.motion_feather_high, gate_r);
     return feather * frame_r * gate_r;
+}
+
+static f32 comp_confidence_required(f32 edge, const Config& cfg) {
+    return edge >= cfg.edge_strength_threshold
+        ? cfg.edge_comp_min_confidence
+        : cfg.flat_comp_min_confidence;
 }
 
 } // namespace
@@ -82,7 +88,8 @@ static inline bool interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
 // num_band/den_band cover global output rows [y0, y0 + band.h).
 static void accumulate(const Image& img, const FlowField* flow, const CovField& covs,
                        const CovField* ref_covs, const Image* robustness, const Image* rob_min,
-                       int tile_size, Image& num, Image& den, int y0, const Config& cfg, f32 ref_rob) {
+                       const Image* edge_map, int tile_size, Image& num, Image& den, int y0,
+                       const Config& cfg, f32 ref_rob) {
     int band_h = num.h, Ws = num.w;
     int lr_h = img.h, lr_w = img.w;
     int nch = cfg.bayer_mode ? 3 : 1;
@@ -108,6 +115,11 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
                 gate_r = frame_r;
                 if (rob_min)
                     gate_r = std::min(gate_r, sample_image_bilinear(*rob_min, grey_y, grey_x));
+                f32 edge = 0.f;
+                if (edge_map)
+                    edge = sample_image_bilinear(*edge_map, grey_y, grey_x);
+                const f32 conf_req = comp_confidence_required(edge, cfg);
+                if (frame_r < conf_req || gate_r < conf_req) continue;
                 merge_weight = comp_merge_weight(frame_r, gate_r, cfg);
                 if (merge_weight <= 1e-5f) continue;
                 use_iso_kernel = iso || gate_r < cfg.motion_iso_threshold;
@@ -181,18 +193,22 @@ static f32 sample_acc_rob_nearest(const Image& acc_rob, f32 grey_y, f32 grey_x) 
     return acc_rob.at(std::max(0, y), std::max(0, x));
 }
 
-static bool ref_only_pixel(f32 acc_r, f32 min_r, const Config& cfg,
+static bool ref_only_pixel(f32 acc_r, f32 min_r, f32 edge, const Config& cfg,
                            bool have_acc, bool have_min) {
     if (!cfg.accumulated_robustness_merge_enabled) return false;
     if (have_acc && acc_r <= cfg.acc_rob_frame_threshold) return true;
     if (have_min && min_r < cfg.motion_comp_hard_cutoff) return true;
+    if (edge >= cfg.edge_strength_threshold) {
+        if (have_min && min_r < cfg.edge_ref_only_cutoff) return true;
+        if (have_acc && acc_r <= cfg.edge_acc_rob_frame_threshold) return true;
+    }
     return false;
 }
 
 // Alg. 11: reference accumulation — uniform 3x3 steerable upscale; overwrite comp
 // wherever acc_rob or rob_min indicates single-frame fallback.
 static void accumulate_ref(const Image& img, const CovField& covs,
-                           const Image* acc_rob, const Image* rob_min,
+                           const Image* acc_rob, const Image* rob_min, const Image* edge_map,
                            Image& num, Image& den, int y0, const Config& cfg) {
     int band_h = num.h, Ws = num.w;
     int lr_h = img.h, lr_w = img.w;
@@ -214,7 +230,9 @@ static void accumulate_ref(const Image& img, const CovField& covs,
             if (acc_rob) local_acc_r = sample_acc_rob_nearest(*acc_rob, grey_y, grey_x);
             f32 local_min_r = 1.f;
             if (rob_min) local_min_r = sample_image_bilinear(*rob_min, grey_y, grey_x);
-            const bool overwrite = ref_only_pixel(local_acc_r, local_min_r, cfg,
+            f32 edge = 0.f;
+            if (edge_map) edge = sample_image_bilinear(*edge_map, grey_y, grey_x);
+            const bool overwrite = ref_only_pixel(local_acc_r, local_min_r, edge, cfg,
                                                   acc_rob != nullptr, rob_min != nullptr);
 
             f32 coarse_x = lr_x, coarse_y = lr_y;
@@ -265,28 +283,34 @@ static void accumulate_ref(const Image& img, const CovField& covs,
 
 void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const CovField& ref_covs, const Image& robustness, const Image* rob_min,
-                     int tile_size, Image& num_band, Image& den_band, int y0, const Config& cfg) {
-    accumulate(comp_raw, &flow, covs, &ref_covs, &robustness, rob_min, tile_size,
+                     const Image* edge_map, int tile_size, Image& num_band, Image& den_band,
+                     int y0, const Config& cfg) {
+    accumulate(comp_raw, &flow, covs, &ref_covs, &robustness, rob_min, edge_map, tile_size,
                num_band, den_band, y0, cfg, 1.f);
 }
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
-                    const Image* acc_rob, const Image* rob_min) {
-    accumulate_ref(ref_raw, covs, acc_rob, rob_min, num_band, den_band, y0, cfg);
+                    const Image* acc_rob, const Image* rob_min, const Image* edge_map) {
+    accumulate_ref(ref_raw, covs, acc_rob, rob_min, edge_map, num_band, den_band, y0, cfg);
+}
+
+void merge_ref_only_band(const Image& ref_raw, const CovField& covs,
+                         Image& num_band, Image& den_band, int y0, const Config& cfg) {
+    accumulate_ref(ref_raw, covs, nullptr, nullptr, nullptr, num_band, den_band, y0, cfg);
 }
 
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                 const CovField& ref_covs, const Image& robustness, const Image* rob_min,
-                int tile_size, Image& num, Image& den, const Config& cfg) {
-    merge_comp_band(comp_raw, flow, covs, ref_covs, robustness, rob_min, tile_size,
+                const Image* edge_map, int tile_size, Image& num, Image& den, const Config& cfg) {
+    merge_comp_band(comp_raw, flow, covs, ref_covs, robustness, rob_min, edge_map, tile_size,
                     num, den, 0, cfg);
 }
 
 void merge_ref(const Image& ref_raw, const CovField& covs,
                Image& num, Image& den, const Config& cfg,
                const Image* acc_rob, const Image* rob_min) {
-    merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob, rob_min);
+    merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob, rob_min, nullptr);
 }
 
 } // namespace hhsr
