@@ -30,6 +30,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     Image rob_min;
     bool have_rob_min = false;
+    Image acc_rob;
+    bool have_acc_rob = false;
 
     int Hs = (int)std::lround(cfg.scale * ref.h);
     int Ws = (int)std::lround(cfg.scale * ref.w);
@@ -53,14 +55,25 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
             for (size_t i = 0; i < rob.data.size(); ++i)
                 rob_min.data[i] = std::min(rob_min.data[i], rob.data[i]);
         }
+        if (!have_acc_rob) {
+            acc_rob = Image(rob.h, rob.w, 1);
+            acc_rob.data = rob.data;
+            have_acc_rob = true;
+        } else {
+            for (size_t i = 0; i < rob.data.size(); ++i)
+                acc_rob.data[i] += rob.data[i];
+        }
         CovField covs = estimate_kernels(comp, cfg);
         merge_comp(comp, flow, covs, ref_covs, rob, have_rob_min ? &rob_min : nullptr,
                    tile_size, num, den, cfg);
     }
 
+    const Image* acc_rob_ptr = (have_acc_rob && cfg.accumulated_robustness_merge_enabled)
+        ? &acc_rob : nullptr;
+
     // --- Merge the reference frame itself (Alg. 11) ---
     report("Reference: merge", 0.92f);
-    merge_ref(ref, ref_covs, num, den, cfg);
+    merge_ref(ref, ref_covs, num, den, cfg, acc_rob_ptr);
 
     // --- Normalize num/den (and apply white balance for bayer) ---
     report("Normalizing", 0.96f);
@@ -110,6 +123,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 
     Image rob_min;
     bool have_rob_min = false;
+    Image acc_rob;
+    bool have_acc_rob = false;
     for (const FrameData& fd : frames) {
         if (!have_rob_min) {
             rob_min = Image(fd.robustness.h, fd.robustness.w, 1);
@@ -119,8 +134,18 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
             for (size_t i = 0; i < fd.robustness.data.size(); ++i)
                 rob_min.data[i] = std::min(rob_min.data[i], fd.robustness.data[i]);
         }
+        if (!have_acc_rob) {
+            acc_rob = Image(fd.robustness.h, fd.robustness.w, 1);
+            acc_rob.data = fd.robustness.data;
+            have_acc_rob = true;
+        } else {
+            for (size_t i = 0; i < fd.robustness.data.size(); ++i)
+                acc_rob.data[i] += fd.robustness.data[i];
+        }
     }
     const Image* rob_min_ptr = have_rob_min ? &rob_min : nullptr;
+    const Image* acc_rob_ptr = (have_acc_rob && cfg.accumulated_robustness_merge_enabled)
+        ? &acc_rob : nullptr;
 
     int Hs = (int)std::lround(cfg.scale * ref.h);
     int Ws = (int)std::lround(cfg.scale * ref.w);
@@ -170,7 +195,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 merge_comp_band(burst[k], fd.flow, fd.covs, ref_covs, fd.robustness, rob_min_ptr,
                                 tile_size, num_band, den_band, y0, cfg);
             }
-            merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg);
+            merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg, acc_rob_ptr);
         }
 
         auto to_srgb = [](f32 v) {

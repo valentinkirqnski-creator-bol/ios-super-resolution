@@ -123,6 +123,17 @@ static void absorb_robustness_min(Image& rob_min, const Image& rob, bool& have) 
         rob_min.data[i] = std::min(rob_min.data[i], rob.data[i]);
 }
 
+static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) {
+    if (!have) {
+        acc_rob = Image(rob.h, rob.w, 1);
+        acc_rob.data = rob.data;
+        have = true;
+        return;
+    }
+    for (size_t i = 0; i < rob.data.size(); ++i)
+        acc_rob.data[i] += rob.data[i];
+}
+
 static void build_robustness_min(const std::vector<CachedCompFrame>& cached,
                                  const std::vector<CachedCompMeta>& cached_meta,
                                  bool stream_comp_raw,
@@ -133,6 +144,19 @@ static void build_robustness_min(const std::vector<CachedCompFrame>& cached,
     } else {
         for (const CachedCompFrame& fc : cached)
             absorb_robustness_min(rob_min, fc.rob, have);
+    }
+}
+
+static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
+                                 const std::vector<CachedCompMeta>& cached_meta,
+                                 bool stream_comp_raw,
+                                 Image& acc_rob, bool& have) {
+    if (stream_comp_raw) {
+        for (const CachedCompMeta& meta : cached_meta)
+            absorb_robustness_sum(acc_rob, meta.rob, have);
+    } else {
+        for (const CachedCompFrame& fc : cached)
+            absorb_robustness_sum(acc_rob, fc.rob, have);
     }
 }
 
@@ -317,6 +341,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     build_robustness_min(cached, cached_meta, stream_comp_raw, rob_min, have_rob_min);
     const Image* rob_min_ptr = have_rob_min ? &rob_min : nullptr;
 
+    Image acc_rob;
+    bool have_acc_rob = false;
+    build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
+    const Image* acc_rob_ptr = (have_acc_rob && work.accumulated_robustness_merge_enabled)
+        ? &acc_rob : nullptr;
+
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
@@ -357,7 +387,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                                 tile_size, num_band, den_band, y0, work);
         }
 
-        merge_ref_band(ref, ref_covs, num_band, den_band, y0, work);
+        merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
 
         encode_band_rows(num_band, den_band, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), bh);

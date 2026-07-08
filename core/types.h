@@ -88,12 +88,12 @@ struct Config {
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     int  ica_n_iter = 3;
 
-    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t).
+    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Paper defaults: t=0.12, Mt=0.8.
     bool  robustness_enabled = true;
-    float r_t  = 0.16f;
+    float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
-    float r_Mt = 0.65f;
+    float r_Mt = 0.80f;
     // Smooth comp-frame weight feather: 0 below low, 1 above high (smoothstep).
     float motion_feather_low  = 0.05f;
     float motion_feather_high = 0.42f;
@@ -101,6 +101,13 @@ struct Config {
     float motion_kernel_widen_max = 6.0f;
     // Use reference gradient structure for comp accumulation (paper edge tolerance).
     bool merge_comp_with_ref_kernels = true;
+
+    // Paper §5 / §6.2: when few frames contribute at a pixel, enforce single-frame
+    // steerable upsampling (Python accumulated_robustness_denoiser.merge).
+    bool  accumulated_robustness_merge_enabled = true;
+    float acc_rob_frame_threshold = 2.0f;
+    int   acc_rob_rad_max = 2;
+    float acc_rob_cov_multiplier = 8.0f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;

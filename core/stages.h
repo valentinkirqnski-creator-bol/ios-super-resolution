@@ -52,13 +52,15 @@ void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovFiel
                      int tile_size, Image& num_band, Image& den_band, int y0, const Config& cfg);
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
-                    Image& num_band, Image& den_band, int y0, const Config& cfg);
+                    Image& num_band, Image& den_band, int y0, const Config& cfg,
+                    const Image* acc_rob = nullptr);
 
 // Whole-image convenience wrappers (num/den are full [Hs, Ws, nch]).
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                 const CovField& ref_covs, const Image& robustness, const Image* rob_min,
                 int tile_size, Image& num, Image& den, const Config& cfg);
 void merge_ref(const Image& ref_raw, const CovField& covs,
-               Image& num, Image& den, const Config& cfg);
+               Image& num, Image& den, const Config& cfg,
+               const Image* acc_rob = nullptr);
 
 } // namespace hhsr
