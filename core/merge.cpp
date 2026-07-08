@@ -44,8 +44,9 @@ static void sample_flow_bilinear(const FlowField& flow, int tile_size, f32 grey_
 }
 
 static f32 comp_merge_weight(f32 frame_r, f32 gate_r, const Config& cfg) {
+    if (gate_r < cfg.motion_comp_hard_cutoff) return 0.f;
     const f32 feather = smoothstepf(cfg.motion_feather_low, cfg.motion_feather_high, gate_r);
-    return feather * frame_r;
+    return feather * frame_r * gate_r;
 }
 
 } // namespace
@@ -100,13 +101,16 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
 
             f32 merge_weight = ref_rob;
             f32 kernel_denoise_power = 1.f;
+            f32 gate_r = 1.f;
+            bool use_iso_kernel = iso;
             if (is_comp) {
                 const f32 frame_r = sample_image_bilinear(*robustness, grey_y, grey_x);
-                f32 gate_r = frame_r;
+                gate_r = frame_r;
                 if (rob_min)
                     gate_r = std::min(gate_r, sample_image_bilinear(*rob_min, grey_y, grey_x));
                 merge_weight = comp_merge_weight(frame_r, gate_r, cfg);
                 if (merge_weight <= 1e-5f) continue;
+                use_iso_kernel = iso || gate_r < cfg.motion_iso_threshold;
                 const f32 uncertain = 1.f - smoothstepf(cfg.motion_feather_low, cfg.motion_feather_high, gate_r);
                 kernel_denoise_power = 1.f + uncertain * std::max(0.f, cfg.motion_kernel_widen_max - 1.f);
             }
@@ -133,7 +137,7 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
             const f32 cov_y = use_ref_kernels ? lr_y : sample_y;
 
             f32 ixx = 0, ixy = 0, iyy = 0;
-            if (!iso) {
+            if (!use_iso_kernel) {
                 f32 kmap_j, kmap_i;
                 if (cfg.bayer_mode) { kmap_j = cov_x / 2 - 0.5f; kmap_i = cov_y / 2 - 0.5f; }
                 else                { kmap_j = cov_x - 0.5f;     kmap_i = cov_y - 0.5f; }
@@ -154,8 +158,8 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
 
                     f32 dist_x = j - lr_mov_j, dist_y = i - lr_mov_i;
                     f32 z;
-                    if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
-                    else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
+                    if (use_iso_kernel) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
+                    else              z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
                     z = std::max(0.f, z) / kernel_denoise_power;
                     f32 w = std::exp(-0.5f * z);
 

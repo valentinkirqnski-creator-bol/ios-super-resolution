@@ -206,15 +206,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         }
     });
 
-    // Alg. 9: 5x5 local minimum. Returned at grey resolution; merge indexes it
-    // in grey coordinates (raw / up), which halves its memory footprint.
+    // Alg. 9: 7x7 local minimum — conservative rob_min at motion boundaries.
     Image r_grey(gh, gw, 1);
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {
             f32 mn = 1e30f;
-            for (int i = -2; i <= 2; ++i) {
+            for (int i = -3; i <= 3; ++i) {
                 int yy = (int)clampf((f32)(y + i), 0.f, (f32)(gh - 1));
-                for (int j = -2; j <= 2; ++j) {
+                for (int j = -3; j <= 3; ++j) {
                     int xx = (int)clampf((f32)(x + j), 0.f, (f32)(gw - 1));
                     mn = std::min(mn, R.at(yy, xx));
                 }
