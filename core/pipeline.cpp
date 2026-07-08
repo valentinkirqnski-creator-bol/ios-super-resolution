@@ -26,6 +26,10 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: local stats", 0.05f);
     RefStats ref_stats = init_robustness(ref, cfg);
+    CovField ref_covs = estimate_kernels(ref, cfg);
+
+    Image rob_min;
+    bool have_rob_min = false;
 
     int Hs = (int)std::lround(cfg.scale * ref.h);
     int Ws = (int)std::lround(cfg.scale * ref.w);
@@ -41,13 +45,21 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, cfg, tile_size);
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, cfg);
+        if (!have_rob_min) {
+            rob_min = Image(rob.h, rob.w, 1);
+            rob_min.data = rob.data;
+            have_rob_min = true;
+        } else {
+            for (size_t i = 0; i < rob.data.size(); ++i)
+                rob_min.data[i] = std::min(rob_min.data[i], rob.data[i]);
+        }
         CovField covs = estimate_kernels(comp, cfg);
-        merge_comp(comp, flow, covs, rob, tile_size, num, den, cfg);
+        merge_comp(comp, flow, covs, ref_covs, rob, have_rob_min ? &rob_min : nullptr,
+                   tile_size, num, den, cfg);
     }
 
     // --- Merge the reference frame itself (Alg. 11) ---
     report("Reference: merge", 0.92f);
-    CovField ref_covs = estimate_kernels(ref, cfg);
     merge_ref(ref, ref_covs, num, den, cfg);
 
     // --- Normalize num/den (and apply white balance for bayer) ---
@@ -96,6 +108,20 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         fd.covs = estimate_kernels(burst[k], cfg);
     }
 
+    Image rob_min;
+    bool have_rob_min = false;
+    for (const FrameData& fd : frames) {
+        if (!have_rob_min) {
+            rob_min = Image(fd.robustness.h, fd.robustness.w, 1);
+            rob_min.data = fd.robustness.data;
+            have_rob_min = true;
+        } else {
+            for (size_t i = 0; i < fd.robustness.data.size(); ++i)
+                rob_min.data[i] = std::min(rob_min.data[i], fd.robustness.data[i]);
+        }
+    }
+    const Image* rob_min_ptr = have_rob_min ? &rob_min : nullptr;
+
     int Hs = (int)std::lround(cfg.scale * ref.h);
     int Ws = (int)std::lround(cfg.scale * ref.w);
 
@@ -141,8 +167,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         if (!merged_on_gpu) {
             for (int k = 1; k < n; ++k) {
                 const FrameData& fd = frames[k - 1];
-                merge_comp_band(burst[k], fd.flow, fd.covs, fd.robustness, tile_size,
-                                num_band, den_band, y0, cfg);
+                merge_comp_band(burst[k], fd.flow, fd.covs, ref_covs, fd.robustness, rob_min_ptr,
+                                tile_size, num_band, den_band, y0, cfg);
             }
             merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg);
         }

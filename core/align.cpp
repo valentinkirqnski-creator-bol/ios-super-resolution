@@ -134,7 +134,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[lvl];
         const Image& m = mov_pyr.levels[lvl];
-        int ts = std::max(4, tile_size); // tile size in this level's pixels
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size())
+                     ? std::max(4, cfg.bm_tile_sizes[lvl])
+                     : std::max(4, tile_size);
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
         bool use_l1 = (lvl == 0); // reference uses L1 at the finest scale
 

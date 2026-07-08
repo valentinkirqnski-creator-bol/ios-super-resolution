@@ -88,12 +88,19 @@ struct Config {
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     int  ica_n_iter = 3;
 
-    // Robustness.
+    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t).
     bool  robustness_enabled = true;
-    float r_t  = 0.12f;
+    float r_t  = 0.16f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
-    float r_Mt = 0.8f;
+    float r_Mt = 0.65f;
+    // Smooth comp-frame weight feather: 0 below low, 1 above high (smoothstep).
+    float motion_feather_low  = 0.05f;
+    float motion_feather_high = 0.42f;
+    // Widen steerable kernels up to this factor in uncertain/motion border regions.
+    float motion_kernel_widen_max = 6.0f;
+    // Use reference gradient structure for comp accumulation (paper edge tolerance).
+    bool merge_comp_with_ref_kernels = true;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
@@ -126,5 +133,11 @@ struct Config {
 };
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+inline f32 smoothstepf(f32 edge0, f32 edge1, f32 x) {
+    if (edge1 <= edge0) return x >= edge1 ? 1.f : 0.f;
+    f32 t = clampf((x - edge0) / (edge1 - edge0), 0.f, 1.f);
+    return t * t * (3.f - 2.f * t);
+}
 
 } // namespace hhsr

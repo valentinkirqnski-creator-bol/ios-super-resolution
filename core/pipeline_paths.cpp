@@ -112,6 +112,30 @@ static bool load_cached_comp(const fs::path& cache, int k, CachedCompFrame& out)
            out.comp.h > 0;
 }
 
+static void absorb_robustness_min(Image& rob_min, const Image& rob, bool& have) {
+    if (!have) {
+        rob_min = Image(rob.h, rob.w, 1);
+        rob_min.data = rob.data;
+        have = true;
+        return;
+    }
+    for (size_t i = 0; i < rob.data.size(); ++i)
+        rob_min.data[i] = std::min(rob_min.data[i], rob.data[i]);
+}
+
+static void build_robustness_min(const std::vector<CachedCompFrame>& cached,
+                                 const std::vector<CachedCompMeta>& cached_meta,
+                                 bool stream_comp_raw,
+                                 Image& rob_min, bool& have) {
+    if (stream_comp_raw) {
+        for (const CachedCompMeta& meta : cached_meta)
+            absorb_robustness_min(rob_min, meta.rob, have);
+    } else {
+        for (const CachedCompFrame& fc : cached)
+            absorb_robustness_min(rob_min, fc.rob, have);
+    }
+}
+
 static void encode_band_rows(const Image& num_band, const Image& den_band, int y0, int bh,
                              const Config& work, int nch, Image& preview, float pscale,
                              int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
@@ -288,6 +312,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int Hs = (int)std::lround(work.scale * ref.h);
     const int Ws = (int)std::lround(work.scale * ref.w);
 
+    Image rob_min;
+    bool have_rob_min = false;
+    build_robustness_min(cached, cached_meta, stream_comp_raw, rob_min, have_rob_min);
+    const Image* rob_min_ptr = have_rob_min ? &rob_min : nullptr;
+
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
@@ -318,14 +347,14 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             for (const CachedCompMeta& meta : cached_meta) {
                 Image comp;
                 if (!load_cached_comp_raw(cache, meta.index, comp)) continue;
-                merge_comp_band(comp, meta.flow, meta.covs, meta.rob, tile_size,
-                                num_band, den_band, y0, work);
+                merge_comp_band(comp, meta.flow, meta.covs, ref_covs, meta.rob, rob_min_ptr,
+                                tile_size, num_band, den_band, y0, work);
                 comp = Image();
             }
         } else {
             for (const CachedCompFrame& fc : cached)
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
-                                num_band, den_band, y0, work);
+                merge_comp_band(fc.comp, fc.flow, fc.covs, ref_covs, fc.rob, rob_min_ptr,
+                                tile_size, num_band, den_band, y0, work);
         }
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work);

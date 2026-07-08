@@ -48,16 +48,16 @@ CovField estimate_kernels(const Image& raw, const Config& cfg);
 // output row (y0 + i). This lets the pipeline process the (huge) output in
 // bounded-memory horizontal bands.
 void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
-                     const Image& robustness, int tile_size,
-                     Image& num_band, Image& den_band, int y0, const Config& cfg);
+                     const CovField& ref_covs, const Image& robustness, const Image* rob_min,
+                     int tile_size, Image& num_band, Image& den_band, int y0, const Config& cfg);
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg);
 
 // Whole-image convenience wrappers (num/den are full [Hs, Ws, nch]).
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,
-                const Image& robustness, int tile_size,
-                Image& num, Image& den, const Config& cfg);
+                const CovField& ref_covs, const Image& robustness, const Image* rob_min,
+                int tile_size, Image& num, Image& den, const Config& cfg);
 void merge_ref(const Image& ref_raw, const CovField& covs,
                Image& num, Image& den, const Config& cfg);
 
