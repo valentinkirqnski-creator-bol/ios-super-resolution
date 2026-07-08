@@ -112,17 +112,6 @@ static bool load_cached_comp(const fs::path& cache, int k, CachedCompFrame& out)
            out.comp.h > 0;
 }
 
-static void absorb_robustness_min(Image& rob_min, const Image& rob, bool& have) {
-    if (!have) {
-        rob_min = Image(rob.h, rob.w, 1);
-        rob_min.data = rob.data;
-        have = true;
-        return;
-    }
-    for (size_t i = 0; i < rob.data.size(); ++i)
-        rob_min.data[i] = std::min(rob_min.data[i], rob.data[i]);
-}
-
 static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) {
     if (!have) {
         acc_rob = Image(rob.h, rob.w, 1);
@@ -132,19 +121,6 @@ static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) 
     }
     for (size_t i = 0; i < rob.data.size(); ++i)
         acc_rob.data[i] += rob.data[i];
-}
-
-static void build_robustness_min(const std::vector<CachedCompFrame>& cached,
-                                 const std::vector<CachedCompMeta>& cached_meta,
-                                 bool stream_comp_raw,
-                                 Image& rob_min, bool& have) {
-    if (stream_comp_raw) {
-        for (const CachedCompMeta& meta : cached_meta)
-            absorb_robustness_min(rob_min, meta.rob, have);
-    } else {
-        for (const CachedCompFrame& fc : cached)
-            absorb_robustness_min(rob_min, fc.rob, have);
-    }
 }
 
 static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
@@ -160,74 +136,24 @@ static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
     }
 }
 
-static inline f32 sample_bilinear_1ch(const Image& img, f32 y, f32 x) {
-    y = clampf(y, 0.f, (f32)(img.h - 1));
-    x = clampf(x, 0.f, (f32)(img.w - 1));
-    const int y0 = (int)std::floor(y);
-    const int x0 = (int)std::floor(x);
-    const int y1 = std::min(y0 + 1, img.h - 1);
-    const int x1 = std::min(x0 + 1, img.w - 1);
-    const f32 fy = y - y0;
-    const f32 fx = x - x0;
-    const f32 top = img.at(y0, x0) * (1.f - fx) + img.at(y0, x1) * fx;
-    const f32 bot = img.at(y1, x0) * (1.f - fx) + img.at(y1, x1) * fx;
-    return top * (1.f - fy) + bot * fy;
-}
-
-static void encode_band_rows(const Image& num_band, const Image& den_band,
-                             const Image& num_ref_band, const Image& den_ref_band,
-                             const Image& den_comp_band, const Image* rob_min,
-                             int y0, int bh, const Config& work, int nch, Image& preview,
-                             float pscale, int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
+static void encode_band_rows(const Image& num_band, const Image& den_band, int y0, int bh,
+                             const Config& work, int nch, Image& preview, float pscale,
+                             int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
     auto to_srgb = [](f32 v) {
         v = clampf(v, 0.f, 1.f);
         return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
     };
-    const int up = work.bayer_mode ? 2 : 1;
-    const f32 scale = work.scale;
     const int x_step = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
     parallel_rows(bh, work.num_threads, [&](int i) {
         int gy = y0 + i;
         int py = std::min(ph - 1, (int)(gy * pscale));
         for (int x = 0; x < Ws; ++x) {
             size_t base = ((size_t)i * Ws + x) * 3;
-            f32 merged[3] = {0, 0, 0};
-            f32 ref_only[3] = {0, 0, 0};
-            f32 comp_str = 0.f;
+            f32 cn[3] = {0, 0, 0};
             for (int ch = 0; ch < nch; ++ch) {
-                f32 d_m = den_band.at(i, x, ch);
-                f32 d_r = den_ref_band.at(i, x, ch);
-                f32 d_c = den_comp_band.at(i, x, ch);
-                merged[ch] = (d_m > 1e-8f) ? num_band.at(i, x, ch) / d_m : 0.f;
-                ref_only[ch] = (d_r > 1e-8f) ? num_ref_band.at(i, x, ch) / d_r : merged[ch];
-                if (d_m > 1e-8f) comp_str += d_c / d_m;
+                f32 d = den_band.at(i, x, ch);
+                cn[ch] = (d > 1e-8f) ? num_band.at(i, x, ch) / d : 0.f;
             }
-            comp_str /= (f32)std::max(1, nch);
-
-            f32 blend = 1.f;
-            if (rob_min) {
-                f32 lr_x = (x + 0.5f) / scale;
-                f32 lr_y = (gy + 0.5f) / scale;
-                f32 grey_x = lr_x / (f32)up;
-                f32 grey_y = lr_y / (f32)up;
-                f32 rm = sample_bilinear_1ch(*rob_min, grey_y, grey_x);
-                const f32 lo = work.encode_rob_min_floor;
-                const f32 hi = lo + work.encode_comp_blend_width;
-                blend = std::min(blend, smoothstepf(lo, hi, rm));
-            }
-            {
-                const f32 lo = work.encode_comp_strength_floor;
-                const f32 hi = lo + work.encode_comp_blend_width;
-                blend = std::min(blend, smoothstepf(lo, hi, comp_str));
-            }
-
-            f32 cn[3];
-            for (int ch = 0; ch < 3; ++ch) {
-                f32 mv = (ch < nch) ? merged[ch] : merged[0];
-                f32 rv = (ch < nch) ? ref_only[ch] : ref_only[0];
-                cn[ch] = blend * mv + (1.f - blend) * rv;
-            }
-
             f32 outc[3];
             if (work.bake_srgb && nch >= 3) {
                 f32 wr = cn[0] * work.white_balance[0];
@@ -290,7 +216,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int nch = work.bayer_mode ? 3 : 1;
 
     report("Reference: grey + pyramid", 0.05f);
-    Image ref_grey = compute_grey_decimate(ref, work.bayer_mode);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);
@@ -313,7 +239,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         Image comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
         if (comp.h <= 0) continue;
 
-        Image comp_grey = compute_grey_decimate(comp, work.bayer_mode);
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         CovField covs = estimate_kernels(comp, work);
@@ -353,11 +279,6 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         return Image();
     }
 
-    Image ref_grey_merge = compute_grey_decimate(ref, work.bayer_mode);
-    Image edge_map = compute_edge_strength_map(ref_grey_merge);
-    ref_grey_merge = Image();
-    const Image* edge_map_ptr = &edge_map;
-
     std::vector<CachedCompFrame> cached;
     std::vector<CachedCompMeta> cached_meta;
     const bool stream_comp_raw = (n - 1) > 4; // 6+ frames: stream; ≤5 uses fast preload
@@ -391,16 +312,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int Hs = (int)std::lround(work.scale * ref.h);
     const int Ws = (int)std::lround(work.scale * ref.w);
 
-    Image rob_min;
-    bool have_rob_min = false;
-    build_robustness_min(cached, cached_meta, stream_comp_raw, rob_min, have_rob_min);
-    const Image* rob_min_ptr = have_rob_min ? &rob_min : nullptr;
-
+    const bool accumulate_r =
+        work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
     Image acc_rob;
     bool have_acc_rob = false;
     build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
-    const Image* acc_rob_ptr = (have_acc_rob && work.accumulated_robustness_merge_enabled)
-        ? &acc_rob : nullptr;
+    const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
 
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
@@ -417,9 +334,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // ~64 MB band budget — num, den, num_ref, den_comp snapshots per band.
+    // ~64 MB band budget.
     const size_t band_budget = 64u * 1024u * 1024u;
-    const size_t bytes_per_row = (size_t)Ws * nch * 4 * 4;
+    const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2;
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
     std::vector<uint16_t> row16((size_t)band_rows * Ws * 3);
@@ -427,30 +344,24 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
         Image num_band(bh, Ws, nch), den_band(bh, Ws, nch);
-        Image num_ref_band(bh, Ws, nch), den_ref_band(bh, Ws, nch);
-        Image den_comp_band(bh, Ws, nch);
 
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
                 Image comp;
                 if (!load_cached_comp_raw(cache, meta.index, comp)) continue;
-                merge_comp_band(comp, meta.flow, meta.covs, ref_covs, meta.rob, rob_min_ptr,
-                                edge_map_ptr, tile_size, num_band, den_band, y0, work);
+                merge_comp_band(comp, meta.flow, meta.covs, meta.rob, tile_size,
+                                num_band, den_band, y0, work);
                 comp = Image();
             }
         } else {
             for (const CachedCompFrame& fc : cached)
-                merge_comp_band(fc.comp, fc.flow, fc.covs, ref_covs, fc.rob, rob_min_ptr,
-                                edge_map_ptr, tile_size, num_band, den_band, y0, work);
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
+                                num_band, den_band, y0, work);
         }
 
-        den_comp_band = den_band;
-        merge_ref_only_band(ref, ref_covs, num_ref_band, den_ref_band, y0, work);
-        merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr, rob_min_ptr,
-                       edge_map_ptr);
+        merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
 
-        encode_band_rows(num_band, den_band, num_ref_band, den_ref_band, den_comp_band,
-                           rob_min_ptr, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
+        encode_band_rows(num_band, den_band, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), bh);
         report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
     }
@@ -460,7 +371,6 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     cached_meta.clear();
     ref = Image();
     ref_covs = CovField();
-    edge_map = Image();
     fs::remove_all(cache, ec);
     report("Done", 1.f);
     return preview;

@@ -5,60 +5,14 @@ namespace hhsr {
 
 namespace {
 
-static inline f32 sample_image_bilinear(const Image& img, f32 y, f32 x, int ch = 0) {
-    y = clampf(y, 0.f, (f32)(img.h - 1));
-    x = clampf(x, 0.f, (f32)(img.w - 1));
-    const int y0 = (int)std::floor(y);
-    const int x0 = (int)std::floor(x);
-    const int y1 = std::min(y0 + 1, img.h - 1);
-    const int x1 = std::min(x0 + 1, img.w - 1);
-    const f32 fy = y - y0;
-    const f32 fx = x - x0;
-    const f32 top = img.at(y0, x0, ch) * (1.f - fx) + img.at(y0, x1, ch) * fx;
-    const f32 bot = img.at(y1, x0, ch) * (1.f - fx) + img.at(y1, x1, ch) * fx;
-    return top * (1.f - fy) + bot * fy;
+static inline f32 denoise_power_merge(f32 r_acc, f32 power_max, f32 max_frame_count) {
+    return (r_acc <= max_frame_count) ? power_max : 1.f;
 }
 
-static void sample_flow_bilinear(const FlowField& flow, int tile_size, f32 grey_x, f32 grey_y,
-                                 f32& out_dx, f32& out_dy) {
-    const f32 fx = grey_x / (f32)tile_size;
-    const f32 fy = grey_y / (f32)tile_size;
-    const int px0 = std::min((int)std::floor(fx), flow.nx - 1);
-    const int py0 = std::min((int)std::floor(fy), flow.ny - 1);
-    const int px1 = std::min(px0 + 1, flow.nx - 1);
-    const int py1 = std::min(py0 + 1, flow.ny - 1);
-    const f32 wx = fx - px0;
-    const f32 wy = fy - py0;
-
-    const f32 dx00 = flow.dx(py0, px0), dy00 = flow.dy(py0, px0);
-    const f32 dx10 = flow.dx(py0, px1), dy10 = flow.dy(py0, px1);
-    const f32 dx01 = flow.dx(py1, px0), dy01 = flow.dy(py1, px0);
-    const f32 dx11 = flow.dx(py1, px1), dy11 = flow.dy(py1, px1);
-
-    const f32 top_dx = dx00 + wx * (dx10 - dx00);
-    const f32 bot_dx = dx01 + wx * (dx11 - dx01);
-    const f32 top_dy = dy00 + wx * (dy10 - dy00);
-    const f32 bot_dy = dy01 + wx * (dy11 - dy01);
-    out_dx = top_dx + wy * (bot_dx - top_dx);
-    out_dy = top_dy + wy * (bot_dy - top_dy);
+static inline int denoise_range_merge(f32 r_acc, int rad_max, f32 max_frame_count) {
+    return (r_acc <= max_frame_count) ? rad_max : 1;
 }
 
-static f32 comp_merge_weight(f32 frame_r, f32 gate_r, const Config& cfg) {
-    if (gate_r < cfg.motion_comp_hard_cutoff || frame_r < cfg.motion_comp_hard_cutoff) return 0.f;
-    const f32 feather = smoothstepf(cfg.motion_feather_low, cfg.motion_feather_high, gate_r);
-    return feather * frame_r * gate_r;
-}
-
-static f32 comp_confidence_required(f32 edge, const Config& cfg) {
-    return edge >= cfg.edge_strength_threshold
-        ? cfg.edge_comp_min_confidence
-        : cfg.flat_comp_min_confidence;
-}
-
-} // namespace
-
-// Bilinearly interpolate the 2x2 covariance field at (kmap_i, kmap_j) and
-// return its inverse [ixx, ixy, iyy]. Returns false if degenerate.
 static inline bool interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
                                   f32& ixx, f32& ixy, f32& iyy) {
     f32 frac_x = kmap_j - std::floor(kmap_j);
@@ -80,103 +34,83 @@ static inline bool interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     f32 det = xx * yy - xy * xy;
     if (det == 0.f) return false;
     f32 inv = 1.f / det;
-    ixx =  inv * yy; ixy = -inv * xy; iyy = inv * xx;
+    ixx = inv * yy;
+    ixy = -inv * xy;
+    iyy = inv * xx;
     return true;
 }
 
-// Core accumulation shared by comp and ref frames (Alg. 4 / Alg. 11).
-// num_band/den_band cover global output rows [y0, y0 + band.h).
-static void accumulate(const Image& img, const FlowField* flow, const CovField& covs,
-                       const CovField* ref_covs, const Image* robustness, const Image* rob_min,
-                       const Image* edge_map, int tile_size, Image& num, Image& den, int y0,
-                       const Config& cfg, f32 ref_rob) {
-    int band_h = num.h, Ws = num.w;
-    int lr_h = img.h, lr_w = img.w;
-    int nch = cfg.bayer_mode ? 3 : 1;
-    bool iso = (cfg.kernel == KernelShape::Iso);
-    f32 scale = cfg.scale;
-    const bool is_comp = (robustness != nullptr);
-    int up = cfg.bayer_mode ? 2 : 1;
+// Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
+static void accumulate_comp(const Image& img, const FlowField& flow, const CovField& covs,
+                            const Image& robustness, int tile_size,
+                            Image& num, Image& den, int y0, const Config& cfg) {
+    const int band_h = num.h, Ws = num.w;
+    const int lr_h = img.h, lr_w = img.w;
+    const int nch = cfg.bayer_mode ? 3 : 1;
+    const bool iso = (cfg.kernel == KernelShape::Iso);
+    const f32 scale = cfg.scale;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
-        int hr_i = y0 + local_i;
+        const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            f32 lr_x = (hr_j + 0.5f) / scale;
-            f32 lr_y = (hr_i + 0.5f) / scale;
-            const f32 grey_x = lr_x / up;
-            const f32 grey_y = lr_y / up;
+            const f32 lr_x = (hr_j + 0.5f) / scale;
+            const f32 lr_y = (hr_i + 0.5f) / scale;
 
-            f32 merge_weight = ref_rob;
-            f32 kernel_denoise_power = 1.f;
-            f32 gate_r = 1.f;
-            bool use_iso_kernel = iso;
-            if (is_comp) {
-                const f32 frame_r = sample_image_bilinear(*robustness, grey_y, grey_x);
-                gate_r = frame_r;
-                if (rob_min)
-                    gate_r = std::min(gate_r, sample_image_bilinear(*rob_min, grey_y, grey_x));
-                f32 edge = 0.f;
-                if (edge_map)
-                    edge = sample_image_bilinear(*edge_map, grey_y, grey_x);
-                const f32 conf_req = comp_confidence_required(edge, cfg);
-                if (frame_r < conf_req || gate_r < conf_req) continue;
-                merge_weight = comp_merge_weight(frame_r, gate_r, cfg);
-                if (merge_weight <= 1e-5f) continue;
-                use_iso_kernel = iso || gate_r < cfg.motion_iso_threshold;
-                // Do not widen comp kernels — uneven widen caused patchy blur next to ref-only zones.
-                kernel_denoise_power = 1.f;
-            }
+            const int px = (int)(lr_x / (f32)tile_size);
+            const int py = (int)(lr_y / (f32)tile_size);
+            const int tpy = std::min(py, flow.ny - 1);
+            const int tpx = std::min(px, flow.nx - 1);
+            const f32 flowx = flow.dx(tpy, tpx);
+            const f32 flowy = flow.dy(tpy, tpx);
 
-            f32 flowx = 0.f, flowy = 0.f;
-            if (flow) {
-                f32 fdx = 0.f, fdy = 0.f;
-                sample_flow_bilinear(*flow, tile_size, grey_x, grey_y, fdx, fdy);
-                flowx = fdx * up;
-                flowy = fdy * up;
-            }
+            const int i_r = std::min((int)lr_y, lr_h - 1);
+            const int j_r = std::min((int)lr_x, lr_w - 1);
+            const f32 local_r = robustness.at(i_r, j_r);
 
-            f32 sample_x = lr_x + flowx;
-            f32 sample_y = lr_y + flowy;
-            if (flow) {
-                if (!(sample_x >= 0 && sample_x < lr_w && sample_y >= 0 && sample_y < lr_h))
-                    continue;
-            }
+            const f32 lr_mov_x = lr_x + flowx;
+            const f32 lr_mov_y = lr_y + flowy;
+            if (!(lr_mov_x >= 0.f && lr_mov_x < (f32)lr_w &&
+                  lr_mov_y >= 0.f && lr_mov_y < (f32)lr_h))
+                continue;
 
-            const bool use_ref_kernels =
-                is_comp && cfg.merge_comp_with_ref_kernels && ref_covs != nullptr;
-            const CovField& active_covs = use_ref_kernels ? *ref_covs : covs;
-            const f32 cov_x = use_ref_kernels ? lr_x : sample_x;
-            const f32 cov_y = use_ref_kernels ? lr_y : sample_y;
-
-            f32 ixx = 0, ixy = 0, iyy = 0;
-            if (!use_iso_kernel) {
+            f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
+            if (!iso) {
                 f32 kmap_j, kmap_i;
-                if (cfg.bayer_mode) { kmap_j = cov_x / 2 - 0.5f; kmap_i = cov_y / 2 - 0.5f; }
-                else                { kmap_j = cov_x - 0.5f;     kmap_i = cov_y - 0.5f; }
-                if (!interp_inv_cov(active_covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
+                if (cfg.bayer_mode) {
+                    kmap_j = lr_mov_x / 2.f - 0.5f;
+                    kmap_i = lr_mov_y / 2.f - 0.5f;
+                } else {
+                    kmap_j = lr_mov_x - 0.5f;
+                    kmap_i = lr_mov_y - 0.5f;
+                }
+                if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }
 
-            int center_j = (int)sample_x, center_i = (int)sample_y;
-            f32 lr_mov_j = sample_x - 0.5f, lr_mov_i = sample_y - 0.5f;
+            const int center_j = (int)lr_mov_x;
+            const int center_i = (int)lr_mov_y;
+            const f32 lr_mov_j = lr_mov_x - 0.5f;
+            const f32 lr_mov_i = lr_mov_y - 0.5f;
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
                 for (int dj = -1; dj <= 1; ++dj) {
-                    int j = center_j + dj, i = center_i + di;
+                    const int j = center_j + dj;
+                    const int i = center_i + di;
                     if (!(j >= 0 && j < lr_w && i >= 0 && i < lr_h)) continue;
 
-                    int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
-                    f32 c = img.at(i, j);
+                    const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
+                    const f32 c = img.at(i, j);
 
-                    f32 dist_x = j - lr_mov_j, dist_y = i - lr_mov_i;
+                    const f32 dist_x = (f32)j - lr_mov_j;
+                    const f32 dist_y = (f32)i - lr_mov_i;
                     f32 z;
-                    if (use_iso_kernel) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
-                    else              z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
-                    z = std::max(0.f, z) / kernel_denoise_power;
-                    f32 w = std::exp(-0.5f * z);
+                    if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
+                    else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
+                    z = std::max(0.f, z);
+                    const f32 w = std::exp(-0.5f * z);
 
-                    val[channel] += w * merge_weight * c;
-                    acc[channel] += w * merge_weight;
+                    val[channel] += w * local_r * c;
+                    acc[channel] += w * local_r;
                 }
             }
             for (int ch = 0; ch < nch; ++ch) {
@@ -187,87 +121,80 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
     });
 }
 
-static f32 sample_acc_rob_nearest(const Image& acc_rob, f32 grey_y, f32 grey_x) {
-    const int y = std::min((int)std::lround(grey_y), acc_rob.h - 1);
-    const int x = std::min((int)std::lround(grey_x), acc_rob.w - 1);
-    return acc_rob.at(std::max(0, y), std::max(0, x));
-}
-
-static bool ref_only_pixel(f32 acc_r, f32 min_r, f32 edge, const Config& cfg,
-                           bool have_acc, bool have_min) {
-    if (!cfg.accumulated_robustness_merge_enabled) return false;
-    if (have_acc && acc_r <= cfg.acc_rob_frame_threshold) return true;
-    if (have_min && min_r < cfg.motion_comp_hard_cutoff) return true;
-    if (edge >= cfg.edge_strength_threshold) {
-        if (have_min && min_r < cfg.edge_ref_only_cutoff) return true;
-        if (have_acc && acc_r <= cfg.edge_acc_rob_frame_threshold) return true;
-    }
-    return false;
-}
-
-// Alg. 11: reference accumulation — uniform 3x3 steerable upscale; overwrite comp
-// wherever acc_rob or rob_min indicates single-frame fallback.
-static void accumulate_ref(const Image& img, const CovField& covs,
-                           const Image* acc_rob, const Image* rob_min, const Image* edge_map,
+// Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
+static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    int band_h = num.h, Ws = num.w;
-    int lr_h = img.h, lr_w = img.w;
-    int nch = cfg.bayer_mode ? 3 : 1;
-    bool iso = (cfg.kernel == KernelShape::Iso);
-    f32 scale = cfg.scale;
-    int up = cfg.bayer_mode ? 2 : 1;
-    constexpr int kRefRad = 1;
+    const int band_h = num.h, Ws = num.w;
+    const int lr_h = img.h, lr_w = img.w;
+    const int nch = cfg.bayer_mode ? 3 : 1;
+    const bool iso = (cfg.kernel == KernelShape::Iso);
+    const f32 scale = cfg.scale;
+
+    const bool robustness_denoise = cfg.accumulated_robustness_denoiser_enabled;
+    const int rad_max = (int)cfg.acc_rob_rad_max;
+    const f32 max_multiplier = cfg.acc_rob_max_multiplier;
+    const f32 max_frame_count = cfg.acc_rob_max_frame_count;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
-        int hr_i = y0 + local_i;
+        const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            f32 lr_x = (hr_j + 0.5f) / scale;
-            f32 lr_y = (hr_i + 0.5f) / scale;
-            const f32 grey_x = lr_x / up;
-            const f32 grey_y = lr_y / up;
+            const f32 coarse_x = (hr_j + 0.5f) / scale;
+            const f32 coarse_y = (hr_i + 0.5f) / scale;
 
             f32 local_acc_r = 0.f;
-            if (acc_rob) local_acc_r = sample_acc_rob_nearest(*acc_rob, grey_y, grey_x);
-            f32 local_min_r = 1.f;
-            if (rob_min) local_min_r = sample_image_bilinear(*rob_min, grey_y, grey_x);
-            f32 edge = 0.f;
-            if (edge_map) edge = sample_image_bilinear(*edge_map, grey_y, grey_x);
-            const bool overwrite = ref_only_pixel(local_acc_r, local_min_r, edge, cfg,
-                                                  acc_rob != nullptr, rob_min != nullptr);
+            f32 additional_denoise_power = 1.f;
+            int rad = 1;
+            if (robustness_denoise && acc_rob) {
+                const int ay = std::min((int)std::lround(coarse_y), acc_rob->h - 1);
+                const int ax = std::min((int)std::lround(coarse_x), acc_rob->w - 1);
+                local_acc_r = acc_rob->at(std::max(0, ay), std::max(0, ax));
+                additional_denoise_power =
+                    denoise_power_merge(local_acc_r, max_multiplier, max_frame_count);
+                rad = denoise_range_merge(local_acc_r, rad_max, max_frame_count);
+            }
 
-            f32 coarse_x = lr_x, coarse_y = lr_y;
-            int center_j = (int)std::lround(coarse_x);
-            int center_i = (int)std::lround(coarse_y);
-
-            f32 ixx = 0, ixy = 0, iyy = 0;
+            f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
             if (!iso) {
                 f32 kmap_j, kmap_i;
-                if (cfg.bayer_mode) { kmap_j = coarse_x / 2 - 0.5f; kmap_i = coarse_y / 2 - 0.5f; }
-                else                { kmap_j = coarse_x - 0.5f;     kmap_i = coarse_y - 0.5f; }
+                if (cfg.bayer_mode) {
+                    kmap_j = coarse_x / 2.f - 0.5f;
+                    kmap_i = coarse_y / 2.f - 0.5f;
+                } else {
+                    kmap_j = coarse_x - 0.5f;
+                    kmap_i = coarse_y - 0.5f;
+                }
                 if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }
 
+            const int center_j = (int)std::lround(coarse_x);
+            const int center_i = (int)std::lround(coarse_y);
+
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
-            for (int di = -kRefRad; di <= kRefRad; ++di) {
-                for (int dj = -kRefRad; dj <= kRefRad; ++dj) {
-                    int j = center_j + dj, i = center_i + di;
+            for (int di = -rad; di <= rad; ++di) {
+                for (int dj = -rad; dj <= rad; ++dj) {
+                    const int j = center_j + dj;
+                    const int i = center_i + di;
                     if (!(j >= 0 && j < lr_w && i >= 0 && i < lr_h)) continue;
 
-                    int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
-                    f32 c = img.at(i, j);
+                    const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
+                    const f32 c = img.at(i, j);
 
-                    f32 dist_x = j - coarse_x, dist_y = i - coarse_y;
-                    f32 z;
-                    if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
-                    else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
-                    z = std::max(0.f, z);
-                    f32 w = std::exp(-0.5f * z);
+                    const f32 dist_x = (f32)j - coarse_x;
+                    const f32 dist_y = (f32)i - coarse_y;
+                    f32 y;
+                    if (iso) y = std::max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
+                    else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
+                                                 iyy * dist_y * dist_y);
+                    y /= additional_denoise_power;
+                    const f32 w = std::exp(-0.5f * y);
 
-                    val[channel] += w * c;
+                    val[channel] += c * w;
                     acc[channel] += w;
                 }
             }
 
+            const bool overwrite =
+                robustness_denoise && acc_rob && local_acc_r < max_frame_count;
             for (int ch = 0; ch < nch; ++ch) {
                 if (overwrite) {
                     num.at(local_i, hr_j, ch) = val[ch];
@@ -281,36 +208,29 @@ static void accumulate_ref(const Image& img, const CovField& covs,
     });
 }
 
+} // namespace
+
 void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
-                     const CovField& ref_covs, const Image& robustness, const Image* rob_min,
-                     const Image* edge_map, int tile_size, Image& num_band, Image& den_band,
-                     int y0, const Config& cfg) {
-    accumulate(comp_raw, &flow, covs, &ref_covs, &robustness, rob_min, edge_map, tile_size,
-               num_band, den_band, y0, cfg, 1.f);
+                     const Image& robustness, int tile_size,
+                     Image& num_band, Image& den_band, int y0, const Config& cfg) {
+    accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg);
 }
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
-                    const Image* acc_rob, const Image* rob_min, const Image* edge_map) {
-    accumulate_ref(ref_raw, covs, acc_rob, rob_min, edge_map, num_band, den_band, y0, cfg);
-}
-
-void merge_ref_only_band(const Image& ref_raw, const CovField& covs,
-                         Image& num_band, Image& den_band, int y0, const Config& cfg) {
-    accumulate_ref(ref_raw, covs, nullptr, nullptr, nullptr, num_band, den_band, y0, cfg);
+                    const Image* acc_rob) {
+    accumulate_ref(ref_raw, covs, acc_rob, num_band, den_band, y0, cfg);
 }
 
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,
-                const CovField& ref_covs, const Image& robustness, const Image* rob_min,
-                const Image* edge_map, int tile_size, Image& num, Image& den, const Config& cfg) {
-    merge_comp_band(comp_raw, flow, covs, ref_covs, robustness, rob_min, edge_map, tile_size,
-                    num, den, 0, cfg);
+                const Image& robustness, int tile_size,
+                Image& num, Image& den, const Config& cfg) {
+    merge_comp_band(comp_raw, flow, covs, robustness, tile_size, num, den, 0, cfg);
 }
 
 void merge_ref(const Image& ref_raw, const CovField& covs,
-               Image& num, Image& den, const Config& cfg,
-               const Image* acc_rob, const Image* rob_min) {
-    merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob, rob_min, nullptr);
+               Image& num, Image& den, const Config& cfg, const Image* acc_rob) {
+    merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob);
 }
 
 } // namespace hhsr

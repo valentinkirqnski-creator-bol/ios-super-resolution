@@ -18,7 +18,7 @@ void tune_config_snr(const Image& ref_raw, Config& cfg) {
     f32 snr = (sigma > 1e-8f) ? brightness / sigma : 15.f;
     snr = clampf(snr, 6.f, 30.f);
 
-    cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.44f, 0.38f);
+    cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.33f, 0.25f);
     cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.0f, 3.0f);
     cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
     cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);

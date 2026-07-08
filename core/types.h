@@ -64,7 +64,7 @@ struct CovField {
     inline const f32* at(int y, int x) const { return &cov[((size_t)y * w + x) * 4]; }
 };
 
-enum class GreyMethod { Decimate }; // FFT-grey omitted on CPU; decimate is used throughout.
+enum class GreyMethod { FFT, Decimate };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };
 
@@ -77,6 +77,7 @@ struct CFA {
 struct Config {
     float scale = 2.0f;
     bool  bayer_mode = true;
+    GreyMethod grey_method = GreyMethod::FFT;
 
     // Noise model: sigma^2 = alpha * I + beta   (already scaled for ISO).
     float alpha = 1.80710882e-4f;
@@ -88,41 +89,19 @@ struct Config {
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     int  ica_n_iter = 3;
 
-    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Paper defaults: t=0.12, Mt=0.8.
+    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Paper / default.yaml defaults.
     bool  robustness_enabled = true;
+    bool  robustness_save_mask = true;
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
-    float r_Mt = 0.55f;
-    // Smooth comp-frame weight feather: 0 below low, 1 above high (smoothstep).
-    float motion_feather_low  = 0.55f;
-    float motion_feather_high = 0.85f;
-    // Below this gate_r (min of frame R and rob_min), comp contributes nothing.
-    float motion_comp_hard_cutoff = 0.52f;
-    // Use isotropic kernels when alignment confidence is uncertain (motion borders).
-    float motion_iso_threshold = 0.88f;
-    // Widen steerable kernels up to this factor in uncertain/motion border regions.
-    float motion_kernel_widen_max = 6.0f;
-    // Use reference gradient structure for comp accumulation (paper edge tolerance).
-    bool merge_comp_with_ref_kernels = true;
+    float r_Mt = 0.80f;
 
-    // Paper §5 / §6.2: when few frames contribute at a pixel, enforce single-frame
-    // steerable upsampling (Python accumulated_robustness_denoiser.merge).
-    bool  accumulated_robustness_merge_enabled = true;
-    float acc_rob_frame_threshold = 0.95f;
-
-    // Edge-aware comp gating: high-gradient pixels need higher alignment confidence
-    // to avoid zippering and chromatic fringing at shadow/highlight boundaries.
-    float edge_strength_threshold = 0.008f;
-    float edge_comp_min_confidence = 0.84f;
-    float flat_comp_min_confidence = 0.72f;
-    float edge_ref_only_cutoff = 0.78f;
-    float edge_acc_rob_frame_threshold = 2.5f;
-
-    // Encode-time safety: blend toward pure ref upscale when comp strength is low.
-    float encode_comp_strength_floor = 0.72f;
-    float encode_comp_blend_width = 0.18f;
-    float encode_rob_min_floor = 0.62f;
+    // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
+    bool  accumulated_robustness_denoiser_enabled = false;
+    float acc_rob_rad_max = 2.0f;
+    float acc_rob_max_multiplier = 8.0f;
+    float acc_rob_max_frame_count = 2.0f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
@@ -134,8 +113,6 @@ struct Config {
     float D_tr      = 0.014f;
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
-    float aniso_detail_floor = 1.65f;
-    float color_saturation = 1.0f;
 
     CFA cfa;
     float white_balance[3] = {1.f, 1.f, 1.f};

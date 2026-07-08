@@ -123,33 +123,6 @@ static void ica_refine(const Image& ref, const Image& grad, const Image& moving,
     });
 }
 
-// 3x3 box smooth on per-tile flow to remove tile-step discontinuities on thin edges.
-static void smooth_flow_3x3(FlowField& flow) {
-    const int ny = flow.ny, nx = flow.nx;
-    std::vector<f32> tmp(flow.flow.size());
-    for (int ty = 0; ty < ny; ++ty) {
-        for (int tx = 0; tx < nx; ++tx) {
-            f32 sdx = 0.f, sdy = 0.f;
-            int cnt = 0;
-            for (int i = -1; i <= 1; ++i) {
-                int yy = ty + i;
-                if (yy < 0 || yy >= ny) continue;
-                for (int j = -1; j <= 1; ++j) {
-                    int xx = tx + j;
-                    if (xx < 0 || xx >= nx) continue;
-                    sdx += flow.dx(yy, xx);
-                    sdy += flow.dy(yy, xx);
-                    ++cnt;
-                }
-            }
-            const f32 inv = 1.f / (f32)cnt;
-            tmp[((size_t)ty * nx + tx) * 2 + 0] = sdx * inv;
-            tmp[((size_t)ty * nx + tx) * 2 + 1] = sdy * inv;
-        }
-    }
-    flow.flow = std::move(tmp);
-}
-
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg, int tile_size) {
     Pyramid mov_pyr = build_pyramid(moving_grey, cfg.bm_factors);
@@ -181,7 +154,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // ICA refinement on the finest grey image.
     Image grad = compute_gradients(ref_grey);
     ica_refine(ref_grey, grad, moving_grey, flow, tile_size, cfg.ica_n_iter, cfg.num_threads);
-    smooth_flow_3x3(flow);
     return flow;
 }
 

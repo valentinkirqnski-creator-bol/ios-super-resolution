@@ -1,10 +1,41 @@
 #include "stages.h"
 #include "parallel.h"
+#include <cmath>
 
 namespace hhsr {
 
-// Alg. 7: guide image at half resolution. For bayer, average the two greens
-// and keep R/B, undoing white balance. For grey mode the input is the guide.
+namespace {
+
+static inline f32 dogson_quadratic(f32 x) {
+    f32 ax = std::fabs(x);
+    if (ax <= 0.5f) return -2.f * ax * ax + 1.f;
+    if (ax <= 1.5f) return ax * ax - 2.5f * ax + 1.5f;
+    return 0.f;
+}
+
+static int bayer_upscale_factor(const Image& guide_stats, int raw_h, int raw_w) {
+    if (guide_stats.h * 2 == raw_h && guide_stats.w * 2 == raw_w) return 2;
+    return 1;
+}
+
+struct NoiseCurves {
+    std::vector<f32> std_curve;
+    std::vector<f32> diff_curve;
+};
+
+static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
+    NoiseCurves nc;
+    nc.std_curve.resize(1001);
+    nc.diff_curve.resize(1001);
+    for (int i = 0; i <= 1000; ++i) {
+        f32 b = i / 1000.f;
+        f32 sigma = std::sqrt(std::max(0.f, alpha * b + beta));
+        nc.std_curve[(size_t)i] = sigma;
+        nc.diff_curve[(size_t)i] = sigma * 0.7978845608f;
+    }
+    return nc;
+}
+
 static Image compute_guide(const Image& raw, const Config& cfg) {
     if (!cfg.bayer_mode) {
         Image g(raw.h, raw.w, 1);
@@ -30,7 +61,6 @@ static Image compute_guide(const Image& raw, const Config& cfg) {
     return guide;
 }
 
-// Alg. 8: 3x3 local mean (mu) and variance (sigma^2) per channel.
 static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     means = Image(guide.h, guide.w, guide.c);
     vars  = Image(guide.h, guide.w, guide.c);
@@ -43,7 +73,8 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
                     for (int j = -1; j <= 1; ++j) {
                         int xx = (int)clampf((f32)(x + j), 0.f, (f32)(guide.w - 1));
                         f32 v = guide.at(yy, xx, ch);
-                        s += v; s2 += v * v;
+                        s += v;
+                        s2 += v * v;
                     }
                 }
                 f32 m = s / 9.f;
@@ -54,155 +85,175 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     }
 }
 
-static inline f32 bilinear(const Image& img, f32 y, f32 x, int ch) {
-    y = clampf(y, 0.f, (f32)(img.h - 1));
-    x = clampf(x, 0.f, (f32)(img.w - 1));
-    int y0 = (int)std::floor(y), x0 = (int)std::floor(x);
-    int y1 = std::min(y0 + 1, img.h - 1), x1 = std::min(x0 + 1, img.w - 1);
-    f32 fy = y - y0, fx = x - x0;
-    f32 top = img.at(y0, x0, ch) * (1 - fx) + img.at(y0, x1, ch) * fx;
-    f32 bot = img.at(y1, x0, ch) * (1 - fx) + img.at(y1, x1, ch) * fx;
-    return top * (1 - fy) + bot * fy;
+static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
+    if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
+        return 1e30f;
+    int center_y = (int)std::lround(LR_y);
+    int center_x = (int)std::lround(LR_x);
+    f32 w_acc = 0.f, buf = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        int y_ = (int)clampf((f32)(center_y + i), 0.f, (f32)(stats.h - 1));
+        f32 dy = (f32)y_ - LR_y;
+        f32 wy = dogson_quadratic(dy);
+        for (int j = -1; j <= 1; ++j) {
+            int x_ = (int)clampf((f32)(center_x + j), 0.f, (f32)(stats.w - 1));
+            f32 dx = (f32)x_ - LR_x;
+            f32 w = wy * dogson_quadratic(dx);
+            buf += stats.at(y_, x_, ch) * w;
+            w_acc += w;
+        }
+    }
+    return (w_acc > 1e-12f) ? buf / w_acc : 1e30f;
 }
 
-static void sample_flow_bilinear(const FlowField& flow, int tile_size, f32 grey_x, f32 grey_y,
-                                 f32& out_dx, f32& out_dy) {
-    const f32 fx = grey_x / (f32)tile_size;
-    const f32 fy = grey_y / (f32)tile_size;
-    const int px0 = std::min((int)std::floor(fx), flow.nx - 1);
-    const int py0 = std::min((int)std::floor(fy), flow.ny - 1);
-    const int px1 = std::min(px0 + 1, flow.nx - 1);
-    const int py1 = std::min(py0 + 1, flow.ny - 1);
-    const f32 wx = fx - px0;
-    const f32 wy = fy - py0;
+static Image upscale_warp_stats(const Image& guide_stats, int raw_h, int raw_w,
+                                bool is_ref, const FlowField* flow, int tile_size,
+                                int num_threads) {
+    const int nc = guide_stats.c;
+    const int s = bayer_upscale_factor(guide_stats, raw_h, raw_w);
+    Image out(raw_h, raw_w, nc);
 
-    const f32 dx00 = flow.dx(py0, px0), dy00 = flow.dy(py0, px0);
-    const f32 dx10 = flow.dx(py0, px1), dy10 = flow.dy(py0, px1);
-    const f32 dx01 = flow.dx(py1, px0), dy01 = flow.dy(py1, px0);
-    const f32 dx11 = flow.dx(py1, px1), dy11 = flow.dy(py1, px1);
-
-    const f32 top_dx = dx00 + wx * (dx10 - dx00);
-    const f32 bot_dx = dx01 + wx * (dx11 - dx01);
-    const f32 top_dy = dy00 + wx * (dy10 - dy00);
-    const f32 bot_dy = dy01 + wx * (dy11 - dy01);
-    out_dx = top_dx + wy * (bot_dx - top_dx);
-    out_dy = top_dy + wy * (bot_dy - top_dy);
+    parallel_rows(raw_h, num_threads, [&](int y) {
+        for (int x = 0; x < raw_w; ++x) {
+            f32 flow_x = 0.f, flow_y = 0.f;
+            if (!is_ref && flow) {
+                int patch_idy = std::min(y / tile_size, flow->ny - 1);
+                int patch_idx = std::min(x / tile_size, flow->nx - 1);
+                flow_x = flow->dx(patch_idy, patch_idx);
+                flow_y = flow->dy(patch_idy, patch_idx);
+            }
+            f32 LR_y = (y + flow_y + 0.5f) / (f32)s - 0.5f;
+            f32 LR_x = (x + flow_x + 0.5f) / (f32)s - 0.5f;
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 v = sample_dogson(guide_stats, LR_y, LR_x, ch);
+                out.at(y, x, ch) = (v > 1e20f) ? 0.f : v;
+            }
+        }
+    });
+    return out;
 }
 
-static f32 sample_tile_map_bilinear(const std::vector<f32>& map, int tny, int tnx, f32 tyf, f32 txf) {
-    const int px0 = std::min((int)std::floor(txf), tnx - 1);
-    const int py0 = std::min((int)std::floor(tyf), tny - 1);
-    const int px1 = std::min(px0 + 1, tnx - 1);
-    const int py1 = std::min(py0 + 1, tny - 1);
-    const f32 wx = txf - px0;
-    const f32 wy = tyf - py0;
-    const f32 v00 = map[(size_t)py0 * tnx + px0];
-    const f32 v10 = map[(size_t)py0 * tnx + px1];
-    const f32 v01 = map[(size_t)py1 * tnx + px0];
-    const f32 v11 = map[(size_t)py1 * tnx + px1];
-    const f32 top = v00 + wx * (v10 - v00);
-    const f32 bot = v01 + wx * (v11 - v01);
-    return top + wy * (bot - top);
+static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
+                              const NoiseCurves& nc, Image& d_sq, Image& sigma_sq) {
+    const int nc_ch = ref_means.c;
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    for (int y = 0; y < ref_means.h; ++y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
+            for (int ch = 0; ch < nc_ch; ++ch) {
+                f32 brightness = ref_means.at(y, x, ch);
+                int id_noise = (int)std::lround(1000.f * brightness);
+                id_noise = std::max(0, std::min(1000, id_noise));
+                f32 sigma_t = nc.std_curve[(size_t)id_noise];
+                f32 d_t = nc.diff_curve[(size_t)id_noise];
+                f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                f32 d_p_ = d_p.at(y, x, ch);
+                f32 d_p_sq = d_p_ * d_p_;
+                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
+            }
+            d_sq.at(y, x) = d_sq_;
+            sigma_sq.at(y, x) = sigma_sq_;
+        }
+    }
 }
+
+static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2) {
+    std::vector<f32> S((size_t)flow.ny * flow.nx, s2);
+    for (int ty = 0; ty < flow.ny; ++ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            f32 mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+            for (int i = -1; i <= 1; ++i) {
+                for (int j = -1; j <= 1; ++j) {
+                    int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    f32 fx = flow.dx(yy, xx), fy = flow.dy(yy, xx);
+                    mnx = std::min(mnx, fx);
+                    mxx = std::max(mxx, fx);
+                    mny = std::min(mny, fy);
+                    mxy = std::max(mxy, fy);
+                }
+            }
+            f32 d0 = mxx - mnx, d1 = mxy - mny;
+            S[(size_t)ty * flow.nx + tx] = (d0 * d0 + d1 * d1 > Mt * Mt) ? s1 : s2;
+        }
+    }
+    return S;
+}
+
+static Image local_min_5x5(const Image& R) {
+    Image r(R.h, R.w, 1);
+    for (int y = 0; y < R.h; ++y) {
+        for (int x = 0; x < R.w; ++x) {
+            f32 mn = 1e30f;
+            for (int i = -2; i <= 2; ++i) {
+                int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
+                for (int j = -2; j <= 2; ++j) {
+                    int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
+                    mn = std::min(mn, R.at(yy, xx));
+                }
+            }
+            r.at(y, x) = mn;
+        }
+    }
+    return r;
+}
+
+} // namespace
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     RefStats st;
     if (!cfg.robustness_enabled) return st;
     Image guide = compute_guide(ref_raw, cfg);
-    local_stats_3x3(guide, st.means, st.stds);
+    Image means, vars;
+    local_stats_3x3(guide, means, vars);
+    st.means = upscale_warp_stats(means, ref_raw.h, ref_raw.w, true, nullptr, 0, cfg.num_threads);
+    st.stds  = upscale_warp_stats(vars, ref_raw.h, ref_raw.w, true, nullptr, 0, cfg.num_threads);
     return st;
 }
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg) {
-    int gh = cfg.bayer_mode ? comp_raw.h / 2 : comp_raw.h;
-    int gw = cfg.bayer_mode ? comp_raw.w / 2 : comp_raw.w;
-
     if (!cfg.robustness_enabled) {
-        // Neutral robustness of 1 everywhere, at grey resolution.
-        Image r(gh, gw, 1);
+        Image r(comp_raw.h, comp_raw.w, 1);
         std::fill(r.data.begin(), r.data.end(), 1.f);
         return r;
     }
 
+    const NoiseCurves nc = make_noise_curves(cfg.alpha, cfg.beta);
+
     Image guide = compute_guide(comp_raw, cfg);
-    Image cmeans, cvars;
-    local_stats_3x3(guide, cmeans, cvars);
-    int nc = guide.c;
+    Image comp_means, comp_vars;
+    local_stats_3x3(guide, comp_means, comp_vars);
+    comp_means = upscale_warp_stats(comp_means, comp_raw.h, comp_raw.w, false, &flow,
+                                    tile_size, cfg.num_threads);
 
-    // Flow tile size expressed in grey pixels (alignment runs on grey).
-    int gts = std::max(1, tile_size);
-    int tny = flow.ny, tnx = flow.nx;
-
-    // Flow-irregularity map S over the tile grid (Alg. 6 penalty).
-    std::vector<f32> S((size_t)tny * tnx, cfg.r_s2);
-    for (int ty = 0; ty < tny; ++ty) {
-        for (int tx = 0; tx < tnx; ++tx) {
-            f32 mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
-            for (int i = -1; i <= 1; ++i) {
-                for (int j = -1; j <= 1; ++j) {
-                    int yy = ty + i, xx = tx + j;
-                    if (yy < 0 || yy >= tny || xx < 0 || xx >= tnx) continue;
-                    f32 fx = flow.dx(yy, xx), fy = flow.dy(yy, xx);
-                    mnx = std::min(mnx, fx); mxx = std::max(mxx, fx);
-                    mny = std::min(mny, fy); mxy = std::max(mxy, fy);
-                }
-            }
-            f32 d0 = mxx - mnx, d1 = mxy - mny;
-            S[(size_t)ty * tnx + tx] = (d0 * d0 + d1 * d1 > cfg.r_Mt * cfg.r_Mt) ? cfg.r_s1 : cfg.r_s2;
+    Image d_p(comp_raw.h, comp_raw.w, ref_stats.means.c);
+    for (int y = 0; y < comp_raw.h; ++y) {
+        for (int x = 0; x < comp_raw.w; ++x) {
+            for (int ch = 0; ch < d_p.c; ++ch)
+                d_p.at(y, x, ch) = std::fabs(ref_stats.means.at(y, x, ch) - comp_means.at(y, x, ch));
         }
     }
 
-    // R at grey resolution.
-    Image R(gh, gw, 1);
-    parallel_rows(gh, cfg.num_threads, [&](int y) {
-        for (int x = 0; x < gw; ++x) {
-            f32 fx = 0.f, fy = 0.f;
-            sample_flow_bilinear(flow, gts, (f32)x, (f32)y, fx, fy);
-            const f32 s = sample_tile_map_bilinear(S, tny, tnx, (f32)y / gts, (f32)x / gts);
+    Image d_sq, sigma_sq;
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc, d_sq, sigma_sq);
 
-            f32 d_sq = 0.f, sigma_sq = 0.f;
-            for (int c = 0; c < nc; ++c) {
-                f32 rm = ref_stats.means.at(std::min(y, ref_stats.means.h - 1),
-                                            std::min(x, ref_stats.means.w - 1), c);
-                f32 cm = bilinear(cmeans, y + fy, x + fx, c);
-                f32 dp = std::fabs(rm - cm);
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
-                // Noise model: sigma^2 = alpha*I + beta (affine). This replaces
-                // the Monte-Carlo std/diff curves of the reference with a direct
-                // evaluation (documented approximation).
-                f32 brightness = clampf(rm, 0.f, 1.f);
-                f32 sigma_t_sq = std::max(cfg.alpha * brightness + cfg.beta, 1e-8f);
-                f32 d_t_sq = sigma_t_sq;
-
-                f32 sigma_p_sq = ref_stats.stds.at(std::min(y, ref_stats.stds.h - 1),
-                                                   std::min(x, ref_stats.stds.w - 1), c);
-                sigma_sq += std::max(sigma_p_sq, sigma_t_sq);
-
-                f32 dp_sq = dp * dp;
-                f32 shrink = dp_sq / (dp_sq + d_t_sq);
-                d_sq += dp_sq * shrink * shrink;
-            }
-            R.at(y, x) = clampf(s * std::exp(-d_sq / std::max(sigma_sq, 1e-8f)) - cfg.r_t, 0.f, 1.f);
-        }
-    });
-
-    // Alg. 9: 7x7 local minimum — conservative rob_min at motion boundaries.
-    Image r_grey(gh, gw, 1);
-    for (int y = 0; y < gh; ++y) {
-        for (int x = 0; x < gw; ++x) {
-            f32 mn = 1e30f;
-            for (int i = -3; i <= 3; ++i) {
-                int yy = (int)clampf((f32)(y + i), 0.f, (f32)(gh - 1));
-                for (int j = -3; j <= 3; ++j) {
-                    int xx = (int)clampf((f32)(x + j), 0.f, (f32)(gw - 1));
-                    mn = std::min(mn, R.at(yy, xx));
-                }
-            }
-            r_grey.at(y, x) = mn;
+    Image R(comp_raw.h, comp_raw.w, 1);
+    for (int y = 0; y < comp_raw.h; ++y) {
+        for (int x = 0; x < comp_raw.w; ++x) {
+            int patch_idy = std::min(y / tile_size, flow.ny - 1);
+            int patch_idx = std::min(x / tile_size, flow.nx - 1);
+            f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
+            f32 sig = std::max(sigma_sq.at(y, x), 1e-8f);
+            R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
         }
     }
-    return r_grey;
+    return local_min_5x5(R);
 }
 
 } // namespace hhsr

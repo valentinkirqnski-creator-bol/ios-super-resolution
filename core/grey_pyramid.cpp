@@ -1,7 +1,116 @@
 #include "stages.h"
 #include "parallel.h"
+#include <complex>
+#include <cmath>
+#include <vector>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace hhsr {
+
+namespace {
+
+static int next_pow2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+static void fft1d(std::vector<std::complex<f32>>& a, bool inverse) {
+    const int n = (int)a.size();
+    int j = 0;
+    for (int i = 1; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        f32 ang = (inverse ? -2.f : 2.f) * (f32)M_PI / (f32)len;
+        std::complex<f32> wlen(std::cos(ang), std::sin(ang));
+        for (int i = 0; i < n; i += len) {
+            std::complex<f32> w(1.f, 0.f);
+            for (int k = 0; k < len / 2; ++k) {
+                std::complex<f32> u = a[i + k];
+                std::complex<f32> v = a[i + k + len / 2] * w;
+                a[i + k] = u + v;
+                a[i + k + len / 2] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+    if (inverse) {
+        for (auto& v : a) v /= (f32)n;
+    }
+}
+
+static void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse) {
+    std::vector<std::complex<f32>> row((size_t)w);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) row[(size_t)x] = data[(size_t)y * w + x];
+        fft1d(row, inverse);
+        for (int x = 0; x < w; ++x) data[(size_t)y * w + x] = row[(size_t)x];
+    }
+    row.assign((size_t)h, {0.f, 0.f});
+    for (int x = 0; x < w; ++x) {
+        for (int y = 0; y < h; ++y) row[(size_t)y] = data[(size_t)y * w + x];
+        fft1d(row, inverse);
+        for (int y = 0; y < h; ++y) data[(size_t)y * w + x] = row[(size_t)y];
+    }
+}
+
+static void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
+    auto swap_quadrant = [&](int y0, int x0, int y1, int x1, int hh, int ww) {
+        for (int y = 0; y < hh; ++y) {
+            for (int x = 0; x < ww; ++x) {
+                std::swap(data[(size_t)(y0 + y) * w + (x0 + x)],
+                          data[(size_t)(y1 + y) * w + (x1 + x)]);
+            }
+        }
+    };
+    swap_quadrant(0, 0, h / 2, w / 2, h / 2, w / 2);
+    swap_quadrant(0, w / 2, h / 2, 0, h / 2, w - w / 2);
+}
+
+} // namespace
+
+// Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT").
+Image compute_grey_fft(const Image& raw) {
+    const int h = raw.h, w = raw.w;
+    const int ph = next_pow2(h), pw = next_pow2(w);
+    std::vector<std::complex<f32>> buf((size_t)ph * pw, {0.f, 0.f});
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            buf[(size_t)y * pw + x] = {raw.at(y, x), 0.f};
+
+    fft2d(buf, ph, pw, false);
+    fftshift2d(buf, ph, pw);
+
+    const int y0 = ph / 4, x0 = pw / 4;
+    for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+            if (y < y0 || y >= ph - y0 || x < x0 || x >= pw - x0)
+                buf[(size_t)y * pw + x] = {0.f, 0.f};
+        }
+    }
+
+    fftshift2d(buf, ph, pw);
+    fft2d(buf, ph, pw, true);
+
+    Image grey(h, w, 1);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            grey.at(y, x) = buf[(size_t)y * pw + x].real();
+    return grey;
+}
+
+Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method) {
+    if (!bayer_mode) return raw;
+    if (method == GreyMethod::FFT) return compute_grey_fft(raw);
+    return compute_grey_decimate(raw, true);
+}
 
 Image compute_grey_decimate(const Image& raw, bool bayer_mode) {
     if (!bayer_mode) return raw;
@@ -63,27 +172,6 @@ Image compute_gradients(const Image& grey) {
         }
     }
     return grad;
-}
-
-Image compute_edge_strength_map(const Image& grey) {
-    Image grad = compute_gradients(grey);
-    Image edge(grey.h, grey.w, 1);
-    for (int y = 0; y < grey.h; ++y) {
-        for (int x = 0; x < grey.w; ++x) {
-            f32 mag = 0.f;
-            for (int dy = 0; dy <= 1; ++dy) {
-                for (int dx = 0; dx <= 1; ++dx) {
-                    int gy = std::min(y + dy, grad.h - 1);
-                    int gx = std::min(x + dx, grad.w - 1);
-                    f32 gxv = grad.at(gy, gx, 0);
-                    f32 gyv = grad.at(gy, gx, 1);
-                    mag = std::max(mag, std::sqrt(gxv * gxv + gyv * gyv));
-                }
-            }
-            edge.at(y, x) = mag;
-        }
-    }
-    return edge;
 }
 
 Image gaussian_blur(const Image& src, float sigma) {
