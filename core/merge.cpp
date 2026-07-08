@@ -111,8 +111,8 @@ static void accumulate(const Image& img, const FlowField* flow, const CovField& 
                 merge_weight = comp_merge_weight(frame_r, gate_r, cfg);
                 if (merge_weight <= 1e-5f) continue;
                 use_iso_kernel = iso || gate_r < cfg.motion_iso_threshold;
-                const f32 uncertain = 1.f - smoothstepf(cfg.motion_feather_low, cfg.motion_feather_high, gate_r);
-                kernel_denoise_power = 1.f + uncertain * std::max(0.f, cfg.motion_kernel_widen_max - 1.f);
+                // Do not widen comp kernels — uneven widen caused patchy blur next to ref-only zones.
+                kernel_denoise_power = 1.f;
             }
 
             f32 flowx = 0.f, flowy = 0.f;
@@ -181,23 +181,18 @@ static f32 sample_acc_rob_nearest(const Image& acc_rob, f32 grey_y, f32 grey_x) 
     return acc_rob.at(std::max(0, y), std::max(0, x));
 }
 
-static int ref_merge_radius(f32 acc_r, const Config& cfg) {
-    if (!cfg.accumulated_robustness_merge_enabled) return 1;
-    return (acc_r <= cfg.acc_rob_frame_threshold) ? cfg.acc_rob_rad_max : 1;
+static bool ref_only_pixel(f32 acc_r, f32 min_r, const Config& cfg,
+                           bool have_acc, bool have_min) {
+    if (!cfg.accumulated_robustness_merge_enabled) return false;
+    if (have_acc && acc_r <= cfg.acc_rob_frame_threshold) return true;
+    if (have_min && min_r < cfg.motion_comp_hard_cutoff) return true;
+    return false;
 }
 
-static f32 ref_cov_denoise_power(f32 acc_r, const Config& cfg) {
-    if (!cfg.accumulated_robustness_merge_enabled) return 1.f;
-    return (acc_r <= cfg.acc_rob_frame_threshold) ? cfg.acc_rob_cov_multiplier : 1.f;
-}
-
-static bool ref_overwrites_comp(f32 acc_r, const Config& cfg) {
-    return cfg.accumulated_robustness_merge_enabled &&
-           acc_r < cfg.acc_rob_frame_threshold;
-}
-
-// Alg. 11: reference accumulation with paper single-frame fallback (§5.2, §6.2).
-static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
+// Alg. 11: reference accumulation — uniform 3x3 steerable upscale; overwrite comp
+// wherever acc_rob or rob_min indicates single-frame fallback.
+static void accumulate_ref(const Image& img, const CovField& covs,
+                           const Image* acc_rob, const Image* rob_min,
                            Image& num, Image& den, int y0, const Config& cfg) {
     int band_h = num.h, Ws = num.w;
     int lr_h = img.h, lr_w = img.w;
@@ -205,6 +200,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     bool iso = (cfg.kernel == KernelShape::Iso);
     f32 scale = cfg.scale;
     int up = cfg.bayer_mode ? 2 : 1;
+    constexpr int kRefRad = 1;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         int hr_i = y0 + local_i;
@@ -216,9 +212,10 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
             f32 local_acc_r = 0.f;
             if (acc_rob) local_acc_r = sample_acc_rob_nearest(*acc_rob, grey_y, grey_x);
-            const int rad = ref_merge_radius(local_acc_r, cfg);
-            const f32 cov_denoise = ref_cov_denoise_power(local_acc_r, cfg);
-            const bool overwrite = ref_overwrites_comp(local_acc_r, cfg);
+            f32 local_min_r = 1.f;
+            if (rob_min) local_min_r = sample_image_bilinear(*rob_min, grey_y, grey_x);
+            const bool overwrite = ref_only_pixel(local_acc_r, local_min_r, cfg,
+                                                  acc_rob != nullptr, rob_min != nullptr);
 
             f32 coarse_x = lr_x, coarse_y = lr_y;
             int center_j = (int)std::lround(coarse_x);
@@ -233,8 +230,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             }
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
-            for (int di = -rad; di <= rad; ++di) {
-                for (int dj = -rad; dj <= rad; ++dj) {
+            for (int di = -kRefRad; di <= kRefRad; ++di) {
+                for (int dj = -kRefRad; dj <= kRefRad; ++dj) {
                     int j = center_j + dj, i = center_i + di;
                     if (!(j >= 0 && j < lr_w && i >= 0 && i < lr_h)) continue;
 
@@ -245,7 +242,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     f32 z;
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
-                    z = std::max(0.f, z) / cov_denoise;
+                    z = std::max(0.f, z);
                     f32 w = std::exp(-0.5f * z);
 
                     val[channel] += w * c;
@@ -275,8 +272,8 @@ void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovFiel
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
-                    const Image* acc_rob) {
-    accumulate_ref(ref_raw, covs, acc_rob, num_band, den_band, y0, cfg);
+                    const Image* acc_rob, const Image* rob_min) {
+    accumulate_ref(ref_raw, covs, acc_rob, rob_min, num_band, den_band, y0, cfg);
 }
 
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,
@@ -288,8 +285,8 @@ void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& co
 
 void merge_ref(const Image& ref_raw, const CovField& covs,
                Image& num, Image& den, const Config& cfg,
-               const Image* acc_rob) {
-    merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob);
+               const Image* acc_rob, const Image* rob_min) {
+    merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob, rob_min);
 }
 
 } // namespace hhsr

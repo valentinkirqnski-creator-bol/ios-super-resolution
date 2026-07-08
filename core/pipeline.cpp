@@ -73,7 +73,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     // --- Merge the reference frame itself (Alg. 11) ---
     report("Reference: merge", 0.92f);
-    merge_ref(ref, ref_covs, num, den, cfg, acc_rob_ptr);
+    merge_ref(ref, ref_covs, num, den, cfg, acc_rob_ptr, have_rob_min ? &rob_min : nullptr);
 
     // --- Normalize num/den (and apply white balance for bayer) ---
     report("Normalizing", 0.96f);
@@ -195,7 +195,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 merge_comp_band(burst[k], fd.flow, fd.covs, ref_covs, fd.robustness, rob_min_ptr,
                                 tile_size, num_band, den_band, y0, cfg);
             }
-            merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg, acc_rob_ptr);
+            merge_ref_band(ref, ref_covs, num_band, den_band, y0, cfg, acc_rob_ptr, rob_min_ptr);
         }
 
         auto to_srgb = [](f32 v) {

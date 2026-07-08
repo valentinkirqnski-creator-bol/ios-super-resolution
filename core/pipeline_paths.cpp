@@ -387,7 +387,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                                 tile_size, num_band, den_band, y0, work);
         }
 
-        merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
+        merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr, rob_min_ptr);
 
         encode_band_rows(num_band, den_band, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), bh);

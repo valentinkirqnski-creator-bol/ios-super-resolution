@@ -110,8 +110,6 @@ struct Config {
     // steerable upsampling (Python accumulated_robustness_denoiser.merge).
     bool  accumulated_robustness_merge_enabled = true;
     float acc_rob_frame_threshold = 1.25f;
-    int   acc_rob_rad_max = 2;
-    float acc_rob_cov_multiplier = 8.0f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
