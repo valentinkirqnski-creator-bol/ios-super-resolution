@@ -51,9 +51,22 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var shutterSlider: Double = 0.5
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
+    @Published private(set) var captureCount: Int = 0
+
+    var isCaptureLimitReached: Bool { captureCount >= Self.maxCaptureLimit }
+    var captureLimitMessage: String {
+        "Limit reached — \(Self.maxCaptureLimit) photos maximum"
+    }
+
+    override init() {
+        super.init()
+        captureCount = UserDefaults.standard.integer(forKey: Self.captureCountKey)
+    }
 
     static let minFrameCount = 2
     static let maxFrameCount = 8
+    static let maxCaptureLimit = 30
+    private static let captureCountKey = "handheldsr.captureCount"
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
@@ -429,6 +442,10 @@ final class CameraModel: NSObject, ObservableObject {
 
     func captureBurst() {
         guard !isBusy else { return }
+        guard !isCaptureLimitReached else {
+            statusText = captureLimitMessage
+            return
+        }
 
         let total = frameCount
         let lens = cameraSelection.label
@@ -683,6 +700,9 @@ final class CameraModel: NSObject, ObservableObject {
                 req.addResource(with: .photo, fileURL: url, options: opts)
             }, completionHandler: { success, _ in
                 DispatchQueue.main.async {
+                    if success {
+                        self.recordSuccessfulCapture()
+                    }
                     self.lastThumbnail = preview
                     self.finish(success: success,
                                 message: success
@@ -695,13 +715,18 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    private func recordSuccessfulCapture() {
+        captureCount = min(Self.maxCaptureLimit, captureCount + 1)
+        UserDefaults.standard.set(captureCount, forKey: Self.captureCountKey)
+    }
+
     private func finish(success: Bool, message: String) {
         DispatchQueue.main.async {
             self.isBusy = false
             self.isCapturing = false
             self.isProcessing = false
             self.progress = success ? 1 : 0
-            self.statusText = message
+            self.statusText = self.isCaptureLimitReached ? self.captureLimitMessage : message
         }
     }
 }
