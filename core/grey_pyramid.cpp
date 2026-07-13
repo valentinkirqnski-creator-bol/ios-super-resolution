@@ -20,9 +20,29 @@ static int next_pow2(int n) {
 
 } // namespace
 
-// Exposed FFT helpers (used by both grey_pyramid.cpp and align.cpp).
-void fft1d(std::vector<std::complex<f32>>& a, bool inverse) {
+void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::complex<f32>>* dft_buf) {
     const int n = (int)a.size();
+    if ((n & (n - 1)) != 0) {
+        // Slow exact DFT for non-power-of-2
+        std::vector<std::complex<f32>> local_buf;
+        std::vector<std::complex<f32>>& out = dft_buf ? *dft_buf : local_buf;
+        if (out.size() < (size_t)n) out.resize(n);
+        std::fill(out.begin(), out.begin() + n, std::complex<f32>{0.f, 0.f});
+
+        f32 dir = inverse ? 1.f : -1.f;
+        for (int k = 0; k < n; ++k) {
+            for (int t = 0; t < n; ++t) {
+                f32 ang = dir * 2.f * (f32)M_PI * k * t / n;
+                out[k] += a[t] * std::complex<f32>(std::cos(ang), std::sin(ang));
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            a[i] = inverse ? out[i] / (f32)n : out[i];
+        }
+        return;
+    }
+
+    // Fast Radix-2 FFT
     int j = 0;
     for (int i = 1; i < n; ++i) {
         int bit = n >> 1;
@@ -49,18 +69,25 @@ void fft1d(std::vector<std::complex<f32>>& a, bool inverse) {
     }
 }
 
-void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse) {
-    std::vector<std::complex<f32>> row((size_t)w);
+void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse,
+           std::vector<std::complex<f32>>* row_buf,
+           std::vector<std::complex<f32>>* dft_buf) {
+    std::vector<std::complex<f32>> local_row;
+    std::vector<std::complex<f32>>& row = row_buf ? *row_buf : local_row;
+    int max_dim = std::max(h, w);
+    if (row.size() < (size_t)max_dim) row.resize(max_dim);
+
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) row[(size_t)x] = data[(size_t)y * w + x];
-        fft1d(row, inverse);
-        for (int x = 0; x < w; ++x) data[(size_t)y * w + x] = row[(size_t)x];
+        std::vector<std::complex<f32>> slice(row.begin(), row.begin() + w);
+        fft1d(slice, inverse, dft_buf);
+        for (int x = 0; x < w; ++x) data[(size_t)y * w + x] = slice[(size_t)x];
     }
-    row.assign((size_t)h, {0.f, 0.f});
     for (int x = 0; x < w; ++x) {
         for (int y = 0; y < h; ++y) row[(size_t)y] = data[(size_t)y * w + x];
-        fft1d(row, inverse);
-        for (int y = 0; y < h; ++y) data[(size_t)y * w + x] = row[(size_t)y];
+        std::vector<std::complex<f32>> slice(row.begin(), row.begin() + h);
+        fft1d(slice, inverse, dft_buf);
+        for (int y = 0; y < h; ++y) data[(size_t)y * w + x] = slice[(size_t)y];
     }
 }
 

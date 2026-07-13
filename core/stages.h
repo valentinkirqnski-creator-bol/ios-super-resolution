@@ -10,8 +10,10 @@
 namespace hhsr {
 
 // ---- grey_pyramid.cpp (FFT helpers, exposed for align.cpp) ---------------
-void fft1d(std::vector<std::complex<f32>>& a, bool inverse);
-void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse);
+void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::complex<f32>>* dft_buf = nullptr);
+void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse,
+           std::vector<std::complex<f32>>* row_buf = nullptr,
+           std::vector<std::complex<f32>>* dft_buf = nullptr);
 void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w);
 
 // ---- grey_pyramid.cpp ---------------------------------------------------
