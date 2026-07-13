@@ -99,7 +99,7 @@ struct Config {
     float r_Mt = 0.80f;
 
     // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
-    bool  accumulated_robustness_denoiser_enabled = false;
+    bool  accumulated_robustness_denoiser_enabled = true;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
     float acc_rob_max_frame_count = 2.0f;
