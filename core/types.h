@@ -76,6 +76,7 @@ struct CFA {
 // Full pipeline configuration, mirroring configs/default.yaml.
 struct Config {
     float scale = 2.0f;
+    int   input_crop_factor = 1; // 2 = center-crop half-res before SR (3 MP -> 12 MP out).
     bool  bayer_mode = true;
     GreyMethod grey_method = GreyMethod::FFT;
 

@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
              toPath:(NSString *)outPath
               scale:(float)scale
+         cropFactor:(int)cropFactor
            progress:(nullable void (^)(NSString *stage, float fraction))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 

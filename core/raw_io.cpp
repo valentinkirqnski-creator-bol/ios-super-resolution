@@ -112,6 +112,21 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         }
     }
 
+    if (cfg.input_crop_factor > 1) {
+        const int factor = cfg.input_crop_factor;
+        int ch = (img.h / factor) & ~1;
+        int cw = (img.w / factor) & ~1;
+        int y0 = ((img.h - ch) / 2) & ~1;
+        int x0 = ((img.w - cw) / 2) & ~1;
+        if (ch > 0 && cw > 0) {
+            Image cropped(ch, cw, 1);
+            for (int y = 0; y < ch; ++y)
+                for (int x = 0; x < cw; ++x)
+                    cropped.at(y, x) = img.at(y0 + y, x0 + x);
+            img = std::move(cropped);
+        }
+    }
+
     if (crop_h > 0 && crop_w > 0 && (img.h > crop_h || img.w > crop_w)) {
         int mh = std::min(img.h, crop_h) & ~1;
         int mw = std::min(img.w, crop_w) & ~1;

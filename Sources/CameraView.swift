@@ -104,7 +104,6 @@ struct CameraView: View {
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
-                captureCountLabel
                 Text(cam.shutterLabel)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundColor(.white.opacity(0.85))
@@ -113,12 +112,6 @@ struct CameraView: View {
             shutterSliderRow
         }
         .padding(.horizontal, 20)
-    }
-
-    private var captureCountLabel: some View {
-        Text("\(cam.captureCount)/\(CameraModel.maxCaptureLimit)")
-            .font(.system(size: 11, weight: .medium, design: .rounded))
-            .foregroundColor(cam.isCaptureLimitReached ? .orange : .white.opacity(0.45))
     }
 
     private var shutterSliderRow: some View {
@@ -191,13 +184,16 @@ struct CameraView: View {
     private var backLensPicker: some View {
         HStack(spacing: 18) {
             if cam.availableCameras.contains(.ultraWide) {
-                lensChip(title: "0.5×", selected: cam.cameraSelection == .ultraWide) {
-                    cam.setCamera(.ultraWide)
+                lensChip(title: "0.5×", selected: cam.lensZoomMode == .ultraWide) {
+                    cam.setLensZoom(.ultraWide)
                 }
             }
             if cam.availableCameras.contains(.wide) {
-                lensChip(title: "1×", selected: cam.cameraSelection == .wide) {
-                    cam.setCamera(.wide)
+                lensChip(title: "1×", selected: cam.lensZoomMode == .wide1x) {
+                    cam.setLensZoom(.wide1x)
+                }
+                lensChip(title: "2×", selected: cam.lensZoomMode == .wide2x) {
+                    cam.setLensZoom(.wide2x)
                 }
             }
         }
@@ -221,14 +217,7 @@ struct CameraView: View {
 
     private var bottomPanel: some View {
         VStack(spacing: 0) {
-            if cam.isCaptureLimitReached {
-                Text(cam.captureLimitMessage)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.orange)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 6)
-            } else if cam.isProcessing, !cam.statusText.isEmpty {
+            if cam.isProcessing, !cam.statusText.isEmpty {
                 Text(cam.statusText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
@@ -273,7 +262,7 @@ struct CameraView: View {
         Button(action: { cam.captureBurst() }) {
             ZStack {
                 Circle()
-                    .strokeBorder(Color.white.opacity(cam.isCaptureLimitReached ? 0.25 : 1), lineWidth: 4)
+                    .strokeBorder(Color.white, lineWidth: 4)
                     .frame(width: 74, height: 74)
                 Circle()
                     .fill(Color.white.opacity(shutterFillOpacity))
@@ -281,11 +270,10 @@ struct CameraView: View {
                     .animation(.easeInOut(duration: 0.12), value: cam.isCapturing)
             }
         }
-        .disabled(cam.isBusy || cam.isCaptureLimitReached)
+        .disabled(cam.isBusy)
     }
 
     private var shutterFillOpacity: Double {
-        if cam.isCaptureLimitReached { return 0.2 }
         if cam.isBusy { return 0.35 }
         return 1
     }

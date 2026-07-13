@@ -20,6 +20,28 @@ enum CameraSelection: String, CaseIterable, Identifiable {
     }
 }
 
+/// Lens/zoom mode for back-camera RAW capture (2× = center crop before SR).
+enum LensZoomMode: Equatable {
+    case ultraWide
+    case wide1x
+    case wide2x
+
+    var label: String {
+        switch self {
+        case .ultraWide: return "0.5×"
+        case .wide1x: return "1×"
+        case .wide2x: return "2×"
+        }
+    }
+
+    var cropFactor: Int {
+        switch self {
+        case .wide2x: return 2
+        default: return 1
+        }
+    }
+}
+
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
 /// the multi-frame super-resolution pipeline on a background queue.
 final class CameraModel: NSObject, ObservableObject {
@@ -34,6 +56,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var lastThumbnail: UIImage?
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
+    @Published var lensZoomMode: LensZoomMode = .wide1x
     @Published var availableCameras: [CameraSelection] = [.wide]
     @Published var frameCount: Int = 4 {
         didSet {
@@ -51,22 +74,9 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var shutterSlider: Double = 0.5
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
-    @Published private(set) var captureCount: Int = 0
-
-    var isCaptureLimitReached: Bool { captureCount >= Self.maxCaptureLimit }
-    var captureLimitMessage: String {
-        "Limit reached — \(Self.maxCaptureLimit) photos maximum"
-    }
-
-    override init() {
-        super.init()
-        captureCount = UserDefaults.standard.integer(forKey: Self.captureCountKey)
-    }
 
     static let minFrameCount = 2
     static let maxFrameCount = 8
-    static let maxCaptureLimit = 30
-    private static let captureCountKey = "handheldsr.captureCount"
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session")
@@ -194,8 +204,24 @@ final class CameraModel: NSObject, ObservableObject {
             guard selection != self.activeCameraSelection else { return }
             if selection != .front { self.lastBackSelection = selection }
             self.activeCameraSelection = selection
-            DispatchQueue.main.async { self.cameraSelection = selection }
+            DispatchQueue.main.async {
+                self.cameraSelection = selection
+                if selection == .ultraWide { self.lensZoomMode = .ultraWide }
+            }
             self.switchCameraDevice(to: selection)
+        }
+    }
+
+    func setLensZoom(_ mode: LensZoomMode) {
+        guard !isBusy else { return }
+        lensZoomMode = mode
+        switch mode {
+        case .ultraWide:
+            guard availableCameras.contains(.ultraWide) else { return }
+            setCamera(.ultraWide)
+        case .wide1x, .wide2x:
+            guard availableCameras.contains(.wide) else { return }
+            setCamera(.wide)
         }
     }
 
@@ -442,13 +468,9 @@ final class CameraModel: NSObject, ObservableObject {
 
     func captureBurst() {
         guard !isBusy else { return }
-        guard !isCaptureLimitReached else {
-            statusText = captureLimitMessage
-            return
-        }
 
         let total = frameCount
-        let lens = cameraSelection.label
+        let lens = lensZoomMode.label
         isBusy = true
         isCapturing = true
         isProcessing = false
@@ -657,10 +679,12 @@ final class CameraModel: NSObject, ObservableObject {
         }
 
         var preview: UIImage?
+        let cropFactor = Int32(lensZoomMode.cropFactor)
         let ok = SRBridge.processDNGs(
             paths,
             toPath: outURL.path,
             scale: 2.0,
+            cropFactor: cropFactor,
             progress: { [weak self] stage, frac in
                 DispatchQueue.main.async {
                     self?.progress = 0.15 + frac * 0.85
@@ -700,9 +724,6 @@ final class CameraModel: NSObject, ObservableObject {
                 req.addResource(with: .photo, fileURL: url, options: opts)
             }, completionHandler: { success, _ in
                 DispatchQueue.main.async {
-                    if success {
-                        self.recordSuccessfulCapture()
-                    }
                     self.lastThumbnail = preview
                     self.finish(success: success,
                                 message: success
@@ -715,18 +736,13 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func recordSuccessfulCapture() {
-        captureCount = min(Self.maxCaptureLimit, captureCount + 1)
-        UserDefaults.standard.set(captureCount, forKey: Self.captureCountKey)
-    }
-
     private func finish(success: Bool, message: String) {
         DispatchQueue.main.async {
             self.isBusy = false
             self.isCapturing = false
             self.isProcessing = false
             self.progress = success ? 1 : 0
-            self.statusText = self.isCaptureLimitReached ? self.captureLimitMessage : message
+            self.statusText = message
         }
     }
 }

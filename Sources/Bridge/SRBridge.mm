@@ -44,6 +44,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
              toPath:(NSString *)outPath
               scale:(float)scale
+         cropFactor:(int)cropFactor
            progress:(void (^)(NSString *, float))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut {
     if (paths.count < 2) return NO;
@@ -55,6 +56,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
 
     Config cfg;
     cfg.scale = scale;
+    cfg.input_crop_factor = std::max(1, cropFactor);
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
