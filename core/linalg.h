@@ -54,7 +54,7 @@ inline void eigen_elmts_2x2(f32 m00, f32 m01, f32 m10, f32 m11,
 // Invert a symmetric 2x2 [xx,xy,yy] into [xx,xy,yy]; returns false if singular.
 inline bool invert_sym_2x2(f32 xx, f32 xy, f32 yy, f32& ixx, f32& ixy, f32& iyy) {
     f32 det = xx * yy - xy * xy;
-    if (det == 0.f) return false;
+    if (std::fabs(det) < 1e-10f) return false;
     f32 inv = 1.f / det;
     ixx =  inv * yy;
     ixy = -inv * xy;

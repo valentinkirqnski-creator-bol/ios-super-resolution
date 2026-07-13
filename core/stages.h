@@ -5,8 +5,14 @@
 //
 #include "types.h"
 #include <vector>
+#include <complex>
 
 namespace hhsr {
+
+// ---- grey_pyramid.cpp (FFT helpers, exposed for align.cpp) ---------------
+void fft1d(std::vector<std::complex<f32>>& a, bool inverse);
+void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse);
+void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w);
 
 // ---- grey_pyramid.cpp ---------------------------------------------------
 Image compute_grey_decimate(const Image& raw, bool bayer_mode);

@@ -18,7 +18,10 @@ static int next_pow2(int n) {
     return p;
 }
 
-static void fft1d(std::vector<std::complex<f32>>& a, bool inverse) {
+} // namespace
+
+// Exposed FFT helpers (used by both grey_pyramid.cpp and align.cpp).
+void fft1d(std::vector<std::complex<f32>>& a, bool inverse) {
     const int n = (int)a.size();
     int j = 0;
     for (int i = 1; i < n; ++i) {
@@ -46,7 +49,7 @@ static void fft1d(std::vector<std::complex<f32>>& a, bool inverse) {
     }
 }
 
-static void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse) {
+void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse) {
     std::vector<std::complex<f32>> row((size_t)w);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) row[(size_t)x] = data[(size_t)y * w + x];
@@ -61,7 +64,7 @@ static void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inver
     }
 }
 
-static void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
+void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
     auto swap_quadrant = [&](int y0, int x0, int y1, int x1, int hh, int ww) {
         for (int y = 0; y < hh; ++y) {
             for (int x = 0; x < ww; ++x) {
@@ -73,8 +76,6 @@ static void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
     swap_quadrant(0, 0, h / 2, w / 2, h / 2, w / 2);
     swap_quadrant(0, w / 2, h / 2, 0, h / 2, w - w / 2);
 }
-
-} // namespace
 
 // Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT").
 Image compute_grey_fft(const Image& raw) {
