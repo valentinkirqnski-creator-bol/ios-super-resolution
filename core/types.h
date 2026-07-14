@@ -109,7 +109,7 @@ struct Config {
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = false;
-    float k_detail  = 0.33f;
+    float k_detail  = 0.25f;
     float k_denoise = 4.5f;
     float D_th      = 0.005f;
     float D_tr      = 0.014f;
