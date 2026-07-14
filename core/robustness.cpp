@@ -1,5 +1,6 @@
 #include "stages.h"
 #include "parallel.h"
+#include <random>
 #include <cmath>
 
 namespace hhsr {
@@ -17,8 +18,6 @@ static int bayer_upscale_factor(const Image& guide_stats, int raw_h, int raw_w) 
     if (guide_stats.h * 2 == raw_h && guide_stats.w * 2 == raw_w) return 2;
     return 1;
 }
-
-#include <random>
 
 struct NoiseCurves {
     std::vector<f32> std_curve;
