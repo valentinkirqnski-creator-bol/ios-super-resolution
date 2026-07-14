@@ -94,7 +94,7 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Paper / default.yaml defaults.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    float r_t  = 0.25f;
+    float r_t  = 0.15f;
     float r_s1 = 0.25f;
     float r_s2 = 24.0f;
     float r_Mt = 0.80f;
