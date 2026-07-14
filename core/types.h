@@ -113,7 +113,7 @@ struct Config {
     float k_denoise = 3.5f;
     float D_th      = 0.005f;
     float D_tr      = 0.014f;
-    float k_stretch = 4.0f;
+    float k_stretch = 6.0f;
     float k_shrink  = 2.0f;
 
     CFA cfa;
