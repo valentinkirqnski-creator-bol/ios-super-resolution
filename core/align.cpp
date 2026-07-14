@@ -128,8 +128,13 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
     int search_size = 2 * R + ts;       // size of search patch
     int corr_size = 2 * R + 1;          // output correlation map size
 
-    int fft_h = search_size;
-    int fft_w = search_size;
+    auto next_pow2 = [](int x) {
+        int p = 1;
+        while (p < x) p *= 2;
+        return p;
+    };
+    int fft_h = next_pow2(search_size);
+    int fft_w = next_pow2(search_size);
 
     // Pre-allocate buffers per row to avoid massive heap fragmentation inside parallel_rows
     struct RowBuffers {
