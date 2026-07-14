@@ -56,30 +56,12 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 lr_x = (hr_j + 0.5f) / scale;
             const f32 lr_y = (hr_i + 0.5f) / scale;
 
-            f32 sx = lr_x / (f32)tile_size - 0.5f;
-            f32 sy = lr_y / (f32)tile_size - 0.5f;
-            int fx = (int)std::floor(sx);
-            int fy = (int)std::floor(sy);
-            f32 wx = sx - (f32)fx;
-            f32 wy = sy - (f32)fy;
-
-            int px0 = std::max(0, std::min(flow.nx - 1, fx));
-            int py0 = std::max(0, std::min(flow.ny - 1, fy));
-            int px1 = std::max(0, std::min(flow.nx - 1, fx + 1));
-            int py1 = std::max(0, std::min(flow.ny - 1, fy + 1));
-
-            f32 tl_x = flow.dx(py0, px0), tl_y = flow.dy(py0, px0);
-            f32 tr_x = flow.dx(py0, px1), tr_y = flow.dy(py0, px1);
-            f32 bl_x = flow.dx(py1, px0), bl_y = flow.dy(py1, px0);
-            f32 br_x = flow.dx(py1, px1), br_y = flow.dy(py1, px1);
-
-            f32 top_x = tl_x + wx * (tr_x - tl_x);
-            f32 bot_x = bl_x + wx * (br_x - bl_x);
-            f32 top_y = tl_y + wx * (tr_y - tl_y);
-            f32 bot_y = bl_y + wx * (br_y - bl_y);
-
-            const f32 flowx = top_x + wy * (bot_x - top_x);
-            const f32 flowy = top_y + wy * (bot_y - top_y);
+            const int px = (int)(lr_x / (f32)tile_size);
+            const int py = (int)(lr_y / (f32)tile_size);
+            const int tpy = std::min(py, flow.ny - 1);
+            const int tpx = std::min(px, flow.nx - 1);
+            const f32 flowx = flow.dx(tpy, tpx);
+            const f32 flowy = flow.dy(tpy, tpx);
 
             const int i_r = std::min((int)lr_y, lr_h - 1);
             const int j_r = std::min((int)lr_x, lr_w - 1);

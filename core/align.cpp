@@ -47,22 +47,22 @@ static Image compute_sobel_grady(const Image& img) {
 // Python: floor_x = x + int(alignment[0]), frac_x = modf(alignment[0])
 //         OOB => 0.0 (NOT clamp-to-edge).
 // ============================================================================
-static inline f32 bilinear_clamp_ica(const Image& img, int pixel_y, int pixel_x,
-                                     int floor_off_y, int floor_off_x,
-                                     f32 frac_x, f32 frac_y) {
+static inline f32 bilinear_oob_zero(const Image& img, int pixel_y, int pixel_x,
+                                    int floor_off_y, int floor_off_x,
+                                    f32 frac_x, f32 frac_y) {
     int floor_y = pixel_y + floor_off_y;
     int floor_x = pixel_x + floor_off_x;
 
-    floor_x = std::max(0, std::min(img.w - 1, floor_x));
-    floor_y = std::max(0, std::min(img.h - 1, floor_y));
-
-    int ceil_x = std::max(0, std::min(img.w - 1, floor_x + 1));
-    int ceil_y = std::max(0, std::min(img.h - 1, floor_y + 1));
-
-    f32 m00 = img.at(floor_y, floor_x);
-    f32 m01 = img.at(floor_y, ceil_x);
-    f32 m10 = img.at(ceil_y, floor_x);
-    f32 m11 = img.at(ceil_y, ceil_x);
+    auto sample = [&](int y, int x) -> f32 {
+        if (y >= 0 && y < img.h && x >= 0 && x < img.w) {
+            return img.at(y, x);
+        }
+        return 0.f;
+    };
+    f32 m00 = sample(floor_y, floor_x);
+    f32 m01 = sample(floor_y, floor_x + 1);
+    f32 m10 = sample(floor_y + 1, floor_x);
+    f32 m11 = sample(floor_y + 1, floor_x + 1);
 
     f32 lerpx_top = m00 + (m01 - m00) * frac_x;
     f32 lerpx_bot = m10 + (m11 - m10) * frac_x;
@@ -378,12 +378,11 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // Decompose flow via modf (matching Python: frac_x, _ = math.modf(s_alignment[0]))
-                f32 int_part_x, int_part_y;
-                f32 frac_x = std::modf(fx, &int_part_x);
-                f32 frac_y = std::modf(fy, &int_part_y);
-                int floor_off_x = (int)int_part_x;
-                int floor_off_y = (int)int_part_y;
+                // Matches Python's math.modf(alignment[0]) where negative values yield negative fractions
+                f32 frac_x = fx - std::trunc(fx);
+                int floor_off_x = (int)std::trunc(fx);
+                f32 frac_y = fy - std::trunc(fy);
+                int floor_off_y = (int)std::trunc(fy);
 
                 f32 B0 = 0.f, B1 = 0.f;
                 for (int i = 0; i < ts; ++i) {
@@ -393,9 +392,7 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                         int px = ox + j;
                         if (px >= ref.w) break;
 
-                        // Bilinear interpolation of moving at (py + flow_y, px + flow_x)
-                        // floor_x = px + int(alignment[0]), frac from modf
-                        f32 mov_interp = bilinear_clamp_ica(moving, py, px,
+                        f32 mov_interp = bilinear_oob_zero(moving, py, px,
                                                             floor_off_y, floor_off_x,
                                                             frac_x, frac_y);
 
