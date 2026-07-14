@@ -103,7 +103,8 @@ final class CameraModel: NSObject, ObservableObject {
 
     private var activeFrameCount = 4
     private var currentBurstTotal = 4
-    private var pendingCaptures = 0
+    private var capturesRequested = 0
+    private var capturesProcessed = 0
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
     private var isAppActive = true
@@ -507,12 +508,13 @@ final class CameraModel: NSObject, ObservableObject {
             self.burstDir = dir
             self.capturedDNGs.removeAll()
             self.currentBurstTotal = self.activeFrameCount
-            self.pendingCaptures = self.currentBurstTotal
+            self.capturesRequested = 0
+            self.capturesProcessed = 0
 
             self.photoOutput.maxPhotoQualityPrioritization = .speed
             self.setResponsiveCaptureEnabled(true)
             self.lockForBurst()
-            self.captureAllRaws()
+            self.captureNextRaw()
         }
     }
 
@@ -520,7 +522,8 @@ final class CameraModel: NSObject, ObservableObject {
         sessionQueue.async {
             let dir = self.burstDir
             self.burstDir = nil
-            self.pendingCaptures = 0
+            self.capturesRequested = self.currentBurstTotal
+            self.capturesProcessed = self.currentBurstTotal
             self.capturedDNGs.removeAll()
             self.restoreCaptureQuality()
             self.removeBurstDir(dir)
@@ -576,21 +579,22 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func captureAllRaws() {
+    @discardableResult
+    private func captureNextRaw() -> Bool {
+        if capturesRequested >= currentBurstTotal { return false }
         guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else {
             abortBurst("RAW capture unavailable")
-            return
+            return false
         }
-        let count = pendingCaptures
-        for _ in 0..<count {
-            let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
-            settings.flashMode = .off
-            settings.photoQualityPrioritization = .speed
-            settings.isAutoStillImageStabilizationEnabled = false
-            applyRawCaptureLimits(to: settings)
-            applyShutterSoundSuppression(to: settings)
-            photoOutput.capturePhoto(with: settings, delegate: self)
-        }
+        capturesRequested += 1
+        let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+        settings.flashMode = .off
+        settings.photoQualityPrioritization = .speed
+        settings.isAutoStillImageStabilizationEnabled = false
+        applyRawCaptureLimits(to: settings)
+        applyShutterSoundSuppression(to: settings)
+        photoOutput.capturePhoto(with: settings, delegate: self)
+        return true
     }
 
     private func restoreCaptureQuality() {
@@ -804,15 +808,25 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             }
         }
 
-        pendingCaptures -= 1
+        capturesProcessed += 1
         DispatchQueue.main.async {
-            let done = self.currentBurstTotal - self.pendingCaptures
-            self.progress = Float(done) / Float(self.currentBurstTotal) * 0.15
+            self.progress = Float(self.capturesProcessed) / Float(self.currentBurstTotal) * 0.15
         }
 
-        if pendingCaptures == 0 {
+        if capturesProcessed == currentBurstTotal {
             unlockAfterBurst()
             processingQueue.async { self.processBurst() }
+        }
+    }
+    
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
+                     error: Error?) {
+        if error != nil { return }
+        if capturesRequested < currentBurstTotal {
+            sessionQueue.async {
+                self.captureNextRaw()
+            }
         }
     }
 }
