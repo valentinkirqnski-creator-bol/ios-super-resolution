@@ -4,6 +4,7 @@ struct CameraView: View {
     @StateObject private var cam = CameraModel()
     @Environment(\.scenePhase) private var scenePhase
     @State private var showViewer = false
+    @State private var showSettings = false
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
 
@@ -47,6 +48,7 @@ struct CameraView: View {
             cam.setPreviewSuspended(open)
         }
         .sheet(isPresented: $showViewer) { resultViewer }
+        .sheet(isPresented: $showSettings) { tuningSettingsView }
     }
 
     // MARK: - Viewfinder
@@ -104,6 +106,12 @@ struct CameraView: View {
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(.white)
+                }
+                .disabled(cam.isBusy)
                 Text(cam.shutterLabel)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundColor(.white.opacity(0.85))
@@ -350,6 +358,79 @@ struct CameraView: View {
             .buttonStyle(.borderedProminent)
             .tint(.white)
         }
+    }
+
+    private var tuningSettingsView: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Robustness (Motion Rejection)")) {
+                    HStack {
+                        Text("Threshold (r_t)")
+                        Spacer()
+                        Text(String(format: "%.2f", cam.tuningParams.r_t))
+                    }
+                    Slider(value: $cam.tuningParams.r_t, in: 0.0...1.0)
+                    
+                    HStack {
+                        Text("Penalty (r_s1)")
+                        Spacer()
+                        Text(String(format: "%.2f", cam.tuningParams.r_s1))
+                    }
+                    Slider(value: $cam.tuningParams.r_s1, in: 0.0...1.0)
+                    
+                    HStack {
+                        Text("Multiplier (r_s2)")
+                        Spacer()
+                        Text(String(format: "%.1f", cam.tuningParams.r_s2))
+                    }
+                    Slider(value: $cam.tuningParams.r_s2, in: 1.0...50.0)
+                    
+                    HStack {
+                        Text("Max Robustness (r_Mt)")
+                        Spacer()
+                        Text(String(format: "%.2f", cam.tuningParams.r_Mt))
+                    }
+                    Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
+                }
+                
+                Section(header: Text("Steerable Kernels (Merging)")) {
+                    Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
+                    
+                    HStack {
+                        Text("Detail Sharpness (k_detail)")
+                        Spacer()
+                        Text(String(format: "%.2f", cam.tuningParams.k_detail))
+                    }
+                    Slider(value: $cam.tuningParams.k_detail, in: 0.1...1.0)
+                    
+                    HStack {
+                        Text("Denoise Strength (k_denoise)")
+                        Spacer()
+                        Text(String(format: "%.1f", cam.tuningParams.k_denoise))
+                    }
+                    Slider(value: $cam.tuningParams.k_denoise, in: 0.0...10.0)
+                    
+                    HStack {
+                        Text("Stretch (k_stretch)")
+                        Spacer()
+                        Text(String(format: "%.1f", cam.tuningParams.k_stretch))
+                    }
+                    Slider(value: $cam.tuningParams.k_stretch, in: 1.0...10.0)
+                }
+                
+                Section(header: Text("Fallback Denoiser")) {
+                    Toggle("Enable Motion Denoiser", isOn: $cam.tuningParams.accumulated_robustness_denoiser_enabled)
+                }
+            }
+            .navigationTitle("Algorithm Tuning")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showSettings = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 

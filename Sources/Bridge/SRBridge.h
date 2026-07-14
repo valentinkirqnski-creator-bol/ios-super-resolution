@@ -14,6 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
              toPath:(NSString *)outPath
               scale:(float)scale
          cropFactor:(int)cropFactor
+       tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
            progress:(nullable void (^)(NSString *stage, float fraction))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 

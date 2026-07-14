@@ -42,6 +42,19 @@ enum LensZoomMode: Equatable {
     }
 }
 
+/// Holds the C++ algorithm tuning parameters for live adjustments.
+struct TuningParams: Equatable {
+    var r_t: Float = 0.15
+    var r_s1: Float = 0.25
+    var r_s2: Float = 24.0
+    var r_Mt: Float = 0.80
+    var k_detail: Float = 0.30
+    var k_denoise: Float = 3.5
+    var k_stretch: Float = 6.0
+    var snr_auto_tune: Bool = true
+    var accumulated_robustness_denoiser_enabled: Bool = true
+}
+
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
 /// the multi-frame super-resolution pipeline on a background queue.
 final class CameraModel: NSObject, ObservableObject {
@@ -57,6 +70,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var lensZoomMode: LensZoomMode = .wide1x
+    @Published var tuningParams = TuningParams()
     @Published var availableCameras: [CameraSelection] = [.wide]
     @Published var frameCount: Int = 4 {
         didSet {
@@ -498,7 +512,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.photoOutput.maxPhotoQualityPrioritization = .speed
             self.setResponsiveCaptureEnabled(true)
             self.lockForBurst()
-            guard self.captureNextRaw() else { return }
+            self.captureAllRaws()
         }
     }
 
@@ -562,20 +576,21 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    @discardableResult
-    private func captureNextRaw() -> Bool {
+    private func captureAllRaws() {
         guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else {
             abortBurst("RAW capture unavailable")
-            return false
+            return
         }
-        let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
-        settings.flashMode = .off
-        settings.photoQualityPrioritization = .speed
-        settings.isAutoStillImageStabilizationEnabled = false
-        applyRawCaptureLimits(to: settings)
-        applyShutterSoundSuppression(to: settings)
-        photoOutput.capturePhoto(with: settings, delegate: self)
-        return true
+        let count = pendingCaptures
+        for _ in 0..<count {
+            let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+            settings.flashMode = .off
+            settings.photoQualityPrioritization = .speed
+            settings.isAutoStillImageStabilizationEnabled = false
+            applyRawCaptureLimits(to: settings)
+            applyShutterSoundSuppression(to: settings)
+            photoOutput.capturePhoto(with: settings, delegate: self)
+        }
     }
 
     private func restoreCaptureQuality() {
@@ -678,6 +693,18 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = 0.15
         }
 
+        let tuningDict: [String: NSNumber] = [
+            "r_t": NSNumber(value: tuningParams.r_t),
+            "r_s1": NSNumber(value: tuningParams.r_s1),
+            "r_s2": NSNumber(value: tuningParams.r_s2),
+            "r_Mt": NSNumber(value: tuningParams.r_Mt),
+            "k_detail": NSNumber(value: tuningParams.k_detail),
+            "k_denoise": NSNumber(value: tuningParams.k_denoise),
+            "k_stretch": NSNumber(value: tuningParams.k_stretch),
+            "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
+            "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled)
+        ]
+
         var preview: UIImage?
         let cropFactor = Int32(lensZoomMode.cropFactor)
         let ok = SRBridge.processDNGs(
@@ -685,6 +712,7 @@ final class CameraModel: NSObject, ObservableObject {
             toPath: outURL.path,
             scale: 2.0,
             cropFactor: cropFactor,
+            tuningParams: tuningDict,
             progress: { [weak self] stage, frac in
                 DispatchQueue.main.async {
                     self?.progress = 0.15 + frac * 0.85
@@ -782,11 +810,7 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             self.progress = Float(done) / Float(self.currentBurstTotal) * 0.15
         }
 
-        if pendingCaptures > 0 {
-            sessionQueue.async {
-                guard self.captureNextRaw() else { return }
-            }
-        } else {
+        if pendingCaptures == 0 {
             unlockAfterBurst()
             processingQueue.async { self.processBurst() }
         }

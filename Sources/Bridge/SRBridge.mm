@@ -45,6 +45,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
              toPath:(NSString *)outPath
               scale:(float)scale
          cropFactor:(int)cropFactor
+       tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
            progress:(void (^)(NSString *, float))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut {
     if (paths.count < 2) return NO;
@@ -61,6 +62,20 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
     cfg.num_threads = 0;     // all CPU cores during active processing
+
+    if (tuning) {
+        if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
+        if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
+        if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
+        if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
+        if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
+        if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
+        if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
+        if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+        if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
+            cfg.accumulated_robustness_denoiser_enabled = tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
+        }
+    }
 
     ProgressFn cb = nullptr;
     if (progress) {
