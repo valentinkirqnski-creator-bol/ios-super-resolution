@@ -94,13 +94,13 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Paper / default.yaml defaults.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    float r_t  = 0.12f;
+    float r_t  = 0.25f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
     float r_Mt = 0.80f;
 
     // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
-    bool  accumulated_robustness_denoiser_enabled = true;
+    bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
     float acc_rob_max_frame_count = 2.0f;
