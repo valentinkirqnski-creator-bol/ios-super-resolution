@@ -36,8 +36,7 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
     const int n_patches = 10000; // 10k is plenty for stable curves and very fast
     f32 scale = std::sqrt(std::max(0.f, alpha * b + beta));
     
-    // Using thread_local random engine for parallelization
-    thread_local std::mt19937 gen(1337 + (int)(b * 1000)); 
+    std::mt19937 gen(1337 + (int)(b * 1000)); 
     std::normal_distribution<f32> dist(0.f, 1.f);
 
     f64 sum_std = 0;

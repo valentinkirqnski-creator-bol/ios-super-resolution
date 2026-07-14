@@ -18,8 +18,8 @@ static Image pad_image_circular(const Image& img, int tile_size) {
         int src_y = y < img.h ? y : (y - img.h);
         for (int x = 0; x < padded.w; ++x) {
             int src_x = x < img.w ? x : (x - img.w);
-            for (int c = 0; c < img.c; ++c) {
-                padded.at(y, x, c) = img.at(src_y, src_x, c);
+            for (int ch = 0; ch < img.c; ++ch) {
+                padded.at(y, x, ch) = img.at(src_y, src_x, ch);
             }
         }
     }
