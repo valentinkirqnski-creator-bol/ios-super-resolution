@@ -95,9 +95,9 @@ struct Config {
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
     float r_t  = 0.40f;
-    float r_s1 = 2.0f;
+    float r_s1 = 1.0f;
     float r_s2 = 12.0f;
-    float r_Mt = 0.80f;
+    float r_Mt = 0.30f;
 
     // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
     bool  accumulated_robustness_denoiser_enabled = false;
