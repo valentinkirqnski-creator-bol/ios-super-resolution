@@ -167,8 +167,8 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
             int ox = tx * ts;
 
             // Round current flow to integer (matching Python's flow.round().long())
-            int flow_dx = (int)std::rint(flow.dx(ty, tx));
-            int flow_dy = (int)std::rint(flow.dy(ty, tx));
+            int flow_dx = (int)std::rint((float)flow.dx(ty, tx));
+            int flow_dy = (int)std::rint((float)flow.dy(ty, tx));
 
             // --- Prepare zero-padded reference tile ---
             std::fill(b.ref_tile_padded.begin(), b.ref_tile_padded.end(), 0.f);
@@ -291,8 +291,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
             int ox = tx * ts;
 
             // Round current flow (matching Python: round(alignments[...]))
-            int flow_dx = (int)std::rint(flow.dx(ty, tx));
-            int flow_dy = (int)std::rint(flow.dy(ty, tx));
+            int flow_dx = (int)std::rint((float)flow.dx(ty, tx));
+            int flow_dy = (int)std::rint((float)flow.dy(ty, tx));
 
             f32 best_err = 1e30f;
             int best_sx = 0, best_sy = 0;

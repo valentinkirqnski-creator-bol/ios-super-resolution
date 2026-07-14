@@ -38,8 +38,8 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
     std::mt19937 gen(1337 + (int)(b * 1000)); 
     std::normal_distribution<f32> dist(0.f, 1.f);
 
-    f64 sum_std = 0;
-    f64 sum_diff = 0;
+    double sum_std = 0;
+    double sum_diff = 0;
 
     for (int i = 0; i < n_patches; ++i) {
         f32 p1[9], p2[9];
