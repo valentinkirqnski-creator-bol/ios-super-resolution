@@ -167,8 +167,8 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
             int ox = tx * ts;
 
             // Round current flow to integer (matching Python's flow.round().long())
-            int flow_dx = (int)std::round(flow.dx(ty, tx));
-            int flow_dy = (int)std::round(flow.dy(ty, tx));
+            int flow_dx = (int)std::rint(flow.dx(ty, tx));
+            int flow_dy = (int)std::rint(flow.dy(ty, tx));
 
             // --- Prepare zero-padded reference tile ---
             std::fill(b.ref_tile_padded.begin(), b.ref_tile_padded.end(), 0.f);
@@ -291,8 +291,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
             int ox = tx * ts;
 
             // Round current flow (matching Python: round(alignments[...]))
-            int flow_dx = (int)std::round(flow.dx(ty, tx));
-            int flow_dy = (int)std::round(flow.dy(ty, tx));
+            int flow_dx = (int)std::rint(flow.dx(ty, tx));
+            int flow_dy = (int)std::rint(flow.dy(ty, tx));
 
             f32 best_err = 1e30f;
             int best_sx = 0, best_sy = 0;
@@ -440,34 +440,14 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
     int up_nx = in.nx * repeat_factor;
     FlowField upsampled(up_ny, up_nx);
 
-    // PyTorch F.interpolate bilinear, align_corners=False
-    // src_idx = (dst_idx + 0.5) / scale - 0.5
+    // Nearest-neighbour upscale by repeat_factor matching Python config default
     for (int ty = 0; ty < up_ny; ++ty) {
-        f32 sy = (ty + 0.5f) / (f32)repeat_factor - 0.5f;
-        int fy = (int)std::floor(sy);
-        f32 wy = sy - fy;
-        fy = std::max(0, std::min(in.ny - 1, fy));
-        int cy = std::max(0, std::min(in.ny - 1, fy + 1));
-
         for (int tx = 0; tx < up_nx; ++tx) {
-            f32 sx = (tx + 0.5f) / (f32)repeat_factor - 0.5f;
-            int fx = (int)std::floor(sx);
-            f32 wx = sx - fx;
-            fx = std::max(0, std::min(in.nx - 1, fx));
-            int cx = std::max(0, std::min(in.nx - 1, fx + 1));
+            int sy = std::min(in.ny - 1, ty / repeat_factor);
+            int sx = std::min(in.nx - 1, tx / repeat_factor);
 
-            f32 tl_dx = in.dx(fy, fx), tl_dy = in.dy(fy, fx);
-            f32 tr_dx = in.dx(fy, cx), tr_dy = in.dy(fy, cx);
-            f32 bl_dx = in.dx(cy, fx), bl_dy = in.dy(cy, fx);
-            f32 br_dx = in.dx(cy, cx), br_dy = in.dy(cy, cx);
-
-            f32 top_dx = tl_dx + wx * (tr_dx - tl_dx);
-            f32 bot_dx = bl_dx + wx * (br_dx - bl_dx);
-            f32 top_dy = tl_dy + wx * (tr_dy - tl_dy);
-            f32 bot_dy = bl_dy + wx * (br_dy - bl_dy);
-
-            upsampled.dx(ty, tx) = (top_dx + wy * (bot_dx - top_dx)) * (f32)upsample_factor;
-            upsampled.dy(ty, tx) = (top_dy + wy * (bot_dy - top_dy)) * (f32)upsample_factor;
+            upsampled.dx(ty, tx) = in.dx(sy, sx) * (f32)upsample_factor;
+            upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
         }
     }
 

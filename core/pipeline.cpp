@@ -9,6 +9,23 @@
 
 namespace hhsr {
 
+static Image pad_image_circular(const Image& img, int tile_size) {
+    int pad_h = (tile_size - img.h % tile_size) % tile_size;
+    int pad_w = (tile_size - img.w % tile_size) % tile_size;
+    if (pad_h == 0 && pad_w == 0) return img;
+    Image padded(img.h + pad_h, img.w + pad_w, img.c);
+    for (int y = 0; y < padded.h; ++y) {
+        int src_y = y < img.h ? y : (y - img.h);
+        for (int x = 0; x < padded.w; ++x) {
+            int src_x = x < img.w ? x : (x - img.w);
+            for (int c = 0; c < img.c; ++c) {
+                padded.at(y, x, c) = img.at(src_y, src_x, c);
+            }
+        }
+    }
+    return padded;
+}
+
 Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                     const ProgressFn& progress) {
     if (burst.empty()) return Image();
@@ -21,6 +38,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: grey + pyramid", 0.02f);
     Image ref_grey = compute_grey(ref, cfg.bayer_mode, cfg.grey_method);
+    ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, cfg.bm_factors);
 
     report("Reference: local stats", 0.05f);

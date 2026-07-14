@@ -18,21 +18,103 @@ static int bayer_upscale_factor(const Image& guide_stats, int raw_h, int raw_w) 
     return 1;
 }
 
+#include <random>
+
 struct NoiseCurves {
     std::vector<f32> std_curve;
     std::vector<f32> diff_curve;
 };
 
+static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32& xmax) {
+    f32 tol_sq = tol * tol;
+    xmin = tol_sq / 2.f * (alpha + std::sqrt(tol_sq * alpha * alpha + 4.f * beta));
+    f32 inner = std::pow(2.f + tol_sq * alpha, 2.f) - 4.f * (1.f + tol_sq * beta);
+    xmax = (2.f + tol_sq * alpha - std::sqrt(std::max(0.f, inner))) / 2.f;
+}
+
+static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean) {
+    const int n_patches = 10000; // 10k is plenty for stable curves and very fast
+    f32 scale = std::sqrt(std::max(0.f, alpha * b + beta));
+    
+    // Using thread_local random engine for parallelization
+    thread_local std::mt19937 gen(1337 + (int)(b * 1000)); 
+    std::normal_distribution<f32> dist(0.f, 1.f);
+
+    f64 sum_std = 0;
+    f64 sum_diff = 0;
+
+    for (int i = 0; i < n_patches; ++i) {
+        f32 p1[9], p2[9];
+        f32 m1 = 0, m2 = 0;
+        for (int j = 0; j < 9; ++j) {
+            f32 v1 = std::max(0.f, std::min(1.f, b + scale * dist(gen)));
+            f32 v2 = std::max(0.f, std::min(1.f, b + scale * dist(gen)));
+            p1[j] = v1; p2[j] = v2;
+            m1 += v1; m2 += v2;
+        }
+        m1 /= 9.f; m2 /= 9.f;
+        f32 s1 = 0, s2 = 0;
+        for (int j = 0; j < 9; ++j) {
+            s1 += (p1[j] - m1) * (p1[j] - m1);
+            s2 += (p2[j] - m2) * (p2[j] - m2);
+        }
+        s1 = std::sqrt(s1 / 9.f);
+        s2 = std::sqrt(s2 / 9.f);
+
+        sum_std += 0.5f * (s1 + s2);
+        sum_diff += std::abs(m1 - m2);
+    }
+    
+    diff_mean = (f32)(sum_diff / n_patches);
+    std_mean = (f32)(sum_std / n_patches);
+}
+
 static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
     nc.std_curve.resize(1001);
     nc.diff_curve.resize(1001);
-    for (int i = 0; i <= 1000; ++i) {
-        f32 b = i / 1000.f;
-        f32 sigma = std::sqrt(std::max(0.f, alpha * b + beta));
-        nc.std_curve[(size_t)i] = sigma;
-        nc.diff_curve[(size_t)i] = sigma * 0.7978845608f;
+
+    f32 xmin, xmax;
+    get_non_linearity_bound(alpha, beta, 3.f, xmin, xmax);
+
+    int imin = (int)std::ceil(xmin * 1000.f) + 1;
+    int imax = (int)std::floor(xmax * 1000.f) - 1;
+
+    if (imin > 1000 || imin >= imax) {
+        imin = 1000;
+        imax = 0;
     }
+
+    parallel_rows(1001, 0, [&](int i) {
+        if (i <= imin || i >= imax) {
+            f32 b = i / 1000.f;
+            unitary_MC(alpha, beta, b, nc.diff_curve[i], nc.std_curve[i]);
+        }
+    });
+
+    if (imin < imax && imin <= 1000 && imax >= 0) {
+        f32 s_min = nc.std_curve[imin];
+        f32 s_max = nc.std_curve[imax];
+        f32 d_min = nc.diff_curve[imin];
+        f32 d_max = nc.diff_curve[imax];
+        f32 b_min = imin / 1000.f;
+        f32 b_max = imax / 1000.f;
+
+        f32 s2_min = s_min * s_min;
+        f32 s2_max = s_max * s_max;
+        f32 d2_min = d_min * d_min;
+        f32 d2_max = d_max * d_max;
+
+        for (int i = imin + 1; i < imax; ++i) {
+            f32 b = i / 1000.f;
+            f32 norm_b = (b - b_min) / std::max(1e-6f, b_max - b_min);
+            f32 s2 = norm_b * (s2_max - s2_min) + s2_min;
+            f32 d2 = norm_b * (d2_max - d2_min) + d2_min;
+            nc.std_curve[i] = std::sqrt(std::max(0.f, s2));
+            nc.diff_curve[i] = std::sqrt(std::max(0.f, d2));
+        }
+    }
+
     return nc;
 }
 
@@ -126,7 +208,7 @@ static Image upscale_warp_stats(const Image& guide_stats, int raw_h, int raw_w,
             f32 LR_x = (x + flow_x + 0.5f) / (f32)s - 0.5f;
             for (int ch = 0; ch < nc; ++ch) {
                 f32 v = sample_dogson(guide_stats, LR_y, LR_x, ch);
-                out.at(y, x, ch) = (v > 1e20f) ? 0.f : v;
+                out.at(y, x, ch) = v;
             }
         }
     });
@@ -249,7 +331,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             int patch_idy = std::min(y / tile_size, flow.ny - 1);
             int patch_idx = std::min(x / tile_size, flow.nx - 1);
             f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
-            f32 sig = std::max(sigma_sq.at(y, x), 1e-8f);
+            f32 sig = sigma_sq.at(y, x);
             R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
         }
     }
