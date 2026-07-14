@@ -97,7 +97,7 @@ struct Config {
     float r_t  = 0.25f;
     float r_s1 = 0.25f;
     float r_s2 = 12.0f;
-    float r_Mt = 0.20f;
+    float r_Mt = 0.60f;
 
     // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
     bool  accumulated_robustness_denoiser_enabled = false;
