@@ -32,11 +32,18 @@ static inline bool interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
     f32 det = xx * yy - xy * xy;
-    if (det == 0.f) return false;
-    f32 inv = 1.f / det;
-    ixx = inv * yy;
-    ixy = -inv * xy;
-    iyy = inv * xx;
+    
+    // If the ellipse collapses (area approaches 0), fall back to an isotropic circular filter
+    if (std::abs(det) > 1e-10f) {
+        f32 inv = 1.f / det;
+        ixx = inv * yy;
+        ixy = -inv * xy;
+        iyy = inv * xx;
+    } else {
+        ixx = 1.f;
+        ixy = 0.f;
+        iyy = 1.f;
+    }
     return true;
 }
 

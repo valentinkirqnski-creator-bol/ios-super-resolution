@@ -43,7 +43,7 @@ enum LensZoomMode: Equatable {
 }
 
 /// Holds the C++ algorithm tuning parameters for live adjustments.
-struct TuningParams: Equatable {
+struct TuningParams: Equatable, Codable {
     var r_t: Float = 0.15
     var r_s1: Float = 0.25
     var r_s2: Float = 24.0
@@ -53,6 +53,9 @@ struct TuningParams: Equatable {
     var k_stretch: Float = 6.0
     var snr_auto_tune: Bool = true
     var accumulated_robustness_denoiser_enabled: Bool = true
+    var acc_rob_rad_max: Float = 2.0
+    var acc_rob_max_multiplier: Float = 8.0
+    var acc_rob_max_frame_count: Float = 2.0
 }
 
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
@@ -70,7 +73,19 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var lensZoomMode: LensZoomMode = .wide1x
-    @Published var tuningParams = TuningParams()
+    @Published var tuningParams: TuningParams = {
+        if let data = UserDefaults.standard.data(forKey: "TuningParams"),
+           let params = try? JSONDecoder().decode(TuningParams.self, from: data) {
+            return params
+        }
+        return TuningParams()
+    }() {
+        didSet {
+            if let data = try? JSONEncoder().encode(tuningParams) {
+                UserDefaults.standard.set(data, forKey: "TuningParams")
+            }
+        }
+    }
     @Published var availableCameras: [CameraSelection] = [.wide]
     @Published var frameCount: Int = 4 {
         didSet {
@@ -706,7 +721,10 @@ final class CameraModel: NSObject, ObservableObject {
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
-            "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled)
+            "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
+            "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
+            "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier),
+            "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count)
         ]
 
         var preview: UIImage?

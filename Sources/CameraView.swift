@@ -420,6 +420,29 @@ struct CameraView: View {
                 
                 Section(header: Text("Fallback Denoiser")) {
                     Toggle("Enable Motion Denoiser", isOn: $cam.tuningParams.accumulated_robustness_denoiser_enabled)
+                    
+                    if cam.tuningParams.accumulated_robustness_denoiser_enabled {
+                        HStack {
+                            Text("Radius Max")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.acc_rob_rad_max))
+                        }
+                        Slider(value: $cam.tuningParams.acc_rob_rad_max, in: 0.0...10.0)
+                        
+                        HStack {
+                            Text("Max Multiplier")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.acc_rob_max_multiplier))
+                        }
+                        Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
+                        
+                        HStack {
+                            Text("Max Frame Count")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.acc_rob_max_frame_count))
+                        }
+                        Slider(value: $cam.tuningParams.acc_rob_max_frame_count, in: 1.0...10.0)
+                    }
                 }
             }
             .navigationTitle("Algorithm Tuning")
