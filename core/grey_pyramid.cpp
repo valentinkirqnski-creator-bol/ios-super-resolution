@@ -195,8 +195,9 @@ Image compute_gradients(const Image& grey) {
             f32 tl = grey.at(y, x),     tr = grey.at(y, x + 1);
             f32 bl = grey.at(y + 1, x), br = grey.at(y + 1, x + 1);
             // gx = horizontal diff averaged over rows; gy = vertical diff.
-            grad.at(y, x, 0) = 0.5f * ((tr - tl) + (br - bl));
-            grad.at(y, x, 1) = 0.5f * ((bl - tl) + (br - tr));
+            // Using 0.25f to match the exact mathematical scaling of Python's 2x conv2d passes
+            grad.at(y, x, 0) = 0.25f * ((tr - tl) + (br - bl));
+            grad.at(y, x, 1) = 0.25f * ((bl - tl) + (br - tr));
         }
     }
     return grad;
