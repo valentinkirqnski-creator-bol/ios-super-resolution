@@ -187,7 +187,25 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 f32 cn[3] = {0, 0, 0};
                 for (int ch = 0; ch < nch; ++ch) {
                     f32 d = den_band.at(i, x, ch);
-                    cn[ch] = (d == 0.f) ? 0.f : num_band.at(i, x, ch) / d;
+                    if (d == 0.f) {
+                        if (cfg.bayer_mode && nch == 1) {
+                            int sy = (int)(gy / cfg.scale);
+                            int sx = (int)(x / cfg.scale);
+                            if ((sy & 1) != (gy & 1)) sy++;
+                            if ((sx & 1) != (x & 1)) sx++;
+                            sy = std::max(0, std::min(ref.h - 1, sy));
+                            sx = std::max(0, std::min(ref.w - 1, sx));
+                            if ((sy & 1) != (gy & 1)) sy += (sy == 0) ? 1 : -1;
+                            if ((sx & 1) != (x & 1)) sx += (sx == 0) ? 1 : -1;
+                            cn[ch] = ref.at(sy, sx);
+                        } else {
+                            int sy = std::max(0, std::min(ref.h - 1, (int)std::lround(gy / cfg.scale)));
+                            int sx = std::max(0, std::min(ref.w - 1, (int)std::lround(x / cfg.scale)));
+                            cn[ch] = ref.at(sy, sx);
+                        }
+                    } else {
+                        cn[ch] = num_band.at(i, x, ch) / d;
+                    }
                 }
                 f32 outc[3];
                 if (cfg.bake_srgb && nch >= 3) {
