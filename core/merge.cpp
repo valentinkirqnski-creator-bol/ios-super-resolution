@@ -167,6 +167,11 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 additional_denoise_power =
                     denoise_power_merge(local_acc_r, max_multiplier, max_frame_count);
                 rad = denoise_range_merge(local_acc_r, rad_max, max_frame_count);
+                
+                if (local_acc_r < max_frame_count && cfg.k_detail < 0.40f) {
+                    f32 boost = (0.40f * 0.40f) / (cfg.k_detail * cfg.k_detail);
+                    additional_denoise_power *= boost;
+                }
             }
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
