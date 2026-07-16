@@ -309,8 +309,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
     }
 
-    const int Hs = (int)std::lround(work.scale * ref.h);
-    const int Ws = (int)std::lround(work.scale * ref.w);
+    const int Hs = (int)std::nearbyint(work.scale * ref.h);
+    const int Ws = (int)std::nearbyint(work.scale * ref.w);
 
     const bool accumulate_r =
         work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;

@@ -168,8 +168,8 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
         return 1e30f;
-    int center_y = (int)std::lround(LR_y);
-    int center_x = (int)std::lround(LR_x);
+    int center_y = (int)std::nearbyint(LR_y);
+    int center_x = (int)std::nearbyint(LR_x);
     f32 w_acc = 0.f, buf = 0.f;
     for (int i = -1; i <= 1; ++i) {
         int y_ = (int)clampf((f32)(center_y + i), 0.f, (f32)(stats.h - 1));
@@ -223,7 +223,7 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
             f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
             for (int ch = 0; ch < nc_ch; ++ch) {
                 f32 brightness = ref_means.at(y, x, ch);
-                int id_noise = (int)std::lround(1000.f * brightness);
+                int id_noise = (int)std::nearbyint(1000.f * brightness);
                 id_noise = std::max(0, std::min(1000, id_noise));
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];

@@ -179,7 +179,7 @@ std::vector<uint8_t> to_rgba8(const Image& rgb) {
     auto srgb = [](f32 v) {
         v = clampf(v, 0.f, 1.f);
         v = v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
-        return (uint8_t)std::lround(clampf(v, 0.f, 1.f) * 255.f);
+        return (uint8_t)std::nearbyint(clampf(v, 0.f, 1.f) * 255.f);
     };
     for (int y = 0; y < rgb.h; ++y) {
         for (int x = 0; x < rgb.w; ++x) {

@@ -114,7 +114,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
                     z = std::max(0.f, z);
-                    const f32 w = std::exp(-0.5f * z);
+                    f32 w = std::exp(-0.5f * z);
+                    if (w == 0.0f && di == 0 && dj == 0) w = 1.0f;
 
                     val[channel] += w * local_r * c;
                     acc[channel] += w * local_r;
@@ -161,17 +162,13 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             f32 additional_denoise_power = 1.f;
             int rad = 1;
             if (robustness_denoise && acc_rob) {
-                const int ay = std::min((int)std::lround(coarse_y), acc_rob->h - 1);
-                const int ax = std::min((int)std::lround(coarse_x), acc_rob->w - 1);
+                const int ay = std::min((int)std::nearbyint(coarse_y), acc_rob->h - 1);
+                const int ax = std::min((int)std::nearbyint(coarse_x), acc_rob->w - 1);
                 local_acc_r = acc_rob->at(std::max(0, ay), std::max(0, ax));
                 additional_denoise_power =
                     denoise_power_merge(local_acc_r, max_multiplier, max_frame_count);
                 rad = denoise_range_merge(local_acc_r, rad_max, max_frame_count);
-                
-                if (local_acc_r < max_frame_count && cfg.k_detail < 0.40f) {
-                    f32 boost = (0.40f * 0.40f) / (cfg.k_detail * cfg.k_detail);
-                    additional_denoise_power *= boost;
-                }
+
             }
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
@@ -207,7 +204,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;
-                    const f32 w = std::exp(-0.5f * y);
+                    f32 w = std::exp(-0.5f * y);
+                    if (w == 0.0f && di == 0 && dj == 0) w = 1.0f;
 
                     val[channel] += c * w;
                     acc[channel] += w;

@@ -50,8 +50,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     Image acc_rob;
     bool have_acc_rob = false;
 
-    int Hs = (int)std::lround(cfg.scale * ref.h);
-    int Ws = (int)std::lround(cfg.scale * ref.w);
+    int Hs = (int)std::nearbyint(cfg.scale * ref.h);
+    int Ws = (int)std::nearbyint(cfg.scale * ref.w);
     int nch = cfg.bayer_mode ? 3 : 1;
     Image num(Hs, Ws, nch), den(Hs, Ws, nch);
 
@@ -108,6 +108,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: grey + pyramid", 0.02f);
     Image ref_grey = compute_grey(ref, cfg.bayer_mode, cfg.grey_method);
+    ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, cfg.bm_factors);
     RefStats ref_stats = init_robustness(ref, cfg);
     CovField ref_covs = estimate_kernels(ref, cfg);
@@ -142,8 +143,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 
     const Image* acc_rob_ptr = have_acc_rob ? &acc_rob : nullptr;
 
-    int Hs = (int)std::lround(cfg.scale * ref.h);
-    int Ws = (int)std::lround(cfg.scale * ref.w);
+    int Hs = (int)std::nearbyint(cfg.scale * ref.h);
+    int Ws = (int)std::nearbyint(cfg.scale * ref.w);
 
     DngStreamWriter writer;
     if (!writer.open(dng_path, Ws, Hs, "HandheldSR-x2", cfg.orientation,

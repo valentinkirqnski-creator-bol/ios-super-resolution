@@ -70,6 +70,29 @@ static inline f32 bilinear_oob_zero(const Image& img, int pixel_y, int pixel_x,
 }
 
 // ============================================================================
+// Clamp-to-edge bilinear interpolation matching Python's ica_kernel_8 exactly.
+// Python: floor_x = clamp(x + int(alignment[0]), 0, w-1)
+//         ceil_x  = clamp(floor_x + 1, 0, w-1)
+// ============================================================================
+static inline f32 bilinear_clamp_edge(const Image& img, int pixel_y, int pixel_x,
+                                      int floor_off_y, int floor_off_x,
+                                      f32 frac_x, f32 frac_y) {
+    int floor_y = std::max(0, std::min(img.h - 1, pixel_y + floor_off_y));
+    int floor_x = std::max(0, std::min(img.w - 1, pixel_x + floor_off_x));
+    int ceil_y  = std::max(0, std::min(img.h - 1, floor_y + 1));
+    int ceil_x  = std::max(0, std::min(img.w - 1, floor_x + 1));
+
+    f32 m00 = img.at(floor_y, floor_x);
+    f32 m01 = img.at(floor_y, ceil_x);
+    f32 m10 = img.at(ceil_y, floor_x);
+    f32 m11 = img.at(ceil_y, ceil_x);
+
+    f32 lerpx_top = m00 + (m01 - m00) * frac_x;
+    f32 lerpx_bot = m10 + (m11 - m10) * frac_x;
+    return lerpx_top + (lerpx_bot - lerpx_top) * frac_y;
+}
+
+// ============================================================================
 // Clamp-to-edge bilinear for L2 block matching patch extraction
 // (matches Python's extract_flow_patches which uses .clamp(0, shape-1))
 // ============================================================================
@@ -128,13 +151,8 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
     int search_size = 2 * R + ts;       // size of search patch
     int corr_size = 2 * R + 1;          // output correlation map size
 
-    auto next_pow2 = [](int x) {
-        int p = 1;
-        while (p < x) p *= 2;
-        return p;
-    };
-    int fft_h = next_pow2(search_size);
-    int fft_w = next_pow2(search_size);
+    int fft_h = search_size;
+    int fft_w = search_size;
 
     // Pre-allocate buffers per row to avoid massive heap fragmentation inside parallel_rows
     struct RowBuffers {
@@ -397,9 +415,15 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                         int px = ox + j;
                         if (px >= ref.w) break;
 
-                        f32 mov_interp = bilinear_oob_zero(moving, py, px,
-                                                            floor_off_y, floor_off_x,
-                                                            frac_x, frac_y);
+                        // Python ica_kernel_8 uses clamp-to-edge;
+                        // ica_kernel_16/32/64 use OOB→0.
+                        f32 mov_interp = (ts == 8)
+                            ? bilinear_clamp_edge(moving, py, px,
+                                                  floor_off_y, floor_off_x,
+                                                  frac_x, frac_y)
+                            : bilinear_oob_zero(moving, py, px,
+                                                floor_off_y, floor_off_x,
+                                                frac_x, frac_y);
 
                         f32 gradt = mov_interp - ref.at(py, px);
                         f32 gx = gradx.at(py, px);
