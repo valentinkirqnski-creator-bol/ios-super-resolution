@@ -376,7 +376,7 @@ struct CameraView: View {
                         Spacer()
                         Text(String(format: "%.2f", cam.tuningParams.r_s1))
                     }
-                    Slider(value: $cam.tuningParams.r_s1, in: 0.0...1.0)
+                    Slider(value: $cam.tuningParams.r_s1, in: 0.0...2.0)
                     
                     HStack {
                         Text("Multiplier (r_s2)")

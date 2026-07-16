@@ -51,19 +51,13 @@ inline void eigen_elmts_2x2(f32 m00, f32 m01, f32 m10, f32 m11,
     }
 }
 
-// Invert a symmetric 2x2 [xx,xy,yy] into [xx,xy,yy]; falls back to identity if singular.
+// Invert a symmetric 2x2 [xx,xy,yy] into [xx,xy,yy]; matches Python without fallback.
 inline void invert_sym_2x2(f32 xx, f32 xy, f32 yy, f32& ixx, f32& ixy, f32& iyy) {
     f32 det = xx * yy - xy * xy;
-    if (std::fabs(det) > 1e-10f) {
-        f32 inv = 1.f / det;
-        ixx =  inv * yy;
-        ixy = -inv * xy;
-        iyy =  inv * xx;
-    } else {
-        ixx = 1.f;
-        ixy = 0.f;
-        iyy = 1.f;
-    }
+    f32 inv = 1.f / det;
+    ixx =  inv * yy;
+    ixy = -inv * xy;
+    iyy =  inv * xx;
 }
 
 } // namespace hhsr

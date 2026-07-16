@@ -128,6 +128,15 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     });
 }
 
+static inline int python_round(float x) {
+    float floor_x = std::floor(x);
+    float frac = x - floor_x;
+    if (frac > 0.5f) return (int)floor_x + 1;
+    if (frac < 0.5f) return (int)floor_x;
+    int a = (int)floor_x;
+    return (a % 2 == 0) ? a : a + 1;
+}
+
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
@@ -145,8 +154,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            const f32 coarse_x = (hr_j + 0.5f) / scale;
-            const f32 coarse_y = (hr_i + 0.5f) / scale;
+            const f32 coarse_x = hr_j / scale;
+            const f32 coarse_y = hr_i / scale;
 
             f32 local_acc_r = 0.f;
             f32 additional_denoise_power = 1.f;
@@ -173,8 +182,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }
 
-            const int center_j = (int)std::lround(coarse_x);
-            const int center_i = (int)std::lround(coarse_y);
+            const int center_j = python_round(coarse_x);
+            const int center_i = python_round(coarse_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -rad; di <= rad; ++di) {
