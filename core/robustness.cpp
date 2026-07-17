@@ -5,12 +5,6 @@
 
 namespace hhsr {
 
-struct NoiseCurves {
-    std::vector<f32> std_curve;
-    std::vector<f32> diff_curve;
-};
-NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta);
-
 namespace {
 
 static inline f32 dogson_quadratic(f32 x) {
@@ -25,6 +19,11 @@ static int bayer_upscale_factor(const Image& guide_stats, int raw_h, int raw_w) 
     return 1;
 }
 
+struct NoiseCurves {
+    std::vector<f32> std_curve;
+    std::vector<f32> diff_curve;
+};
+
 static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32& xmax) {
     f32 tol_sq = tol * tol;
     xmin = tol_sq / 2.f * (alpha + std::sqrt(tol_sq * alpha * alpha + 4.f * beta));
@@ -33,7 +32,7 @@ static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32
 }
 
 static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean) {
-    const int n_patches = 100000; // matches Python's n_patches = int(1e5)
+    const int n_patches = 10000; // 10k is plenty for stable curves and very fast
     f32 scale = std::sqrt(std::max(0.f, alpha * b + beta));
     
     std::mt19937 gen(1337 + (int)(b * 1000)); 
@@ -68,9 +67,7 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
     std_mean = (f32)(sum_std / n_patches);
 }
 
-} // end anonymous namespace
-
-NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta) {
+static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
     nc.std_curve.resize(1001);
     nc.diff_curve.resize(1001);
@@ -200,8 +197,8 @@ static Image upscale_warp_stats(const Image& guide_stats, int raw_h, int raw_w,
         for (int x = 0; x < raw_w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
             if (!is_ref && flow) {
-                int patch_idy = std::min(y / (tile_size * s), flow->ny - 1);
-                int patch_idx = std::min(x / (tile_size * s), flow->nx - 1);
+                int patch_idy = std::min(y / tile_size, flow->ny - 1);
+                int patch_idx = std::min(x / tile_size, flow->nx - 1);
                 flow_x = flow->dx(patch_idy, patch_idx);
                 flow_y = flow->dy(patch_idy, patch_idx);
             }
@@ -284,6 +281,8 @@ static Image local_min_5x5(const Image& R) {
     return r;
 }
 
+} // namespace
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     RefStats st;
     if (!cfg.robustness_enabled) return st;
@@ -303,38 +302,19 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         return r;
     }
 
-    const NoiseCurves nc = make_noise_curves_cpu(cfg.alpha, cfg.beta);
+    const NoiseCurves nc = make_noise_curves(cfg.alpha, cfg.beta);
 
-    // Python: compute_guide → local_stats (at guide resolution) → upscale_warp_stats
-    // The guide image is half-size in bayer mode. All intermediate maps (d_p,
-    // d_sq, sigma_sq, R) are kept at GUIDE resolution, matching Python exactly.
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-
-    // upscale_warp_stats warps comp_means from guide to raw space THEN back
-    // to guide space. In Python this is done at raw-pixel precision with the
-    // flow defined on raw coordinates — same as what upscale_warp_stats does
-    // (upsample factor = 2 in bayer mode = raw resolution), then R is computed
-    // at guide pixels. We replicate by warping to raw resolution exactly as
-    // before but only reading every other pixel for the guide.
-    const int guide_h = guide.h;
-    const int guide_w = guide.w;
-
-    // Warp comp_means to raw resolution (same as before)
-    Image comp_means_raw = upscale_warp_stats(comp_means, comp_raw.h, comp_raw.w, false, &flow,
+    comp_means = upscale_warp_stats(comp_means, comp_raw.h, comp_raw.w, false, &flow,
                                     tile_size, cfg.num_threads);
 
-    const int nc_ch = ref_stats.means.c;
-
-    Image d_p(comp_raw.h, comp_raw.w, nc_ch);
+    Image d_p(comp_raw.h, comp_raw.w, ref_stats.means.c);
     for (int y = 0; y < comp_raw.h; ++y) {
         for (int x = 0; x < comp_raw.w; ++x) {
-            for (int ch = 0; ch < nc_ch; ++ch) {
-                f32 ref_v  = ref_stats.means.at(y, x, ch);
-                f32 comp_v = comp_means_raw.at(y, x, ch);
-                d_p.at(y, x, ch) = std::fabs(ref_v - comp_v);
-            }
+            for (int ch = 0; ch < d_p.c; ++ch)
+                d_p.at(y, x, ch) = std::fabs(ref_stats.means.at(y, x, ch) - comp_means.at(y, x, ch));
         }
     }
 
@@ -343,15 +323,11 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
-    // Threshold: operate at raw resolution, look up flow tile using raw coords scaled by bayer scale
-    int raw_h = comp_raw.h;
-    int raw_w = comp_raw.w;
-    int scale = cfg.bayer_mode ? 2 : 1;
-    Image R(raw_h, raw_w, 1);
-    for (int y = 0; y < raw_h; ++y) {
-        for (int x = 0; x < raw_w; ++x) {
-            int patch_idy = std::min(y / (tile_size * scale), flow.ny - 1);
-            int patch_idx = std::min(x / (tile_size * scale), flow.nx - 1);
+    Image R(comp_raw.h, comp_raw.w, 1);
+    for (int y = 0; y < comp_raw.h; ++y) {
+        for (int x = 0; x < comp_raw.w; ++x) {
+            int patch_idy = std::min(y / tile_size, flow.ny - 1);
+            int patch_idx = std::min(x / tile_size, flow.nx - 1);
             f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
             f32 sig = sigma_sq.at(y, x);
             R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
@@ -359,4 +335,5 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
     return local_min_5x5(R);
 }
+
 } // namespace hhsr

@@ -70,11 +70,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 flowx = flow.dx(tpy, tpx);
             const f32 flowy = flow.dy(tpy, tpx);
 
-            // Robustness map is at guide resolution (half-size in bayer mode),
-            // matching Python's cuda_robustness_threshold which operates on the guide image.
-            const f32 rob_scale = cfg.bayer_mode ? 0.5f : 1.0f;
-            const int i_r = std::min((int)(lr_y * rob_scale), robustness.h - 1);
-            const int j_r = std::min((int)(lr_x * rob_scale), robustness.w - 1);
+            const int i_r = std::min((int)lr_y, lr_h - 1);
+            const int j_r = std::min((int)lr_x, lr_w - 1);
             const f32 local_r = robustness.at(i_r, j_r);
 
             const f32 lr_mov_x = lr_x + flowx;
@@ -90,8 +87,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x / 2.f - 0.5f;
                     kmap_i = lr_mov_y / 2.f - 0.5f;
                 } else {
-                    kmap_j = lr_mov_x;
-                    kmap_i = lr_mov_y;
+                    kmap_j = lr_mov_x - 0.5f;
+                    kmap_i = lr_mov_y - 0.5f;
                 }
                 if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }
@@ -165,10 +162,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             f32 additional_denoise_power = 1.f;
             int rad = 1;
             if (robustness_denoise && acc_rob) {
-                // acc_rob is accumulated guide-res R maps — half-size in bayer mode
-                const f32 rob_scale = cfg.bayer_mode ? 0.5f : 1.0f;
-                const int ay = std::min((int)std::nearbyint(coarse_y * rob_scale), acc_rob->h - 1);
-                const int ax = std::min((int)std::nearbyint(coarse_x * rob_scale), acc_rob->w - 1);
+                const int ay = std::min((int)std::nearbyint(coarse_y), acc_rob->h - 1);
+                const int ax = std::min((int)std::nearbyint(coarse_x), acc_rob->w - 1);
                 local_acc_r = acc_rob->at(std::max(0, ay), std::max(0, ax));
                 additional_denoise_power =
                     denoise_power_merge(local_acc_r, max_multiplier, max_frame_count);
@@ -183,8 +178,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x / 2.f - 0.5f;
                     kmap_i = coarse_y / 2.f - 0.5f;
                 } else {
-                    kmap_j = coarse_x;
-                    kmap_i = coarse_y;
+                    kmap_j = coarse_x - 0.5f;
+                    kmap_i = coarse_y - 0.5f;
                 }
                 if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }

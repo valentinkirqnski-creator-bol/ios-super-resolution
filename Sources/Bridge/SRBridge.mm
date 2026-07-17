@@ -61,7 +61,6 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
     cfg.use_gpu = false;
-    cfg.use_metal = true;
     cfg.num_threads = 0;     // all CPU cores during active processing
 
     if (tuning) {

@@ -3,7 +3,6 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
-#include <zlib.h>
 
 namespace hhsr {
 
@@ -28,11 +27,6 @@ private:
     FILE* f_ = nullptr;
     int W_ = 0, H_ = 0;
     long rows_written_ = 0;
-
-    z_stream strm_;
-    bool z_active_ = false;
-    uint32_t strip_byte_count_offset_ = 0;
-    uint32_t compressed_size_ = 0;
 };
 
 } // namespace hhsr

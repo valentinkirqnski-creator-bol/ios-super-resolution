@@ -1,7 +1,6 @@
 #include "pipeline.h"
 #include "stages.h"
 #include "dng_writer.h"
-#include "metal/MetalContext.h"
 #include <vector>
 
 #ifdef HHSR_USE_VULKAN
@@ -101,12 +100,6 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                            const std::string& dng_path, const ProgressFn& progress,
                            int maxPreviewDim) {
     if (burst.empty()) return Image();
-
-    Image mtl_out = process_burst_metal(burst, cfg, dng_path, progress);
-    if (mtl_out.h > 0 && mtl_out.w > 0) return mtl_out;
-
-
-
     const Image& ref = burst[0];
     int n = (int)burst.size();
     int tile_size = cfg.bm_tile_sizes.empty() ? 16 : cfg.bm_tile_sizes[0];

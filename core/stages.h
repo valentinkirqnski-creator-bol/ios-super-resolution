@@ -32,11 +32,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size);
 
-// CPU flow upscaling between pyramid levels (shared with Metal host path).
-FlowField upscale_alignment_flow(const FlowField& in, int target_ny, int target_nx,
-                                 int upsample_factor, int new_tile_size,
-                                 int prev_tile_size);
-
 // ---- robustness.cpp -----------------------------------------------------
 struct RefStats { Image means; Image stds; }; // raw resolution [h, w, ch]
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);

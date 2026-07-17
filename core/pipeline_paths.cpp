@@ -6,7 +6,6 @@
 #include "snr_tuning.h"
 #include "raw_io.h"
 #include "parallel.h"
-#include "metal/MetalContext.h"
 #include <vector>
 #include <array>
 #include <filesystem>
@@ -153,7 +152,7 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
             f32 cn[3] = {0, 0, 0};
             for (int ch = 0; ch < nch; ++ch) {
                 f32 d = den_band.at(i, x, ch);
-                cn[ch] = (d > 0.f) ? num_band.at(i, x, ch) / d : 0.f;
+                cn[ch] = (d > 1e-8f) ? num_band.at(i, x, ch) / d : 0.f;
             }
             f32 outc[3];
             if (work.bake_srgb && nch >= 3) {
@@ -202,12 +201,6 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                                  const std::string& dng_path, const ProgressFn& progress,
                                  int maxPreviewDim) {
     if (paths.size() < 2) return Image();
-
-    if (cfg.use_metal) {
-        Image metal_preview;
-        if (try_process_burst_paths_metal(paths, cfg, dng_path, progress, maxPreviewDim, metal_preview))
-            return metal_preview;
-    }
 
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
@@ -329,9 +322,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
-    if (!writer.open(dng_path, Ws, Hs, model, work.orientation,
-                     work.has_color_matrix ? work.color_matrix : nullptr,
-                     work.bayer_mode ? work.white_balance : nullptr,
+    if (!writer.open(dng_path, Ws, Hs, model, work.orientation, nullptr, nullptr,
                      work.bake_srgb, make)) {
         fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
