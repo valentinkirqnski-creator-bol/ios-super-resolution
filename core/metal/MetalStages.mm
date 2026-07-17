@@ -609,7 +609,7 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
     return out_rob.h > 0;
 }
 
-static bool estimate_covs_metal(id<MTLTexture> raw, bool bayer_mode, id<MTLTexture>& covs_out,
+static bool estimate_covs_metal(id<MTLTexture> raw, bool bayer_mode, __strong id<MTLTexture>& covs_out,
                                 id<MTLBuffer> k_params_buf, MetalContext& ctx) {
     int cov_w = bayer_mode ? (int)raw.width / 2 : (int)raw.width;
     int cov_h = bayer_mode ? (int)raw.height / 2 : (int)raw.height;
