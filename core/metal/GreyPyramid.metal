@@ -50,7 +50,6 @@ kernel void kernel_downsample(
 
     int factor = params.factor;
     int radius = params.radius;
-    int ksize = params.ksize;
 
     // The output pixel (gid.x, gid.y) corresponds to the input pixel at:
     // in_x = gid.x * factor + radius

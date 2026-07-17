@@ -37,24 +37,21 @@ inline void eigen_elmts_2x2(float a, float b, float c, float d, thread float2& l
     }
 }
 
+inline float apply_vst(texture2d<float, access::read> rawTex, int rx, int ry, float alpha, float beta) {
+    rx = clamp(rx, 0, (int)rawTex.get_width() - 1);
+    ry = clamp(ry, 0, (int)rawTex.get_height() - 1);
+    float v = rawTex.read(uint2(rx, ry)).r;
+    float c = 0.375f * alpha * alpha + beta;
+    return (2.0f / alpha) * sqrt(max(0.0f, alpha * v + c));
+}
+
 kernel void kernel_compute_covariances(
     texture2d<float, access::read> rawTex [[texture(0)]],
     texture2d<float, access::write> covTex [[texture(1)]],
     constant KernelParams& params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    int w = covTex.get_width();
-    int h = covTex.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    
-    // generalized anscombe VST inline for the 4x4 raw neighborhood
-    auto vst = [&](int rx, int ry) -> float {
-        rx = clamp(rx, 0, (int)rawTex.get_width() - 1);
-        ry = clamp(ry, 0, (int)rawTex.get_height() - 1);
-        float v = rawTex.read(uint2(rx, ry)).r;
-        float c = 0.375f * params.alpha * params.alpha + params.beta;
-        return (2.0f / params.alpha) * sqrt(max(0.0f, params.alpha * v + c));
-    };
+    if (gid.x >= covTex.get_width() || gid.y >= covTex.get_height()) return;
     
     // Grey decimate locally for a 3x3 grey window to compute gradients
     float grey[3][3];
@@ -63,10 +60,10 @@ kernel void kernel_compute_covariances(
             int gx = (int)gid.x + j;
             int gy = (int)gid.y + i;
             
-            float p00 = vst(gx * 2, gy * 2);
-            float p01 = vst(gx * 2 + 1, gy * 2);
-            float p10 = vst(gx * 2, gy * 2 + 1);
-            float p11 = vst(gx * 2 + 1, gy * 2 + 1);
+            float p00 = apply_vst(rawTex, gx * 2, gy * 2, params.alpha, params.beta);
+            float p01 = apply_vst(rawTex, gx * 2 + 1, gy * 2, params.alpha, params.beta);
+            float p10 = apply_vst(rawTex, gx * 2, gy * 2 + 1, params.alpha, params.beta);
+            float p11 = apply_vst(rawTex, gx * 2 + 1, gy * 2 + 1, params.alpha, params.beta);
             
             grey[i+1][j+1] = 0.25f * (p00 + p01 + p10 + p11);
         }

@@ -41,17 +41,15 @@ kernel void kernel_local_stats_3x3(
     texture2d<float, access::write> varsTex [[texture(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    int w = guideTex.get_width();
-    int h = guideTex.get_height();
-    if (gid.x >= w || gid.y >= h) return;
+    if (gid.x >= meansTex.get_width() || gid.y >= meansTex.get_height()) return;
     
     float3 s = float3(0.0f);
     float3 s2 = float3(0.0f);
     
     for (int i = -1; i <= 1; ++i) {
-        int yy = clamp((int)gid.y + i, 0, h - 1);
+        int yy = clamp((int)gid.y + i, 0, (int)guideTex.get_height() - 1);
         for (int j = -1; j <= 1; ++j) {
-            int xx = clamp((int)gid.x + j, 0, w - 1);
+            int xx = clamp((int)gid.x + j, 0, (int)guideTex.get_width() - 1);
             float3 v = guideTex.read(uint2(xx, yy)).rgb;
             s += v;
             s2 += v * v;
@@ -190,9 +188,7 @@ kernel void kernel_robustness_threshold(
     constant ThresholdParams& params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    int w = d_sq_Tex.get_width();
-    int h = d_sq_Tex.get_height();
-    if (gid.x >= w || gid.y >= h) return;
+    if (gid.x >= R_Tex.get_width() || gid.y >= R_Tex.get_height()) return;
     
     float min_d_sq = 1e38f;
     float min_sigma_sq = 1e38f;
