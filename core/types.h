@@ -131,6 +131,7 @@ struct Config {
 
     int num_threads = 0;      // 0 => hardware_concurrency
     bool use_gpu = false;     // opt-in Vulkan compute merge (experimental)
+    bool use_metal = false;   // iOS: GPU path for align/robustness/merge (falls back to CPU)
 };
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }

@@ -26,6 +26,8 @@ void MetalContext::init() {
         _library = [_device newDefaultLibrary];
         if (!_library) {
             std::cerr << "Warning: Could not load default Metal library. Make sure .metal files are compiled into the app." << std::endl;
+            _available = false;
+            return;
         }
         _available = true;
         std::cout << "Metal backend initialized. Device: " << [[_device name] UTF8String] << std::endl;
@@ -183,6 +185,40 @@ id<MTLTexture> MetalContext::create_empty_texture(int w, int h, int channels) {
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     desc.storageMode = MTLStorageModeShared;
     return [_device newTextureWithDescriptor:desc];
+}
+
+id<MTLTexture> MetalContext::create_texture_from_flow(const FlowField& f) {
+    if (!_available || f.nx <= 0 || f.ny <= 0) return nil;
+    Image flow_img(f.ny, f.nx, 2);
+    for (int ty = 0; ty < f.ny; ++ty) {
+        for (int tx = 0; tx < f.nx; ++tx) {
+            flow_img.at(ty, tx, 0) = f.dx(ty, tx);
+            flow_img.at(ty, tx, 1) = f.dy(ty, tx);
+        }
+    }
+    return create_texture(flow_img);
+}
+
+void MetalContext::read_flow_texture(id<MTLTexture> tex, FlowField& f) {
+    if (!_available || !tex) return;
+    Image img;
+    read_texture(tex, img);
+    if (img.h <= 0 || img.w <= 0) return;
+    f = FlowField(img.h, img.w);
+    for (int ty = 0; ty < f.ny; ++ty) {
+        for (int tx = 0; tx < f.nx; ++tx) {
+            f.dx(ty, tx) = img.at(ty, tx, 0);
+            f.dy(ty, tx) = img.at(ty, tx, 1);
+        }
+    }
+}
+
+bool MetalContext::validate_pipelines(const std::vector<std::string>& names) {
+    if (!_available || !_library) return false;
+    for (const std::string& name : names) {
+        if (!get_pipeline_state(name)) return false;
+    }
+    return true;
 }
 #endif
 

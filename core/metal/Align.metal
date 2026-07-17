@@ -33,9 +33,10 @@ kernel void kernel_compute_sobel(
 // upscale_flow (Nearest Neighbor matching Python flow.repeat_interleave)
 // --------------------------------------------------------------------------------
 struct UpscaleParams {
-    int factor;
-    int prev_ts;
-    int ts;
+    int repeat_factor;
+    int upsample_factor;
+    int up_ny;
+    int up_nx;
 };
 
 kernel void kernel_upscale_flow(
@@ -45,17 +46,15 @@ kernel void kernel_upscale_flow(
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= outFlow.get_width() || gid.y >= outFlow.get_height()) return;
-    
-    // Nearest neighbor sampling matching Python's repeat_interleave
-    // scale_factor = prev_ts / (ts * factor)
-    float scale = (float)params.prev_ts / (float)(params.ts * params.factor);
-    
-    uint2 in_gid = uint2(gid.x / params.factor, gid.y / params.factor);
-    in_gid.x = min(in_gid.x, (uint)(inFlow.get_width() - 1));
-    in_gid.y = min(in_gid.y, (uint)(inFlow.get_height() - 1));
-    
-    float2 f = inFlow.read(in_gid).rg;
-    outFlow.write(float4(f.x * scale, f.y * scale, 0, 1), gid);
+
+    float2 out_v = float2(0.0f, 0.0f);
+    if ((int)gid.y < params.up_ny && (int)gid.x < params.up_nx) {
+        int sy = min((int)gid.y / params.repeat_factor, (int)inFlow.get_height() - 1);
+        int sx = min((int)gid.x / params.repeat_factor, (int)inFlow.get_width() - 1);
+        float2 f = inFlow.read(uint2(sx, sy)).rg;
+        out_v = float2(f.x * (float)params.upsample_factor, f.y * (float)params.upsample_factor);
+    }
+    outFlow.write(float4(out_v.x, out_v.y, 0, 1), gid);
 }
 
 // --------------------------------------------------------------------------------

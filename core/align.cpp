@@ -457,9 +457,9 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
 //   upsampled *= upsample_factor
 //   # zero-pad if size mismatch
 // ============================================================================
-static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
-                               int upsample_factor, int new_tile_size,
-                               int prev_tile_size) {
+FlowField upscale_alignment_flow(const FlowField& in, int target_ny, int target_nx,
+                                 int upsample_factor, int new_tile_size,
+                                 int prev_tile_size) {
     // Compute repeat factor matching Python
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -538,7 +538,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1]
                           : ts;
-            flow = upscale_flow(flow, ny, nx, upsample_factor, ts, prev_ts);
+            flow = upscale_alignment_flow(flow, ny, nx, upsample_factor, ts, prev_ts);
         }
 
         // Determine metric for this level

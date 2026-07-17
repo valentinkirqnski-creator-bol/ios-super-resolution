@@ -17,6 +17,7 @@ settings:
     SWIFT_OBJC_BRIDGING_HEADER: "Sources/Bridge/HandheldSR-Bridging-Header.h"
     # Portable C++ core (vendored into this repo) + vendored LibRaw headers.
     HEADER_SEARCH_PATHS:
+      - "$(inherited)"
       - "$(SRCROOT)"
       - "$(SRCROOT)/vendor/LibRaw"
       - "$(SRCROOT)/vendor/LibRaw/libraw"
@@ -24,10 +25,12 @@ settings:
       - "$(inherited)"
       - "HAVE_LIBRAW=1"
       - "LIBRAW_NODLL=1"
+      - "USE_ZLIB=1"
     # LibRaw emits many benign warnings; don't fail the build on them.
     OTHER_CFLAGS: "-w"
     OTHER_CPLUSPLUSFLAGS: "-w"
-    OTHER_LDFLAGS: "-lz"
+    OTHER_LDFLAGS:
+      - "$(inherited)"
 
 targets:
   HandheldSRCamera:
@@ -60,6 +63,7 @@ targets:
         optional: true
     dependencies:
       # Link system SDK frameworks only — do not embed from $(SRCROOT).
+      - sdk: libz.tbd
       - sdk: Metal.framework
     info:
       path: Sources/Info.plist

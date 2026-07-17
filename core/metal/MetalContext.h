@@ -55,7 +55,10 @@ public:
     // Texture helpers
     id<MTLTexture> create_texture(const Image& img);
     id<MTLTexture> create_empty_texture(int w, int h, int channels = 1);
+    id<MTLTexture> create_texture_from_flow(const FlowField& f);
     void read_texture(id<MTLTexture> tex, Image& img);
+    void read_flow_texture(id<MTLTexture> tex, FlowField& f);
+    bool validate_pipelines(const std::vector<std::string>& names);
 #endif
 
 private:
@@ -75,7 +78,12 @@ private:
     bool _available;
 };
 
-// Main entry point for the Metal pipeline (called from pipeline.cpp)
+// Disk-backed Metal path (streaming frames from disk). Returns true on success.
+bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const Config& cfg,
+                                   const std::string& dng_path, const ProgressFn& progress,
+                                   int maxPreviewDim, Image& out_preview);
+
+// In-memory Metal path (called from pipeline.cpp).
 Image process_burst_metal(const std::vector<Image>& burst, const Config& cfg,
                           const std::string& dng_path, const ProgressFn& progress);
 
