@@ -284,8 +284,6 @@ static Image local_min_5x5(const Image& R) {
     return r;
 }
 
-} // namespace
-
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     RefStats st;
     if (!cfg.robustness_enabled) return st;
