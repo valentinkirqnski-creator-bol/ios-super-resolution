@@ -325,3 +325,160 @@ kernel void kernel_ica_refine(
     
     outFlow.write(float4(flow.x, flow.y, 0, 1), gid);
 }
+ 
+ // --------------------------------------------------------------------------------
+// kernel_block_match_L2_FFT
+// Custom 24-point 2D DFT native Metal implementation matching PyTorch's irfft2
+// --------------------------------------------------------------------------------
+kernel void kernel_block_match_L2_FFT(
+    texture2d<float, access::read> refTex [[texture(0)]],
+    texture2d<float, access::read> movTex [[texture(1)]],
+    texture2d<float, access::read> inFlow [[texture(2)]],
+    texture2d<float, access::write> outFlow [[texture(3)]],
+    constant BlockMatchParams& params [[buffer(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    int tx = tgid.x;
+    int ty = tgid.y;
+    int ts = params.ts;
+    int R = params.search_radius; // Must be 4
+    
+    if (tx >= (int)outFlow.get_width() || ty >= (int)outFlow.get_height()) return;
+    
+    float2 initial_flow = inFlow.read(uint2(tx, ty)).rg;
+    int flow_dx = (int)round(initial_flow.x);
+    int flow_dy = (int)round(initial_flow.y);
+    
+    int ox = tx * ts;
+    int oy = ty * ts;
+    
+    threadgroup float ref_spatial[576];
+    threadgroup float mov_spatial[576];
+    threadgroup float2 corrs_freq[576];
+    threadgroup float corrs_spatial[576];
+    
+    int py = tid / 24;
+    int px = tid % 24;
+    
+    // Load ref_spatial (16x16 zero-padded to 24x24 by placing at center R, R)
+    float r_val = 0.0f;
+    if (py >= R && py < R + ts && px >= R && px < R + ts) {
+        int ry = oy + (py - R);
+        int rx = ox + (px - R);
+        if (ry < (int)refTex.get_height() && rx < (int)refTex.get_width()) {
+            r_val = refTex.read(uint2(rx, ry)).r;
+        }
+    }
+    ref_spatial[tid] = r_val;
+    
+    // Load mov_spatial (24x24)
+    int my = oy + flow_dy - R + py;
+    int mx = ox + flow_dx - R + px;
+    my = clamp(my, 0, (int)movTex.get_height() - 1);
+    mx = clamp(mx, 0, (int)movTex.get_width() - 1);
+    mov_spatial[tid] = movTex.read(uint2(mx, my)).r;
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Forward 2D DFT (size 24x24) for both patches
+    float2 R_k = float2(0.0f, 0.0f);
+    float2 M_k = float2(0.0f, 0.0f);
+    for (int n = 0; n < 576; ++n) {
+        int ny = n / 24;
+        int nx = n % 24;
+        float angle = -2.0f * M_PI_F * ((float)(py * ny) + (float)(px * nx)) / 24.0f;
+        float2 tw = float2(cos(angle), sin(angle));
+        
+        float r_n = ref_spatial[n];
+        R_k += float2(r_n * tw.x, r_n * tw.y);
+        
+        float m_n = mov_spatial[n];
+        M_k += float2(m_n * tw.x, m_n * tw.y);
+    }
+    
+    // Complex multiply: conj(R_k) * M_k
+    // conj(R_k) = (R_k.x, -R_k.y)
+    // C_k = conj(R_k) * M_k = (R_k.x * M_k.x + R_k.y * M_k.y, R_k.x * M_k.y - R_k.y * M_k.x)
+    corrs_freq[tid] = float2(R_k.x * M_k.x + R_k.y * M_k.y, R_k.x * M_k.y - R_k.y * M_k.x);
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Inverse 2D DFT
+    float2 c_spatial = float2(0.0f, 0.0f);
+    for (int k = 0; k < 576; ++k) {
+        int ky = k / 24;
+        int kx = k % 24;
+        float angle = 2.0f * M_PI_F * ((float)(py * ky) + (float)(px * kx)) / 24.0f;
+        float2 tw = float2(cos(angle), sin(angle));
+        
+        float2 C = corrs_freq[k];
+        c_spatial += float2(C.x * tw.x - C.y * tw.y, C.x * tw.y + C.y * tw.x);
+    }
+    corrs_spatial[tid] = c_spatial.x / 576.0f;
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Compute L2 Error = sum(mov^2) - 2 * corrs
+    // And find argmax (min L2) using threadgroup reduction
+    
+    int s_dy = py - 12;
+    int s_dx = px - 12;
+    
+    float l2_err = 1e38f;
+    
+    if (abs(s_dy) <= R && abs(s_dx) <= R) {
+        float mov_sq_sum = 0.0f;
+        for (int i = 0; i < ts; ++i) {
+            for (int j = 0; j < ts; ++j) {
+                int sm_y = i + s_dy + R;
+                int sm_x = j + s_dx + R;
+                float m = mov_spatial[sm_y * 24 + sm_x];
+                mov_sq_sum += m * m;
+            }
+        }
+        
+        // PyTorch fftshift centers the zero-frequency at 12, 12
+        // So corrs_spatial[py * 24 + px] corresponds to shift (s_dy, s_dx)
+        float corr = corrs_spatial[tid];
+        l2_err = mov_sq_sum - 2.0f * corr;
+    }
+    
+    // Shared memory for reduction
+    threadgroup float best_errs[576];
+    threadgroup int best_idxs[576];
+    
+    best_errs[tid] = l2_err;
+    best_idxs[tid] = tid;
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // Parallel reduction to find minimum L2 error
+    for (int stride = 256; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < 576) {
+            if (best_errs[tid + stride] < best_errs[tid]) {
+                best_errs[tid] = best_errs[tid + stride];
+                best_idxs[tid] = best_idxs[tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Handle the remaining 64 elements (576 = 512 + 64)
+    if (tid == 0) {
+        for (int i = 1; i < 576; ++i) {
+            if (best_errs[i] < best_errs[0]) {
+                best_errs[0] = best_errs[i];
+                best_idxs[0] = best_idxs[i];
+            }
+        }
+        
+        int best_tid = best_idxs[0];
+        int best_py = best_tid / 24;
+        int best_px = best_tid % 24;
+        
+        float final_dx = initial_flow.x + (float)(best_px - 12);
+        float final_dy = initial_flow.y + (float)(best_py - 12);
+        
+        outFlow.write(float4(final_dx, final_dy, 0.0f, 1.0f), uint2(tx, ty));
+    }
+}

@@ -32,7 +32,7 @@ static const std::vector<std::string> kRequiredKernels = {
     "kernel_local_stats_3x3", "kernel_upscale_warp_stats", "kernel_build_dp_guide",
     "kernel_apply_noise_model", "kernel_compute_flow_S", "kernel_robustness_threshold",
     "kernel_local_min_5x5", "kernel_compute_covariances",
-    "kernel_block_match_L1", "kernel_block_match_L2", "kernel_compute_sobel",
+    "kernel_block_match_L1", "kernel_block_match_L2", "kernel_block_match_L2_FFT", "kernel_compute_sobel",
     "kernel_ica_refine", "kernel_accumulate_comp_band", "kernel_accumulate_ref_band"
 };
 
@@ -326,7 +326,8 @@ static FlowField align_metal_cpu_upscale(const std::vector<id<MTLTexture>>& ref_
         if (!flow) return FlowField();
 
         std::string metric = (lvl < (int)cfg.bm_metrics.size()) ? cfg.bm_metrics[lvl] : "L2";
-        id<MTLComputePipelineState> pso_bm = ctx.get_pipeline_state("kernel_block_match_" + metric);
+        std::string kernel_name = (metric == "L2") ? "kernel_block_match_L2_FFT" : "kernel_block_match_" + metric;
+        id<MTLComputePipelineState> pso_bm = ctx.get_pipeline_state(kernel_name);
         id<MTLTexture> out_bm = ctx.create_empty_texture(nx, ny, 2, true);
         struct { int ts; int search_radius; } p_bm = { ts, radius };
         id<MTLBuffer> bm_buf = [ctx.device() newBufferWithBytes:&p_bm length:sizeof(p_bm)
@@ -340,7 +341,14 @@ static FlowField align_metal_cpu_upscale(const std::vector<id<MTLTexture>>& ref_
             [enc setTexture:flow atIndex:2];
             [enc setTexture:out_bm atIndex:3];
             [enc setBuffer:bm_buf offset:0 atIndex:0];
-            dispatch_kernel(enc, nx, ny);
+            
+            if (metric == "L2") {
+                [enc dispatchThreadgroups:MTLSizeMake(nx, ny, 1)
+                    threadsPerThreadgroup:MTLSizeMake(576, 1, 1)];
+            } else {
+                dispatch_kernel(enc, nx, ny);
+            }
+            
             [enc endEncoding];
             if (!run_cmd(cmd)) return FlowField();
         }
