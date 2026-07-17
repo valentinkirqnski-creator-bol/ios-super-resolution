@@ -195,9 +195,9 @@ kernel void kernel_robustness_threshold(
     
     // 5x5 quad window = radius 2
     for (int i = -2; i <= 2; ++i) {
-        int yy = clamp((int)gid.y + i, 0, h - 1);
+        int yy = clamp((int)gid.y + i, 0, (int)R_Tex.get_height() - 1);
         for (int j = -2; j <= 2; ++j) {
-            int xx = clamp((int)gid.x + j, 0, w - 1);
+            int xx = clamp((int)gid.x + j, 0, (int)R_Tex.get_width() - 1);
             
             float d2 = d_sq_Tex.read(uint2(xx, yy)).r;
             float s2 = sigma_sq_Tex.read(uint2(xx, yy)).r;
