@@ -87,7 +87,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
             for (int ch = 0; ch < nch; ++ch) {
                 size_t i = ((size_t)y * Ws + x) * nch + ch;
                 f32 d = den.data[i];
-                f32 v = (d > 1e-8f) ? num.data[i] / d : 0.f;
+                f32 v = (d > 0.f) ? num.data[i] / d : 0.f;
                 if (cfg.bayer_mode) v *= cfg.white_balance[ch];
                 out.data[i] = v;
             }
