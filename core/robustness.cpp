@@ -5,6 +5,12 @@
 
 namespace hhsr {
 
+struct NoiseCurves {
+    std::vector<f32> std_curve;
+    std::vector<f32> diff_curve;
+};
+NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta);
+
 namespace {
 
 static inline f32 dogson_quadratic(f32 x) {
@@ -18,11 +24,6 @@ static int bayer_upscale_factor(const Image& guide_stats, int raw_h, int raw_w) 
     if (guide_stats.h * 2 == raw_h && guide_stats.w * 2 == raw_w) return 2;
     return 1;
 }
-
-struct NoiseCurves {
-    std::vector<f32> std_curve;
-    std::vector<f32> diff_curve;
-};
 
 static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32& xmax) {
     f32 tol_sq = tol * tol;
@@ -67,7 +68,9 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
     std_mean = (f32)(sum_std / n_patches);
 }
 
-static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
+} // end anonymous namespace
+
+NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta) {
     NoiseCurves nc;
     nc.std_curve.resize(1001);
     nc.diff_curve.resize(1001);
@@ -302,7 +305,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         return r;
     }
 
-    const NoiseCurves nc = make_noise_curves(cfg.alpha, cfg.beta);
+    const NoiseCurves nc = make_noise_curves_cpu(cfg.alpha, cfg.beta);
 
     // Python: compute_guide → local_stats (at guide resolution) → upscale_warp_stats
     // The guide image is half-size in bayer mode. All intermediate maps (d_p,

@@ -50,6 +50,11 @@ targets:
           - "raw_io.cpp"
           - "dng_writer.cpp"
           - "snr_tuning.cpp"
+          - "metal/*.mm"
+          - "metal/*.metal"
+    dependencies:
+      - framework: Metal.framework
+      - framework: MetalPerformanceShaders.framework
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.
