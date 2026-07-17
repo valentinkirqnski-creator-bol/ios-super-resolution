@@ -100,8 +100,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const float* cm /*9, XYZ->cam*/,
                                              const float* wb /*3, green-norm, WB in pixels*/,
                                              bool baked_srgb,
-                                             uint32_t& strip_offset_out) {
-    const uint32_t strip_bytes = (uint32_t)W * H * 3 * 2;
+                                             uint32_t& strip_offset_out,
+                                             uint32_t& strip_byte_count_offset) {
+    const uint32_t strip_bytes = 0; // We don't know the compressed size yet
 
     IFD ifd;
     ifd.longv(254, 0);                 // NewSubfileType
@@ -110,7 +111,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(256, (uint32_t)W);       // ImageWidth
     ifd.longv(257, (uint32_t)H);       // ImageLength
     ifd.shorts(258, {16, 16, 16});     // BitsPerSample
-    ifd.shortv(259, 1);                // Compression = none
+    ifd.shortv(259, 8);                // Compression = Deflate (zlib)
     if (baked_srgb)
         ifd.shortv(262, 2);            // PhotometricInterpretation = RGB (sRGB baked)
     else
@@ -175,6 +176,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     w32(out, ifd_offset);
     w16(out, (uint16_t)n);
     for (const auto& e : ifd.e) {
+        if (e.tag == 279) strip_byte_count_offset = (uint32_t)out.size() + 8; // Tag(2) + Type(2) + Count(4) = 8
         w16(out, e.tag);
         w16(out, e.type);
         w32(out, e.count);
@@ -210,34 +212,95 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                            const float* wbGainsGreenNorm, bool bakedSrgb,
                            const std::string& camera_make) {
     if (W <= 0 || H <= 0) return false;
-    W_ = W; H_ = H; rows_written_ = 0;
+    W_ = W; H_ = H; rows_written_ = 0; compressed_size_ = 0;
+    
+    // Initialize zlib state
+    strm_.zalloc = Z_NULL;
+    strm_.zfree = Z_NULL;
+    strm_.opaque = Z_NULL;
+    if (deflateInit(&strm_, Z_DEFAULT_COMPRESSION) != Z_OK) return false;
+    z_active_ = true;
+
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
-                                                   bakedSrgb, strip_offset);
-    f_ = fopen(path.c_str(), "wb");
+                                                   bakedSrgb, strip_offset, strip_byte_count_offset_);
+    f_ = fopen(path.c_str(), "wb+"); // wb+ to allow fseek back
     if (!f_) return false;
     return fwrite(prefix.data(), 1, prefix.size(), f_) == prefix.size();
 }
 
 bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
-    if (!f_ || nrows <= 0) return false;
+    if (!f_ || !z_active_ || nrows <= 0) return false;
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
-    // uint16 samples are little-endian on all supported ABIs (arm64/x86); write raw.
-    size_t n = (size_t)nrows * W_ * 3;
-    bool ok = fwrite(rgb16, sizeof(uint16_t), n, f_) == n;
+    
+    size_t nbytes = (size_t)nrows * W_ * 3 * sizeof(uint16_t);
+    strm_.avail_in = (uInt)nbytes;
+    strm_.next_in = (Bytef*)rgb16;
+
+    const int BUF_SIZE = 262144;
+    std::vector<uint8_t> out(BUF_SIZE);
+
+    while (strm_.avail_in > 0) {
+        strm_.avail_out = BUF_SIZE;
+        strm_.next_out = out.data();
+        if (deflate(&strm_, Z_NO_FLUSH) == Z_STREAM_ERROR) return false;
+        size_t have = BUF_SIZE - strm_.avail_out;
+        if (have > 0) {
+            if (fwrite(out.data(), 1, have, f_) != have) return false;
+            compressed_size_ += (uint32_t)have;
+        }
+    }
     rows_written_ += nrows;
-    return ok;
+    return true;
 }
 
 bool DngStreamWriter::close() {
     if (!f_) return false;
+    bool ok = (rows_written_ == H_);
+    
+    if (z_active_) {
+        const int BUF_SIZE = 262144;
+        std::vector<uint8_t> out(BUF_SIZE);
+        strm_.avail_in = 0;
+        strm_.next_in = Z_NULL;
+        int ret;
+        do {
+            strm_.avail_out = BUF_SIZE;
+            strm_.next_out = out.data();
+            ret = deflate(&strm_, Z_FINISH);
+            size_t have = BUF_SIZE - strm_.avail_out;
+            if (have > 0) {
+                if (fwrite(out.data(), 1, have, f_) == have) {
+                    compressed_size_ += (uint32_t)have;
+                }
+            }
+        } while (ret == Z_OK);
+        
+        deflateEnd(&strm_);
+        z_active_ = false;
+
+        // Patch StripByteCounts in the IFD!
+        if (strip_byte_count_offset_ > 0) {
+            fseek(f_, strip_byte_count_offset_, SEEK_SET);
+            uint8_t count_bytes[4];
+            count_bytes[0] = (uint8_t)(compressed_size_ & 0xFF);
+            count_bytes[1] = (uint8_t)((compressed_size_ >> 8) & 0xFF);
+            count_bytes[2] = (uint8_t)((compressed_size_ >> 16) & 0xFF);
+            count_bytes[3] = (uint8_t)((compressed_size_ >> 24) & 0xFF);
+            fwrite(count_bytes, 1, 4, f_);
+        }
+    }
+
     fclose(f_);
     f_ = nullptr;
-    return rows_written_ == H_;
+    return ok;
 }
 
-DngStreamWriter::~DngStreamWriter() { if (f_) fclose(f_); }
+DngStreamWriter::~DngStreamWriter() { 
+    if (z_active_) deflateEnd(&strm_);
+    if (f_) fclose(f_); 
+}
 
 } // namespace hhsr
