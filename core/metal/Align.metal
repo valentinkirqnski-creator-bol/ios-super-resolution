@@ -201,6 +201,12 @@ inline float sample_oob_zero(texture2d<float, access::read> img, int y, int x) {
     return 0.0f;
 }
 
+inline float sample_clamp_edge(texture2d<float, access::read> img, int y, int x) {
+    y = clamp(y, 0, (int)img.get_height() - 1);
+    x = clamp(x, 0, (int)img.get_width() - 1);
+    return img.read(uint2(x, y)).r;
+}
+
 inline float bilinear_oob_zero(texture2d<float, access::read> img, int pixel_y, int pixel_x,
                                int floor_off_y, int floor_off_x, float frac_x, float frac_y) {
     int floor_y = pixel_y + floor_off_y;
@@ -210,6 +216,21 @@ inline float bilinear_oob_zero(texture2d<float, access::read> img, int pixel_y, 
     float m01 = sample_oob_zero(img, floor_y, floor_x + 1);
     float m10 = sample_oob_zero(img, floor_y + 1, floor_x);
     float m11 = sample_oob_zero(img, floor_y + 1, floor_x + 1);
+    
+    float lerpx_top = m00 + (m01 - m00) * frac_x;
+    float lerpx_bot = m10 + (m11 - m10) * frac_x;
+    return lerpx_top + (lerpx_bot - lerpx_top) * frac_y;
+}
+
+inline float bilinear_clamp_edge(texture2d<float, access::read> img, int pixel_y, int pixel_x,
+                                 int floor_off_y, int floor_off_x, float frac_x, float frac_y) {
+    int floor_y = pixel_y + floor_off_y;
+    int floor_x = pixel_x + floor_off_x;
+    
+    float m00 = sample_clamp_edge(img, floor_y, floor_x);
+    float m01 = sample_clamp_edge(img, floor_y, floor_x + 1);
+    float m10 = sample_clamp_edge(img, floor_y + 1, floor_x);
+    float m11 = sample_clamp_edge(img, floor_y + 1, floor_x + 1);
     
     float lerpx_top = m00 + (m01 - m00) * frac_x;
     float lerpx_bot = m10 + (m11 - m10) * frac_x;
@@ -281,7 +302,9 @@ kernel void kernel_ica_refine(
                 int rx = ox + j;
                 if (ry < (int)refTex.get_height() && rx < (int)refTex.get_width()) {
                     float r_val = refTex.read(uint2(rx, ry)).r;
-                    float m_val = bilinear_oob_zero(movTex, ry, rx, floor_off_y, floor_off_x, frac_x, frac_y);
+                    float m_val = (ts == 8)
+                        ? bilinear_clamp_edge(movTex, ry, rx, floor_off_y, floor_off_x, frac_x, frac_y)
+                        : bilinear_oob_zero(movTex, ry, rx, floor_off_y, floor_off_x, frac_x, frac_y);
                     float err = m_val - r_val;
                     
                     float gx = gxTex.read(uint2(rx, ry)).r;

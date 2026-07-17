@@ -47,17 +47,21 @@ static Image compute_sobel_grady(const Image& img) {
 // Python: floor_x = x + int(alignment[0]), frac_x = modf(alignment[0])
 //         OOB => 0.0 (NOT clamp-to-edge).
 // ============================================================================
-static inline f32 bilinear_oob_zero(const Image& img, int pixel_y, int pixel_x,
+static inline f32 bilinear_oob_zero(const Image& moving, int ts, int pixel_y, int pixel_x,
                                     int floor_off_y, int floor_off_x,
                                     f32 frac_x, f32 frac_y) {
     int floor_y = pixel_y + floor_off_y;
     int floor_x = pixel_x + floor_off_x;
 
-    auto sample = [&](int y, int x) -> f32 {
-        if (y >= 0 && y < img.h && x >= 0 && x < img.w) {
-            return img.at(y, x);
+    auto sample = [&](int py, int px) -> f32 {
+        if (ts == 8) {
+            py = std::max(0, std::min(moving.h - 1, py));
+            px = std::max(0, std::min(moving.w - 1, px));
+            return moving.at(py, px);
+        } else {
+            if (py < 0 || py >= moving.h || px < 0 || px >= moving.w) return 0.f;
+            return moving.at(py, px);
         }
-        return 0.f;
     };
     f32 m00 = sample(floor_y, floor_x);
     f32 m01 = sample(floor_y, floor_x + 1);
