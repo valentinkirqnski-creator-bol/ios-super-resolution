@@ -1,5 +1,6 @@
 #include "stages.h"
 #include "parallel.h"
+#include "linalg.h"
 
 namespace hhsr {
 
@@ -13,7 +14,8 @@ static inline int denoise_range_merge(f32 r_acc, int rad_max, f32 max_frame_coun
     return (r_acc <= max_frame_count) ? rad_max : 1;
 }
 
-static inline bool interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
+// Bilinear cov sample + invert_2x2 (identity on singular), matching merge.py / linalg.py.
+static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
                                   f32& ixx, f32& ixy, f32& iyy) {
     f32 frac_x = kmap_j - std::floor(kmap_j);
     f32 frac_y = kmap_i - std::floor(kmap_i);
@@ -31,20 +33,7 @@ static inline bool interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
         return top + frac_y * (bot - top);
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
-    f32 det = xx * yy - xy * xy;
-    
-    // If the ellipse collapses (area approaches 0), fall back to an isotropic circular filter
-    if (std::abs(det) > 1e-10f) {
-        f32 inv = 1.f / det;
-        ixx = inv * yy;
-        ixy = -inv * xy;
-        iyy = inv * xx;
-    } else {
-        ixx = 1.f;
-        ixy = 0.f;
-        iyy = 1.f;
-    }
-    return true;
+    invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -63,12 +52,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 lr_x = (hr_j + 0.5f) / scale;
             const f32 lr_y = (hr_i + 0.5f) / scale;
 
+            // Python: px = int(lr_x // tile_size)  (no clamp)
             const int px = (int)(lr_x / (f32)tile_size);
             const int py = (int)(lr_y / (f32)tile_size);
-            const int tpy = std::min(py, flow.ny - 1);
-            const int tpx = std::min(px, flow.nx - 1);
-            const f32 flowx = flow.dx(tpy, tpx);
-            const f32 flowy = flow.dy(tpy, tpx);
+            const f32 flowx = flow.dx(py, px);
+            const f32 flowy = flow.dy(py, px);
 
             const int i_r = std::min((int)lr_y, lr_h - 1);
             const int j_r = std::min((int)lr_x, lr_w - 1);
@@ -90,7 +78,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x - 0.5f;
                     kmap_i = lr_mov_y - 0.5f;
                 }
-                if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy);
             }
 
             const int center_j = (int)lr_mov_x;
@@ -145,13 +133,15 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            const f32 coarse_x = (hr_j + 0.5f) / scale;
-            const f32 coarse_y = (hr_i + 0.5f) / scale;
+            // Python: coarse_ref_sub_pos = output_pixel / scale  (no +0.5)
+            const f32 coarse_x = (f32)hr_j / scale;
+            const f32 coarse_y = (f32)hr_i / scale;
 
             f32 local_acc_r = 0.f;
             f32 additional_denoise_power = 1.f;
             int rad = 1;
             if (robustness_denoise && acc_rob) {
+                // Python: acc_rob[min(round(coarse_y), h-1), min(round(coarse_x), w-1)]
                 const int ay = std::min((int)std::lround(coarse_y), acc_rob->h - 1);
                 const int ax = std::min((int)std::lround(coarse_x), acc_rob->w - 1);
                 local_acc_r = acc_rob->at(std::max(0, ay), std::max(0, ax));
@@ -164,15 +154,18 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             if (!iso) {
                 f32 kmap_j, kmap_i;
                 if (cfg.bayer_mode) {
-                    kmap_j = coarse_x / 2.f - 0.5f;
-                    kmap_i = coarse_y / 2.f - 0.5f;
+                    // Python: grey_pos = (coarse - 0.5) / 2
+                    kmap_j = (coarse_x - 0.5f) / 2.f;
+                    kmap_i = (coarse_y - 0.5f) / 2.f;
                 } else {
-                    kmap_j = coarse_x - 0.5f;
-                    kmap_i = coarse_y - 0.5f;
+                    // Python: grey_pos = coarse  (no -0.5)
+                    kmap_j = coarse_x;
+                    kmap_i = coarse_y;
                 }
-                if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy);
             }
 
+            // Python: center = round(coarse)
             const int center_j = (int)std::lround(coarse_x);
             const int center_i = (int)std::lround(coarse_y);
 
@@ -200,6 +193,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 }
             }
 
+            // Python: overwrite when robustness_denoise and local_acc_r < max_frame_count
             const bool overwrite =
                 robustness_denoise && acc_rob && local_acc_r < max_frame_count;
             for (int ch = 0; ch < nch; ++ch) {

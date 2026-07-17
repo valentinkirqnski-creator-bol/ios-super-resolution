@@ -154,17 +154,66 @@ Image compute_grey_decimate(const Image& raw, bool bayer_mode) {
     return grey;
 }
 
-// 5-tap binomial kernel (1 4 6 4 1)/16, applied separably. Matches the
-// Gaussian pyramid downsampling used by the reference (cuda_downsample).
+// scipy.ndimage._filters._gaussian_kernel1d (order=0) + cuda_downsample:
+//   sigma = factor * 0.5, radius = int(4 * sigma + 0.5)
+//   valid (no-pad) separable conv, then stride subsample.
+static std::vector<f32> scipy_gaussian_kernel1d(f32 sigma, int radius) {
+    std::vector<f32> k(2 * radius + 1);
+    f32 sigma2 = sigma * sigma;
+    f32 sum = 0.f;
+    for (int i = -radius; i <= radius; ++i) {
+        f32 v = std::exp(-0.5f / sigma2 * (f32)(i * i));
+        k[i + radius] = v;
+        sum += v;
+    }
+    for (f32& v : k) v /= sum;
+    return k; // order-0 is symmetric; Python's [::-1] for correlate is a no-op
+}
+
 static Image downsample_by(const Image& src, int factor) {
+    // Matches utils_image.cuda_downsample(..., kernel='gaussian', factor)
     if (factor <= 1) return src;
-    // Blur then subsample. Use repeated binomial blur proportional to factor.
-    Image blurred = gaussian_blur(src, 0.5f * factor);
-    int dh = src.h / factor, dw = src.w / factor;
-    Image out(dh, dw, 1);
-    for (int y = 0; y < dh; ++y)
-        for (int x = 0; x < dw; ++x)
-            out.at(y, x) = blurred.at(y * factor, x * factor);
+
+    f32 sigma = 0.5f * (f32)factor;
+    int radius = (int)(4.f * sigma + 0.5f); // int(4*factor*0.5 + 0.5)
+    std::vector<f32> ker = scipy_gaussian_kernel1d(sigma, radius);
+    const int klen = (int)ker.size(); // 2*radius+1
+
+    // Valid vertical conv: out_h = src.h - klen + 1
+    int tmp_h = src.h - klen + 1;
+    int tmp_w = src.w;
+    if (tmp_h < 1 || tmp_w < 1) return Image(0, 0, 1);
+    Image tmp(tmp_h, tmp_w, 1);
+    for (int y = 0; y < tmp_h; ++y) {
+        for (int x = 0; x < tmp_w; ++x) {
+            f32 acc = 0.f;
+            for (int i = 0; i < klen; ++i)
+                acc += ker[i] * src.at(y + i, x);
+            tmp.at(y, x) = acc;
+        }
+    }
+
+    // Valid horizontal conv
+    int filt_h = tmp_h;
+    int filt_w = tmp_w - klen + 1;
+    if (filt_w < 1) return Image(0, 0, 1);
+    Image filtered(filt_h, filt_w, 1);
+    for (int y = 0; y < filt_h; ++y) {
+        for (int x = 0; x < filt_w; ++x) {
+            f32 acc = 0.f;
+            for (int j = 0; j < klen; ++j)
+                acc += ker[j] * tmp.at(y, x + j);
+            filtered.at(y, x) = acc;
+        }
+    }
+
+    // h2, w2 = floor(shape / factor); return filtered[:, :, :h2*factor:factor, :w2*factor:factor]
+    int h2 = filt_h / factor;
+    int w2 = filt_w / factor;
+    Image out(h2, w2, 1);
+    for (int y = 0; y < h2; ++y)
+        for (int x = 0; x < w2; ++x)
+            out.at(y, x) = filtered.at(y * factor, x * factor);
     return out;
 }
 
@@ -185,8 +234,11 @@ Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors) {
 }
 
 Image compute_gradients(const Image& grey) {
-    // Matches kernels.py: separable [-0.5,0.5] pair producing a 2-channel
-    // gradient (gx, gy), reducing the image by 1 pixel in each direction.
+    // Matches kernels.py separable convs:
+    //   tmp0 = [-0.5, 0.5] * I,  tmp1 = [0.5, 0.5] * I  (horizontal)
+    //   gx = [0.5, 0.5]^T * tmp0, gy = [-0.5, 0.5]^T * tmp1  (vertical, groups=2)
+    // => gx = 0.25*((tr-tl)+(br-bl)), gy = 0.25*((bl+br)-(tl+tr))
+    // Output is reduced by 1 pixel in each direction.
     int gh = grey.h - 1, gw = grey.w - 1;
     if (gh < 1 || gw < 1) return Image(0, 0, 2);
     Image grad(gh, gw, 2);
@@ -194,9 +246,8 @@ Image compute_gradients(const Image& grey) {
         for (int x = 0; x < gw; ++x) {
             f32 tl = grey.at(y, x),     tr = grey.at(y, x + 1);
             f32 bl = grey.at(y + 1, x), br = grey.at(y + 1, x + 1);
-            // gx = horizontal diff averaged over rows; gy = vertical diff.
-            grad.at(y, x, 0) = 0.5f * ((tr - tl) + (br - bl));
-            grad.at(y, x, 1) = 0.5f * ((bl - tl) + (br - tr));
+            grad.at(y, x, 0) = 0.25f * ((tr - tl) + (br - bl));
+            grad.at(y, x, 1) = 0.25f * ((bl - tl) + (br - tr));
         }
     }
     return grad;

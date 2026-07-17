@@ -4,10 +4,10 @@
 
 namespace hhsr {
 
-// Generalized Anscombe VST: 2/alpha * sqrt(max(alpha*I + 3/8 alpha^2 + beta, 0)).
+// Generalized Anscombe VST — matches utils_image.GAT / cuda_GAT.
 static Image apply_gat(const Image& img, f32 alpha, f32 beta) {
     Image out(img.h, img.w, 1);
-    f32 c = 0.375f * alpha * alpha + beta;
+    f32 c = 0.375f * alpha * alpha + beta; // 3/8 * alpha^2 + beta
     for (size_t i = 0; i < img.data.size(); ++i) {
         f32 v = alpha * img.data[i] + c;
         out.data[i] = (2.f / alpha) * std::sqrt(std::max(0.f, v));
@@ -15,17 +15,19 @@ static Image apply_gat(const Image& img, f32 alpha, f32 beta) {
     return out;
 }
 
-// Alg. 5 helpers: eigenvalue -> anisotropy A and detail factor D -> k1, k2.
+// Matches kernels.py compute_k / hard_threshold / linear.
 static void compute_k(f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
-    f32 sum = l1 + l2;
-    f32 A = 1.f + std::sqrt(std::max((l1 - l2) / (sum == 0.f ? 1e-12f : sum), 0.f));
-    f32 D = clampf(1.f - std::sqrt(std::max(l1, 0.f)) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
+    // Python: A = 1 + sqrt((l1 - l2)/(l1 + l2))
+    f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
+    // Python: D = clamp(1 - sqrt(l1)/D_tr + D_th, 0, 1)
+    f32 D = clampf(1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
 
     f32 kk1, kk2;
     if (cfg.selection == SelectionLaw::HardThreshold) {
+        // hard_threshold: if A > 1.95 else (also NaN falls here in Python)
         if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
         else           { kk1 = 1.f; kk2 = 1.f; }
-    } else { // Linear
+    } else {
         kk1 = 1.f + A / 2.f * (1.f / cfg.k_shrink - 1.f);
         kk2 = 1.f + A / 2.f * (cfg.k_stretch - 1.f);
     }
@@ -43,29 +45,31 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
 
     parallel_rows(H, cfg.num_threads, [&](int y) {
         for (int x = 0; x < W; ++x) {
-            // Structure tensor over the 2x2 gradient neighborhood.
+            // Structure tensor over 2x2 gradient neighborhood (cuda_estimate_kernel)
             f32 s00 = 0, s01 = 0, s11 = 0;
             for (int i = 0; i < 2; ++i) {
                 for (int j = 0; j < 2; ++j) {
                     int gy = y - 1 + i, gx = x - 1 + j;
                     if (gy < 0 || gy >= grad.h || gx < 0 || gx >= grad.w) continue;
                     f32 gxv = grad.at(gy, gx, 0), gyv = grad.at(gy, gx, 1);
-                    s00 += gxv * gxv; s01 += gxv * gyv; s11 += gyv * gyv;
+                    s00 += gxv * gxv;
+                    s01 += gxv * gyv;
+                    s11 += gyv * gyv;
                 }
             }
             f32 l[2], e1[2], e2[2];
             eigen_elmts_2x2(s00, s01, s01, s11, l, e1, e2);
 
+            // Python always runs compute_k (iso only affects merge, not estimate)
             f32 k1, k2;
-            if (cfg.kernel == KernelShape::Iso) { k1 = cfg.k_detail; k2 = cfg.k_detail; }
-            else compute_k(l[0], l[1], k1, k2, cfg);
+            compute_k(l[0], l[1], k1, k2, cfg);
 
             f32 k1s = k1 * k1, k2s = k2 * k2;
             f32* c = covs.at(y, x);
-            c[0] = k1s * e1[0] * e1[0] + k2s * e2[0] * e2[0]; // xx
-            c[1] = k1s * e1[0] * e1[1] + k2s * e2[0] * e2[1]; // xy
-            c[2] = c[1];                                       // yx
-            c[3] = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1]; // yy
+            c[0] = k1s * e1[0] * e1[0] + k2s * e2[0] * e2[0];
+            c[1] = k1s * e1[0] * e1[1] + k2s * e2[0] * e2[1];
+            c[2] = c[1];
+            c[3] = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1];
         }
     });
     return covs;

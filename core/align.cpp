@@ -1,13 +1,8 @@
 #include "stages.h"
 #include "parallel.h"
-#include "linalg.h"
-#include <complex>
 #include <cmath>
+#include <limits>
 #include <vector>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 namespace hhsr {
 
@@ -43,26 +38,24 @@ static Image compute_sobel_grady(const Image& img) {
 }
 
 // ============================================================================
-// Bilinear interpolation matching the Python ICA kernel exactly.
-// Python: floor_x = x + int(alignment[0]), frac_x = modf(alignment[0])
-//         OOB => 0.0 (NOT clamp-to-edge).
+// Bilinear interpolation matching Python ICA (ICA.py):
+//   floor_x = x + int(alignment[0]);  frac = modf(alignment)
+//   floor/ceil clamped to image bounds (clamp-to-edge), NOT OOB→0.
 // ============================================================================
-static inline f32 bilinear_oob_zero(const Image& img, int pixel_y, int pixel_x,
-                                    int floor_off_y, int floor_off_x,
-                                    f32 frac_x, f32 frac_y) {
+static inline f32 bilinear_clamp(const Image& img, int pixel_y, int pixel_x,
+                                 int floor_off_y, int floor_off_x,
+                                 f32 frac_x, f32 frac_y) {
     int floor_y = pixel_y + floor_off_y;
     int floor_x = pixel_x + floor_off_x;
+    floor_x = std::max(0, std::min(img.w - 1, floor_x));
+    floor_y = std::max(0, std::min(img.h - 1, floor_y));
+    int ceil_x = std::max(0, std::min(img.w - 1, floor_x + 1));
+    int ceil_y = std::max(0, std::min(img.h - 1, floor_y + 1));
 
-    auto sample = [&](int y, int x) -> f32 {
-        if (y >= 0 && y < img.h && x >= 0 && x < img.w) {
-            return img.at(y, x);
-        }
-        return 0.f;
-    };
-    f32 m00 = sample(floor_y, floor_x);
-    f32 m01 = sample(floor_y, floor_x + 1);
-    f32 m10 = sample(floor_y + 1, floor_x);
-    f32 m11 = sample(floor_y + 1, floor_x + 1);
+    f32 m00 = img.at(floor_y, floor_x);
+    f32 m01 = img.at(floor_y, ceil_x);
+    f32 m10 = img.at(ceil_y, floor_x);
+    f32 m11 = img.at(ceil_y, ceil_x);
 
     f32 lerpx_top = m00 + (m01 - m00) * frac_x;
     f32 lerpx_bot = m10 + (m11 - m10) * frac_x;
@@ -70,54 +63,13 @@ static inline f32 bilinear_oob_zero(const Image& img, int pixel_y, int pixel_x,
 }
 
 // ============================================================================
-// Clamp-to-edge bilinear for L2 block matching patch extraction
-// (matches Python's extract_flow_patches which uses .clamp(0, shape-1))
-// ============================================================================
-static inline f32 sample_clamp(const Image& img, int iy, int ix) {
-    iy = std::max(0, std::min(img.h - 1, iy));
-    ix = std::max(0, std::min(img.w - 1, ix));
-    return img.at(iy, ix);
-}
-
-// ============================================================================
 // FFT-based L2 block matching — matches Python's align_lvl_block_matching_L2
 //
-// Algorithm:
-// 1. For each tile, extract a (2R+ts) × (2R+ts) search patch from moving,
-//    centred on the tile position + current flow (rounded to int), clamped.
-// 2. The reference tile is zero-padded to (2R+ts) × (2R+ts).
-// 3. Cross-correlation via conj(ref_fft) * mov_fft → irfft2 → fftshift.
-// 4. Crop to (2R+1) × (2R+1) valid region.
-// 5. Compute windowed L2 norm of search patches via box-sum.
-// 6. L2_error = L2_search - 2 * corrs. Argmin gives best shift.
+// PyTorch path: corrs = fftshift(irfft2(conj(rfft2(ref)) * rfft2(mov), s=N))
+// For real signals that equals circular cross-correlation:
+//   corr[dy,dx] = sum_{i,j} ref[i,j] * mov[(i+dy)%N, (j+dx)%N]
+// which is DFT-exact (same math as rfft2/irfft2), without library float drift.
 // ============================================================================
-
-// Pad dimension to next power of 2 (FFT requirement for radix-2)
-static int next_pow2(int n) {
-    int p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
-
-// 2D real-to-complex FFT: input real[h*w], output complex[h*w] (full-size, not rfft)
-static void rfft2d_full(const f32* real_in, int h, int w,
-                        std::vector<std::complex<f32>>& out,
-                        std::vector<std::complex<f32>>* row_buf = nullptr,
-                        std::vector<std::complex<f32>>* dft_buf = nullptr) {
-    out.resize((size_t)h * w);
-    for (int i = 0; i < h * w; ++i) out[i] = {real_in[i], 0.f};
-    fft2d(out, h, w, false, row_buf, dft_buf);
-}
-
-// 2D IFFT → real: takes complex[h*w], writes real output
-static void irfft2d_full(std::vector<std::complex<f32>>& data, int h, int w,
-                         std::vector<f32>& real_out,
-                         std::vector<std::complex<f32>>* row_buf = nullptr,
-                         std::vector<std::complex<f32>>* dft_buf = nullptr) {
-    fft2d(data, h, w, true, row_buf, dft_buf);
-    real_out.resize((size_t)h * w);
-    for (int i = 0; i < h * w; ++i) real_out[i] = data[i].real();
-}
 
 static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
@@ -125,45 +77,29 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
-    int search_size = 2 * R + ts;       // size of search patch
-    int corr_size = 2 * R + 1;          // output correlation map size
+    int search_size = 2 * R + ts;       // N — same as Python
+    int corr_size = 2 * R + 1;
+    const int N = search_size;
 
-    auto next_pow2 = [](int x) {
-        int p = 1;
-        while (p < x) p *= 2;
-        return p;
-    };
-    int fft_h = next_pow2(search_size);
-    int fft_w = next_pow2(search_size);
-
-    // Pre-allocate buffers per row to avoid massive heap fragmentation inside parallel_rows
     struct RowBuffers {
-        std::vector<std::complex<f32>> ref_fft;
-        std::vector<std::complex<f32>> mov_fft;
-        std::vector<f32> corr_real;
         std::vector<f32> ref_tile_padded;
         std::vector<f32> mov_patch;
-        std::vector<std::complex<f32>> cross;
-        std::vector<f32> shifted;
-        std::vector<f32> corrs;
+        std::vector<f32> corr;      // N×N circular correlation (pre-fftshift)
+        std::vector<f32> shifted;   // after fftshift
+        std::vector<f32> corrs;     // cropped corr_size×corr_size
         std::vector<f32> L2_search;
-        std::vector<std::complex<f32>> row_buf;
-        std::vector<std::complex<f32>> dft_buf;
 
-        RowBuffers(int fh, int fw, int c_size) 
-            : ref_fft(fh * fw), mov_fft(fh * fw),
-              ref_tile_padded(fh * fw, 0.f), mov_patch(fh * fw, 0.f),
-              cross(fh * fw), shifted(fh * fw),
+        RowBuffers(int n, int c_size)
+            : ref_tile_padded(n * n, 0.f), mov_patch(n * n, 0.f),
+              corr(n * n), shifted(n * n),
               corrs(c_size * c_size), L2_search(c_size * c_size, 0.f) {}
     };
 
     std::vector<RowBuffers> buffers;
     buffers.reserve(ny);
-    for (int i = 0; i < ny; ++i) {
-        buffers.emplace_back(fft_h, fft_w, corr_size);
-    }
+    for (int i = 0; i < ny; ++i)
+        buffers.emplace_back(N, corr_size);
 
-    // Process each tile
     parallel_rows(ny, num_threads, [&](int ty) {
         RowBuffers& b = buffers[ty];
 
@@ -171,93 +107,86 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
             int oy = ty * ts;
             int ox = tx * ts;
 
-            // Round current flow to integer (matching Python's flow.round().long())
+            // torch: flow.round().long() — round half to even
             int flow_dx = (int)std::rint((float)flow.dx(ty, tx));
             int flow_dy = (int)std::rint((float)flow.dy(ty, tx));
 
-            // --- Prepare zero-padded reference tile ---
+            // Zero-padded reference tile at offset R (pad (R,R,R,R) in Python)
             std::fill(b.ref_tile_padded.begin(), b.ref_tile_padded.end(), 0.f);
             for (int i = 0; i < ts; ++i) {
                 for (int j = 0; j < ts; ++j) {
                     int ry = oy + i;
                     int rx = ox + j;
-                    if (ry < ref.h && rx < ref.w) {
-                        b.ref_tile_padded[(size_t)(i + R) * fft_w + (j + R)] = ref.at(ry, rx);
+                    if (ry < ref.h && rx < ref.w)
+                        b.ref_tile_padded[(size_t)(i + R) * N + (j + R)] = ref.at(ry, rx);
+                }
+            }
+
+            // Search patch — clamp to edge (extract_flow_patches)
+            for (int i = 0; i < N; ++i) {
+                for (int j = 0; j < N; ++j) {
+                    int my = std::max(0, std::min(moving.h - 1, oy + flow_dy + i - R));
+                    int mx = std::max(0, std::min(moving.w - 1, ox + flow_dx + j - R));
+                    b.mov_patch[(size_t)i * N + j] = moving.at(my, mx);
+                }
+            }
+
+            // Circular cross-correlation ≡ irfft2(conj(rfft2(ref))*rfft2(mov))
+            // corr[dy,dx] = sum ref[i,j] * mov[(i+dy)%N,(j+dx)%N]
+            // Restrict sum to nonzero ref support [R,R+ts)²
+            for (int dy = 0; dy < N; ++dy) {
+                for (int dx = 0; dx < N; ++dx) {
+                    f32 s = 0.f;
+                    for (int i = 0; i < ts; ++i) {
+                        int ri = i + R;
+                        int mi = ri + dy;
+                        if (mi >= N) mi -= N;
+                        for (int j = 0; j < ts; ++j) {
+                            int rj = j + R;
+                            int mj = rj + dx;
+                            if (mj >= N) mj -= N;
+                            s += b.ref_tile_padded[(size_t)ri * N + rj]
+                               * b.mov_patch[(size_t)mi * N + mj];
+                        }
                     }
+                    b.corr[(size_t)dy * N + dx] = s;
                 }
             }
 
-            // --- Extract search patch from moving image ---
-            std::fill(b.mov_patch.begin(), b.mov_patch.end(), 0.f);
-            for (int i = 0; i < search_size; ++i) {
-                for (int j = 0; j < search_size; ++j) {
-                    int my = oy + flow_dy + i - R;
-                    int mx = ox + flow_dx + j - R;
-                    // Clamp to image bounds
-                    my = std::max(0, std::min(moving.h - 1, my));
-                    mx = std::max(0, std::min(moving.w - 1, mx));
-                    b.mov_patch[(size_t)i * fft_w + j] = moving.at(my, mx);
-                }
-            }
-
-            // --- FFT cross-correlation ---
-            rfft2d_full(b.ref_tile_padded.data(), fft_h, fft_w, b.ref_fft, &b.row_buf, &b.dft_buf);
-            rfft2d_full(b.mov_patch.data(), fft_h, fft_w, b.mov_fft, &b.row_buf, &b.dft_buf);
-
-            // conj(ref_fft) * mov_fft
-            for (size_t i = 0; i < b.cross.size(); ++i) {
-                b.cross[i] = std::conj(b.ref_fft[i]) * b.mov_fft[i];
-            }
-
-            // IFFT → real correlation
-            irfft2d_full(b.cross, fft_h, fft_w, b.corr_real, &b.row_buf, &b.dft_buf);
-
-            // fftshift (matching Python: torch.fft.fftshift logic: shift by (dim + 1) // 2)
+            // torch.fft.fftshift: roll by n // 2  →  shifted[y] = corr[(y+n/2)%n]
             {
-                int shift_y = (fft_h + 1) / 2;
-                int shift_x = (fft_w + 1) / 2;
-                for (int y = 0; y < fft_h; ++y) {
-                    for (int x = 0; x < fft_w; ++x) {
-                        int sy = (y + shift_y) % fft_h;
-                        int sx = (x + shift_x) % fft_w;
-                        b.shifted[(size_t)y * fft_w + x] = b.corr_real[(size_t)sy * fft_w + sx];
+                int shift = N / 2;
+                for (int y = 0; y < N; ++y) {
+                    for (int x = 0; x < N; ++x) {
+                        int sy = (y + shift) % N;
+                        int sx = (x + shift) % N;
+                        b.shifted[(size_t)y * N + x] = b.corr[(size_t)sy * N + sx];
                     }
                 }
-                b.corr_real = b.shifted;
             }
 
-            // --- Crop to valid region ---
-            int crop_y0 = (fft_h - 1 - corr_size) / 2 + 1;
-            int crop_x0 = (fft_w - 1 - corr_size) / 2 + 1;
-
-            for (int i = 0; i < corr_size; ++i) {
-                for (int j = 0; j < corr_size; ++j) {
+            // crop = (N - 1 - corr_size) // 2; then [crop+1 : crop+corr_size+1]
+            int crop = (N - 1 - corr_size) / 2;
+            int crop0 = crop + 1;
+            for (int i = 0; i < corr_size; ++i)
+                for (int j = 0; j < corr_size; ++j)
                     b.corrs[(size_t)i * corr_size + j] =
-                        b.corr_real[(size_t)(crop_y0 + i) * fft_w + (crop_x0 + j)];
-                }
-            }
+                        b.shifted[(size_t)(crop0 + i) * N + (crop0 + j)];
 
-            // --- Compute windowed L2 norm of search patches ---
-            // Box-filter convolution: sum of squares over ts×ts windows within
-            // the search_size×search_size search patch. Output is corr_size×corr_size.
+            // Box-filter sum of squares over ts×ts windows
             std::fill(b.L2_search.begin(), b.L2_search.end(), 0.f);
             for (int i = 0; i < corr_size; ++i) {
                 for (int j = 0; j < corr_size; ++j) {
                     f32 sum_sq = 0.f;
-                    for (int ki = 0; ki < ts; ++ki) {
+                    for (int ki = 0; ki < ts; ++ki)
                         for (int kj = 0; kj < ts; ++kj) {
-                            int si = i + ki;
-                            int sj = j + kj;
-                            f32 v = b.mov_patch[(size_t)si * fft_w + sj];
+                            f32 v = b.mov_patch[(size_t)(i + ki) * N + (j + kj)];
                             sum_sq += v * v;
                         }
-                    }
                     b.L2_search[(size_t)i * corr_size + j] = sum_sq;
                 }
             }
 
-            // --- L2 error = L2_search - 2 * corrs ---
-            // (Omits the constant ref L2 norm which doesn't affect argmin)
             f32 best_err = 1e30f;
             int best_dy = 0, best_dx = 0;
             for (int i = 0; i < corr_size; ++i) {
@@ -272,7 +201,6 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                 }
             }
 
-            // Update flow: += delta (matching Python: alignment[:,:,0] += dx)
             flow.dx(ty, tx) += (f32)best_dx;
             flow.dy(ty, tx) += (f32)best_dy;
         }
@@ -280,8 +208,11 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
 }
 
 // ============================================================================
-// L1 block matching — matches Python's align_lvl_block_matching_L1
-// Rounds flow to integer, OOB => 0.0.
+// L1 block matching — matches Python's align_lvl_block_matching_L1 CUDA kernels
+// including the broken argmin (`if err < min` never updates err).
+//
+// cuda_L1_local_search16: err starts as s_err[0,0]
+// cuda_L1_local_search32/64: err starts as +inf → condition never fires → shift 0
 // ============================================================================
 static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
@@ -289,18 +220,17 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
+    int corr = 2 * R + 1;
 
     parallel_rows(ny, num_threads, [&](int ty) {
+        std::vector<f32> s_err((size_t)corr * corr);
         for (int tx = 0; tx < nx; ++tx) {
             int oy = ty * ts;
             int ox = tx * ts;
 
-            // Round current flow (matching Python: round(alignments[...]))
-            int flow_dx = (int)std::rint((float)flow.dx(ty, tx));
-            int flow_dy = (int)std::rint((float)flow.dy(ty, tx));
-
-            f32 best_err = 1e30f;
-            int best_sx = 0, best_sy = 0;
+            // CUDA round(): half away from zero
+            int flow_dx = (int)std::lround((float)flow.dx(ty, tx));
+            int flow_dy = (int)std::lround((float)flow.dy(ty, tx));
 
             for (int sdy = -R; sdy <= R; ++sdy) {
                 for (int sdx = -R; sdx <= R; ++sdx) {
@@ -311,27 +241,39 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                         for (int j = 0; j < ts; ++j) {
                             int rx = ox + j;
                             if (rx >= ref.w) break;
-
                             int my = ry + flow_dy + sdy;
                             int mx = rx + flow_dx + sdx;
-                            // OOB => 0.0 (matching Python CUDA kernel)
                             f32 mv = (my >= 0 && my < moving.h &&
                                       mx >= 0 && mx < moving.w)
                                      ? moving.at(my, mx) : 0.f;
                             l1_sum += std::fabs(ref.at(ry, rx) - mv);
                         }
                     }
-                    if (l1_sum < best_err) {
-                        best_err = l1_sum;
-                        best_sy = sdy;
-                        best_sx = sdx;
+                    s_err[(size_t)(sdy + R) * corr + (sdx + R)] = l1_sum;
+                }
+            }
+
+            // --- Python CUDA argmin bug (verbatim) ---
+            //   min = s_err[i,j]
+            //   if err < min:  # never assigns err = min
+            //       min_shift = (j-R, i-R)
+            // ts==16: err = s_err[0,0];  ts==32/64: err = +inf
+            f32 err = (ts == 16)
+                          ? s_err[0]
+                          : std::numeric_limits<f32>::infinity();
+            int min_shift_x = 0, min_shift_y = 0; // unset locals → 0 in practice
+            for (int i = 0; i < corr; ++i) {
+                for (int j = 0; j < corr; ++j) {
+                    f32 min_v = s_err[(size_t)i * corr + j];
+                    if (err < min_v) {
+                        min_shift_y = i - R;
+                        min_shift_x = j - R;
                     }
                 }
             }
 
-            // Update: flow = rounded_flow + best_shift (matching Python)
-            flow.dx(ty, tx) = (f32)(flow_dx + best_sx);
-            flow.dy(ty, tx) = (f32)(flow_dy + best_sy);
+            flow.dx(ty, tx) = (f32)(flow_dx + min_shift_x);
+            flow.dy(ty, tx) = (f32)(flow_dy + min_shift_y);
         }
     });
 }
@@ -339,8 +281,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
 // ============================================================================
 // Per-level ICA refinement — matches Python's align_lvl_ica + ica_kernel_*
 //
-// Uses Sobel gradients (same size as image), bilinear interpolation with
-// modf decomposition and OOB=>0, and Cramer's rule update.
+// Uses Sobel gradients (same size as image), bilinear with modf + clamp-to-edge,
+// and Cramer's rule update.
 // ============================================================================
 static void ica_refine_level(const Image& ref, const Image& gradx,
                               const Image& grady, const Image& moving,
@@ -397,9 +339,9 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                         int px = ox + j;
                         if (px >= ref.w) break;
 
-                        f32 mov_interp = bilinear_oob_zero(moving, py, px,
-                                                            floor_off_y, floor_off_x,
-                                                            frac_x, frac_y);
+                        f32 mov_interp = bilinear_clamp(moving, py, px,
+                                                        floor_off_y, floor_off_x,
+                                                        frac_x, frac_y);
 
                         f32 gradt = mov_interp - ref.at(py, px);
                         f32 gx = gradx.at(py, px);
