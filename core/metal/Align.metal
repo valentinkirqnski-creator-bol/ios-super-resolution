@@ -10,18 +10,19 @@ kernel void kernel_compute_sobel(
     texture2d<float, access::write> gradyTex [[texture(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
+    if (gid.x >= inTexture.get_width() || gid.y >= inTexture.get_height()) return;
+    
     int w = inTexture.get_width();
     int h = inTexture.get_height();
-    if (gid.x >= w || gid.y >= h) return;
     
     // Sobel X: [-1, 0, 1]
     float mx = (gid.x > 0) ? inTexture.read(uint2(gid.x - 1, gid.y)).r : 0.0f;
-    float px = (gid.x + 1 < w) ? inTexture.read(uint2(gid.x + 1, gid.y)).r : 0.0f;
+    float px = ((int)gid.x + 1 < w) ? inTexture.read(uint2(gid.x + 1, gid.y)).r : 0.0f;
     float gx = px - mx;
     
     // Sobel Y: [-1, 0, 1]^T
     float my = (gid.y > 0) ? inTexture.read(uint2(gid.x, gid.y - 1)).r : 0.0f;
-    float py = (gid.y + 1 < h) ? inTexture.read(uint2(gid.x, gid.y + 1)).r : 0.0f;
+    float py = ((int)gid.y + 1 < h) ? inTexture.read(uint2(gid.x, gid.y + 1)).r : 0.0f;
     float gy = py - my;
     
     gradxTex.write(float4(gx, 0, 0, 1), gid);
@@ -73,9 +74,7 @@ kernel void kernel_block_match_L1(
     constant BlockMatchParams& params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]] // Thread per patch (ty, tx)
 ) {
-    int ny = outFlow.get_height();
-    int nx = outFlow.get_width();
-    if (gid.x >= nx || gid.y >= ny) return;
+    if (gid.x >= outFlow.get_width() || gid.y >= outFlow.get_height()) return;
     
     int tx = gid.x;
     int ty = gid.y;
@@ -100,7 +99,7 @@ kernel void kernel_block_match_L1(
                 for (int j = 0; j < ts; ++j) {
                     int ry = oy + i;
                     int rx = ox + j;
-                    float r_val = (ry < refTex.get_height() && rx < refTex.get_width()) ? 
+                    float r_val = (ry < (int)refTex.get_height() && rx < (int)refTex.get_width()) ? 
                                   refTex.read(uint2(rx, ry)).r : 0.0f;
                     
                     int my = oy + flow_dy + s_dy + i;
@@ -137,9 +136,7 @@ kernel void kernel_block_match_L2(
     constant BlockMatchParams& params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    int ny = outFlow.get_height();
-    int nx = outFlow.get_width();
-    if (gid.x >= nx || gid.y >= ny) return;
+    if (gid.x >= outFlow.get_width() || gid.y >= outFlow.get_height()) return;
     
     int tx = gid.x;
     int ty = gid.y;
@@ -164,7 +161,7 @@ kernel void kernel_block_match_L2(
                 for (int j = 0; j < ts; ++j) {
                     int ry = oy + i;
                     int rx = ox + j;
-                    float r_val = (ry < refTex.get_height() && rx < refTex.get_width()) ? 
+                    float r_val = (ry < (int)refTex.get_height() && rx < (int)refTex.get_width()) ? 
                                   refTex.read(uint2(rx, ry)).r : 0.0f;
                     
                     int my = oy + flow_dy + s_dy + i;
@@ -198,22 +195,22 @@ struct IcaParams {
     int n_iter;
 };
 
+inline float sample_oob_zero(texture2d<float, access::read> img, int y, int x) {
+    if (y >= 0 && y < (int)img.get_height() && x >= 0 && x < (int)img.get_width()) {
+        return img.read(uint2(x, y)).r;
+    }
+    return 0.0f;
+}
+
 inline float bilinear_oob_zero(texture2d<float, access::read> img, int pixel_y, int pixel_x,
                                int floor_off_y, int floor_off_x, float frac_x, float frac_y) {
     int floor_y = pixel_y + floor_off_y;
     int floor_x = pixel_x + floor_off_x;
     
-    auto sample = [&](int y, int x) -> float {
-        if (y >= 0 && y < img.get_height() && x >= 0 && x < img.get_width()) {
-            return img.read(uint2(x, y)).r;
-        }
-        return 0.0f;
-    };
-    
-    float m00 = sample(floor_y, floor_x);
-    float m01 = sample(floor_y, floor_x + 1);
-    float m10 = sample(floor_y + 1, floor_x);
-    float m11 = sample(floor_y + 1, floor_x + 1);
+    float m00 = sample_oob_zero(img, floor_y, floor_x);
+    float m01 = sample_oob_zero(img, floor_y, floor_x + 1);
+    float m10 = sample_oob_zero(img, floor_y + 1, floor_x);
+    float m11 = sample_oob_zero(img, floor_y + 1, floor_x + 1);
     
     float lerpx_top = m00 + (m01 - m00) * frac_x;
     float lerpx_bot = m10 + (m11 - m10) * frac_x;
@@ -230,9 +227,7 @@ kernel void kernel_ica_refine(
     constant IcaParams& params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    int ny = outFlow.get_height();
-    int nx = outFlow.get_width();
-    if (gid.x >= nx || gid.y >= ny) return;
+    if (gid.x >= outFlow.get_width() || gid.y >= outFlow.get_height()) return;
     
     int tx = gid.x;
     int ty = gid.y;
@@ -249,7 +244,7 @@ kernel void kernel_ica_refine(
         for (int j = 0; j < ts; ++j) {
             int ry = oy + i;
             int rx = ox + j;
-            if (ry < refTex.get_height() && rx < refTex.get_width()) {
+            if (ry < (int)refTex.get_height() && rx < (int)refTex.get_width()) {
                 float gx = gxTex.read(uint2(rx, ry)).r;
                 float gy = gyTex.read(uint2(rx, ry)).r;
                 h11 += gx * gx;
@@ -285,7 +280,7 @@ kernel void kernel_ica_refine(
             for (int j = 0; j < ts; ++j) {
                 int ry = oy + i;
                 int rx = ox + j;
-                if (ry < refTex.get_height() && rx < refTex.get_width()) {
+                if (ry < (int)refTex.get_height() && rx < (int)refTex.get_width()) {
                     float r_val = refTex.read(uint2(rx, ry)).r;
                     float m_val = bilinear_oob_zero(movTex, ry, rx, floor_off_y, floor_off_x, frac_x, frac_y);
                     float err = m_val - r_val;
