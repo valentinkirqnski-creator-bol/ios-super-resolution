@@ -22,7 +22,7 @@ void MetalContext::init() {
 #ifdef __OBJC__
     _device = MTLCreateSystemDefaultDevice();
     if (_device) {
-        _command_queue = [_device commandQueue];
+        _command_queue = [_device newCommandQueue];
         _library = [_device newDefaultLibrary];
         if (!_library) {
             std::cerr << "Warning: Could not load default Metal library. Make sure .metal files are compiled into the app." << std::endl;
