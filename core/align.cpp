@@ -16,7 +16,7 @@ namespace hhsr {
 // Produces same-sized output (unlike compute_gradients which shrinks by 1).
 // SOBEL_X = [[-1,0,1]], SOBEL_Y = [[-1],[0],[1]]
 // ============================================================================
-static Image compute_sobel_gradx(const Image& img) {
+Image compute_sobel_gradx(const Image& img) {
     Image out(img.h, img.w, 1);
     for (int y = 0; y < img.h; ++y) {
         for (int x = 0; x < img.w; ++x) {
@@ -29,7 +29,7 @@ static Image compute_sobel_gradx(const Image& img) {
     return out;
 }
 
-static Image compute_sobel_grady(const Image& img) {
+Image compute_sobel_grady(const Image& img) {
     Image out(img.h, img.w, 1);
     for (int y = 0; y < img.h; ++y) {
         for (int x = 0; x < img.w; ++x) {
@@ -142,7 +142,7 @@ static void irfft2d_full(std::vector<std::complex<f32>>& data, int h, int w,
     for (int i = 0; i < h * w; ++i) real_out[i] = data[i].real();
 }
 
-static void block_match_level_L2(const Image& ref, const Image& moving,
+void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
     int ny = flow.ny, nx = flow.nx;
@@ -301,7 +301,7 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
 // L1 block matching — matches Python's align_lvl_block_matching_L1
 // Rounds flow to integer, OOB => 0.0.
 // ============================================================================
-static void block_match_level_L1(const Image& ref, const Image& moving,
+void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
     int ny = flow.ny, nx = flow.nx;
@@ -360,7 +360,41 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
 // Uses Sobel gradients (same size as image), bilinear interpolation with
 // modf decomposition and OOB=>0, and Cramer's rule update.
 // ============================================================================
-static void ica_refine_level(const Image& ref, const Image& gradx,
+void compute_hessian_inverse(const Image& ref, const Image& gradx, const Image& grady,
+                             int tile_size, int ny, int nx,
+                             std::vector<f32>& out_ih) {
+    out_ih.assign((size_t)ny * nx * 4, 0.f);
+    int ts = tile_size;
+    for (int ty = 0; ty < ny; ++ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            int oy = ty * ts, ox = tx * ts;
+            f32 h00 = 0, h01 = 0, h11 = 0;
+            for (int i = 0; i < ts; ++i) {
+                int py = oy + i;
+                if (py >= ref.h) break;
+                for (int j = 0; j < ts; ++j) {
+                    int px = ox + j;
+                    if (px >= ref.w) break;
+                    f32 gx = gradx.at(py, px), gy = grady.at(py, px);
+                    h00 += gx * gx;
+                    h01 += gx * gy;
+                    h11 += gy * gy;
+                }
+            }
+            f32 det = h00 * h11 - h01 * h01;
+            size_t base = ((size_t)ty * nx + tx) * 4;
+            if (std::fabs(det) >= 1e-10f) {
+                f32 inv = 1.f / det;
+                out_ih[base + 0] = inv * h11;
+                out_ih[base + 1] = -inv * h01;
+                out_ih[base + 2] = inv * h00;
+                out_ih[base + 3] = 1.f;
+            }
+        }
+    }
+}
+
+void ica_refine_level(const Image& ref, const Image& gradx,
                               const Image& grady, const Image& moving,
                               FlowField& flow, int tile_size, int n_iter,
                               int num_threads) {
@@ -457,9 +491,9 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
 //   upsampled *= upsample_factor
 //   # zero-pad if size mismatch
 // ============================================================================
-static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
-                               int upsample_factor, int new_tile_size,
-                               int prev_tile_size) {
+FlowField upscale_alignment_flow(const FlowField& in, int target_ny, int target_nx,
+                                 int upsample_factor, int new_tile_size,
+                                 int prev_tile_size) {
     // Compute repeat factor matching Python
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -538,7 +572,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1]
                           : ts;
-            flow = upscale_flow(flow, ny, nx, upsample_factor, ts, prev_ts);
+            flow = upscale_alignment_flow(flow, ny, nx, upsample_factor, ts, prev_ts);
         }
 
         // Determine metric for this level

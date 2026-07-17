@@ -28,12 +28,13 @@ NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta);
 namespace {
 
 static const std::vector<std::string> kRequiredKernels = {
-    "kernel_grey_decimate", "kernel_downsample", "kernel_extract_guide",
+    "kernel_apply_gat", "kernel_grey_decimate", "kernel_compute_gradients",
+    "kernel_downsample", "kernel_extract_guide",
     "kernel_local_stats_3x3", "kernel_upscale_warp_stats", "kernel_build_dp_guide",
     "kernel_apply_noise_model", "kernel_compute_flow_S", "kernel_robustness_threshold",
     "kernel_local_min_5x5", "kernel_compute_covariances",
-    "kernel_block_match_L1", "kernel_block_match_L2", "kernel_block_match_L2_FFT", "kernel_compute_sobel",
-    "kernel_ica_refine", "kernel_accumulate_comp_band", "kernel_accumulate_ref_band"
+    "kernel_block_match_L1", "kernel_compute_sobel", "kernel_ica_refine",
+    "kernel_accumulate_comp_band", "kernel_accumulate_ref_band"
 };
 
 static bool save_flow(const fs::path& p, const FlowField& f) {
@@ -180,8 +181,8 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 
 struct RefGpuState {
     id<MTLTexture> raw;
-    id<MTLTexture> grey;
-    std::vector<id<MTLTexture>> pyr;
+    Pyramid ref_pyr;
+    std::vector<id<MTLBuffer>> ref_hess_buf;
     id<MTLTexture> guide;
     id<MTLTexture> means_guide;
     id<MTLTexture> vars_guide;
@@ -233,86 +234,123 @@ static void dispatch_kernel(id<MTLComputeCommandEncoder> enc, int w, int h, int 
          threadsPerThreadgroup:MTLSizeMake(tg, tg, 1)];
 }
 
-static id<MTLTexture> compute_grey_metal(id<MTLTexture> in_raw, bool bayer_mode, MetalContext& ctx) {
-    if (!bayer_mode) return in_raw;
+static id<MTLTexture> apply_gat_metal(id<MTLTexture> raw, f32 alpha, f32 beta, MetalContext& ctx) {
+    id<MTLComputePipelineState> pso = ctx.get_pipeline_state("kernel_apply_gat");
+    id<MTLTexture> out_tex = ctx.create_empty_texture((int)raw.width, (int)raw.height, 1, true);
+    if (!pso || !out_tex) return nil;
+    struct { float alpha; float beta; } gp = { alpha, beta };
+    id<MTLBuffer> gp_buf = [ctx.device() newBufferWithBytes:&gp length:sizeof(gp)
+                                                    options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!begin_kernel(enc, pso)) return nil;
+    [enc setTexture:raw atIndex:0];
+    [enc setTexture:out_tex atIndex:1];
+    [enc setBuffer:gp_buf offset:0 atIndex:0];
+    dispatch_kernel(enc, (int)raw.width, (int)raw.height);
+    [enc endEncoding];
+    return run_cmd(cmd) ? out_tex : nil;
+}
+
+static id<MTLTexture> grey_decimate_metal(id<MTLTexture> in_tex, MetalContext& ctx) {
     id<MTLComputePipelineState> pso = ctx.get_pipeline_state("kernel_grey_decimate");
-    int gw = (int)in_raw.width / 2;
-    int gh = (int)in_raw.height / 2;
+    int gw = (int)in_tex.width / 2;
+    int gh = (int)in_tex.height / 2;
     id<MTLTexture> out_tex = ctx.create_empty_texture(gw, gh, 1, true);
     if (!pso || !out_tex) return nil;
     id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!begin_kernel(enc, pso)) return nil;
-    [enc setTexture:in_raw atIndex:0];
+    [enc setTexture:in_tex atIndex:0];
     [enc setTexture:out_tex atIndex:1];
     dispatch_kernel(enc, gw, gh);
     [enc endEncoding];
     return run_cmd(cmd) ? out_tex : nil;
 }
 
-static id<MTLTexture> compute_downsample_metal(id<MTLTexture> src, int factor, MetalContext& ctx) {
-    if (factor <= 1) return src;
-    id<MTLComputePipelineState> pso = ctx.get_pipeline_state("kernel_downsample");
-    float sigma = factor * 0.5f;
-    int radius = (int)(4.0f * sigma + 0.5f);
-    int ksize = 2 * radius + 1;
-    std::vector<f32> kernel1d(ksize);
-    f32 ksum = 0.f;
-    for (int i = -radius; i <= radius; ++i) {
-        kernel1d[i + radius] = std::exp(-0.5f * (float)(i * i) / (sigma * sigma));
-        ksum += kernel1d[i + radius];
-    }
-    for (auto& v : kernel1d) v /= ksum;
-    int out_h = ((int)src.height - (ksize - 1)) / factor;
-    int out_w = ((int)src.width - (ksize - 1)) / factor;
-    id<MTLTexture> out_tex = ctx.create_empty_texture(out_w, out_h, 1, true);
+static id<MTLTexture> compute_gradients_metal(id<MTLTexture> grey, MetalContext& ctx) {
+    id<MTLComputePipelineState> pso = ctx.get_pipeline_state("kernel_compute_gradients");
+    int gw = (int)grey.width - 1;
+    int gh = (int)grey.height - 1;
+    if (gw < 1 || gh < 1) return nil;
+    id<MTLTexture> out_tex = ctx.create_empty_texture(gw, gh, 2, true);
     if (!pso || !out_tex) return nil;
-    struct { int factor; int ksize; int radius; } params = { factor, ksize, radius };
-    id<MTLBuffer> w_buf = [ctx.device() newBufferWithBytes:kernel1d.data()
-                                                    length:kernel1d.size() * sizeof(float)
-                                                   options:MTLResourceStorageModeShared];
-    id<MTLBuffer> p_buf = [ctx.device() newBufferWithBytes:&params length:sizeof(params)
-                                                   options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!begin_kernel(enc, pso)) return nil;
-    [enc setTexture:src atIndex:0];
+    [enc setTexture:grey atIndex:0];
     [enc setTexture:out_tex atIndex:1];
-    [enc setBuffer:w_buf offset:0 atIndex:0];
-    [enc setBuffer:p_buf offset:0 atIndex:1];
-    dispatch_kernel(enc, out_w, out_h);
+    dispatch_kernel(enc, gw, gh);
     [enc endEncoding];
     return run_cmd(cmd) ? out_tex : nil;
 }
 
-static std::vector<id<MTLTexture>> build_pyramid_metal(id<MTLTexture> grey,
-                                                         const std::vector<int>& factors,
-                                                         MetalContext& ctx) {
-    std::vector<id<MTLTexture>> pyr;
-    id<MTLTexture> cur = grey;
-    for (size_t i = 0; i < factors.size(); ++i) {
-        int f = factors[i];
-        if (!(f == 1 && i == 0))
-            cur = compute_downsample_metal(cur, f, ctx);
-        if (!cur) return {};
-        pyr.push_back(cur);
-    }
-    return pyr;
+static bool compute_covs_metal(id<MTLTexture> grey, id<MTLTexture> grad, id<MTLTexture> covs_out,
+                               id<MTLBuffer> k_params_buf, MetalContext& ctx) {
+    id<MTLComputePipelineState> pso = ctx.get_pipeline_state("kernel_compute_covariances");
+    if (!pso || !covs_out) return false;
+    id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!begin_kernel(enc, pso)) return false;
+    [enc setTexture:grey atIndex:0];
+    [enc setTexture:grad atIndex:1];
+    [enc setTexture:covs_out atIndex:2];
+    [enc setBuffer:k_params_buf offset:0 atIndex:0];
+    dispatch_kernel(enc, (int)covs_out.width, (int)covs_out.height);
+    [enc endEncoding];
+    return run_cmd(cmd);
 }
 
-static FlowField align_metal_cpu_upscale(const std::vector<id<MTLTexture>>& ref_pyr,
-                                         const std::vector<id<MTLTexture>>& mov_pyr,
-                                         const Config& cfg, int tile_size, MetalContext& ctx) {
-    int nlev = (int)ref_pyr.size();
+static bool estimate_covs_from_raw_metal(id<MTLTexture> raw, bool bayer_mode, f32 alpha, f32 beta,
+                                         __strong id<MTLTexture>& covs_out, id<MTLBuffer> k_params_buf,
+                                         MetalContext& ctx) {
+    id<MTLTexture> vst = apply_gat_metal(raw, alpha, beta, ctx);
+    if (!vst) return false;
+    id<MTLTexture> grey = bayer_mode ? grey_decimate_metal(vst, ctx) : vst;
+    if (!grey) return false;
+    id<MTLTexture> grad = compute_gradients_metal(grey, ctx);
+    if (!grad) return false;
+    if (!covs_out)
+        covs_out = ctx.create_empty_texture((int)grey.width, (int)grey.height, 4, false);
+    return compute_covs_metal(grey, grad, covs_out, k_params_buf, ctx);
+}
+
+static std::vector<id<MTLBuffer>> precompute_ref_hessian_bufs(
+    const Pyramid& ref_pyr, const Config& cfg, int tile_size, MetalContext& ctx) {
+    std::vector<id<MTLBuffer>> hess_bufs;
+    hess_bufs.reserve(ref_pyr.levels.size());
+    for (size_t lvl = 0; lvl < ref_pyr.levels.size(); ++lvl) {
+        const Image& r = ref_pyr.levels[lvl];
+        int ts = (lvl < cfg.bm_tile_sizes.size()) ? std::max(4, cfg.bm_tile_sizes[lvl])
+                                                  : std::max(4, tile_size);
+        int ny = std::max(1, r.h / ts);
+        int nx = std::max(1, r.w / ts);
+        Image gx = compute_sobel_gradx(r);
+        Image gy = compute_sobel_grady(r);
+        std::vector<f32> hess;
+        compute_hessian_inverse(r, gx, gy, ts, ny, nx, hess);
+        id<MTLBuffer> buf = [ctx.device() newBufferWithBytes:hess.data()
+                                                      length:hess.size() * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        hess_bufs.push_back(buf);
+    }
+    return hess_bufs;
+}
+
+static FlowField align_hybrid(const Pyramid& ref_pyr,
+                              const std::vector<id<MTLBuffer>>& ref_hess_buf,
+                              const Pyramid& mov_pyr,
+                              const Config& cfg, int tile_size, MetalContext& ctx) {
+    int nlev = (int)ref_pyr.levels.size();
     FlowField flow_cpu;
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
-        id<MTLTexture> r = ref_pyr[lvl];
-        id<MTLTexture> m = mov_pyr[lvl];
+        const Image& r = ref_pyr.levels[lvl];
+        const Image& m = mov_pyr.levels[lvl];
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? std::max(4, cfg.bm_tile_sizes[lvl])
                                                        : std::max(4, tile_size);
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
-        int ny = std::max(1, (int)r.height / ts);
-        int nx = std::max(1, (int)r.width / ts);
+        int ny = std::max(1, r.h / ts);
+        int nx = std::max(1, r.w / ts);
 
         if (flow_cpu.nx == 0) {
             flow_cpu = FlowField(ny, nx);
@@ -322,69 +360,70 @@ static FlowField align_metal_cpu_upscale(const std::vector<id<MTLTexture>>& ref_
             flow_cpu = upscale_alignment_flow(flow_cpu, ny, nx, upsample_factor, ts, prev_ts);
         }
 
-        id<MTLTexture> flow = ctx.create_texture_from_flow(flow_cpu);
-        if (!flow) return FlowField();
-
         std::string metric = (lvl < (int)cfg.bm_metrics.size()) ? cfg.bm_metrics[lvl] : "L2";
-        std::string kernel_name = (metric == "L2") ? "kernel_block_match_L2_FFT" : "kernel_block_match_" + metric;
-        id<MTLComputePipelineState> pso_bm = ctx.get_pipeline_state(kernel_name);
-        id<MTLTexture> out_bm = ctx.create_empty_texture(nx, ny, 2, true);
-        struct { int ts; int search_radius; } p_bm = { ts, radius };
-        id<MTLBuffer> bm_buf = [ctx.device() newBufferWithBytes:&p_bm length:sizeof(p_bm)
-                                                        options:MTLResourceStorageModeShared];
-        {
+        if (metric == "L1") {
+            id<MTLTexture> r_tex = ctx.create_texture(r);
+            id<MTLTexture> m_tex = ctx.create_texture(m);
+            id<MTLTexture> flow = ctx.create_texture_from_flow(flow_cpu);
+            id<MTLTexture> out_bm = ctx.create_empty_texture(nx, ny, 2, true);
+            id<MTLComputePipelineState> pso_bm = ctx.get_pipeline_state("kernel_block_match_L1");
+            struct { int ts; int search_radius; } p_bm = { ts, radius };
+            id<MTLBuffer> bm_buf = [ctx.device() newBufferWithBytes:&p_bm length:sizeof(p_bm)
+                                                            options:MTLResourceStorageModeShared];
             id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            if (!begin_kernel(enc, pso_bm)) return FlowField();
-            [enc setTexture:r atIndex:0];
-            [enc setTexture:m atIndex:1];
+            if (!begin_kernel(enc, pso_bm) || !r_tex || !m_tex || !flow || !out_bm) return FlowField();
+            [enc setTexture:r_tex atIndex:0];
+            [enc setTexture:m_tex atIndex:1];
             [enc setTexture:flow atIndex:2];
             [enc setTexture:out_bm atIndex:3];
             [enc setBuffer:bm_buf offset:0 atIndex:0];
-            
-            if (metric == "L2") {
-                [enc dispatchThreadgroups:MTLSizeMake(nx, ny, 1)
-                    threadsPerThreadgroup:MTLSizeMake(576, 1, 1)];
-            } else {
-                dispatch_kernel(enc, nx, ny);
-            }
-            
+            dispatch_kernel(enc, nx, ny);
             [enc endEncoding];
             if (!run_cmd(cmd)) return FlowField();
+            ctx.read_flow_texture(out_bm, flow_cpu);
+        } else {
+            block_match_level_L2(r, m, ts, radius, flow_cpu, cfg.num_threads);
         }
-        flow = out_bm;
 
-        id<MTLTexture> gx = ctx.create_empty_texture((int)r.width, (int)r.height, 1, true);
-        id<MTLTexture> gy = ctx.create_empty_texture((int)r.width, (int)r.height, 1, true);
+        id<MTLTexture> r_tex = ctx.create_texture(r);
+        id<MTLTexture> m_tex = ctx.create_texture(m);
+        id<MTLTexture> flow = ctx.create_texture_from_flow(flow_cpu);
+        id<MTLTexture> gx = ctx.create_empty_texture(r.w, r.h, 1, true);
+        id<MTLTexture> gy = ctx.create_empty_texture(r.w, r.h, 1, true);
         id<MTLComputePipelineState> pso_sobel = ctx.get_pipeline_state("kernel_compute_sobel");
         {
             id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            if (!begin_kernel(enc, pso_sobel)) return FlowField();
-            [enc setTexture:r atIndex:0];
+            if (!begin_kernel(enc, pso_sobel) || !r_tex || !m_tex || !flow || !gx || !gy) return FlowField();
+            [enc setTexture:r_tex atIndex:0];
             [enc setTexture:gx atIndex:1];
             [enc setTexture:gy atIndex:2];
-            dispatch_kernel(enc, (int)r.width, (int)r.height);
+            dispatch_kernel(enc, r.w, r.h);
             [enc endEncoding];
             if (!run_cmd(cmd)) return FlowField();
         }
 
         id<MTLTexture> out_ica = ctx.create_empty_texture(nx, ny, 2, false);
-        struct { int ts; int n_iter; } p_ica = { ts, cfg.ica_n_iter };
+        struct { int ts; int n_iter; int img_w; int img_h; } p_ica = {
+            ts, cfg.ica_n_iter, r.w, r.h
+        };
         id<MTLBuffer> ica_buf = [ctx.device() newBufferWithBytes:&p_ica length:sizeof(p_ica)
                                                          options:MTLResourceStorageModeShared];
         id<MTLComputePipelineState> pso_ica = ctx.get_pipeline_state("kernel_ica_refine");
+        id<MTLBuffer> hess_buf = (lvl < (int)ref_hess_buf.size()) ? ref_hess_buf[lvl] : nil;
         {
             id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            if (!begin_kernel(enc, pso_ica)) return FlowField();
-            [enc setTexture:r atIndex:0];
+            if (!begin_kernel(enc, pso_ica) || !hess_buf) return FlowField();
+            [enc setTexture:r_tex atIndex:0];
             [enc setTexture:gx atIndex:1];
             [enc setTexture:gy atIndex:2];
-            [enc setTexture:m atIndex:3];
+            [enc setTexture:m_tex atIndex:3];
             [enc setTexture:flow atIndex:4];
             [enc setTexture:out_ica atIndex:5];
-            [enc setBuffer:ica_buf offset:0 atIndex:0];
+            [enc setBuffer:hess_buf offset:0 atIndex:0];
+            [enc setBuffer:ica_buf offset:0 atIndex:1];
             dispatch_kernel(enc, nx, ny);
             [enc endEncoding];
             if (!run_cmd(cmd)) return FlowField();
@@ -394,14 +433,19 @@ static FlowField align_metal_cpu_upscale(const std::vector<id<MTLTexture>>& ref_
     return flow_cpu;
 }
 
-static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, RefGpuState& ref,
-                         id<MTLBuffer> guide_buf, id<MTLBuffer> k_params_buf, MetalContext& ctx) {
+static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, int tile_size,
+                         RefGpuState& ref, id<MTLBuffer> guide_buf, id<MTLBuffer> k_params_buf,
+                         MetalContext& ctx) {
+    Image ref_grey = compute_grey(ref_raw, cfg.bayer_mode, cfg.grey_method);
+    ref_grey = pad_grey_circular(ref_grey, tile_size);
+    ref.ref_pyr = build_pyramid(ref_grey, cfg.bm_factors);
+    if (ref.ref_pyr.levels.empty()) return false;
+
+    ref.ref_hess_buf = precompute_ref_hessian_bufs(ref.ref_pyr, cfg, tile_size, ctx);
+    if (ref.ref_hess_buf.size() != ref.ref_pyr.levels.size()) return false;
+
     ref.raw = ctx.create_texture(ref_raw);
     if (!ref.raw) return false;
-    ref.grey = compute_grey_metal(ref.raw, cfg.bayer_mode, ctx);
-    if (!ref.grey) return false;
-    ref.pyr = build_pyramid_metal(ref.grey, cfg.bm_factors, ctx);
-    if (ref.pyr.empty()) return false;
 
     int gh = cfg.bayer_mode ? ref_raw.h / 2 : ref_raw.h;
     int gw = cfg.bayer_mode ? ref_raw.w / 2 : ref_raw.w;
@@ -410,7 +454,7 @@ static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, RefGpuState& r
     ref.vars_guide = ctx.create_empty_texture(gw, gh, 4, true);
     ref.means_raw = ctx.create_empty_texture(ref_raw.w, ref_raw.h, 4, true);
     ref.vars_raw = ctx.create_empty_texture(ref_raw.w, ref_raw.h, 4, true);
-    ref.covs = ctx.create_empty_texture((int)ref.grey.width, (int)ref.grey.height, 4, true);
+    ref.covs = ctx.create_empty_texture(gw, gh, 4, true);
     ref.dummy_flow = ctx.create_empty_texture(1, 1, 2, true);
     if (!ref.guide || !ref.means_guide || !ref.vars_guide || !ref.means_raw || !ref.vars_raw || !ref.covs || !ref.dummy_flow)
         return false;
@@ -418,7 +462,6 @@ static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, RefGpuState& r
     id<MTLComputePipelineState> pso_guide = ctx.get_pipeline_state("kernel_extract_guide");
     id<MTLComputePipelineState> pso_stats = ctx.get_pipeline_state("kernel_local_stats_3x3");
     id<MTLComputePipelineState> pso_warp = ctx.get_pipeline_state("kernel_upscale_warp_stats");
-    id<MTLComputePipelineState> pso_cov = ctx.get_pipeline_state("kernel_compute_covariances");
 
     {
         id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
@@ -476,18 +519,8 @@ static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, RefGpuState& r
         [enc endEncoding];
         if (!run_cmd(cmd)) return false;
     }
-    {
-        id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        if (!begin_kernel(enc, pso_cov)) return false;
-        [enc setTexture:ref.raw atIndex:0];
-        [enc setTexture:ref.covs atIndex:1];
-        [enc setBuffer:k_params_buf offset:0 atIndex:0];
-        dispatch_kernel(enc, (int)ref.covs.width, (int)ref.covs.height);
-        [enc endEncoding];
-        if (!run_cmd(cmd)) return false;
-    }
-    return true;
+    return estimate_covs_from_raw_metal(ref.raw, cfg.bayer_mode, cfg.alpha, cfg.beta,
+                                        ref.covs, k_params_buf, ctx);
 }
 
 static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flow_tex,
@@ -638,22 +671,11 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
     return out_rob.h > 0;
 }
 
-static bool estimate_covs_metal(id<MTLTexture> raw, bool bayer_mode, __strong id<MTLTexture>& covs_out,
-                                id<MTLBuffer> k_params_buf, MetalContext& ctx) {
-    int cov_w = bayer_mode ? (int)raw.width / 2 : (int)raw.width;
-    int cov_h = bayer_mode ? (int)raw.height / 2 : (int)raw.height;
-    covs_out = ctx.create_empty_texture(cov_w, cov_h, 4, false);
-    if (!covs_out) return false;
-    id<MTLComputePipelineState> pso = ctx.get_pipeline_state("kernel_compute_covariances");
-    id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!begin_kernel(enc, pso)) return false;
-    [enc setTexture:raw atIndex:0];
-    [enc setTexture:covs_out atIndex:1];
-    [enc setBuffer:k_params_buf offset:0 atIndex:0];
-    dispatch_kernel(enc, cov_w, cov_h);
-    [enc endEncoding];
-    return run_cmd(cmd);
+static bool estimate_covs_metal(id<MTLTexture> raw, bool bayer_mode, f32 alpha, f32 beta,
+                                __strong id<MTLTexture>& covs_out, id<MTLBuffer> k_params_buf,
+                                MetalContext& ctx) {
+    covs_out = nil;
+    return estimate_covs_from_raw_metal(raw, bayer_mode, alpha, beta, covs_out, k_params_buf, ctx);
 }
 
 } // namespace
@@ -690,10 +712,12 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
 
     struct KernelParams {
         float alpha; float beta; float k_detail; float k_denoise;
-        float D_tr; float D_th; float k_shrink; float k_stretch; int selection_law;
+        float D_tr; float D_th; float k_shrink; float k_stretch;
+        int selection_law; int iso_kernel;
     } k_params = { work.alpha, work.beta, work.k_detail, work.k_denoise,
                    work.D_tr, work.D_th, work.k_shrink, work.k_stretch,
-                   (work.selection == SelectionLaw::Linear) ? 0 : 1 };
+                   (work.selection == SelectionLaw::Linear) ? 0 : 1,
+                   (work.kernel == KernelShape::Iso) ? 1 : 0 };
     id<MTLBuffer> k_params_buf = [ctx.device() newBufferWithBytes:&k_params length:sizeof(k_params)
                                                             options:MTLResourceStorageModeShared];
 
@@ -706,8 +730,8 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
                                                       options:MTLResourceStorageModeShared];
 
     RefGpuState ref_gpu;
-    report("Reference: GPU grey + pyramid + robustness", 0.05f);
-    if (!init_ref_gpu(ref, work, ref_gpu, guide_buf, k_params_buf, ctx)) {
+    report("Reference: CPU grey/pyramid + GPU robustness/kernels", 0.05f);
+    if (!init_ref_gpu(ref, work, tile_size, ref_gpu, guide_buf, k_params_buf, ctx)) {
         std::cerr << "Metal ref init failed; falling back to CPU." << std::endl;
         return false;
     }
@@ -729,21 +753,20 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
 
         id<MTLTexture> comp_raw = ctx.create_texture(comp);
         if (!comp_raw) continue;
-        id<MTLTexture> comp_grey = compute_grey_metal(comp_raw, work.bayer_mode, ctx);
-        if (!comp_grey) continue;
-        std::vector<id<MTLTexture>> comp_pyr = build_pyramid_metal(comp_grey, work.bm_factors, ctx);
-        if (comp_pyr.empty()) continue;
 
-        FlowField flow = align_metal_cpu_upscale(ref_gpu.pyr, comp_pyr, work, tile_size, ctx);
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        Pyramid comp_pyr = build_pyramid(comp_grey, work.bm_factors);
+        if (comp_pyr.levels.empty()) continue;
+
+        FlowField flow = align_hybrid(ref_gpu.ref_pyr, ref_gpu.ref_hess_buf, comp_pyr,
+                                      work, tile_size, ctx);
         if (flow.nx <= 0) continue;
         id<MTLTexture> flow_tex = ctx.create_texture_from_flow(flow);
         if (!flow_tex) continue;
 
         Image rob;
         if (!work.robustness_enabled) {
-            int gh = work.bayer_mode ? ref_h / 2 : ref_h;
-            int gw = work.bayer_mode ? ref_w / 2 : ref_w;
-            rob = Image(gh, gw, 1);
+            rob = Image(ref_h, ref_w, 1);
             std::fill(rob.data.begin(), rob.data.end(), 1.f);
         } else if (!compute_robustness_metal(comp_raw, flow_tex, ref_gpu, tile_size, work,
                                              guide_buf, std_buf, diff_buf, rob, ctx)) {
@@ -751,7 +774,8 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
         }
 
         id<MTLTexture> comp_covs = nil;
-        if (!estimate_covs_metal(comp_raw, work.bayer_mode, comp_covs, k_params_buf, ctx)) continue;
+        if (!estimate_covs_metal(comp_raw, work.bayer_mode, work.alpha, work.beta,
+                                 comp_covs, k_params_buf, ctx)) continue;
         CovField covs;
         Image cov_img;
         ctx.read_texture(comp_covs, cov_img);
@@ -775,7 +799,8 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
         n_comp_ok++;
     }
 
-    ref_gpu.pyr.clear();
+    ref_gpu.ref_pyr = Pyramid();
+    ref_gpu.ref_hess_buf.clear();
 
     if (n_comp_ok < 1) {
         fs::remove_all(cache, ec);

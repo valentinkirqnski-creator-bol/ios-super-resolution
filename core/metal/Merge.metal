@@ -410,13 +410,14 @@ kernel void kernel_accumulate_ref_band(
 
     float additional_denoise_power = 1.0f;
     int rad = 1;
+    float local_acc_r = 0.0f;
 
     if (params.acc_rob_enabled == 1 && accRobTex.get_width() > 1) {
         float rob_scale = (params.bayer_mode == 1) ? 0.5f : 1.0f;
         int ay = min((int)round(coarse_y * rob_scale), (int)accRobTex.get_height() - 1);
         int ax = min((int)round(coarse_x * rob_scale), (int)accRobTex.get_width() - 1);
 
-        float local_acc_r = accRobTex.read(uint2(max(0, ax), max(0, ay))).r;
+        local_acc_r = accRobTex.read(uint2(max(0, ax), max(0, ay))).r;
         if (local_acc_r <= params.max_frame_count) {
             additional_denoise_power = params.max_multiplier;
             rad = params.rad_max;
@@ -480,6 +481,12 @@ kernel void kernel_accumulate_ref_band(
 
     float4 prev_num = numTex.read(gid);
     float4 prev_den = denTex.read(gid);
-    numTex.write(prev_num + float4(val.x, val.y, val.z, 0), gid);
-    denTex.write(prev_den + float4(acc.x, acc.y, acc.z, 0), gid);
+    float4 out_num = prev_num + float4(val.x, val.y, val.z, 0);
+    float4 out_den = prev_den + float4(acc.x, acc.y, acc.z, 0);
+    if (params.acc_rob_enabled == 1 && local_acc_r < params.max_frame_count) {
+        out_num = float4(val.x, val.y, val.z, 0);
+        out_den = float4(acc.x, acc.y, acc.z, 0);
+    }
+    numTex.write(out_num, gid);
+    denTex.write(out_den, gid);
 }

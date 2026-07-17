@@ -27,10 +27,37 @@ Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 Image compute_gradients(const Image& grey);
 Image gaussian_blur(const Image& src, float sigma);
 
+// Circular pad grey to tile boundary (matches Python init_alignment F.pad circular).
+Image pad_grey_circular(const Image& grey, int tile_size);
+
 // ---- align.cpp ----------------------------------------------------------
+Image compute_sobel_gradx(const Image& img);
+Image compute_sobel_grady(const Image& img);
+
+void block_match_level_L1(const Image& ref, const Image& moving,
+                          int tile_size, int search_radius,
+                          FlowField& flow, int num_threads);
+
+void block_match_level_L2(const Image& ref, const Image& moving,
+                          int tile_size, int search_radius,
+                          FlowField& flow, int num_threads);
+
+// Per-tile inverse Hessian for ICA: [ny*nx*4] = ih11, ih12, ih22, valid.
+void compute_hessian_inverse(const Image& ref, const Image& gradx, const Image& grady,
+                             int tile_size, int ny, int nx,
+                             std::vector<f32>& out_ih);
+
+void ica_refine_level(const Image& ref, const Image& gradx, const Image& grady,
+                      const Image& moving, FlowField& flow, int tile_size,
+                      int n_iter, int num_threads);
+
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size);
+
+FlowField upscale_alignment_flow(const FlowField& in, int target_ny, int target_nx,
+                                 int upsample_factor, int new_tile_size,
+                                 int prev_tile_size);
 
 // ---- robustness.cpp -----------------------------------------------------
 struct RefStats { Image means; Image stds; }; // raw resolution [h, w, ch]

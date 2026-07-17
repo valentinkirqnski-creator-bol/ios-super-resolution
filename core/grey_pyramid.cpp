@@ -249,6 +249,22 @@ Image compute_gradients(const Image& grey) {
     return grad;
 }
 
+Image pad_grey_circular(const Image& grey, int tile_size) {
+    int pad_h = (tile_size - grey.h % tile_size) % tile_size;
+    int pad_w = (tile_size - grey.w % tile_size) % tile_size;
+    if (pad_h == 0 && pad_w == 0) return grey;
+    Image padded(grey.h + pad_h, grey.w + pad_w, grey.c);
+    for (int y = 0; y < padded.h; ++y) {
+        int src_y = y < grey.h ? y : (y - grey.h);
+        for (int x = 0; x < padded.w; ++x) {
+            int src_x = x < grey.w ? x : (x - grey.w);
+            for (int ch = 0; ch < grey.c; ++ch)
+                padded.at(y, x, ch) = grey.at(src_y, src_x, ch);
+        }
+    }
+    return padded;
+}
+
 Image gaussian_blur(const Image& src, float sigma) {
     if (sigma <= 0.f) return src;
     int radius = std::max(1, (int)std::ceil(3.f * sigma));
