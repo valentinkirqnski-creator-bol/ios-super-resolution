@@ -59,8 +59,8 @@ targets:
           - "**/*_ph.cpp"
         optional: true
     dependencies:
-      - framework: Metal.framework
-      - framework: MetalPerformanceShaders.framework
+      # Link system SDK frameworks only — do not embed from $(SRCROOT).
+      - sdk: Metal.framework
     info:
       path: Sources/Info.plist
       properties:
