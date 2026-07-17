@@ -27,6 +27,7 @@ settings:
     # LibRaw emits many benign warnings; don't fail the build on them.
     OTHER_CFLAGS: "-w"
     OTHER_CPLUSPLUSFLAGS: "-w"
+    OTHER_LDFLAGS: "-lz"
 
 targets:
   HandheldSRCamera:
