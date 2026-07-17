@@ -1,0 +1,1 @@
+$content = Get-Content core/metal/MetalStages.mm -Raw; $content = [regex]::Replace($content, 'ctx\.create_empty_texture\(([^,]+),\s*([^,]+),\s*([0-9]+)\)', 'ctx.create_empty_texture($1, $2, $3, true)'); Set-Content core/metal/MetalStages.mm $content

@@ -186,6 +186,7 @@ struct RefGpuState {
     id<MTLTexture> means_guide;
     id<MTLTexture> vars_guide;
     id<MTLTexture> means_raw;
+    id<MTLTexture> vars_raw;
     id<MTLTexture> covs;
     id<MTLTexture> dummy_flow;
 };
@@ -400,9 +401,10 @@ static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, RefGpuState& r
     ref.means_guide = ctx.create_empty_texture(gw, gh, 4, true);
     ref.vars_guide = ctx.create_empty_texture(gw, gh, 4, true);
     ref.means_raw = ctx.create_empty_texture(ref_raw.w, ref_raw.h, 4, true);
+    ref.vars_raw = ctx.create_empty_texture(ref_raw.w, ref_raw.h, 4, true);
     ref.covs = ctx.create_empty_texture((int)ref.grey.width, (int)ref.grey.height, 4, true);
     ref.dummy_flow = ctx.create_empty_texture(1, 1, 2, true);
-    if (!ref.guide || !ref.means_guide || !ref.vars_guide || !ref.means_raw || !ref.covs || !ref.dummy_flow)
+    if (!ref.guide || !ref.means_guide || !ref.vars_guide || !ref.means_raw || !ref.vars_raw || !ref.covs || !ref.dummy_flow)
         return false;
 
     id<MTLComputePipelineState> pso_guide = ctx.get_pipeline_state("kernel_extract_guide");
@@ -450,6 +452,23 @@ static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, RefGpuState& r
         if (!run_cmd(cmd)) return false;
     }
     {
+        struct { int raw_h; int raw_w; int upscale; int tile_size; int is_ref; } wp = {
+            ref_raw.h, ref_raw.w, cfg.bayer_mode ? 2 : 1, 0, 1
+        };
+        id<MTLBuffer> wp_buf = [ctx.device() newBufferWithBytes:&wp length:sizeof(wp)
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!begin_kernel(enc, pso_warp)) return false;
+        [enc setTexture:ref.vars_guide atIndex:0];
+        [enc setTexture:ref.dummy_flow atIndex:1];
+        [enc setTexture:ref.vars_raw atIndex:2];
+        [enc setBuffer:wp_buf offset:0 atIndex:0];
+        dispatch_kernel(enc, ref_raw.w, ref_raw.h);
+        [enc endEncoding];
+        if (!run_cmd(cmd)) return false;
+    }
+    {
         id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!begin_kernel(enc, pso_cov)) return false;
@@ -476,12 +495,12 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
     id<MTLTexture> comp_means = ctx.create_empty_texture(gw, gh, 4, true);
     id<MTLTexture> comp_vars = ctx.create_empty_texture(gw, gh, 4, true);
     id<MTLTexture> comp_means_raw = ctx.create_empty_texture(raw_w, raw_h, 4, true);
-    id<MTLTexture> d_p = ctx.create_empty_texture(gw, gh, 4, true);
-    id<MTLTexture> d_sq = ctx.create_empty_texture(gw, gh, 1, true);
-    id<MTLTexture> sigma_sq = ctx.create_empty_texture(gw, gh, 1, true);
+    id<MTLTexture> d_p = ctx.create_empty_texture(raw_w, raw_h, 4, true);
+    id<MTLTexture> d_sq = ctx.create_empty_texture(raw_w, raw_h, 1, true);
+    id<MTLTexture> sigma_sq = ctx.create_empty_texture(raw_w, raw_h, 1, true);
     id<MTLTexture> s_tex = ctx.create_empty_texture((int)flow_tex.width, (int)flow_tex.height, 1, true);
-    id<MTLTexture> r_pre = ctx.create_empty_texture(gw, gh, 1, true);
-    id<MTLTexture> r_out = ctx.create_empty_texture(gw, gh, 1, false);
+    id<MTLTexture> r_pre = ctx.create_empty_texture(raw_w, raw_h, 1, true);
+    id<MTLTexture> r_out = ctx.create_empty_texture(raw_w, raw_h, 1, false);
     if (!guide || !comp_means || !comp_means_raw || !d_p || !d_sq || !sigma_sq || !s_tex || !r_out)
         return false;
 
@@ -534,7 +553,7 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         if (!run_cmd(cmd)) return false;
     }
     {
-        struct { int guide_h; int guide_w; int bayer_mode; } dp = { gh, gw, cfg.bayer_mode ? 1 : 0 };
+        struct { int guide_h; int guide_w; int bayer_mode; } dp = { raw_h, raw_w, cfg.bayer_mode ? 1 : 0 };
         id<MTLBuffer> dp_buf = [ctx.device() newBufferWithBytes:&dp length:sizeof(dp)
                                                         options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
@@ -544,7 +563,7 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         [enc setTexture:comp_means_raw atIndex:1];
         [enc setTexture:d_p atIndex:2];
         [enc setBuffer:dp_buf offset:0 atIndex:0];
-        dispatch_kernel(enc, gw, gh);
+        dispatch_kernel(enc, raw_w, raw_h);
         [enc endEncoding];
         if (!run_cmd(cmd)) return false;
     }
@@ -553,13 +572,13 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!begin_kernel(enc, pso_noise)) return false;
         [enc setTexture:d_p atIndex:0];
-        [enc setTexture:ref.means_guide atIndex:1];
-        [enc setTexture:ref.vars_guide atIndex:2];
+        [enc setTexture:ref.means_raw atIndex:1];
+        [enc setTexture:ref.vars_raw atIndex:2];
         [enc setTexture:d_sq atIndex:3];
         [enc setTexture:sigma_sq atIndex:4];
         [enc setBuffer:std_buf offset:0 atIndex:0];
         [enc setBuffer:diff_buf offset:0 atIndex:1];
-        dispatch_kernel(enc, gw, gh);
+        dispatch_kernel(enc, raw_w, raw_h);
         [enc endEncoding];
         if (!run_cmd(cmd)) return false;
     }
@@ -578,7 +597,9 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         if (!run_cmd(cmd)) return false;
     }
     {
-        struct { float t; int tile_size; int bayer_mode; } tp = { cfg.r_t, tile_size, cfg.bayer_mode ? 1 : 0 };
+        struct { int bayer_mode; int tile_size; float t; } tp = {
+            cfg.bayer_mode ? 1 : 0, tile_size, cfg.r_t
+        };
         id<MTLBuffer> tp_buf = [ctx.device() newBufferWithBytes:&tp length:sizeof(tp)
                                                         options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
@@ -589,7 +610,7 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         [enc setTexture:s_tex atIndex:2];
         [enc setTexture:r_pre atIndex:3];
         [enc setBuffer:tp_buf offset:0 atIndex:0];
-        dispatch_kernel(enc, gw, gh);
+        dispatch_kernel(enc, raw_w, raw_h);
         [enc endEncoding];
         if (!run_cmd(cmd)) return false;
     }
@@ -599,12 +620,12 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         if (!begin_kernel(enc, pso_min)) return false;
         [enc setTexture:r_pre atIndex:0];
         [enc setTexture:r_out atIndex:1];
-        dispatch_kernel(enc, gw, gh);
+        dispatch_kernel(enc, raw_w, raw_h);
         [enc endEncoding];
         if (!run_cmd(cmd)) return false;
     }
 
-    out_rob = Image(gh, gw, 1);
+    out_rob = Image(raw_h, raw_w, 1);
     ctx.read_texture(r_out, out_rob);
     return out_rob.h > 0;
 }

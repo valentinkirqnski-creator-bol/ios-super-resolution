@@ -126,8 +126,8 @@ kernel void kernel_upscale_warp_stats(
     float flow_x = 0.0f;
     float flow_y = 0.0f;
     if (params.is_ref == 0) {
-        int patch_idy = min(y / params.tile_size, (int)flowTex.get_height() - 1);
-        int patch_idx = min(x / params.tile_size, (int)flowTex.get_width() - 1);
+        int patch_idy = min(y / (params.tile_size * params.upscale), (int)flowTex.get_height() - 1);
+        int patch_idx = min(x / (params.tile_size * params.upscale), (int)flowTex.get_width() - 1);
         float2 flow = flowTex.read(uint2(patch_idx, patch_idy)).rg;
         flow_x = flow.x;
         flow_y = flow.y;
@@ -159,11 +159,8 @@ kernel void kernel_build_dp_guide(
 ) {
     if (gid.x >= (uint)params.guide_w || gid.y >= (uint)params.guide_h) return;
 
-    int ry = params.bayer_mode ? (int)gid.y * 2 : (int)gid.y;
-    int rx = params.bayer_mode ? (int)gid.x * 2 : (int)gid.x;
-
-    float3 ref_v = refMeansRaw.read(uint2(rx, ry)).rgb;
-    float3 comp_v = compMeansRaw.read(uint2(rx, ry)).rgb;
+    float3 ref_v = refMeansRaw.read(gid).rgb;
+    float3 comp_v = compMeansRaw.read(gid).rgb;
     float3 d_p = abs(ref_v - comp_v);
     d_pTex.write(float4(d_p, 1.0f), gid);
 }
@@ -263,10 +260,9 @@ kernel void kernel_robustness_threshold(
     float d_sq = d_sq_Tex.read(gid).r;
     float sigma_sq = sigma_sq_Tex.read(gid).r;
 
-    int raw_y = params.bayer_mode ? (int)gid.y * 2 : (int)gid.y;
-    int raw_x = params.bayer_mode ? (int)gid.x * 2 : (int)gid.x;
-    int patch_idy = min(raw_y / params.tile_size, (int)sTex.get_height() - 1);
-    int patch_idx = min(raw_x / params.tile_size, (int)sTex.get_width() - 1);
+    int scale = params.bayer_mode ? 2 : 1;
+    int patch_idy = min((int)gid.y / (params.tile_size * scale), (int)sTex.get_height() - 1);
+    int patch_idx = min((int)gid.x / (params.tile_size * scale), (int)sTex.get_width() - 1);
 
     float s = sTex.read(uint2(patch_idx, patch_idy)).r;
     float R_val = clamp(s * exp(-d_sq / sigma_sq) - params.t, 0.0f, 1.0f);
