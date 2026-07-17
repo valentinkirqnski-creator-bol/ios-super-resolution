@@ -94,6 +94,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
             }
         }
     }
+    return out;
 }
 
 Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
