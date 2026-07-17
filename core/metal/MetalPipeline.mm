@@ -295,7 +295,7 @@ Image process_burst_metal(const std::vector<Image>& burst, const Config& cfg,
     
     // 7. Loop over comps
     for (size_t i = 1; i < burst.size(); ++i) {
-        if (progress) progress(0.1f + 0.8f * (float)i / burst.size());
+        if (progress) progress("Metal Pipeline", 0.1f + 0.8f * (float)i / burst.size());
         
         GPUFrame comp;
         comp.raw = ctx.create_texture(burst[i]);
@@ -357,7 +357,7 @@ Image process_burst_metal(const std::vector<Image>& burst, const Config& cfg,
         }
         
         id<MTLTexture> R_tex = ctx.create_empty_texture(ref.guide.width, ref.guide.height, 1);
-        struct { float t; float s1; float s2; int tile_size; float Mt; } t_params = { cfg.t, cfg.s1, cfg.s2, 16, cfg.Mt };
+        struct { float t; float s1; float s2; int tile_size; float Mt; } t_params = { cfg.r_t, cfg.r_s1, cfg.r_s2, 16, cfg.r_Mt };
         id<MTLBuffer> t_params_buf = [ctx.device() newBufferWithBytes:&t_params length:sizeof(t_params) options:MTLResourceStorageModeShared];
         {
             id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
@@ -427,7 +427,7 @@ Image process_burst_metal(const std::vector<Image>& burst, const Config& cfg,
     Image final_img(out_h, out_w, channels);
     ctx.read_texture(final_tex, final_img);
     
-    if (progress) progress(1.0f);
+    if (progress) progress("Metal Pipeline", 1.0f);
     
     return final_img;
 #else
