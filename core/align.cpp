@@ -425,7 +425,7 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                             ? bilinear_clamp_edge(moving, py, px,
                                                   floor_off_y, floor_off_x,
                                                   frac_x, frac_y)
-                            : bilinear_oob_zero(moving, py, px,
+                            : bilinear_oob_zero(moving, ts, py, px,
                                                 floor_off_y, floor_off_x,
                                                 frac_x, frac_y);
 
