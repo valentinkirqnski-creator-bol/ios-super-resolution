@@ -37,7 +37,7 @@ static id<MTLTexture> compute_grey_metal_tex(id<MTLTexture> in_raw, bool bayer_m
     [enc dispatchThreadgroups:MTLSizeMake((gw+15)/16, (gh+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
     [enc endEncoding];
     [cmd commit];
-    [cmd waitUntilCompleted];
+    
     return out_tex;
 }
 
@@ -70,7 +70,7 @@ static id<MTLTexture> compute_downsample_metal_tex(id<MTLTexture> src, int facto
     [enc dispatchThreadgroups:MTLSizeMake((out_w+15)/16, (out_h+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
     [enc endEncoding];
     [cmd commit];
-    [cmd waitUntilCompleted];
+    
     return out_tex;
 }
 
@@ -118,7 +118,7 @@ static id<MTLTexture> align_metal_tex(const std::vector<id<MTLTexture>>& ref_pyr
             [enc dispatchThreadgroups:MTLSizeMake((nx+15)/16, (ny+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
             [enc endEncoding];
             [cmd commit];
-            [cmd waitUntilCompleted];
+            
         }
         flow = up_flow;
         
@@ -140,7 +140,7 @@ static id<MTLTexture> align_metal_tex(const std::vector<id<MTLTexture>>& ref_pyr
             [enc dispatchThreadgroups:MTLSizeMake((nx+15)/16, (ny+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
             [enc endEncoding];
             [cmd commit];
-            [cmd waitUntilCompleted];
+            
         }
         flow = out_bm_flow;
         
@@ -156,7 +156,7 @@ static id<MTLTexture> align_metal_tex(const std::vector<id<MTLTexture>>& ref_pyr
             [enc dispatchThreadgroups:MTLSizeMake((r.width+15)/16, (r.height+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
             [enc endEncoding];
             [cmd commit];
-            [cmd waitUntilCompleted];
+            
         }
         
         id<MTLTexture> out_ica_flow = ctx.create_empty_texture(nx, ny, 2);
@@ -176,7 +176,7 @@ static id<MTLTexture> align_metal_tex(const std::vector<id<MTLTexture>>& ref_pyr
             [enc dispatchThreadgroups:MTLSizeMake((nx+15)/16, (ny+15)/16, 1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
             [enc endEncoding];
             [cmd commit];
-            [cmd waitUntilCompleted];
+            
         }
         flow = out_ica_flow;
     }

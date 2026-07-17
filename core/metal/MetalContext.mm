@@ -87,8 +87,18 @@ MetalBuffer MetalContext::create_buffer(int size_bytes) {
     return buf;
 }
 
+void MetalContext::sync() {
+#ifdef __OBJC__
+    if (!_available || !_command_queue) return;
+    id<MTLCommandBuffer> cmd = [_command_queue commandBuffer];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+#endif
+}
+
 void MetalContext::read_buffer(const MetalBuffer& mtl_buf, Image& img) {
     if (!_available || !mtl_buf.buffer) return;
+    sync();
 
 #ifdef __OBJC__
     if (img.data.size() * sizeof(f32) != mtl_buf.size_bytes) {
@@ -142,6 +152,7 @@ id<MTLTexture> MetalContext::create_texture(const Image& img) {
 
 void MetalContext::read_texture(id<MTLTexture> tex, Image& img) {
     if (!_available || !tex) return;
+    sync();
     
     int channels = 1;
     int bytes_per_pixel = sizeof(float);
@@ -172,7 +183,7 @@ void MetalContext::read_texture(id<MTLTexture> tex, Image& img) {
     }
 }
 
-id<MTLTexture> MetalContext::create_empty_texture(int w, int h, int channels) {
+id<MTLTexture> MetalContext::create_empty_texture(int w, int h, int channels, bool is_private) {
     if (!_available) return nil;
     MTLPixelFormat format = MTLPixelFormatR32Float;
     if (channels == 2) format = MTLPixelFormatRG32Float;
@@ -183,7 +194,7 @@ id<MTLTexture> MetalContext::create_empty_texture(int w, int h, int channels) {
                                                                                    height:h
                                                                                 mipmapped:NO];
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    desc.storageMode = MTLStorageModeShared;
+    desc.storageMode = is_private ? MTLStorageModePrivate : MTLStorageModeShared;
     return [_device newTextureWithDescriptor:desc];
 }
 

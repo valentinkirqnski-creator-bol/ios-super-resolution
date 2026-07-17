@@ -47,6 +47,9 @@ public:
     // Read back a Metal buffer into a C++ Image
     void read_buffer(const MetalBuffer& mtl_buf, Image& img);
 
+    // Synchronize CPU with GPU (waits for all queued work)
+    void sync();
+
 #ifdef __OBJC__
     id<MTLDevice> device() const { return _device; }
     id<MTLCommandQueue> command_queue() const { return _command_queue; }
@@ -54,7 +57,7 @@ public:
     
     // Texture helpers
     id<MTLTexture> create_texture(const Image& img);
-    id<MTLTexture> create_empty_texture(int w, int h, int channels = 1);
+    id<MTLTexture> create_empty_texture(int w, int h, int channels = 1, bool is_private = false);
     id<MTLTexture> create_texture_from_flow(const FlowField& f);
     void read_texture(id<MTLTexture> tex, Image& img);
     void read_flow_texture(id<MTLTexture> tex, FlowField& f);
