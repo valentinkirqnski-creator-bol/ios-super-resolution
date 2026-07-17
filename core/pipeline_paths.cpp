@@ -203,13 +203,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                                  int maxPreviewDim) {
     if (paths.size() < 2) return Image();
 
-#ifdef __OBJC__
     if (cfg.use_metal) {
         Image metal_preview;
         if (try_process_burst_paths_metal(paths, cfg, dng_path, progress, maxPreviewDim, metal_preview))
             return metal_preview;
     }
-#endif
 
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
