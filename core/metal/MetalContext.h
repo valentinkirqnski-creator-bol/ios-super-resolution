@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include "../types.h"
+#include "../pipeline.h"
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
