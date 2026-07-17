@@ -103,7 +103,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     if (burst.empty()) return Image();
 
     Image mtl_out = process_burst_metal(burst, cfg, dng_path, progress);
-    if (!mtl_out.empty()) return mtl_out;
+    if (mtl_out.h > 0 && mtl_out.w > 0) return mtl_out;
 
 
 
