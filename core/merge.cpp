@@ -90,8 +90,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x / 2.f - 0.5f;
                     kmap_i = lr_mov_y / 2.f - 0.5f;
                 } else {
-                    kmap_j = lr_mov_x - 0.5f;
-                    kmap_i = lr_mov_y - 0.5f;
+                    kmap_j = lr_mov_x;
+                    kmap_i = lr_mov_y;
                 }
                 if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }
@@ -183,8 +183,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x / 2.f - 0.5f;
                     kmap_i = coarse_y / 2.f - 0.5f;
                 } else {
-                    kmap_j = coarse_x - 0.5f;
-                    kmap_i = coarse_y - 0.5f;
+                    kmap_j = coarse_x;
+                    kmap_i = coarse_y;
                 }
                 if (!interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy)) continue;
             }

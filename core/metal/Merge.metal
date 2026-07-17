@@ -210,16 +210,16 @@ kernel void kernel_accumulate_ref(
             kmap_j = coarse_x / 2.0f - 0.5f;
             kmap_i = coarse_y / 2.0f - 0.5f;
         } else {
-            kmap_j = coarse_x - 0.5f;
-            kmap_i = coarse_y - 0.5f;
+            kmap_j = coarse_x;
+            kmap_i = coarse_y;
         }
         interp_inv_cov(covTex, kmap_i, kmap_j, ixx, ixy, iyy);
     }
     
     int center_j = python_round(coarse_x);
     int center_i = python_round(coarse_y);
-    float coarse_j = coarse_x - 0.5f;
-    float coarse_i = coarse_y - 0.5f;
+    float coarse_j = coarse_x;
+    float coarse_i = coarse_y;
     
     float3 val = float3(0.0f);
     float3 acc = float3(0.0f);
@@ -334,16 +334,16 @@ kernel void kernel_accumulate_comp_band(
             kmap_j = lr_mov_x / 2.0f - 0.5f;
             kmap_i = lr_mov_y / 2.0f - 0.5f;
         } else {
-            kmap_j = lr_mov_x - 0.5f;
-            kmap_i = lr_mov_y - 0.5f;
+            kmap_j = lr_mov_x;
+            kmap_i = lr_mov_y;
         }
         interp_inv_cov(covTex, kmap_i, kmap_j, ixx, ixy, iyy);
     }
 
     int center_j = (int)lr_mov_x;
     int center_i = (int)lr_mov_y;
-    float lr_mov_j = lr_mov_x - 0.5f;
-    float lr_mov_i = lr_mov_y - 0.5f;
+    float lr_mov_j = lr_mov_x;
+    float lr_mov_i = lr_mov_y;
 
     float3 val = float3(0.0f);
     float3 acc = float3(0.0f);
