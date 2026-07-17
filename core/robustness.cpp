@@ -32,7 +32,7 @@ static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32
 }
 
 static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean) {
-    const int n_patches = 10000; // 10k is plenty for stable curves and very fast
+    const int n_patches = 100000; // matches Python's n_patches = int(1e5)
     f32 scale = std::sqrt(std::max(0.f, alpha * b + beta));
     
     std::mt19937 gen(1337 + (int)(b * 1000)); 
@@ -304,30 +304,83 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     const NoiseCurves nc = make_noise_curves(cfg.alpha, cfg.beta);
 
+    // Python: compute_guide → local_stats (at guide resolution) → upscale_warp_stats
+    // The guide image is half-size in bayer mode. All intermediate maps (d_p,
+    // d_sq, sigma_sq, R) are kept at GUIDE resolution, matching Python exactly.
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-    comp_means = upscale_warp_stats(comp_means, comp_raw.h, comp_raw.w, false, &flow,
+
+    // upscale_warp_stats warps comp_means from guide to raw space THEN back
+    // to guide space. In Python this is done at raw-pixel precision with the
+    // flow defined on raw coordinates — same as what upscale_warp_stats does
+    // (upsample factor = 2 in bayer mode = raw resolution), then R is computed
+    // at guide pixels. We replicate by warping to raw resolution exactly as
+    // before but only reading every other pixel for the guide.
+    const int guide_h = guide.h;
+    const int guide_w = guide.w;
+
+    // Warp comp_means to raw resolution (same as before)
+    Image comp_means_raw = upscale_warp_stats(comp_means, comp_raw.h, comp_raw.w, false, &flow,
                                     tile_size, cfg.num_threads);
 
-    Image d_p(comp_raw.h, comp_raw.w, ref_stats.means.c);
-    for (int y = 0; y < comp_raw.h; ++y) {
-        for (int x = 0; x < comp_raw.w; ++x) {
-            for (int ch = 0; ch < d_p.c; ++ch)
-                d_p.at(y, x, ch) = std::fabs(ref_stats.means.at(y, x, ch) - comp_means.at(y, x, ch));
+    // Build d_p at guide resolution by sampling raw-res warped means at guide pixel centres
+    // (Python: comp_local_means is at raw-res after upscale_warp_stats, then compute_dist
+    //  computes |ref - comp| also at raw-res. robustness_threshold then runs at guide-res
+    //  for bayer mode, so we need d_p at guide-res too.)
+    const int nc_ch = ref_stats.means.c; // number of guide channels
+
+    // apply_noise_model computes d_sq and sigma_sq at the same size as ref_stats.means.
+    // ref_stats.means was built from the ref guide (guide resolution). So d_p must also
+    // be at guide resolution.
+    Image d_p(guide_h, guide_w, nc_ch);
+    for (int y = 0; y < guide_h; ++y) {
+        for (int x = 0; x < guide_w; ++x) {
+            // Sample the warped comp_means at the guide pixel centre.
+            // In Python the entire pipeline stays at guide-res because upscale_warp_stats
+            // upscales to raw then the diff is taken at raw, but robustness_threshold
+            // evaluates at guide pixels (idy/2, idx/2 in bayer mode).
+            // For simplicity we use the raw-res comp_means and ref_stats.means,
+            // reading at the Bayer-centre position (2y, 2x) or directly for mono.
+            int ry = cfg.bayer_mode ? y * 2 : y;
+            int rx = cfg.bayer_mode ? x * 2 : x;
+            for (int ch = 0; ch < nc_ch; ++ch) {
+                f32 ref_v  = ref_stats.means.at(ry, rx, ch);
+                f32 comp_v = comp_means_raw.at(ry, rx, ch);
+                d_p.at(y, x, ch) = std::fabs(ref_v - comp_v);
+            }
+        }
+    }
+
+    // ref_stats.means / stds at guide resolution (ref was built via compute_guide → local_stats)
+    // We need to pass guide-resolution ref stats to apply_noise_model.
+    // Build guide-res view of ref_stats.means / stds.
+    Image ref_means_guide(guide_h, guide_w, nc_ch);
+    Image ref_stds_guide(guide_h, guide_w, nc_ch);
+    for (int y = 0; y < guide_h; ++y) {
+        for (int x = 0; x < guide_w; ++x) {
+            int ry = cfg.bayer_mode ? y * 2 : y;
+            int rx = cfg.bayer_mode ? x * 2 : x;
+            for (int ch = 0; ch < nc_ch; ++ch) {
+                ref_means_guide.at(y, x, ch) = ref_stats.means.at(ry, rx, ch);
+                ref_stds_guide.at(y, x, ch)  = ref_stats.stds.at(ry, rx, ch);
+            }
         }
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc, d_sq, sigma_sq);
+    apply_noise_model(d_p, ref_means_guide, ref_stds_guide, nc, d_sq, sigma_sq);
 
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
-    Image R(comp_raw.h, comp_raw.w, 1);
-    for (int y = 0; y < comp_raw.h; ++y) {
-        for (int x = 0; x < comp_raw.w; ++x) {
-            int patch_idy = std::min(y / tile_size, flow.ny - 1);
-            int patch_idx = std::min(x / tile_size, flow.nx - 1);
+    // Threshold: operate at guide resolution, look up flow tile using raw coords
+    Image R(guide_h, guide_w, 1);
+    for (int y = 0; y < guide_h; ++y) {
+        for (int x = 0; x < guide_w; ++x) {
+            int raw_y = cfg.bayer_mode ? y * 2 : y;
+            int raw_x = cfg.bayer_mode ? x * 2 : x;
+            int patch_idy = std::min(raw_y / tile_size, flow.ny - 1);
+            int patch_idx = std::min(raw_x / tile_size, flow.nx - 1);
             f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
             f32 sig = sigma_sq.at(y, x);
             R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
@@ -335,5 +388,4 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
     return local_min_5x5(R);
 }
-
 } // namespace hhsr
