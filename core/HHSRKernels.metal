@@ -157,6 +157,60 @@ kernel void transpose_c(device float2* out [[buffer(0)]],
     out[x * h + y] = in[y * w + x];
 }
 
+// Pack/scatter column strips so 2D FFT needs only one full-frame complex buffer.
+kernel void gather_cols(device float2* out [[buffer(0)]],
+                        device const float2* in [[buffer(1)]],
+                        constant uint& h [[buffer(2)]],
+                        constant uint& w [[buffer(3)]],
+                        constant uint& col0 [[buffer(4)]],
+                        constant uint& ncol [[buffer(5)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.y, y = gid.x;
+    if (c >= ncol || y >= h) return;
+    out[c * h + y] = in[y * w + (col0 + c)];
+}
+
+kernel void scatter_cols(device float2* out [[buffer(0)]],
+                         device const float2* in [[buffer(1)]],
+                         constant uint& h [[buffer(2)]],
+                         constant uint& w [[buffer(3)]],
+                         constant uint& col0 [[buffer(4)]],
+                         constant uint& ncol [[buffer(5)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.y, y = gid.x;
+    if (c >= ncol || y >= h) return;
+    out[y * w + (col0 + c)] = in[c * h + y];
+}
+
+// In-place fftshift for even h,w (swap halves). Involutory — inv unused.
+kernel void fftshift_swap_x(device float2* data [[buffer(0)]],
+                            constant uint& h [[buffer(1)]],
+                            constant uint& w [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    uint y = gid.y, x = gid.x;
+    uint half_w = w / 2u;
+    if (y >= h || x >= half_w) return;
+    uint i0 = y * w + x;
+    uint i1 = y * w + x + half_w;
+    float2 t = data[i0];
+    data[i0] = data[i1];
+    data[i1] = t;
+}
+
+kernel void fftshift_swap_y(device float2* data [[buffer(0)]],
+                            constant uint& h [[buffer(1)]],
+                            constant uint& w [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    uint y = gid.y, x = gid.x;
+    uint half_h = h / 2u;
+    if (y >= half_h || x >= w) return;
+    uint i0 = y * w + x;
+    uint i1 = (y + half_h) * w + x;
+    float2 t = data[i0];
+    data[i0] = data[i1];
+    data[i1] = t;
+}
+
 kernel void fftshift2d_c(device float2* out [[buffer(0)]],
                          device const float2* in [[buffer(1)]],
                          constant uint& h [[buffer(2)]],
@@ -196,6 +250,7 @@ struct L2Params {
     uint ny, nx;
     int ts, R, N;
     int ref_h, ref_w, mov_h, mov_w;
+    uint tile_base, tile_count;
 };
 
 kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
@@ -204,7 +259,9 @@ kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
                           device const float* mov [[buffer(3)]],
                           device const float* flow [[buffer(4)]],
                           constant L2Params& P [[buffer(5)]],
-                          uint tid [[thread_position_in_grid]]) {
+                          uint local [[thread_position_in_grid]]) {
+    if (local >= P.tile_count) return;
+    uint tid = P.tile_base + local;
     uint ntiles = P.ny * P.nx;
     if (tid >= ntiles) return;
     uint ty = tid / P.nx;
@@ -217,7 +274,7 @@ kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
     int flow_dx = int(rint(fdx));
     int flow_dy = int(rint(fdy));
 
-    uint base = tid * uint(N * N);
+    uint base = local * uint(N * N);
     for (int i = 0; i < N * N; ++i)
         ref_pad[base + uint(i)] = 0.f;
 
@@ -251,14 +308,16 @@ kernel void l2_argmin(device float* flow [[buffer(0)]],
                       device const float* corr [[buffer(1)]],
                       device const float* mov_patch [[buffer(2)]],
                       constant L2Params& P [[buffer(3)]],
-                      uint tid [[thread_position_in_grid]]) {
+                      uint local [[thread_position_in_grid]]) {
+    if (local >= P.tile_count) return;
+    uint tid = P.tile_base + local;
     uint ntiles = P.ny * P.nx;
     if (tid >= ntiles) return;
     int N = P.N, ts = P.ts, R = P.R;
     int corr_size = 2 * R + 1;
     int crop = (N - 1 - corr_size) / 2;
     int crop0 = crop + 1;
-    uint base = tid * uint(N * N);
+    uint base = local * uint(N * N);
 
     float best = 1e30f;
     int best_dy = 0, best_dx = 0;
