@@ -18,6 +18,11 @@ NS_ASSUME_NONNULL_BEGIN
            progress:(nullable void (^)(NSString *stage, float fraction))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 
+/// Decode our LinearRaw Deflate DNG and write a tone-mapped JPEG
+/// (Highlights −100, Shadows +60, Contrast +5; no sharpen / NR).
++ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
+                         toPath:(NSString *)jpgPath;
+
 @end
 
 NS_ASSUME_NONNULL_END

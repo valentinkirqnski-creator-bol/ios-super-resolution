@@ -1,5 +1,7 @@
 #import "SRBridge.h"
 #import <UIKit/UIKit.h>
+#import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 
 #include <string>
 #include <vector>
@@ -7,6 +9,7 @@
 #include "core/types.h"
 #include "core/pipeline.h"
 #include "core/metal_gpu.h"
+#include "core/dng_writer.h"
 
 using namespace hhsr;
 
@@ -103,6 +106,68 @@ static UIImage* UIImageFromPreview(const Image& preview) {
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
+}
+
++ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
+    if (dngPath.length == 0 || jpgPath.length == 0) return NO;
+
+    std::vector<uint16_t> rgb;
+    int W = 0, H = 0;
+    if (!load_linear_dng_rgb16(std::string(dngPath.UTF8String), rgb, W, H) || W <= 0 || H <= 0)
+        return NO;
+
+    // Build a 16-bit RGB CGImage (no alpha) for Core Image tone mapping.
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return NO;
+    NSData* data = [NSData dataWithBytes:rgb.data() length:rgb.size() * sizeof(uint16_t)];
+    rgb.clear();
+    rgb.shrink_to_fit();
+
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+    CGImageRef cgIn = CGImageCreate(
+        W, H, 16, 48, W * 6, cs,
+        kCGBitmapByteOrder16Little | kCGImageAlphaNone,
+        provider, NULL, false, kCGRenderingIntentDefault);
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(cs);
+    if (!cgIn) return NO;
+
+    CIImage* image = [CIImage imageWithCGImage:cgIn];
+    CGImageRelease(cgIn);
+
+    CIFilter* hs = [CIFilter filterWithName:@"CIHighlightShadowAdjust"];
+    if (hs) {
+        [hs setValue:image forKey:kCIInputImageKey];
+        [hs setValue:@(1.0) forKey:@"inputHighlightAmount"];
+        [hs setValue:@(0.6) forKey:@"inputShadowAmount"];
+        if (hs.outputImage) image = hs.outputImage;
+    }
+    CIFilter* cc = [CIFilter filterWithName:@"CIColorControls"];
+    if (cc) {
+        [cc setValue:image forKey:kCIInputImageKey];
+        [cc setValue:@(1.05) forKey:kCIInputContrastKey];
+        [cc setValue:@(0.0) forKey:kCIInputBrightnessKey];
+        [cc setValue:@(1.0) forKey:kCIInputSaturationKey];
+        if (cc.outputImage) image = cc.outputImage;
+    }
+
+    CIContext* ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    CGImageRef cgOut = [ctx createCGImage:image fromRect:image.extent];
+    if (!cgOut) return NO;
+
+    NSURL* url = [NSURL fileURLWithPath:jpgPath];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)url, CFSTR("public.jpeg"), 1, NULL);
+    if (!dest) {
+        CGImageRelease(cgOut);
+        return NO;
+    }
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.92};
+    CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CGImageRelease(cgOut);
+    return ok;
 }
 
 @end

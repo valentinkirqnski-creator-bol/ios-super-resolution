@@ -2,9 +2,6 @@ import AVFoundation
 import Photos
 import UIKit
 import Combine
-import CoreImage
-import ImageIO
-import UniformTypeIdentifiers
 
 /// Final save format after SR (DNG always produced; JPG is a tone-mapped export).
 enum ExportFormat: String, CaseIterable, Identifiable, Codable {
@@ -891,53 +888,14 @@ final class CameraModel: NSObject, ObservableObject {
 
     /// Lightroom-like finish from the SR DNG: Highlights −100, Shadows +60,
     /// Contrast +5, Sharpening 0, Noise Reduction 0 → JPEG.
+    /// Uses our own Deflate LinearRaw decoder (ImageIO cannot read these DNGs).
     private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
-        guard let src = CGImageSourceCreateWithURL(dngURL as CFURL, nil),
-              CGImageSourceGetCount(src) > 0 else { return nil }
-        let opts: [CFString: Any] = [
-            kCGImageSourceShouldCache: true,
-            kCGImageSourceShouldAllowFloat: true
-        ]
-        guard let cg = CGImageSourceCreateImageAtIndex(src, 0, opts as CFDictionary) else {
-            return nil
-        }
-
-        var image = CIImage(cgImage: cg)
-
-        if let hs = CIFilter(name: "CIHighlightShadowAdjust") {
-            hs.setValue(image, forKey: kCIInputImageKey)
-            // Lightroom Highlights −100 → max highlight compression
-            hs.setValue(1.0 as NSNumber, forKey: "inputHighlightAmount")
-            // Lightroom Shadows +60 → lift shadows (~0.6 on −1…1)
-            hs.setValue(0.6 as NSNumber, forKey: "inputShadowAmount")
-            if let out = hs.outputImage { image = out }
-        }
-
-        if let cc = CIFilter(name: "CIColorControls") {
-            cc.setValue(image, forKey: kCIInputImageKey)
-            // Lightroom Contrast +5 on −100…+100 → mild bump around neutral 1.0
-            cc.setValue(1.05 as NSNumber, forKey: kCIInputContrastKey)
-            cc.setValue(0.0 as NSNumber, forKey: kCIInputBrightnessKey)
-            cc.setValue(1.0 as NSNumber, forKey: kCIInputSaturationKey)
-            if let out = cc.outputImage { image = out }
-        }
-        // Sharpening 0 / NR 0 — intentionally no CISharpen / noise filters.
-
-        let ctx = CIContext(options: [.useSoftwareRenderer: false])
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
-        guard let cgOut = ctx.createCGImage(image, from: image.extent),
-              let dest = CGImageDestinationCreateWithURL(
-                outURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil
-              ) else { return nil }
-
-        let jpgOpts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.92]
-        CGImageDestinationAddImage(dest, cgOut, jpgOpts as CFDictionary)
-        guard CGImageDestinationFinalize(dest) else {
-            try? FileManager.default.removeItem(at: outURL)
-            return nil
-        }
-        return outURL
+        let ok = SRBridge.exportJPEGFromLinearDNG(dngURL.path, toPath: outURL.path)
+        if ok { return outURL }
+        try? FileManager.default.removeItem(at: outURL)
+        return nil
     }
 
     private func saveToPhotos(url: URL, robustnessMask: URL?, preview: UIImage?, burstDir: URL?) {

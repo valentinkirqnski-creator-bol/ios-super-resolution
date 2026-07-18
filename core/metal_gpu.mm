@@ -14,14 +14,14 @@
 namespace hhsr {
 namespace {
 
-// Bluestein A scratch rows per dispatch (~16MB at m=8192).
-static constexpr uint32_t kFftBatchChunk = 128;
-// Flush GPU every N Bluestein batch groups (avoid per-chunk CPU sync stalls).
-static constexpr uint32_t kFlushEveryChunks = 8;
-// Column strips between flushes in 2D FFT.
-static constexpr uint32_t kColFlushEvery = 16;
+// Bluestein A scratch rows per dispatch (~16MB at m=8192 with 128).
+static constexpr uint32_t kFftBatchChunk = 256;
+// Soft commit (no wait) every N Bluestein groups to bound CB size; dual-A covers hazards.
+static constexpr uint32_t kCommitEveryChunks = 16;
+// Soft commit every N column strips in 2D FFT (no wait).
+static constexpr uint32_t kColCommitEvery = 32;
 // Max L2 tiles processed together (buffers scale with ntiles * N²).
-static constexpr uint32_t kL2TileChunk = 512;
+static constexpr uint32_t kL2TileChunk = 1024;
 
 static int next_pow2(int n) {
     int p = 1;
@@ -34,15 +34,35 @@ struct MetalCtx {
     id<MTLCommandQueue> queue = nil;
     id<MTLLibrary> library = nil;
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipes;
-    // Reused scratch to cut alloc pressure at full-res 1×.
-    id<MTLBuffer> scratch_A = nil;
+    // Dual Bluestein A: ping-pong across soft commits without waitUntilCompleted.
+    id<MTLBuffer> scratch_A0 = nil;
+    id<MTLBuffer> scratch_A1 = nil;
     id<MTLBuffer> scratch_B = nil;
     id<MTLBuffer> scratch_chirp = nil;
     id<MTLBuffer> scratch_cols = nil;
-    size_t scratch_A_bytes = 0;
+    size_t scratch_A0_bytes = 0;
+    size_t scratch_A1_bytes = 0;
     size_t scratch_B_bytes = 0;
     size_t scratch_chirp_bytes = 0;
     size_t scratch_cols_bytes = 0;
+    // Cached Bluestein chirp + FFT(B) for (n, inverse).
+    uint32_t cache_n = 0;
+    int cache_inv = -1;
+    id<MTLBuffer> cache_chirp = nil;
+    id<MTLBuffer> cache_B = nil;
+    // Reused L2 working set (grow-only).
+    id<MTLBuffer> l2_ref_pad = nil;
+    id<MTLBuffer> l2_mov_patch = nil;
+    id<MTLBuffer> l2_rows = nil;
+    id<MTLBuffer> l2_F_ref = nil;
+    id<MTLBuffer> l2_F_mov = nil;
+    id<MTLBuffer> l2_cols = nil;
+    id<MTLBuffer> l2_full = nil;
+    id<MTLBuffer> l2_corr = nil;
+    id<MTLBuffer> l2_corr_shift = nil;
+    size_t l2_ref_pad_b = 0, l2_mov_patch_b = 0, l2_rows_b = 0;
+    size_t l2_F_ref_b = 0, l2_F_mov_b = 0, l2_cols_b = 0;
+    size_t l2_full_b = 0, l2_corr_b = 0, l2_corr_shift_b = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -143,12 +163,23 @@ static void dispatch1(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineSta
     }
 }
 
+// Commit and wait — only for final readback / error boundaries.
 static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!cmd) return false;
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    cmd = [c.queue commandBuffer];
+    return cmd != nil;
+}
+
+// Commit without waiting so the GPU can stay busy; caller must not reuse
+// resources still owned by the previous CB (use dual scratch).
+static bool commit_cmd(__strong id<MTLCommandBuffer>& cmd) {
+    auto& c = ctx();
+    if (!cmd) return false;
+    [cmd commit];
     cmd = [c.queue commandBuffer];
     return cmd != nil;
 }
@@ -219,41 +250,58 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     const size_t chirp_bytes = sizeof(float) * 2 * n;
     const size_t B_bytes = sizeof(float) * 2 * m;
     const size_t A_bytes = sizeof(float) * 2 * m * kFftBatchChunk;
-    id<MTLBuffer> chirp = c.scratch(c.scratch_chirp, c.scratch_chirp_bytes, chirp_bytes);
-    id<MTLBuffer> B = c.scratch(c.scratch_B, c.scratch_B_bytes, B_bytes);
-    id<MTLBuffer> A = c.scratch(c.scratch_A, c.scratch_A_bytes, A_bytes);
-    if (!chirp || !B || !A) return false;
+    id<MTLBuffer> A0 = c.scratch(c.scratch_A0, c.scratch_A0_bytes, A_bytes);
+    id<MTLBuffer> A1 = c.scratch(c.scratch_A1, c.scratch_A1_bytes, A_bytes);
+    if (!A0 || !A1) return false;
 
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     uint32_t n_u = n, m_u = m;
     int inv = inverse ? 1 : 0;
+    id<MTLBuffer> chirp = nil;
+    id<MTLBuffer> B = nil;
 
-    [enc setBuffer:chirp offset:0 atIndex:0];
-    [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
-    [enc setBytes:&inv length:sizeof(inv) atIndex:2];
-    dispatch1(enc, c.pipe("make_chirp"), n);
+    if (c.cache_n == n && c.cache_inv == inv && c.cache_chirp && c.cache_B) {
+        chirp = c.cache_chirp;
+        B = c.cache_B;
+    } else {
+        chirp = c.scratch(c.scratch_chirp, c.scratch_chirp_bytes, chirp_bytes);
+        B = c.scratch(c.scratch_B, c.scratch_B_bytes, B_bytes);
+        if (!chirp || !B) return false;
 
-    [enc setBuffer:B offset:0 atIndex:0];
-    [enc setBytes:&m_u length:sizeof(m_u) atIndex:1];
-    dispatch1(enc, c.pipe("bluestein_clear_B"), m);
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setBuffer:chirp offset:0 atIndex:0];
+        [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
+        [enc setBytes:&inv length:sizeof(inv) atIndex:2];
+        dispatch1(enc, c.pipe("make_chirp"), n);
 
-    [enc setBuffer:B offset:0 atIndex:0];
-    [enc setBuffer:chirp offset:0 atIndex:1];
-    [enc setBytes:&n_u length:sizeof(n_u) atIndex:2];
-    [enc setBytes:&m_u length:sizeof(m_u) atIndex:3];
-    dispatch1(enc, c.pipe("bluestein_fill_B"), n);
-    [enc endEncoding];
+        [enc setBuffer:B offset:0 atIndex:0];
+        [enc setBytes:&m_u length:sizeof(m_u) atIndex:1];
+        dispatch1(enc, c.pipe("bluestein_clear_B"), m);
 
-    if (!fft1d_pow2_encode(B, m, m, 0, 1, false, false, cmd)) return false;
+        [enc setBuffer:B offset:0 atIndex:0];
+        [enc setBuffer:chirp offset:0 atIndex:1];
+        [enc setBytes:&n_u length:sizeof(n_u) atIndex:2];
+        [enc setBytes:&m_u length:sizeof(m_u) atIndex:3];
+        dispatch1(enc, c.pipe("bluestein_fill_B"), n);
+        [enc endEncoding];
 
-    uint32_t chunks_since_flush = 0;
+        if (!fft1d_pow2_encode(B, m, m, 0, 1, false, false, cmd)) return false;
+        // Hold B/chirp for reuse across column strips / L2 calls with same n.
+        c.cache_chirp = chirp;
+        c.cache_B = B;
+        c.cache_n = n;
+        c.cache_inv = inv;
+    }
+
+    uint32_t chunks_since_commit = 0;
+    int a_sel = 0;
     for (uint32_t b0 = 0; b0 < batch; b0 += kFftBatchChunk) {
         uint32_t bc = std::min(kFftBatchChunk, batch - b0);
         uint32_t str = stride;
         uint32_t bat = bc;
         NSUInteger in_off = (NSUInteger)b0 * stride * sizeof(float) * 2;
+        id<MTLBuffer> A = (a_sel == 0) ? A0 : A1;
 
-        enc = [cmd computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setBuffer:A offset:0 atIndex:0];
         [enc setBuffer:data offset:in_off atIndex:1];
         [enc setBuffer:chirp offset:0 atIndex:2];
@@ -294,15 +342,16 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
         dispatch2(enc, c.pipe("bluestein_extract"), n, bc);
         [enc endEncoding];
 
-        if (++chunks_since_flush >= kFlushEveryChunks) {
-            chunks_since_flush = 0;
-            if (!flush_cmd(cmd)) return false;
+        a_sel ^= 1;
+        if (++chunks_since_commit >= kCommitEveryChunks) {
+            chunks_since_commit = 0;
+            // Soft commit — dual A means the next chunk uses the other buffer.
+            if (!commit_cmd(cmd)) return false;
         }
     }
-    if (chunks_since_flush != 0 && !flush_cmd(cmd)) return false;
 
     if (inverse) {
-        enc = [cmd computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         for (uint32_t b0 = 0; b0 < batch; b0 += kFftBatchChunk) {
             uint32_t bc = std::min(kFftBatchChunk, batch - b0);
             uint32_t str = stride;
@@ -314,7 +363,6 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
             dispatch2(enc, c.pipe("fft_scale_inv"), n, bc);
         }
         [enc endEncoding];
-        if (!flush_cmd(cmd)) return false;
     }
     return true;
 }
@@ -330,8 +378,10 @@ static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t 
 static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h, uint32_t w,
                       bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
+    // Rows then columns stay on the GPU; Metal tracks buffer hazards in-CB.
+    // Soft-commit only to bound encoder size — no waitUntilCompleted mid-FFT.
     if (!fft1d_gpu(cbuf, w, w, h, inverse, cmd)) return false;
-    if (!flush_cmd(cmd)) return false;
+    if (!commit_cmd(cmd)) return false;
 
     uint32_t strips = 0;
     for (uint32_t col0 = 0; col0 < w; col0 += kFftBatchChunk) {
@@ -358,12 +408,11 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h,
         dispatch2(enc, c.pipe("scatter_cols"), h, ncol);
         [enc endEncoding];
 
-        if (++strips >= kColFlushEvery) {
+        if (++strips >= kColCommitEvery) {
             strips = 0;
-            if (!flush_cmd(cmd)) return false;
+            if (!commit_cmd(cmd)) return false;
         }
     }
-    if (strips != 0 && !flush_cmd(cmd)) return false;
     return true;
 }
 
@@ -387,15 +436,15 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
         uint32_t tile_base, tile_count;
     } P{ny, nx, ts, R, N, ref_h, ref_w, mov_h, mov_w, tile_base, tile_count};
 
-    id<MTLBuffer> ref_pad = buf(nullptr, all_tiles);
-    id<MTLBuffer> mov_patch = buf(nullptr, all_tiles);
-    id<MTLBuffer> rows = buf(nullptr, (size_t)row_batch * N * sizeof(float) * 2);
-    id<MTLBuffer> F_ref = buf(nullptr, half_c);
-    id<MTLBuffer> F_mov = buf(nullptr, half_c);
-    id<MTLBuffer> cols = buf(nullptr, (size_t)tile_count * wh * N * sizeof(float) * 2);
-    id<MTLBuffer> full = buf(nullptr, full_c);
-    id<MTLBuffer> corr = buf(nullptr, all_tiles);
-    id<MTLBuffer> corr_shift = buf(nullptr, all_tiles);
+    id<MTLBuffer> ref_pad = c.scratch(c.l2_ref_pad, c.l2_ref_pad_b, all_tiles);
+    id<MTLBuffer> mov_patch = c.scratch(c.l2_mov_patch, c.l2_mov_patch_b, all_tiles);
+    id<MTLBuffer> rows = c.scratch(c.l2_rows, c.l2_rows_b, (size_t)row_batch * N * sizeof(float) * 2);
+    id<MTLBuffer> F_ref = c.scratch(c.l2_F_ref, c.l2_F_ref_b, half_c);
+    id<MTLBuffer> F_mov = c.scratch(c.l2_F_mov, c.l2_F_mov_b, half_c);
+    id<MTLBuffer> cols = c.scratch(c.l2_cols, c.l2_cols_b, (size_t)tile_count * wh * N * sizeof(float) * 2);
+    id<MTLBuffer> full = c.scratch(c.l2_full, c.l2_full_b, full_c);
+    id<MTLBuffer> corr = c.scratch(c.l2_corr, c.l2_corr_b, all_tiles);
+    id<MTLBuffer> corr_shift = c.scratch(c.l2_corr_shift, c.l2_corr_shift_b, all_tiles);
     if (!ref_pad || !mov_patch || !rows || !F_ref || !F_mov || !cols || !full ||
         !corr || !corr_shift)
         return false;

@@ -10,7 +10,11 @@ namespace hhsr {
 bool write_linear_dng(const std::string& path, const Image& rgb,
                       const std::string& camera_model = "HandheldSR-x2");
 
-// Streaming LinearRaw RGB DNG with lossless Deflate (ZIP) strip compression.
+// Decode a HandheldSR LinearRaw Deflate DNG (Compression=8, Predictor=2) to planar RGB16.
+bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb,
+                           int& W, int& H);
+
+// Streaming LinearRaw RGB DNG with lossless Deflate (ZIP) + horizontal predictor.
 class DngStreamWriter {
 public:
     bool open(const std::string& path, int W, int H,
@@ -33,6 +37,7 @@ private:
     uint32_t compressed_bytes_ = 0;
     void* z_stream_ = nullptr;             // z_stream*
     std::vector<uint8_t> z_out_;
+    std::vector<uint16_t> pred_row_;       // predictor scratch (one row)
     bool deflate_ok_ = false;
 };
 

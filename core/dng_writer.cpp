@@ -39,6 +39,11 @@ static void w32(std::vector<uint8_t>& b, uint32_t v) {
     b.push_back((v >> 16) & 0xFF); b.push_back((v >> 24) & 0xFF);
 }
 
+static uint16_t r16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static uint32_t r32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 struct IFD {
     std::vector<Entry> e;
 
@@ -100,10 +105,26 @@ static std::string now_tiff_datetime() {
     return std::string(buf);
 }
 
+// TIFF Predictor=2 horizontal differencing (chunky RGB16), in-place, right→left.
+static void apply_hdiff_rgb16(uint16_t* row, int W) {
+    for (int x = W - 1; x >= 1; --x) {
+        row[x * 3 + 0] = (uint16_t)(row[x * 3 + 0] - row[(x - 1) * 3 + 0]);
+        row[x * 3 + 1] = (uint16_t)(row[x * 3 + 1] - row[(x - 1) * 3 + 1]);
+        row[x * 3 + 2] = (uint16_t)(row[x * 3 + 2] - row[(x - 1) * 3 + 2]);
+    }
+}
+
+static void undo_hdiff_rgb16(uint16_t* row, int W) {
+    for (int x = 1; x < W; ++x) {
+        row[x * 3 + 0] = (uint16_t)(row[x * 3 + 0] + row[(x - 1) * 3 + 0]);
+        row[x * 3 + 1] = (uint16_t)(row[x * 3 + 1] + row[(x - 1) * 3 + 1]);
+        row[x * 3 + 2] = (uint16_t)(row[x * 3 + 2] + row[(x - 1) * 3 + 2]);
+    }
+}
+
 } // namespace
 
 // Builds DNG header. StripByteCounts left as 0 — patched after Deflate finishes.
-// Returns prefix bytes; strip_offset_out / strip_byte_counts_offset_out are file offsets.
 static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const std::string& camera_make,
                                              const std::string& camera_model,
@@ -134,9 +155,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
     ifd.ascii(306, now_tiff_datetime()); // DateTime
+    ifd.shortv(317, 2);                // Predictor = horizontal differencing
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
 
-    // Photos / DNG readers need crop + active area for non-zero dimensions.
     ifd.longs(50719, {0, 0});
     ifd.longs(50720, {(uint32_t)W, (uint32_t)H});
     ifd.longs(50829, {0, 0, (uint32_t)H, (uint32_t)W});
@@ -149,10 +170,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     if (!baked_srgb) {
         ifd.shortv(50778, 21);         // CalibrationIlluminant1 = D65
-        // Identity ColorMatrix1 — WB already in pixels; real matrix + AsShotNeutral
-        // re-develops color and casts magenta on iOS Photos / LR Mobile.
         ifd.srational(50721, {1,1, 0,1, 0,1,  0,1, 1,1, 0,1,  0,1, 0,1, 1,1});
-        // Scene-referred linear data (helps Photos treat LinearRaw correctly).
         ifd.shortv(50831, 1);          // ColorimetricReference = scene referred
     }
 
@@ -167,11 +185,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     std::vector<uint8_t> heap;
     int strip_off_entry = -1;
-    int strip_bc_entry = -1;
     for (int i = 0; i < (int)ifd.e.size(); ++i) {
         auto& e = ifd.e[(size_t)i];
         if (e.tag == 273) strip_off_entry = i;
-        if (e.tag == 279) strip_bc_entry = i;
         if (!e.payload.empty()) {
             if (heap.size() & 1) heap.push_back(0);
             e.inlineval = heap_base + (uint32_t)heap.size();
@@ -190,7 +206,6 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     for (int i = 0; i < (int)ifd.e.size(); ++i) {
         const auto& e = ifd.e[(size_t)i];
         if (e.tag == 279) {
-            // Value field starts 8 bytes into the 12-byte IFD entry.
             strip_byte_counts_offset_out = (uint32_t)out.size() + 8;
         }
         w16(out, e.tag);
@@ -203,7 +218,6 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     while (out.size() < strip_offset) out.push_back(0);
 
     strip_offset_out = strip_offset;
-    (void)strip_bc_entry;
     (void)type_size;
     return out;
 }
@@ -248,13 +262,15 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
 
     auto* zs = new z_stream();
     std::memset(zs, 0, sizeof(z_stream));
-    if (deflateInit(zs, Z_DEFAULT_COMPRESSION) != Z_OK) {
+    // Best ratio — lossless; cost is CPU on the merge thread after SR work.
+    if (deflateInit(zs, Z_BEST_COMPRESSION) != Z_OK) {
         delete zs;
         fclose(f_); f_ = nullptr;
         return false;
     }
     z_stream_ = zs;
     z_out_.resize(256 * 1024);
+    pred_row_.resize((size_t)W * 3);
     deflate_ok_ = true;
     return true;
 }
@@ -265,18 +281,23 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
     if (nrows <= 0) return true;
 
     auto* zs = static_cast<z_stream*>(z_stream_);
-    zs->next_in = reinterpret_cast<Bytef*>(const_cast<uint16_t*>(rgb16));
-    zs->avail_in = (uInt)((size_t)nrows * W_ * 3 * sizeof(uint16_t));
+    for (int r = 0; r < nrows; ++r) {
+        std::memcpy(pred_row_.data(), rgb16 + (size_t)r * W_ * 3, (size_t)W_ * 3 * sizeof(uint16_t));
+        apply_hdiff_rgb16(pred_row_.data(), W_);
 
-    while (zs->avail_in > 0) {
-        zs->next_out = z_out_.data();
-        zs->avail_out = (uInt)z_out_.size();
-        int ret = deflate(zs, Z_NO_FLUSH);
-        if (ret != Z_OK) return false;
-        size_t produced = z_out_.size() - zs->avail_out;
-        if (produced) {
-            if (fwrite(z_out_.data(), 1, produced, f_) != produced) return false;
-            compressed_bytes_ += (uint32_t)produced;
+        zs->next_in = reinterpret_cast<Bytef*>(pred_row_.data());
+        zs->avail_in = (uInt)((size_t)W_ * 3 * sizeof(uint16_t));
+
+        while (zs->avail_in > 0) {
+            zs->next_out = z_out_.data();
+            zs->avail_out = (uInt)z_out_.size();
+            int ret = deflate(zs, Z_NO_FLUSH);
+            if (ret != Z_OK) return false;
+            size_t produced = z_out_.size() - zs->avail_out;
+            if (produced) {
+                if (fwrite(z_out_.data(), 1, produced, f_) != produced) return false;
+                compressed_bytes_ += (uint32_t)produced;
+            }
         }
     }
     rows_written_ += nrows;
@@ -335,6 +356,83 @@ DngStreamWriter::~DngStreamWriter() {
         z_stream_ = nullptr;
     }
     if (f_) fclose(f_);
+}
+
+bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, int& W, int& H) {
+    rgb.clear();
+    W = H = 0;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long fsz = ftell(f);
+    if (fsz < 16) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+
+    std::vector<uint8_t> file((size_t)fsz);
+    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return false; }
+    fclose(f);
+
+    if (file[0] != 'I' || file[1] != 'I' || r16(file.data() + 2) != 42) return false;
+    uint32_t ifd = r32(file.data() + 4);
+    if (ifd + 2 > file.size()) return false;
+    uint16_t nent = r16(file.data() + ifd);
+    if (ifd + 2u + (uint32_t)nent * 12u + 4u > file.size()) return false;
+
+    uint32_t width = 0, height = 0, strip_off = 0, strip_bc = 0, rows_per_strip = 0;
+    uint16_t compression = 1, predictor = 1, spp = 0;
+    for (uint16_t i = 0; i < nent; ++i) {
+        const uint8_t* e = file.data() + ifd + 2 + i * 12;
+        uint16_t tag = r16(e), type = r16(e + 2);
+        uint32_t count = r32(e + 4), val = r32(e + 8);
+        auto as_long = [&](uint32_t fallback) -> uint32_t {
+            if (type == T_LONG && count == 1) return val;
+            if (type == T_SHORT && count == 1) return val & 0xFFFF;
+            return fallback;
+        };
+        switch (tag) {
+            case 256: width = as_long(width); break;
+            case 257: height = as_long(height); break;
+            case 259: compression = (uint16_t)as_long(compression); break;
+            case 273: strip_off = as_long(strip_off); break;
+            case 277: spp = (uint16_t)as_long(spp); break;
+            case 278: rows_per_strip = as_long(rows_per_strip); break;
+            case 279: strip_bc = as_long(strip_bc); break;
+            case 317: predictor = (uint16_t)as_long(predictor); break;
+            default: break;
+        }
+    }
+    if (width == 0 || height == 0 || spp != 3 || strip_off == 0) return false;
+    if (rows_per_strip == 0) rows_per_strip = height;
+    if (compression != 8 && compression != 1) return false;
+    if (strip_off >= file.size()) return false;
+
+    const size_t raw_bytes = (size_t)width * height * 3 * sizeof(uint16_t);
+    rgb.resize((size_t)width * height * 3);
+
+    if (compression == 1) {
+        if (strip_off + raw_bytes > file.size()) { rgb.clear(); return false; }
+        std::memcpy(rgb.data(), file.data() + strip_off, raw_bytes);
+    } else {
+        if (strip_bc == 0 || strip_off + strip_bc > file.size()) { rgb.clear(); return false; }
+        z_stream zs{};
+        if (inflateInit(&zs) != Z_OK) { rgb.clear(); return false; }
+        zs.next_in = file.data() + strip_off;
+        zs.avail_in = (uInt)strip_bc;
+        zs.next_out = reinterpret_cast<Bytef*>(rgb.data());
+        zs.avail_out = (uInt)raw_bytes;
+        int ret = inflate(&zs, Z_FINISH);
+        inflateEnd(&zs);
+        if (ret != Z_STREAM_END || zs.total_out != raw_bytes) { rgb.clear(); return false; }
+    }
+
+    if (predictor == 2) {
+        for (uint32_t y = 0; y < height; ++y)
+            undo_hdiff_rgb16(rgb.data() + (size_t)y * width * 3, (int)width);
+    }
+
+    W = (int)width;
+    H = (int)height;
+    return true;
 }
 
 } // namespace hhsr
