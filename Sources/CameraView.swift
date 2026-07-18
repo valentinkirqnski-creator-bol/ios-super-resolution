@@ -444,6 +444,12 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.acc_rob_max_frame_count, in: 1.0...10.0)
                     }
                 }
+
+                Section {
+                    Button("Reset") {
+                        cam.tuningParams = .ghostReductionPreset
+                    }
+                }
             }
             .navigationTitle("Algorithm Tuning")
             .navigationBarTitleDisplayMode(.inline)

@@ -57,6 +57,22 @@ struct TuningParams: Equatable, Codable {
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 8.0
     var acc_rob_max_frame_count: Float = 2.0
+
+    /// Aggressive motion-ghost preset used by the settings Reset button.
+    static let ghostReductionPreset = TuningParams(
+        r_t: 1.00,
+        r_s1: 0.25,
+        r_s2: 2.5,
+        r_Mt: 0.80,
+        k_detail: 0.20,
+        k_denoise: 0.0,
+        k_stretch: 4.0,
+        snr_auto_tune: false,
+        accumulated_robustness_denoiser_enabled: true,
+        acc_rob_rad_max: 2.0,
+        acc_rob_max_multiplier: 5.2,
+        acc_rob_max_frame_count: 2.0
+    )
 }
 
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs

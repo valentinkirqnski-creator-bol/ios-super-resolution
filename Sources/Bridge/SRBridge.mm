@@ -6,6 +6,7 @@
 
 #include "core/types.h"
 #include "core/pipeline.h"
+#include "core/metal_gpu.h"
 
 using namespace hhsr;
 
@@ -50,6 +51,9 @@ static UIImage* UIImageFromPreview(const Image& preview) {
         previewImage:(UIImage * _Nullable * _Nullable)previewOut {
     if (paths.count < 2) return NO;
     if (previewOut) *previewOut = nil;
+
+    // Grey-FFT + L2 BM require Metal (no CPU fallback).
+    if (!metal_gpu_init()) return NO;
 
     std::vector<std::string> vpaths;
     vpaths.reserve(paths.count);

@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #ifdef __APPLE__
+#include "metal_gpu.h"
 #include <Accelerate/Accelerate.h>
 #endif
 
@@ -320,7 +321,14 @@ void fftshift2d_real(std::vector<f32>& data, int h, int w) {
 
 // Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT")
 // at native (h,w); no power-of-2 padding.
+// On Apple: Metal GPU only (same math: row/col DFT + shift + lowpass). No CPU fallback.
 Image compute_grey_fft(const Image& raw) {
+#ifdef __APPLE__
+    Image grey = compute_grey_fft_metal(raw);
+    if (grey.h > 0 && grey.w > 0) return grey;
+    // Metal required — do not fall back to vDSP/CPU.
+    return Image();
+#else
     const int h = raw.h, w = raw.w;
     std::vector<std::complex<f32>> buf((size_t)h * w);
     for (int y = 0; y < h; ++y)
@@ -347,6 +355,7 @@ Image compute_grey_fft(const Image& raw) {
         for (int x = 0; x < w; ++x)
             grey.at(y, x) = buf[(size_t)y * w + x].real();
     return grey;
+#endif
 }
 
 Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method) {

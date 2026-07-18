@@ -49,6 +49,8 @@ targets:
           - "raw_io.cpp"
           - "dng_writer.cpp"
           - "snr_tuning.cpp"
+          - "metal_gpu.mm"
+          - "HHSRKernels.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.
@@ -75,3 +77,5 @@ targets:
         INFOPLIST_KEY_UIApplicationSupportsIndoorMaps: NO
     dependencies:
       - sdk: Accelerate.framework
+      - sdk: Metal.framework
+      - sdk: Foundation.framework
