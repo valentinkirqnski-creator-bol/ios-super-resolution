@@ -892,7 +892,7 @@ final class CameraModel: NSObject, ObservableObject {
     private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
-        let ok = SRBridge.exportJPEGFromLinearDNG(dngURL.path, toPath: outURL.path)
+        let ok = SRBridge.exportJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path)
         if ok { return outURL }
         try? FileManager.default.removeItem(at: outURL)
         return nil
