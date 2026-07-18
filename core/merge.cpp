@@ -32,6 +32,9 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
         fx = std::max((int)std::floor(kmap_j), 0);
         fy = std::max((int)std::floor(kmap_i), 0);
     }
+    // Clamp high side too — large motion can push kmap past the cov field.
+    fx = std::min(fx, covs.w - 1);
+    fy = std::min(fy, covs.h - 1);
     int cx = std::min(fx + 1, covs.w - 1), cy = std::min(fy + 1, covs.h - 1);
 
     const f32* tl = covs.at(fy, fx);
@@ -79,11 +82,13 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 lr_x = (hr_j + 0.5f) / scale;
             const f32 lr_y = (hr_i + 0.5f) / scale;
 
-            // Python: px = int(lr_x // tile_size)  (no clamp)
+            // Python: px = int(lr_x // tile_size); clamp like f22fb05 to avoid OOB flow reads.
             const int px = (int)(lr_x / (f32)tile_size);
             const int py = (int)(lr_y / (f32)tile_size);
-            const f32 flowx = flow.dx(py, px);
-            const f32 flowy = flow.dy(py, px);
+            const int tpy = std::max(0, std::min(py, flow.ny - 1));
+            const int tpx = std::max(0, std::min(px, flow.nx - 1));
+            const f32 flowx = flow.dx(tpy, tpx);
+            const f32 flowy = flow.dy(tpy, tpx);
 
             const int i_r = std::min((int)lr_y, lr_h - 1);
             const int j_r = std::min((int)lr_x, lr_w - 1);
