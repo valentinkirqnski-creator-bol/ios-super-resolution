@@ -748,7 +748,9 @@ final class CameraModel: NSObject, ObservableObject {
         capturedDNGs.removeAll()
 
         if ok {
-            saveToPhotos(url: outURL, preview: preview, burstDir: burstDir)
+            let robURL = URL(fileURLWithPath:
+                outURL.deletingPathExtension().path + "_robustness.pgm")
+            saveToPhotos(url: outURL, robustnessMask: robURL, preview: preview, burstDir: burstDir)
         } else {
             removeBurstDir(burstDir)
             self.burstDir = nil
@@ -756,7 +758,58 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func saveToPhotos(url: URL, preview: UIImage?, burstDir: URL?) {
+    /// Load 8-bit binary PGM (P5) written by the C++ robustness export.
+    private static func uiImageFromPGM(url: URL) -> UIImage? {
+        guard let data = try? Data(contentsOf: url), data.count > 16 else { return nil }
+        var i = 0
+        func nextToken() -> String? {
+            while i < data.count {
+                let b = data[i]
+                if b == 0x23 { // '#' comment
+                    while i < data.count && data[i] != 0x0a { i += 1 }
+                    continue
+                }
+                if b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d {
+                    i += 1
+                    continue
+                }
+                break
+            }
+            let start = i
+            while i < data.count {
+                let b = data[i]
+                if b == 0x20 || b == 0x09 || b == 0x0a || b == 0x0d { break }
+                i += 1
+            }
+            guard i > start else { return nil }
+            return String(bytes: data[start..<i], encoding: .ascii)
+        }
+        guard nextToken() == "P5",
+              let ws = nextToken(), let hs = nextToken(), let ms = nextToken(),
+              let w = Int(ws), let h = Int(hs), let maxv = Int(ms), maxv == 255,
+              w > 0, h > 0 else { return nil }
+        // Single whitespace after maxval, then raw bytes
+        while i < data.count && (data[i] == 0x20 || data[i] == 0x09 || data[i] == 0x0d) { i += 1 }
+        if i < data.count && data[i] == 0x0a { i += 1 }
+        let need = w * h
+        guard i + need <= data.count else { return nil }
+        var rgba = [UInt8](repeating: 255, count: need * 4)
+        for p in 0..<need {
+            let g = data[i + p]
+            rgba[p * 4 + 0] = g
+            rgba[p * 4 + 1] = g
+            rgba[p * 4 + 2] = g
+            rgba[p * 4 + 3] = 255
+        }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: &rgba, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w * 4, space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let cg = ctx.makeImage() else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
+    private func saveToPhotos(url: URL, robustnessMask: URL?, preview: UIImage?, burstDir: URL?) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {
@@ -768,17 +821,34 @@ final class CameraModel: NSObject, ObservableObject {
                 self.burstDir = nil
                 return
             }
+            var maskJPEG: URL?
+            if let rob = robustnessMask, FileManager.default.fileExists(atPath: rob.path),
+               let img = Self.uiImageFromPGM(url: rob),
+               let jpeg = img.jpegData(compressionQuality: 0.92) {
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("robustness_mask_\(UUID().uuidString).jpg")
+                try? jpeg.write(to: tmp, options: .atomic)
+                maskJPEG = tmp
+            }
+            let savedMask = maskJPEG != nil
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 let opts = PHAssetResourceCreationOptions()
                 opts.shouldMoveFile = false
                 req.addResource(with: .photo, fileURL: url, options: opts)
+                if let maskJPEG {
+                    let mreq = PHAssetCreationRequest.forAsset()
+                    mreq.addResource(with: .photo, fileURL: maskJPEG, options: opts)
+                }
             }, completionHandler: { success, _ in
+                if let maskJPEG { try? FileManager.default.removeItem(at: maskJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = preview
                     self.finish(success: success,
                                 message: success
-                                    ? "Saved super-res DNG to Photos"
+                                    ? (savedMask
+                                       ? "Saved DNG + robustness mask to Photos"
+                                       : "Saved super-res DNG to Photos")
                                     : "Could not save to Photos")
                 }
                 self.removeBurstDir(burstDir)

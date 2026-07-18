@@ -3,12 +3,40 @@
 #include "dng_writer.h"
 #include "snr_tuning.h"
 #include <vector>
+#include <fstream>
+#include <algorithm>
+#include <cmath>
 
 #ifdef HHSR_USE_VULKAN
 #include "gpu/gpu_merge.h"
 #endif
 
 namespace hhsr {
+
+bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
+                               const std::string& dng_path) {
+    if (acc_rob.data.empty() || acc_rob.h <= 0 || acc_rob.w <= 0) return false;
+    std::string path = dng_path;
+    const std::string suf = ".dng";
+    if (path.size() >= suf.size() &&
+        path.compare(path.size() - suf.size(), suf.size(), suf) == 0)
+        path.replace(path.size() - suf.size(), suf.size(), "_robustness.pgm");
+    else
+        path += "_robustness.pgm";
+
+    const f32 inv_n = 1.f / (f32)std::max(1, n_comp_frames);
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    out << "P5\n" << acc_rob.w << " " << acc_rob.h << "\n255\n";
+    for (int y = 0; y < acc_rob.h; ++y) {
+        for (int x = 0; x < acc_rob.w; ++x) {
+            // Mean robustness in [0,1] → 8-bit (white = fully trusted)
+            f32 v = clampf(acc_rob.at(y, x) * inv_n, 0.f, 1.f);
+            out.put((char)(unsigned char)(v * 255.f + 0.5f));
+        }
+    }
+    return (bool)out;
+}
 
 Image pad_image_circular(const Image& img, int tile_size) {
     int pad_h = (tile_size - img.h % tile_size) % tile_size;
@@ -229,6 +257,10 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     }
 
     writer.close();
+    if (work.robustness_save_mask && have_acc_rob) {
+        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
+            report("Wrote robustness mask", 0.99f);
+    }
     report("Done", 1.0f);
     return preview;
 }

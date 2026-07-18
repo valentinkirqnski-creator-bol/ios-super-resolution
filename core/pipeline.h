@@ -40,4 +40,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                                  const std::string& dng_path, const ProgressFn& progress,
                                  int maxPreviewDim = 512);
 
+// Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
+// Path: replace ".dng" with "_robustness.pgm", or append that suffix.
+bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
+                               const std::string& dng_path);
+
 } // namespace hhsr

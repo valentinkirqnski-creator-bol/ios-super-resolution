@@ -371,6 +371,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
 
     writer.close();
+    if (work.robustness_save_mask && have_acc_rob) {
+        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
+            report("Wrote robustness mask", 0.985f);
+    }
     cached.clear();
     cached_meta.clear();
     ref = Image();
