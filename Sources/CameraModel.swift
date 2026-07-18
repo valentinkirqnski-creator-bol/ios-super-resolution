@@ -2,6 +2,24 @@ import AVFoundation
 import Photos
 import UIKit
 import Combine
+import CoreImage
+import ImageIO
+import UniformTypeIdentifiers
+
+/// Final save format after SR (DNG always produced; JPG is a tone-mapped export).
+enum ExportFormat: String, CaseIterable, Identifiable, Codable {
+    case dng
+    case jpg
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .dng: return "DNG"
+        case .jpg: return "JPG"
+        }
+    }
+}
 
 /// Back wide (1×), ultra-wide (0.5×), or front selfie camera.
 enum CameraSelection: String, CaseIterable, Identifiable {
@@ -90,6 +108,15 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var lensZoomMode: LensZoomMode = .wide1x
+    @Published var exportFormat: ExportFormat = {
+        if let raw = UserDefaults.standard.string(forKey: "ExportFormat"),
+           let fmt = ExportFormat(rawValue: raw) {
+            return fmt
+        }
+        return .dng
+    }() {
+        didSet { UserDefaults.standard.set(exportFormat.rawValue, forKey: "ExportFormat") }
+    }
     @Published var tuningParams: TuningParams = {
         if let data = UserDefaults.standard.data(forKey: "TuningParams"),
            let params = try? JSONDecoder().decode(TuningParams.self, from: data) {
@@ -125,7 +152,7 @@ final class CameraModel: NSObject, ObservableObject {
     static let maxFrameCount = 8
 
     let session = AVCaptureSession()
-    private let sessionQueue = DispatchQueue(label: "camera.session")
+    private let sessionQueue = DispatchQueue(label: "camera.session", qos: .userInteractive)
     private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .userInitiated)
     private let photoOutput = AVCapturePhotoOutput()
     private var device: AVCaptureDevice?
@@ -139,6 +166,10 @@ final class CameraModel: NSObject, ObservableObject {
     private var capturesProcessed = 0
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
+    /// Pre-created empty folder so mkdir is off the shutter critical path.
+    private var readyBurstDir: URL?
+    private var cachedRawPixelFormat: OSType?
+    private var cachedMaxPhotoDimensions: CMVideoDimensions?
     private var isAppActive = true
     private var previewSuspended = false
     private var exposureSyncTimer: Timer?
@@ -239,9 +270,34 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func setResponsiveCaptureEnabled(_ enabled: Bool) {
+    /// Keep the photo pipeline warm for immediate RAW bursts (no extra frame buffers).
+    private func applyFastCapturePipelineSettings() {
+        photoOutput.maxPhotoQualityPrioritization = .speed
         if #available(iOS 17.0, *) {
-            photoOutput.isResponsiveCaptureEnabled = enabled
+            // Responsive/fast prioritization cut shutter lag without holding a RAW burst in RAM.
+            // (Zero shutter lag left at system default — its ring buffer can raise memory.)
+            if photoOutput.isResponsiveCaptureSupported {
+                photoOutput.isResponsiveCaptureEnabled = true
+            }
+            if photoOutput.isFastCapturePrioritizationSupported {
+                photoOutput.isFastCapturePrioritizationEnabled = true
+            }
+        }
+    }
+
+    private func ensureReadyBurstDir() {
+        if let dir = readyBurstDir,
+           FileManager.default.fileExists(atPath: dir.path) {
+            return
+        }
+        readyBurstDir = nil
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("burst_\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            readyBurstDir = dir
+        } catch {
+            readyBurstDir = nil
         }
     }
 
@@ -333,18 +389,18 @@ final class CameraModel: NSObject, ObservableObject {
             }
             session.addOutput(photoOutput)
         }
-        photoOutput.maxPhotoQualityPrioritization = .balanced
-        setResponsiveCaptureEnabled(false)
+        applyFastCapturePipelineSettings()
         configureRawCaptureLimits()
         refreshExposureRange()
         applyDefaultDeviceModes()
 
         session.commitConfiguration()
         startPreviewIfNeeded()
+        ensureReadyBurstDir()
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
             self.startAutoExposureSyncIfNeeded()
-            if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            if self.cachedRawPixelFormat == nil {
                 self.statusText = "RAW capture not supported on this camera"
             }
         }
@@ -369,14 +425,16 @@ final class CameraModel: NSObject, ObservableObject {
         videoInput = input
         device = dev
 
+        applyFastCapturePipelineSettings()
         configureRawCaptureLimits()
         refreshExposureRange()
         applyDefaultDeviceModes()
 
         session.commitConfiguration()
+        ensureReadyBurstDir()
         DispatchQueue.main.async {
             self.startAutoExposureSyncIfNeeded()
-            if self.photoOutput.availableRawPhotoPixelFormatTypes.isEmpty {
+            if self.cachedRawPixelFormat == nil {
                 self.statusText = "RAW not supported on \(selection.label)"
             } else {
                 self.statusText = ""
@@ -524,8 +582,12 @@ final class CameraModel: NSObject, ObservableObject {
         progress = 0
         statusText = "Capturing \(total) frames · \(lens)"
 
-        sessionQueue.async {
-            guard self.photoOutput.availableRawPhotoPixelFormatTypes.first != nil else {
+        // User-interactive QoS: get onto the camera queue and fire capturePhoto ASAP.
+        sessionQueue.async(qos: .userInteractive) {
+            if self.cachedRawPixelFormat == nil {
+                self.cachedRawPixelFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first
+            }
+            guard self.cachedRawPixelFormat != nil else {
                 DispatchQueue.main.async {
                     self.isBusy = false
                     self.isCapturing = false
@@ -534,19 +596,27 @@ final class CameraModel: NSObject, ObservableObject {
                 return
             }
 
-            let dir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("burst_\(Int(Date().timeIntervalSince1970))")
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            self.ensureReadyBurstDir()
+            guard let dir = self.readyBurstDir else {
+                DispatchQueue.main.async {
+                    self.isBusy = false
+                    self.isCapturing = false
+                    self.statusText = "Could not create capture folder"
+                }
+                return
+            }
             self.burstDir = dir
-            self.capturedDNGs.removeAll()
+            self.readyBurstDir = nil
+            self.capturedDNGs.removeAll(keepingCapacity: true)
             self.currentBurstTotal = self.activeFrameCount
             self.capturesRequested = 0
             self.capturesProcessed = 0
 
-            self.photoOutput.maxPhotoQualityPrioritization = .speed
-            self.setResponsiveCaptureEnabled(true)
+            // Pipeline already warm; only lock AE/AF/WB then shoot.
             self.lockForBurst()
             self.captureNextRaw()
+            // Refill ready folder for the next shutter (disk only, not on critical path).
+            self.ensureReadyBurstDir()
         }
     }
 
@@ -556,9 +626,9 @@ final class CameraModel: NSObject, ObservableObject {
             self.burstDir = nil
             self.capturesRequested = self.currentBurstTotal
             self.capturesProcessed = self.currentBurstTotal
-            self.capturedDNGs.removeAll()
-            self.restoreCaptureQuality()
+            self.capturedDNGs.removeAll(keepingCapacity: true)
             self.removeBurstDir(dir)
+            self.ensureReadyBurstDir()
             if let d = self.device, (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
@@ -595,7 +665,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func unlockAfterBurst() {
         sessionQueue.async {
-            self.restoreCaptureQuality()
+            // Leave speed/responsive pipeline warm for the next shutter.
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
             if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
@@ -614,10 +684,12 @@ final class CameraModel: NSObject, ObservableObject {
     @discardableResult
     private func captureNextRaw() -> Bool {
         if capturesRequested >= currentBurstTotal { return false }
-        guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else {
+        guard let rawFormat = cachedRawPixelFormat
+                ?? photoOutput.availableRawPhotoPixelFormatTypes.first else {
             abortBurst("RAW capture unavailable")
             return false
         }
+        cachedRawPixelFormat = rawFormat
         capturesRequested += 1
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         settings.flashMode = .off
@@ -629,24 +701,23 @@ final class CameraModel: NSObject, ObservableObject {
         return true
     }
 
-    private func restoreCaptureQuality() {
-        photoOutput.maxPhotoQualityPrioritization = .balanced
-        setResponsiveCaptureEnabled(false)
-    }
-
     private func configureRawCaptureLimits() {
+        cachedRawPixelFormat = photoOutput.availableRawPhotoPixelFormatTypes.first
         if #available(iOS 16.0, *) {
             photoOutput.isHighResolutionCaptureEnabled = false
-            if let dims = preferredRawDimensions() {
+            cachedMaxPhotoDimensions = preferredRawDimensions()
+            if let dims = cachedMaxPhotoDimensions {
                 photoOutput.maxPhotoDimensions = dims
             }
+        } else {
+            cachedMaxPhotoDimensions = nil
         }
     }
 
     private func applyRawCaptureLimits(to settings: AVCapturePhotoSettings) {
         if #available(iOS 16.0, *) {
             settings.isHighResolutionPhotoEnabled = false
-            if let dims = preferredRawDimensions() {
+            if let dims = cachedMaxPhotoDimensions ?? preferredRawDimensions() {
                 settings.maxPhotoDimensions = dims
             }
         }
@@ -676,30 +747,23 @@ final class CameraModel: NSObject, ObservableObject {
     // MARK: - Processing
 
     /// Remove leftover burst folders (~500 MB each) from tmp after crashes or older builds.
+    /// Call on sessionQueue. Preserves the pre-created ready folder and any in-flight burst.
     private func purgeStaleCaptureFiles() {
-        processingQueue.async {
-            let fm = FileManager.default
-            let tmp = fm.temporaryDirectory
-            if let entries = try? fm.contentsOfDirectory(
-                at: tmp, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
-                for url in entries {
-                    let name = url.lastPathComponent
-                    if name.hasPrefix("burst_") || name.hasSuffix("_cache") {
-                        try? fm.removeItem(at: url)
-                    }
-                }
-            }
-            if let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first,
-               let entries = try? fm.contentsOfDirectory(
-                at: caches, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
-                for url in entries {
-                    let name = url.lastPathComponent
-                    if name.hasPrefix("burst_") || name.hasSuffix("_cache") {
-                        try? fm.removeItem(at: url)
-                    }
-                }
+        let keep = Set([readyBurstDir?.path, burstDir?.path].compactMap { $0 })
+        let fm = FileManager.default
+        let roots = [fm.temporaryDirectory]
+            + (fm.urls(for: .cachesDirectory, in: .userDomainMask).first.map { [$0] } ?? [])
+        for root in roots {
+            guard let entries = try? fm.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+            for url in entries {
+                let name = url.lastPathComponent
+                guard name.hasPrefix("burst_") || name.hasSuffix("_cache") else { continue }
+                if keep.contains(url.path) { continue }
+                try? fm.removeItem(at: url)
             }
         }
+        ensureReadyBurstDir()
     }
 
     private func removeBurstDir(_ dir: URL?) {
@@ -825,7 +889,59 @@ final class CameraModel: NSObject, ObservableObject {
         return UIImage(cgImage: cg)
     }
 
+    /// Lightroom-like finish from the SR DNG: Highlights −100, Shadows +60,
+    /// Contrast +5, Sharpening 0, Noise Reduction 0 → JPEG.
+    private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
+        guard let src = CGImageSourceCreateWithURL(dngURL as CFURL, nil),
+              CGImageSourceGetCount(src) > 0 else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceShouldCache: true,
+            kCGImageSourceShouldAllowFloat: true
+        ]
+        guard let cg = CGImageSourceCreateImageAtIndex(src, 0, opts as CFDictionary) else {
+            return nil
+        }
+
+        var image = CIImage(cgImage: cg)
+
+        if let hs = CIFilter(name: "CIHighlightShadowAdjust") {
+            hs.setValue(image, forKey: kCIInputImageKey)
+            // Lightroom Highlights −100 → max highlight compression
+            hs.setValue(1.0 as NSNumber, forKey: "inputHighlightAmount")
+            // Lightroom Shadows +60 → lift shadows (~0.6 on −1…1)
+            hs.setValue(0.6 as NSNumber, forKey: "inputShadowAmount")
+            if let out = hs.outputImage { image = out }
+        }
+
+        if let cc = CIFilter(name: "CIColorControls") {
+            cc.setValue(image, forKey: kCIInputImageKey)
+            // Lightroom Contrast +5 on −100…+100 → mild bump around neutral 1.0
+            cc.setValue(1.05 as NSNumber, forKey: kCIInputContrastKey)
+            cc.setValue(0.0 as NSNumber, forKey: kCIInputBrightnessKey)
+            cc.setValue(1.0 as NSNumber, forKey: kCIInputSaturationKey)
+            if let out = cc.outputImage { image = out }
+        }
+        // Sharpening 0 / NR 0 — intentionally no CISharpen / noise filters.
+
+        let ctx = CIContext(options: [.useSoftwareRenderer: false])
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
+        guard let cgOut = ctx.createCGImage(image, from: image.extent),
+              let dest = CGImageDestinationCreateWithURL(
+                outURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil
+              ) else { return nil }
+
+        let jpgOpts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.92]
+        CGImageDestinationAddImage(dest, cgOut, jpgOpts as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else {
+            try? FileManager.default.removeItem(at: outURL)
+            return nil
+        }
+        return outURL
+    }
+
     private func saveToPhotos(url: URL, robustnessMask: URL?, preview: UIImage?, burstDir: URL?) {
+        let format = exportFormat
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {
@@ -837,6 +953,24 @@ final class CameraModel: NSObject, ObservableObject {
                 self.burstDir = nil
                 return
             }
+
+            var saveURL = url
+            var tempJPEG: URL?
+            if format == .jpg {
+                if let jpg = Self.renderExportJPEG(fromDNG: url) {
+                    saveURL = jpg
+                    tempJPEG = jpg
+                } else {
+                    DispatchQueue.main.async {
+                        self.lastThumbnail = preview
+                        self.finish(success: false, message: "JPG export failed")
+                    }
+                    self.removeBurstDir(burstDir)
+                    self.burstDir = nil
+                    return
+                }
+            }
+
             var maskJPEG: URL?
             if let rob = robustnessMask, FileManager.default.fileExists(atPath: rob.path),
                let img = Self.uiImageFromPGM(url: rob),
@@ -847,24 +981,26 @@ final class CameraModel: NSObject, ObservableObject {
                 maskJPEG = tmp
             }
             let savedMask = maskJPEG != nil
+            let label = format == .jpg ? "JPG" : "DNG"
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 let opts = PHAssetResourceCreationOptions()
                 opts.shouldMoveFile = false
-                req.addResource(with: .photo, fileURL: url, options: opts)
+                req.addResource(with: .photo, fileURL: saveURL, options: opts)
                 if let maskJPEG {
                     let mreq = PHAssetCreationRequest.forAsset()
                     mreq.addResource(with: .photo, fileURL: maskJPEG, options: opts)
                 }
             }, completionHandler: { success, _ in
                 if let maskJPEG { try? FileManager.default.removeItem(at: maskJPEG) }
+                if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = preview
                     self.finish(success: success,
                                 message: success
                                     ? (savedMask
-                                       ? "Saved DNG + robustness mask to Photos"
-                                       : "Saved super-res DNG to Photos")
+                                       ? "Saved \(label) + robustness mask to Photos"
+                                       : "Saved super-res \(label) to Photos")
                                     : "Could not save to Photos")
                 }
                 self.removeBurstDir(burstDir)
@@ -904,7 +1040,8 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                 let idx = capturedDNGs.count
                 let url = dir.appendingPathComponent("frame_\(idx).dng")
                 do {
-                    try data.write(to: url, options: .atomic)
+                    // Non-atomic: avoids temp+rename I/O; partial files are purged with the burst dir.
+                    try data.write(to: url)
                     capturedDNGs.append(url)
                 } catch {
                     abortBurst("Write error: \(error.localizedDescription)")
@@ -928,10 +1065,9 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
         if error != nil { return }
+        // Fire next exposure immediately — no sessionQueue hop between frames.
         if capturesRequested < currentBurstTotal {
-            sessionQueue.async {
-                self.captureNextRaw()
-            }
+            _ = captureNextRaw()
         }
     }
 }

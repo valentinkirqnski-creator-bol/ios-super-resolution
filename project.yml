@@ -65,7 +65,7 @@ targets:
       properties:
         CFBundleDisplayName: Handheld SR
         NSCameraUsageDescription: "The camera is used to capture a short RAW burst for multi-frame super-resolution."
-        NSPhotoLibraryAddUsageDescription: "Used to save the final 48 MP DNG to your photo library."
+        NSPhotoLibraryAddUsageDescription: "Used to save the final super-resolution DNG or JPG to your photo library."
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -79,3 +79,6 @@ targets:
       - sdk: Accelerate.framework
       - sdk: Metal.framework
       - sdk: Foundation.framework
+      - sdk: libz.tbd
+      - sdk: CoreImage.framework
+      - sdk: ImageIO.framework

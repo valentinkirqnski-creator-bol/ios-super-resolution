@@ -190,25 +190,35 @@ struct CameraView: View {
     // MARK: - Lens picker (over viewfinder)
 
     private var backLensPicker: some View {
-        HStack(spacing: 18) {
-            if cam.availableCameras.contains(.ultraWide) {
-                lensChip(title: "0.5×", selected: cam.lensZoomMode == .ultraWide) {
-                    cam.setLensZoom(.ultraWide)
+        VStack(spacing: 8) {
+            HStack(spacing: 18) {
+                if cam.availableCameras.contains(.ultraWide) {
+                    lensChip(title: "0.5×", selected: cam.lensZoomMode == .ultraWide) {
+                        cam.setLensZoom(.ultraWide)
+                    }
+                }
+                if cam.availableCameras.contains(.wide) {
+                    lensChip(title: "1×", selected: cam.lensZoomMode == .wide1x) {
+                        cam.setLensZoom(.wide1x)
+                    }
+                    lensChip(title: "2×", selected: cam.lensZoomMode == .wide2x) {
+                        cam.setLensZoom(.wide2x)
+                    }
                 }
             }
-            if cam.availableCameras.contains(.wide) {
-                lensChip(title: "1×", selected: cam.lensZoomMode == .wide1x) {
-                    cam.setLensZoom(.wide1x)
+            HStack(spacing: 18) {
+                lensChip(title: "DNG", selected: cam.exportFormat == .dng) {
+                    cam.exportFormat = .dng
                 }
-                lensChip(title: "2×", selected: cam.lensZoomMode == .wide2x) {
-                    cam.setLensZoom(.wide2x)
+                lensChip(title: "JPG", selected: cam.exportFormat == .jpg) {
+                    cam.exportFormat = .jpg
                 }
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(Color.black.opacity(0.45))
-        .clipShape(Capsule())
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -418,6 +428,20 @@ struct CameraView: View {
                     Slider(value: $cam.tuningParams.k_stretch, in: 1.0...10.0)
                 }
                 
+                Section(header: Text("Export")) {
+                    Picker("Format", selection: $cam.exportFormat) {
+                        ForEach(ExportFormat.allCases) { fmt in
+                            Text(fmt.label).tag(fmt)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(cam.exportFormat == .dng
+                         ? "Lossless compressed LinearRaw DNG (same quality, smaller file)."
+                         : "Tone-mapped JPEG from the DNG: Highlights −100, Shadows +60, Contrast +5.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Fallback Denoiser")) {
                     Toggle("Enable Motion Denoiser", isOn: $cam.tuningParams.accumulated_robustness_denoiser_enabled)
                     

@@ -4,6 +4,8 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <ctime>
+#include <zlib.h>
 
 namespace hhsr {
 
@@ -23,14 +25,12 @@ static inline uint32_t type_size(uint16_t t) {
     }
 }
 
-// One IFD entry. If `payload` is non-empty it is written to the heap and the
-// entry stores its offset; otherwise `inlineval` holds the (<=4 byte) value.
 struct Entry {
     uint16_t tag = 0;
     uint16_t type = 0;
     uint32_t count = 0;
     uint32_t inlineval = 0;
-    std::vector<uint8_t> payload; // external data (empty => inline)
+    std::vector<uint8_t> payload;
 };
 
 static void w16(std::vector<uint8_t>& b, uint16_t v) { b.push_back(v & 0xFF); b.push_back(v >> 8); }
@@ -81,83 +81,97 @@ struct IFD {
     }
     void longs(uint16_t tag, std::vector<uint32_t> vals) {
         if (vals.size() == 1) { longv(tag, vals[0]); return; }
-        // Multi-value LONG tags (crop size, active area) need external storage
-        // because image dimensions exceed the 4-byte inline limit.
         std::vector<uint8_t> p;
         for (uint32_t v : vals) w32(p, v);
         e.push_back({tag, T_LONG, (uint32_t)vals.size(), 0, p});
     }
 };
 
+static std::string now_tiff_datetime() {
+    char buf[20];
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::strftime(buf, sizeof(buf), "%Y:%m:%d %H:%M:%S", &tm);
+    return std::string(buf);
+}
+
 } // namespace
 
-// Builds the DNG header + IFD + heap bytes for a W x H, 3-sample image and
-// returns them plus the file offset at which the strip data begins.
+// Builds DNG header. StripByteCounts left as 0 — patched after Deflate finishes.
+// Returns prefix bytes; strip_offset_out / strip_byte_counts_offset_out are file offsets.
 static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const std::string& camera_make,
                                              const std::string& camera_model,
                                              int orientation,
-                                             const float* cm /*9, XYZ->cam*/,
-                                             const float* wb /*3, green-norm, WB in pixels*/,
+                                             const float* /*cm*/,
+                                             const float* /*wb*/,
                                              bool baked_srgb,
-                                             uint32_t& strip_offset_out) {
-    const uint32_t strip_bytes = (uint32_t)W * H * 3 * 2;
-
+                                             uint32_t& strip_offset_out,
+                                             uint32_t& strip_byte_counts_offset_out) {
     IFD ifd;
     ifd.longv(254, 0);                 // NewSubfileType
-    ifd.ascii(271, camera_make.empty() ? "HandheldSR" : camera_make); // Make
-    ifd.ascii(272, camera_model.empty() ? "HandheldSR-x2" : camera_model); // Model
-    ifd.longv(256, (uint32_t)W);       // ImageWidth
-    ifd.longv(257, (uint32_t)H);       // ImageLength
-    ifd.shorts(258, {16, 16, 16});     // BitsPerSample
-    ifd.shortv(259, 1);                // Compression = none
+    ifd.ascii(271, camera_make.empty() ? "HandheldSR" : camera_make);
+    ifd.ascii(272, camera_model.empty() ? "HandheldSR-x2" : camera_model);
+    ifd.longv(256, (uint32_t)W);
+    ifd.longv(257, (uint32_t)H);
+    ifd.shorts(258, {16, 16, 16});
+    ifd.shortv(259, 8);                // Compression = Adobe Deflate (lossless ZIP)
     if (baked_srgb)
-        ifd.shortv(262, 2);            // PhotometricInterpretation = RGB (sRGB baked)
+        ifd.shortv(262, 2);            // RGB
     else
-        ifd.shortv(262, 34892);        // PhotometricInterpretation = LinearRaw
-    ifd.longv(273, 0);                 // StripOffsets (patched after layout)
+        ifd.shortv(262, 34892);        // LinearRaw
+    ifd.longv(273, 0);                 // StripOffsets (patched)
     if (orientation >= 1 && orientation <= 8)
-        ifd.shortv(274, (uint16_t)orientation); // Orientation
+        ifd.shortv(274, (uint16_t)orientation);
     ifd.shortv(277, 3);                // SamplesPerPixel
     ifd.longv(278, (uint32_t)H);       // RowsPerStrip
-    ifd.longv(279, strip_bytes);       // StripByteCounts
+    ifd.longv(279, 0);                 // StripByteCounts (patched after compress)
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
-    ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned int
+    ifd.ascii(305, "HandheldSR");      // Software
+    ifd.ascii(306, now_tiff_datetime()); // DateTime
+    ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
 
-    // Crop / active area — required by iOS Photos to show non-zero dimensions.
-    ifd.longs(50719, {0, 0});                      // DefaultCropOrigin
-    ifd.longs(50720, {(uint32_t)W, (uint32_t)H});  // DefaultCropSize
-    ifd.longs(50829, {0, 0, (uint32_t)H, (uint32_t)W}); // ActiveArea
+    // Photos / DNG readers need crop + active area for non-zero dimensions.
+    ifd.longs(50719, {0, 0});
+    ifd.longs(50720, {(uint32_t)W, (uint32_t)H});
+    ifd.longs(50829, {0, 0, (uint32_t)H, (uint32_t)W});
 
-    // DNG identity tags — always written so viewers (incl. iOS Photos) recognize
-    // the file as DNG, not a generic RGB TIFF.
     ifd.bytes4(50706, 1, 4, 0, 0);     // DNGVersion 1.4.0.0
     ifd.bytes4(50707, 1, 3, 0, 0);     // DNGBackwardVersion 1.3.0.0
-    ifd.ascii(50708, camera_model.empty() ? "HandheldSR-x2" : camera_model); // UniqueCameraModel
-    ifd.shorts(50714, {0, 0, 0});      // BlackLevel (per channel)
-    ifd.longs(50717, {65535, 65535, 65535}); // WhiteLevel (per channel)
+    ifd.ascii(50708, camera_model.empty() ? "HandheldSR-x2" : camera_model);
+    ifd.shorts(50714, {0, 0, 0});
+    ifd.longs(50717, {65535, 65535, 65535});
 
     if (!baked_srgb) {
-        ifd.shortv(50778, 21);             // CalibrationIlluminant1 = D65
-        // Identity ColorMatrix1. Merged pixels already include camera WB; writing
-        // the real matrix plus AsShotNeutral/AnalogBalance makes iOS and Lightroom
-        // Mobile re-develop color and produces a magenta cast. This matches the
-        // first working build (Lightroom import OK).
+        ifd.shortv(50778, 21);         // CalibrationIlluminant1 = D65
+        // Identity ColorMatrix1 — WB already in pixels; real matrix + AsShotNeutral
+        // re-develops color and casts magenta on iOS Photos / LR Mobile.
         ifd.srational(50721, {1,1, 0,1, 0,1,  0,1, 1,1, 0,1,  0,1, 0,1, 1,1});
-        // Do NOT write AsShotNeutral or AnalogBalance — WB is in the pixel data.
+        // Scene-referred linear data (helps Photos treat LinearRaw correctly).
+        ifd.shortv(50831, 1);          // ColorimetricReference = scene referred
     }
 
-    // IFD entries must be sorted by tag.
-    std::sort(ifd.e.begin(), ifd.e.end(), [](const Entry& a, const Entry& b) { return a.tag < b.tag; });
+    std::sort(ifd.e.begin(), ifd.e.end(), [](const Entry& a, const Entry& b) {
+        return a.tag < b.tag;
+    });
 
     const uint32_t n = (uint32_t)ifd.e.size();
     const uint32_t ifd_offset = 8;
     const uint32_t ifd_size = 2 + n * 12 + 4;
     const uint32_t heap_base = ifd_offset + ifd_size;
 
-    // Assign heap offsets, then the strip after the heap (2-byte aligned).
     std::vector<uint8_t> heap;
-    for (auto& e : ifd.e) {
+    int strip_off_entry = -1;
+    int strip_bc_entry = -1;
+    for (int i = 0; i < (int)ifd.e.size(); ++i) {
+        auto& e = ifd.e[(size_t)i];
+        if (e.tag == 273) strip_off_entry = i;
+        if (e.tag == 279) strip_bc_entry = i;
         if (!e.payload.empty()) {
             if (heap.size() & 1) heap.push_back(0);
             e.inlineval = heap_base + (uint32_t)heap.size();
@@ -166,25 +180,31 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     }
     uint32_t strip_offset = heap_base + (uint32_t)heap.size();
     if (strip_offset & 1) strip_offset += 1;
-    for (auto& e : ifd.e) if (e.tag == 273) e.inlineval = strip_offset;
+    if (strip_off_entry >= 0) ifd.e[(size_t)strip_off_entry].inlineval = strip_offset;
 
-    // Serialize.
     std::vector<uint8_t> out;
     out.push_back('I'); out.push_back('I');
     w16(out, 42);
     w32(out, ifd_offset);
     w16(out, (uint16_t)n);
-    for (const auto& e : ifd.e) {
+    for (int i = 0; i < (int)ifd.e.size(); ++i) {
+        const auto& e = ifd.e[(size_t)i];
+        if (e.tag == 279) {
+            // Value field starts 8 bytes into the 12-byte IFD entry.
+            strip_byte_counts_offset_out = (uint32_t)out.size() + 8;
+        }
         w16(out, e.tag);
         w16(out, e.type);
         w32(out, e.count);
         w32(out, e.inlineval);
     }
-    w32(out, 0); // no next IFD
+    w32(out, 0);
     out.insert(out.end(), heap.begin(), heap.end());
     while (out.size() < strip_offset) out.push_back(0);
 
     strip_offset_out = strip_offset;
+    (void)strip_bc_entry;
+    (void)type_size;
     return out;
 }
 
@@ -204,40 +224,117 @@ bool write_linear_dng(const std::string& path, const Image& rgb, const std::stri
     return w.close();
 }
 
-// --- Streaming writer ---
 bool DngStreamWriter::open(const std::string& path, int W, int H, const std::string& camera_model,
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
                            const std::string& camera_make) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
+    compressed_bytes_ = 0;
+    strip_byte_counts_offset_ = 0;
+    deflate_ok_ = false;
+
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
-                                                   bakedSrgb, strip_offset);
-    f_ = fopen(path.c_str(), "wb");
+                                                   bakedSrgb, strip_offset,
+                                                   strip_byte_counts_offset_);
+    f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
-    return fwrite(prefix.data(), 1, prefix.size(), f_) == prefix.size();
+    if (fwrite(prefix.data(), 1, prefix.size(), f_) != prefix.size()) {
+        fclose(f_); f_ = nullptr;
+        return false;
+    }
+
+    auto* zs = new z_stream();
+    std::memset(zs, 0, sizeof(z_stream));
+    if (deflateInit(zs, Z_DEFAULT_COMPRESSION) != Z_OK) {
+        delete zs;
+        fclose(f_); f_ = nullptr;
+        return false;
+    }
+    z_stream_ = zs;
+    z_out_.resize(256 * 1024);
+    deflate_ok_ = true;
+    return true;
 }
 
 bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
-    if (!f_ || nrows <= 0) return false;
+    if (!f_ || !deflate_ok_ || !z_stream_ || nrows <= 0) return false;
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
-    // uint16 samples are little-endian on all supported ABIs (arm64/x86); write raw.
-    size_t n = (size_t)nrows * W_ * 3;
-    bool ok = fwrite(rgb16, sizeof(uint16_t), n, f_) == n;
+
+    auto* zs = static_cast<z_stream*>(z_stream_);
+    zs->next_in = reinterpret_cast<Bytef*>(const_cast<uint16_t*>(rgb16));
+    zs->avail_in = (uInt)((size_t)nrows * W_ * 3 * sizeof(uint16_t));
+
+    while (zs->avail_in > 0) {
+        zs->next_out = z_out_.data();
+        zs->avail_out = (uInt)z_out_.size();
+        int ret = deflate(zs, Z_NO_FLUSH);
+        if (ret != Z_OK) return false;
+        size_t produced = z_out_.size() - zs->avail_out;
+        if (produced) {
+            if (fwrite(z_out_.data(), 1, produced, f_) != produced) return false;
+            compressed_bytes_ += (uint32_t)produced;
+        }
+    }
     rows_written_ += nrows;
-    return ok;
+    return true;
 }
 
 bool DngStreamWriter::close() {
     if (!f_) return false;
+    bool ok = rows_written_ == H_ && deflate_ok_ && z_stream_;
+
+    if (ok) {
+        auto* zs = static_cast<z_stream*>(z_stream_);
+        int ret;
+        do {
+            zs->next_out = z_out_.data();
+            zs->avail_out = (uInt)z_out_.size();
+            ret = deflate(zs, Z_FINISH);
+            if (ret != Z_OK && ret != Z_STREAM_END) { ok = false; break; }
+            size_t produced = z_out_.size() - zs->avail_out;
+            if (produced) {
+                if (fwrite(z_out_.data(), 1, produced, f_) != produced) { ok = false; break; }
+                compressed_bytes_ += (uint32_t)produced;
+            }
+        } while (ret != Z_STREAM_END);
+
+        if (ok && strip_byte_counts_offset_ > 0) {
+            if (fseek(f_, (long)strip_byte_counts_offset_, SEEK_SET) == 0) {
+                uint8_t le[4] = {
+                    (uint8_t)(compressed_bytes_ & 0xFF),
+                    (uint8_t)((compressed_bytes_ >> 8) & 0xFF),
+                    (uint8_t)((compressed_bytes_ >> 16) & 0xFF),
+                    (uint8_t)((compressed_bytes_ >> 24) & 0xFF),
+                };
+                if (fwrite(le, 1, 4, f_) != 4) ok = false;
+            } else {
+                ok = false;
+            }
+        }
+    }
+
+    if (z_stream_) {
+        deflateEnd(static_cast<z_stream*>(z_stream_));
+        delete static_cast<z_stream*>(z_stream_);
+        z_stream_ = nullptr;
+    }
     fclose(f_);
     f_ = nullptr;
-    return rows_written_ == H_;
+    deflate_ok_ = false;
+    return ok;
 }
 
-DngStreamWriter::~DngStreamWriter() { if (f_) fclose(f_); }
+DngStreamWriter::~DngStreamWriter() {
+    if (z_stream_) {
+        deflateEnd(static_cast<z_stream*>(z_stream_));
+        delete static_cast<z_stream*>(z_stream_);
+        z_stream_ = nullptr;
+    }
+    if (f_) fclose(f_);
+}
 
 } // namespace hhsr
