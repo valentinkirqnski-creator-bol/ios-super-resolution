@@ -151,8 +151,8 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
             size_t base = ((size_t)i * Ws + x) * 3;
             f32 cn[3] = {0, 0, 0};
             for (int ch = 0; ch < nch; ++ch) {
-                f32 d = den_band.at(i, x, ch);
-                cn[ch] = (d > 0.f) ? num_band.at(i, x, ch) / d : 0.f;
+                // Python utils.divide: bare num/den
+                cn[ch] = num_band.at(i, x, ch) / den_band.at(i, x, ch);
             }
             f32 outc[3];
             if (work.bake_srgb && nch >= 3) {
@@ -216,6 +216,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int nch = work.bayer_mode ? 3 : 1;
 
     report("Reference: grey + pyramid", 0.05f);
+    // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);

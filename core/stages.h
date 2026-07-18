@@ -16,6 +16,12 @@ void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse,
            std::vector<std::complex<f32>>* dft_buf = nullptr);
 void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w);
 
+// Torch-style real 2D FFT packing: out is [h, w/2+1] complex (row-major).
+// Built on the same vDSP-backed fft1d as fft2d.
+void rfft2(const f32* in, int h, int w, std::vector<std::complex<f32>>& out);
+void irfft2(const std::vector<std::complex<f32>>& in, int h, int w, std::vector<f32>& out);
+void fftshift2d_real(std::vector<f32>& data, int h, int w);
+
 // ---- grey_pyramid.cpp ---------------------------------------------------
 Image compute_grey_decimate(const Image& raw, bool bayer_mode);
 Image compute_grey_fft(const Image& raw);

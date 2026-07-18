@@ -249,6 +249,75 @@ static void ifftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
     roll_axis1(data, h, w, -(w / 2));
 }
 
+// Torch torch.fft.rfft2 / irfft2 packing via row–column 1D FFTs (vDSP-backed fft1d).
+void rfft2(const f32* in, int h, int w, std::vector<std::complex<f32>>& out) {
+    const int wh = w / 2 + 1;
+    out.assign((size_t)h * wh, {0.f, 0.f});
+    if (h <= 0 || w <= 0) return;
+
+    std::vector<std::complex<f32>> row((size_t)w);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x)
+            row[(size_t)x] = {in[(size_t)y * w + x], 0.f};
+        fft1d(row, false, nullptr);
+        for (int x = 0; x < wh; ++x)
+            out[(size_t)y * wh + x] = row[(size_t)x];
+    }
+
+    std::vector<std::complex<f32>> col((size_t)h);
+    for (int x = 0; x < wh; ++x) {
+        for (int y = 0; y < h; ++y)
+            col[(size_t)y] = out[(size_t)y * wh + x];
+        fft1d(col, false, nullptr);
+        for (int y = 0; y < h; ++y)
+            out[(size_t)y * wh + x] = col[(size_t)y];
+    }
+}
+
+void irfft2(const std::vector<std::complex<f32>>& in, int h, int w, std::vector<f32>& out) {
+    const int wh = w / 2 + 1;
+    out.assign((size_t)h * w, 0.f);
+    if (h <= 0 || w <= 0 || (int)in.size() < h * wh) return;
+
+    std::vector<std::complex<f32>> work = in;
+    std::vector<std::complex<f32>> col((size_t)h);
+    for (int x = 0; x < wh; ++x) {
+        for (int y = 0; y < h; ++y)
+            col[(size_t)y] = work[(size_t)y * wh + x];
+        fft1d(col, true, nullptr);
+        for (int y = 0; y < h; ++y)
+            work[(size_t)y * wh + x] = col[(size_t)y];
+    }
+
+    std::vector<std::complex<f32>> row((size_t)w);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < wh; ++x)
+            row[(size_t)x] = work[(size_t)y * wh + x];
+        // Hermitian completion (numpy/torch irfft2)
+        for (int x = wh; x < w; ++x) {
+            int k = w - x;
+            row[(size_t)x] = std::conj(work[(size_t)y * wh + k]);
+        }
+        fft1d(row, true, nullptr);
+        for (int x = 0; x < w; ++x)
+            out[(size_t)y * w + x] = row[(size_t)x].real();
+    }
+}
+
+void fftshift2d_real(std::vector<f32>& data, int h, int w) {
+    // torch.fft.fftshift: out[i] = in[(i + n//2) % n]
+    if (h <= 0 || w <= 0) return;
+    std::vector<f32> tmp = data;
+    int shy = h / 2, shx = w / 2;
+    for (int y = 0; y < h; ++y) {
+        int sy = (y + shy) % h;
+        for (int x = 0; x < w; ++x) {
+            int sx = (x + shx) % w;
+            data[(size_t)y * w + x] = tmp[(size_t)sy * w + sx];
+        }
+    }
+}
+
 // Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT")
 // at native (h,w); no power-of-2 padding.
 Image compute_grey_fft(const Image& raw) {

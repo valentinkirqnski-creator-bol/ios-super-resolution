@@ -82,7 +82,7 @@ struct Config {
 
     // Noise model: sigma^2 = alpha * I + beta   (already scaled for ISO).
     float alpha = 1.80710882e-4f;
-    float beta  = 3.1937599182e-6f;
+    float beta  = 3.1937599182128e-6f; // matches monte_carlo_simulation.py / fast_monte_carlo.py
 
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};

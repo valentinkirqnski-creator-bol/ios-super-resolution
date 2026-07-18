@@ -40,6 +40,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
 
     report("Reference: grey + pyramid", 0.02f);
+    // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
@@ -89,10 +90,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         for (int x = 0; x < Ws; ++x) {
             for (int ch = 0; ch < nch; ++ch) {
                 size_t i = ((size_t)y * Ws + x) * nch + ch;
-                f32 d = den.data[i];
-                f32 v = (d > 0.f) ? num.data[i] / d : 0.f;
-                if (work.bayer_mode) v *= work.white_balance[ch];
-                out.data[i] = v;
+                // Python utils.divide: bare num/den (no den==0 guard, no WB bake)
+                out.data[i] = num.data[i] / den.data[i];
             }
         }
     }
@@ -112,6 +111,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
 
     report("Reference: grey + pyramid", 0.02f);
+    // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
@@ -192,8 +192,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 size_t base = ((size_t)i * Ws + x) * 3;
                 f32 cn[3] = {0, 0, 0};
                 for (int ch = 0; ch < nch; ++ch) {
-                    f32 d = den_band.at(i, x, ch);
-                    cn[ch] = (d > 0.f) ? num_band.at(i, x, ch) / d : 0.f;
+                    // Python utils.divide: bare num/den
+                    cn[ch] = num_band.at(i, x, ch) / den_band.at(i, x, ch);
                 }
                 f32 outc[3];
                 if (work.bake_srgb && nch >= 3) {

@@ -1,8 +1,9 @@
 #include "stages.h"
 #include "parallel.h"
+#include <cstdint>
 #include <limits>
-#include <random>
 #include <cmath>
+#include <vector>
 
 namespace hhsr {
 
@@ -26,50 +27,142 @@ static constexpr int k_n_patches = 100000; // n_patches = int(1e5)
 static constexpr int k_n_brightness = 1000;
 static constexpr f32 k_tol = 3.f;
 
+// ============================================================================
+// NumPy RandomState (legacy / frozen @ 1.16) — MT19937 + polar Box-Muller.
+// Same generator family as np.random.randn. Seeded per brightness for a
+// deterministic app; stock Python is unseeded + multiprocessed so curves
+// cannot bit-match without baking a dumped table from a Python run.
+// ============================================================================
+struct NumpyRandomState {
+    static constexpr int N = 624;
+    static constexpr int M = 397;
+    static constexpr uint32_t MATRIX_A = 0x9908b0dfu;
+    static constexpr uint32_t UPPER_MASK = 0x80000000u;
+    static constexpr uint32_t LOWER_MASK = 0x7fffffffu;
+
+    uint32_t key[N]{};
+    int pos = N;
+    int has_gauss = 0;
+    double gauss = 0.0;
+
+    explicit NumpyRandomState(uint32_t seed) { rk_seed(seed); }
+
+    void rk_seed(uint32_t seed) {
+        seed &= 0xffffffffu;
+        for (int i = 0; i < N; ++i) {
+            key[i] = seed;
+            seed = (1812433253u * (seed ^ (seed >> 30)) + (uint32_t)i + 1u) & 0xffffffffu;
+        }
+        pos = N;
+        has_gauss = 0;
+        gauss = 0.0;
+    }
+
+    uint32_t rk_random() {
+        uint32_t y;
+        if (pos == N) {
+            int i;
+            for (i = 0; i < N - M; ++i) {
+                y = (key[i] & UPPER_MASK) | (key[i + 1] & LOWER_MASK);
+                key[i] = key[i + M] ^ (y >> 1) ^ ((y & 1u) ? MATRIX_A : 0u);
+            }
+            for (; i < N - 1; ++i) {
+                y = (key[i] & UPPER_MASK) | (key[i + 1] & LOWER_MASK);
+                key[i] = key[i + (M - N)] ^ (y >> 1) ^ ((y & 1u) ? MATRIX_A : 0u);
+            }
+            y = (key[N - 1] & UPPER_MASK) | (key[0] & LOWER_MASK);
+            key[N - 1] = key[M - 1] ^ (y >> 1) ^ ((y & 1u) ? MATRIX_A : 0u);
+            pos = 0;
+        }
+        y = key[pos++];
+        y ^= (y >> 11);
+        y ^= (y << 7) & 0x9d2c5680u;
+        y ^= (y << 15) & 0xefc60000u;
+        y ^= (y >> 18);
+        return y;
+    }
+
+    double rk_double() {
+        // NumPy randomkit: (a*2^26 + b) / 2^53
+        long a = (long)(rk_random() >> 5);
+        long b = (long)(rk_random() >> 6);
+        return (a * 67108864.0 + b) / 9007199254740992.0;
+    }
+
+    double rk_gauss() {
+        if (has_gauss) {
+            const double tmp = gauss;
+            gauss = 0.0;
+            has_gauss = 0;
+            return tmp;
+        }
+        double f, x1, x2, r2;
+        do {
+            x1 = 2.0 * rk_double() - 1.0;
+            x2 = 2.0 * rk_double() - 1.0;
+            r2 = x1 * x1 + x2 * x2;
+        } while (r2 >= 1.0 || r2 == 0.0);
+        f = std::sqrt(-2.0 * std::log(r2) / r2);
+        gauss = f * x1;
+        has_gauss = 1;
+        return f * x2;
+    }
+};
+
 static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32& xmax) {
-    f32 tol_sq = tol * tol;
-    xmin = tol_sq / 2.f * (alpha + std::sqrt(tol_sq * alpha * alpha + 4.f * beta));
-    // Same formula as Python; clamp under the sqrt only for float safety when inner < 0.
-    f32 inner = std::pow(2.f + tol_sq * alpha, 2.f) - 4.f * (1.f + tol_sq * beta);
-    xmax = (2.f + tol_sq * alpha - std::sqrt(std::max(0.f, inner))) / 2.f;
+    // float64 like NumPy for the bound indices
+    double a = (double)alpha, b = (double)beta, t = (double)tol;
+    double tol_sq = t * t;
+    xmin = (f32)(tol_sq / 2.0 * (a + std::sqrt(tol_sq * a * a + 4.0 * b)));
+    double inner = std::pow(2.0 + tol_sq * a, 2.0) - 4.0 * (1.0 + tol_sq * b);
+    xmax = (f32)((2.0 + tol_sq * a - std::sqrt(std::max(0.0, inner))) / 2.0);
 }
 
 static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean) {
-    // Matches fast_monte_carlo.unitary_MC (population std, ddof=0).
-    f32 scale = std::sqrt(std::max(0.f, alpha * b + beta));
+    // Same estimator as fast_monte_carlo.unitary_MC (population std, |Δμ|),
+    // same draw order (all patch1 then all patch2). RNG seed is C++-only.
+    const double bd = (double)b;
+    const double scale = std::sqrt(std::max(0.0, (double)alpha * bd + (double)beta));
+    const uint32_t seed = 1337u + (uint32_t)std::lround(bd * (double)k_n_brightness);
+    NumpyRandomState rng(seed);
 
-    // Seeded for determinism; Python uses unseeded np.random so curves won't bit-match,
-    // but sample count / estimator match.
-    std::mt19937 gen(1337 + (int)(b * 1000));
-    std::normal_distribution<f32> dist(0.f, 1.f);
-
-    double sum_std = 0;
-    double sum_diff = 0;
-
-    for (int i = 0; i < k_n_patches; ++i) {
-        f32 p1[9], p2[9];
-        f32 m1 = 0, m2 = 0;
-        for (int j = 0; j < 9; ++j) {
-            f32 v1 = std::max(0.f, std::min(1.f, b + scale * dist(gen)));
-            f32 v2 = std::max(0.f, std::min(1.f, b + scale * dist(gen)));
-            p1[j] = v1; p2[j] = v2;
-            m1 += v1; m2 += v2;
+    const int n = k_n_patches;
+    auto fill_patch_stats = [&](std::vector<double>& means, std::vector<double>& stds) {
+        means.resize((size_t)n);
+        stds.resize((size_t)n);
+        for (int i = 0; i < n; ++i) {
+            double p[9];
+            double m = 0.0;
+            for (int j = 0; j < 9; ++j) {
+                double v = bd + scale * rng.rk_gauss();
+                p[j] = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+                m += p[j];
+            }
+            m /= 9.0;
+            double s = 0.0;
+            for (int j = 0; j < 9; ++j) {
+                double d = p[j] - m;
+                s += d * d;
+            }
+            means[(size_t)i] = m;
+            stds[(size_t)i] = std::sqrt(s / 9.0);
         }
-        m1 /= 9.f; m2 /= 9.f;
-        f32 s1 = 0, s2 = 0;
-        for (int j = 0; j < 9; ++j) {
-            s1 += (p1[j] - m1) * (p1[j] - m1);
-            s2 += (p2[j] - m2) * (p2[j] - m2);
-        }
-        s1 = std::sqrt(s1 / 9.f);
-        s2 = std::sqrt(s2 / 9.f);
+    };
 
-        sum_std += 0.5 * (double)(s1 + s2);
-        sum_diff += (double)std::fabs(m1 - m2);
+    // C-order (N,3,3): entire patch1 stream, then patch2 — same as NumPy randn.
+    std::vector<double> m1, s1, m2, s2;
+    fill_patch_stats(m1, s1);
+    fill_patch_stats(m2, s2);
+
+    double sum_std = 0.0;
+    double sum_diff = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum_std += 0.5 * (s1[(size_t)i] + s2[(size_t)i]);
+        sum_diff += std::fabs(m1[(size_t)i] - m2[(size_t)i]);
     }
 
-    diff_mean = (f32)(sum_diff / k_n_patches);
-    std_mean = (f32)(sum_std / k_n_patches);
+    diff_mean = (f32)(sum_diff / n);
+    std_mean = (f32)(sum_std / n);
 }
 
 // Matches fast_monte_carlo.interp_MC + run_fast_MC overwrite of [imin:imax].
@@ -116,8 +209,8 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     int imin = (int)std::ceil(xmin * (f32)k_n_brightness) + 1;
     int imax = (int)std::floor(xmax * (f32)k_n_brightness) - 1;
 
-    // Python: if imin > n_brightness_levels: full regular MC
-    const bool full_mc = (imin > k_n_brightness) || (imin >= imax) || (imin < 1) || (imax > k_n_brightness - 1);
+    // Python run_fast_MC: only this gate triggers full regular MC
+    const bool full_mc = (imin > k_n_brightness);
 
     if (full_mc) {
         parallel_rows(k_n_brightness + 1, 0, [&](int i) {

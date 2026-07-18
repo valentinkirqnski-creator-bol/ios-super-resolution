@@ -24,7 +24,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     f32 frac_y = kmap_i - std::trunc(kmap_i);
     int fx, fy;
     if (raw_det) {
-        // Python accumulate: floor_x = max(int(kmap_j), 0)
+        // Python accumulate: floor_x = max(int(kmap_j), 0) — no high clamp
         fx = std::max((int)kmap_j, 0);
         fy = std::max((int)kmap_i, 0);
     } else {
@@ -32,9 +32,6 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
         fx = std::max((int)std::floor(kmap_j), 0);
         fy = std::max((int)std::floor(kmap_i), 0);
     }
-    // Clamp high side too — large motion can push kmap past the cov field.
-    fx = std::min(fx, covs.w - 1);
-    fy = std::min(fy, covs.h - 1);
     int cx = std::min(fx + 1, covs.w - 1), cy = std::min(fy + 1, covs.h - 1);
 
     const f32* tl = covs.at(fy, fx);
@@ -49,18 +46,12 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
     if (raw_det) {
+        // Python: inv_det = 1.0 / det  ("Invertible by design") — no fallback
         f32 det = xx * yy - xy * xy;
-        // If the ellipse collapses, fall back to isotropic (avoids Inf/NaN weights).
-        if (std::abs(det) > 1e-10f) {
-            f32 inv_det = 1.f / det;
-            ixx =  inv_det * yy;
-            ixy = -inv_det * xy;
-            iyy =  inv_det * xx;
-        } else {
-            ixx = 1.f;
-            ixy = 0.f;
-            iyy = 1.f;
-        }
+        f32 inv_det = 1.f / det;
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
@@ -82,13 +73,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 lr_x = (hr_j + 0.5f) / scale;
             const f32 lr_y = (hr_i + 0.5f) / scale;
 
-            // Python: px = int(lr_x // tile_size); clamp like f22fb05 to avoid OOB flow reads.
+            // Python: px = int(lr_x // tile_size); no clamp on flow tile index
             const int px = (int)(lr_x / (f32)tile_size);
             const int py = (int)(lr_y / (f32)tile_size);
-            const int tpy = std::max(0, std::min(py, flow.ny - 1));
-            const int tpx = std::max(0, std::min(px, flow.nx - 1));
-            const f32 flowx = flow.dx(tpy, tpx);
-            const f32 flowy = flow.dy(tpy, tpx);
+            const f32 flowx = flow.dx(py, px);
+            const f32 flowy = flow.dy(py, px);
 
             const int i_r = std::min((int)lr_y, lr_h - 1);
             const int j_r = std::min((int)lr_x, lr_w - 1);
@@ -174,9 +163,10 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             int rad = 1;
             if (robustness_denoise && acc_rob) {
                 // Python: acc_rob[min(round(coarse_y), h-1), min(round(coarse_x), w-1)]
+                // (high clamp only — no max(0,·))
                 const int ay = std::min((int)std::lround(coarse_y), acc_rob->h - 1);
                 const int ax = std::min((int)std::lround(coarse_x), acc_rob->w - 1);
-                local_acc_r = acc_rob->at(std::max(0, ay), std::max(0, ax));
+                local_acc_r = acc_rob->at(ay, ax);
                 additional_denoise_power =
                     denoise_power_merge(local_acc_r, max_multiplier, max_frame_count);
                 rad = denoise_range_merge(local_acc_r, rad_max, max_frame_count);
