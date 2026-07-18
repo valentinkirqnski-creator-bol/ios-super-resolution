@@ -16,9 +16,19 @@ static Image apply_gat(const Image& img, f32 alpha, f32 beta) {
 }
 
 // Matches kernels.py compute_k / hard_threshold / linear.
+// Extra float guards: flat tensors (l1+l2≈0) and tiny negatives under sqrt
+// otherwise yield NaN cov → NaN merge weights → black/green speckles.
 static void compute_k(f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
+    l1 = std::max(0.f, l1);
+    l2 = std::max(0.f, l2);
+    f32 sum = l1 + l2;
+    if (sum < 1e-12f) {
+        // Isotropic denoise-sized kernel (same role as NaN→identity path in spirit).
+        k1 = k2 = cfg.k_detail * cfg.k_denoise;
+        return;
+    }
     // Python: A = 1 + sqrt((l1 - l2)/(l1 + l2))
-    f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
+    f32 A = 1.f + std::sqrt(std::max(0.f, (l1 - l2) / sum));
     // Python: D = clamp(1 - sqrt(l1)/D_tr + D_th, 0, 1)
     f32 D = clampf(1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
 
@@ -33,6 +43,10 @@ static void compute_k(f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
     }
     k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
     k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
+    // Keep cov from collapsing to a single Bayer site under float32 exp.
+    constexpr f32 k_min = 0.15f;
+    k1 = std::max(k1, k_min);
+    k2 = std::max(k2, k_min);
 }
 
 CovField estimate_kernels(const Image& raw, const Config& cfg) {

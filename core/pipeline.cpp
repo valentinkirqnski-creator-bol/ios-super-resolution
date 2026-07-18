@@ -84,6 +84,10 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     report("Reference: merge", 0.92f);
     merge_ref(ref, ref_covs, num, den, work, have_acc_rob ? &acc_rob : nullptr);
 
+    AccumDiag diag;
+    accumulate_diag(num, den, diag);
+    report(format_accum_diag(diag), 0.94f);
+
     report("Normalizing", 0.96f);
     Image out(Hs, Ws, nch);
     for (int y = 0; y < Hs; ++y) {

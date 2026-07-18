@@ -6,6 +6,7 @@
 #include "types.h"
 #include <vector>
 #include <complex>
+#include <string>
 
 namespace hhsr {
 
@@ -70,5 +71,18 @@ void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& co
 void merge_ref(const Image& ref_raw, const CovField& covs,
                Image& num, Image& den, const Config& cfg,
                const Image* acc_rob = nullptr);
+
+// Accumulator health before num/den (for green/black speckle debugging).
+struct AccumDiag {
+    size_t pixels = 0;
+    size_t den_zero[3] = {0, 0, 0};
+    size_t den_tiny[3] = {0, 0, 0};      // 0 < d < 1e-12
+    size_t den_nonfinite[3] = {0, 0, 0};
+    size_t num_nonfinite[3] = {0, 0, 0};
+    size_t only_green = 0;               // G>0, R==0, B==0
+    size_t rgb_all_zero = 0;
+};
+void accumulate_diag(const Image& num, const Image& den, AccumDiag& d);
+std::string format_accum_diag(const AccumDiag& d);
 
 } // namespace hhsr

@@ -1,10 +1,31 @@
 #include "stages.h"
 #include "parallel.h"
 #include "linalg.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <string>
 
 namespace hhsr {
 
 namespace {
+
+// Cap inverse-covariance entries so steerable kernels cannot become so sharp
+// that only one Bayer site in the 3×3 gets non-zero weight (R/B den→0 → green).
+static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
+    constexpr f32 k_max_abs = 32.f; // iso path uses ~2 on the diagonal
+    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
+    if (!(m > k_max_abs) || !std::isfinite(m)) {
+        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+            ixx = 2.f; ixy = 0.f; iyy = 2.f; // iso-like fallback
+        }
+        return;
+    }
+    f32 s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
 
 static inline f32 denoise_power_merge(f32 r_acc, f32 power_max, f32 max_frame_count) {
     return (r_acc <= max_frame_count) ? power_max : 1.f;
@@ -62,6 +83,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -261,6 +283,39 @@ void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& co
 void merge_ref(const Image& ref_raw, const CovField& covs,
                Image& num, Image& den, const Config& cfg, const Image* acc_rob) {
     merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob);
+}
+
+void accumulate_diag(const Image& num, const Image& den, AccumDiag& d) {
+    const int nch = std::min(3, num.c);
+    const size_t n = (size_t)num.h * (size_t)num.w;
+    for (size_t p = 0; p < n; ++p) {
+        ++d.pixels;
+        f32 dens[3] = {0, 0, 0};
+        for (int ch = 0; ch < nch; ++ch) {
+            f32 nv = num.data[p * (size_t)num.c + (size_t)ch];
+            f32 dv = den.data[p * (size_t)den.c + (size_t)ch];
+            dens[ch] = dv;
+            if (!std::isfinite(nv)) ++d.num_nonfinite[ch];
+            if (!std::isfinite(dv)) ++d.den_nonfinite[ch];
+            else if (dv == 0.f) ++d.den_zero[ch];
+            else if (dv > 0.f && dv < 1e-12f) ++d.den_tiny[ch];
+        }
+        if (nch >= 3) {
+            if (dens[0] == 0.f && dens[1] == 0.f && dens[2] == 0.f) ++d.rgb_all_zero;
+            else if (dens[0] == 0.f && dens[1] > 0.f && dens[2] == 0.f) ++d.only_green;
+        }
+    }
+}
+
+std::string format_accum_diag(const AccumDiag& d) {
+    if (d.pixels == 0) return "accum: empty";
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "accum den0 R/G/B=%zu/%zu/%zu onlyG=%zu all0=%zu nanDen=%zu",
+        d.den_zero[0], d.den_zero[1], d.den_zero[2],
+        d.only_green, d.rgb_all_zero,
+        d.den_nonfinite[0] + d.den_nonfinite[1] + d.den_nonfinite[2]);
+    return std::string(buf);
 }
 
 } // namespace hhsr

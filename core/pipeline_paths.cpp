@@ -343,6 +343,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     band_rows = std::min(band_rows, Hs);
     std::vector<uint16_t> row16((size_t)band_rows * Ws * 3);
 
+    AccumDiag diag;
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
         Image num_band(bh, Ws, nch), den_band(bh, Ws, nch);
@@ -362,6 +363,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
+        accumulate_diag(num_band, den_band, diag);
 
         encode_band_rows(num_band, den_band, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), bh);
@@ -374,6 +376,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     ref = Image();
     ref_covs = CovField();
     fs::remove_all(cache, ec);
+    report(format_accum_diag(diag), 0.99f);
     report("Done", 1.f);
     return preview;
 }
