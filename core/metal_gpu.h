@@ -1,9 +1,9 @@
 #pragma once
 //
 // Metal GPU backend for grey-FFT and L2 block-matching.
-// Same mathematical pipeline as the CPU path (row/col 1D DFT via radix-2 +
-// Bluestein, Torch-style rfft2/irfft2 L2). No CPU/vDSP fallback on Apple:
-// if Metal cannot run, these entry points return failure / empty outputs.
+// FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein, same
+// twiddle recurrence and scaling). L2 matches Torch rfft2/irfft2 path.
+// No CPU fallback on Apple: failure returns empty / false.
 //
 #include "types.h"
 #include <complex>

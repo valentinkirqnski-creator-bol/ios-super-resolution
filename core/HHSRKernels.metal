@@ -1,6 +1,6 @@
 // Metal kernels for HHSR grey-FFT + L2 BM.
-// 1D DFT: Cooley–Tukey radix-2 (pow2) and Bluestein (arbitrary n), matching
-// the CPU reference in grey_pyramid.cpp (not vDSP).
+// 1D DFT matches grey_pyramid.cpp fft1d_pow2_inplace_ref + fft1d_bluestein
+// (same bit-reversal, iterative twiddles w*=wlen, Bluestein scaling).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -12,55 +12,45 @@ inline float2 cmul(float2 a, float2 b) {
 }
 inline float2 cconj(float2 a) { return float2(a.x, -a.y); }
 
-// Bit-reverse permute for one length-n (pow2) vector. One thread per element.
-kernel void fft_bitrev(device float2* data [[buffer(0)]],
-                       constant uint& n [[buffer(1)]],
-                       constant uint& stride [[buffer(2)]],
-                       constant uint& batch_count [[buffer(3)]],
-                       uint2 gid [[thread_position_in_grid]]) {
-    uint batch = gid.y;
-    uint i = gid.x;
-    if (batch >= batch_count || i >= n) return;
+// Exact port of fft1d_pow2_inplace_ref — one thread per batch vector.
+// Does NOT divide by n (C++ ref / vDSP zip also leave scaling to the caller).
+kernel void fft1d_pow2_cpp(device float2* data [[buffer(0)]],
+                           constant uint& n [[buffer(1)]],
+                           constant uint& stride [[buffer(2)]],
+                           constant uint& batch_count [[buffer(3)]],
+                           constant int& inverse [[buffer(4)]],
+                           uint batch [[thread_position_in_grid]]) {
+    if (batch >= batch_count || n <= 1u) return;
+    device float2* a = data + batch * stride;
+
+    // Numerical Recipes bit-reversal (same as C++)
     uint j = 0;
-    uint x = i;
-    // log2(n) bits
-    for (uint n2 = n; n2 > 1u; n2 >>= 1) {
-        j = (j << 1) | (x & 1u);
-        x >>= 1;
+    for (uint i = 1; i < n; ++i) {
+        uint bit = n >> 1;
+        for (; (j & bit) != 0u; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float2 tmp = a[i];
+            a[i] = a[j];
+            a[j] = tmp;
+        }
     }
-    if (i < j) {
-        uint base = batch * stride;
-        float2 tmp = data[base + i];
-        data[base + i] = data[base + j];
-        data[base + j] = tmp;
+
+    for (uint len = 2; len <= n; len <<= 1) {
+        float ang = (inverse != 0 ? 2.f : -2.f) * PI / float(len);
+        float2 wlen = float2(cos(ang), sin(ang));
+        for (uint i = 0; i < n; i += len) {
+            float2 w = float2(1.f, 0.f);
+            uint half_n = len >> 1;
+            for (uint k = 0; k < half_n; ++k) {
+                float2 u = a[i + k];
+                float2 v = cmul(a[i + k + half_n], w);
+                a[i + k] = u + v;
+                a[i + k + half_n] = u - v;
+                w = cmul(w, wlen);
+            }
+        }
     }
-}
-
-// One radix-2 butterfly stage. len = current DFT length (2,4,...,n).
-kernel void fft_radix2_stage(device float2* data [[buffer(0)]],
-                             constant uint& n [[buffer(1)]],
-                             constant uint& stride [[buffer(2)]],
-                             constant uint& batch_count [[buffer(3)]],
-                             constant uint& len [[buffer(4)]],
-                             constant int& inverse [[buffer(5)]],
-                             uint2 gid [[thread_position_in_grid]]) {
-    uint batch = gid.y;
-    uint i = gid.x;
-    if (batch >= batch_count || i >= n) return;
-    uint half_n = len >> 1;
-    if ((i % len) >= half_n) return;
-
-    float ang = (inverse ? 2.f : -2.f) * PI / float(len);
-    uint k = i % half_n;
-    float2 w = float2(cos(ang * float(k)), sin(ang * float(k)));
-
-    uint base = batch * stride;
-    uint i0 = (i / len) * len + k;
-    uint i1 = i0 + half_n;
-    float2 u = data[base + i0];
-    float2 v = cmul(data[base + i1], w);
-    data[base + i0] = u + v;
-    data[base + i1] = u - v;
 }
 
 kernel void fft_scale_inv(device float2* data [[buffer(0)]],
@@ -74,15 +64,6 @@ kernel void fft_scale_inv(device float2* data [[buffer(0)]],
     data[batch * stride + i] /= float(n);
 }
 
-kernel void cbuf_mul(device float2* a [[buffer(0)]],
-                     device const float2* b [[buffer(1)]],
-                     constant uint& count [[buffer(2)]],
-                     uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    a[id] = cmul(a[id], b[id]);
-}
-
-// A[b*m+i] *= B[i]  (broadcast B across batches)
 kernel void cbuf_mul_broadcast_B(device float2* A [[buffer(0)]],
                                  device const float2* B [[buffer(1)]],
                                  constant uint& m [[buffer(2)]],
@@ -92,18 +73,6 @@ kernel void cbuf_mul_broadcast_B(device float2* A [[buffer(0)]],
     uint i = gid.x;
     if (b >= batch || i >= m) return;
     A[b * m + i] = cmul(A[b * m + i], B[i]);
-}
-
-kernel void cbuf_mul_chirp(device float2* a [[buffer(0)]],
-                           device const float2* chirp [[buffer(1)]],
-                           constant uint& n [[buffer(2)]],
-                           constant uint& stride [[buffer(3)]],
-                           constant uint& batch_count [[buffer(4)]],
-                           uint2 gid [[thread_position_in_grid]]) {
-    uint batch = gid.y;
-    uint i = gid.x;
-    if (batch >= batch_count || i >= n) return;
-    a[batch * stride + i] = cmul(a[batch * stride + i], chirp[i]);
 }
 
 kernel void bluestein_pack_A(device float2* A [[buffer(0)]],
@@ -124,17 +93,24 @@ kernel void bluestein_pack_A(device float2* A [[buffer(0)]],
         A[out_i] = float2(0.f, 0.f);
 }
 
-kernel void bluestein_pack_B(device float2* B [[buffer(0)]],
+// Clear B then fill — avoid race that zeroed mirrored taps (old bug).
+kernel void bluestein_clear_B(device float2* B [[buffer(0)]],
+                              constant uint& m [[buffer(1)]],
+                              uint i [[thread_position_in_grid]]) {
+    if (i >= m) return;
+    B[i] = float2(0.f, 0.f);
+}
+
+kernel void bluestein_fill_B(device float2* B [[buffer(0)]],
                              device const float2* chirp [[buffer(1)]],
                              constant uint& n [[buffer(2)]],
                              constant uint& m [[buffer(3)]],
                              uint i [[thread_position_in_grid]]) {
-    if (i >= m) return;
-    B[i] = float2(0.f, 0.f);
-    if (i < n) {
-        B[i] = cconj(chirp[i]);
-        if (i > 0) B[m - i] = B[i];
-    }
+    // Only i in [0,n) write; mirrored index m-i is written here too.
+    if (i >= n) return;
+    float2 v = cconj(chirp[i]);
+    B[i] = v;
+    if (i > 0u) B[m - i] = v;
 }
 
 kernel void bluestein_extract(device float2* out [[buffer(0)]],
@@ -156,12 +132,11 @@ kernel void make_chirp(device float2* chirp [[buffer(0)]],
                        constant int& inverse [[buffer(2)]],
                        uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
-    float dir = inverse ? 1.f : -1.f;
+    float dir = inverse != 0 ? 1.f : -1.f;
     float ang = dir * PI * float(i) * float(i) / float(n);
     chirp[i] = float2(cos(ang), sin(ang));
 }
 
-// Pack real image rows into complex [batch=h][w]
 kernel void pack_rows_real(device float2* out [[buffer(0)]],
                            device const float* in [[buffer(1)]],
                            constant uint& h [[buffer(2)]],
@@ -182,26 +157,6 @@ kernel void transpose_c(device float2* out [[buffer(0)]],
     out[x * h + y] = in[y * w + x];
 }
 
-kernel void fftshift_zero_lowpass(device float2* data [[buffer(0)]],
-                                  constant uint& h [[buffer(1)]],
-                                  constant uint& w [[buffer(2)]],
-                                  uint2 gid [[thread_position_in_grid]]) {
-    // In-place fftshift then zero outer quarters (matches CPU grey path).
-    uint y = gid.y, x = gid.x;
-    if (y >= h || x >= w) return;
-    // Cooperative shift needs temp — done on host via two buffers; this kernel
-    // only zeros after shift. See metal_gpu.mm.
-    (void)data;
-}
-
-kernel void copy_c(device float2* out [[buffer(0)]],
-                   device const float2* in [[buffer(1)]],
-                   constant uint& count [[buffer(2)]],
-                   uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    out[id] = in[id];
-}
-
 kernel void fftshift2d_c(device float2* out [[buffer(0)]],
                          device const float2* in [[buffer(1)]],
                          constant uint& h [[buffer(2)]],
@@ -210,19 +165,11 @@ kernel void fftshift2d_c(device float2* out [[buffer(0)]],
                          uint2 gid [[thread_position_in_grid]]) {
     uint y = gid.y, x = gid.x;
     if (y >= h || x >= w) return;
-    int shy = int(h) / 2;
-    int shx = int(w) / 2;
-    int sy, sx;
+    uint shy = h / 2u, shx = w / 2u;
     if (inv == 0) {
-        // fftshift: out[y,x] = in[(y+h/2)%h, (x+w/2)%w]
-        sy = int((y + uint(shy)) % h);
-        sx = int((x + uint(shx)) % w);
-        out[y * w + x] = in[uint(sy) * w + uint(sx)];
+        out[y * w + x] = in[((y + shy) % h) * w + ((x + shx) % w)];
     } else {
-        // ifftshift: out[y,x] = in[(y - h/2 + h)%h, ...]
-        sy = int((y + h - uint(shy)) % h);
-        sx = int((x + w - uint(shx)) % w);
-        out[y * w + x] = in[uint(sy) * w + uint(sx)];
+        out[y * w + x] = in[((y + h - shy) % h) * w + ((x + w - shx) % w)];
     }
 }
 
@@ -232,7 +179,7 @@ kernel void zero_fft_borders(device float2* data [[buffer(0)]],
                              uint2 gid [[thread_position_in_grid]]) {
     uint y = gid.y, x = gid.x;
     if (y >= h || x >= w) return;
-    uint y0 = h / 4, x0 = w / 4;
+    uint y0 = h / 4u, x0 = w / 4u;
     if (y < y0 || y >= h - y0 || x < x0 || x >= w - x0)
         data[y * w + x] = float2(0.f, 0.f);
 }
@@ -245,7 +192,6 @@ kernel void extract_real(device float* out [[buffer(0)]],
     out[id] = in[id].x;
 }
 
-// ---- L2 BM: pack tiles -------------------------------------------------
 struct L2Params {
     uint ny, nx;
     int ts, R, N;
@@ -266,16 +212,15 @@ kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
     int ts = P.ts, R = P.R, N = P.N;
     int oy = int(ty) * ts;
     int ox = int(tx) * ts;
-    float fdx = flow[tid * 2 + 0];
-    float fdy = flow[tid * 2 + 1];
-    // torch round half to even
+    float fdx = flow[tid * 2u + 0u];
+    float fdy = flow[tid * 2u + 1u];
     int flow_dx = int(rint(fdx));
     int flow_dy = int(rint(fdy));
 
     uint base = tid * uint(N * N);
-    for (int i = 0; i < N * N; ++i) {
+    for (int i = 0; i < N * N; ++i)
         ref_pad[base + uint(i)] = 0.f;
-    }
+
     for (int i = 0; i < ts; ++i) {
         for (int j = 0; j < ts; ++j) {
             int ry = oy + i, rx = ox + j;
@@ -300,17 +245,6 @@ kernel void l2_conj_mul(device float2* F [[buffer(0)]],
                         uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     F[id] = cmul(cconj(F[id]), Fmov[id]);
-}
-
-kernel void fftshift2d_real_batch(device float* data [[buffer(0)]],
-                                  constant uint& N [[buffer(1)]],
-                                  constant uint& batch_count [[buffer(2)]],
-                                  uint2 gid [[thread_position_in_grid]]) {
-    uint batch = gid.y;
-    uint i = gid.x;
-    if (batch >= batch_count || i >= N * N) return;
-    // needs temp — host uses ping-pong buffers
-    (void)data;
 }
 
 kernel void l2_argmin(device float* flow [[buffer(0)]],
@@ -345,8 +279,8 @@ kernel void l2_argmin(device float* flow [[buffer(0)]],
             }
         }
     }
-    flow[tid * 2 + 0] += float(best_dx);
-    flow[tid * 2 + 1] += float(best_dy);
+    flow[tid * 2u + 0u] += float(best_dx);
+    flow[tid * 2u + 1u] += float(best_dy);
 }
 
 kernel void fftshift2d_real(device float* out [[buffer(0)]],
@@ -359,19 +293,17 @@ kernel void fftshift2d_real(device float* out [[buffer(0)]],
     uint idx = gid.x;
     if (batch >= batch_count || idx >= h * w) return;
     uint y = idx / w, x = idx % w;
-    uint shy = h / 2, shx = w / 2;
-    uint sy = (y + shy) % h;
-    uint sx = (x + shx) % w;
-    out[batch * h * w + y * w + x] = in[batch * h * w + sy * w + sx];
+    uint shy = h / 2u, shx = w / 2u;
+    out[batch * h * w + y * w + x] =
+        in[batch * h * w + ((y + shy) % h) * w + ((x + shx) % w)];
 }
 
-// Pack real NxN tiles → complex for row FFT batch (batch = ntiles * N rows)
 kernel void pack_tile_rows(device float2* out [[buffer(0)]],
                            device const float* in [[buffer(1)]],
                            constant uint& N [[buffer(2)]],
                            constant uint& ntiles [[buffer(3)]],
                            uint2 gid [[thread_position_in_grid]]) {
-    uint row = gid.y; // 0 .. ntiles*N
+    uint row = gid.y;
     uint x = gid.x;
     if (row >= ntiles * N || x >= N) return;
     out[row * N + x] = float2(in[row * N + x], 0.f);
@@ -389,28 +321,14 @@ kernel void take_rfft_half(device float2* out [[buffer(0)]],
     out[row * wh + x] = in[row * N + x];
 }
 
-kernel void hermite_complete_row(device float2* row [[buffer(0)]],
-                                 constant uint& N [[buffer(1)]],
-                                 constant uint& wh [[buffer(2)]],
-                                 constant uint& nrows [[buffer(3)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
-    uint r = gid.y;
-    uint x = gid.x;
-    if (r >= nrows || x >= N) return;
-    if (x < wh) return;
-    uint k = N - x;
-    row[r * N + x] = cconj(row[r * N + k]);
-}
-
 kernel void write_rfft_cols_from_half(device float2* cols [[buffer(0)]],
                                       device const float2* rfft_pack [[buffer(1)]],
                                       constant uint& N [[buffer(2)]],
                                       constant uint& wh [[buffer(3)]],
                                       constant uint& ntiles [[buffer(4)]],
                                       uint2 gid [[thread_position_in_grid]]) {
-    // rfft_pack layout: [ntiles][N][wh]; cols layout for col-FFT: [ntiles*wh][N]
     uint tile = gid.y;
-    uint idx = gid.x; // y * wh + xfreq
+    uint idx = gid.x;
     if (tile >= ntiles || idx >= N * wh) return;
     uint y = idx / wh;
     uint xf = idx % wh;
@@ -438,7 +356,7 @@ kernel void expand_half_to_full_rows(device float2* full [[buffer(0)]],
                                      constant uint& ntiles [[buffer(4)]],
                                      uint2 gid [[thread_position_in_grid]]) {
     uint tile = gid.y;
-    uint idx = gid.x; // y*N+x
+    uint idx = gid.x;
     if (tile >= ntiles || idx >= N * N) return;
     uint y = idx / N;
     uint x = idx % N;

@@ -3,11 +3,9 @@
 #include <complex>
 #include <cmath>
 #include <vector>
-#include <unordered_map>
 
 #ifdef __APPLE__
 #include "metal_gpu.h"
-#include <Accelerate/Accelerate.h>
 #endif
 
 #ifndef M_PI
@@ -22,12 +20,6 @@ static int next_pow2(int n) {
     int p = 1;
     while (p < n) p <<= 1;
     return p;
-}
-
-static unsigned log2_pow2(int n) {
-    unsigned l = 0;
-    while ((1u << l) < (unsigned)n) ++l;
-    return l;
 }
 
 // Radix-2 only; n must be power of 2. Does not divide by n on inverse.
@@ -56,90 +48,11 @@ static void fft1d_pow2_inplace_ref(std::vector<std::complex<f32>>& a, bool inver
     }
 }
 
-#ifdef __APPLE__
-// Cached vDSP radix-2 setups (thread-local; execute is thread-safe per setup use).
-static FFTSetup vdsp_fftsetup(unsigned log2n) {
-    static thread_local FFTSetup setups[32] = {};
-    if (log2n >= 32) return nullptr;
-    if (!setups[log2n])
-        setups[log2n] = vDSP_create_fftsetup(log2n, kFFTRadix2);
-    return setups[log2n];
-}
-
-static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) {
-    const int n = (int)a.size();
-    if (n <= 1) return;
-    unsigned log2n = log2_pow2(n);
-    FFTSetup setup = vdsp_fftsetup(log2n);
-    if (!setup) {
-        fft1d_pow2_inplace_ref(a, inverse);
-        return;
-    }
-    // Split-complex scratch (thread-local, grow as needed).
-    static thread_local std::vector<f32> re, im;
-    if (re.size() < (size_t)n) {
-        re.resize((size_t)n);
-        im.resize((size_t)n);
-    }
-    for (int i = 0; i < n; ++i) {
-        re[(size_t)i] = a[(size_t)i].real();
-        im[(size_t)i] = a[(size_t)i].imag();
-    }
-    DSPSplitComplex split{re.data(), im.data()};
-    vDSP_fft_zip(setup, &split, 1, log2n, inverse ? FFT_INVERSE : FFT_FORWARD);
-    for (int i = 0; i < n; ++i)
-        a[(size_t)i] = {re[(size_t)i], im[(size_t)i]};
-}
-
-// vDSP DFT for lengths f*2^n (f in {1,3,5,15}, n>=3). Returns false if unsupported.
-static bool fft1d_vdsp_dft(std::vector<std::complex<f32>>& a, bool inverse) {
-    const int n = (int)a.size();
-    if (n <= 1) return true;
-
-    struct Key {
-        int n;
-        bool inv;
-        bool operator==(const Key& o) const { return n == o.n && inv == o.inv; }
-    };
-    struct KeyHash {
-        size_t operator()(const Key& k) const {
-            return (size_t)k.n * 2u + (k.inv ? 1u : 0u);
-        }
-    };
-    static thread_local std::unordered_map<Key, vDSP_DFT_Setup, KeyHash> cache;
-
-    Key key{n, inverse};
-    vDSP_DFT_Setup setup = nullptr;
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-        setup = it->second;
-    } else {
-        setup = vDSP_DFT_zop_CreateSetup(
-            nullptr, (vDSP_Length)n,
-            inverse ? vDSP_DFT_INVERSE : vDSP_DFT_FORWARD);
-        if (!setup) return false;
-        cache.emplace(key, setup);
-    }
-
-    static thread_local std::vector<f32> re, im;
-    if (re.size() < (size_t)n) {
-        re.resize((size_t)n);
-        im.resize((size_t)n);
-    }
-    for (int i = 0; i < n; ++i) {
-        re[(size_t)i] = a[(size_t)i].real();
-        im[(size_t)i] = a[(size_t)i].imag();
-    }
-    vDSP_DFT_Execute(setup, re.data(), im.data(), re.data(), im.data());
-    for (int i = 0; i < n; ++i)
-        a[(size_t)i] = {re[(size_t)i], im[(size_t)i]};
-    return true;
-}
-#else
+// Use the portable Cooley–Tukey reference (same as Metal fft1d_pow2_cpp).
+// Previously Apple used vDSP here; that diverged from the GPU path.
 static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) {
     fft1d_pow2_inplace_ref(a, inverse);
 }
-#endif
 
 // Bluestein's algorithm — arbitrary-n DFT via padded radix-2 convolution.
 static void fft1d_bluestein(std::vector<std::complex<f32>>& a, bool inverse) {
@@ -206,13 +119,7 @@ void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::com
         if (inverse) for (auto& v : a) v /= (f32)n;
         return;
     }
-#ifdef __APPLE__
-    // Prefer Accelerate DFT when length is supported (f*2^n).
-    if (fft1d_vdsp_dft(a, inverse)) {
-        if (inverse) for (auto& v : a) v /= (f32)n;
-        return;
-    }
-#endif
+    // Same as Metal: Bluestein (no vDSP DFT — keeps CPU/GPU FFT identical).
     fft1d_bluestein(a, inverse);
     if (inverse) for (auto& v : a) v /= (f32)n;
 }

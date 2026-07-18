@@ -60,9 +60,9 @@ static MetalCtx& ctx() {
         if (!c.library) return;
         // Touch critical pipelines
         const char* need[] = {
-            "fft_bitrev", "fft_radix2_stage", "fft_scale_inv", "make_chirp",
-            "bluestein_pack_A", "bluestein_pack_B", "bluestein_extract",
-            "cbuf_mul", "cbuf_mul_broadcast_B", "cbuf_mul_chirp", "pack_rows_real", "transpose_c",
+            "fft1d_pow2_cpp", "fft_scale_inv", "make_chirp",
+            "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
+            "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "fftshift2d_c", "zero_fft_borders", "extract_real",
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
@@ -116,9 +116,9 @@ static void dispatch1(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineSta
     }
 }
 
-// Batched in-place 1D radix-2 FFT on float2 buffer (batch * stride).
+// C++ fft1d_pow2_inplace_ref — unscaled. Optional apply_inv_scale matches fft1d().
 static bool fft1d_pow2_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
-                           uint32_t batch, bool inverse,
+                           uint32_t batch, bool inverse, bool apply_inv_scale,
                            id<MTLCommandBuffer> cmd) {
     if (n <= 1) return true;
     if ((n & (n - 1)) != 0) return false;
@@ -128,22 +128,22 @@ static bool fft1d_pow2_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     uint32_t n_u = n, str = stride, bat = batch;
     int inv = inverse ? 1 : 0;
 
+    [enc setComputePipelineState:c.pipe("fft1d_pow2_cpp")];
     [enc setBuffer:data offset:0 atIndex:0];
     [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
     [enc setBytes:&str length:sizeof(str) atIndex:2];
     [enc setBytes:&bat length:sizeof(bat) atIndex:3];
-    dispatch2(enc, c.pipe("fft_bitrev"), n, batch);
-
-    for (uint32_t len = 2; len <= n; len <<= 1) {
-        [enc setBuffer:data offset:0 atIndex:0];
-        [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
-        [enc setBytes:&str length:sizeof(str) atIndex:2];
-        [enc setBytes:&bat length:sizeof(bat) atIndex:3];
-        [enc setBytes:&len length:sizeof(len) atIndex:4];
-        [enc setBytes:&inv length:sizeof(inv) atIndex:5];
-        dispatch2(enc, c.pipe("fft_radix2_stage"), n, batch);
+    [enc setBytes:&inv length:sizeof(inv) atIndex:4];
+    NSUInteger tw = c.pipe("fft1d_pow2_cpp").threadExecutionWidth;
+    if (@available(iOS 11.0, *)) {
+        [enc dispatchThreads:MTLSizeMake(batch, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake((batch + tw - 1) / tw, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
     }
-    if (inverse) {
+
+    if (inverse && apply_inv_scale) {
         [enc setBuffer:data offset:0 atIndex:0];
         [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
         [enc setBytes:&str length:sizeof(str) atIndex:2];
@@ -154,13 +154,13 @@ static bool fft1d_pow2_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     return true;
 }
 
-// Batched Bluestein 1D FFT (arbitrary n). data: batch * stride float2, uses first n.
+// C++ fft1d_bluestein exactly: inner pow2 unscaled, then A/=m, outer fft1d /=n if inv.
 static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
                                 uint32_t batch, bool inverse,
                                 id<MTLCommandBuffer> cmd) {
     if (n <= 1) return true;
     if ((n & (n - 1)) == 0)
-        return fft1d_pow2_gpu(data, n, stride, batch, inverse, cmd);
+        return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
 
     auto& c = ctx();
     const uint32_t m = (uint32_t)next_pow2(2 * (int)n - 1);
@@ -182,10 +182,14 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     dispatch1(enc, c.pipe("make_chirp"), n);
 
     [enc setBuffer:B offset:0 atIndex:0];
+    [enc setBytes:&m_u length:sizeof(m_u) atIndex:1];
+    dispatch1(enc, c.pipe("bluestein_clear_B"), m);
+
+    [enc setBuffer:B offset:0 atIndex:0];
     [enc setBuffer:chirp offset:0 atIndex:1];
     [enc setBytes:&n_u length:sizeof(n_u) atIndex:2];
     [enc setBytes:&m_u length:sizeof(m_u) atIndex:3];
-    dispatch1(enc, c.pipe("bluestein_pack_B"), m);
+    dispatch1(enc, c.pipe("bluestein_fill_B"), n);
 
     [enc setBuffer:A offset:0 atIndex:0];
     [enc setBuffer:data offset:0 atIndex:1];
@@ -197,9 +201,9 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     dispatch2(enc, c.pipe("bluestein_pack_A"), m, batch);
     [enc endEncoding];
 
-    // FFT B once (batch=1), FFT A (batch)
-    if (!fft1d_pow2_gpu(B, m, m, 1, false, cmd)) return false;
-    if (!fft1d_pow2_gpu(A, m, m, batch, false, cmd)) return false;
+    // Inner pow2: no 1/m scale (matches C++ fft1d_pow2_inplace_ref)
+    if (!fft1d_pow2_gpu(B, m, m, 1, false, false, cmd)) return false;
+    if (!fft1d_pow2_gpu(A, m, m, batch, false, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:A offset:0 atIndex:0];
@@ -209,9 +213,16 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     dispatch2(enc, c.pipe("cbuf_mul_broadcast_B"), m, batch);
     [enc endEncoding];
 
-    if (!fft1d_pow2_gpu(A, m, m, batch, true, cmd)) return false;
-
+    // Inverse pow2 unscaled, then explicit /= m (C++ bluestein)
+    if (!fft1d_pow2_gpu(A, m, m, batch, true, false, cmd)) return false;
     enc = [cmd computeCommandEncoder];
+    [enc setBuffer:A offset:0 atIndex:0];
+    [enc setBytes:&m_u length:sizeof(m_u) atIndex:1];
+    uint32_t a_stride = m_u;
+    [enc setBytes:&a_stride length:sizeof(a_stride) atIndex:2];
+    [enc setBytes:&bat length:sizeof(bat) atIndex:3];
+    dispatch2(enc, c.pipe("fft_scale_inv"), m, batch);
+
     [enc setBuffer:data offset:0 atIndex:0];
     [enc setBuffer:A offset:0 atIndex:1];
     [enc setBuffer:chirp offset:0 atIndex:2];
@@ -222,6 +233,7 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     dispatch2(enc, c.pipe("bluestein_extract"), n, batch);
     [enc endEncoding];
 
+    // Outer fft1d inverse normalize by n
     if (inverse) {
         enc = [cmd computeCommandEncoder];
         [enc setBuffer:data offset:0 atIndex:0];
@@ -237,7 +249,7 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
 static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t batch,
                       bool inverse, id<MTLCommandBuffer> cmd) {
     if ((n & (n - 1)) == 0)
-        return fft1d_pow2_gpu(data, n, stride, batch, inverse, cmd);
+        return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
     return fft1d_bluestein_gpu(data, n, stride, batch, inverse, cmd);
 }
 
