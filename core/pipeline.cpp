@@ -90,8 +90,10 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         for (int x = 0; x < Ws; ++x) {
             for (int ch = 0; ch < nch; ++ch) {
                 size_t i = ((size_t)y * Ws + x) * nch + ch;
-                // Python utils.divide: bare num/den (no den==0 guard, no WB bake)
-                out.data[i] = num.data[i] / den.data[i];
+                // Production guard: den==0 → 0 (avoids Inf/NaN black holes).
+                // No WB bake — matches Python merge output (WB is for preview/DNG).
+                f32 d = den.data[i];
+                out.data[i] = (d > 0.f) ? num.data[i] / d : 0.f;
             }
         }
     }
@@ -192,8 +194,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 size_t base = ((size_t)i * Ws + x) * 3;
                 f32 cn[3] = {0, 0, 0};
                 for (int ch = 0; ch < nch; ++ch) {
-                    // Python utils.divide: bare num/den
-                    cn[ch] = num_band.at(i, x, ch) / den_band.at(i, x, ch);
+                    f32 d = den_band.at(i, x, ch);
+                    cn[ch] = (d > 0.f) ? num_band.at(i, x, ch) / d : 0.f;
                 }
                 f32 outc[3];
                 if (work.bake_srgb && nch >= 3) {
