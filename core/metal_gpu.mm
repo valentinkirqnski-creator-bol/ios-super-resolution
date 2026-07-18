@@ -59,7 +59,7 @@ struct MetalCtx {
         return p;
     }
 
-    id<MTLBuffer> scratch(id<MTLBuffer>& slot, size_t& slot_bytes, size_t need) {
+    id<MTLBuffer> scratch(__strong id<MTLBuffer>& slot, size_t& slot_bytes, size_t need) {
         if (need == 0) return nil;
         if (slot && slot_bytes >= need) return slot;
         slot = [device newBufferWithLength:need options:MTLResourceStorageModeShared];
