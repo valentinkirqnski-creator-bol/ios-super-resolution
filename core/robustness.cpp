@@ -336,12 +336,16 @@ static Image upscale_warp_stats(const Image& guide_stats,
     parallel_rows(out_h, num_threads, [&](int y) {
         for (int x = 0; x < out_w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
-            if (!is_ref && flow) {
+            if (!is_ref && flow && tile_size > 0 && flow->ny > 0 && flow->nx > 0 &&
+                !flow->flow.empty()) {
                 // Python: patch_idy = int(y // tile_size)  (no clamp)
                 int patch_idy = y / tile_size;
                 int patch_idx = x / tile_size;
-                flow_x = flow->dx(patch_idy, patch_idx);
-                flow_y = flow->dy(patch_idy, patch_idx);
+                if (patch_idy >= 0 && patch_idy < flow->ny &&
+                    patch_idx >= 0 && patch_idx < flow->nx) {
+                    flow_x = flow->dx(patch_idy, patch_idx);
+                    flow_y = flow->dy(patch_idy, patch_idx);
+                }
             }
             f32 LR_y = (y + flow_y + 0.5f) / s - 0.5f;
             f32 LR_x = (x + flow_x + 0.5f) / s - 0.5f;
@@ -440,6 +444,12 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg) {
     if (!cfg.robustness_enabled) {
+        Image r(comp_raw.h, comp_raw.w, 1);
+        std::fill(r.data.begin(), r.data.end(), 1.f);
+        return r;
+    }
+    // Empty flow (e.g. grey/align failed) — do not index flow.flow.data()==nullptr.
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) {
         Image r(comp_raw.h, comp_raw.w, 1);
         std::fill(r.data.begin(), r.data.end(), 1.f);
         return r;

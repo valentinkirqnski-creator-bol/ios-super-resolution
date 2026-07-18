@@ -188,19 +188,15 @@ static inline f32 bilinear_ica(const Image& img, int pixel_y, int pixel_x,
 
 // ============================================================================
 // L2 BM — Torch: rfft2 / irfft2 / fftshift path
-// On Apple: Metal GPU only (same math). No CPU/vDSP fallback.
+// On Apple: prefer Metal; fall back to CPU if GPU fails.
 // ============================================================================
 static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
 #ifdef __APPLE__
-    (void)num_threads;
-    if (!block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow)) {
-        // Leave flow unchanged on failure; pipeline will produce bad/empty align.
+    if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow))
         return;
-    }
-    return;
-#else
+#endif
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
@@ -303,7 +299,6 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
             flow.dy(ty, tx) += (f32)best_dy;
         }
     });
-#endif // !__APPLE__
 }
 
 // ============================================================================
