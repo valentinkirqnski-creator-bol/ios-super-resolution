@@ -122,7 +122,7 @@ static void dispatch1(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineSta
     }
 }
 
-static bool flush_cmd(id<MTLCommandBuffer>& cmd) {
+static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!cmd) return false;
     [cmd commit];
@@ -135,7 +135,7 @@ static bool flush_cmd(id<MTLCommandBuffer>& cmd) {
 static bool fft1d_pow2_gpu_chunk(id<MTLBuffer> data, uint32_t n, uint32_t stride,
                                  uint32_t batch_offset, uint32_t batch,
                                  bool inverse, bool apply_inv_scale,
-                                 id<MTLCommandBuffer>& cmd) {
+                                 __strong id<MTLCommandBuffer>& cmd) {
     if (n <= 1 || batch == 0) return true;
     if ((n & (n - 1)) != 0) return false;
     auto& c = ctx();
@@ -174,7 +174,7 @@ static bool fft1d_pow2_gpu_chunk(id<MTLBuffer> data, uint32_t n, uint32_t stride
 
 static bool fft1d_pow2_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
                            uint32_t batch, bool inverse, bool apply_inv_scale,
-                           id<MTLCommandBuffer>& cmd) {
+                           __strong id<MTLCommandBuffer>& cmd) {
     for (uint32_t b0 = 0; b0 < batch; b0 += kFftBatchChunk) {
         uint32_t bc = std::min(kFftBatchChunk, batch - b0);
         if (!fft1d_pow2_gpu_chunk(data, n, stride, b0, bc, inverse, apply_inv_scale, cmd))
@@ -185,7 +185,7 @@ static bool fft1d_pow2_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
 
 static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
                                 uint32_t batch, bool inverse,
-                                id<MTLCommandBuffer>& cmd) {
+                                __strong id<MTLCommandBuffer>& cmd) {
     if (n <= 1 || batch == 0) return true;
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
@@ -289,7 +289,7 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
 }
 
 static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t batch,
-                      bool inverse, id<MTLCommandBuffer>& cmd) {
+                      bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
     return fft1d_bluestein_gpu(data, n, stride, batch, inverse, cmd);
@@ -297,7 +297,7 @@ static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t 
 
 // 2D FFT with one full-frame complex buffer: row FFTs in place, column FFTs via strips.
 static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h, uint32_t w,
-                      bool inverse, id<MTLCommandBuffer>& cmd) {
+                      bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!fft1d_gpu(cbuf, w, w, h, inverse, cmd)) return false;
 
