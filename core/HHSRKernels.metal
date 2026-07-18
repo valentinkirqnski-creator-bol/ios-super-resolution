@@ -47,16 +47,16 @@ kernel void fft_radix2_stage(device float2* data [[buffer(0)]],
     uint batch = gid.y;
     uint i = gid.x;
     if (batch >= batch_count || i >= n) return;
-    uint half = len >> 1;
-    if ((i % len) >= half) return;
+    uint half_n = len >> 1;
+    if ((i % len) >= half_n) return;
 
     float ang = (inverse ? 2.f : -2.f) * PI / float(len);
-    uint k = i % half;
+    uint k = i % half_n;
     float2 w = float2(cos(ang * float(k)), sin(ang * float(k)));
 
     uint base = batch * stride;
     uint i0 = (i / len) * len + k;
-    uint i1 = i0 + half;
+    uint i1 = i0 + half_n;
     float2 u = data[base + i0];
     float2 v = cmul(data[base + i1], w);
     data[base + i0] = u + v;
@@ -403,21 +403,21 @@ kernel void hermite_complete_row(device float2* row [[buffer(0)]],
 }
 
 kernel void write_rfft_cols_from_half(device float2* cols [[buffer(0)]],
-                                      device const float2* half [[buffer(1)]],
+                                      device const float2* rfft_pack [[buffer(1)]],
                                       constant uint& N [[buffer(2)]],
                                       constant uint& wh [[buffer(3)]],
                                       constant uint& ntiles [[buffer(4)]],
                                       uint2 gid [[thread_position_in_grid]]) {
-    // half layout: [ntiles][N][wh]; cols layout for col-FFT: [ntiles*wh][N]
+    // rfft_pack layout: [ntiles][N][wh]; cols layout for col-FFT: [ntiles*wh][N]
     uint tile = gid.y;
     uint idx = gid.x; // y * wh + xfreq
     if (tile >= ntiles || idx >= N * wh) return;
     uint y = idx / wh;
     uint xf = idx % wh;
-    cols[(tile * wh + xf) * N + y] = half[(tile * N + y) * wh + xf];
+    cols[(tile * wh + xf) * N + y] = rfft_pack[(tile * N + y) * wh + xf];
 }
 
-kernel void write_half_from_cols(device float2* half [[buffer(0)]],
+kernel void write_half_from_cols(device float2* rfft_pack [[buffer(0)]],
                                  device const float2* cols [[buffer(1)]],
                                  constant uint& N [[buffer(2)]],
                                  constant uint& wh [[buffer(3)]],
@@ -428,11 +428,11 @@ kernel void write_half_from_cols(device float2* half [[buffer(0)]],
     if (tile >= ntiles || idx >= N * wh) return;
     uint y = idx / wh;
     uint xf = idx % wh;
-    half[(tile * N + y) * wh + xf] = cols[(tile * wh + xf) * N + y];
+    rfft_pack[(tile * N + y) * wh + xf] = cols[(tile * wh + xf) * N + y];
 }
 
 kernel void expand_half_to_full_rows(device float2* full [[buffer(0)]],
-                                     device const float2* half [[buffer(1)]],
+                                     device const float2* rfft_pack [[buffer(1)]],
                                      constant uint& N [[buffer(2)]],
                                      constant uint& wh [[buffer(3)]],
                                      constant uint& ntiles [[buffer(4)]],
@@ -445,10 +445,10 @@ kernel void expand_half_to_full_rows(device float2* full [[buffer(0)]],
     uint base_h = (tile * N + y) * wh;
     uint base_f = (tile * N + y) * N;
     if (x < wh)
-        full[base_f + x] = half[base_h + x];
+        full[base_f + x] = rfft_pack[base_h + x];
     else {
         uint k = N - x;
-        full[base_f + x] = cconj(half[base_h + k]);
+        full[base_f + x] = cconj(rfft_pack[base_h + k]);
     }
 }
 
