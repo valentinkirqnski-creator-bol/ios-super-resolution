@@ -69,7 +69,9 @@ static bool load_image(const fs::path& p, Image& im) {
     int32_t hdr[3];
     std::ifstream in(p, std::ios::binary);
     if (!in || !in.read((char*)hdr, sizeof(hdr))) return false;
-    im = Image(hdr[0], hdr[1], hdr[2]);
+    // Reuse storage when shape matches — avoids alloc+zero on every reload.
+    if (im.h != hdr[0] || im.w != hdr[1] || im.c != hdr[2])
+        im = Image(hdr[0], hdr[1], hdr[2]);
     return (bool)in.read((char*)im.data.data(), (std::streamsize)(im.data.size() * sizeof(f32)));
 }
 
@@ -344,17 +346,17 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     std::vector<uint16_t> row16((size_t)band_rows * Ws * 3);
 
     AccumDiag diag;
+    // One scratch for streaming reloads (6+ frames). Shape is fixed for the burst.
+    Image comp_scratch;
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
         Image num_band(bh, Ws, nch), den_band(bh, Ws, nch);
 
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
-                Image comp;
-                if (!load_cached_comp_raw(cache, meta.index, comp)) continue;
-                merge_comp_band(comp, meta.flow, meta.covs, meta.rob, tile_size,
+                if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
                                 num_band, den_band, y0, work);
-                comp = Image();
             }
         } else {
             for (const CachedCompFrame& fc : cached)
