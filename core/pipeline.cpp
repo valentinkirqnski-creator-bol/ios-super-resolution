@@ -193,7 +193,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 f32 cn[3] = {0, 0, 0};
                 for (int ch = 0; ch < nch; ++ch) {
                     f32 d = den_band.at(i, x, ch);
-                    cn[ch] = (d > 1e-8f) ? num_band.at(i, x, ch) / d : 0.f;
+                    cn[ch] = (d > 0.f) ? num_band.at(i, x, ch) / d : 0.f;
                 }
                 f32 outc[3];
                 if (work.bake_srgb && nch >= 3) {
