@@ -14,12 +14,24 @@ static inline int denoise_range_merge(f32 r_acc, int rad_max, f32 max_frame_coun
     return (r_acc <= max_frame_count) ? rad_max : 1;
 }
 
-// Bilinear cov sample + invert_2x2 (identity on singular), matching merge.py / linalg.py.
+// Bilinear cov sample + invert.
+// ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
+// comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy) {
-    f32 frac_x = kmap_j - std::floor(kmap_j);
-    f32 frac_y = kmap_i - std::floor(kmap_i);
-    int fx = std::max((int)kmap_j, 0), fy = std::max((int)kmap_i, 0);
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
+    // math.modf: fractional part keeps sign of value
+    f32 frac_x = kmap_j - std::trunc(kmap_j);
+    f32 frac_y = kmap_i - std::trunc(kmap_i);
+    int fx, fy;
+    if (raw_det) {
+        // Python accumulate: floor_x = max(int(kmap_j), 0)
+        fx = std::max((int)kmap_j, 0);
+        fy = std::max((int)kmap_i, 0);
+    } else {
+        // Python accumulate_ref: floor_x = int(max(math.floor(grey_pos), 0))
+        fx = std::max((int)std::floor(kmap_j), 0);
+        fy = std::max((int)std::floor(kmap_i), 0);
+    }
     int cx = std::min(fx + 1, covs.w - 1), cy = std::min(fy + 1, covs.h - 1);
 
     const f32* tl = covs.at(fy, fx);
@@ -33,7 +45,15 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
         return top + frac_y * (bot - top);
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
-    invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
+    if (raw_det) {
+        f32 det = xx * yy - xy * xy;
+        f32 inv_det = 1.f / det;
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
+    } else {
+        invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
+    }
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -78,7 +98,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x - 0.5f;
                     kmap_i = lr_mov_y - 0.5f;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
 
             const int center_j = (int)lr_mov_x;
@@ -162,7 +182,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
             }
 
             // Python: center = round(coarse)

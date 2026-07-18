@@ -27,6 +27,9 @@ Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 Image compute_gradients(const Image& grey);
 Image gaussian_blur(const Image& src, float sigma);
 
+// Circular pad so height/width are multiples of tile_size (alignment.init_alignment).
+Image pad_image_circular(const Image& img, int tile_size);
+
 // ---- align.cpp ----------------------------------------------------------
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
@@ -35,6 +38,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 // ---- robustness.cpp -----------------------------------------------------
 struct RefStats { Image means; Image stds; }; // raw resolution [h, w, ch]
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
+
+// MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
+f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
 
 // Robustness mask r at raw resolution [h, w, 1].
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,

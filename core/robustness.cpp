@@ -142,6 +142,17 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     return nc;
 }
 
+} // namespace
+
+f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
+    // Python: id_noise = round(1000*brightness); std = std_curve[id_noise] — no clamp
+    NoiseCurves nc = make_noise_curves(alpha, beta);
+    int id = (int)std::lround(1000.f * brightness);
+    return nc.std_curve[(size_t)id];
+}
+
+namespace {
+
 static Image compute_guide(const Image& raw, const Config& cfg) {
     if (!cfg.bayer_mode) {
         // Python: guide_img = raw.reshape((1, H, W))
@@ -259,9 +270,8 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
             f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
             for (int ch = 0; ch < nc_ch; ++ch) {
                 f32 brightness = ref_means.at(y, x, ch);
-                // Python: id_noise = round(1000 * brightness)
+                // Python: id_noise = round(1000 * brightness) — no clamp
                 int id_noise = (int)std::lround(1000.f * brightness);
-                id_noise = std::max(0, std::min(k_n_brightness, id_noise));
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);

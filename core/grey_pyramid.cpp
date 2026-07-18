@@ -18,31 +18,9 @@ static int next_pow2(int n) {
     return p;
 }
 
-} // namespace
-
-void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::complex<f32>>* dft_buf) {
+// Radix-2 only; n must be power of 2. Does not divide by n on inverse.
+static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) {
     const int n = (int)a.size();
-    if ((n & (n - 1)) != 0) {
-        // Slow exact DFT for non-power-of-2
-        std::vector<std::complex<f32>> local_buf;
-        std::vector<std::complex<f32>>& out = dft_buf ? *dft_buf : local_buf;
-        if (out.size() < (size_t)n) out.resize(n);
-        std::fill(out.begin(), out.begin() + n, std::complex<f32>{0.f, 0.f});
-
-        f32 dir = inverse ? 1.f : -1.f;
-        for (int k = 0; k < n; ++k) {
-            for (int t = 0; t < n; ++t) {
-                f32 ang = dir * 2.f * (f32)M_PI * k * t / n;
-                out[k] += a[t] * std::complex<f32>(std::cos(ang), std::sin(ang));
-            }
-        }
-        for (int i = 0; i < n; ++i) {
-            a[i] = inverse ? out[i] / (f32)n : out[i];
-        }
-        return;
-    }
-
-    // Fast Radix-2 FFT
     int j = 0;
     for (int i = 1; i < n; ++i) {
         int bit = n >> 1;
@@ -51,7 +29,7 @@ void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::com
         if (i < j) std::swap(a[i], a[j]);
     }
     for (int len = 2; len <= n; len <<= 1) {
-        f32 ang = (inverse ? -2.f : 2.f) * (f32)M_PI / (f32)len;
+        f32 ang = (inverse ? 2.f : -2.f) * (f32)M_PI / (f32)len;
         std::complex<f32> wlen(std::cos(ang), std::sin(ang));
         for (int i = 0; i < n; i += len) {
             std::complex<f32> w(1.f, 0.f);
@@ -64,8 +42,74 @@ void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::com
             }
         }
     }
-    if (inverse) {
-        for (auto& v : a) v /= (f32)n;
+}
+
+// Bluestein's algorithm — arbitrary-n DFT via padded radix-2 convolution.
+static void fft1d_bluestein(std::vector<std::complex<f32>>& a, bool inverse) {
+    const int n = (int)a.size();
+    if (n <= 1) return;
+    const int m = next_pow2(2 * n - 1);
+    const f32 dir = inverse ? 1.f : -1.f;
+
+    std::vector<std::complex<f32>> chirp(n);
+    for (int i = 0; i < n; ++i) {
+        f32 ang = dir * (f32)M_PI * (f32)i * (f32)i / (f32)n;
+        chirp[i] = {std::cos(ang), std::sin(ang)};
+    }
+
+    std::vector<std::complex<f32>> A((size_t)m, {0.f, 0.f});
+    std::vector<std::complex<f32>> B((size_t)m, {0.f, 0.f});
+    for (int i = 0; i < n; ++i) {
+        A[i] = a[i] * chirp[i];
+        B[i] = std::conj(chirp[i]);
+        if (i > 0) B[m - i] = B[i];
+    }
+
+    fft1d_pow2_inplace(A, false);
+    fft1d_pow2_inplace(B, false);
+    for (int i = 0; i < m; ++i) A[i] *= B[i];
+    fft1d_pow2_inplace(A, true);
+    for (int i = 0; i < m; ++i) A[i] /= (f32)m;
+
+    for (int i = 0; i < n; ++i)
+        a[i] = A[i] * chirp[i];
+}
+
+static void roll_axis0(std::vector<std::complex<f32>>& data, int h, int w, int shift) {
+    if (h <= 1 || shift % h == 0) return;
+    shift %= h;
+    if (shift < 0) shift += h;
+    std::vector<std::complex<f32>> tmp(data);
+    for (int y = 0; y < h; ++y) {
+        int ny = (y + shift) % h;
+        for (int x = 0; x < w; ++x)
+            data[(size_t)ny * w + x] = tmp[(size_t)y * w + x];
+    }
+}
+
+static void roll_axis1(std::vector<std::complex<f32>>& data, int h, int w, int shift) {
+    if (w <= 1 || shift % w == 0) return;
+    shift %= w;
+    if (shift < 0) shift += w;
+    std::vector<std::complex<f32>> row(w);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) row[x] = data[(size_t)y * w + x];
+        for (int x = 0; x < w; ++x)
+            data[(size_t)y * w + (x + shift) % w] = row[x];
+    }
+}
+
+} // namespace
+
+void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::complex<f32>>* /*dft_buf*/) {
+    const int n = (int)a.size();
+    if (n <= 1) return;
+    if ((n & (n - 1)) == 0) {
+        fft1d_pow2_inplace(a, inverse);
+        if (inverse) for (auto& v : a) v /= (f32)n;
+    } else {
+        fft1d_bluestein(a, inverse);
+        if (inverse) for (auto& v : a) v /= (f32)n;
     }
 }
 
@@ -92,45 +136,45 @@ void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse,
 }
 
 void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
-    auto swap_quadrant = [&](int y0, int x0, int y1, int x1, int hh, int ww) {
-        for (int y = 0; y < hh; ++y) {
-            for (int x = 0; x < ww; ++x) {
-                std::swap(data[(size_t)(y0 + y) * w + (x0 + x)],
-                          data[(size_t)(y1 + y) * w + (x1 + x)]);
-            }
-        }
-    };
-    swap_quadrant(0, 0, h / 2, w / 2, h / 2, w / 2);
-    swap_quadrant(0, w / 2, h / 2, 0, h / 2, w - w / 2);
+    // numpy.fft.fftshift: roll by +n//2 on each axis
+    roll_axis0(data, h, w, h / 2);
+    roll_axis1(data, h, w, w / 2);
 }
 
-// Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT").
+static void ifftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
+    // numpy.fft.ifftshift: roll by -n//2 on each axis
+    roll_axis0(data, h, w, -(h / 2));
+    roll_axis1(data, h, w, -(w / 2));
+}
+
+// Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT")
+// at native (h,w); no power-of-2 padding.
 Image compute_grey_fft(const Image& raw) {
     const int h = raw.h, w = raw.w;
-    const int ph = next_pow2(h), pw = next_pow2(w);
-    std::vector<std::complex<f32>> buf((size_t)ph * pw, {0.f, 0.f});
+    std::vector<std::complex<f32>> buf((size_t)h * w);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            buf[(size_t)y * pw + x] = {raw.at(y, x), 0.f};
+            buf[(size_t)y * w + x] = {raw.at(y, x), 0.f};
 
-    fft2d(buf, ph, pw, false);
-    fftshift2d(buf, ph, pw);
+    fft2d(buf, h, w, false);
+    fftshift2d(buf, h, w);
 
-    const int y0 = ph / 4, x0 = pw / 4;
-    for (int y = 0; y < ph; ++y) {
-        for (int x = 0; x < pw; ++x) {
-            if (y < y0 || y >= ph - y0 || x < x0 || x >= pw - x0)
-                buf[(size_t)y * pw + x] = {0.f, 0.f};
+    // Python: zero [:h//4,:], [:,:w//4], [-h//4:,:], [:,-w//4:]
+    const int y0 = h / 4, x0 = w / 4;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (y < y0 || y >= h - y0 || x < x0 || x >= w - x0)
+                buf[(size_t)y * w + x] = {0.f, 0.f};
         }
     }
 
-    fftshift2d(buf, ph, pw);
-    fft2d(buf, ph, pw, true);
+    ifftshift2d(buf, h, w);
+    fft2d(buf, h, w, true);
 
     Image grey(h, w, 1);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            grey.at(y, x) = buf[(size_t)y * pw + x].real();
+            grey.at(y, x) = buf[(size_t)y * w + x].real();
     return grey;
 }
 

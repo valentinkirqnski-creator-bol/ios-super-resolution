@@ -43,16 +43,17 @@ enum LensZoomMode: Equatable {
 }
 
 /// Holds the C++ algorithm tuning parameters for live adjustments.
+/// Defaults match configs/default.yaml / core/types.h.
 struct TuningParams: Equatable, Codable {
-    var r_t: Float = 0.15
-    var r_s1: Float = 0.25
-    var r_s2: Float = 24.0
+    var r_t: Float = 0.12
+    var r_s1: Float = 2.0
+    var r_s2: Float = 12.0
     var r_Mt: Float = 0.80
-    var k_detail: Float = 0.30
-    var k_denoise: Float = 3.5
-    var k_stretch: Float = 6.0
+    var k_detail: Float = 0.25
+    var k_denoise: Float = 4.0
+    var k_stretch: Float = 4.0
     var snr_auto_tune: Bool = true
-    var accumulated_robustness_denoiser_enabled: Bool = true
+    var accumulated_robustness_denoiser_enabled: Bool = false
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 8.0
     var acc_rob_max_frame_count: Float = 2.0

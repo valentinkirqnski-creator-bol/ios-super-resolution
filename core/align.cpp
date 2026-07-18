@@ -1,10 +1,47 @@
 #include "stages.h"
 #include "parallel.h"
 #include <cmath>
+#include <complex>
 #include <limits>
 #include <vector>
 
 namespace hhsr {
+
+namespace {
+
+// CUDA-style pairwise tree reduce (ica_kernel_8/16 shared-mem loop).
+static f32 butterfly_reduce_sum(std::vector<f32>& s, int n) {
+    int N = n / 2;
+    while (N > 0) {
+        for (int tid = 0; tid < N; ++tid)
+            s[(size_t)tid] += s[(size_t)tid + N];
+        N /= 2;
+    }
+    return s[0];
+}
+
+// CUDA shfl_down_sync warp reduce then sum warp leaders (L1/ICA 32/64).
+// vals[tid] = per-thread contribution; n_threads multiple of 32.
+static f32 warp_then_block_reduce_sum(std::vector<f32>& vals, int n_threads) {
+    constexpr int WARP = 32;
+    std::vector<f32> tmp(vals.size());
+    for (int base = 0; base < n_threads; base += WARP) {
+        for (int offset = WARP / 2; offset > 0; offset /= 2) {
+            tmp = vals;
+            for (int lane = 0; lane < WARP; ++lane) {
+                int src = lane + offset;
+                f32 add = (src < WARP) ? tmp[(size_t)base + src] : 0.f;
+                vals[(size_t)base + lane] = tmp[(size_t)base + lane] + add;
+            }
+        }
+    }
+    f32 sum = vals[0];
+    for (int w = WARP; w < n_threads; w += WARP)
+        sum += vals[(size_t)w];
+    return sum;
+}
+
+} // namespace
 
 // ============================================================================
 // Sobel gradients — matches Python's F.conv2d(image, SOBEL_X/Y, padding='same')
@@ -40,22 +77,35 @@ static Image compute_sobel_grady(const Image& img) {
 // ============================================================================
 // Bilinear interpolation matching Python ICA (ICA.py):
 //   floor_x = x + int(alignment[0]);  frac = modf(alignment)
-//   floor/ceil clamped to image bounds (clamp-to-edge), NOT OOB→0.
+//   tile 8 (ica_kernel_8): clamp-to-edge
+//   tile 16/32/64: OOB samples → 0.0
 // ============================================================================
-static inline f32 bilinear_clamp(const Image& img, int pixel_y, int pixel_x,
-                                 int floor_off_y, int floor_off_x,
-                                 f32 frac_x, f32 frac_y) {
+static inline f32 sample_or_zero(const Image& img, int y, int x) {
+    return (y >= 0 && y < img.h && x >= 0 && x < img.w) ? img.at(y, x) : 0.f;
+}
+
+static inline f32 bilinear_ica(const Image& img, int pixel_y, int pixel_x,
+                               int floor_off_y, int floor_off_x,
+                               f32 frac_x, f32 frac_y, bool clamp_edge) {
     int floor_y = pixel_y + floor_off_y;
     int floor_x = pixel_x + floor_off_x;
-    floor_x = std::max(0, std::min(img.w - 1, floor_x));
-    floor_y = std::max(0, std::min(img.h - 1, floor_y));
-    int ceil_x = std::max(0, std::min(img.w - 1, floor_x + 1));
-    int ceil_y = std::max(0, std::min(img.h - 1, floor_y + 1));
 
-    f32 m00 = img.at(floor_y, floor_x);
-    f32 m01 = img.at(floor_y, ceil_x);
-    f32 m10 = img.at(ceil_y, floor_x);
-    f32 m11 = img.at(ceil_y, ceil_x);
+    f32 m00, m01, m10, m11;
+    if (clamp_edge) {
+        int fy = std::max(0, std::min(img.h - 1, floor_y));
+        int fx = std::max(0, std::min(img.w - 1, floor_x));
+        int cy = std::max(0, std::min(img.h - 1, fy + 1));
+        int cx = std::max(0, std::min(img.w - 1, fx + 1));
+        m00 = img.at(fy, fx);
+        m01 = img.at(fy, cx);
+        m10 = img.at(cy, fx);
+        m11 = img.at(cy, cx);
+    } else {
+        m00 = sample_or_zero(img, floor_y + 0, floor_x + 0);
+        m01 = sample_or_zero(img, floor_y + 0, floor_x + 1);
+        m10 = sample_or_zero(img, floor_y + 1, floor_x + 0);
+        m11 = sample_or_zero(img, floor_y + 1, floor_x + 1);
+    }
 
     f32 lerpx_top = m00 + (m01 - m00) * frac_x;
     f32 lerpx_bot = m10 + (m11 - m10) * frac_x;
@@ -65,10 +115,9 @@ static inline f32 bilinear_clamp(const Image& img, int pixel_y, int pixel_x,
 // ============================================================================
 // FFT-based L2 block matching — matches Python's align_lvl_block_matching_L2
 //
-// PyTorch path: corrs = fftshift(irfft2(conj(rfft2(ref)) * rfft2(mov), s=N))
-// For real signals that equals circular cross-correlation:
-//   corr[dy,dx] = sum_{i,j} ref[i,j] * mov[(i+dy)%N, (j+dx)%N]
-// which is DFT-exact (same math as rfft2/irfft2), without library float drift.
+// PyTorch: corrs = fftshift(irfft2(conj(rfft2(ref)) * rfft2(mov), s=N))
+// C++:     same via full complex fft2 (real input) — same DFT ops/order family
+//          as rfft2/irfft2, not spatial accumulation.
 // ============================================================================
 
 static void block_match_level_L2(const Image& ref, const Image& moving,
@@ -77,22 +126,29 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
-    int search_size = 2 * R + ts;       // N — same as Python
+    int search_size = 2 * R + ts;
     int corr_size = 2 * R + 1;
     const int N = search_size;
+    const size_t NN = (size_t)N * N;
 
     struct RowBuffers {
         std::vector<f32> ref_tile_padded;
         std::vector<f32> mov_patch;
-        std::vector<f32> corr;      // N×N circular correlation (pre-fftshift)
-        std::vector<f32> shifted;   // after fftshift
-        std::vector<f32> corrs;     // cropped corr_size×corr_size
+        std::vector<std::complex<f32>> F_ref;
+        std::vector<std::complex<f32>> F_mov;
+        std::vector<f32> corr;
+        std::vector<f32> shifted;
+        std::vector<f32> corrs;
         std::vector<f32> L2_search;
+        std::vector<std::complex<f32>> row_buf;
+        std::vector<std::complex<f32>> dft_buf;
 
         RowBuffers(int n, int c_size)
             : ref_tile_padded(n * n, 0.f), mov_patch(n * n, 0.f),
+              F_ref(n * n), F_mov(n * n),
               corr(n * n), shifted(n * n),
-              corrs(c_size * c_size), L2_search(c_size * c_size, 0.f) {}
+              corrs(c_size * c_size), L2_search(c_size * c_size, 0.f),
+              row_buf(n), dft_buf(n) {}
     };
 
     std::vector<RowBuffers> buffers;
@@ -111,7 +167,6 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
             int flow_dx = (int)std::rint((float)flow.dx(ty, tx));
             int flow_dy = (int)std::rint((float)flow.dy(ty, tx));
 
-            // Zero-padded reference tile at offset R (pad (R,R,R,R) in Python)
             std::fill(b.ref_tile_padded.begin(), b.ref_tile_padded.end(), 0.f);
             for (int i = 0; i < ts; ++i) {
                 for (int j = 0; j < ts; ++j) {
@@ -122,7 +177,6 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                 }
             }
 
-            // Search patch — clamp to edge (extract_flow_patches)
             for (int i = 0; i < N; ++i) {
                 for (int j = 0; j < N; ++j) {
                     int my = std::max(0, std::min(moving.h - 1, oy + flow_dy + i - R));
@@ -131,29 +185,20 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                 }
             }
 
-            // Circular cross-correlation ≡ irfft2(conj(rfft2(ref))*rfft2(mov))
-            // corr[dy,dx] = sum ref[i,j] * mov[(i+dy)%N,(j+dx)%N]
-            // Restrict sum to nonzero ref support [R,R+ts)²
-            for (int dy = 0; dy < N; ++dy) {
-                for (int dx = 0; dx < N; ++dx) {
-                    f32 s = 0.f;
-                    for (int i = 0; i < ts; ++i) {
-                        int ri = i + R;
-                        int mi = ri + dy;
-                        if (mi >= N) mi -= N;
-                        for (int j = 0; j < ts; ++j) {
-                            int rj = j + R;
-                            int mj = rj + dx;
-                            if (mj >= N) mj -= N;
-                            s += b.ref_tile_padded[(size_t)ri * N + rj]
-                               * b.mov_patch[(size_t)mi * N + mj];
-                        }
-                    }
-                    b.corr[(size_t)dy * N + dx] = s;
-                }
+            // irfft2(conj(rfft2(ref)) * rfft2(mov)) via full fft2 of real arrays
+            for (size_t i = 0; i < NN; ++i) {
+                b.F_ref[i] = {b.ref_tile_padded[i], 0.f};
+                b.F_mov[i] = {b.mov_patch[i], 0.f};
             }
+            fft2d(b.F_ref, N, N, false, &b.row_buf, &b.dft_buf);
+            fft2d(b.F_mov, N, N, false, &b.row_buf, &b.dft_buf);
+            for (size_t i = 0; i < NN; ++i)
+                b.F_ref[i] = std::conj(b.F_ref[i]) * b.F_mov[i];
+            fft2d(b.F_ref, N, N, true, &b.row_buf, &b.dft_buf);
+            for (size_t i = 0; i < NN; ++i)
+                b.corr[i] = b.F_ref[i].real();
 
-            // torch.fft.fftshift: roll by n // 2  →  shifted[y] = corr[(y+n/2)%n]
+            // torch.fft.fftshift: out[i] = in[(i + n//2) % n]  (even N: same as roll)
             {
                 int shift = N / 2;
                 for (int y = 0; y < N; ++y) {
@@ -165,7 +210,6 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                 }
             }
 
-            // crop = (N - 1 - corr_size) // 2; then [crop+1 : crop+corr_size+1]
             int crop = (N - 1 - corr_size) / 2;
             int crop0 = crop + 1;
             for (int i = 0; i < corr_size; ++i)
@@ -173,7 +217,7 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                     b.corrs[(size_t)i * corr_size + j] =
                         b.shifted[(size_t)(crop0 + i) * N + (crop0 + j)];
 
-            // Box-filter sum of squares over ts×ts windows
+            // Valid box filter on search_area.square() (conv2d padding=valid)
             std::fill(b.L2_search.begin(), b.L2_search.end(), 0.f);
             for (int i = 0; i < corr_size; ++i) {
                 for (int j = 0; j < corr_size; ++j) {
@@ -187,6 +231,7 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                 }
             }
 
+            // torch.argmin — first minimum
             f32 best_err = 1e30f;
             int best_dy = 0, best_dx = 0;
             for (int i = 0; i < corr_size; ++i) {
@@ -211,8 +256,9 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
 // L1 block matching — matches Python's align_lvl_block_matching_L1 CUDA kernels
 // including the broken argmin (`if err < min` never updates err).
 //
-// cuda_L1_local_search16: err starts as s_err[0,0]
-// cuda_L1_local_search32/64: err starts as +inf → condition never fires → shift 0
+// cuda_L1_local_search16: err starts as s_err[0,0]; L1 sum via warp reduce
+// cuda_L1_local_search32/64: err starts as +inf → condition never fires →
+//   min_shift never written in CUDA (UB); Numba locals are typically 0 → we use 0
 // ============================================================================
 static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
@@ -221,9 +267,12 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
     int ts = tile_size;
     int R = search_radius;
     int corr = 2 * R + 1;
+    const int n_threads = ts * ts; // 1 thread/pixel (ts=64 uses 1024 with 4px/thread in CUDA;
+                                   // we still reduce over ts*ts pixel contribs in CUDA order)
 
     parallel_rows(ny, num_threads, [&](int ty) {
         std::vector<f32> s_err((size_t)corr * corr);
+        std::vector<f32> per_thread((size_t)std::max(n_threads, 32));
         for (int tx = 0; tx < nx; ++tx) {
             int oy = ty * ts;
             int ox = tx * ts;
@@ -234,34 +283,43 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
 
             for (int sdy = -R; sdy <= R; ++sdy) {
                 for (int sdx = -R; sdx <= R; ++sdx) {
-                    f32 l1_sum = 0.f;
+                    // Per-pixel |ref-mov| then CUDA-order block reduce
+                    std::fill(per_thread.begin(), per_thread.end(), 0.f);
                     for (int i = 0; i < ts; ++i) {
                         int ry = oy + i;
-                        if (ry >= ref.h) break;
                         for (int j = 0; j < ts; ++j) {
                             int rx = ox + j;
-                            if (rx >= ref.w) break;
+                            int tid = i * ts + j; // ty*TILE + tx with ty=i, tx=j
+                            f32 rv = (ry < ref.h && rx < ref.w) ? ref.at(ry, rx) : 0.f;
                             int my = ry + flow_dy + sdy;
                             int mx = rx + flow_dx + sdx;
-                            f32 mv = (my >= 0 && my < moving.h &&
-                                      mx >= 0 && mx < moving.w)
-                                     ? moving.at(my, mx) : 0.f;
-                            l1_sum += std::fabs(ref.at(ry, rx) - mv);
+                            f32 mv = (my >= 0 && my < moving.h && mx >= 0 && mx < moving.w)
+                                         ? moving.at(my, mx) : 0.f;
+                            per_thread[(size_t)tid] = std::fabs(rv - mv);
                         }
+                    }
+                    f32 l1_sum;
+                    if (ts == 16 || ts == 32 || ts == 64) {
+                        // Pad to multiple of 32 for warp reduce (ts=16 → 256)
+                        int nt = n_threads;
+                        if (nt % 32) nt = ((nt + 31) / 32) * 32;
+                        if ((int)per_thread.size() < nt) per_thread.resize(nt, 0.f);
+                        l1_sum = warp_then_block_reduce_sum(per_thread, nt);
+                    } else {
+                        // ts==8 not implemented in Python L1; sequential fallback
+                        l1_sum = 0.f;
+                        for (int t = 0; t < n_threads; ++t) l1_sum += per_thread[(size_t)t];
                     }
                     s_err[(size_t)(sdy + R) * corr + (sdx + R)] = l1_sum;
                 }
             }
 
             // --- Python CUDA argmin bug (verbatim) ---
-            //   min = s_err[i,j]
-            //   if err < min:  # never assigns err = min
-            //       min_shift = (j-R, i-R)
-            // ts==16: err = s_err[0,0];  ts==32/64: err = +inf
             f32 err = (ts == 16)
                           ? s_err[0]
                           : std::numeric_limits<f32>::infinity();
-            int min_shift_x = 0, min_shift_y = 0; // unset locals → 0 in practice
+            // Uninitialized in CUDA when the if never fires; device locals → 0
+            int min_shift_x = 0, min_shift_y = 0;
             for (int i = 0; i < corr; ++i) {
                 for (int j = 0; j < corr; ++j) {
                     f32 min_v = s_err[(size_t)i * corr + j];
@@ -280,9 +338,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
 
 // ============================================================================
 // Per-level ICA refinement — matches Python's align_lvl_ica + ica_kernel_*
-//
-// Uses Sobel gradients (same size as image), bilinear with modf + clamp-to-edge,
-// and Cramer's rule update.
+// B accumulation uses the same reduce trees as the CUDA kernels (butterfly for
+// 8/16, warp+block for 32/64).
 // ============================================================================
 static void ica_refine_level(const Image& ref, const Image& gradx,
                               const Image& grady, const Image& moving,
@@ -290,15 +347,17 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                               int num_threads) {
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
+    const bool clamp_edge = (ts == 8);
+    const int n_pix = ts * ts;
 
-    // Pre-compute per-tile Hessian and its inverse
-    // Hessian H = [[sum(gx*gx), sum(gx*gy)], [sum(gx*gy), sum(gy*gy)]]
     parallel_rows(ny, num_threads, [&](int ty) {
+        std::vector<f32> s_B0((size_t)std::max(n_pix, 1024));
+        std::vector<f32> s_B1((size_t)std::max(n_pix, 1024));
+
         for (int tx = 0; tx < nx; ++tx) {
             int oy = ty * ts;
             int ox = tx * ts;
 
-            // Accumulate Hessian over tile
             f32 h00 = 0, h01 = 0, h10 = 0, h11 = 0;
             for (int i = 0; i < ts; ++i) {
                 int py = oy + i;
@@ -315,49 +374,87 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                 }
             }
 
-            // Check singularity (matching Python: abs(det) < 1e-10)
             f32 det = h00 * h11 - h01 * h10;
             if (std::fabs(det) < 1e-10f) continue;
             f32 det_inv = 1.f / det;
 
-            // ICA iterations
             f32 fx = flow.dx(ty, tx);
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // Matches Python's math.modf(alignment[0]) where negative values yield negative fractions
                 f32 frac_x = fx - std::trunc(fx);
                 int floor_off_x = (int)std::trunc(fx);
                 f32 frac_y = fy - std::trunc(fy);
                 int floor_off_y = (int)std::trunc(fy);
 
-                f32 B0 = 0.f, B1 = 0.f;
-                for (int i = 0; i < ts; ++i) {
-                    int py = oy + i;
-                    if (py >= ref.h) break;
-                    for (int j = 0; j < ts; ++j) {
-                        int px = ox + j;
-                        if (px >= ref.w) break;
+                std::fill(s_B0.begin(), s_B0.end(), 0.f);
+                std::fill(s_B1.begin(), s_B1.end(), 0.f);
 
-                        f32 mov_interp = bilinear_clamp(moving, py, px,
-                                                        floor_off_y, floor_off_x,
-                                                        frac_x, frac_y);
-
-                        f32 gradt = mov_interp - ref.at(py, px);
-                        f32 gx = gradx.at(py, px);
-                        f32 gy = grady.at(py, px);
-
-                        // Accumulate: B += -grad * gradt (matching Python)
-                        B0 += -gx * gradt;
-                        B1 += -gy * gradt;
+                if (ts == 64) {
+                    // ica_kernel_64: 16×64 threads, each owns 4 vertical pixels
+                    for (int tyy = 0; tyy < 16; ++tyy) {
+                        for (int txx = 0; txx < 64; ++txx) {
+                            int ti = tyy * 64 + txx;
+                            int px = ox + txx;
+                            int py0 = oy + tyy * 4;
+                            f32 B0 = 0.f, B1 = 0.f;
+                            for (int k = 0; k < 4; ++k) {
+                                int py = py0 + k;
+                                if (py >= ref.h || px >= ref.w) continue;
+                                f32 mov_interp = bilinear_ica(moving, py, px,
+                                                              floor_off_y, floor_off_x,
+                                                              frac_x, frac_y, false);
+                                f32 gradt = mov_interp - ref.at(py, px);
+                                f32 gx = gradx.at(py, px);
+                                f32 gy = grady.at(py, px);
+                                B0 += -gx * gradt;
+                                B1 += -gy * gradt;
+                            }
+                            s_B0[(size_t)ti] = B0;
+                            s_B1[(size_t)ti] = B1;
+                        }
                     }
+                    // Warp reduce with warp0 kept in "register" path:
+                    // same as warp_then_block_reduce_sum (adds vals[0]+vals[32]+...)
+                    f32 B0 = warp_then_block_reduce_sum(s_B0, 1024);
+                    f32 B1 = warp_then_block_reduce_sum(s_B1, 1024);
+                    fx += det_inv * (h11 * B0 - h01 * B1);
+                    fy += det_inv * (-h10 * B0 + h00 * B1);
+                } else {
+                    for (int i = 0; i < ts; ++i) {
+                        int py = oy + i;
+                        for (int j = 0; j < ts; ++j) {
+                            int px = ox + j;
+                            int tid = i * ts + j;
+                            if (py >= ref.h || px >= ref.w) {
+                                s_B0[(size_t)tid] = 0.f;
+                                s_B1[(size_t)tid] = 0.f;
+                                continue;
+                            }
+                            f32 mov_interp = bilinear_ica(moving, py, px,
+                                                          floor_off_y, floor_off_x,
+                                                          frac_x, frac_y, clamp_edge);
+                            f32 gradt = mov_interp - ref.at(py, px);
+                            f32 gx = gradx.at(py, px);
+                            f32 gy = grady.at(py, px);
+                            s_B0[(size_t)tid] = -gx * gradt;
+                            s_B1[(size_t)tid] = -gy * gradt;
+                        }
+                    }
+                    f32 B0, B1;
+                    if (ts == 8 || ts == 16) {
+                        B0 = butterfly_reduce_sum(s_B0, n_pix);
+                        B1 = butterfly_reduce_sum(s_B1, n_pix);
+                    } else {
+                        // ts == 32 (and any other): warp + block reduce
+                        int nt = n_pix;
+                        if (nt % 32) nt = ((nt + 31) / 32) * 32;
+                        B0 = warp_then_block_reduce_sum(s_B0, nt);
+                        B1 = warp_then_block_reduce_sum(s_B1, nt);
+                    }
+                    fx += det_inv * (h11 * B0 - h01 * B1);
+                    fy += det_inv * (-h10 * B0 + h00 * B1);
                 }
-
-                // Update flow: Cramer's rule (matching Python)
-                // alignment[0] += det_inv * (A11 * B0 - A01 * B1)
-                // alignment[1] += det_inv * (-A10 * B0 + A00 * B1)
-                fx += det_inv * (h11 * B0 - h01 * B1);
-                fy += det_inv * (-h10 * B0 + h00 * B1);
             }
 
             flow.dx(ty, tx) = fx;

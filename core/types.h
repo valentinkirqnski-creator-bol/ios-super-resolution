@@ -75,7 +75,7 @@ struct CFA {
 
 // Full pipeline configuration, mirroring configs/default.yaml.
 struct Config {
-    float scale = 2.0f;
+    float scale = 1.0f;
     int   input_crop_factor = 1; // 2 = center-crop half-res before SR (3 MP -> 12 MP out).
     bool  bayer_mode = true;
     GreyMethod grey_method = GreyMethod::FFT;
@@ -86,17 +86,18 @@ struct Config {
 
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
-    std::vector<int> bm_tile_sizes   = {16, 16, 16, 8};
+    std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
+    std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
 
-    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Paper / default.yaml defaults.
+    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    float r_t  = 0.15f;
-    float r_s1 = 0.25f;
-    float r_s2 = 24.0f;
+    float r_t  = 0.12f;
+    float r_s1 = 2.0f;
+    float r_s2 = 12.0f;
     float r_Mt = 0.80f;
 
     // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
@@ -109,11 +110,11 @@ struct Config {
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = true;
-    float k_detail  = 0.30f;
-    float k_denoise = 3.5f;
-    float D_th      = 0.005f;
-    float D_tr      = 0.014f;
-    float k_stretch = 6.0f;
+    float k_detail  = 0.25f;  // overwritten by SNR lerp [0.33, 0.25]
+    float k_denoise = 4.0f;   // overwritten by SNR lerp [5.0, 3.0]
+    float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
+    float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]
+    float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
 
     CFA cfa;

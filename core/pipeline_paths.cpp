@@ -217,6 +217,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     report("Reference: grey + pyramid", 0.05f);
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);

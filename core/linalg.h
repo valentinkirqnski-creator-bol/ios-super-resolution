@@ -111,8 +111,9 @@ inline void eigen_elmts_2x2(f32 m00, f32 m01, f32 m10, f32 m11,
 // covs[yi][xi][i][j], center_pos = {y, x}; frac from modf as in Python.
 inline void interpolate_cov(const f32 covs[2][2][2][2], f32 center_y, f32 center_x,
                             f32 out[2][2]) {
-    f32 reframed_posx = center_x - std::floor(center_x); // matches math.modf for >= 0
-    f32 reframed_posy = center_y - std::floor(center_y);
+    // math.modf — fractional part keeps sign of center_*
+    f32 reframed_posx = center_x - std::trunc(center_x);
+    f32 reframed_posy = center_y - std::trunc(center_y);
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             out[i][j] =
