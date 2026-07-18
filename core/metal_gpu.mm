@@ -14,10 +14,14 @@
 namespace hhsr {
 namespace {
 
-// Max 1D FFTs per Bluestein/pow2 dispatch (limits A scratch + GPU watchdog).
-static constexpr uint32_t kFftBatchChunk = 48;
+// Bluestein A scratch rows per dispatch (~16MB at m=8192).
+static constexpr uint32_t kFftBatchChunk = 128;
+// Flush GPU every N Bluestein batch groups (avoid per-chunk CPU sync stalls).
+static constexpr uint32_t kFlushEveryChunks = 8;
+// Column strips between flushes in 2D FFT.
+static constexpr uint32_t kColFlushEvery = 16;
 // Max L2 tiles processed together (buffers scale with ntiles * N²).
-static constexpr uint32_t kL2TileChunk = 256;
+static constexpr uint32_t kL2TileChunk = 512;
 
 static int next_pow2(int n) {
     int p = 1;
@@ -30,6 +34,15 @@ struct MetalCtx {
     id<MTLCommandQueue> queue = nil;
     id<MTLLibrary> library = nil;
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipes;
+    // Reused scratch to cut alloc pressure at full-res 1×.
+    id<MTLBuffer> scratch_A = nil;
+    id<MTLBuffer> scratch_B = nil;
+    id<MTLBuffer> scratch_chirp = nil;
+    id<MTLBuffer> scratch_cols = nil;
+    size_t scratch_A_bytes = 0;
+    size_t scratch_B_bytes = 0;
+    size_t scratch_chirp_bytes = 0;
+    size_t scratch_cols_bytes = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -44,6 +57,14 @@ struct MetalCtx {
         if (!p) return nil;
         pipes[name] = p;
         return p;
+    }
+
+    id<MTLBuffer> scratch(id<MTLBuffer>& slot, size_t& slot_bytes, size_t need) {
+        if (need == 0) return nil;
+        if (slot && slot_bytes >= need) return slot;
+        slot = [device newBufferWithLength:need options:MTLResourceStorageModeShared];
+        slot_bytes = slot ? need : 0;
+        return slot;
     }
 };
 
@@ -65,7 +86,7 @@ static MetalCtx& ctx() {
         }
         if (!c.library) return;
         const char* need[] = {
-            "fft1d_pow2_cpp", "fft_scale_inv", "make_chirp",
+            "fft1d_pow2_cpp", "fft1d_bitrev", "fft1d_butterfly", "fft_scale_inv", "make_chirp",
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
@@ -132,10 +153,11 @@ static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
     return cmd != nil;
 }
 
-static bool fft1d_pow2_gpu_chunk(id<MTLBuffer> data, uint32_t n, uint32_t stride,
-                                 uint32_t batch_offset, uint32_t batch,
-                                 bool inverse, bool apply_inv_scale,
-                                 __strong id<MTLCommandBuffer>& cmd) {
+// Parallel staged pow2 FFT — no CPU sync (encode only).
+static bool fft1d_pow2_encode(id<MTLBuffer> data, uint32_t n, uint32_t stride,
+                              uint32_t batch_offset, uint32_t batch,
+                              bool inverse, bool apply_inv_scale,
+                              __strong id<MTLCommandBuffer>& cmd) {
     if (n <= 1 || batch == 0) return true;
     if ((n & (n - 1)) != 0) return false;
     auto& c = ctx();
@@ -146,19 +168,20 @@ static bool fft1d_pow2_gpu_chunk(id<MTLBuffer> data, uint32_t n, uint32_t stride
     int inv = inverse ? 1 : 0;
     NSUInteger byte_off = (NSUInteger)batch_offset * stride * sizeof(float) * 2;
 
-    [enc setComputePipelineState:c.pipe("fft1d_pow2_cpp")];
     [enc setBuffer:data offset:byte_off atIndex:0];
     [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
     [enc setBytes:&str length:sizeof(str) atIndex:2];
     [enc setBytes:&bat length:sizeof(bat) atIndex:3];
-    [enc setBytes:&inv length:sizeof(inv) atIndex:4];
-    NSUInteger tw = c.pipe("fft1d_pow2_cpp").threadExecutionWidth;
-    if (@available(iOS 11.0, *)) {
-        [enc dispatchThreads:MTLSizeMake(batch, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake((batch + tw - 1) / tw, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+    dispatch2(enc, c.pipe("fft1d_bitrev"), n, batch);
+
+    for (uint32_t len = 2; len <= n; len <<= 1) {
+        [enc setBuffer:data offset:byte_off atIndex:0];
+        [enc setBytes:&n_u length:sizeof(n_u) atIndex:1];
+        [enc setBytes:&str length:sizeof(str) atIndex:2];
+        [enc setBytes:&bat length:sizeof(bat) atIndex:3];
+        [enc setBytes:&len length:sizeof(len) atIndex:4];
+        [enc setBytes:&inv length:sizeof(inv) atIndex:5];
+        dispatch2(enc, c.pipe("fft1d_butterfly"), n / 2, batch);
     }
 
     if (inverse && apply_inv_scale) {
@@ -169,15 +192,16 @@ static bool fft1d_pow2_gpu_chunk(id<MTLBuffer> data, uint32_t n, uint32_t stride
         dispatch2(enc, c.pipe("fft_scale_inv"), n, batch);
     }
     [enc endEncoding];
-    return flush_cmd(cmd);
+    return true;
 }
 
 static bool fft1d_pow2_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
                            uint32_t batch, bool inverse, bool apply_inv_scale,
                            __strong id<MTLCommandBuffer>& cmd) {
+    // Encode all batches without mid-flush; caller flushes at phase boundaries.
     for (uint32_t b0 = 0; b0 < batch; b0 += kFftBatchChunk) {
         uint32_t bc = std::min(kFftBatchChunk, batch - b0);
-        if (!fft1d_pow2_gpu_chunk(data, n, stride, b0, bc, inverse, apply_inv_scale, cmd))
+        if (!fft1d_pow2_encode(data, n, stride, b0, bc, inverse, apply_inv_scale, cmd))
             return false;
     }
     return true;
@@ -192,9 +216,13 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
 
     auto& c = ctx();
     const uint32_t m = (uint32_t)next_pow2(2 * (int)n - 1);
-    id<MTLBuffer> chirp = buf(nullptr, sizeof(float) * 2 * n);
-    id<MTLBuffer> B = buf(nullptr, sizeof(float) * 2 * m);
-    if (!chirp || !B) return false;
+    const size_t chirp_bytes = sizeof(float) * 2 * n;
+    const size_t B_bytes = sizeof(float) * 2 * m;
+    const size_t A_bytes = sizeof(float) * 2 * m * kFftBatchChunk;
+    id<MTLBuffer> chirp = c.scratch(c.scratch_chirp, c.scratch_chirp_bytes, chirp_bytes);
+    id<MTLBuffer> B = c.scratch(c.scratch_B, c.scratch_B_bytes, B_bytes);
+    id<MTLBuffer> A = c.scratch(c.scratch_A, c.scratch_A_bytes, A_bytes);
+    if (!chirp || !B || !A) return false;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     uint32_t n_u = n, m_u = m;
@@ -216,11 +244,9 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     dispatch1(enc, c.pipe("bluestein_fill_B"), n);
     [enc endEncoding];
 
-    if (!fft1d_pow2_gpu(B, m, m, 1, false, false, cmd)) return false;
+    if (!fft1d_pow2_encode(B, m, m, 0, 1, false, false, cmd)) return false;
 
-    id<MTLBuffer> A = buf(nullptr, sizeof(float) * 2 * m * kFftBatchChunk);
-    if (!A) return false;
-
+    uint32_t chunks_since_flush = 0;
     for (uint32_t b0 = 0; b0 < batch; b0 += kFftBatchChunk) {
         uint32_t bc = std::min(kFftBatchChunk, batch - b0);
         uint32_t str = stride;
@@ -238,7 +264,7 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
         dispatch2(enc, c.pipe("bluestein_pack_A"), m, bc);
         [enc endEncoding];
 
-        if (!fft1d_pow2_gpu(A, m, m, bc, false, false, cmd)) return false;
+        if (!fft1d_pow2_encode(A, m, m, 0, bc, false, false, cmd)) return false;
 
         enc = [cmd computeCommandEncoder];
         [enc setBuffer:A offset:0 atIndex:0];
@@ -248,7 +274,7 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
         dispatch2(enc, c.pipe("cbuf_mul_broadcast_B"), m, bc);
         [enc endEncoding];
 
-        if (!fft1d_pow2_gpu(A, m, m, bc, true, false, cmd)) return false;
+        if (!fft1d_pow2_encode(A, m, m, 0, bc, true, false, cmd)) return false;
 
         enc = [cmd computeCommandEncoder];
         uint32_t a_stride = m_u;
@@ -267,13 +293,18 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
         [enc setBytes:&bat length:sizeof(bat) atIndex:6];
         dispatch2(enc, c.pipe("bluestein_extract"), n, bc);
         [enc endEncoding];
-        if (!flush_cmd(cmd)) return false;
+
+        if (++chunks_since_flush >= kFlushEveryChunks) {
+            chunks_since_flush = 0;
+            if (!flush_cmd(cmd)) return false;
+        }
     }
+    if (chunks_since_flush != 0 && !flush_cmd(cmd)) return false;
 
     if (inverse) {
+        enc = [cmd computeCommandEncoder];
         for (uint32_t b0 = 0; b0 < batch; b0 += kFftBatchChunk) {
             uint32_t bc = std::min(kFftBatchChunk, batch - b0);
-            enc = [cmd computeCommandEncoder];
             uint32_t str = stride;
             NSUInteger off = (NSUInteger)b0 * stride * sizeof(float) * 2;
             [enc setBuffer:data offset:off atIndex:0];
@@ -281,9 +312,9 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
             [enc setBytes:&str length:sizeof(str) atIndex:2];
             [enc setBytes:&bc length:sizeof(bc) atIndex:3];
             dispatch2(enc, c.pipe("fft_scale_inv"), n, bc);
-            [enc endEncoding];
-            if (!flush_cmd(cmd)) return false;
         }
+        [enc endEncoding];
+        if (!flush_cmd(cmd)) return false;
     }
     return true;
 }
@@ -300,7 +331,9 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h,
                       bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!fft1d_gpu(cbuf, w, w, h, inverse, cmd)) return false;
+    if (!flush_cmd(cmd)) return false;
 
+    uint32_t strips = 0;
     for (uint32_t col0 = 0; col0 < w; col0 += kFftBatchChunk) {
         uint32_t ncol = std::min(kFftBatchChunk, w - col0);
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -324,8 +357,13 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h,
         [enc setBytes:&ncol length:sizeof(ncol) atIndex:5];
         dispatch2(enc, c.pipe("scatter_cols"), h, ncol);
         [enc endEncoding];
-        if (!flush_cmd(cmd)) return false;
+
+        if (++strips >= kColFlushEvery) {
+            strips = 0;
+            if (!flush_cmd(cmd)) return false;
+        }
     }
+    if (strips != 0 && !flush_cmd(cmd)) return false;
     return true;
 }
 
@@ -533,7 +571,7 @@ Image compute_grey_fft_metal(const Image& raw) {
 
     id<MTLBuffer> real_in = buf(raw.data.data(), n * sizeof(float));
     id<MTLBuffer> c0 = buf(nullptr, cbytes);
-    id<MTLBuffer> col_scratch = buf(nullptr, col_bytes);
+    id<MTLBuffer> col_scratch = c.scratch(c.scratch_cols, c.scratch_cols_bytes, col_bytes);
     if (!real_in || !c0 || !col_scratch) return Image();
 
     // Forward FFT (one full complex + column strip scratch)

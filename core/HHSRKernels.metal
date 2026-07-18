@@ -53,6 +53,63 @@ kernel void fft1d_pow2_cpp(device float2* data [[buffer(0)]],
     }
 }
 
+// Parallel pow2 FFT (same math as fft1d_pow2_cpp): bit-reverse + butterfly stages.
+kernel void fft1d_bitrev(device float2* data [[buffer(0)]],
+                         constant uint& n [[buffer(1)]],
+                         constant uint& stride [[buffer(2)]],
+                         constant uint& batch_count [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint batch = gid.y;
+    uint i = gid.x;
+    if (batch >= batch_count || i >= n || n <= 1u) return;
+    uint j = 0;
+    uint x = i;
+    for (uint bit = n >> 1; bit != 0u; bit >>= 1) {
+        j = (j << 1) | (x & 1u);
+        x >>= 1;
+    }
+    if (i < j) {
+        device float2* a = data + batch * stride;
+        float2 tmp = a[i];
+        a[i] = a[j];
+        a[j] = tmp;
+    }
+}
+
+kernel void fft1d_butterfly(device float2* data [[buffer(0)]],
+                            constant uint& n [[buffer(1)]],
+                            constant uint& stride [[buffer(2)]],
+                            constant uint& batch_count [[buffer(3)]],
+                            constant uint& len [[buffer(4)]],
+                            constant int& inverse [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    uint batch = gid.y;
+    uint id = gid.x; // 0 .. n/2 - 1
+    uint half_n = len >> 1;
+    if (batch >= batch_count || id >= (n >> 1) || half_n == 0u) return;
+    uint group = id / half_n;
+    uint k = id % half_n;
+    uint i = group * len;
+    float ang = (inverse != 0 ? 2.f : -2.f) * PI / float(len);
+    float2 wlen = float2(cos(ang), sin(ang));
+    // w = wlen^k
+    float2 w = float2(1.f, 0.f);
+    {
+        uint kk = k;
+        float2 b = wlen;
+        while (kk != 0u) {
+            if ((kk & 1u) != 0u) w = cmul(w, b);
+            b = cmul(b, b);
+            kk >>= 1;
+        }
+    }
+    device float2* a = data + batch * stride;
+    float2 u = a[i + k];
+    float2 v = cmul(a[i + k + half_n], w);
+    a[i + k] = u + v;
+    a[i + k + half_n] = u - v;
+}
+
 kernel void fft_scale_inv(device float2* data [[buffer(0)]],
                           constant uint& n [[buffer(1)]],
                           constant uint& stride [[buffer(2)]],
