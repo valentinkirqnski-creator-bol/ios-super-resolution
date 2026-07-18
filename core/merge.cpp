@@ -47,10 +47,17 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
     if (raw_det) {
         f32 det = xx * yy - xy * xy;
-        f32 inv_det = 1.f / det;
-        ixx =  inv_det * yy;
-        ixy = -inv_det * xy;
-        iyy =  inv_det * xx;
+        // If the ellipse collapses, fall back to isotropic (avoids Inf/NaN weights).
+        if (std::abs(det) > 1e-10f) {
+            f32 inv_det = 1.f / det;
+            ixx =  inv_det * yy;
+            ixy = -inv_det * xy;
+            iyy =  inv_det * xx;
+        } else {
+            ixx = 1.f;
+            ixy = 0.f;
+            iyy = 1.f;
+        }
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
