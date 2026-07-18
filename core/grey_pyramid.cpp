@@ -3,6 +3,11 @@
 #include <complex>
 #include <cmath>
 #include <vector>
+#include <unordered_map>
+
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -18,8 +23,14 @@ static int next_pow2(int n) {
     return p;
 }
 
+static unsigned log2_pow2(int n) {
+    unsigned l = 0;
+    while ((1u << l) < (unsigned)n) ++l;
+    return l;
+}
+
 // Radix-2 only; n must be power of 2. Does not divide by n on inverse.
-static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) {
+static void fft1d_pow2_inplace_ref(std::vector<std::complex<f32>>& a, bool inverse) {
     const int n = (int)a.size();
     int j = 0;
     for (int i = 1; i < n; ++i) {
@@ -43,6 +54,91 @@ static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) 
         }
     }
 }
+
+#ifdef __APPLE__
+// Cached vDSP radix-2 setups (thread-local; execute is thread-safe per setup use).
+static FFTSetup vdsp_fftsetup(unsigned log2n) {
+    static thread_local FFTSetup setups[32] = {};
+    if (log2n >= 32) return nullptr;
+    if (!setups[log2n])
+        setups[log2n] = vDSP_create_fftsetup(log2n, kFFTRadix2);
+    return setups[log2n];
+}
+
+static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) {
+    const int n = (int)a.size();
+    if (n <= 1) return;
+    unsigned log2n = log2_pow2(n);
+    FFTSetup setup = vdsp_fftsetup(log2n);
+    if (!setup) {
+        fft1d_pow2_inplace_ref(a, inverse);
+        return;
+    }
+    // Split-complex scratch (thread-local, grow as needed).
+    static thread_local std::vector<f32> re, im;
+    if (re.size() < (size_t)n) {
+        re.resize((size_t)n);
+        im.resize((size_t)n);
+    }
+    for (int i = 0; i < n; ++i) {
+        re[(size_t)i] = a[(size_t)i].real();
+        im[(size_t)i] = a[(size_t)i].imag();
+    }
+    DSPSplitComplex split{re.data(), im.data()};
+    vDSP_fft_zip(setup, &split, 1, log2n, inverse ? FFT_INVERSE : FFT_FORWARD);
+    for (int i = 0; i < n; ++i)
+        a[(size_t)i] = {re[(size_t)i], im[(size_t)i]};
+}
+
+// vDSP DFT for lengths f*2^n (f in {1,3,5,15}, n>=3). Returns false if unsupported.
+static bool fft1d_vdsp_dft(std::vector<std::complex<f32>>& a, bool inverse) {
+    const int n = (int)a.size();
+    if (n <= 1) return true;
+
+    struct Key {
+        int n;
+        bool inv;
+        bool operator==(const Key& o) const { return n == o.n && inv == o.inv; }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            return (size_t)k.n * 2u + (k.inv ? 1u : 0u);
+        }
+    };
+    static thread_local std::unordered_map<Key, vDSP_DFT_Setup, KeyHash> cache;
+
+    Key key{n, inverse};
+    vDSP_DFT_Setup setup = nullptr;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        setup = it->second;
+    } else {
+        setup = vDSP_DFT_zop_CreateSetup(
+            nullptr, (vDSP_Length)n,
+            inverse ? vDSP_DFT_INVERSE : vDSP_DFT_FORWARD);
+        if (!setup) return false;
+        cache.emplace(key, setup);
+    }
+
+    static thread_local std::vector<f32> re, im;
+    if (re.size() < (size_t)n) {
+        re.resize((size_t)n);
+        im.resize((size_t)n);
+    }
+    for (int i = 0; i < n; ++i) {
+        re[(size_t)i] = a[(size_t)i].real();
+        im[(size_t)i] = a[(size_t)i].imag();
+    }
+    vDSP_DFT_Execute(setup, re.data(), im.data(), re.data(), im.data());
+    for (int i = 0; i < n; ++i)
+        a[(size_t)i] = {re[(size_t)i], im[(size_t)i]};
+    return true;
+}
+#else
+static void fft1d_pow2_inplace(std::vector<std::complex<f32>>& a, bool inverse) {
+    fft1d_pow2_inplace_ref(a, inverse);
+}
+#endif
 
 // Bluestein's algorithm — arbitrary-n DFT via padded radix-2 convolution.
 static void fft1d_bluestein(std::vector<std::complex<f32>>& a, bool inverse) {
@@ -107,31 +203,37 @@ void fft1d(std::vector<std::complex<f32>>& a, bool inverse, std::vector<std::com
     if ((n & (n - 1)) == 0) {
         fft1d_pow2_inplace(a, inverse);
         if (inverse) for (auto& v : a) v /= (f32)n;
-    } else {
-        fft1d_bluestein(a, inverse);
-        if (inverse) for (auto& v : a) v /= (f32)n;
+        return;
     }
+#ifdef __APPLE__
+    // Prefer Accelerate DFT when length is supported (f*2^n).
+    if (fft1d_vdsp_dft(a, inverse)) {
+        if (inverse) for (auto& v : a) v /= (f32)n;
+        return;
+    }
+#endif
+    fft1d_bluestein(a, inverse);
+    if (inverse) for (auto& v : a) v /= (f32)n;
 }
 
 void fft2d(std::vector<std::complex<f32>>& data, int h, int w, bool inverse,
            std::vector<std::complex<f32>>* row_buf,
            std::vector<std::complex<f32>>* dft_buf) {
-    std::vector<std::complex<f32>> local_row;
-    std::vector<std::complex<f32>>& row = row_buf ? *row_buf : local_row;
-    int max_dim = std::max(h, w);
-    if (row.size() < (size_t)max_dim) row.resize(max_dim);
+    (void)dft_buf;
+    std::vector<std::complex<f32>> local_work;
+    std::vector<std::complex<f32>>& work = row_buf ? *row_buf : local_work;
 
     for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) row[(size_t)x] = data[(size_t)y * w + x];
-        std::vector<std::complex<f32>> slice(row.begin(), row.begin() + w);
-        fft1d(slice, inverse, dft_buf);
-        for (int x = 0; x < w; ++x) data[(size_t)y * w + x] = slice[(size_t)x];
+        work.resize((size_t)w);
+        for (int x = 0; x < w; ++x) work[(size_t)x] = data[(size_t)y * w + x];
+        fft1d(work, inverse, nullptr);
+        for (int x = 0; x < w; ++x) data[(size_t)y * w + x] = work[(size_t)x];
     }
     for (int x = 0; x < w; ++x) {
-        for (int y = 0; y < h; ++y) row[(size_t)y] = data[(size_t)y * w + x];
-        std::vector<std::complex<f32>> slice(row.begin(), row.begin() + h);
-        fft1d(slice, inverse, dft_buf);
-        for (int y = 0; y < h; ++y) data[(size_t)y * w + x] = slice[(size_t)y];
+        work.resize((size_t)h);
+        for (int y = 0; y < h; ++y) work[(size_t)y] = data[(size_t)y * w + x];
+        fft1d(work, inverse, nullptr);
+        for (int y = 0; y < h; ++y) data[(size_t)y * w + x] = work[(size_t)y];
     }
 }
 

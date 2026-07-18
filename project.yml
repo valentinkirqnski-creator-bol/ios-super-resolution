@@ -73,3 +73,5 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_UIApplicationSupportsIndoorMaps: NO
+    dependencies:
+      - sdk: Accelerate.framework
