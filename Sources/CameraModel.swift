@@ -1051,7 +1051,6 @@ final class CameraModel: NSObject, ObservableObject {
 
             var saveURL = url
             var tempJPEG: URL?
-            var dngPreviewJPEG: URL?
             if format == .jpg {
                 if let jpg = Self.renderExportJPEG(fromDNG: url) {
                     saveURL = jpg
@@ -1064,17 +1063,6 @@ final class CameraModel: NSObject, ObservableObject {
                     self.removeBurstDir(burstDir)
                     self.burstDir = nil
                     return
-                }
-            } else {
-                // Photos cannot decode our Deflate LinearRaw DNG → grey / 0 MP.
-                // Pair a tone-mapped JPEG (visible) with the DNG as alternatePhoto.
-                if let jpg = Self.renderExportJPEG(fromDNG: url) {
-                    dngPreviewJPEG = jpg
-                } else if let preview, let data = preview.jpegData(compressionQuality: 0.9) {
-                    let tmp = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("dng_prev_\(UUID().uuidString).jpg")
-                    try? data.write(to: tmp, options: .atomic)
-                    dngPreviewJPEG = tmp
                 }
             }
 
@@ -1093,12 +1081,7 @@ final class CameraModel: NSObject, ObservableObject {
                 let req = PHAssetCreationRequest.forAsset()
                 let opts = PHAssetResourceCreationOptions()
                 opts.shouldMoveFile = false
-                if format == .dng, let dngPreviewJPEG {
-                    req.addResource(with: .photo, fileURL: dngPreviewJPEG, options: opts)
-                    req.addResource(with: .alternatePhoto, fileURL: url, options: opts)
-                } else {
-                    req.addResource(with: .photo, fileURL: saveURL, options: opts)
-                }
+                req.addResource(with: .photo, fileURL: saveURL, options: opts)
                 if let maskJPEG {
                     let mreq = PHAssetCreationRequest.forAsset()
                     mreq.addResource(with: .photo, fileURL: maskJPEG, options: opts)
@@ -1106,7 +1089,6 @@ final class CameraModel: NSObject, ObservableObject {
             }, completionHandler: { success, _ in
                 if let maskJPEG { try? FileManager.default.removeItem(at: maskJPEG) }
                 if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
-                if let dngPreviewJPEG { try? FileManager.default.removeItem(at: dngPreviewJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = preview
                     self.finish(success: success,

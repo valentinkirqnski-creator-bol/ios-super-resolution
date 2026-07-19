@@ -51,6 +51,19 @@ static inline float to_srgb_gamma(float v) {
     return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
 }
 
+// Python raw2rgb smoothstep (luma-preserving): base contrast before display gamma.
+static inline void apply_smoothstep_rgb(float& r, float& g, float& b) {
+    r = clampf(r, 0.f, 1.f);
+    g = clampf(g, 0.f, 1.f);
+    b = clampf(b, 0.f, 1.f);
+    const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    const float y2 = y * y * (3.f - 2.f * y);
+    const float s = (y > 1e-6f) ? (y2 / y) : 0.f;
+    r = clampf(r * s, 0.f, 1.f);
+    g = clampf(g * s, 0.f, 1.f);
+    b = clampf(b * s, 0.f, 1.f);
+}
+
 @implementation SRBridge
 
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
@@ -128,7 +141,8 @@ static inline float to_srgb_gamma(float v) {
         W <= 0 || H <= 0)
         return NO;
 
-    // Convert linear camera RGB → display sRGB (same as pipeline preview), then tone-map.
+    // Linear camera RGB → WB → cam→sRGB → smoothstep (Python-like base) → sRGB gamma,
+    // then Lightroom-style Highlights −100 / Shadows +60 / Contrast +5.
     std::vector<uint8_t> srgb((size_t)W * (size_t)H * 4);
     const size_t n = (size_t)W * (size_t)H;
     for (size_t i = 0; i < n; ++i) {
@@ -144,6 +158,7 @@ static inline float to_srgb_gamma(float v) {
         } else {
             sr = wr; sg = wg; sb = wb_;
         }
+        apply_smoothstep_rgb(sr, sg, sb);
         srgb[i * 4 + 0] = (uint8_t)std::lround(to_srgb_gamma(sr) * 255.f);
         srgb[i * 4 + 1] = (uint8_t)std::lround(to_srgb_gamma(sg) * 255.f);
         srgb[i * 4 + 2] = (uint8_t)std::lround(to_srgb_gamma(sb) * 255.f);
@@ -179,13 +194,21 @@ static inline float to_srgb_gamma(float v) {
         [hs setValue:@(0.6) forKey:@"inputShadowAmount"];
         if (hs.outputImage) image = hs.outputImage;
     }
+    // Contrast +5 on top of the smoothstep base; mild vibrance restores chroma
+    // crushed by shadow lift (saturation alone tends to look neon).
     CIFilter* cc = [CIFilter filterWithName:@"CIColorControls"];
     if (cc) {
         [cc setValue:image forKey:kCIInputImageKey];
         [cc setValue:@(1.05) forKey:kCIInputContrastKey];
         [cc setValue:@(0.0) forKey:kCIInputBrightnessKey];
-        [cc setValue:@(1.0) forKey:kCIInputSaturationKey];
+        [cc setValue:@(1.08) forKey:kCIInputSaturationKey];
         if (cc.outputImage) image = cc.outputImage;
+    }
+    CIFilter* vib = [CIFilter filterWithName:@"CIVibrance"];
+    if (vib) {
+        [vib setValue:image forKey:kCIInputImageKey];
+        [vib setValue:@(0.35) forKey:@"inputAmount"];
+        if (vib.outputImage) image = vib.outputImage;
     }
 
     CIContext* ctx = [CIContext contextWithOptions:@{

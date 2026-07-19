@@ -445,8 +445,8 @@ struct CameraView: View {
                     }
                     .pickerStyle(.segmented)
                     Text(cam.exportFormat == .dng
-                         ? "LinearRaw DNG + JPEG preview in Photos (open DNG in Lightroom for full edit)."
-                         : "Tone-mapped JPEG: WB + color matrix + gamma, then Highlights −100, Shadows +60, Contrast +5.")
+                         ? "LinearRaw DNG only (open in Lightroom / RAW apps; Photos may show a grey thumbnail)."
+                         : "Tone-mapped JPEG: WB + matrix + S-curve + gamma, then Highlights −100, Shadows +60, Contrast +5.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
