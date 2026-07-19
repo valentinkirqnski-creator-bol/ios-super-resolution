@@ -22,7 +22,8 @@ static constexpr uint32_t kCommitEveryChunks = 16;
 // Soft commit every N column strips in 2D FFT (no wait).
 static constexpr uint32_t kColCommitEvery = 32;
 // Max L2 tiles processed together (buffers scale with ntiles * N²).
-static constexpr uint32_t kL2TileChunk = 1024;
+// Larger chunks + dual-slot async (below) cut full-res 1× sync thrash.
+static constexpr uint32_t kL2TileChunk = 2048;
 
 static int next_pow2(int n) {
     int p = 1;
@@ -51,19 +52,16 @@ struct MetalCtx {
     int cache_inv = -1;
     id<MTLBuffer> cache_chirp = nil;
     id<MTLBuffer> cache_B = nil;
-    // Reused L2 working set (grow-only).
-    id<MTLBuffer> l2_ref_pad = nil;
-    id<MTLBuffer> l2_mov_patch = nil;
-    id<MTLBuffer> l2_rows = nil;
-    id<MTLBuffer> l2_F_ref = nil;
-    id<MTLBuffer> l2_F_mov = nil;
-    id<MTLBuffer> l2_cols = nil;
-    id<MTLBuffer> l2_full = nil;
-    id<MTLBuffer> l2_corr = nil;
-    id<MTLBuffer> l2_corr_shift = nil;
-    size_t l2_ref_pad_b = 0, l2_mov_patch_b = 0, l2_rows_b = 0;
-    size_t l2_F_ref_b = 0, l2_F_mov_b = 0, l2_cols_b = 0;
-    size_t l2_full_b = 0, l2_corr_b = 0, l2_corr_shift_b = 0;
+    // Dual L2 working sets (grow-only) so chunk N+1 can encode while N runs.
+    struct L2Scratch {
+        id<MTLBuffer> ref_pad = nil, mov_patch = nil, rows = nil;
+        id<MTLBuffer> F_ref = nil, F_mov = nil, cols = nil, full = nil;
+        id<MTLBuffer> corr = nil, corr_shift = nil;
+        size_t ref_pad_b = 0, mov_patch_b = 0, rows_b = 0;
+        size_t F_ref_b = 0, F_mov_b = 0, cols_b = 0, full_b = 0;
+        size_t corr_b = 0, corr_shift_b = 0;
+    };
+    L2Scratch l2[2];
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -418,12 +416,16 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h,
     return true;
 }
 
-// Run one L2 chunk: tile_base .. tile_base+tile_count-1 (local buffers sized to tile_count).
+// Run one L2 chunk: tile_base .. tile_base+tile_count-1 (buffers from scratch slot).
+// Commits asynchronously; caller waits before reusing the same slot.
 static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer> flow_b,
                      int ref_h, int ref_w, int mov_h, int mov_w,
                      int ts, int R, int N, int wh,
-                     uint32_t ny, uint32_t nx, uint32_t tile_base, uint32_t tile_count) {
+                     uint32_t ny, uint32_t nx, uint32_t tile_base, uint32_t tile_count,
+                     int slot, __strong id<MTLCommandBuffer>& out_cmd) {
     auto& c = ctx();
+    if (slot < 0 || slot > 1) return false;
+    MetalCtx::L2Scratch& s = c.l2[slot];
     const size_t tile_elems = (size_t)N * N;
     const size_t tile_bytes = tile_elems * sizeof(float);
     const size_t all_tiles = tile_bytes * tile_count;
@@ -438,15 +440,15 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
         uint32_t tile_base, tile_count;
     } P{ny, nx, ts, R, N, ref_h, ref_w, mov_h, mov_w, tile_base, tile_count};
 
-    id<MTLBuffer> ref_pad = c.scratch(c.l2_ref_pad, c.l2_ref_pad_b, all_tiles);
-    id<MTLBuffer> mov_patch = c.scratch(c.l2_mov_patch, c.l2_mov_patch_b, all_tiles);
-    id<MTLBuffer> rows = c.scratch(c.l2_rows, c.l2_rows_b, (size_t)row_batch * N * sizeof(float) * 2);
-    id<MTLBuffer> F_ref = c.scratch(c.l2_F_ref, c.l2_F_ref_b, half_c);
-    id<MTLBuffer> F_mov = c.scratch(c.l2_F_mov, c.l2_F_mov_b, half_c);
-    id<MTLBuffer> cols = c.scratch(c.l2_cols, c.l2_cols_b, (size_t)tile_count * wh * N * sizeof(float) * 2);
-    id<MTLBuffer> full = c.scratch(c.l2_full, c.l2_full_b, full_c);
-    id<MTLBuffer> corr = c.scratch(c.l2_corr, c.l2_corr_b, all_tiles);
-    id<MTLBuffer> corr_shift = c.scratch(c.l2_corr_shift, c.l2_corr_shift_b, all_tiles);
+    id<MTLBuffer> ref_pad = c.scratch(s.ref_pad, s.ref_pad_b, all_tiles);
+    id<MTLBuffer> mov_patch = c.scratch(s.mov_patch, s.mov_patch_b, all_tiles);
+    id<MTLBuffer> rows = c.scratch(s.rows, s.rows_b, (size_t)row_batch * N * sizeof(float) * 2);
+    id<MTLBuffer> F_ref = c.scratch(s.F_ref, s.F_ref_b, half_c);
+    id<MTLBuffer> F_mov = c.scratch(s.F_mov, s.F_mov_b, half_c);
+    id<MTLBuffer> cols = c.scratch(s.cols, s.cols_b, (size_t)tile_count * wh * N * sizeof(float) * 2);
+    id<MTLBuffer> full = c.scratch(s.full, s.full_b, full_c);
+    id<MTLBuffer> corr = c.scratch(s.corr, s.corr_b, all_tiles);
+    id<MTLBuffer> corr_shift = c.scratch(s.corr_shift, s.corr_shift_b, all_tiles);
     if (!ref_pad || !mov_patch || !rows || !F_ref || !F_mov || !cols || !full ||
         !corr || !corr_shift)
         return false;
@@ -602,8 +604,8 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc endEncoding];
 
     [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    out_cmd = cmd;
+    return true;
 }
 
 } // namespace
@@ -696,12 +698,32 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     if (!ref_img || !mov_img || !flow_b) return false;
 
+    // Ping-pong two L2 scratch sets. Bluestein (non-pow2 N) shares global FFT
+    // scratch — serialize those chunks. Pow2 N can fully overlap.
+    const bool bluestein = (N & (N - 1)) != 0;
+    __strong id<MTLCommandBuffer> pending[2] = {nil, nil};
+    int slot = 0;
+    auto wait_slot = [&](int s) -> bool {
+        if (!pending[s]) return true;
+        [pending[s] waitUntilCompleted];
+        const bool ok = (pending[s].status == MTLCommandBufferStatusCompleted);
+        pending[s] = nil;
+        return ok;
+    };
     for (uint32_t t0 = 0; t0 < ntiles; t0 += kL2TileChunk) {
         uint32_t tc = std::min(kL2TileChunk, ntiles - t0);
-        if (!l2_chunk(ref_img, mov_img, flow_b, ref.h, ref.w, moving.h, moving.w,
-                      ts, R, N, wh, (uint32_t)ny, (uint32_t)nx, t0, tc))
+        if (bluestein) {
+            if (!wait_slot(0) || !wait_slot(1)) return false;
+        } else if (!wait_slot(slot)) {
             return false;
+        }
+        if (!l2_chunk(ref_img, mov_img, flow_b, ref.h, ref.w, moving.h, moving.w,
+                      ts, R, N, wh, (uint32_t)ny, (uint32_t)nx, t0, tc,
+                      slot, pending[slot]))
+            return false;
+        slot ^= 1;
     }
+    if (!wait_slot(0) || !wait_slot(1)) return false;
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
     return true;
 }
@@ -733,11 +755,19 @@ struct MergeRefParamsCPU {
 };
 static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
 
-struct MergeAccState {
+// Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
+struct MergeAccSlot {
     id<MTLBuffer> num = nil;
     id<MTLBuffer> den = nil;
-    size_t capacity = 0; // allocated bytes
-    size_t bytes = 0;    // active band bytes
+    size_t capacity = 0;
+    size_t bytes = 0;
+};
+
+struct MergeInflight {
+    __strong id<MTLCommandBuffer> cmd = nil;
+    int slot = -1;
+    Image* num = nullptr;
+    Image* den = nullptr;
 };
 
 // One GPU-resident copy per comparison frame (keeps buffers across bands).
@@ -767,7 +797,10 @@ struct MergeRefGpu {
     size_t img_b = 0, cov_b = 0, acc_b = 0;
 };
 
-static MergeAccState g_merge_acc;
+static MergeAccSlot g_merge_acc[2];
+static int g_merge_write_slot = 0;
+static bool g_merge_need_zero = false;
+static MergeInflight g_merge_inflight;
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
 static __strong id<MTLCommandBuffer> g_merge_band_cmd = nil;
@@ -793,9 +826,19 @@ static bool merge_band_cmd_ensure() {
 }
 
 // One compute encoder for all comps + ref in a band (avoids N begin/end pairs).
+// Accumulators are zeroed with a blit on this CB (not a CPU memset).
 static bool merge_enc_ensure() {
     if (g_merge_enc) return true;
     if (!merge_band_cmd_ensure()) return false;
+    if (g_merge_need_zero) {
+        MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
+        id<MTLBlitCommandEncoder> blit = [g_merge_band_cmd blitCommandEncoder];
+        if (!blit) return false;
+        [blit fillBuffer:slot.num range:NSMakeRange(0, slot.bytes) value:0];
+        [blit fillBuffer:slot.den range:NSMakeRange(0, slot.bytes) value:0];
+        [blit endEncoding];
+        g_merge_need_zero = false;
+    }
     g_merge_enc = [g_merge_band_cmd computeCommandEncoder];
     return g_merge_enc != nil;
 }
@@ -1006,43 +1049,92 @@ static bool acquire_ref_gpu(const Image& img, const CovField& covs, const Image*
     return true;
 }
 
-// Grow-only GPU accumulators. Zero only at the start of a band (when CB is new).
-static bool ensure_acc_buffers(size_t nelem, bool zero) {
+static bool readback_slot(int slot_i, Image& num_band, Image& den_band);
+static bool metal_merge_wait_inflight_impl();
+
+// Grow-only per-slot GPU accumulators. Zero via blit when the band CB opens.
+static bool ensure_acc_buffers(size_t nelem, bool start_band) {
     const size_t bytes = nelem * sizeof(float);
     if (bytes == 0) return false;
     auto& c = ctx();
-    if (!g_merge_acc.num || !g_merge_acc.den || g_merge_acc.capacity < bytes) {
-        g_merge_acc.num = [c.device newBufferWithLength:bytes
-                                                options:MTLResourceStorageModeShared];
-        g_merge_acc.den = [c.device newBufferWithLength:bytes
-                                                options:MTLResourceStorageModeShared];
-        g_merge_acc.capacity = (g_merge_acc.num && g_merge_acc.den) ? bytes : 0;
-        if (!g_merge_acc.capacity) return false;
-        zero = true;
+    if (start_band) {
+        // New band: use the free slot (other may still be in flight for encode overlap).
+        g_merge_write_slot ^= 1;
+        // If this slot is still the in-flight target, wait it out first.
+        if (g_merge_inflight.cmd && g_merge_inflight.slot == g_merge_write_slot) {
+            if (!metal_merge_wait_inflight_impl()) return false;
+        }
+        g_merge_need_zero = true;
     }
-    g_merge_acc.bytes = bytes;
-    if (zero) {
-        memset([g_merge_acc.num contents], 0, bytes);
-        memset([g_merge_acc.den contents], 0, bytes);
+    MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
+    if (!slot.num || !slot.den || slot.capacity < bytes) {
+        slot.num = [c.device newBufferWithLength:bytes
+                                         options:MTLResourceStorageModeShared];
+        slot.den = [c.device newBufferWithLength:bytes
+                                         options:MTLResourceStorageModeShared];
+        slot.capacity = (slot.num && slot.den) ? bytes : 0;
+        if (!slot.capacity) return false;
+        g_merge_need_zero = true;
     }
+    slot.bytes = bytes;
     return true;
 }
 
-static bool readback_acc(Image& num_band, Image& den_band) {
-    if (!g_merge_acc.num || !g_merge_acc.den) return false;
-    const size_t bytes = g_merge_acc.bytes;
+static bool readback_slot(int slot_i, Image& num_band, Image& den_band) {
+    if (slot_i < 0 || slot_i > 1) return false;
+    MergeAccSlot& slot = g_merge_acc[slot_i];
+    if (!slot.num || !slot.den) return false;
+    const size_t bytes = slot.bytes;
     if (num_band.data.size() * sizeof(float) < bytes ||
         den_band.data.size() * sizeof(float) < bytes)
         return false;
-    memcpy(num_band.data.data(), [g_merge_acc.num contents], bytes);
-    memcpy(den_band.data.data(), [g_merge_acc.den contents], bytes);
+    memcpy(num_band.data.data(), [slot.num contents], bytes);
+    memcpy(den_band.data.data(), [slot.den contents], bytes);
     return true;
+}
+
+// Wait + readback the in-flight band into the Image* captured at commit time.
+static bool metal_merge_wait_inflight_impl() {
+    if (!g_merge_inflight.cmd) return true;
+    [g_merge_inflight.cmd waitUntilCompleted];
+    const bool ok = (g_merge_inflight.cmd.status == MTLCommandBufferStatusCompleted);
+    Image* num = g_merge_inflight.num;
+    Image* den = g_merge_inflight.den;
+    const int slot = g_merge_inflight.slot;
+    g_merge_inflight = {};
+    if (!ok || !num || !den) return false;
+    return readback_slot(slot, *num, *den);
 }
 
 } // namespace
 
 bool metal_merge_has_frame(int frame_id) {
     return merge_frame_resident(frame_id);
+}
+
+bool metal_merge_wait_inflight() {
+    return metal_merge_wait_inflight_impl();
+}
+
+void metal_merge_begin_burst() {
+    (void)metal_merge_wait_inflight_impl();
+    merge_band_cmd_reset();
+    g_merge_frames.clear();
+    g_merge_ref = {};
+    // First band XORs to slot 0.
+    g_merge_write_slot = 1;
+    g_merge_need_zero = false;
+    // Keep grow-only acc buffers; next ensure_acc will blit-zero.
+}
+
+bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
+                                const CovField& covs, const Image& robustness,
+                                int frame_id) {
+    if (!metal_gpu_init() || frame_id < 0) return false;
+    if (comp_raw.h <= 0 || comp_raw.w <= 0) return false;
+    id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil;
+    return acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
+                             b_img, b_flow, b_cov, b_rob);
 }
 
 bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
@@ -1055,12 +1147,8 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     if (!resident && (comp_raw.h <= 0 || comp_raw.w <= 0)) return false;
     auto& c = ctx();
 
-    // New merge pass (band 0, no open CB yet): drop previous shot's GPU frames.
+    // New band when no CB is open (previous band finished / burst begin).
     const bool start_band = (g_merge_band_cmd == nil);
-    if (y0 == 0 && start_band) {
-        g_merge_frames.clear();
-        g_merge_ref = {};
-    }
 
     if (!ensure_acc_buffers(num_band.data.size(), start_band)) return false;
 
@@ -1104,13 +1192,14 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.cov_w = hit->cov_w > 0 ? (uint32_t)hit->cov_w : 1u;
     }
 
+    MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
         merge_band_cmd_reset();
         return false;
     }
     id<MTLComputeCommandEncoder> enc = g_merge_enc;
-    [enc setBuffer:g_merge_acc.num offset:0 atIndex:0];
-    [enc setBuffer:g_merge_acc.den offset:0 atIndex:1];
+    [enc setBuffer:slot.num offset:0 atIndex:0];
+    [enc setBuffer:slot.den offset:0 atIndex:1];
     [enc setBuffer:b_img offset:0 atIndex:2];
     [enc setBuffer:b_flow offset:0 atIndex:3];
     [enc setBuffer:b_cov offset:0 atIndex:4];
@@ -1129,10 +1218,6 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     auto& c = ctx();
 
     const bool start_band = (g_merge_band_cmd == nil);
-    if (y0 == 0 && start_band) {
-        g_merge_frames.clear();
-        g_merge_ref = {};
-    }
 
     if (!ensure_acc_buffers(num_band.data.size(), start_band)) return false;
 
@@ -1165,13 +1250,14 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     p.cfa10 = cfg.cfa.p[1][0];
     p.cfa11 = cfg.cfa.p[1][1];
 
+    MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
         merge_band_cmd_reset();
         return false;
     }
     id<MTLComputeCommandEncoder> enc = g_merge_enc;
-    [enc setBuffer:g_merge_acc.num offset:0 atIndex:0];
-    [enc setBuffer:g_merge_acc.den offset:0 atIndex:1];
+    [enc setBuffer:slot.num offset:0 atIndex:0];
+    [enc setBuffer:slot.den offset:0 atIndex:1];
     [enc setBuffer:b_img offset:0 atIndex:2];
     [enc setBuffer:b_cov offset:0 atIndex:3];
     [enc setBuffer:b_acc offset:0 atIndex:4];
@@ -1180,12 +1266,21 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     merge_enc_close();
 
     [g_merge_band_cmd commit];
-    [g_merge_band_cmd waitUntilCompleted];
-    const bool ok = (g_merge_band_cmd.status == MTLCommandBufferStatusCompleted);
+    // Resolve any previous in-flight band now (GPU current keeps running).
+    if (g_merge_inflight.cmd) {
+        if (!metal_merge_wait_inflight_impl()) {
+            merge_band_cmd_reset();
+            return false;
+        }
+    }
+    g_merge_inflight.cmd = g_merge_band_cmd;
+    g_merge_inflight.slot = g_merge_write_slot;
+    g_merge_inflight.num = &num_band;
+    g_merge_inflight.den = &den_band;
     merge_band_cmd_reset();
-    if (!ok) return false;
-
-    return readback_acc(num_band, den_band);
+    // Caller must metal_merge_wait_inflight() before reading this band's host images,
+    // or start the next band (which resolves this one when the following ref commits).
+    return true;
 }
 
 } // namespace hhsr

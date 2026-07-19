@@ -92,26 +92,26 @@ struct Config {
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
 
-    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). configs/default.yaml.
+    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). App defaults.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    float r_t  = 0.12f;
-    float r_s1 = 2.0f;
-    float r_s2 = 12.0f;
-    float r_Mt = 0.80f;
+    float r_t  = 1.0f;
+    float r_s1 = 1.52f;
+    float r_s2 = 2.1f;
+    float r_Mt = 1.0f;
 
-    // accumulated_robustness_denoiser.merge (default.yaml: enabled False).
-    bool  accumulated_robustness_denoiser_enabled = false;
+    // accumulated_robustness_denoiser.merge
+    bool  accumulated_robustness_denoiser_enabled = true;
     float acc_rob_rad_max = 2.0f;
-    float acc_rob_max_multiplier = 8.0f;
-    float acc_rob_max_frame_count = 2.0f;
+    float acc_rob_max_multiplier = 1.8f;
+    float acc_rob_max_frame_count = 1.0f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;
-    bool  snr_auto_tune = true;
-    float k_detail  = 0.25f;  // overwritten by SNR lerp [0.33, 0.25]
-    float k_denoise = 4.0f;   // overwritten by SNR lerp [5.0, 3.0]
+    bool  snr_auto_tune = false;
+    float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
+    float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
     float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
     float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]
     float k_stretch = 4.0f;

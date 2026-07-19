@@ -1,6 +1,5 @@
 #import "SRBridge.h"
 #import <UIKit/UIKit.h>
-#import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
 
@@ -51,17 +50,25 @@ static inline float to_srgb_gamma(float v) {
     return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
 }
 
-// Python raw2rgb smoothstep (luma-preserving): base contrast before display gamma.
-static inline void apply_smoothstep_rgb(float& r, float& g, float& b) {
-    r = clampf(r, 0.f, 1.f);
-    g = clampf(g, 0.f, 1.f);
-    b = clampf(b, 0.f, 1.f);
+// Soft display S-curve: midtone contrast without the crunchy/halo look of
+// luma-preserving smoothstep + CIHighlightShadowAdjust.
+static inline float tone_s_curve(float v) {
+    v = clampf(v, 0.f, 1.f);
+    const float s = v * v * (3.f - 2.f * v);
+    return clampf(v * 0.42f + s * 0.58f, 0.f, 1.f);
+}
+
+// Mild chroma lift in display space (keeps neutrals, less dull than flat gamma).
+static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount) {
     const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-    const float y2 = y * y * (3.f - 2.f * y);
-    const float s = (y > 1e-6f) ? (y2 / y) : 0.f;
-    r = clampf(r * s, 0.f, 1.f);
-    g = clampf(g * s, 0.f, 1.f);
-    b = clampf(b * s, 0.f, 1.f);
+    const float mx = std::max(r, std::max(g, b));
+    const float mn = std::min(r, std::min(g, b));
+    const float sat = (mx > 1e-6f) ? (mx - mn) / mx : 0.f;
+    // Vibrance-like: boost low-sat more than already-vivid colors.
+    const float boost = 1.f + amount * (1.f - sat);
+    r = clampf(y + (r - y) * boost, 0.f, 1.f);
+    g = clampf(y + (g - y) * boost, 0.f, 1.f);
+    b = clampf(y + (b - y) * boost, 0.f, 1.f);
 }
 
 @implementation SRBridge
@@ -141,8 +148,9 @@ static inline void apply_smoothstep_rgb(float& r, float& g, float& b) {
         W <= 0 || H <= 0)
         return NO;
 
-    // Linear camera RGB → WB → cam→sRGB → smoothstep (Python-like base) → sRGB gamma,
-    // then Lightroom-style Highlights −100 / Shadows +60 / Contrast +5.
+    // Linear camera RGB → WB → cam→sRGB → sRGB gamma → soft S-curve → vibrance.
+    // No CIHighlightShadowAdjust / ColorControls (those washed midtones and
+    // added a crunchy, almost-sharpened look).
     std::vector<uint8_t> srgb((size_t)W * (size_t)H * 4);
     const size_t n = (size_t)W * (size_t)H;
     for (size_t i = 0; i < n; ++i) {
@@ -158,10 +166,21 @@ static inline void apply_smoothstep_rgb(float& r, float& g, float& b) {
         } else {
             sr = wr; sg = wg; sb = wb_;
         }
-        apply_smoothstep_rgb(sr, sg, sb);
-        srgb[i * 4 + 0] = (uint8_t)std::lround(to_srgb_gamma(sr) * 255.f);
-        srgb[i * 4 + 1] = (uint8_t)std::lround(to_srgb_gamma(sg) * 255.f);
-        srgb[i * 4 + 2] = (uint8_t)std::lround(to_srgb_gamma(sb) * 255.f);
+        // Soft highlight rolloff before gamma (keeps sparkle without clipping harsh).
+        auto rolloff = [](float v) {
+            if (v <= 1.f) return clampf(v, 0.f, 1.f);
+            return 1.f - 1.f / (1.f + (v - 1.f) * 2.5f);
+        };
+        sr = to_srgb_gamma(rolloff(sr));
+        sg = to_srgb_gamma(rolloff(sg));
+        sb = to_srgb_gamma(rolloff(sb));
+        sr = tone_s_curve(sr);
+        sg = tone_s_curve(sg);
+        sb = tone_s_curve(sb);
+        apply_vibrance_rgb(sr, sg, sb, 0.28f);
+        srgb[i * 4 + 0] = (uint8_t)std::lround(sr * 255.f);
+        srgb[i * 4 + 1] = (uint8_t)std::lround(sg * 255.f);
+        srgb[i * 4 + 2] = (uint8_t)std::lround(sb * 255.f);
         srgb[i * 4 + 3] = 255;
     }
     rgb.clear();
@@ -175,55 +194,12 @@ static inline void apply_smoothstep_rgb(float& r, float& g, float& b) {
     srgb.shrink_to_fit();
 
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-    CGImageRef cgIn = CGImageCreate(
+    CGImageRef cgOut = CGImageCreate(
         W, H, 8, 32, W * 4, cs,
         kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast,
         provider, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(cs);
-    if (!cgIn) return NO;
-
-    CIImage* image = [CIImage imageWithCGImage:cgIn];
-    CGImageRelease(cgIn);
-
-    // Highlights −100 / Shadows +60 (UI copy) via CIHighlightShadowAdjust.
-    CIFilter* hs = [CIFilter filterWithName:@"CIHighlightShadowAdjust"];
-    if (hs) {
-        [hs setValue:image forKey:kCIInputImageKey];
-        [hs setValue:@(1.0) forKey:@"inputHighlightAmount"];
-        [hs setValue:@(0.6) forKey:@"inputShadowAmount"];
-        if (hs.outputImage) image = hs.outputImage;
-    }
-    // Contrast +5 on top of the smoothstep base; mild vibrance restores chroma
-    // crushed by shadow lift (saturation alone tends to look neon).
-    CIFilter* cc = [CIFilter filterWithName:@"CIColorControls"];
-    if (cc) {
-        [cc setValue:image forKey:kCIInputImageKey];
-        [cc setValue:@(1.05) forKey:kCIInputContrastKey];
-        [cc setValue:@(0.0) forKey:kCIInputBrightnessKey];
-        [cc setValue:@(1.08) forKey:kCIInputSaturationKey];
-        if (cc.outputImage) image = cc.outputImage;
-    }
-    CIFilter* vib = [CIFilter filterWithName:@"CIVibrance"];
-    if (vib) {
-        [vib setValue:image forKey:kCIInputImageKey];
-        [vib setValue:@(0.35) forKey:@"inputAmount"];
-        if (vib.outputImage) image = vib.outputImage;
-    }
-
-    CIContext* ctx = [CIContext contextWithOptions:@{
-        kCIContextUseSoftwareRenderer: @NO,
-        kCIContextWorkingColorSpace: [NSNull null]
-    }];
-    CGColorSpaceRef outCS = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGImageRef cgOut = [ctx createCGImage:image
-                                 fromRect:image.extent
-                                   format:kCIFormatBGRA8
-                               colorSpace:outCS ? outCS : nil];
-    if (outCS) CGColorSpaceRelease(outCS);
-    if (!cgOut) {
-        cgOut = [ctx createCGImage:image fromRect:image.extent];
-    }
     if (!cgOut) return NO;
 
     NSURL* url = [NSURL fileURLWithPath:jpgPath];

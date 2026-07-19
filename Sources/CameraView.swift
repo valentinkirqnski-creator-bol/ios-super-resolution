@@ -446,7 +446,7 @@ struct CameraView: View {
                     .pickerStyle(.segmented)
                     Text(cam.exportFormat == .dng
                          ? "LinearRaw DNG only (open in Lightroom / RAW apps; Photos may show a grey thumbnail)."
-                         : "Tone-mapped JPEG: WB + matrix + S-curve + gamma, then Highlights −100, Shadows +60, Contrast +5.")
+                         : "Tone-mapped JPEG: WB + matrix + sRGB gamma + soft S-curve + vibrance (no shadow lift / sharpen).")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -480,7 +480,7 @@ struct CameraView: View {
 
                 Section {
                     Button("Reset") {
-                        cam.tuningParams = .ghostReductionPreset
+                        cam.tuningParams = .appDefaults
                     }
                 }
             }

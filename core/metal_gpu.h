@@ -41,4 +41,18 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
 // True if this comparison frame's RAW/flow/cov/R already reside on the GPU.
 bool metal_merge_has_frame(int frame_id);
 
+// Upload one comparison frame into the GPU merge cache (no accumulate).
+// Call before the band loop so band 0 is not stalled on PCIe copies.
+bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
+                                const CovField& covs, const Image& robustness,
+                                int frame_id);
+
+// Drop previous burst's GPU merge cache (call once before prefetching a new shot).
+void metal_merge_begin_burst();
+
+// merge_ref_band_metal commits asynchronously and resolves any *previous* in-flight
+// band into its host images (so encode can overlap the next GPU band). Call this
+// to wait + readback the latest band before using its num/den. No-op if idle.
+bool metal_merge_wait_inflight();
+
 } // namespace hhsr

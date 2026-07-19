@@ -288,7 +288,9 @@ void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     const Image* acc_rob) {
 #ifdef __APPLE__
     // Metal GPU only — same Alg. 11 math (accumulated-robustness denoise unchanged).
-    if (!merge_ref_band_metal(ref_raw, covs, num_band, den_band, y0, cfg, acc_rob)) {
+    // merge_ref_band_metal commits async; wait so num/den are filled for sync callers.
+    if (!merge_ref_band_metal(ref_raw, covs, num_band, den_band, y0, cfg, acc_rob) ||
+        !metal_merge_wait_inflight()) {
         return;
     }
 #else

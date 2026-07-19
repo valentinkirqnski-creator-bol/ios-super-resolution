@@ -58,36 +58,25 @@ enum LensZoomMode: Equatable {
 }
 
 /// Holds the C++ algorithm tuning parameters for live adjustments.
-/// Defaults match configs/default.yaml / core/types.h.
 struct TuningParams: Equatable, Codable {
-    var r_t: Float = 0.12
-    var r_s1: Float = 2.0
-    var r_s2: Float = 12.0
-    var r_Mt: Float = 0.80
-    var k_detail: Float = 0.25
-    var k_denoise: Float = 4.0
+    var r_t: Float = 1.0
+    var r_s1: Float = 1.52
+    var r_s2: Float = 2.1
+    var r_Mt: Float = 1.0
+    var k_detail: Float = 0.17
+    var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
-    var snr_auto_tune: Bool = true
-    var accumulated_robustness_denoiser_enabled: Bool = false
+    var snr_auto_tune: Bool = false
+    var accumulated_robustness_denoiser_enabled: Bool = true
     var acc_rob_rad_max: Float = 2.0
-    var acc_rob_max_multiplier: Float = 8.0
-    var acc_rob_max_frame_count: Float = 2.0
+    var acc_rob_max_multiplier: Float = 1.8
+    var acc_rob_max_frame_count: Float = 1.0
 
-    /// Aggressive motion-ghost preset used by the settings Reset button.
-    static let ghostReductionPreset = TuningParams(
-        r_t: 1.00,
-        r_s1: 0.25,
-        r_s2: 2.5,
-        r_Mt: 0.80,
-        k_detail: 0.20,
-        k_denoise: 0.0,
-        k_stretch: 4.0,
-        snr_auto_tune: false,
-        accumulated_robustness_denoiser_enabled: true,
-        acc_rob_rad_max: 2.0,
-        acc_rob_max_multiplier: 5.2,
-        acc_rob_max_frame_count: 2.0
-    )
+    /// App defaults — also applied by the settings Reset button.
+    static let appDefaults = TuningParams()
+
+    /// Legacy name used by the Reset button.
+    static let ghostReductionPreset = TuningParams.appDefaults
 }
 
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
@@ -123,11 +112,22 @@ final class CameraModel: NSObject, ObservableObject {
     }
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
+        // Bump when app defaults change so existing installs pick up the new preset once.
+        let defaultsVersion = 3
+        let verKey = "TuningParamsDefaultsVersion"
+        if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
+            UserDefaults.standard.set(defaultsVersion, forKey: verKey)
+            let params = TuningParams.appDefaults
+            if let data = try? JSONEncoder().encode(params) {
+                UserDefaults.standard.set(data, forKey: "TuningParams")
+            }
+            return params
+        }
         if let data = UserDefaults.standard.data(forKey: "TuningParams"),
            let params = try? JSONDecoder().decode(TuningParams.self, from: data) {
             return params
         }
-        return TuningParams()
+        return TuningParams.appDefaults
     }() {
         didSet {
             if let data = try? JSONEncoder().encode(tuningParams) {
@@ -147,8 +147,8 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    // Shutter: Auto (A), or manual via log-scaled slider (0…1).
-    @Published var shutterIsAuto = false
+    // Shutter: Auto (A), or manual via log-scaled slider (0…1). Default = AE on.
+    @Published var shutterIsAuto = true
     @Published var shutterSlider: Double = 0.5
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
@@ -183,6 +183,8 @@ final class CameraModel: NSObject, ObservableObject {
     private var captureKind: CaptureKind = .none
     private var zslWanted = false
     private var zslCapturing = false
+    /// True while a burst is capturing/processing — ZSL ring + system ZSL stay off.
+    private var zslPausedForPipeline = false
     private var zslRing: [URL] = []
     private var zslDir: URL?
     private var zslSeq = 0
@@ -303,6 +305,18 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func applyZSLMode() {
         // System ZSL cuts first-frame latency; our disk ring holds the multi-frame burst.
+        // Never run the ring while a burst is in flight.
+        if zslPausedForPipeline {
+            zslWanted = zslEnabled
+            if #available(iOS 17.0, *) {
+                photoOutput.isZeroShutterLagEnabled = false
+            }
+            if !zslEnabled {
+                clearZSLRing()
+                DispatchQueue.main.async { self.zslBufferReady = 0 }
+            }
+            return
+        }
         if #available(iOS 17.0, *) {
             photoOutput.isZeroShutterLagEnabled = zslEnabled
         }
@@ -315,6 +329,33 @@ final class CameraModel: NSObject, ObservableObject {
             clearZSLRing()
             DispatchQueue.main.async { self.zslBufferReady = 0 }
         }
+    }
+
+    /// Stop continuous ZSL capture (app ring + system flag) for the whole process window.
+    private func pauseZSLForProcessing() {
+        zslPausedForPipeline = true
+        zslCapturing = false
+        if captureKind == .zsl { captureKind = .none }
+        if #available(iOS 17.0, *) {
+            photoOutput.isZeroShutterLagEnabled = false
+        }
+    }
+
+    /// Re-enable ZSL only after capture + merge (+ Photos save) fully finish.
+    private func resumeZSLAfterProcessing() {
+        zslPausedForPipeline = false
+        pipelineBusy = false
+        captureKind = .none
+        guard zslEnabled else {
+            zslWanted = false
+            return
+        }
+        zslWanted = true
+        if #available(iOS 17.0, *) {
+            photoOutput.isZeroShutterLagEnabled = true
+        }
+        ensureZSLDir()
+        scheduleNextZSL()
     }
 
     private func ensureZSLDir() {
@@ -340,7 +381,8 @@ final class CameraModel: NSObject, ObservableObject {
 
     /// Keep at most `activeFrameCount` Apple RAW DNGs on disk; oldest dropped.
     private func pumpZSL() {
-        guard zslWanted, isAppActive, !previewSuspended, !pipelineBusy, !zslCapturing else { return }
+        guard zslWanted, isAppActive, !previewSuspended,
+              !pipelineBusy, !zslPausedForPipeline, !zslCapturing else { return }
         guard cachedRawPixelFormat != nil
                 || photoOutput.availableRawPhotoPixelFormatTypes.first != nil else { return }
         ensureZSLDir()
@@ -351,9 +393,14 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func scheduleNextZSL() {
-        // Pace captures (~8–12 fps max) to limit thermal / NAND pressure.
-        sessionQueue.asyncAfter(deadline: .now() + 0.09) { [weak self] in
-            self?.pumpZSL()
+        guard zslWanted, !pipelineBusy, !zslPausedForPipeline else { return }
+        // Fill quickly, then refresh slower once primed so continuous DNG writes
+        // don't thermally throttle the following LibRaw + Metal merge.
+        let primed = zslRing.count >= activeFrameCount
+        let delay = primed ? 0.28 : 0.09
+        sessionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
+            self.pumpZSL()
         }
     }
 
@@ -655,11 +702,12 @@ final class CameraModel: NSObject, ObservableObject {
 
         sessionQueue.async(qos: .userInteractive) {
             self.pipelineBusy = true
+            self.pauseZSLForProcessing()
             if self.cachedRawPixelFormat == nil {
                 self.cachedRawPixelFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first
             }
             guard self.cachedRawPixelFormat != nil else {
-                self.pipelineBusy = false
+                self.resumeZSLAfterProcessing()
                 DispatchQueue.main.async {
                     self.isBusy = false
                     self.isCapturing = false
@@ -668,45 +716,33 @@ final class CameraModel: NSObject, ObservableObject {
                 return
             }
 
-            // ZSL path: take the last N frames already buffered — no post-shutter hold.
-            if self.zslWanted && self.zslRing.count >= self.activeFrameCount {
+            // ZSL path: process ring DNGs in place (no copyItem — that was the slow path).
+            if self.zslEnabled && self.zslRing.count >= self.activeFrameCount {
                 self.zslCapturing = false
                 self.captureKind = .none
+                let n = self.activeFrameCount
+                let take = Array(self.zslRing.suffix(n))
+                self.zslRing.removeLast(n)
+                let readyLeft = self.zslRing.count
+                // Output-only folder (inputs stay in the ZSL ring dir until processBurst cleans up).
                 self.ensureReadyBurstDir()
                 guard let dir = self.readyBurstDir else {
-                    self.pipelineBusy = false
+                    // Put frames back so the buffer is not lost on folder failure.
+                    self.zslRing.append(contentsOf: take)
+                    self.resumeZSLAfterProcessing()
                     DispatchQueue.main.async {
                         self.isBusy = false
                         self.isCapturing = false
+                        self.zslBufferReady = self.zslRing.count
                         self.statusText = "Could not create capture folder"
                     }
                     return
                 }
                 self.burstDir = dir
                 self.readyBurstDir = nil
-                let take = Array(self.zslRing.suffix(self.activeFrameCount))
-                self.capturedDNGs.removeAll(keepingCapacity: true)
-                for (i, src) in take.enumerated() {
-                    let dst = dir.appendingPathComponent("frame_\(i).dng")
-                    do {
-                        if FileManager.default.fileExists(atPath: dst.path) {
-                            try FileManager.default.removeItem(at: dst)
-                        }
-                        try FileManager.default.copyItem(at: src, to: dst)
-                        self.capturedDNGs.append(dst)
-                    } catch {
-                        self.pipelineBusy = false
-                        DispatchQueue.main.async {
-                            self.isBusy = false
-                            self.isCapturing = false
-                            self.statusText = "ZSL copy failed"
-                        }
-                        return
-                    }
-                }
-                self.lockForBurst()
-                self.unlockAfterBurst()
+                self.capturedDNGs = take
                 DispatchQueue.main.async {
+                    self.zslBufferReady = readyLeft
                     self.statusText = "ZSL \(take.count) frames · \(lens)"
                     self.progress = 0.12
                     self.isCapturing = false
@@ -723,7 +759,7 @@ final class CameraModel: NSObject, ObservableObject {
 
             self.ensureReadyBurstDir()
             guard let dir = self.readyBurstDir else {
-                self.pipelineBusy = false
+                self.resumeZSLAfterProcessing()
                 DispatchQueue.main.async {
                     self.isBusy = false
                     self.isCapturing = false
@@ -754,10 +790,9 @@ final class CameraModel: NSObject, ObservableObject {
             self.capturesProcessed = self.currentBurstTotal
             self.capturedDNGs.removeAll(keepingCapacity: true)
             self.captureKind = .none
-            self.pipelineBusy = false
             self.removeBurstDir(dir)
             self.ensureReadyBurstDir()
-            if self.zslWanted { self.scheduleNextZSL() }
+            self.resumeZSLAfterProcessing()
             if let d = self.device, (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
@@ -944,6 +979,7 @@ final class CameraModel: NSObject, ObservableObject {
 
         var preview: UIImage?
         let cropFactor = Int32(lensZoomMode.cropFactor)
+        let inputURLs = capturedDNGs
         let ok = SRBridge.processDNGs(
             paths,
             toPath: outURL.path,
@@ -960,6 +996,11 @@ final class CameraModel: NSObject, ObservableObject {
         )
 
         capturedDNGs.removeAll()
+        // Free ZSL ring inputs (and non-ZSL frame_*.dng) as soon as LibRaw is done.
+        // Non-ZSL files also live under burstDir; removeBurstDir later is then cheaper.
+        for u in inputURLs {
+            try? FileManager.default.removeItem(at: u)
+        }
 
         if ok {
             let robURL = URL(fileURLWithPath:
@@ -1113,9 +1154,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.statusText = message
         }
         sessionQueue.async {
-            self.pipelineBusy = false
-            self.captureKind = .none
-            if self.zslWanted { self.scheduleNextZSL() }
+            self.resumeZSLAfterProcessing()
         }
     }
 }
@@ -1170,8 +1209,12 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
         defer {
             zslCapturing = false
             if captureKind == .zsl { captureKind = .none }
-            scheduleNextZSL()
+            // Never keep pumping while a burst is processing.
+            if !pipelineBusy && !zslPausedForPipeline {
+                scheduleNextZSL()
+            }
         }
+        if pipelineBusy || zslPausedForPipeline { return }
         if error != nil || !photo.isRawPhoto { return }
         guard let dir = zslDir else { return }
         autoreleasepool {

@@ -1,5 +1,6 @@
-// Disk-backed burst processing for memory-constrained mobile targets (iOS).
-// Peak RAM ≈ 1 reference frame + 1 comparison frame + 1 frame's analysis + band buffers.
+// Burst processing for memory-constrained mobile targets (iOS).
+// ≤8 comps: keep RAW+analysis in RAM. Larger bursts: spill Bayer to disk only.
+// On Apple, frames are prefetched to the GPU before the merge band loop.
 #include "pipeline.h"
 #include "stages.h"
 #include "dng_writer.h"
@@ -22,43 +23,6 @@ namespace fs = std::filesystem;
 namespace hhsr {
 
 namespace {
-
-static bool save_flow(const fs::path& p, const FlowField& f) {
-    int32_t hdr[2] = {f.ny, f.nx};
-    std::ofstream out(p, std::ios::binary);
-    if (!out) return false;
-    out.write((const char*)hdr, sizeof(hdr));
-    out.write((const char*)f.flow.data(), (std::streamsize)(f.flow.size() * sizeof(f32)));
-    return out.good();
-}
-
-static bool load_flow(const fs::path& p, FlowField& f) {
-    int32_t hdr[2];
-    std::ifstream in(p, std::ios::binary);
-    if (!in || !in.read((char*)hdr, sizeof(hdr))) return false;
-    f = FlowField(hdr[0], hdr[1]);
-    return (bool)in.read((char*)f.flow.data(), (std::streamsize)(f.flow.size() * sizeof(f32)));
-}
-
-static bool save_covs(const fs::path& p, const CovField& c) {
-    int32_t hdr[2] = {c.h, c.w};
-    std::vector<f32> payload;
-    payload.reserve(2 + c.cov.size());
-    // write header then data in one file
-    std::ofstream out(p, std::ios::binary);
-    if (!out) return false;
-    out.write((const char*)hdr, sizeof(hdr));
-    out.write((const char*)c.cov.data(), (std::streamsize)(c.cov.size() * sizeof(f32)));
-    return out.good();
-}
-
-static bool load_covs(const fs::path& p, CovField& c) {
-    int32_t hdr[2];
-    std::ifstream in(p, std::ios::binary);
-    if (!in || !in.read((char*)hdr, sizeof(hdr))) return false;
-    c = CovField(hdr[0], hdr[1]);
-    return (bool)in.read((char*)c.cov.data(), (std::streamsize)(c.cov.size() * sizeof(f32)));
-}
 
 static bool save_image(const fs::path& p, const Image& im) {
     int32_t hdr[3] = {im.h, im.w, im.c};
@@ -94,30 +58,8 @@ struct CachedCompMeta {
     int index = 0;
 };
 
-static bool load_cached_comp_meta(const fs::path& cache, int k, CachedCompMeta& out) {
-    std::string idx = std::to_string(k);
-    fs::path fflow = cache / ("f" + idx + ".flow");
-    if (!fs::exists(fflow)) return false;
-    out.index = k;
-    return load_flow(fflow, out.flow) &&
-           load_image(cache / ("f" + idx + ".rob"), out.rob) &&
-           load_covs(cache / ("f" + idx + ".cov"), out.covs);
-}
-
 static bool load_cached_comp_raw(const fs::path& cache, int k, Image& comp) {
     return load_image(cache / ("f" + std::to_string(k) + ".raw"), comp) && comp.h > 0;
-}
-
-static bool load_cached_comp(const fs::path& cache, int k, CachedCompFrame& out) {
-    std::string idx = std::to_string(k);
-    fs::path fflow = cache / ("f" + idx + ".flow");
-    if (!fs::exists(fflow)) return false;
-    out.index = k;
-    return load_flow(fflow, out.flow) &&
-           load_image(cache / ("f" + idx + ".rob"), out.rob) &&
-           load_covs(cache / ("f" + idx + ".cov"), out.covs) &&
-           load_image(cache / ("f" + idx + ".raw"), out.comp) &&
-           out.comp.h > 0;
 }
 
 static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) {
@@ -231,16 +173,25 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);
 
-    // Reference Bayer not needed during comparison analysis — reload for merge pass.
-    ref = Image();
+    // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
+    // Peak during analyze ≈ ref + one comparison frame.
 
     fs::path cache = fs::path(dng_path).parent_path() /
                      (fs::path(dng_path).stem().string() + "_cache");
     std::error_code ec;
     fs::remove_all(cache, ec);
-    fs::create_directories(cache, ec);
 
-    // Pass 1 — analyze one comparison frame at a time; persist analysis to disk.
+    // Keep analysis in RAM. Only spill RAW to disk when the burst is large.
+    // (Old path wrote everything to disk then re-read it — that was "Loading frames".)
+    std::vector<CachedCompFrame> cached;
+    std::vector<CachedCompMeta> cached_meta;
+    const bool stream_comp_raw = (n - 1) > 8; // ≤8 frames: full RAM path
+    if (stream_comp_raw)
+        fs::create_directories(cache, ec);
+
+    cached.reserve((size_t)std::max(0, n - 1));
+    cached_meta.reserve((size_t)std::max(0, n - 1));
+
     int n_comp_ok = 0;
     for (int k = 1; k < n; ++k) {
         report("Frame " + std::to_string(k + 1) + ": analyze",
@@ -253,25 +204,34 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         CovField covs = estimate_kernels(comp, work);
-
-        std::string idx = std::to_string(k);
-        if (!save_flow(cache / ("f" + idx + ".flow"), flow) ||
-            !save_image(cache / ("f" + idx + ".rob"), rob) ||
-            !save_covs(cache / ("f" + idx + ".cov"), covs) ||
-            !save_image(cache / ("f" + idx + ".raw"), comp)) {
-            comp = Image();
-            continue;
-        }
-        n_comp_ok++;
-        comp = Image();
         comp_grey = Image();
-        flow = FlowField();
-        rob = Image();
-        covs = CovField();
+
+        if (stream_comp_raw) {
+            // Spill Bayer only; keep flow/R/cov in RAM (small vs RAW).
+            if (!save_image(cache / ("f" + std::to_string(k) + ".raw"), comp)) {
+                continue;
+            }
+            CachedCompMeta meta;
+            meta.index = k;
+            meta.flow = std::move(flow);
+            meta.rob = std::move(rob);
+            meta.covs = std::move(covs);
+            cached_meta.push_back(std::move(meta));
+            n_comp_ok++;
+        } else {
+            CachedCompFrame fc;
+            fc.index = k;
+            fc.flow = std::move(flow);
+            fc.rob = std::move(rob);
+            fc.covs = std::move(covs);
+            fc.comp = std::move(comp);
+            cached.push_back(std::move(fc));
+            n_comp_ok++;
+        }
     }
 
     if (n_comp_ok < 1) {
-        fs::remove_all(cache, ec);
+        if (stream_comp_raw) fs::remove_all(cache, ec);
         report("Error: could not analyze comparison frames", 1.f);
         return Image();
     }
@@ -281,42 +241,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     ref_pyr = Pyramid();
     ref_stats = RefStats();
 
-    report("Loading frames for merge", 0.44f);
-    ref = load_raw_frame(paths[0], work, false, ref_h, ref_w);
     if (ref.h <= 0) {
-        fs::remove_all(cache, ec);
-        report("Error: could not reload reference frame", 1.f);
+        if (stream_comp_raw) fs::remove_all(cache, ec);
+        report("Error: reference frame missing for merge", 1.f);
         return Image();
-    }
-
-    std::vector<CachedCompFrame> cached;
-    std::vector<CachedCompMeta> cached_meta;
-    const bool stream_comp_raw = (n - 1) > 4; // 6+ frames: stream; ≤5 uses fast preload
-
-    if (stream_comp_raw) {
-        cached_meta.reserve(n - 1);
-        for (int k = 1; k < n; ++k) {
-            CachedCompMeta meta;
-            if (load_cached_comp_meta(cache, k, meta))
-                cached_meta.push_back(std::move(meta));
-        }
-        if (cached_meta.empty()) {
-            fs::remove_all(cache, ec);
-            report("Error: could not load cached frames", 1.f);
-            return Image();
-        }
-    } else {
-        cached.reserve(n - 1);
-        for (int k = 1; k < n; ++k) {
-            CachedCompFrame fc;
-            if (load_cached_comp(cache, k, fc))
-                cached.push_back(std::move(fc));
-        }
-        if (cached.empty()) {
-            fs::remove_all(cache, ec);
-            report("Error: could not load cached frames", 1.f);
-            return Image();
-        }
     }
 
     const int Hs = (int)std::lround(work.scale * ref.h);
@@ -337,7 +265,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                      work.white_balance,
                      work.bake_srgb, make,
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
-        fs::remove_all(cache, ec);
+        if (stream_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
         return Image();
     }
@@ -348,8 +276,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     Image preview(ph, pw, 3);
 
     // Larger bands on Apple → fewer GPU sync/readback round-trips.
+    // 1× (~8k wide) needs more budget than 2× crop to stay at ~2–3 bands.
 #if defined(__APPLE__)
-    const size_t band_budget = 128u * 1024u * 1024u;
+    const size_t band_budget = 256u * 1024u * 1024u;
 #else
     const size_t band_budget = 64u * 1024u * 1024u;
 #endif
@@ -358,33 +287,110 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     band_rows = std::min(band_rows, Hs);
     std::vector<uint16_t> row16((size_t)band_rows * Ws * 3);
 
-    AccumDiag diag;
-    // Reused across bands (GPU zeros its own accumulators).
-    Image num_band, den_band;
-    // One scratch for streaming first-upload only (6+ frames).
     Image comp_scratch;
+#if defined(__APPLE__)
+    // Upload all comparison frames to GPU before the band loop so merge isn't
+    // stalled on the first band's PCIe copies.
+    report("Preparing GPU merge", 0.46f);
+    metal_merge_begin_burst();
+    if (stream_comp_raw) {
+        for (const CachedCompMeta& meta : cached_meta) {
+            if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+            metal_merge_prefetch_frame(comp_scratch, meta.flow, meta.covs, meta.rob,
+                                       meta.index);
+        }
+        comp_scratch = Image(); // free host RAW; GPU holds copies
+    } else {
+        for (CachedCompFrame& fc : cached) {
+            if (metal_merge_prefetch_frame(fc.comp, fc.flow, fc.covs, fc.rob, fc.index))
+                fc.comp = Image(); // host RAW freed; GPU holds the copy
+        }
+    }
+#endif
+
+    AccumDiag diag;
+#if defined(__APPLE__)
+    // Double-buffer host bands: while GPU runs band N, CPU encodes band N-1.
+    Image num_bands[2], den_bands[2];
+    int cur = 0;
+    bool have_ready = false;
+    int ready = 0, ready_y0 = 0, ready_bh = 0;
+    report("Merging output", 0.48f);
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
+        cur ^= 1;
+        Image& num_band = num_bands[cur];
+        Image& den_band = den_bands[cur];
         if (num_band.h != bh || num_band.w != Ws || num_band.c != nch) {
             num_band = Image(bh, Ws, nch);
             den_band = Image(bh, Ws, nch);
-        } else {
-            // CPU merge uses += ; Metal zeros GPU-side — keep host clear either way.
-            std::fill(num_band.data.begin(), num_band.data.end(), 0.f);
-            std::fill(den_band.data.begin(), den_band.data.end(), 0.f);
         }
 
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
-#if defined(__APPLE__)
-                // After band 0, RAW/flow/cov/R already live on the GPU — skip disk I/O.
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
                     merge_comp_band(empty, meta.flow, meta.covs, meta.rob, tile_size,
                                     num_band, den_band, y0, work, meta.index);
                     continue;
                 }
-#endif
+                if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
+                                num_band, den_band, y0, work, meta.index);
+            }
+        } else {
+            for (const CachedCompFrame& fc : cached) {
+                if (metal_merge_has_frame(fc.index)) {
+                    Image empty;
+                    merge_comp_band(empty, fc.flow, fc.covs, fc.rob, tile_size,
+                                    num_band, den_band, y0, work, fc.index);
+                    continue;
+                }
+                if (fc.comp.h <= 0) continue;
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
+                                num_band, den_band, y0, work, fc.index);
+            }
+        }
+
+        // Async commit; resolves previous in-flight band into its host images.
+        if (!merge_ref_band_metal(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr))
+            continue;
+
+        if (have_ready) {
+            Image& rn = num_bands[ready];
+            Image& rd = den_bands[ready];
+            encode_band_rows(rn, rd, ready_y0, ready_bh, work, nch, preview, pscale, ph, pw, Ws, row16);
+            writer.write_rows(row16.data(), ready_bh);
+            report("Merging output", 0.48f + 0.50f * (float)(ready_y0 + ready_bh) / Hs);
+        }
+        ready = cur;
+        ready_y0 = y0;
+        ready_bh = bh;
+        have_ready = true;
+    }
+    if (have_ready && metal_merge_wait_inflight()) {
+        Image& rn = num_bands[ready];
+        Image& rd = den_bands[ready];
+        accumulate_diag(rn, rd, diag);
+        encode_band_rows(rn, rd, ready_y0, ready_bh, work, nch, preview, pscale, ph, pw, Ws, row16);
+        writer.write_rows(row16.data(), ready_bh);
+        report("Merging output", 0.48f + 0.50f * (float)(ready_y0 + ready_bh) / Hs);
+    }
+#else
+    Image num_band, den_band;
+    report("Merging output", 0.48f);
+    for (int y0 = 0; y0 < Hs; y0 += band_rows) {
+        const int bh = std::min(band_rows, Hs - y0);
+        if (num_band.h != bh || num_band.w != Ws || num_band.c != nch) {
+            num_band = Image(bh, Ws, nch);
+            den_band = Image(bh, Ws, nch);
+        } else {
+            std::fill(num_band.data.begin(), num_band.data.end(), 0.f);
+            std::fill(den_band.data.begin(), den_band.data.end(), 0.f);
+        }
+
+        if (stream_comp_raw) {
+            for (const CachedCompMeta& meta : cached_meta) {
                 if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
                                 num_band, den_band, y0, work, meta.index);
@@ -396,12 +402,14 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
-        accumulate_diag(num_band, den_band, diag);
+        if (y0 + bh >= Hs)
+            accumulate_diag(num_band, den_band, diag);
 
         encode_band_rows(num_band, den_band, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), bh);
         report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
     }
+#endif
 
     writer.close();
     if (work.robustness_save_mask && have_acc_rob) {
@@ -412,7 +420,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     cached_meta.clear();
     ref = Image();
     ref_covs = CovField();
-    fs::remove_all(cache, ec);
+    if (stream_comp_raw) fs::remove_all(cache, ec);
     report(format_accum_diag(diag), 0.99f);
     report("Done", 1.f);
     return preview;
