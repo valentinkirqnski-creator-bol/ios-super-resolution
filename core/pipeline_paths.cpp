@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cmath>
 #include <future>
+#include <memory>
 #if defined(__APPLE__)
 #include <thread>
 #endif
@@ -230,18 +231,29 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     cached.reserve((size_t)std::max(0, n - 1));
     cached_meta.reserve((size_t)std::max(0, n - 1));
 
-    // Prefetch next LibRaw decode only on lighter crops (2×).
-    const bool prefetch_next = !full_res;
+    // Prefetch next LibRaw decode: 2× during whole analyze; 1× only after grey
+    // is freed (overlaps rob/kernels, +1 Bayer peak briefly).
     int pref_k = -1;
     std::future<Image> pref_fut;
-
+    std::future<bool> spill_fut;
+    bool spill_pending = false;
     int n_comp_ok = 0;
+    auto drain_spill = [&]() {
+        if (!spill_fut.valid()) return;
+        const bool ok = spill_fut.get();
+        if (!ok && spill_pending && !cached_meta.empty()) {
+            cached_meta.pop_back();
+            n_comp_ok = std::max(0, n_comp_ok - 1);
+        }
+        spill_pending = false;
+    };
     for (int k = 1; k < n; ++k) {
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.08f + 0.35f * (float)(k - 1) / std::max(1, n - 1));
+        drain_spill();
 
         Image comp;
-        if (prefetch_next && pref_k == k && pref_fut.valid()) {
+        if (pref_k == k && pref_fut.valid()) {
             comp = pref_fut.get();
             pref_k = -1;
         } else {
@@ -249,8 +261,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
         if (comp.h <= 0) continue;
 
-        // Kick next decode while this frame runs on CPU/GPU (2× only).
-        if (prefetch_next && k + 1 < n) {
+        // 2×: decode next during align. 1×: wait until after grey (lower peak).
+        if (!full_res && k + 1 < n) {
             const int nk = k + 1;
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
@@ -262,9 +274,19 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         comp_grey = Image(); // free before robustness/kernels peak
 
+        // Full-res: decode next while Metal rob/kernels run (grey already freed).
+        if (full_res && k + 1 < n) {
+            const int nk = k + 1;
+            pref_k = nk;
+            pref_fut = std::async(std::launch::async, [&, nk]() {
+                return load_raw_frame(paths[nk], work, false, ref_h, ref_w);
+            });
+        }
+
         Image rob;
         CovField covs;
         if (full_res) {
+            // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
             covs = estimate_kernels(comp, work);
         } else {
@@ -276,11 +298,15 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
 
         if (stream_comp_raw) {
-            // Spill Bayer only; keep flow/R/cov in RAM (needed for merge).
-            if (!save_image(cache / ("f" + std::to_string(k) + ".raw"), comp)) {
-                continue;
-            }
-            comp = Image(); // drop host Bayer immediately (save keeps a disk copy)
+            // Spill Bayer async (overlaps next decode already in flight). Keep
+            // flow/R/cov in RAM. Grow-only L2/Alg.5 scratch stays until merge.
+            const int sk = k;
+            auto spill_img = std::make_shared<Image>(std::move(comp));
+            const fs::path spill_path = cache / ("f" + std::to_string(sk) + ".raw");
+            spill_fut = std::async(std::launch::async, [spill_path, spill_img]() {
+                return save_image(spill_path, *spill_img);
+            });
+            spill_pending = true;
             CachedCompMeta meta;
             meta.index = k;
             meta.flow = std::move(flow);
@@ -298,11 +324,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             cached.push_back(std::move(fc));
             n_comp_ok++;
         }
-#if defined(__APPLE__)
-        // Full-res: drop grow-only L2/Alg. 5 GPU scratch before the next frame.
-        if (full_res) metal_trim_analyze_scratch();
-#endif
     }
+    drain_spill();
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
     if (n_comp_ok < 1) {
@@ -350,9 +373,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // Band size: 2× uses large double-buffered bands. Full 1× uses one large band
-    // slot (single GPU/host acc) so peak RAM ≈ one band, not four — fewer syncs
-    // without the jetsam from host×2+GPU×2 at 512MB.
+    // Band size: 2× double-buffers GPU+host. Full 1× keeps one GPU acc slot
+    // (jetsam-safe) but dual host bands so Deflate can overlap the next GPU band.
     const size_t out_px = (size_t)Hs * (size_t)Ws;
     const bool heavy_1x = out_px >= 28ull * 1000ull * 1000ull; // ~full-res scale-2
 #if defined(__APPLE__)
@@ -363,7 +385,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2; // num+den float row
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
-    if (heavy_1x) band_rows = std::min(band_rows, 768);
+    // ~960 rows fits the 192MB single-slot budget at full-res scale-2.
+    if (heavy_1x) band_rows = std::min(band_rows, 960);
     std::vector<uint16_t> row16((size_t)band_rows * (size_t)Ws * 3u);
 
     Image comp_scratch;
@@ -402,14 +425,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     AccumDiag diag;
 #if defined(__APPLE__)
-    // 2×: double-buffer host + async encode. 1×: one host band, wait+encode each
-    // band (pairs with single GPU acc slot) — larger bands, safe peak RAM.
+    // Dual host bands + async Deflate for both 1× and 2×. 1× still uses a
+    // single GPU acc slot (ensure_acc waits/readbacks before reuse).
     Image num_bands[2], den_bands[2];
     std::vector<uint16_t> row16_async[2];
-    if (!heavy_1x) {
-        row16_async[0].resize(row16.size());
-        row16_async[1].resize(row16.size());
-    }
+    row16_async[0].resize(row16.size());
+    row16_async[1].resize(row16.size());
     int cur = 0;
     bool have_ready = false;
     int ready = 0, ready_y0 = 0, ready_bh = 0;
@@ -420,8 +441,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     report("Merging output", 0.48f);
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
-        if (!heavy_1x) cur ^= 1;
-        else cur = 0;
+        cur ^= 1;
         join_encode();
         Image& num_band = num_bands[cur];
         Image& den_band = den_bands[cur];
@@ -474,23 +494,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             return Image();
         }
 
-        if (heavy_1x) {
-            // Single-slot: wait this band, encode, free host pressure before next.
-            if (!metal_merge_wait_inflight()) {
-                report("Error: GPU merge readback failed", 1.f);
-                metal_merge_set_single_acc_slot(false);
-                writer.close();
-                if (stream_comp_raw) fs::remove_all(cache, ec);
-                return Image();
-            }
-            if (y0 + bh >= Hs) accumulate_diag(num_band, den_band, diag);
-            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
-                row16.resize((size_t)bh * (size_t)Ws * 3u);
-            encode_band_rows(num_band, den_band, y0, bh, work, nch,
-                             preview, pscale, ph, pw, Ws, row16);
-            writer.write_rows(row16.data(), bh);
-            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
-        } else if (have_ready) {
+        // Previous band is resident on host once ensure_acc waited (1×) or
+        // ping-pong resolved (2×). Encode it while this band's GPU runs.
+        if (have_ready) {
             const int er = ready, ey0 = ready_y0, ebh = ready_bh;
             std::vector<uint16_t>& out16 = row16_async[er];
             if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
@@ -502,15 +508,13 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             });
             report("Merging output", 0.48f + 0.50f * (float)(ey0 + ebh) / Hs);
         }
-        if (!heavy_1x) {
-            ready = cur;
-            ready_y0 = y0;
-            ready_bh = bh;
-            have_ready = true;
-        }
+        ready = cur;
+        ready_y0 = y0;
+        ready_bh = bh;
+        have_ready = true;
     }
     join_encode();
-    if (!heavy_1x && have_ready && metal_merge_wait_inflight()) {
+    if (have_ready && metal_merge_wait_inflight()) {
         Image& rn = num_bands[ready];
         Image& rd = den_bands[ready];
         accumulate_diag(rn, rd, diag);

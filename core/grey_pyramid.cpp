@@ -315,36 +315,37 @@ static Image downsample_by(const Image& src, int factor) {
     int tmp_w = src.w;
     if (tmp_h < 1 || tmp_w < 1) return Image(0, 0, 1);
     Image tmp(tmp_h, tmp_w, 1);
-    for (int y = 0; y < tmp_h; ++y) {
+    parallel_rows(tmp_h, 0, [&](int y) {
         for (int x = 0; x < tmp_w; ++x) {
             f32 acc = 0.f;
             for (int i = 0; i < klen; ++i)
                 acc += ker[i] * src.at(y + i, x);
             tmp.at(y, x) = acc;
         }
-    }
+    });
 
     // Valid horizontal conv
     int filt_h = tmp_h;
     int filt_w = tmp_w - klen + 1;
     if (filt_w < 1) return Image(0, 0, 1);
     Image filtered(filt_h, filt_w, 1);
-    for (int y = 0; y < filt_h; ++y) {
+    parallel_rows(filt_h, 0, [&](int y) {
         for (int x = 0; x < filt_w; ++x) {
             f32 acc = 0.f;
             for (int j = 0; j < klen; ++j)
                 acc += ker[j] * tmp.at(y, x + j);
             filtered.at(y, x) = acc;
         }
-    }
+    });
 
     // h2, w2 = floor(shape / factor); return filtered[:, :, :h2*factor:factor, :w2*factor:factor]
     int h2 = filt_h / factor;
     int w2 = filt_w / factor;
     Image out(h2, w2, 1);
-    for (int y = 0; y < h2; ++y)
+    parallel_rows(h2, 0, [&](int y) {
         for (int x = 0; x < w2; ++x)
             out.at(y, x) = filtered.at(y * factor, x * factor);
+    });
     return out;
 }
 
