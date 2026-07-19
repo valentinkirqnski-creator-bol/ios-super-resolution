@@ -303,8 +303,9 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
 
     auto* zs = new z_stream();
     std::memset(zs, 0, sizeof(z_stream));
-    // Best ratio — lossless; cost is CPU on the merge thread after SR work.
-    if (deflateInit(zs, Z_BEST_COMPRESSION) != Z_OK) {
+    // Lossless Deflate (same pixels). Default level is much faster than Z_BEST
+    // and is often the dominant cost of the UI "Merging output" phase.
+    if (deflateInit(zs, Z_DEFAULT_COMPRESSION) != Z_OK) {
         delete zs;
         fclose(f_); f_ = nullptr;
         return false;

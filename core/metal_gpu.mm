@@ -62,6 +62,11 @@ struct MetalCtx {
         size_t corr_b = 0, corr_shift_b = 0;
     };
     L2Scratch l2[2];
+    // Grow-only Alg. 5 temps — avoid alloc/free per frame (memory pressure slows merge).
+    id<MTLBuffer> kern_raw = nil, kern_vst = nil, kern_grey = nil;
+    id<MTLBuffer> kern_grad = nil, kern_cov = nil;
+    size_t kern_raw_b = 0, kern_vst_b = 0, kern_grey_b = 0;
+    size_t kern_grad_b = 0, kern_cov_b = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -722,38 +727,35 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     const size_t grad_b = (size_t)(grey_h - 1) * (size_t)(grey_w - 1) * 2u * sizeof(float);
     const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
 
-    id<MTLBuffer> b_raw = buf(raw.data.data(), raw_b);
-    id<MTLBuffer> b_vst = buf(nullptr, raw_b);
-    id<MTLBuffer> b_grey = buf(nullptr, grey_b);
-    id<MTLBuffer> b_grad = buf(nullptr, grad_b);
-    id<MTLBuffer> b_cov = buf(nullptr, cov_b);
+    id<MTLBuffer> b_raw = c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
+    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, raw_b);
+    id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
+    id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
+    id<MTLBuffer> b_cov = c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
     if (!b_raw || !b_vst || !b_grey || !b_grad || !b_cov) return CovField();
+    memcpy([b_raw contents], raw.data.data(), raw_b);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return CovField();
 
+    // One encoder: Metal tracks RAW hazards between dispatches (same math, less overhead).
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return CovField();
     [enc setBuffer:b_vst offset:0 atIndex:0];
     [enc setBuffer:b_raw offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gat"), p.raw_w, p.raw_h);
-    [enc endEncoding];
 
-    enc = [cmd computeCommandEncoder];
     [enc setBuffer:b_grey offset:0 atIndex:0];
     [enc setBuffer:b_vst offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
-    [enc endEncoding];
 
-    enc = [cmd computeCommandEncoder];
     [enc setBuffer:b_grad offset:0 atIndex:0];
     [enc setBuffer:b_grey offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
-    [enc endEncoding];
 
-    enc = [cmd computeCommandEncoder];
     [enc setBuffer:b_cov offset:0 atIndex:0];
     [enc setBuffer:b_grad offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
@@ -1212,6 +1214,13 @@ void metal_merge_begin_burst() {
     g_merge_write_slot = 1;
     g_merge_need_zero = false;
     // Keep grow-only acc buffers; next ensure_acc will blit-zero.
+    // Drop Alg. 5 scratch so merge prefetch is not fighting kernel temps for RAM
+    // (that pressure was making the merge phase slower after GPU kernels landed).
+    auto& c = ctx();
+    c.kern_raw = nil; c.kern_vst = nil; c.kern_grey = nil;
+    c.kern_grad = nil; c.kern_cov = nil;
+    c.kern_raw_b = c.kern_vst_b = c.kern_grey_b = 0;
+    c.kern_grad_b = c.kern_cov_b = 0;
 }
 
 bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,

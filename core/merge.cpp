@@ -287,8 +287,8 @@ void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
                     const Image* acc_rob) {
 #ifdef __APPLE__
-    // Metal GPU only — same Alg. 11 math (accumulated-robustness denoise unchanged).
-    // merge_ref_band_metal commits async; wait so num/den are filled for sync callers.
+    // Metal GPU only — same Alg. 11 math. Waits for this band (sync API).
+    // pipeline_paths Apple path calls merge_ref_band_metal directly for async overlap.
     if (!merge_ref_band_metal(ref_raw, covs, num_band, den_band, y0, cfg, acc_rob) ||
         !metal_merge_wait_inflight()) {
         return;
