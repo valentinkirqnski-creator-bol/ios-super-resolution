@@ -1399,3 +1399,54 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     flow[tid * 2u + 0u] = fx;
     flow[tid * 2u + 1u] = fy;
 }
+
+// ---------------------------------------------------------------------------
+// Pyramid downsample — exact match of grey_pyramid.cpp downsample_by /
+// Python cuda_downsample: scipy gaussian_kernel1d, valid separable conv, stride.
+// ---------------------------------------------------------------------------
+struct PyrDownParams {
+    uint in_h, in_w;
+    uint out_h, out_w;
+    uint klen;
+    uint factor;
+    uint _pad0, _pad1; // 32 bytes for setBytes
+};
+
+// Valid vertical conv: out[y,x] = sum_i ker[i] * in[y+i, x]
+kernel void pyr_conv_y(device const float* in [[buffer(0)]],
+                       device float* out [[buffer(1)]],
+                       device const float* ker [[buffer(2)]],
+                       constant PyrDownParams& p [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    float acc = 0.f;
+    for (uint i = 0u; i < p.klen; ++i)
+        acc += ker[i] * in[(gid.y + i) * p.in_w + gid.x];
+    out[gid.y * p.out_w + gid.x] = acc;
+}
+
+// Valid horizontal conv: out[y,x] = sum_j ker[j] * in[y, x+j]
+// in_w is the temp width (same as vertical out_w); out size is filt.
+kernel void pyr_conv_x(device const float* in [[buffer(0)]],
+                       device float* out [[buffer(1)]],
+                       device const float* ker [[buffer(2)]],
+                       constant PyrDownParams& p [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    // p.in_w = temp width, p.in_h unused for addressing rows
+    float acc = 0.f;
+    const uint row = gid.y * p.in_w;
+    for (uint j = 0u; j < p.klen; ++j)
+        acc += ker[j] * in[row + gid.x + j];
+    out[gid.y * p.out_w + gid.x] = acc;
+}
+
+// filtered[y*factor, x*factor] → out[y,x]
+kernel void pyr_subsample(device const float* in [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant PyrDownParams& p [[buffer(3)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    out[gid.y * p.out_w + gid.x] =
+        in[(gid.y * p.factor) * p.in_w + (gid.x * p.factor)];
+}

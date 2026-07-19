@@ -357,7 +357,20 @@ Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors) {
     int abs_factor = 1;
     for (size_t i = 0; i < factors.size(); ++i) {
         int f = factors[i];
-        cur = (f == 1 && i == 0) ? grey : downsample_by(cur, f);
+        if (f == 1 && i == 0) {
+            cur = grey;
+        } else {
+#ifdef __APPLE__
+            // Same math as downsample_by / Python cuda_downsample.
+            Image gpu_out;
+            if (downsample_by_metal(cur, f, gpu_out) && gpu_out.h > 0)
+                cur = std::move(gpu_out);
+            else
+                cur = downsample_by(cur, f);
+#else
+            cur = downsample_by(cur, f);
+#endif
+        }
         abs_factor *= f;
         pyr.levels.push_back(cur);
         pyr.abs_factors.push_back(abs_factor);

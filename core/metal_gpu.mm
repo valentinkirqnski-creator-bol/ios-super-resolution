@@ -68,6 +68,9 @@ struct MetalCtx {
     id<MTLBuffer> kern_grad = nil, kern_cov = nil;
     size_t kern_raw_b = 0, kern_vst_b = 0, kern_grey_b = 0;
     size_t kern_grad_b = 0, kern_cov_b = 0;
+    // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
+    id<MTLBuffer> sticky_grey = nil;
+    int sticky_grey_h = 0, sticky_grey_w = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -123,6 +126,7 @@ static MetalCtx& ctx() {
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_make_mask", "rob_local_min_5x5", "l1_bm_ts16", "ica_refine_tile",
+            "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -686,6 +690,11 @@ Image compute_grey_fft_metal(const Image& raw) {
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
+    // Pin for align_metal (moving grey) — same pixels as the host Image.
+    c.sticky_grey = real_out;
+    c.sticky_grey_h = (int)h;
+    c.sticky_grey_w = (int)w;
+
     Image grey((int)h, (int)w, 1);
     memcpy(grey.data.data(), [real_out contents], n * sizeof(float));
     return grey;
@@ -1109,24 +1118,143 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     return r;
 }
 
-bool block_match_level_L2_metal(const Image& ref, const Image& moving,
-                                int tile_size, int search_radius,
-                                FlowField& flow) {
-    if (!metal_gpu_init()) return false;
-    const int ny = flow.ny, nx = flow.nx;
+namespace {
+
+struct PyrDownParamsCPU {
+    uint32_t in_h, in_w, out_h, out_w, klen, factor;
+    uint32_t _pad0 = 0, _pad1 = 0;
+};
+static_assert(sizeof(PyrDownParamsCPU) == 32, "PyrDownParamsCPU");
+
+static std::vector<float> scipy_gaussian_kernel1d_metal(float sigma, int radius) {
+    std::vector<float> k(2 * radius + 1);
+    float sigma2 = sigma * sigma;
+    float sum = 0.f;
+    for (int i = -radius; i <= radius; ++i) {
+        float v = std::exp(-0.5f / sigma2 * (float)(i * i));
+        k[(size_t)(i + radius)] = v;
+        sum += v;
+    }
+    for (float& v : k) v /= sum;
+    return k;
+}
+
+// GPU valid-gauss + stride. Same math as grey_pyramid.cpp downsample_by.
+static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
+                               id<MTLBuffer>& dst, int& dh, int& dw) {
+    if (factor <= 1) {
+        dst = src;
+        dh = sh;
+        dw = sw;
+        return src != nil;
+    }
+    auto& c = ctx();
+    float sigma = 0.5f * (float)factor;
+    int radius = (int)(4.f * sigma + 0.5f);
+    std::vector<float> ker = scipy_gaussian_kernel1d_metal(sigma, radius);
+    const int klen = (int)ker.size();
+    int tmp_h = sh - klen + 1;
+    int tmp_w = sw;
+    if (tmp_h < 1 || tmp_w < 1) return false;
+    int filt_h = tmp_h;
+    int filt_w = tmp_w - klen + 1;
+    if (filt_w < 1) return false;
+    dh = filt_h / factor;
+    dw = filt_w / factor;
+    if (dh < 1 || dw < 1) return false;
+
+    id<MTLBuffer> b_ker = buf(ker.data(), ker.size() * sizeof(float));
+    id<MTLBuffer> b_tmp = buf(nullptr, (size_t)tmp_h * tmp_w * sizeof(float));
+    id<MTLBuffer> b_filt = buf(nullptr, (size_t)filt_h * filt_w * sizeof(float));
+    id<MTLBuffer> b_out = buf(nullptr, (size_t)dh * dw * sizeof(float));
+    if (!b_ker || !b_tmp || !b_filt || !b_out) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+
+    PyrDownParamsCPU py{};
+    py.in_h = (uint32_t)sh;
+    py.in_w = (uint32_t)sw;
+    py.out_h = (uint32_t)tmp_h;
+    py.out_w = (uint32_t)tmp_w;
+    py.klen = (uint32_t)klen;
+    py.factor = (uint32_t)factor;
+    [enc setBuffer:src offset:0 atIndex:0];
+    [enc setBuffer:b_tmp offset:0 atIndex:1];
+    [enc setBuffer:b_ker offset:0 atIndex:2];
+    [enc setBytes:&py length:sizeof(py) atIndex:3];
+    dispatch2(enc, c.pipe("pyr_conv_y"), (NSUInteger)tmp_w, (NSUInteger)tmp_h);
+
+    PyrDownParamsCPU px = py;
+    px.in_h = (uint32_t)tmp_h;
+    px.in_w = (uint32_t)tmp_w;
+    px.out_h = (uint32_t)filt_h;
+    px.out_w = (uint32_t)filt_w;
+    [enc setBuffer:b_tmp offset:0 atIndex:0];
+    [enc setBuffer:b_filt offset:0 atIndex:1];
+    [enc setBuffer:b_ker offset:0 atIndex:2];
+    [enc setBytes:&px length:sizeof(px) atIndex:3];
+    dispatch2(enc, c.pipe("pyr_conv_x"), (NSUInteger)filt_w, (NSUInteger)filt_h);
+
+    PyrDownParamsCPU ps{};
+    ps.in_h = (uint32_t)filt_h;
+    ps.in_w = (uint32_t)filt_w;
+    ps.out_h = (uint32_t)dh;
+    ps.out_w = (uint32_t)dw;
+    ps.klen = (uint32_t)klen;
+    ps.factor = (uint32_t)factor;
+    [enc setBuffer:b_filt offset:0 atIndex:0];
+    [enc setBuffer:b_out offset:0 atIndex:1];
+    [enc setBytes:&ps length:sizeof(ps) atIndex:3];
+    dispatch2(enc, c.pipe("pyr_subsample"), (NSUInteger)dw, (NSUInteger)dh);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    dst = b_out;
+    return true;
+}
+
+// Same as CPU upscale_flow in align.cpp (nearest / default.yaml).
+static FlowField upscale_flow_host(const FlowField& in, int target_ny, int target_nx,
+                                   int upsample_factor, int new_tile_size,
+                                   int prev_tile_size) {
+    int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
+    int repeat_factor = upsample_factor / std::max(1, tile_ratio);
+    if (repeat_factor < 1) repeat_factor = 1;
+    int up_ny = in.ny * repeat_factor;
+    int up_nx = in.nx * repeat_factor;
+    FlowField upsampled(up_ny, up_nx);
+    for (int ty = 0; ty < up_ny; ++ty) {
+        for (int tx = 0; tx < up_nx; ++tx) {
+            int sy = std::min(in.ny - 1, ty / repeat_factor);
+            int sx = std::min(in.nx - 1, tx / repeat_factor);
+            upsampled.dx(ty, tx) = in.dx(sy, sx) * (float)upsample_factor;
+            upsampled.dy(ty, tx) = in.dy(sy, sx) * (float)upsample_factor;
+        }
+    }
+    FlowField out(target_ny, target_nx);
+    for (int ty = 0; ty < target_ny; ++ty) {
+        for (int tx = 0; tx < target_nx; ++tx) {
+            if (ty < up_ny && tx < up_nx) {
+                out.dx(ty, tx) = upsampled.dx(ty, tx);
+                out.dy(ty, tx) = upsampled.dy(ty, tx);
+            }
+        }
+    }
+    return out;
+}
+
+static bool l2_bufs(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer> flow_b,
+                    int ref_h, int ref_w, int mov_h, int mov_w,
+                    int tile_size, int search_radius, int ny, int nx) {
     if (ny <= 0 || nx <= 0) return true;
     const int ts = tile_size, R = search_radius;
     const int N = 2 * R + ts;
     const int wh = N / 2 + 1;
     const uint32_t ntiles = (uint32_t)(ny * nx);
-
-    id<MTLBuffer> ref_img = buf(ref.data.data(), ref.data.size() * sizeof(float));
-    id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
-    id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    if (!ref_img || !mov_img || !flow_b) return false;
-
-    // Ping-pong two L2 scratch sets. Bluestein (non-pow2 N) shares global FFT
-    // scratch — serialize those chunks. Pow2 N can fully overlap.
     const bool bluestein = (N & (N - 1)) != 0;
     __strong id<MTLCommandBuffer> pending[2] = {nil, nil};
     int slot = 0;
@@ -1144,48 +1272,35 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
         } else if (!wait_slot(slot)) {
             return false;
         }
-        if (!l2_chunk(ref_img, mov_img, flow_b, ref.h, ref.w, moving.h, moving.w,
+        if (!l2_chunk(ref_img, mov_img, flow_b, ref_h, ref_w, mov_h, mov_w,
                       ts, R, N, wh, (uint32_t)ny, (uint32_t)nx, t0, tc,
                       slot, pending[slot]))
             return false;
         slot ^= 1;
     }
-    if (!wait_slot(0) || !wait_slot(1)) return false;
-    memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
-    return true;
+    return wait_slot(0) && wait_slot(1);
 }
 
-bool block_match_level_L1_metal(const Image& ref, const Image& moving,
-                                int tile_size, int search_radius,
-                                FlowField& flow) {
-    if (!metal_gpu_init()) return false;
-    // Kernel is specialized for default finest level (ts=16, R<=1).
+static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
+                    int ref_h, int ref_w, int mov_h, int mov_w,
+                    int tile_size, int search_radius, int ny, int nx) {
     if (tile_size != 16 || search_radius < 0 || search_radius > 1) return false;
-    const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
     auto& c = ctx();
-
     struct L1BmParamsCPU {
         uint32_t ref_h, ref_w, mov_h, mov_w;
         uint32_t ny, nx, ts, R;
     };
     static_assert(sizeof(L1BmParamsCPU) == 32, "L1BmParamsCPU layout");
-
     L1BmParamsCPU p{};
-    p.ref_h = (uint32_t)ref.h;
-    p.ref_w = (uint32_t)ref.w;
-    p.mov_h = (uint32_t)moving.h;
-    p.mov_w = (uint32_t)moving.w;
+    p.ref_h = (uint32_t)ref_h;
+    p.ref_w = (uint32_t)ref_w;
+    p.mov_h = (uint32_t)mov_h;
+    p.mov_w = (uint32_t)mov_w;
     p.ny = (uint32_t)ny;
     p.nx = (uint32_t)nx;
     p.ts = (uint32_t)tile_size;
     p.R = (uint32_t)search_radius;
-
-    id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
-    id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
-    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    if (!b_ref || !b_mov || !b_flow) return false;
-
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -1205,27 +1320,17 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
-    memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
-    return true;
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
 
-bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
-                            const std::vector<float>& hess_packed,
-                            const Image& moving, FlowField& flow,
-                            int tile_size, int n_iter) {
-    if (!metal_gpu_init()) return false;
-    // Default pyramid uses ts∈{8,16} (ica_kernel_8 / ica_kernel_16).
+static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy,
+                     id<MTLBuffer> b_hess, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
+                     int ref_h, int ref_w, int mov_h, int mov_w,
+                     int ny, int nx, int tile_size, int n_iter) {
     if (tile_size != 8 && tile_size != 16) return false;
     if (n_iter < 0) return false;
-    const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
-    const size_t ntiles = (size_t)ny * (size_t)nx;
-    if (hess_packed.size() < ntiles * 4) return false;
-    if (gradx.h != ref.h || gradx.w != ref.w || grady.h != ref.h || grady.w != ref.w)
-        return false;
     auto& c = ctx();
-
     struct IcaParamsCPU {
         uint32_t ref_h, ref_w, mov_h, mov_w;
         uint32_t ny, nx, ts, n_iter;
@@ -1233,26 +1338,16 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
         uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
     };
     static_assert(sizeof(IcaParamsCPU) == 48, "IcaParamsCPU layout");
-
     IcaParamsCPU p{};
-    p.ref_h = (uint32_t)ref.h;
-    p.ref_w = (uint32_t)ref.w;
-    p.mov_h = (uint32_t)moving.h;
-    p.mov_w = (uint32_t)moving.w;
+    p.ref_h = (uint32_t)ref_h;
+    p.ref_w = (uint32_t)ref_w;
+    p.mov_h = (uint32_t)mov_h;
+    p.mov_w = (uint32_t)mov_w;
     p.ny = (uint32_t)ny;
     p.nx = (uint32_t)nx;
     p.ts = (uint32_t)tile_size;
     p.n_iter = (uint32_t)n_iter;
     p.clamp_edge = (tile_size == 8) ? 1u : 0u;
-
-    id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
-    id<MTLBuffer> b_gx = buf(gradx.data.data(), gradx.data.size() * sizeof(float));
-    id<MTLBuffer> b_gy = buf(grady.data.data(), grady.data.size() * sizeof(float));
-    id<MTLBuffer> b_hess = buf(hess_packed.data(), hess_packed.size() * sizeof(float));
-    id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
-    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    if (!b_ref || !b_gx || !b_gy || !b_hess || !b_mov || !b_flow) return false;
-
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -1267,7 +1362,7 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
     id<MTLComputePipelineState> pipe = c.pipe("ica_refine_tile");
     if (!pipe) return false;
     [enc setComputePipelineState:pipe];
-    const NSUInteger n = (NSUInteger)ntiles;
+    const NSUInteger n = (NSUInteger)ny * (NSUInteger)nx;
     NSUInteger tg = std::min(n, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
     if (tg == 0) tg = 1;
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
@@ -1275,8 +1370,197 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    return cmd.status == MTLCommandBufferStatusCompleted;
+}
+
+} // namespace
+
+bool block_match_level_L2_metal(const Image& ref, const Image& moving,
+                                int tile_size, int search_radius,
+                                FlowField& flow) {
+    if (!metal_gpu_init()) return false;
+    const int ny = flow.ny, nx = flow.nx;
+    if (ny <= 0 || nx <= 0) return true;
+    id<MTLBuffer> ref_img = buf(ref.data.data(), ref.data.size() * sizeof(float));
+    id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
+    id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    if (!ref_img || !mov_img || !flow_b) return false;
+    if (!l2_bufs(ref_img, mov_img, flow_b, ref.h, ref.w, moving.h, moving.w,
+                 tile_size, search_radius, ny, nx))
+        return false;
+    memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
+    return true;
+}
+
+bool block_match_level_L1_metal(const Image& ref, const Image& moving,
+                                int tile_size, int search_radius,
+                                FlowField& flow) {
+    if (!metal_gpu_init()) return false;
+    if (tile_size != 16 || search_radius < 0 || search_radius > 1) return false;
+    const int ny = flow.ny, nx = flow.nx;
+    if (ny <= 0 || nx <= 0) return true;
+    id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    if (!b_ref || !b_mov || !b_flow) return false;
+    if (!l1_bufs(b_ref, b_mov, b_flow, ref.h, ref.w, moving.h, moving.w,
+                 tile_size, search_radius, ny, nx))
+        return false;
     memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
+    return true;
+}
+
+bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
+                            const std::vector<float>& hess_packed,
+                            const Image& moving, FlowField& flow,
+                            int tile_size, int n_iter) {
+    if (!metal_gpu_init()) return false;
+    if (tile_size != 8 && tile_size != 16) return false;
+    if (n_iter < 0) return false;
+    const int ny = flow.ny, nx = flow.nx;
+    if (ny <= 0 || nx <= 0) return true;
+    const size_t ntiles = (size_t)ny * (size_t)nx;
+    if (hess_packed.size() < ntiles * 4) return false;
+    if (gradx.h != ref.h || gradx.w != ref.w || grady.h != ref.h || grady.w != ref.w)
+        return false;
+    id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
+    id<MTLBuffer> b_gx = buf(gradx.data.data(), gradx.data.size() * sizeof(float));
+    id<MTLBuffer> b_gy = buf(grady.data.data(), grady.data.size() * sizeof(float));
+    id<MTLBuffer> b_hess = buf(hess_packed.data(), hess_packed.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    if (!b_ref || !b_gx || !b_gy || !b_hess || !b_mov || !b_flow) return false;
+    if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, b_mov, b_flow,
+                  ref.h, ref.w, moving.h, moving.w, ny, nx, tile_size, n_iter))
+        return false;
+    memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
+    return true;
+}
+
+bool downsample_by_metal(const Image& src, int factor, Image& out) {
+    if (!metal_gpu_init() || src.h <= 0 || src.w <= 0) return false;
+    if (factor <= 1) {
+        out = src;
+        return true;
+    }
+    id<MTLBuffer> b_src = buf(src.data.data(), src.data.size() * sizeof(float));
+    if (!b_src) return false;
+    id<MTLBuffer> b_dst = nil;
+    int dh = 0, dw = 0;
+    if (!gpu_downsample_buf(b_src, src.h, src.w, factor, b_dst, dh, dw) || !b_dst)
+        return false;
+    out = Image(dh, dw, 1);
+    memcpy(out.data.data(), [b_dst contents], (size_t)dh * dw * sizeof(float));
+    return true;
+}
+
+bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
+                 const std::vector<AlignIcaLevelHost>& ica_levels,
+                 const Config& cfg, int tile_size, FlowField& flow_out) {
+    if (!metal_gpu_init()) return false;
+    const int nlev = (int)ref_pyr.levels.size();
+    if (nlev <= 0 || (int)ica_levels.size() != nlev) return false;
+    if (moving_grey.h <= 0 || moving_grey.w <= 0) return false;
+    // Default pyramid tile sizes only (L1 ts=16 R<=1; ICA 8/16).
+    for (int lvl = 0; lvl < nlev; ++lvl) {
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
+        if (ts != 8 && ts != 16) return false;
+        std::string metric = "L2";
+        if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
+        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
+        if (metric == "L1" && (ts != 16 || radius > 1)) return false;
+    }
+
+    auto& c = ctx();
+    // Moving level-0: reuse sticky grey from compute_grey_fft_metal when possible.
+    id<MTLBuffer> mov0 = nil;
+    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
+        mov0 = c.sticky_grey;
+    } else {
+        mov0 = buf(moving_grey.data.data(), moving_grey.data.size() * sizeof(float));
+    }
+    if (!mov0) return false;
+
+    struct Lev {
+        id<MTLBuffer> img = nil;
+        int h = 0, w = 0;
+    };
+    std::vector<Lev> mov_pyr((size_t)nlev);
+    mov_pyr[0] = {mov0, moving_grey.h, moving_grey.w};
+    for (int i = 0; i < nlev; ++i) {
+        int f = (i < (int)cfg.bm_factors.size()) ? cfg.bm_factors[i] : 1;
+        if (i == 0 && f == 1) continue;
+        if (i == 0) {
+            // factors[0] != 1: downsample from grey
+            id<MTLBuffer> dst = nil;
+            int dh = 0, dw = 0;
+            if (!gpu_downsample_buf(mov0, moving_grey.h, moving_grey.w, f, dst, dh, dw))
+                return false;
+            mov_pyr[0] = {dst, dh, dw};
+        } else {
+            id<MTLBuffer> dst = nil;
+            int dh = 0, dw = 0;
+            const Lev& prev = mov_pyr[(size_t)i - 1];
+            if (!gpu_downsample_buf(prev.img, prev.h, prev.w, f, dst, dh, dw))
+                return false;
+            mov_pyr[(size_t)i] = {dst, dh, dw};
+        }
+    }
+    // Fill any missing (factor==1 after level 0 shouldn't happen with default)
+    for (int i = 1; i < nlev; ++i) {
+        if (!mov_pyr[(size_t)i].img) return false;
+    }
+
+    FlowField flow;
+    for (int lvl = nlev - 1; lvl >= 0; --lvl) {
+        const Image& r = ref_pyr.levels[(size_t)lvl];
+        const Lev& m = mov_pyr[(size_t)lvl];
+        const AlignIcaLevelHost& ic = ica_levels[(size_t)lvl];
+        if (!ic.gx || !ic.gy || !ic.hess) return false;
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
+        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
+        int ny = r.h / ts;
+        int nx = r.w / ts;
+        if (ny <= 0 || nx <= 0) return false;
+        if (ic.hess_floats < (size_t)ny * nx * 4) return false;
+
+        if (flow.nx == 0) {
+            flow = FlowField(ny, nx);
+        } else {
+            int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
+                                  ? cfg.bm_factors[lvl + 1] : 1;
+            int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                          ? cfg.bm_tile_sizes[lvl + 1] : ts;
+            flow = upscale_flow_host(flow, ny, nx, upsample_factor, ts, prev_ts);
+        }
+
+        id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
+        id<MTLBuffer> b_gx = buf(ic.gx->data.data(), ic.gx->data.size() * sizeof(float));
+        id<MTLBuffer> b_gy = buf(ic.gy->data.data(), ic.gy->data.size() * sizeof(float));
+        id<MTLBuffer> b_hess = buf(ic.hess, ic.hess_floats * sizeof(float));
+        id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+        if (!b_ref || !b_gx || !b_gy || !b_hess || !b_flow) return false;
+
+        std::string metric = "L2";
+        if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
+        bool bm_ok = false;
+        if (metric == "L1")
+            bm_ok = l1_bufs(b_ref, m.img, b_flow, r.h, r.w, m.h, m.w, ts, radius, ny, nx);
+        else
+            bm_ok = l2_bufs(b_ref, m.img, b_flow, r.h, r.w, m.h, m.w, ts, radius, ny, nx);
+        if (!bm_ok) return false;
+
+        // ICA on same GPU buffers — no host round-trip after BM.
+        if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, m.img, b_flow,
+                      r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))
+            return false;
+
+        // Small flow download for CPU upscale between levels / final out.
+        memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
+    }
+
+    flow_out = std::move(flow);
     return true;
 }
 
@@ -1688,6 +1972,8 @@ void metal_trim_analyze_scratch() {
     c.kern_grad_b = c.kern_cov_b = 0;
     c.l2[0] = {};
     c.l2[1] = {};
+    c.sticky_grey = nil;
+    c.sticky_grey_h = c.sticky_grey_w = 0;
     clear_rob_ref_gpu();
 }
 

@@ -40,6 +40,24 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
                             const Image& moving, FlowField& flow,
                             int tile_size, int n_iter);
 
+// Exact cuda_downsample / grey_pyramid.cpp downsample_by (valid gauss + stride).
+bool downsample_by_metal(const Image& src, int factor, Image& out);
+
+// Per-level ICA inputs from align.cpp ref cache (host).
+struct AlignIcaLevelHost {
+    const Image* gx = nullptr;
+    const Image* gy = nullptr;
+    const float* hess = nullptr; // ny*nx*4
+    size_t hess_floats = 0;
+};
+
+// GPU-resident moving pyramid + BM→ICA (same math as align()). Uses sticky
+// grey buffer from the last compute_grey_fft_metal when dims match (no re-upload).
+// Downloads final flow only. Returns false → caller uses CPU align.
+bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
+                 const std::vector<AlignIcaLevelHost>& ica_levels,
+                 const Config& cfg, int tile_size, FlowField& flow_out);
+
 // Alg. 5 kernel covariance on GPU. Empty CovField on failure.
 CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
 

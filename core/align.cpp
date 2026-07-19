@@ -584,11 +584,7 @@ void clear_align_ref_ica_cache() {
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg, int tile_size) {
     (void)ref_grey; // pyramid already built from padded ref
-    // Moving: unpadded grey → pyramid (matches Python align())
-    Pyramid mov_pyr = build_pyramid(moving_grey, cfg.bm_factors);
-
     int nlev = (int)ref_pyr.levels.size();
-    FlowField flow;
 
     if (g_ref_ica_cache.key != (const void*)&ref_pyr ||
         (int)g_ref_ica_cache.levels.size() != nlev) {
@@ -604,6 +600,28 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             L.hess = compute_hessian(L.gx, L.gy, ts);
         }
     }
+
+#ifdef __APPLE__
+    // Resident moving pyramid + BM→ICA (same math as CPU path below).
+    {
+        std::vector<AlignIcaLevelHost> ica((size_t)nlev);
+        for (int lvl = 0; lvl < nlev; ++lvl) {
+            const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
+            ica[(size_t)lvl].gx = &L.gx;
+            ica[(size_t)lvl].gy = &L.gy;
+            ica[(size_t)lvl].hess = L.hess.data.data();
+            ica[(size_t)lvl].hess_floats = L.hess.data.size();
+        }
+        FlowField flow_gpu;
+        if (align_metal(ref_pyr, moving_grey, ica, cfg, tile_size, flow_gpu))
+            return flow_gpu;
+    }
+#endif
+
+    // Moving: unpadded grey → pyramid (matches Python align())
+    Pyramid mov_pyr = build_pyramid(moving_grey, cfg.bm_factors);
+
+    FlowField flow;
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[lvl];
