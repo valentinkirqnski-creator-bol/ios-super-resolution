@@ -500,6 +500,8 @@ kernel void extract_real_tiles(device float* out [[buffer(0)]],
 
 // ---- Merge (Alg. 4 / Alg. 11) — faithful port of merge.cpp -----------------
 
+// Layout must match MergeCompParamsCPU / MergeRefParamsCPU in metal_gpu.mm.
+// Padded to a multiple of 16 bytes for constant-buffer setBytes alignment.
 struct MergeCompParams {
     uint band_h;
     uint Ws;
@@ -519,6 +521,8 @@ struct MergeCompParams {
     uint cfa01;
     uint cfa10;
     uint cfa11;
+    uint _pad0;
+    uint _pad1;
 };
 
 struct MergeRefParams {
@@ -543,6 +547,9 @@ struct MergeRefParams {
     uint cfa01;
     uint cfa10;
     uint cfa11;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
 
 inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
@@ -707,8 +714,8 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
             z = max(0.f, z);
-            // fast exp: same formula as CPU std::exp; precise::exp was a merge bottleneck
-            float w = metal::exp(-0.5f * z);
+            // Same formula as CPU std::exp (fast path; was precise::exp).
+            float w = exp(-0.5f * z);
 
             float contrib_v = w * local_r * c;
             float contrib_a = w * local_r;
@@ -786,7 +793,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
-            float w = metal::exp(-0.5f * y);
+            float w = exp(-0.5f * y);
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }

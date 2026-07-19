@@ -709,14 +709,17 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
 
 namespace {
 
-// Must match HHSRKernels.metal MergeCompParams / MergeRefParams layout.
+// Must match HHSRKernels.metal MergeCompParams / MergeRefParams layout
+// (including 16-byte padding for constant-buffer setBytes).
 struct MergeCompParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
     uint32_t flow_ny, flow_nx, cov_h, cov_w;
     uint32_t nch, bayer, iso, tile_size;
     float scale;
     uint32_t cfa00, cfa01, cfa10, cfa11;
+    uint32_t _pad0 = 0, _pad1 = 0;
 };
+static_assert(sizeof(MergeCompParamsCPU) == 80, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -726,7 +729,9 @@ struct MergeRefParamsCPU {
     float max_multiplier;
     float max_frame_count;
     uint32_t cfa00, cfa01, cfa10, cfa11;
+    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
 };
+static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
 
 struct MergeAccState {
     id<MTLBuffer> num = nil;
@@ -765,8 +770,8 @@ struct MergeRefGpu {
 static MergeAccState g_merge_acc;
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
-static id<MTLCommandBuffer> g_merge_band_cmd = nil;
-static id<MTLComputeCommandEncoder> g_merge_enc = nil;
+static __strong id<MTLCommandBuffer> g_merge_band_cmd = nil;
+static __strong id<MTLComputeCommandEncoder> g_merge_enc = nil;
 
 static void merge_enc_close() {
     if (g_merge_enc) {

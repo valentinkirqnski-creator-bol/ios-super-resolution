@@ -11,6 +11,7 @@
 #endif
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
@@ -367,6 +368,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         if (num_band.h != bh || num_band.w != Ws || num_band.c != nch) {
             num_band = Image(bh, Ws, nch);
             den_band = Image(bh, Ws, nch);
+        } else {
+            // CPU merge uses += ; Metal zeros GPU-side — keep host clear either way.
+            std::fill(num_band.data.begin(), num_band.data.end(), 0.f);
+            std::fill(den_band.data.begin(), den_band.data.end(), 0.f);
         }
 
         if (stream_comp_raw) {
