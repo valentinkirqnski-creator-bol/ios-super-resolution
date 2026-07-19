@@ -889,6 +889,7 @@ struct MergeRefGpu {
 static MergeAccSlot g_merge_acc[2];
 static int g_merge_write_slot = 0;
 static bool g_merge_need_zero = false;
+static bool g_merge_single_slot = false;
 static MergeInflight g_merge_inflight;
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
@@ -1147,11 +1148,18 @@ static bool ensure_acc_buffers(size_t nelem, bool start_band) {
     if (bytes == 0) return false;
     auto& c = ctx();
     if (start_band) {
-        // New band: use the free slot (other may still be in flight for encode overlap).
-        g_merge_write_slot ^= 1;
-        // If this slot is still the in-flight target, wait it out first.
-        if (g_merge_inflight.cmd && g_merge_inflight.slot == g_merge_write_slot) {
-            if (!metal_merge_wait_inflight_impl()) return false;
+        if (g_merge_single_slot) {
+            // One slot only: always wait previous before reusing (saves ~2× GPU RAM).
+            if (g_merge_inflight.cmd) {
+                if (!metal_merge_wait_inflight_impl()) return false;
+            }
+            g_merge_write_slot = 0;
+        } else {
+            // Ping-pong: free slot may still be in flight for encode overlap.
+            g_merge_write_slot ^= 1;
+            if (g_merge_inflight.cmd && g_merge_inflight.slot == g_merge_write_slot) {
+                if (!metal_merge_wait_inflight_impl()) return false;
+            }
         }
         g_merge_need_zero = true;
     }
@@ -1205,13 +1213,17 @@ bool metal_merge_wait_inflight() {
     return metal_merge_wait_inflight_impl();
 }
 
+void metal_merge_set_single_acc_slot(bool enabled) {
+    g_merge_single_slot = enabled;
+}
+
 void metal_merge_begin_burst() {
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
     g_merge_frames.clear();
     g_merge_ref = {};
-    // First band XORs to slot 0.
-    g_merge_write_slot = 1;
+    // First band XORs to slot 0 when double-buffered.
+    g_merge_write_slot = g_merge_single_slot ? 0 : 1;
     g_merge_need_zero = false;
     // Drop previous burst's grow-only acc slots (1× bands can be hundreds of MB;
     // keeping them across shots causes jetsam on the next full-res merge).

@@ -54,6 +54,10 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
 // Drop previous burst's GPU merge cache (call once before prefetching a new shot).
 void metal_merge_begin_burst();
 
+// When true, reuse one GPU num/den slot (wait each band). Cuts peak RAM ~2× so
+// full-res 1× can use larger bands without jetsam. Default false (2× double-buffer).
+void metal_merge_set_single_acc_slot(bool enabled);
+
 // merge_ref_band_metal commits asynchronously and resolves any *previous* in-flight
 // band into its host images (so encode can overlap the next GPU band). Call this
 // to wait + readback the latest band before using its num/den. No-op if idle.

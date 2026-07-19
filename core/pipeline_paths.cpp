@@ -297,20 +297,20 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // Band size: 2× crop can use large bands; full 1× must stay smaller or iOS jetsams
-    // (host×2 + GPU×2 num/den + RGB16 + prefetched frames easily exceeds 1–2 GB).
+    // Band size: 2× uses large double-buffered bands. Full 1× uses one large band
+    // slot (single GPU/host acc) so peak RAM ≈ one band, not four — fewer syncs
+    // without the jetsam from host×2+GPU×2 at 512MB.
     const size_t out_px = (size_t)Hs * (size_t)Ws;
     const bool heavy_1x = out_px >= 28ull * 1000ull * 1000ull; // ~full-res scale-2
 #if defined(__APPLE__)
-    const size_t band_budget = heavy_1x ? (96u * 1024u * 1024u) : (384u * 1024u * 1024u);
+    const size_t band_budget = heavy_1x ? (192u * 1024u * 1024u) : (384u * 1024u * 1024u);
 #else
     const size_t band_budget = 64u * 1024u * 1024u;
 #endif
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2; // num+den float row
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
-    // Hard cap rows so a single host band pair cannot balloon on wide sensors.
-    if (heavy_1x) band_rows = std::min(band_rows, 384);
+    if (heavy_1x) band_rows = std::min(band_rows, 768);
     std::vector<uint16_t> row16((size_t)band_rows * (size_t)Ws * 3u);
 
     Image comp_scratch;
@@ -318,6 +318,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     // Upload all comparison frames to GPU before the band loop so merge isn't
     // stalled on the first band's PCIe copies.
     report("Preparing GPU merge", 0.46f);
+    metal_merge_set_single_acc_slot(heavy_1x);
     metal_merge_begin_burst();
     if (stream_comp_raw) {
         for (const CachedCompMeta& meta : cached_meta) {
@@ -336,8 +337,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     AccumDiag diag;
 #if defined(__APPLE__)
-    // Double-buffer host bands. Async encode only on lighter (2×) outputs — on 1×
-    // keep encode synchronous to avoid a third full-band RGB16 allocation + jetsam.
+    // 2×: double-buffer host + async encode. 1×: one host band, wait+encode each
+    // band (pairs with single GPU acc slot) — larger bands, safe peak RAM.
     Image num_bands[2], den_bands[2];
     std::vector<uint16_t> row16_async[2];
     if (!heavy_1x) {
@@ -354,7 +355,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     report("Merging output", 0.48f);
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
-        cur ^= 1;
+        if (!heavy_1x) cur ^= 1;
+        else cur = 0;
         join_encode();
         Image& num_band = num_bands[cur];
         Image& den_band = den_bands[cur];
@@ -365,6 +367,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             } catch (...) {
                 report("Error: out of memory during merge", 1.f);
                 join_encode();
+                metal_merge_set_single_acc_slot(false);
                 writer.close();
                 if (stream_comp_raw) fs::remove_all(cache, ec);
                 return Image();
@@ -397,42 +400,52 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             }
         }
 
-        // Async commit; resolves previous in-flight band into its host images.
         if (!merge_ref_band_metal(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr)) {
             report("Error: GPU merge failed (memory?)", 1.f);
             join_encode();
+            metal_merge_set_single_acc_slot(false);
             writer.close();
             if (stream_comp_raw) fs::remove_all(cache, ec);
             return Image();
         }
 
-        if (have_ready) {
-            const int er = ready, ey0 = ready_y0, ebh = ready_bh;
-            if (heavy_1x) {
-                if (row16.size() < (size_t)ebh * (size_t)Ws * 3u)
-                    row16.resize((size_t)ebh * (size_t)Ws * 3u);
-                encode_band_rows(num_bands[er], den_bands[er], ey0, ebh, work, nch,
-                                 preview, pscale, ph, pw, Ws, row16);
-                writer.write_rows(row16.data(), ebh);
-            } else {
-                std::vector<uint16_t>& out16 = row16_async[er];
-                if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
-                    out16.resize((size_t)ebh * (size_t)Ws * 3u);
-                encode_thr = std::thread([&, er, ey0, ebh]() {
-                    encode_band_rows(num_bands[er], den_bands[er], ey0, ebh, work, nch,
-                                     preview, pscale, ph, pw, Ws, out16);
-                    writer.write_rows(out16.data(), ebh);
-                });
+        if (heavy_1x) {
+            // Single-slot: wait this band, encode, free host pressure before next.
+            if (!metal_merge_wait_inflight()) {
+                report("Error: GPU merge readback failed", 1.f);
+                metal_merge_set_single_acc_slot(false);
+                writer.close();
+                if (stream_comp_raw) fs::remove_all(cache, ec);
+                return Image();
             }
+            if (y0 + bh >= Hs) accumulate_diag(num_band, den_band, diag);
+            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
+                row16.resize((size_t)bh * (size_t)Ws * 3u);
+            encode_band_rows(num_band, den_band, y0, bh, work, nch,
+                             preview, pscale, ph, pw, Ws, row16);
+            writer.write_rows(row16.data(), bh);
+            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
+        } else if (have_ready) {
+            const int er = ready, ey0 = ready_y0, ebh = ready_bh;
+            std::vector<uint16_t>& out16 = row16_async[er];
+            if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
+                out16.resize((size_t)ebh * (size_t)Ws * 3u);
+            encode_thr = std::thread([&, er, ey0, ebh]() {
+                encode_band_rows(num_bands[er], den_bands[er], ey0, ebh, work, nch,
+                                 preview, pscale, ph, pw, Ws, out16);
+                writer.write_rows(out16.data(), ebh);
+            });
             report("Merging output", 0.48f + 0.50f * (float)(ey0 + ebh) / Hs);
         }
-        ready = cur;
-        ready_y0 = y0;
-        ready_bh = bh;
-        have_ready = true;
+        if (!heavy_1x) {
+            ready = cur;
+            ready_y0 = y0;
+            ready_bh = bh;
+            have_ready = true;
+        }
     }
     join_encode();
-    if (have_ready && metal_merge_wait_inflight()) {
+    if (!heavy_1x && have_ready && metal_merge_wait_inflight()) {
         Image& rn = num_bands[ready];
         Image& rd = den_bands[ready];
         accumulate_diag(rn, rd, diag);
@@ -442,6 +455,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         writer.write_rows(row16.data(), ready_bh);
         report("Merging output", 0.48f + 0.50f * (float)(ready_y0 + ready_bh) / Hs);
     }
+    metal_merge_set_single_acc_slot(false);
 #else
     Image num_band, den_band;
     report("Merging output", 0.48f);
