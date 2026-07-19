@@ -4,6 +4,9 @@
 #include <limits>
 #include <cmath>
 #include <vector>
+#ifdef __APPLE__
+#include "metal_gpu.h"
+#endif
 
 namespace hhsr {
 
@@ -244,6 +247,13 @@ f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
     return nc.std_curve[(size_t)id];
 }
 
+void fetch_noise_curves(f32 alpha, f32 beta,
+                        std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
+    NoiseCurves nc = make_noise_curves(alpha, beta);
+    std_curve = nc.std_curve;
+    diff_curve = nc.diff_curve;
+}
+
 namespace {
 
 static Image compute_guide(const Image& raw, const Config& cfg) {
@@ -431,14 +441,21 @@ static Image local_min_5x5(const Image& R) {
 } // namespace
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
+    if (!cfg.robustness_enabled) return RefStats();
+#ifdef __APPLE__
+    // Metal GPU only — same math as the CPU path below (golden reference).
+    RefStats gpu = init_robustness_metal(ref_raw, cfg);
+    if (gpu.means.h > 0 && gpu.means.w > 0) return gpu;
+    return RefStats();
+#else
     RefStats st;
-    if (!cfg.robustness_enabled) return st;
     Image guide = compute_guide(ref_raw, cfg);
     Image means, vars;
     local_stats_3x3(guide, means, vars);
     st.means = upscale_warp_stats(means, true, nullptr, 0, cfg.num_threads);
     st.stds  = upscale_warp_stats(vars, true, nullptr, 0, cfg.num_threads);
     return st;
+#endif
 }
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
@@ -454,6 +471,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         std::fill(r.data.begin(), r.data.end(), 1.f);
         return r;
     }
+
+#ifdef __APPLE__
+    // Metal GPU only — same Alg. robustness math as the CPU path below.
+    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg);
+    if (gpu.h > 0 && gpu.w > 0) return gpu;
+    return Image();
+#else
 
     const NoiseCurves nc = make_noise_curves(cfg.alpha, cfg.beta);
 
@@ -490,6 +514,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         }
     }
     return local_min_5x5(R);
+#endif
 }
 
 } // namespace hhsr

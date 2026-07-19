@@ -978,3 +978,202 @@ kernel void kernel_estimate_cov(device float* covs [[buffer(0)]],
     covs[base + 2u] = covs[base + 1u];
     covs[base + 3u] = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1];
 }
+
+// =============================================================================
+// Robustness — 1:1 with robustness.cpp (noise curves stay on CPU / uploaded LUT)
+// =============================================================================
+
+struct RobGuideParams {
+    uint raw_h, raw_w, guide_h, guide_w;
+    uint bayer; // 1 = Bayer → RGB guide
+    uint cfa00, cfa01, cfa10, cfa11;
+    float wb0, wb1, wb2;
+    uint _pad0;
+};
+
+struct RobStatsParams {
+    uint h, w, nch;
+    uint _pad0;
+};
+
+struct RobDogsonParams {
+    uint in_h, in_w, out_h, out_w, nch;
+    uint is_ref;      // 1 = no flow
+    uint tile_size;
+    uint flow_ny, flow_nx;
+    float s;          // always 2.f (Python CUDA hardcode)
+    uint _pad0, _pad1;
+};
+
+struct RobMaskParams {
+    uint h, w, nch;
+    uint tile_size;
+    uint flow_nx;
+    uint curve_n;     // 1001
+    float r_t;
+    uint _pad0;
+};
+
+inline float dogson_quadratic(float x) {
+    float ax = fabs(x);
+    if (ax <= 0.5f) return -2.f * ax * ax + 1.f;
+    if (ax <= 1.5f) return ax * ax - 2.5f * ax + 1.5f;
+    return 0.f;
+}
+
+// std::lround half-away-from-zero (not banker's round)
+inline int lround_away(float x) {
+    return (x >= 0.f) ? int(floor(x + 0.5f)) : int(ceil(x - 0.5f));
+}
+
+inline int clamp_edge(int v, int hi) {
+    float f = clamp(float(v), 0.f, float(hi));
+    return int(f);
+}
+
+kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
+                            device const float* raw [[buffer(1)]],
+                            constant RobGuideParams& p [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.guide_w || gid.y >= p.guide_h) return;
+    uint cfa[2][2] = {{p.cfa00, p.cfa01}, {p.cfa10, p.cfa11}};
+    float wb[3] = {p.wb0, p.wb1, p.wb2};
+    uint o = (gid.y * p.guide_w + gid.x) * 3u;
+    guide[o + 0u] = 0.f;
+    guide[o + 1u] = 0.f;
+    guide[o + 2u] = 0.f;
+    float gsum = 0.f;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            uint c = cfa[i][j];
+            float v = raw[(gid.y * 2u + uint(i)) * p.raw_w + (gid.x * 2u + uint(j))] / wb[c];
+            if (c == 1u) gsum += v;
+            else guide[o + c] = v;
+        }
+    }
+    guide[o + 1u] = 0.5f * gsum;
+}
+
+kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
+                                device float* vars [[buffer(1)]],
+                                device const float* guide [[buffer(2)]],
+                                constant RobStatsParams& p [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    int y = int(gid.y), x = int(gid.x);
+    int H = int(p.h), W = int(p.w);
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        float s = 0.f, s2 = 0.f;
+        for (int i = -1; i <= 1; ++i) {
+            int yy = clamp_edge(y + i, H - 1);
+            for (int j = -1; j <= 1; ++j) {
+                int xx = clamp_edge(x + j, W - 1);
+                float v = guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
+                s += v;
+                s2 += v * v;
+            }
+        }
+        float m = s / 9.f;
+        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+        means[o] = m;
+        vars[o] = s2 / 9.f - m * m;
+    }
+}
+
+kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
+                               device const float* stats [[buffer(1)]],
+                               device const float* flow [[buffer(2)]],
+                               constant RobDogsonParams& p [[buffer(3)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    int y = int(gid.y), x = int(gid.x);
+    float flow_x = 0.f, flow_y = 0.f;
+    if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
+        int patch_idy = y / int(p.tile_size);
+        int patch_idx = x / int(p.tile_size);
+        if (patch_idy >= 0 && patch_idy < int(p.flow_ny) &&
+            patch_idx >= 0 && patch_idx < int(p.flow_nx)) {
+            uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
+            flow_x = flow[fi + 0u];
+            flow_y = flow[fi + 1u];
+        }
+    }
+    float LR_y = (float(y) + flow_y + 0.5f) / p.s - 0.5f;
+    float LR_x = (float(x) + flow_x + 0.5f) / p.s - 0.5f;
+
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        float val;
+        if (!(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w))) {
+            val = INFINITY;
+        } else {
+            int center_y = lround_away(LR_y);
+            int center_x = lround_away(LR_x);
+            float w_acc = 0.f, buf = 0.f;
+            for (int i = -1; i <= 1; ++i) {
+                int y_ = clamp_edge(center_y + i, int(p.in_h) - 1);
+                float dy = float(y_) - LR_y;
+                float wy = dogson_quadratic(dy);
+                for (int j = -1; j <= 1; ++j) {
+                    int x_ = clamp_edge(center_x + j, int(p.in_w) - 1);
+                    float dx = float(x_) - LR_x;
+                    float w = wy * dogson_quadratic(dx);
+                    buf += stats[(uint(y_) * p.in_w + uint(x_)) * p.nch + ch] * w;
+                    w_acc += w;
+                }
+            }
+            val = buf / w_acc;
+        }
+        out[(gid.y * p.out_w + gid.x) * p.nch + ch] = val;
+    }
+}
+
+kernel void rob_make_mask(device float* R [[buffer(0)]],
+                          device const float* comp_means [[buffer(1)]],
+                          device const float* ref_means [[buffer(2)]],
+                          device const float* ref_vars [[buffer(3)]],
+                          device const float* std_curve [[buffer(4)]],
+                          device const float* diff_curve [[buffer(5)]],
+                          device const float* S [[buffer(6)]],
+                          constant RobMaskParams& p [[buffer(7)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    float d_sq_ = 0.f, sigma_sq_ = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+        float brightness = ref_means[o];
+        int id_noise = lround_away(1000.f * brightness);
+        // Valid brightness ∈[0,1] → id 0..1000; clamp only avoids GPU OOB on +inf tiles.
+        uint id = uint(clamp(id_noise, 0, int(p.curve_n) - 1));
+        float sigma_t = std_curve[id];
+        float d_t = diff_curve[id];
+        float sigma_p_sq = ref_vars[o];
+        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+        float d_p_ = fabs(ref_means[o] - comp_means[o]);
+        float d_p_sq = d_p_ * d_p_;
+        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+        d_sq_ += d_p_sq * shrink * shrink;
+    }
+    int patch_idy = int(gid.y) / int(p.tile_size);
+    int patch_idx = int(gid.x) / int(p.tile_size);
+    float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
+    float sig = sigma_sq_;
+    R[gid.y * p.w + gid.x] = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+}
+
+kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
+                              device const float* R [[buffer(1)]],
+                              constant RobStatsParams& p [[buffer(2)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    int y = int(gid.y), x = int(gid.x);
+    int H = int(p.h), W = int(p.w);
+    float mn = INFINITY;
+    for (int i = -2; i <= 2; ++i) {
+        int yy = clamp_edge(y + i, H - 1);
+        for (int j = -2; j <= 2; ++j) {
+            int xx = clamp_edge(x + j, W - 1);
+            mn = min(mn, R[uint(yy) * p.w + uint(xx)]);
+        }
+    }
+    out[gid.y * p.w + gid.x] = mn;
+}

@@ -49,6 +49,10 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
 
+// Full noise curves (1001 bins) for GPU upload — same cache as CPU robustness.
+void fetch_noise_curves(f32 alpha, f32 beta,
+                        std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
+
 // Robustness mask r at raw resolution [h, w, 1].
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg);

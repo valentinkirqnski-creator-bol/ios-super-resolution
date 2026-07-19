@@ -1,6 +1,6 @@
 #pragma once
 //
-// Metal GPU backend for grey-FFT, L2 block-matching, kernel covariance, and merge.
+// Metal GPU backend for grey-FFT, L2 BM, kernel covariance, robustness, and merge.
 // FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein, same
 // twiddle recurrence and scaling). L2 matches Torch rfft2/irfft2 path.
 // Kernels match kernels.cpp estimate_kernels (GAT + decimate + grads + cov).
@@ -8,6 +8,7 @@
 // No CPU fallback on Apple: failure returns empty / false.
 //
 #include "types.h"
+#include "stages.h"
 #include <complex>
 #include <vector>
 
@@ -27,6 +28,12 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
 
 // Alg. 5 kernel covariance on GPU. Empty CovField on failure.
 CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
+
+// Robustness hot path on GPU (1:1 with robustness.cpp). Noise curves stay on CPU.
+// Empty RefStats / Image on failure.
+RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg);
+Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
+                               const FlowField& flow, int tile_size, const Config& cfg);
 
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).

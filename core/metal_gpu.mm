@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -120,6 +121,8 @@ static MetalCtx& ctx() {
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
+            "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
+            "rob_make_mask", "rob_local_min_5x5",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -769,6 +772,283 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     CovField covs(grey_h, grey_w);
     memcpy(covs.cov.data(), [b_cov contents], cov_b);
     return covs;
+}
+
+namespace {
+
+struct RobGuideParamsCPU {
+    uint32_t raw_h, raw_w, guide_h, guide_w;
+    uint32_t bayer;
+    uint32_t cfa00, cfa01, cfa10, cfa11;
+    float wb0, wb1, wb2;
+    uint32_t _pad0 = 0;
+};
+static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
+
+struct RobStatsParamsCPU {
+    uint32_t h, w, nch, _pad0 = 0;
+};
+static_assert(sizeof(RobStatsParamsCPU) == 16, "RobStatsParamsCPU");
+
+struct RobDogsonParamsCPU {
+    uint32_t in_h, in_w, out_h, out_w, nch;
+    uint32_t is_ref, tile_size, flow_ny, flow_nx;
+    float s;
+    uint32_t _pad0 = 0, _pad1 = 0;
+};
+static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
+
+struct RobMaskParamsCPU {
+    uint32_t h, w, nch, tile_size, flow_nx, curve_n;
+    float r_t;
+    uint32_t _pad0 = 0;
+};
+static_assert(sizeof(RobMaskParamsCPU) == 32, "RobMaskParamsCPU");
+
+static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2) {
+    const f32 inf = std::numeric_limits<f32>::infinity();
+    std::vector<f32> S((size_t)flow.ny * (size_t)flow.nx, s2);
+    for (int ty = 0; ty < flow.ny; ++ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
+            for (int i = -1; i <= 1; ++i) {
+                for (int j = -1; j <= 1; ++j) {
+                    int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    f32 fx = flow.dx(yy, xx), fy = flow.dy(yy, xx);
+                    mnx = std::min(mnx, fx);
+                    mxx = std::max(mxx, fx);
+                    mny = std::min(mny, fy);
+                    mxy = std::max(mxy, fy);
+                }
+            }
+            f32 d0 = mxx - mnx, d1 = mxy - mny;
+            S[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
+                (d0 * d0 + d1 * d1 > Mt * Mt) ? s1 : s2;
+        }
+    }
+    return S;
+}
+
+static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
+                                id<MTLBuffer>& b_means, id<MTLBuffer>& b_vars,
+                                int& guide_h, int& guide_w, int& nch,
+                                id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    const bool bayer = cfg.bayer_mode;
+    guide_h = bayer ? raw.h / 2 : raw.h;
+    guide_w = bayer ? raw.w / 2 : raw.w;
+    nch = bayer ? 3 : 1;
+    if (guide_h < 1 || guide_w < 1) return false;
+
+    const size_t raw_b = raw.data.size() * sizeof(float);
+    const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
+    id<MTLBuffer> b_raw = buf(raw.data.data(), raw_b);
+    id<MTLBuffer> b_guide = buf(nullptr, guide_b);
+    b_means = buf(nullptr, guide_b);
+    b_vars = buf(nullptr, guide_b);
+    if (!b_raw || !b_guide || !b_means || !b_vars) return false;
+
+    if (bayer) {
+        RobGuideParamsCPU gp{};
+        gp.raw_h = (uint32_t)raw.h;
+        gp.raw_w = (uint32_t)raw.w;
+        gp.guide_h = (uint32_t)guide_h;
+        gp.guide_w = (uint32_t)guide_w;
+        gp.bayer = 1u;
+        gp.cfa00 = cfg.cfa.p[0][0];
+        gp.cfa01 = cfg.cfa.p[0][1];
+        gp.cfa10 = cfg.cfa.p[1][0];
+        gp.cfa11 = cfg.cfa.p[1][1];
+        gp.wb0 = cfg.white_balance[0];
+        gp.wb1 = cfg.white_balance[1];
+        gp.wb2 = cfg.white_balance[2];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:b_guide offset:0 atIndex:0];
+        [enc setBuffer:b_raw offset:0 atIndex:1];
+        [enc setBytes:&gp length:sizeof(gp) atIndex:2];
+        dispatch2(enc, c.pipe("rob_guide_bayer"), gp.guide_w, gp.guide_h);
+        [enc endEncoding];
+    } else {
+        memcpy([b_guide contents], raw.data.data(), guide_b);
+    }
+
+    RobStatsParamsCPU sp{};
+    sp.h = (uint32_t)guide_h;
+    sp.w = (uint32_t)guide_w;
+    sp.nch = (uint32_t)nch;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_means offset:0 atIndex:0];
+    [enc setBuffer:b_vars offset:0 atIndex:1];
+    [enc setBuffer:b_guide offset:0 atIndex:2];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+    dispatch2(enc, c.pipe("rob_local_stats_3x3"), sp.w, sp.h);
+    [enc endEncoding];
+    return true;
+}
+
+static bool rob_dogson(id<MTLBuffer> b_in, id<MTLBuffer>& b_out,
+                       int in_h, int in_w, int nch, bool is_ref,
+                       const FlowField* flow, int tile_size,
+                       int& out_h, int& out_w, id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    out_h = (nch == 3) ? in_h * 2 : in_h;
+    out_w = (nch == 3) ? in_w * 2 : in_w;
+    const size_t out_b = (size_t)out_h * (size_t)out_w * (size_t)nch * sizeof(float);
+    b_out = buf(nullptr, out_b);
+    if (!b_out) return false;
+
+    RobDogsonParamsCPU dp{};
+    dp.in_h = (uint32_t)in_h;
+    dp.in_w = (uint32_t)in_w;
+    dp.out_h = (uint32_t)out_h;
+    dp.out_w = (uint32_t)out_w;
+    dp.nch = (uint32_t)nch;
+    dp.is_ref = is_ref ? 1u : 0u;
+    dp.tile_size = (uint32_t)std::max(0, tile_size);
+    dp.flow_ny = (!is_ref && flow) ? (uint32_t)flow->ny : 0u;
+    dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
+    dp.s = 2.f;
+
+    id<MTLBuffer> b_flow = nil;
+    if (!is_ref && flow && !flow->flow.empty()) {
+        b_flow = buf(flow->flow.data(), flow->flow.size() * sizeof(float));
+        if (!b_flow) return false;
+    } else {
+        static float kDummyFlow[2] = {0.f, 0.f};
+        b_flow = buf(kDummyFlow, sizeof(kDummyFlow));
+        if (!b_flow) return false;
+    }
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_out offset:0 atIndex:0];
+    [enc setBuffer:b_in offset:0 atIndex:1];
+    [enc setBuffer:b_flow offset:0 atIndex:2];
+    [enc setBytes:&dp length:sizeof(dp) atIndex:3];
+    dispatch2(enc, c.pipe("rob_upscale_dogson"), dp.out_w, dp.out_h);
+    [enc endEncoding];
+    return true;
+}
+
+} // namespace
+
+RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
+    if (!metal_gpu_init() || ref_raw.h <= 0 || ref_raw.w <= 0) return RefStats();
+    auto& c = ctx();
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return RefStats();
+
+    id<MTLBuffer> b_means = nil, b_vars = nil;
+    int gh = 0, gw = 0, nch = 0;
+    if (!rob_run_guide_stats(ref_raw, cfg, b_means, b_vars, gh, gw, nch, cmd))
+        return RefStats();
+
+    id<MTLBuffer> b_out_m = nil, b_out_v = nil;
+    int oh = 0, ow = 0;
+    if (!rob_dogson(b_means, b_out_m, gh, gw, nch, true, nullptr, 0, oh, ow, cmd))
+        return RefStats();
+    int oh2 = 0, ow2 = 0;
+    if (!rob_dogson(b_vars, b_out_v, gh, gw, nch, true, nullptr, 0, oh2, ow2, cmd))
+        return RefStats();
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return RefStats();
+
+    RefStats st;
+    st.means = Image(oh, ow, nch);
+    st.stds = Image(oh2, ow2, nch);
+    const size_t mb = st.means.data.size() * sizeof(float);
+    const size_t vb = st.stds.data.size() * sizeof(float);
+    memcpy(st.means.data.data(), [b_out_m contents], mb);
+    memcpy(st.stds.data.data(), [b_out_v contents], vb);
+    return st;
+}
+
+Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
+                               const FlowField& flow, int tile_size, const Config& cfg) {
+    if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
+    if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
+    auto& c = ctx();
+
+    std::vector<f32> std_curve, diff_curve;
+    fetch_noise_curves(cfg.alpha, cfg.beta, std_curve, diff_curve);
+    if (std_curve.empty() || diff_curve.empty()) return Image();
+
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return Image();
+
+    id<MTLBuffer> b_gmeans = nil, b_gvars = nil;
+    int gh = 0, gw = 0, nch = 0;
+    if (!rob_run_guide_stats(comp_raw, cfg, b_gmeans, b_gvars, gh, gw, nch, cmd))
+        return Image();
+    (void)b_gvars;
+
+    id<MTLBuffer> b_comp = nil;
+    int oh = 0, ow = 0;
+    if (!rob_dogson(b_gmeans, b_comp, gh, gw, nch, false, &flow, tile_size, oh, ow, cmd))
+        return Image();
+
+    if (oh != ref_stats.means.h || ow != ref_stats.means.w || nch != ref_stats.means.c)
+        return Image();
+
+    const size_t ref_b = ref_stats.means.data.size() * sizeof(float);
+    const size_t mask_b = (size_t)oh * (size_t)ow * sizeof(float);
+    id<MTLBuffer> b_ref_m = buf(ref_stats.means.data.data(), ref_b);
+    id<MTLBuffer> b_ref_v = buf(ref_stats.stds.data.data(), ref_b);
+    id<MTLBuffer> b_std = buf(std_curve.data(), std_curve.size() * sizeof(float));
+    id<MTLBuffer> b_diff = buf(diff_curve.data(), diff_curve.size() * sizeof(float));
+    id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
+    id<MTLBuffer> b_R = buf(nullptr, mask_b);
+    id<MTLBuffer> b_out = buf(nullptr, mask_b);
+    if (!b_ref_m || !b_ref_v || !b_std || !b_diff || !b_S || !b_R || !b_out) return Image();
+
+    RobMaskParamsCPU mp{};
+    mp.h = (uint32_t)oh;
+    mp.w = (uint32_t)ow;
+    mp.nch = (uint32_t)nch;
+    mp.tile_size = (uint32_t)tile_size;
+    mp.flow_nx = (uint32_t)flow.nx;
+    mp.curve_n = (uint32_t)std_curve.size();
+    mp.r_t = cfg.r_t;
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return Image();
+    [enc setBuffer:b_R offset:0 atIndex:0];
+    [enc setBuffer:b_comp offset:0 atIndex:1];
+    [enc setBuffer:b_ref_m offset:0 atIndex:2];
+    [enc setBuffer:b_ref_v offset:0 atIndex:3];
+    [enc setBuffer:b_std offset:0 atIndex:4];
+    [enc setBuffer:b_diff offset:0 atIndex:5];
+    [enc setBuffer:b_S offset:0 atIndex:6];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+    dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
+    [enc endEncoding];
+
+    RobStatsParamsCPU sp{};
+    sp.h = (uint32_t)oh;
+    sp.w = (uint32_t)ow;
+    sp.nch = 1u;
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return Image();
+    [enc setBuffer:b_out offset:0 atIndex:0];
+    [enc setBuffer:b_R offset:0 atIndex:1];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+    dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
+    [enc endEncoding];
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
+
+    Image r(oh, ow, 1);
+    memcpy(r.data.data(), [b_out contents], mask_b);
+    return r;
 }
 
 bool block_match_level_L2_metal(const Image& ref, const Image& moving,
