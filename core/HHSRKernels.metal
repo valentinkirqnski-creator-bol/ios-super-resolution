@@ -707,7 +707,8 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
             z = max(0.f, z);
-            float w = metal::precise::exp(-0.5f * z);
+            // fast exp: same formula as CPU std::exp; precise::exp was a merge bottleneck
+            float w = metal::exp(-0.5f * z);
 
             float contrib_v = w * local_r * c;
             float contrib_a = w * local_r;
@@ -785,7 +786,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
-            float w = metal::precise::exp(-0.5f * y);
+            float w = metal::exp(-0.5f * y);
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }

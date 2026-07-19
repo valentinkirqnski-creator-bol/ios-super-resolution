@@ -27,8 +27,9 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
 // No CPU fallback. Host caches per-frame GPU buffers across bands and batches
-// all comps+ref for a band into one command buffer (avoids re-upload thrash).
+// all comps+ref for a band into one command buffer + one compute encoder.
 // frame_id >= 0: stable cache key (needed when CPU streams into one scratch Image).
+// When metal_merge_has_frame(frame_id), comp_raw may be empty (skip disk reload).
 bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
                            const CovField& covs, const Image& robustness,
                            int tile_size, Image& num_band, Image& den_band,
@@ -36,5 +37,8 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
 bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
                           Image& num_band, Image& den_band, int y0,
                           const Config& cfg, const Image* acc_rob);
+
+// True if this comparison frame's RAW/flow/cov/R already reside on the GPU.
+bool metal_merge_has_frame(int frame_id);
 
 } // namespace hhsr

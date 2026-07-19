@@ -6,6 +6,9 @@
 #include "snr_tuning.h"
 #include "raw_io.h"
 #include "parallel.h"
+#if defined(__APPLE__)
+#include "metal_gpu.h"
+#endif
 #include <vector>
 #include <array>
 #include <filesystem>
@@ -343,25 +346,41 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // ~64 MB band budget.
+    // Larger bands on Apple → fewer GPU sync/readback round-trips.
+#if defined(__APPLE__)
+    const size_t band_budget = 128u * 1024u * 1024u;
+#else
     const size_t band_budget = 64u * 1024u * 1024u;
+#endif
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2;
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
     std::vector<uint16_t> row16((size_t)band_rows * Ws * 3);
 
     AccumDiag diag;
-    // One scratch for streaming reloads (6+ frames). Shape is fixed for the burst.
+    // Reused across bands (GPU zeros its own accumulators).
+    Image num_band, den_band;
+    // One scratch for streaming first-upload only (6+ frames).
     Image comp_scratch;
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
-        Image num_band(bh, Ws, nch), den_band(bh, Ws, nch);
+        if (num_band.h != bh || num_band.w != Ws || num_band.c != nch) {
+            num_band = Image(bh, Ws, nch);
+            den_band = Image(bh, Ws, nch);
+        }
 
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
+#if defined(__APPLE__)
+                // After band 0, RAW/flow/cov/R already live on the GPU — skip disk I/O.
+                if (metal_merge_has_frame(meta.index)) {
+                    Image empty;
+                    merge_comp_band(empty, meta.flow, meta.covs, meta.rob, tile_size,
+                                    num_band, den_band, y0, work, meta.index);
+                    continue;
+                }
+#endif
                 if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
-                // Pass frame index so Metal can keep one GPU RAW per frame across
-                // bands (scratch Image pointer is reused and would thrash otherwise).
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
                                 num_band, den_band, y0, work, meta.index);
             }
