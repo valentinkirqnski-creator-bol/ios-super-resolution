@@ -16,11 +16,11 @@ namespace hhsr {
 namespace {
 
 // Bluestein A scratch rows per dispatch (~16MB at m=8192 with 128).
-static constexpr uint32_t kFftBatchChunk = 256;
+static constexpr uint32_t kFftBatchChunk = 320;
 // Soft commit (no wait) every N Bluestein groups to bound CB size; dual-A covers hazards.
-static constexpr uint32_t kCommitEveryChunks = 16;
+static constexpr uint32_t kCommitEveryChunks = 24;
 // Soft commit every N column strips in 2D FFT (no wait).
-static constexpr uint32_t kColCommitEvery = 32;
+static constexpr uint32_t kColCommitEvery = 48;
 // Max L2 tiles processed together (buffers scale with ntiles * N²).
 // Larger chunks + dual-slot async (below) cut full-res 1× sync thrash.
 static constexpr uint32_t kL2TileChunk = 2048;
@@ -114,6 +114,7 @@ static MetalCtx& ctx() {
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
+            "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -680,6 +681,92 @@ Image compute_grey_fft_metal(const Image& raw) {
     Image grey((int)h, (int)w, 1);
     memcpy(grey.data.data(), [real_out contents], n * sizeof(float));
     return grey;
+}
+
+CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
+    if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return CovField();
+    auto& c = ctx();
+
+    struct KernelEstParamsCPU {
+        uint32_t raw_h, raw_w, grey_h, grey_w;
+        uint32_t bayer, selection;
+        float alpha, beta;
+        float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
+        uint32_t _pad0 = 0, _pad1 = 0;
+    };
+    static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
+
+    const bool bayer = cfg.bayer_mode;
+    const int grey_h = bayer ? raw.h / 2 : raw.h;
+    const int grey_w = bayer ? raw.w / 2 : raw.w;
+    if (grey_h < 2 || grey_w < 2) return CovField();
+
+    KernelEstParamsCPU p{};
+    p.raw_h = (uint32_t)raw.h;
+    p.raw_w = (uint32_t)raw.w;
+    p.grey_h = (uint32_t)grey_h;
+    p.grey_w = (uint32_t)grey_w;
+    p.bayer = bayer ? 1u : 0u;
+    p.selection = (cfg.selection == SelectionLaw::HardThreshold) ? 0u : 1u;
+    p.alpha = cfg.alpha;
+    p.beta = cfg.beta;
+    p.k_detail = cfg.k_detail;
+    p.k_denoise = cfg.k_denoise;
+    p.D_th = cfg.D_th;
+    p.D_tr = cfg.D_tr;
+    p.k_stretch = cfg.k_stretch;
+    p.k_shrink = cfg.k_shrink;
+
+    const size_t raw_b = raw.data.size() * sizeof(float);
+    const size_t grey_b = (size_t)grey_h * (size_t)grey_w * sizeof(float);
+    const size_t grad_b = (size_t)(grey_h - 1) * (size_t)(grey_w - 1) * 2u * sizeof(float);
+    const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
+
+    id<MTLBuffer> b_raw = buf(raw.data.data(), raw_b);
+    id<MTLBuffer> b_vst = buf(nullptr, raw_b);
+    id<MTLBuffer> b_grey = buf(nullptr, grey_b);
+    id<MTLBuffer> b_grad = buf(nullptr, grad_b);
+    id<MTLBuffer> b_cov = buf(nullptr, cov_b);
+    if (!b_raw || !b_vst || !b_grey || !b_grad || !b_cov) return CovField();
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return CovField();
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setBuffer:b_vst offset:0 atIndex:0];
+    [enc setBuffer:b_raw offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat"), p.raw_w, p.raw_h);
+    [enc endEncoding];
+
+    enc = [cmd computeCommandEncoder];
+    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
+    [enc endEncoding];
+
+    enc = [cmd computeCommandEncoder];
+    [enc setBuffer:b_grad offset:0 atIndex:0];
+    [enc setBuffer:b_grey offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
+    [enc endEncoding];
+
+    enc = [cmd computeCommandEncoder];
+    [enc setBuffer:b_cov offset:0 atIndex:0];
+    [enc setBuffer:b_grad offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_estimate_cov"), p.grey_w, p.grey_h);
+    [enc endEncoding];
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return CovField();
+
+    CovField covs(grey_h, grey_w);
+    memcpy(covs.cov.data(), [b_cov contents], cov_b);
+    return covs;
 }
 
 bool block_match_level_L2_metal(const Image& ref, const Image& moving,

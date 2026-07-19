@@ -813,3 +813,168 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
         if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
     }
 }
+
+// =============================================================================
+// Alg. 5 — estimate_kernels (matches kernels.cpp exactly, incl. float guards)
+// =============================================================================
+
+struct KernelEstParams {
+    uint raw_h, raw_w, grey_h, grey_w;
+    uint bayer;     // 1 = decimate 2x2 after GAT
+    uint selection; // 0 = HardThreshold, 1 = Linear (C++ enum order)
+    float alpha, beta;
+    float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
+    uint _pad0, _pad1; // 64 bytes total for setBytes
+};
+
+inline float gat_sample(float v, float alpha, float beta) {
+    // apply_gat: c = 0.375*alpha^2 + beta; out = (2/alpha)*sqrt(max(0, alpha*v+c))
+    float c = 0.375f * alpha * alpha + beta;
+    float t = alpha * v + c;
+    return (2.f / alpha) * sqrt(max(0.f, t));
+}
+
+// linalg.h real_polyroots_2 / eigen_val / eigen_vect / eigen_elmts
+inline void real_polyroots_2(float a, float b, float c, thread float roots[2]) {
+    float delta = max(b * b - 4.f * a * c, 0.f);
+    float r1 = (-b + sqrt(delta)) / (2.f * a);
+    float r2 = (-b - sqrt(delta)) / (2.f * a);
+    if (fabs(r1) >= fabs(r2)) { roots[0] = r1; roots[1] = r2; }
+    else                      { roots[0] = r2; roots[1] = r1; }
+}
+
+inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
+                            thread float l[2], thread float e1[2], thread float e2[2]) {
+    float b = -(m00 + m11);
+    float c = m00 * m11 - m01 * m10;
+    real_polyroots_2(1.f, b, c, l);
+
+    if (m01 == 0.f && m00 == m11) {
+        e1[0] = 1.f; e1[1] = 0.f;
+        e2[0] = 0.f; e2[1] = 1.f;
+        return;
+    }
+    e1[0] = m00 + m01 - l[1];
+    e1[1] = m10 + m11 - l[1];
+    if (e1[0] == 0.f) {
+        e1[1] = 1.f;
+        e2[0] = 1.f;
+        e2[1] = 0.f;
+    } else if (e1[1] == 0.f) {
+        e1[0] = 1.f;
+        e2[0] = 0.f;
+        e2[1] = 1.f;
+    } else {
+        float norm_ = sqrt(e1[0] * e1[0] + e1[1] * e1[1]);
+        e1[0] /= norm_;
+        e1[1] /= norm_;
+        float sign = copysign(1.f, e1[0]);
+        e2[1] = fabs(e1[0]);
+        e2[0] = -e1[1] * sign;
+    }
+}
+
+// kernels.cpp compute_k (incl. flat-tensor + k_min guards)
+inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
+                          constant KernelEstParams& p) {
+    l1 = max(0.f, l1);
+    l2 = max(0.f, l2);
+    float sum = l1 + l2;
+    if (sum < 1e-12f) {
+        k1 = k2 = p.k_detail * p.k_denoise;
+        return;
+    }
+    float A = 1.f + sqrt(max(0.f, (l1 - l2) / sum));
+    float D = clamp(1.f - sqrt(l1) / p.D_tr + p.D_th, 0.f, 1.f);
+    float kk1, kk2;
+    if (p.selection == 0u) {
+        if (A > 1.95f) { kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch; }
+        else           { kk1 = 1.f; kk2 = 1.f; }
+    } else {
+        kk1 = 1.f + A / 2.f * (1.f / p.k_shrink - 1.f);
+        kk2 = 1.f + A / 2.f * (p.k_stretch - 1.f);
+    }
+    k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
+    k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
+    constexpr float k_min = 0.15f;
+    k1 = max(k1, k_min);
+    k2 = max(k2, k_min);
+}
+
+kernel void kernel_gat(device float* out [[buffer(0)]],
+                       device const float* raw [[buffer(1)]],
+                       constant KernelEstParams& p [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
+    uint i = gid.y * p.raw_w + gid.x;
+    out[i] = gat_sample(raw[i], p.alpha, p.beta);
+}
+
+kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],
+                                 device const float* vst [[buffer(1)]],
+                                 constant KernelEstParams& p [[buffer(2)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
+    uint y = gid.y, x = gid.x;
+    if (p.bayer) {
+        uint y0 = y * 2u, x0 = x * 2u;
+        float s = vst[y0 * p.raw_w + x0] + vst[y0 * p.raw_w + x0 + 1u] +
+                  vst[(y0 + 1u) * p.raw_w + x0] + vst[(y0 + 1u) * p.raw_w + x0 + 1u];
+        grey[y * p.grey_w + x] = 0.25f * s;
+    } else {
+        grey[y * p.grey_w + x] = vst[y * p.raw_w + x];
+    }
+}
+
+kernel void kernel_gradients(device float* grad [[buffer(0)]],
+                             device const float* grey [[buffer(1)]],
+                             constant KernelEstParams& p [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint gh = p.grey_h - 1u, gw = p.grey_w - 1u;
+    if (gid.x >= gw || gid.y >= gh) return;
+    uint y = gid.y, x = gid.x;
+    float tl = grey[y * p.grey_w + x];
+    float tr = grey[y * p.grey_w + x + 1u];
+    float bl = grey[(y + 1u) * p.grey_w + x];
+    float br = grey[(y + 1u) * p.grey_w + x + 1u];
+    uint o = (y * gw + x) * 2u;
+    grad[o + 0u] = 0.25f * ((tr - tl) + (br - bl));
+    grad[o + 1u] = 0.25f * ((bl - tl) + (br - tr));
+}
+
+kernel void kernel_estimate_cov(device float* covs [[buffer(0)]],
+                                device const float* grad [[buffer(1)]],
+                                constant KernelEstParams& p [[buffer(2)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
+    int y = int(gid.y), x = int(gid.x);
+    int grad_h = int(p.grey_h) - 1;
+    int grad_w = int(p.grey_w) - 1;
+
+    float s00 = 0.f, s01 = 0.f, s11 = 0.f;
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            int gy = y - 1 + i, gx = x - 1 + j;
+            if (gy < 0 || gy >= grad_h || gx < 0 || gx >= grad_w) continue;
+            uint gi = (uint(gy) * uint(grad_w) + uint(gx)) * 2u;
+            float gxv = grad[gi + 0u];
+            float gyv = grad[gi + 1u];
+            s00 += gxv * gxv;
+            s01 += gxv * gyv;
+            s11 += gyv * gyv;
+        }
+    }
+
+    float l[2], e1[2], e2[2];
+    eigen_elmts_2x2(s00, s01, s01, s11, l, e1, e2);
+
+    float k1, k2;
+    compute_k_cpu(l[0], l[1], k1, k2, p);
+
+    float k1s = k1 * k1, k2s = k2 * k2;
+    uint base = (gid.y * p.grey_w + gid.x) * 4u;
+    covs[base + 0u] = k1s * e1[0] * e1[0] + k2s * e2[0] * e2[0];
+    covs[base + 1u] = k1s * e1[0] * e1[1] + k2s * e2[0] * e2[1];
+    covs[base + 2u] = covs[base + 1u];
+    covs[base + 3u] = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1];
+}

@@ -1,55 +1,55 @@
 #include "stages.h"
 #include "parallel.h"
 #include "linalg.h"
+#ifdef __APPLE__
+#include "metal_gpu.h"
+#endif
 
 namespace hhsr {
 
-// Generalized Anscombe VST — matches utils_image.GAT / cuda_GAT.
-static Image apply_gat(const Image& img, f32 alpha, f32 beta) {
-    Image out(img.h, img.w, 1);
-    f32 c = 0.375f * alpha * alpha + beta; // 3/8 * alpha^2 + beta
-    for (size_t i = 0; i < img.data.size(); ++i) {
-        f32 v = alpha * img.data[i] + c;
-        out.data[i] = (2.f / alpha) * std::sqrt(std::max(0.f, v));
-    }
-    return out;
-}
-
-// Matches kernels.py compute_k / hard_threshold / linear.
-// Extra float guards: flat tensors (l1+l2≈0) and tiny negatives under sqrt
-// otherwise yield NaN cov → NaN merge weights → black/green speckles.
-static void compute_k(f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
-    l1 = std::max(0.f, l1);
-    l2 = std::max(0.f, l2);
-    f32 sum = l1 + l2;
-    if (sum < 1e-12f) {
-        // Isotropic denoise-sized kernel (same role as NaN→identity path in spirit).
-        k1 = k2 = cfg.k_detail * cfg.k_denoise;
-        return;
-    }
-    // Python: A = 1 + sqrt((l1 - l2)/(l1 + l2))
-    f32 A = 1.f + std::sqrt(std::max(0.f, (l1 - l2) / sum));
-    // Python: D = clamp(1 - sqrt(l1)/D_tr + D_th, 0, 1)
-    f32 D = clampf(1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
-
-    f32 kk1, kk2;
-    if (cfg.selection == SelectionLaw::HardThreshold) {
-        // hard_threshold: if A > 1.95 else (also NaN falls here in Python)
-        if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
-        else           { kk1 = 1.f; kk2 = 1.f; }
-    } else {
-        kk1 = 1.f + A / 2.f * (1.f / cfg.k_shrink - 1.f);
-        kk2 = 1.f + A / 2.f * (cfg.k_stretch - 1.f);
-    }
-    k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
-    k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
-    // Keep cov from collapsing to a single Bayer site under float32 exp.
-    constexpr f32 k_min = 0.15f;
-    k1 = std::max(k1, k_min);
-    k2 = std::max(k2, k_min);
-}
-
 CovField estimate_kernels(const Image& raw, const Config& cfg) {
+#ifdef __APPLE__
+    // Metal GPU only — same Alg. 5 math as the CPU path below (golden reference).
+    CovField gpu = estimate_kernels_metal(raw, cfg);
+    if (gpu.h > 0 && gpu.w > 0) return gpu;
+    return CovField();
+#else
+    // Generalized Anscombe VST — matches utils_image.GAT / cuda_GAT.
+    auto apply_gat = [](const Image& img, f32 alpha, f32 beta) {
+        Image out(img.h, img.w, 1);
+        f32 c = 0.375f * alpha * alpha + beta; // 3/8 * alpha^2 + beta
+        for (size_t i = 0; i < img.data.size(); ++i) {
+            f32 v = alpha * img.data[i] + c;
+            out.data[i] = (2.f / alpha) * std::sqrt(std::max(0.f, v));
+        }
+        return out;
+    };
+    // Matches kernels.py compute_k / hard_threshold / linear (+ C++ float guards).
+    auto compute_k = [](f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
+        l1 = std::max(0.f, l1);
+        l2 = std::max(0.f, l2);
+        f32 sum = l1 + l2;
+        if (sum < 1e-12f) {
+            k1 = k2 = cfg.k_detail * cfg.k_denoise;
+            return;
+        }
+        f32 A = 1.f + std::sqrt(std::max(0.f, (l1 - l2) / sum));
+        f32 D = clampf(1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
+        f32 kk1, kk2;
+        if (cfg.selection == SelectionLaw::HardThreshold) {
+            if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
+            else           { kk1 = 1.f; kk2 = 1.f; }
+        } else {
+            kk1 = 1.f + A / 2.f * (1.f / cfg.k_shrink - 1.f);
+            kk2 = 1.f + A / 2.f * (cfg.k_stretch - 1.f);
+        }
+        k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
+        k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
+        constexpr f32 k_min = 0.15f;
+        k1 = std::max(k1, k_min);
+        k2 = std::max(k2, k_min);
+    };
+
     Image vst = apply_gat(raw, cfg.alpha, cfg.beta);
     Image grey = compute_grey_decimate(vst, cfg.bayer_mode);
     Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
@@ -87,6 +87,7 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
     });
     return covs;
+#endif
 }
 
 } // namespace hhsr
