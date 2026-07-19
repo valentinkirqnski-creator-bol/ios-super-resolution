@@ -1177,3 +1177,94 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
     }
     out[gid.y * p.w + gid.x] = mn;
 }
+
+// L1 BM for ts==16: one thread per tile. Per-shift costs use the same
+// warp-then-block reduce order as align.cpp; argmin matches the Python
+// CUDA bug (err fixed at s_err[0], update when err < min_v).
+struct L1BmParams {
+    uint ref_h, ref_w, mov_h, mov_w;
+    uint ny, nx, ts, R;
+};
+
+inline float cuda_shfl_down_warp_sum_lane0_local(thread float* lane /*32*/) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float next[32];
+        for (int i = 0; i < 32; ++i) {
+            int src = i + offset;
+            float shfl = (src < 32) ? lane[src] : lane[i];
+            next[i] = lane[i] + shfl;
+        }
+        for (int i = 0; i < 32; ++i) lane[i] = next[i];
+    }
+    return lane[0];
+}
+
+inline float warp_then_block_reduce_256(thread float* vals /*256*/) {
+    float warp_sums[8];
+    for (int w = 0; w < 8; ++w)
+        warp_sums[w] = cuda_shfl_down_warp_sum_lane0_local(vals + w * 32);
+    float total = warp_sums[0];
+    for (int w = 1; w < 8; ++w) total += warp_sums[w];
+    return total;
+}
+
+kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
+                       device const float* mov [[buffer(1)]],
+                       device float* flow [[buffer(2)]],
+                       constant L1BmParams& p [[buffer(3)]],
+                       uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.ny * p.nx) return;
+    uint ty = tid / p.nx;
+    uint tx = tid % p.nx;
+    int ts = int(p.ts);
+    int R = int(p.R);
+    int corr = 2 * R + 1;
+    int oy = int(ty) * ts;
+    int ox = int(tx) * ts;
+
+    // CUDA round(): half away from zero (Metal round matches).
+    float fdx = flow[tid * 2u + 0u];
+    float fdy = flow[tid * 2u + 1u];
+    int flow_dx = int(round(fdx));
+    int flow_dy = int(round(fdy));
+
+    float s_err[9]; // R<=1 → corr<=3; default R=1. Cap at 9 for stack.
+    // General R: use max corr 9 (R<=4 would need more — only dispatch for R<=1).
+    if (corr > 9) return;
+
+    float per[256];
+    for (int sdy = -R; sdy <= R; ++sdy) {
+        for (int sdx = -R; sdx <= R; ++sdx) {
+            for (int i = 0; i < ts; ++i) {
+                int ry = oy + i;
+                for (int j = 0; j < ts; ++j) {
+                    int rx = ox + j;
+                    int tidp = i * ts + j;
+                    float rv = (ry < int(p.ref_h) && rx < int(p.ref_w))
+                                   ? ref[uint(ry) * p.ref_w + uint(rx)] : 0.f;
+                    int my = ry + flow_dy + sdy;
+                    int mx = rx + flow_dx + sdx;
+                    float mv = (my >= 0 && my < int(p.mov_h) && mx >= 0 && mx < int(p.mov_w))
+                                   ? mov[uint(my) * p.mov_w + uint(mx)] : 0.f;
+                    per[tidp] = fabs(rv - mv);
+                }
+            }
+            s_err[(sdy + R) * corr + (sdx + R)] = warp_then_block_reduce_256(per);
+        }
+    }
+
+    // Python CUDA argmin bug for ts==16
+    float err = s_err[0];
+    int min_shift_x = 0, min_shift_y = 0;
+    for (int i = 0; i < corr; ++i) {
+        for (int j = 0; j < corr; ++j) {
+            float min_v = s_err[i * corr + j];
+            if (err < min_v) {
+                min_shift_y = i - R;
+                min_shift_x = j - R;
+            }
+        }
+    }
+    flow[tid * 2u + 0u] = float(flow_dx + min_shift_x);
+    flow[tid * 2u + 1u] = float(flow_dy + min_shift_y);
+}

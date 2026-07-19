@@ -194,6 +194,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
+    ref_grey = Image(); // align uses pyramid only
 
     // Full-res (~12MP Bayer) cannot hold every comparison RAW + dual Metal peaks.
     const bool full_res =
@@ -212,6 +213,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         ref_stats = init_robustness(ref, work);
         ref_covs = ref_cov_fut.get();
     }
+#if defined(__APPLE__)
+    // GPU already holds ref means/vars; drop host copies to cut peak RAM.
+    metal_release_host_ref_stats(ref_stats);
+#endif
 
     // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
     // Peak during analyze ≈ ref + one comparison (+ optional prefetch on 2×).
@@ -335,6 +340,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
 
     // Release reference-side helpers not needed during merge.
+    clear_align_ref_ica_cache();
     ref_grey = Image();
     ref_pyr = Pyramid();
     ref_stats = RefStats();

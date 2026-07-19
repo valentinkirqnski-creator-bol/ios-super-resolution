@@ -133,25 +133,25 @@ static HessianField compute_hessian(const Image& gradx, const Image& grady, int 
 // ============================================================================
 static Image compute_sobel_gradx(const Image& img) {
     Image out(img.h, img.w, 1);
-    for (int y = 0; y < img.h; ++y) {
+    parallel_rows(img.h, 0, [&](int y) {
         for (int x = 0; x < img.w; ++x) {
             f32 vm = (x - 1 >= 0) ? img.at(y, x - 1) : 0.f;
             f32 vp = (x + 1 < img.w) ? img.at(y, x + 1) : 0.f;
             out.at(y, x) = -vm + vp;
         }
-    }
+    });
     return out;
 }
 
 static Image compute_sobel_grady(const Image& img) {
     Image out(img.h, img.w, 1);
-    for (int y = 0; y < img.h; ++y) {
+    parallel_rows(img.h, 0, [&](int y) {
         for (int x = 0; x < img.w; ++x) {
             f32 vm = (y - 1 >= 0) ? img.at(y - 1, x) : 0.f;
             f32 vp = (y + 1 < img.h) ? img.at(y + 1, x) : 0.f;
             out.at(y, x) = -vm + vp;
         }
-    }
+    });
     return out;
 }
 
@@ -312,6 +312,10 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
 static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
+#ifdef __APPLE__
+    if (block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow))
+        return;
+#endif
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
@@ -551,6 +555,22 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
     return out;
 }
 
+// Ref Sobel+Hessian are independent of the moving frame — reuse across
+// comparison frames in one burst. Cleared before merge (see clear_align_ref_ica_cache).
+struct RefIcaLevel {
+    Image gx, gy;
+    HessianField hess;
+};
+struct RefIcaBurstCache {
+    const void* key = nullptr;
+    std::vector<RefIcaLevel> levels;
+};
+static RefIcaBurstCache g_ref_ica_cache;
+
+void clear_align_ref_ica_cache() {
+    g_ref_ica_cache = {};
+}
+
 // ============================================================================
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
@@ -563,6 +583,21 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 
     int nlev = (int)ref_pyr.levels.size();
     FlowField flow;
+
+    if (g_ref_ica_cache.key != (const void*)&ref_pyr ||
+        (int)g_ref_ica_cache.levels.size() != nlev) {
+        g_ref_ica_cache.key = (const void*)&ref_pyr;
+        g_ref_ica_cache.levels.assign((size_t)nlev, RefIcaLevel{});
+        for (int lvl = 0; lvl < nlev; ++lvl) {
+            const Image& r = ref_pyr.levels[lvl];
+            int ts = (lvl < (int)cfg.bm_tile_sizes.size())
+                         ? cfg.bm_tile_sizes[lvl] : tile_size;
+            RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
+            L.gx = compute_sobel_gradx(r);
+            L.gy = compute_sobel_grady(r);
+            L.hess = compute_hessian(L.gx, L.gy, ts);
+        }
+    }
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[lvl];
@@ -597,11 +632,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg.num_threads);
 
-        // init_ica once per level (Sobel + Hessian), then ICA iters
-        Image gx = compute_sobel_gradx(r);
-        Image gy = compute_sobel_grady(r);
-        HessianField hess = compute_hessian(gx, gy, ts);
-        ica_refine_level(r, gx, gy, m, hess, flow, ts, cfg.ica_n_iter, cfg.num_threads);
+        const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
+        ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts, cfg.ica_n_iter,
+                         cfg.num_threads);
     }
 
     return flow;

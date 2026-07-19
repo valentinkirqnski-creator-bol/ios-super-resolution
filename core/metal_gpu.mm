@@ -122,7 +122,7 @@ static MetalCtx& ctx() {
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
-            "rob_make_mask", "rob_local_min_5x5",
+            "rob_make_mask", "rob_local_min_5x5", "l1_bm_ts16",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -936,9 +936,29 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
 
 } // namespace
 
+// Sticky ref means/vars for compute_robustness_metal (avoid re-upload + free host).
+static id<MTLBuffer> g_rob_ref_m = nil;
+static id<MTLBuffer> g_rob_ref_v = nil;
+static int g_rob_ref_h = 0, g_rob_ref_w = 0, g_rob_ref_c = 0;
+static size_t g_rob_ref_bytes = 0;
+static id<MTLBuffer> g_rob_std_curve = nil;
+static id<MTLBuffer> g_rob_diff_curve = nil;
+static size_t g_rob_curve_n = 0;
+
+static void clear_rob_ref_gpu() {
+    g_rob_ref_m = nil;
+    g_rob_ref_v = nil;
+    g_rob_ref_h = g_rob_ref_w = g_rob_ref_c = 0;
+    g_rob_ref_bytes = 0;
+    g_rob_std_curve = nil;
+    g_rob_diff_curve = nil;
+    g_rob_curve_n = 0;
+}
+
 RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     if (!metal_gpu_init() || ref_raw.h <= 0 || ref_raw.w <= 0) return RefStats();
     auto& c = ctx();
+    clear_rob_ref_gpu();
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return RefStats();
 
@@ -959,6 +979,14 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return RefStats();
 
+    // Pin Dogson outputs for all comparison frames (same math, no re-upload).
+    g_rob_ref_m = b_out_m;
+    g_rob_ref_v = b_out_v;
+    g_rob_ref_h = oh;
+    g_rob_ref_w = ow;
+    g_rob_ref_c = nch;
+    g_rob_ref_bytes = (size_t)oh * (size_t)ow * (size_t)nch * sizeof(float);
+
     RefStats st;
     st.means = Image(oh, ow, nch);
     st.stds = Image(oh2, ow2, nch);
@@ -967,6 +995,20 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     memcpy(st.means.data.data(), [b_out_m contents], mb);
     memcpy(st.stds.data.data(), [b_out_v contents], vb);
     return st;
+}
+
+void metal_release_host_ref_stats(RefStats& ref_stats) {
+    // Keep h/w/c for dimension checks; drop ~2× full-res 3ch float host copies.
+    const int mh = ref_stats.means.h, mw = ref_stats.means.w, mc = ref_stats.means.c;
+    const int sh = ref_stats.stds.h, sw = ref_stats.stds.w, sc = ref_stats.stds.c;
+    ref_stats.means = Image();
+    ref_stats.stds = Image();
+    ref_stats.means.h = mh;
+    ref_stats.means.w = mw;
+    ref_stats.means.c = mc;
+    ref_stats.stds.h = sh;
+    ref_stats.stds.w = sw;
+    ref_stats.stds.c = sc;
 }
 
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
@@ -998,12 +1040,27 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     if (oh != ref_stats.means.h || ow != ref_stats.means.w || nch != ref_stats.means.c)
         return Image();
 
-    const size_t ref_b = ref_stats.means.data.size() * sizeof(float);
+    const size_t ref_b = (size_t)oh * (size_t)ow * (size_t)nch * sizeof(float);
     const size_t mask_b = (size_t)oh * (size_t)ow * sizeof(float);
-    id<MTLBuffer> b_ref_m = buf(ref_stats.means.data.data(), ref_b);
-    id<MTLBuffer> b_ref_v = buf(ref_stats.stds.data.data(), ref_b);
-    id<MTLBuffer> b_std = buf(std_curve.data(), std_curve.size() * sizeof(float));
-    id<MTLBuffer> b_diff = buf(diff_curve.data(), diff_curve.size() * sizeof(float));
+    id<MTLBuffer> b_ref_m = nil;
+    id<MTLBuffer> b_ref_v = nil;
+    if (g_rob_ref_m && g_rob_ref_v && g_rob_ref_bytes == ref_b &&
+        g_rob_ref_h == oh && g_rob_ref_w == ow && g_rob_ref_c == nch) {
+        b_ref_m = g_rob_ref_m;
+        b_ref_v = g_rob_ref_v;
+    } else if (!ref_stats.means.data.empty() && !ref_stats.stds.data.empty()) {
+        b_ref_m = buf(ref_stats.means.data.data(), ref_b);
+        b_ref_v = buf(ref_stats.stds.data.data(), ref_b);
+    } else {
+        return Image();
+    }
+    if (g_rob_curve_n != std_curve.size() || !g_rob_std_curve || !g_rob_diff_curve) {
+        g_rob_std_curve = buf(std_curve.data(), std_curve.size() * sizeof(float));
+        g_rob_diff_curve = buf(diff_curve.data(), diff_curve.size() * sizeof(float));
+        g_rob_curve_n = std_curve.size();
+    }
+    id<MTLBuffer> b_std = g_rob_std_curve;
+    id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
@@ -1095,6 +1152,61 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     }
     if (!wait_slot(0) || !wait_slot(1)) return false;
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
+    return true;
+}
+
+bool block_match_level_L1_metal(const Image& ref, const Image& moving,
+                                int tile_size, int search_radius,
+                                FlowField& flow) {
+    if (!metal_gpu_init()) return false;
+    // Kernel is specialized for default finest level (ts=16, R<=1).
+    if (tile_size != 16 || search_radius < 0 || search_radius > 1) return false;
+    const int ny = flow.ny, nx = flow.nx;
+    if (ny <= 0 || nx <= 0) return true;
+    auto& c = ctx();
+
+    struct L1BmParamsCPU {
+        uint32_t ref_h, ref_w, mov_h, mov_w;
+        uint32_t ny, nx, ts, R;
+    };
+    static_assert(sizeof(L1BmParamsCPU) == 32, "L1BmParamsCPU layout");
+
+    L1BmParamsCPU p{};
+    p.ref_h = (uint32_t)ref.h;
+    p.ref_w = (uint32_t)ref.w;
+    p.mov_h = (uint32_t)moving.h;
+    p.mov_w = (uint32_t)moving.w;
+    p.ny = (uint32_t)ny;
+    p.nx = (uint32_t)nx;
+    p.ts = (uint32_t)tile_size;
+    p.R = (uint32_t)search_radius;
+
+    id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    if (!b_ref || !b_mov || !b_flow) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_ref offset:0 atIndex:0];
+    [enc setBuffer:b_mov offset:0 atIndex:1];
+    [enc setBuffer:b_flow offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    id<MTLComputePipelineState> pipe = c.pipe("l1_bm_ts16");
+    if (!pipe) return false;
+    [enc setComputePipelineState:pipe];
+    const NSUInteger ntiles = (NSUInteger)ny * (NSUInteger)nx;
+    NSUInteger tg = std::min(ntiles, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
+    if (tg == 0) tg = 1;
+    [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
     return true;
 }
 
@@ -1506,6 +1618,7 @@ void metal_trim_analyze_scratch() {
     c.kern_grad_b = c.kern_cov_b = 0;
     c.l2[0] = {};
     c.l2[1] = {};
+    clear_rob_ref_gpu();
 }
 
 void metal_merge_begin_burst() {

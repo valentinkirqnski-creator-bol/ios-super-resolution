@@ -26,12 +26,21 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow);
 
+// L1 BM for ts==16 (default finest level). Same warp-reduce + broken argmin
+// as align.cpp. Returns false if unsupported (ts!=16 or R>1) or GPU fail.
+bool block_match_level_L1_metal(const Image& ref, const Image& moving,
+                                int tile_size, int search_radius,
+                                FlowField& flow);
+
 // Alg. 5 kernel covariance on GPU. Empty CovField on failure.
 CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
 
 // Robustness hot path on GPU (1:1 with robustness.cpp). Noise curves stay on CPU.
 // Empty RefStats / Image on failure.
+// init pins ref means/vars on GPU; after init, host RefStats pixel buffers may be
+// cleared (keep h/w/c) — compute_robustness_metal uses the pinned GPU copy.
 RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg);
+void metal_release_host_ref_stats(RefStats& ref_stats); // free host pixels; keep dims
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
                                const FlowField& flow, int tile_size, const Config& cfg);
 

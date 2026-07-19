@@ -41,6 +41,8 @@ Image pad_image_circular(const Image& img, int tile_size);
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size);
+// Free cached ref Sobel/Hessian (call when reference pyramid is released).
+void clear_align_ref_ica_cache();
 
 // ---- robustness.cpp -----------------------------------------------------
 struct RefStats { Image means; Image stds; }; // raw resolution [h, w, ch]
