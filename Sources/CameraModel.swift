@@ -303,7 +303,9 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func applyZSLMode() {
         // System ZSL cuts first-frame latency; our disk ring holds the multi-frame burst.
-        photoOutput.isZeroShutterLagEnabled = zslEnabled
+        if #available(iOS 17.0, *) {
+            photoOutput.isZeroShutterLagEnabled = zslEnabled
+        }
         if zslEnabled {
             zslWanted = true
             ensureZSLDir()
