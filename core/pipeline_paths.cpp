@@ -326,8 +326,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
-    if (!writer.open(dng_path, Ws, Hs, model, work.orientation, nullptr, nullptr,
-                     work.bake_srgb, make)) {
+    if (!writer.open(dng_path, Ws, Hs, model, work.orientation,
+                     work.has_color_matrix ? work.color_matrix : nullptr,
+                     work.white_balance,
+                     work.bake_srgb, make,
+                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
         fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
         return Image();

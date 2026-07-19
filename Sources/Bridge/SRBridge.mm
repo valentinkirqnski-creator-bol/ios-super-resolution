@@ -2,9 +2,11 @@
 #import <UIKit/UIKit.h>
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 #include <string>
 #include <vector>
+#include <cmath>
 
 #include "core/types.h"
 #include "core/pipeline.h"
@@ -29,7 +31,8 @@ static UIImage* UIImageFromPreview(const Image& preview) {
         }
     }
 
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
     NSData* nsData = [NSData dataWithBytes:rgba.data() length:rgba.size()];
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)nsData);
     CGImageRef cg = CGImageCreate(
@@ -41,6 +44,11 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(cs);
     return img;
+}
+
+static inline float to_srgb_gamma(float v) {
+    v = clampf(v, 0.f, 1.f);
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
 }
 
 @implementation SRBridge
@@ -66,7 +74,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     cfg.scale = scale;
     cfg.input_crop_factor = std::max(1, cropFactor);
     cfg.bayer_mode = true;
-    cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview
+    cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview / JPEG
     cfg.use_gpu = false;
     cfg.num_threads = 0;     // all CPU cores during active processing
 
@@ -113,20 +121,48 @@ static UIImage* UIImageFromPreview(const Image& preview) {
 
     std::vector<uint16_t> rgb;
     int W = 0, H = 0;
-    if (!load_linear_dng_rgb16(std::string(dngPath.UTF8String), rgb, W, H) || W <= 0 || H <= 0)
+    float wb[3] = {1.f, 1.f, 1.f};
+    float m[9] = {1,0,0, 0,1,0, 0,0,1};
+    bool has_color = false;
+    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+        W <= 0 || H <= 0)
         return NO;
 
-    // Build a 16-bit RGB CGImage (no alpha) for Core Image tone mapping.
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    if (!cs) return NO;
-    NSData* data = [NSData dataWithBytes:rgb.data() length:rgb.size() * sizeof(uint16_t)];
+    // Convert linear camera RGB → display sRGB (same as pipeline preview), then tone-map.
+    std::vector<uint8_t> srgb((size_t)W * (size_t)H * 4);
+    const size_t n = (size_t)W * (size_t)H;
+    for (size_t i = 0; i < n; ++i) {
+        float r = rgb[i * 3 + 0] * (1.f / 65535.f);
+        float g = rgb[i * 3 + 1] * (1.f / 65535.f);
+        float b = rgb[i * 3 + 2] * (1.f / 65535.f);
+        float wr = r * wb[0], wg = g * wb[1], wb_ = b * wb[2];
+        float sr, sg, sb;
+        if (has_color) {
+            sr = m[0] * wr + m[1] * wg + m[2] * wb_;
+            sg = m[3] * wr + m[4] * wg + m[5] * wb_;
+            sb = m[6] * wr + m[7] * wg + m[8] * wb_;
+        } else {
+            sr = wr; sg = wg; sb = wb_;
+        }
+        srgb[i * 4 + 0] = (uint8_t)std::lround(to_srgb_gamma(sr) * 255.f);
+        srgb[i * 4 + 1] = (uint8_t)std::lround(to_srgb_gamma(sg) * 255.f);
+        srgb[i * 4 + 2] = (uint8_t)std::lround(to_srgb_gamma(sb) * 255.f);
+        srgb[i * 4 + 3] = 255;
+    }
     rgb.clear();
     rgb.shrink_to_fit();
 
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return NO;
+    NSData* data = [NSData dataWithBytes:srgb.data() length:srgb.size()];
+    srgb.clear();
+    srgb.shrink_to_fit();
+
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
     CGImageRef cgIn = CGImageCreate(
-        W, H, 16, 48, W * 6, cs,
-        kCGBitmapByteOrder16Little | kCGImageAlphaNone,
+        W, H, 8, 32, W * 4, cs,
+        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast,
         provider, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(cs);
@@ -135,6 +171,7 @@ static UIImage* UIImageFromPreview(const Image& preview) {
     CIImage* image = [CIImage imageWithCGImage:cgIn];
     CGImageRelease(cgIn);
 
+    // Highlights −100 / Shadows +60 (UI copy) via CIHighlightShadowAdjust.
     CIFilter* hs = [CIFilter filterWithName:@"CIHighlightShadowAdjust"];
     if (hs) {
         [hs setValue:image forKey:kCIInputImageKey];
@@ -151,8 +188,19 @@ static UIImage* UIImageFromPreview(const Image& preview) {
         if (cc.outputImage) image = cc.outputImage;
     }
 
-    CIContext* ctx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    CGImageRef cgOut = [ctx createCGImage:image fromRect:image.extent];
+    CIContext* ctx = [CIContext contextWithOptions:@{
+        kCIContextUseSoftwareRenderer: @NO,
+        kCIContextWorkingColorSpace: [NSNull null]
+    }];
+    CGColorSpaceRef outCS = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGImageRef cgOut = [ctx createCGImage:image
+                                 fromRect:image.extent
+                                   format:kCIFormatBGRA8
+                               colorSpace:outCS ? outCS : nil];
+    if (outCS) CGColorSpaceRelease(outCS);
+    if (!cgOut) {
+        cgOut = [ctx createCGImage:image fromRect:image.extent];
+    }
     if (!cgOut) return NO;
 
     NSURL* url = [NSURL fileURLWithPath:jpgPath];

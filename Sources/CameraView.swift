@@ -428,6 +428,15 @@ struct CameraView: View {
                     Slider(value: $cam.tuningParams.k_stretch, in: 1.0...10.0)
                 }
                 
+                Section(header: Text("Capture")) {
+                    Toggle("Zero Shutter Lag (ZSL)", isOn: $cam.zslEnabled)
+                    Text(cam.zslEnabled
+                         ? "Buffers \(cam.frameCount) RAW frames continuously. Tap shutter to grab them without holding still afterward. Ready: \(cam.zslBufferReady)/\(cam.frameCount)."
+                         : "Off — classic burst: frames are captured after you tap the shutter.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Export")) {
                     Picker("Format", selection: $cam.exportFormat) {
                         ForEach(ExportFormat.allCases) { fmt in
@@ -436,8 +445,8 @@ struct CameraView: View {
                     }
                     .pickerStyle(.segmented)
                     Text(cam.exportFormat == .dng
-                         ? "Lossless compressed LinearRaw DNG (same quality, smaller file)."
-                         : "Tone-mapped JPEG from the DNG: Highlights −100, Shadows +60, Contrast +5.")
+                         ? "LinearRaw DNG + JPEG preview in Photos (open DNG in Lightroom for full edit)."
+                         : "Tone-mapped JPEG: WB + color matrix + gamma, then Highlights −100, Shadows +60, Contrast +5.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }

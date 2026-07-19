@@ -3,8 +3,10 @@
 #include <cstring>
 #include <vector>
 #include <cstdint>
+#include <cmath>
 #include <algorithm>
 #include <ctime>
+#include <utility>
 #include <zlib.h>
 
 namespace hhsr {
@@ -122,16 +124,24 @@ static void undo_hdiff_rgb16(uint16_t* row, int W) {
     }
 }
 
+static void append_f32_le(std::vector<uint8_t>& p, float v) {
+    uint32_t u = 0;
+    std::memcpy(&u, &v, sizeof(u));
+    w32(p, u);
+}
+
 } // namespace
 
 // Builds DNG header. StripByteCounts left as 0 — patched after Deflate finishes.
+// Private tag 65000: 12×f32 LE = wb[3] + cam_to_srgb[9] for JPEG export.
 static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const std::string& camera_make,
                                              const std::string& camera_model,
                                              int orientation,
-                                             const float* /*cm*/,
-                                             const float* /*wb*/,
+                                             const float* cm,
+                                             const float* wb,
                                              bool baked_srgb,
+                                             const float* cam_to_srgb,
                                              uint32_t& strip_offset_out,
                                              uint32_t& strip_byte_counts_offset_out) {
     IFD ifd;
@@ -170,8 +180,39 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     if (!baked_srgb) {
         ifd.shortv(50778, 21);         // CalibrationIlluminant1 = D65
-        ifd.srational(50721, {1,1, 0,1, 0,1,  0,1, 1,1, 0,1,  0,1, 0,1, 1,1});
+        if (cm) {
+            std::vector<int32_t> nd;
+            nd.reserve(18);
+            for (int i = 0; i < 9; ++i) {
+                nd.push_back((int32_t)std::lround(cm[i] * 10000.f));
+                nd.push_back(10000);
+            }
+            ifd.srational(50721, std::move(nd));
+        } else {
+            ifd.srational(50721, {1,1, 0,1, 0,1,  0,1, 1,1, 0,1,  0,1, 0,1, 1,1});
+        }
+        if (wb) {
+            auto to_rat = [](float g) -> std::pair<uint32_t, uint32_t> {
+                float n = (g > 1e-6f) ? (1.f / g) : 1.f;
+                return {(uint32_t)std::lround(n * 10000.f), 10000u};
+            };
+            auto r = to_rat(wb[0]), g = to_rat(wb[1]), b = to_rat(wb[2]);
+            ifd.rational(50728, {r.first, r.second, g.first, g.second, b.first, b.second});
+        }
         ifd.shortv(50831, 1);          // ColorimetricReference = scene referred
+    }
+
+    if (wb || cam_to_srgb) {
+        std::vector<uint8_t> blob;
+        blob.reserve(48);
+        for (int i = 0; i < 3; ++i) append_f32_le(blob, wb ? wb[i] : 1.f);
+        for (int i = 0; i < 9; ++i) {
+            float v = 0.f;
+            if (cam_to_srgb) v = cam_to_srgb[i];
+            else if (i == 0 || i == 4 || i == 8) v = 1.f;
+            append_f32_le(blob, v);
+        }
+        ifd.e.push_back({65000, T_BYTE, (uint32_t)blob.size(), 0, std::move(blob)});
     }
 
     std::sort(ifd.e.begin(), ifd.e.end(), [](const Entry& a, const Entry& b) {
@@ -241,7 +282,7 @@ bool write_linear_dng(const std::string& path, const Image& rgb, const std::stri
 bool DngStreamWriter::open(const std::string& path, int W, int H, const std::string& camera_model,
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
-                           const std::string& camera_make) {
+                           const std::string& camera_make, const float* camToSrgb) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
     compressed_bytes_ = 0;
@@ -251,7 +292,7 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
-                                                   bakedSrgb, strip_offset,
+                                                   bakedSrgb, camToSrgb, strip_offset,
                                                    strip_byte_counts_offset_);
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
@@ -432,6 +473,50 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
 
     W = (int)width;
     H = (int)height;
+    return true;
+}
+
+bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
+                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
+                                 bool& has_color) {
+    has_color = false;
+    wb[0] = wb[1] = wb[2] = 1.f;
+    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
+
+    if (!load_linear_dng_rgb16(path, rgb, W, H)) return false;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return true;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return true; }
+    long fsz = ftell(f);
+    if (fsz < 16) { fclose(f); return true; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return true; }
+    std::vector<uint8_t> file((size_t)fsz);
+    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return true; }
+    fclose(f);
+
+    if (file[0] != 'I' || file[1] != 'I') return true;
+    uint32_t ifd = r32(file.data() + 4);
+    if (ifd + 2 > file.size()) return true;
+    uint16_t nent = r16(file.data() + ifd);
+    for (uint16_t i = 0; i < nent; ++i) {
+        const uint8_t* e = file.data() + ifd + 2 + i * 12;
+        uint16_t tag = r16(e), type = r16(e + 2);
+        uint32_t count = r32(e + 4), val = r32(e + 8);
+        if (tag != 65000 || type != T_BYTE || count < 48) continue;
+        uint32_t off = (count <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+        if (off + 48 > file.size()) continue;
+        auto read_f = [&](uint32_t o) -> float {
+            uint32_t u = r32(file.data() + o);
+            float v = 0.f;
+            std::memcpy(&v, &u, sizeof(v));
+            return v;
+        };
+        for (int k = 0; k < 3; ++k) wb[k] = read_f(off + (uint32_t)k * 4);
+        for (int k = 0; k < 9; ++k) cam_to_srgb[k] = read_f(off + 12 + (uint32_t)k * 4);
+        has_color = true;
+        break;
+    }
     return true;
 }
 

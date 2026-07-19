@@ -189,7 +189,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     if (!writer.open(dng_path, Ws, Hs, "HandheldSR-x2", work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
                      work.bayer_mode ? work.white_balance : nullptr,
-                     work.bake_srgb)) {
+                     work.bake_srgb, "HandheldSR",
+                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
         report("Error: cannot open output DNG", 1.0f);
         return Image();
     }
