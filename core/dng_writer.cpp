@@ -165,7 +165,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
     ifd.ascii(306, now_tiff_datetime()); // DateTime
-    ifd.shortv(317, 2);                // Predictor = horizontal differencing
+    ifd.shortv(317, 1);                // Predictor = none (faster write; same pixels)
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
 
     ifd.longs(50719, {0, 0});
@@ -296,6 +296,8 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                                                    strip_byte_counts_offset_);
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
+    // Large stdio buffer — fewer syscalls during streaming Deflate.
+    setvbuf(f_, nullptr, _IOFBF, 1u << 20);
     if (fwrite(prefix.data(), 1, prefix.size(), f_) != prefix.size()) {
         fclose(f_); f_ = nullptr;
         return false;
@@ -303,33 +305,36 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
 
     auto* zs = new z_stream();
     std::memset(zs, 0, sizeof(z_stream));
-    // Lossless Deflate (same pixels). Default level is much faster than Z_BEST
-    // and is often the dominant cost of the UI "Merging output" phase.
-    if (deflateInit(zs, Z_DEFAULT_COMPRESSION) != Z_OK) {
+    // Fastest lossless zlib level — same decoded RGB16, much less CPU than Z_BEST/default.
+    if (deflateInit(zs, Z_BEST_SPEED) != Z_OK) {
         delete zs;
         fclose(f_); f_ = nullptr;
         return false;
     }
     z_stream_ = zs;
-    z_out_.resize(256 * 1024);
-    pred_row_.resize((size_t)W * 3);
+    z_out_.resize(1u << 20);
     deflate_ok_ = true;
     return true;
 }
 
 bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
-    if (!f_ || !deflate_ok_ || !z_stream_ || nrows <= 0) return false;
+    if (!f_ || !deflate_ok_ || !z_stream_ || !rgb16 || nrows <= 0) return false;
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
 
     auto* zs = static_cast<z_stream*>(z_stream_);
-    for (int r = 0; r < nrows; ++r) {
-        std::memcpy(pred_row_.data(), rgb16 + (size_t)r * W_ * 3, (size_t)W_ * 3 * sizeof(uint16_t));
-        apply_hdiff_rgb16(pred_row_.data(), W_);
-
-        zs->next_in = reinterpret_cast<Bytef*>(pred_row_.data());
-        zs->avail_in = (uInt)((size_t)W_ * 3 * sizeof(uint16_t));
-
+    // Bulk feed (no per-row copy / predictor) — same pixels, far less overhead.
+    const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
+    zs->next_in = reinterpret_cast<Bytef*>(const_cast<uint16_t*>(rgb16));
+    zs->avail_in = 0;
+    size_t remaining = nbytes;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(rgb16);
+    while (remaining > 0) {
+        const uInt chunk = (uInt)std::min(remaining, (size_t)0x80000000u);
+        zs->next_in = reinterpret_cast<Bytef*>(const_cast<uint8_t*>(src));
+        zs->avail_in = chunk;
+        src += chunk;
+        remaining -= chunk;
         while (zs->avail_in > 0) {
             zs->next_out = z_out_.data();
             zs->avail_out = (uInt)z_out_.size();

@@ -92,55 +92,74 @@ static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
 static void encode_band_rows(const Image& num_band, const Image& den_band, int y0, int bh,
                              const Config& work, int nch, Image& preview, float pscale,
                              int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
+    // Same num/den → RGB16 math as before; pointer loops + sparse preview only.
     auto to_srgb = [](f32 v) {
         v = clampf(v, 0.f, 1.f);
         return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
     };
     const int x_step = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
+    // Preview is UI-only; sample a bit more sparsely (DNG pixels unchanged).
+    const int y_step = std::max(1, x_step);
+    const f32* nump = num_band.data.data();
+    const f32* denp = den_band.data.data();
+    uint16_t* outp = row16.data();
+    const bool bake = work.bake_srgb && nch >= 3;
+    const f32* m = work.cam_to_srgb;
+    const f32 wb0 = work.white_balance[0], wb1 = work.white_balance[1], wb2 = work.white_balance[2];
+    const bool prev_color = !bake && nch >= 3 && work.has_cam_to_srgb;
+
     parallel_rows(bh, work.num_threads, [&](int i) {
-        int gy = y0 + i;
-        int py = std::min(ph - 1, (int)(gy * pscale));
+        const int gy = y0 + i;
+        const bool do_prev_row = ((gy % y_step) == 0);
+        const int py = std::min(ph - 1, (int)(gy * pscale));
+        const size_t row_off = (size_t)i * (size_t)Ws * (size_t)nch;
         for (int x = 0; x < Ws; ++x) {
-            size_t base = ((size_t)i * Ws + x) * 3;
-            f32 cn[3] = {0, 0, 0};
-            for (int ch = 0; ch < nch; ++ch) {
-                f32 d = den_band.at(i, x, ch);
-                cn[ch] = (d > 0.f) ? num_band.at(i, x, ch) / d : 0.f;
-            }
-            f32 outc[3];
-            if (work.bake_srgb && nch >= 3) {
-                f32 wr = cn[0] * work.white_balance[0];
-                f32 wg = cn[1] * work.white_balance[1];
-                f32 wb = cn[2] * work.white_balance[2];
-                const f32* m = work.cam_to_srgb;
-                outc[0] = m[0] * wr + m[1] * wg + m[2] * wb;
-                outc[1] = m[3] * wr + m[4] * wg + m[5] * wb;
-                outc[2] = m[6] * wr + m[7] * wg + m[8] * wb;
-            } else if (nch >= 3) {
-                outc[0] = cn[0]; outc[1] = cn[1]; outc[2] = cn[2];
-            } else {
-                outc[0] = outc[1] = outc[2] = cn[0];
-            }
-            for (int k = 0; k < 3; ++k) {
-                f32 v = work.bake_srgb ? to_srgb(outc[k]) : clampf(outc[k], 0.f, 1.f);
-                row16[base + k] = (uint16_t)(v * 65535.f + 0.5f);
-            }
-            if ((x % x_step) == 0) {
-                f32 preview_lin[3] = {outc[0], outc[1], outc[2]};
-                if (!work.bake_srgb && nch >= 3) {
-                    f32 wr = cn[0] * work.white_balance[0];
-                    f32 wg = cn[1] * work.white_balance[1];
-                    f32 wb = cn[2] * work.white_balance[2];
-                    if (work.has_cam_to_srgb) {
-                        const f32* m = work.cam_to_srgb;
-                        preview_lin[0] = m[0] * wr + m[1] * wg + m[2] * wb;
-                        preview_lin[1] = m[3] * wr + m[4] * wg + m[5] * wb;
-                        preview_lin[2] = m[6] * wr + m[7] * wg + m[8] * wb;
-                    } else {
-                        preview_lin[0] = wr; preview_lin[1] = wg; preview_lin[2] = wb;
-                    }
+            const size_t pi = row_off + (size_t)x * (size_t)nch;
+            f32 cn0 = 0.f, cn1 = 0.f, cn2 = 0.f;
+            {
+                f32 d0 = denp[pi];
+                cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
+                if (nch >= 2) {
+                    f32 d1 = denp[pi + 1];
+                    cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
                 }
-                int px = std::min(pw - 1, (int)(x * pscale));
+                if (nch >= 3) {
+                    f32 d2 = denp[pi + 2];
+                    cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
+                }
+            }
+            f32 lin0, lin1, lin2;
+            if (bake) {
+                f32 wr = cn0 * wb0, wg = cn1 * wb1, wb = cn2 * wb2;
+                lin0 = m[0] * wr + m[1] * wg + m[2] * wb;
+                lin1 = m[3] * wr + m[4] * wg + m[5] * wb;
+                lin2 = m[6] * wr + m[7] * wg + m[8] * wb;
+            } else if (nch >= 3) {
+                lin0 = cn0; lin1 = cn1; lin2 = cn2;
+            } else {
+                lin0 = lin1 = lin2 = cn0;
+            }
+            const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0, 0.f, 1.f);
+            const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1, 0.f, 1.f);
+            const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2, 0.f, 1.f);
+            const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
+            outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
+            outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
+            outp[base + 2] = (uint16_t)(v2 * 65535.f + 0.5f);
+
+            if (do_prev_row && (x % x_step) == 0) {
+                f32 preview_lin[3] = {lin0, lin1, lin2};
+                if (prev_color) {
+                    f32 wr = cn0 * wb0, wg = cn1 * wb1, wb = cn2 * wb2;
+                    preview_lin[0] = m[0] * wr + m[1] * wg + m[2] * wb;
+                    preview_lin[1] = m[3] * wr + m[4] * wg + m[5] * wb;
+                    preview_lin[2] = m[6] * wr + m[7] * wg + m[8] * wb;
+                } else if (!bake && nch >= 3) {
+                    preview_lin[0] = cn0 * wb0;
+                    preview_lin[1] = cn1 * wb1;
+                    preview_lin[2] = cn2 * wb2;
+                }
+                const int px = std::min(pw - 1, (int)(x * pscale));
                 for (int k = 0; k < 3; ++k)
                     preview.at(py, px, k) = to_srgb(clampf(preview_lin[k], 0.f, 1.f));
             }
@@ -281,7 +300,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     // Larger bands on Apple → fewer GPU sync/readback round-trips.
     // 1× (~8k) aims for ~2–4 bands; 2× crop often fits in one band.
 #if defined(__APPLE__)
-    const size_t band_budget = 384u * 1024u * 1024u;
+    // Prefer fewer, larger bands so Deflate/encode runs in bigger chunks.
+    const size_t band_budget = 512u * 1024u * 1024u;
 #else
     const size_t band_budget = 64u * 1024u * 1024u;
 #endif
