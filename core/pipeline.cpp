@@ -212,7 +212,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         for (int k = 1; k < n; ++k) {
             const FrameData& fd = frames[k - 1];
             merge_comp_band(burst[k], fd.flow, fd.covs, fd.robustness, tile_size,
-                            num_band, den_band, y0, work);
+                            num_band, den_band, y0, work, k);
         }
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
 

@@ -1,8 +1,9 @@
 #pragma once
 //
-// Metal GPU backend for grey-FFT and L2 block-matching.
+// Metal GPU backend for grey-FFT, L2 block-matching, and merge accumulate.
 // FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein, same
 // twiddle recurrence and scaling). L2 matches Torch rfft2/irfft2 path.
+// Merge matches merge.cpp accumulate_comp / accumulate_ref (incl. robustness).
 // No CPU fallback on Apple: failure returns empty / false.
 //
 #include "types.h"
@@ -22,5 +23,18 @@ Image compute_grey_fft_metal(const Image& raw);
 bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow);
+
+// Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
+// Same math as merge_comp_band / merge_ref_band (robustness unchanged).
+// No CPU fallback. Host caches per-frame GPU buffers across bands and batches
+// all comps+ref for a band into one command buffer (avoids re-upload thrash).
+// frame_id >= 0: stable cache key (needed when CPU streams into one scratch Image).
+bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
+                           const CovField& covs, const Image& robustness,
+                           int tile_size, Image& num_band, Image& den_band,
+                           int y0, const Config& cfg, int frame_id = -1);
+bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
+                          Image& num_band, Image& den_band, int y0,
+                          const Config& cfg, const Image* acc_rob);
 
 } // namespace hhsr

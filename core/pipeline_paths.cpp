@@ -80,6 +80,7 @@ struct CachedCompFrame {
     Image rob;
     CovField covs;
     Image comp;
+    int index = 0;
 };
 
 struct CachedCompMeta {
@@ -107,6 +108,7 @@ static bool load_cached_comp(const fs::path& cache, int k, CachedCompFrame& out)
     std::string idx = std::to_string(k);
     fs::path fflow = cache / ("f" + idx + ".flow");
     if (!fs::exists(fflow)) return false;
+    out.index = k;
     return load_flow(fflow, out.flow) &&
            load_image(cache / ("f" + idx + ".rob"), out.rob) &&
            load_covs(cache / ("f" + idx + ".cov"), out.covs) &&
@@ -358,13 +360,15 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+                // Pass frame index so Metal can keep one GPU RAW per frame across
+                // bands (scratch Image pointer is reused and would thrash otherwise).
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
-                                num_band, den_band, y0, work);
+                                num_band, den_band, y0, work, meta.index);
             }
         } else {
             for (const CachedCompFrame& fc : cached)
                 merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
-                                num_band, den_band, y0, work);
+                                num_band, den_band, y0, work, fc.index);
         }
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);

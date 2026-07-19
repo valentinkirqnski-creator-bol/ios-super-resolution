@@ -1,6 +1,9 @@
 #include "stages.h"
 #include "parallel.h"
 #include "linalg.h"
+#ifdef __APPLE__
+#include "metal_gpu.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +15,7 @@ namespace {
 
 // Cap inverse-covariance entries so steerable kernels cannot become so sharp
 // that only one Bayer site in the 3×3 gets non-zero weight (R/B den→0 → green).
+// Kept compiled on Apple too so CPU remains the golden reference for validation.
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
     constexpr f32 k_max_abs = 32.f; // iso path uses ~2 on the diagonal
     f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
@@ -87,6 +91,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
+// On Apple, merge_comp_band_metal runs the same math on GPU.
 static void accumulate_comp(const Image& img, const FlowField& flow, const CovField& covs,
                             const Image& robustness, int tile_size,
                             Image& num, Image& den, int y0, const Config& cfg) {
@@ -264,14 +269,31 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
 void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
-                     Image& num_band, Image& den_band, int y0, const Config& cfg) {
+                     Image& num_band, Image& den_band, int y0, const Config& cfg,
+                     int frame_id) {
+#ifdef __APPLE__
+    // Metal GPU only — same Alg. 4 math as accumulate_comp (incl. per-pixel robustness).
+    if (!merge_comp_band_metal(comp_raw, flow, covs, robustness, tile_size,
+                               num_band, den_band, y0, cfg, frame_id)) {
+        return;
+    }
+#else
+    (void)frame_id;
     accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg);
+#endif
 }
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
                     const Image* acc_rob) {
+#ifdef __APPLE__
+    // Metal GPU only — same Alg. 11 math (accumulated-robustness denoise unchanged).
+    if (!merge_ref_band_metal(ref_raw, covs, num_band, den_band, y0, cfg, acc_rob)) {
+        return;
+    }
+#else
     accumulate_ref(ref_raw, covs, acc_rob, num_band, den_band, y0, cfg);
+#endif
 }
 
 void merge_comp(const Image& comp_raw, const FlowField& flow, const CovField& covs,

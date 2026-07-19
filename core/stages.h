@@ -57,9 +57,11 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 CovField estimate_kernels(const Image& raw, const Config& cfg);
 
 // ---- merge.cpp ----------------------------------------------------------
+// frame_id: optional stable id for GPU buffer reuse when raw is streamed via scratch.
 void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
-                     Image& num_band, Image& den_band, int y0, const Config& cfg);
+                     Image& num_band, Image& den_band, int y0, const Config& cfg,
+                     int frame_id = -1);
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,

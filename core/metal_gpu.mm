@@ -1,4 +1,4 @@
-// Metal runtime for grey-FFT + L2 BM (Apple / iOS only).
+// Metal runtime for grey-FFT + L2 BM + merge accumulate (Apple / iOS only).
 // Chunks large batches so full-res (1×) fits in memory / GPU time; 2× crop is smaller.
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -114,6 +114,7 @@ static MetalCtx& ctx() {
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
+            "merge_accumulate_comp", "merge_accumulate_ref",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -701,6 +702,416 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
             return false;
     }
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
+    return true;
+}
+
+
+namespace {
+
+// Must match HHSRKernels.metal MergeCompParams / MergeRefParams layout.
+struct MergeCompParamsCPU {
+    uint32_t band_h, Ws, y0, lr_h, lr_w;
+    uint32_t flow_ny, flow_nx, cov_h, cov_w;
+    uint32_t nch, bayer, iso, tile_size;
+    float scale;
+    uint32_t cfa00, cfa01, cfa10, cfa11;
+};
+
+struct MergeRefParamsCPU {
+    uint32_t band_h, Ws, y0, lr_h, lr_w;
+    uint32_t cov_h, cov_w, acc_h, acc_w;
+    uint32_t nch, bayer, iso, robustness_denoise, rad_max;
+    float scale;
+    float max_multiplier;
+    float max_frame_count;
+    uint32_t cfa00, cfa01, cfa10, cfa11;
+};
+
+struct MergeAccState {
+    id<MTLBuffer> num = nil;
+    id<MTLBuffer> den = nil;
+    const f32* num_ptr = nullptr;
+    const f32* den_ptr = nullptr;
+    size_t bytes = 0;
+};
+
+// One GPU-resident copy per comparison frame (keeps buffers across bands).
+struct MergeFrameGpu {
+    int key = -1; // >=0: frame_id; -1: pointer-keyed
+    const f32* img = nullptr;
+    const f32* flow = nullptr;
+    const f32* cov = nullptr;
+    const f32* rob = nullptr;
+    id<MTLBuffer> b_img = nil;
+    id<MTLBuffer> b_flow = nil;
+    id<MTLBuffer> b_cov = nil;
+    id<MTLBuffer> b_rob = nil;
+    size_t img_b = 0, flow_b = 0, cov_b = 0, rob_b = 0;
+};
+
+struct MergeRefGpu {
+    const f32* img = nullptr;
+    const f32* cov = nullptr;
+    const f32* acc = nullptr;
+    id<MTLBuffer> b_img = nil;
+    id<MTLBuffer> b_cov = nil;
+    id<MTLBuffer> b_acc = nil;
+    size_t img_b = 0, cov_b = 0, acc_b = 0;
+};
+
+static MergeAccState g_merge_acc;
+static std::vector<MergeFrameGpu> g_merge_frames;
+static MergeRefGpu g_merge_ref;
+static id<MTLCommandBuffer> g_merge_band_cmd = nil;
+
+static void merge_band_cmd_reset() { g_merge_band_cmd = nil; }
+
+static bool merge_band_cmd_ensure() {
+    if (g_merge_band_cmd) return true;
+    auto& c = ctx();
+    g_merge_band_cmd = [c.queue commandBuffer];
+    return g_merge_band_cmd != nil;
+}
+
+static id<MTLBuffer> ensure_sized(__strong id<MTLBuffer>& slot, size_t nbytes) {
+    if (nbytes == 0) return nil;
+    if (slot && slot.length >= nbytes) return slot;
+    slot = buf(nullptr, nbytes);
+    return slot;
+}
+
+static bool copy_into(id<MTLBuffer> slot, const f32* data, size_t nbytes) {
+    if (!slot || !data || nbytes == 0 || slot.length < nbytes) return false;
+    memcpy([slot contents], data, nbytes);
+    return true;
+}
+
+// Resolve comparison-frame GPU buffers. Prefer frame_key (>=0) so streamed
+// scratch Images (same CPU pointer, new pixels) still hit across bands.
+static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
+                              const CovField& covs, const Image& rob, int frame_key,
+                              __strong id<MTLBuffer>& b_img, __strong id<MTLBuffer>& b_flow,
+                              __strong id<MTLBuffer>& b_cov, __strong id<MTLBuffer>& b_rob) {
+    const f32* ip = img.data.data();
+    const f32* fp = flow.flow.data();
+    const f32* cp = covs.cov.data();
+    const f32* rp = rob.data.data();
+    const size_t img_b = img.data.size() * sizeof(float);
+    const size_t flow_b = flow.flow.size() * sizeof(float);
+    const size_t cov_b = covs.cov.size() * sizeof(float);
+    const size_t rob_b = rob.data.size() * sizeof(float);
+    if (!ip || !fp || !rp || img_b == 0 || flow_b == 0 || rob_b == 0) return false;
+
+    auto finish = [&](MergeFrameGpu& e) -> bool {
+        b_img = e.b_img;
+        b_flow = e.b_flow;
+        b_cov = e.b_cov;
+        b_rob = e.b_rob;
+        if (!b_cov) {
+            static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+            b_cov = buf(kDummyCov, sizeof(kDummyCov));
+            e.b_cov = b_cov;
+        }
+        return b_img && b_flow && b_rob && b_cov;
+    };
+
+    // Stable frame id: upload once, reuse for every band.
+    if (frame_key >= 0) {
+        auto upload_into = [&](MergeFrameGpu& e) -> bool {
+            e.key = frame_key;
+            e.img = ip;
+            e.flow = fp;
+            e.cov = cp;
+            e.rob = rp;
+            e.img_b = img_b;
+            e.flow_b = flow_b;
+            e.cov_b = cov_b;
+            e.rob_b = rob_b;
+            e.b_img = buf(ip, img_b);
+            e.b_flow = buf(fp, flow_b);
+            e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+            e.b_rob = buf(rp, rob_b);
+            if (!e.b_img || !e.b_flow || !e.b_rob) return false;
+            if (!e.b_cov) {
+                static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+                e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
+                if (!e.b_cov) return false;
+            }
+            return finish(e);
+        };
+        for (MergeFrameGpu& e : g_merge_frames) {
+            if (e.key != frame_key) continue;
+            if (e.b_img && e.b_flow && e.b_rob && e.img_b == img_b &&
+                e.flow_b == flow_b && e.cov_b == cov_b && e.rob_b == rob_b)
+                return finish(e);
+            return upload_into(e);
+        }
+        MergeFrameGpu e;
+        g_merge_frames.push_back(e);
+        return upload_into(g_merge_frames.back());
+    }
+
+    for (MergeFrameGpu& e : g_merge_frames) {
+        if (e.key >= 0 || e.img != ip) continue;
+        const bool same_aux = (e.flow == fp && e.cov == cp && e.rob == rp &&
+                               e.img_b == img_b && e.flow_b == flow_b &&
+                               e.cov_b == cov_b && e.rob_b == rob_b);
+        if (same_aux && e.b_img && e.b_flow && e.b_rob)
+            return finish(e);
+        // Same img allocation, new contents/aux (legacy streamed path).
+        if (!ensure_sized(e.b_img, img_b) || !copy_into(e.b_img, ip, img_b)) return false;
+        e.b_flow = buf(fp, flow_b);
+        e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+        e.b_rob = buf(rp, rob_b);
+        e.flow = fp;
+        e.cov = cp;
+        e.rob = rp;
+        e.img_b = img_b;
+        e.flow_b = flow_b;
+        e.cov_b = cov_b;
+        e.rob_b = rob_b;
+        if (!e.b_flow || !e.b_rob) return false;
+        if (!e.b_cov) {
+            static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+            e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
+            if (!e.b_cov) return false;
+        }
+        return finish(e);
+    }
+
+    MergeFrameGpu e;
+    e.key = -1;
+    e.img = ip;
+    e.flow = fp;
+    e.cov = cp;
+    e.rob = rp;
+    e.img_b = img_b;
+    e.flow_b = flow_b;
+    e.cov_b = cov_b;
+    e.rob_b = rob_b;
+    e.b_img = buf(ip, img_b);
+    e.b_flow = buf(fp, flow_b);
+    e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+    e.b_rob = buf(rp, rob_b);
+    if (!e.b_img || !e.b_flow || !e.b_rob) return false;
+    if (!e.b_cov) {
+        static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+        e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
+        if (!e.b_cov) return false;
+    }
+    g_merge_frames.push_back(e);
+    return finish(g_merge_frames.back());
+}
+
+static bool acquire_ref_gpu(const Image& img, const CovField& covs, const Image* acc_rob,
+                            bool denoise, __strong id<MTLBuffer>& b_img,
+                            __strong id<MTLBuffer>& b_cov, __strong id<MTLBuffer>& b_acc) {
+    const f32* ip = img.data.data();
+    const f32* cp = covs.cov.data();
+    const f32* ap = (denoise && acc_rob) ? acc_rob->data.data() : nullptr;
+    const size_t img_b = img.data.size() * sizeof(float);
+    const size_t cov_b = covs.cov.size() * sizeof(float);
+    const size_t acc_b = (denoise && acc_rob) ? acc_rob->data.size() * sizeof(float) : sizeof(float);
+    if (!ip || img_b == 0) return false;
+
+    if (g_merge_ref.img == ip && g_merge_ref.cov == cp && g_merge_ref.acc == ap &&
+        g_merge_ref.img_b == img_b && g_merge_ref.cov_b == cov_b &&
+        g_merge_ref.acc_b == acc_b && g_merge_ref.b_img) {
+        b_img = g_merge_ref.b_img;
+        b_cov = g_merge_ref.b_cov;
+        b_acc = g_merge_ref.b_acc;
+        if (!b_cov) {
+            static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+            b_cov = buf(kDummyCov, sizeof(kDummyCov));
+            g_merge_ref.b_cov = b_cov;
+        }
+        return b_img && b_cov && b_acc;
+    }
+
+    g_merge_ref.img = ip;
+    g_merge_ref.cov = cp;
+    g_merge_ref.acc = ap;
+    g_merge_ref.img_b = img_b;
+    g_merge_ref.cov_b = cov_b;
+    g_merge_ref.acc_b = acc_b;
+    g_merge_ref.b_img = buf(ip, img_b);
+    g_merge_ref.b_cov = cov_b ? buf(cp, cov_b) : nil;
+    if (denoise && ap)
+        g_merge_ref.b_acc = buf(ap, acc_b);
+    else {
+        static float kDummyRob = 0.f;
+        g_merge_ref.b_acc = buf(&kDummyRob, sizeof(float));
+    }
+    if (!g_merge_ref.b_img || !g_merge_ref.b_acc) return false;
+    if (!g_merge_ref.b_cov) {
+        static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
+        g_merge_ref.b_cov = buf(kDummyCov, sizeof(kDummyCov));
+        if (!g_merge_ref.b_cov) return false;
+    }
+    b_img = g_merge_ref.b_img;
+    b_cov = g_merge_ref.b_cov;
+    b_acc = g_merge_ref.b_acc;
+    return true;
+}
+
+static bool ensure_acc_buffers(Image& num_band, Image& den_band) {
+    const size_t bytes = num_band.data.size() * sizeof(float);
+    if (bytes == 0 || num_band.data.size() != den_band.data.size()) return false;
+
+    const bool same = (g_merge_acc.num_ptr == num_band.data.data() &&
+                       g_merge_acc.den_ptr == den_band.data.data() &&
+                       g_merge_acc.bytes == bytes &&
+                       g_merge_acc.num && g_merge_acc.den);
+    if (!same) {
+        // New band: upload zeroed CPU accumulators.
+        g_merge_acc.num = buf(num_band.data.data(), bytes);
+        g_merge_acc.den = buf(den_band.data.data(), bytes);
+        g_merge_acc.num_ptr = num_band.data.data();
+        g_merge_acc.den_ptr = den_band.data.data();
+        g_merge_acc.bytes = bytes;
+        return g_merge_acc.num && g_merge_acc.den;
+    }
+    return true;
+}
+
+static bool readback_acc(Image& num_band, Image& den_band) {
+    if (!g_merge_acc.num || !g_merge_acc.den) return false;
+    const size_t bytes = g_merge_acc.bytes;
+    memcpy(num_band.data.data(), [g_merge_acc.num contents], bytes);
+    memcpy(den_band.data.data(), [g_merge_acc.den contents], bytes);
+    return true;
+}
+
+} // namespace
+
+bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
+                           const CovField& covs, const Image& robustness,
+                           int tile_size, Image& num_band, Image& den_band,
+                           int y0, const Config& cfg, int frame_id) {
+    if (!metal_gpu_init()) return false;
+    if (num_band.h <= 0 || num_band.w <= 0 || comp_raw.h <= 0) return false;
+    auto& c = ctx();
+
+    // New merge pass (band 0, no open CB yet): drop previous shot's GPU frames.
+    if (y0 == 0 && !g_merge_band_cmd) {
+        g_merge_frames.clear();
+        g_merge_ref = {};
+    }
+
+    if (!ensure_acc_buffers(num_band, den_band)) return false;
+
+    id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil;
+    if (!acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
+                           b_img, b_flow, b_cov, b_rob))
+        return false;
+
+    MergeCompParamsCPU p{};
+    p.band_h = (uint32_t)num_band.h;
+    p.Ws = (uint32_t)num_band.w;
+    p.y0 = (uint32_t)y0;
+    p.lr_h = (uint32_t)comp_raw.h;
+    p.lr_w = (uint32_t)comp_raw.w;
+    p.flow_ny = (uint32_t)flow.ny;
+    p.flow_nx = (uint32_t)flow.nx;
+    p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
+    p.cov_w = covs.w > 0 ? (uint32_t)covs.w : 1u;
+    p.nch = (uint32_t)num_band.c;
+    p.bayer = cfg.bayer_mode ? 1u : 0u;
+    p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
+    p.tile_size = (uint32_t)tile_size;
+    p.scale = cfg.scale;
+    p.cfa00 = cfg.cfa.p[0][0];
+    p.cfa01 = cfg.cfa.p[0][1];
+    p.cfa10 = cfg.cfa.p[1][0];
+    p.cfa11 = cfg.cfa.p[1][1];
+
+    // Batch comps (+ later ref) into one CB per band — no per-frame sync.
+    if (!merge_band_cmd_ensure()) return false;
+    id<MTLComputeCommandEncoder> enc = [g_merge_band_cmd computeCommandEncoder];
+    if (!enc) {
+        merge_band_cmd_reset();
+        return false;
+    }
+    [enc setBuffer:g_merge_acc.num offset:0 atIndex:0];
+    [enc setBuffer:g_merge_acc.den offset:0 atIndex:1];
+    [enc setBuffer:b_img offset:0 atIndex:2];
+    [enc setBuffer:b_flow offset:0 atIndex:3];
+    [enc setBuffer:b_cov offset:0 atIndex:4];
+    [enc setBuffer:b_rob offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    dispatch2(enc, c.pipe("merge_accumulate_comp"), p.Ws, p.band_h);
+    [enc endEncoding];
+    return true;
+}
+
+bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
+                          Image& num_band, Image& den_band, int y0,
+                          const Config& cfg, const Image* acc_rob) {
+    if (!metal_gpu_init()) return false;
+    if (num_band.h <= 0 || num_band.w <= 0 || ref_raw.h <= 0) return false;
+    auto& c = ctx();
+
+    if (y0 == 0 && !g_merge_band_cmd) {
+        g_merge_frames.clear();
+        g_merge_ref = {};
+    }
+
+    if (!ensure_acc_buffers(num_band, den_band)) return false;
+
+    const bool denoise = cfg.accumulated_robustness_denoiser_enabled && acc_rob &&
+                         acc_rob->h > 0 && acc_rob->w > 0;
+    id<MTLBuffer> b_img = nil, b_cov = nil, b_acc = nil;
+    if (!acquire_ref_gpu(ref_raw, covs, acc_rob, denoise, b_img, b_cov, b_acc))
+        return false;
+
+    MergeRefParamsCPU p{};
+    p.band_h = (uint32_t)num_band.h;
+    p.Ws = (uint32_t)num_band.w;
+    p.y0 = (uint32_t)y0;
+    p.lr_h = (uint32_t)ref_raw.h;
+    p.lr_w = (uint32_t)ref_raw.w;
+    p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
+    p.cov_w = covs.w > 0 ? (uint32_t)covs.w : 1u;
+    p.acc_h = denoise ? (uint32_t)acc_rob->h : 1u;
+    p.acc_w = denoise ? (uint32_t)acc_rob->w : 1u;
+    p.nch = (uint32_t)num_band.c;
+    p.bayer = cfg.bayer_mode ? 1u : 0u;
+    p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
+    p.robustness_denoise = denoise ? 1u : 0u;
+    p.rad_max = (uint32_t)std::max(0, (int)cfg.acc_rob_rad_max);
+    p.scale = cfg.scale;
+    p.max_multiplier = cfg.acc_rob_max_multiplier;
+    p.max_frame_count = cfg.acc_rob_max_frame_count;
+    p.cfa00 = cfg.cfa.p[0][0];
+    p.cfa01 = cfg.cfa.p[0][1];
+    p.cfa10 = cfg.cfa.p[1][0];
+    p.cfa11 = cfg.cfa.p[1][1];
+
+    if (!merge_band_cmd_ensure()) return false;
+    id<MTLComputeCommandEncoder> enc = [g_merge_band_cmd computeCommandEncoder];
+    if (!enc) {
+        merge_band_cmd_reset();
+        return false;
+    }
+    [enc setBuffer:g_merge_acc.num offset:0 atIndex:0];
+    [enc setBuffer:g_merge_acc.den offset:0 atIndex:1];
+    [enc setBuffer:b_img offset:0 atIndex:2];
+    [enc setBuffer:b_cov offset:0 atIndex:3];
+    [enc setBuffer:b_acc offset:0 atIndex:4];
+    [enc setBytes:&p length:sizeof(p) atIndex:5];
+    dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
+    [enc endEncoding];
+
+    [g_merge_band_cmd commit];
+    [g_merge_band_cmd waitUntilCompleted];
+    const bool ok = (g_merge_band_cmd.status == MTLCommandBufferStatusCompleted);
+    merge_band_cmd_reset();
+    if (!ok) return false;
+
+    if (!readback_acc(num_band, den_band)) return false;
+    // Next band allocates new Images — force new acc buffers.
+    g_merge_acc.num_ptr = nullptr;
+    g_merge_acc.den_ptr = nullptr;
     return true;
 }
 

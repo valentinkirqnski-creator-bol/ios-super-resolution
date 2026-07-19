@@ -1,6 +1,7 @@
-// Metal kernels for HHSR grey-FFT + L2 BM.
+// Metal kernels for HHSR grey-FFT + L2 BM + merge accumulate.
 // 1D DFT matches grey_pyramid.cpp fft1d_pow2_inplace_ref + fft1d_bluestein
 // (same bit-reversal, iterative twiddles w*=wlen, Bluestein scaling).
+// Merge matches merge.cpp accumulate_comp / accumulate_ref (Alg. 4 / 11).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -495,4 +496,312 @@ kernel void extract_real_tiles(device float* out [[buffer(0)]],
     uint i = gid.x;
     if (tile >= ntiles || i >= N * N) return;
     out[tile * N * N + i] = in[tile * N * N + i].x;
+}
+
+// ---- Merge (Alg. 4 / Alg. 11) — faithful port of merge.cpp -----------------
+
+struct MergeCompParams {
+    uint band_h;
+    uint Ws;
+    uint y0;
+    uint lr_h;
+    uint lr_w;
+    uint flow_ny;
+    uint flow_nx;
+    uint cov_h;
+    uint cov_w;
+    uint nch;
+    uint bayer;
+    uint iso;
+    uint tile_size;
+    float scale;
+    uint cfa00;
+    uint cfa01;
+    uint cfa10;
+    uint cfa11;
+};
+
+struct MergeRefParams {
+    uint band_h;
+    uint Ws;
+    uint y0;
+    uint lr_h;
+    uint lr_w;
+    uint cov_h;
+    uint cov_w;
+    uint acc_h;
+    uint acc_w;
+    uint nch;
+    uint bayer;
+    uint iso;
+    uint robustness_denoise;
+    uint rad_max;
+    float scale;
+    float max_multiplier;
+    float max_frame_count;
+    uint cfa00;
+    uint cfa01;
+    uint cfa10;
+    uint cfa11;
+};
+
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
+    const float k_max_abs = 32.f;
+    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
+    if (!(m > k_max_abs) || !isfinite(m)) {
+        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+            ixx = 2.f; ixy = 0.f; iyy = 2.f;
+        }
+        return;
+    }
+    float s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
+inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx) {
+    return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
+}
+
+inline float cov_lerp2(device const float* covs, uint cov_w,
+                       int fy, int fx, int cy, int cx,
+                       float frac_x, float frac_y, int idx) {
+    float tl = cov_at(covs, cov_w, fy, fx, idx);
+    float tr = cov_at(covs, cov_w, fy, cx, idx);
+    float bl = cov_at(covs, cov_w, cy, fx, idx);
+    float br = cov_at(covs, cov_w, cy, cx, idx);
+    float top = tl + frac_x * (tr - tl);
+    float bot = bl + frac_x * (br - bl);
+    return top + frac_y * (bot - top);
+}
+
+// raw_det=true -> accumulate (comp); false -> accumulate_ref
+inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
+                           float kmap_i, float kmap_j,
+                           thread float& ixx, thread float& ixy, thread float& iyy,
+                           bool raw_det) {
+    float frac_x = kmap_j - trunc(kmap_j);
+    float frac_y = kmap_i - trunc(kmap_i);
+    int fx, fy;
+    if (raw_det) {
+        fx = max(int(kmap_j), 0);
+        fy = max(int(kmap_i), 0);
+    } else {
+        fx = max(int(floor(kmap_j)), 0);
+        fy = max(int(floor(kmap_i)), 0);
+    }
+    int cx = min(fx + 1, int(cov_w) - 1);
+    int cy = min(fy + 1, int(cov_h) - 1);
+
+    float xx = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 0);
+    float xy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 1);
+    float yy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 3);
+    if (raw_det) {
+        float det = xx * yy - xy * xy;
+        if (fabs(det) > 1e-10f) {
+            float inv_det = 1.f / det;
+            ixx =  inv_det * yy;
+            ixy = -inv_det * xy;
+            iyy =  inv_det * xx;
+        } else {
+            ixx = 1.f; ixy = 0.f; iyy = 1.f;
+        }
+    } else {
+        // invert_sym_2x2 / invert_2x2 with EPSILON_DIV
+        float det = xx * yy - xy * xy;
+        if (fabs(det) > 1e-10f) {
+            float det_i = 1.f / det;
+            ixx =  yy * det_i;
+            ixy = -xy * det_i;
+            iyy =  xx * det_i;
+        } else {
+            ixx = 1.f; ixy = 0.f; iyy = 1.f;
+        }
+    }
+    soften_inv_cov(ixx, ixy, iyy);
+}
+
+inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
+    if (!p.bayer) return 0;
+    int ii = i & 1, jj = j & 1;
+    if (ii == 0 && jj == 0) return int(p.cfa00);
+    if (ii == 0 && jj == 1) return int(p.cfa01);
+    if (ii == 1 && jj == 0) return int(p.cfa10);
+    return int(p.cfa11);
+}
+
+inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
+    if (!p.bayer) return 0;
+    int ii = i & 1, jj = j & 1;
+    if (ii == 0 && jj == 0) return int(p.cfa00);
+    if (ii == 0 && jj == 1) return int(p.cfa01);
+    if (ii == 1 && jj == 0) return int(p.cfa10);
+    return int(p.cfa11);
+}
+
+// Alg. 4 — merge.cpp accumulate_comp
+kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
+                                  device float* den [[buffer(1)]],
+                                  device const float* img [[buffer(2)]],
+                                  device const float* flow [[buffer(3)]],
+                                  device const float* covs [[buffer(4)]],
+                                  device const float* robustness [[buffer(5)]],
+                                  constant MergeCompParams& p [[buffer(6)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint hr_j = gid.x;
+    uint local_i = gid.y;
+    if (hr_j >= p.Ws || local_i >= p.band_h) return;
+
+    int hr_i = int(p.y0 + local_i);
+    float lr_x = (float(hr_j) + 0.5f) / p.scale;
+    float lr_y = (float(hr_i) + 0.5f) / p.scale;
+
+    // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
+    int px = int(lr_x / float(p.tile_size));
+    int py = int(lr_y / float(p.tile_size));
+    float flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
+    float flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
+
+    int i_r = min(int(lr_y), int(p.lr_h) - 1);
+    int j_r = min(int(lr_x), int(p.lr_w) - 1);
+    float local_r = robustness[uint(i_r) * p.lr_w + uint(j_r)];
+
+    float lr_mov_x = lr_x + flowx;
+    float lr_mov_y = lr_y + flowy;
+    if (!(lr_mov_x >= 0.f && lr_mov_x < float(p.lr_w) &&
+          lr_mov_y >= 0.f && lr_mov_y < float(p.lr_h)))
+        return;
+
+    float ixx = 0.f, ixy = 0.f, iyy = 0.f;
+    if (!p.iso) {
+        float kmap_j, kmap_i;
+        if (p.bayer) {
+            kmap_j = lr_mov_x / 2.f - 0.5f;
+            kmap_i = lr_mov_y / 2.f - 0.5f;
+        } else {
+            kmap_j = lr_mov_x - 0.5f;
+            kmap_i = lr_mov_y - 0.5f;
+        }
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
+    }
+
+    int center_j = int(lr_mov_x);
+    int center_i = int(lr_mov_y);
+    float lr_mov_j = lr_mov_x - 0.5f;
+    float lr_mov_i = lr_mov_y - 0.5f;
+
+    float val0 = 0.f, val1 = 0.f, val2 = 0.f;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    for (int di = -1; di <= 1; ++di) {
+        for (int dj = -1; dj <= 1; ++dj) {
+            int j = center_j + dj;
+            int i = center_i + di;
+            if (!(j >= 0 && j < int(p.lr_w) && i >= 0 && i < int(p.lr_h))) continue;
+
+            int channel = cfa_channel(p, i, j);
+            float c = img[uint(i) * p.lr_w + uint(j)];
+            float dist_x = float(j) - lr_mov_j;
+            float dist_y = float(i) - lr_mov_i;
+            float z;
+            if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
+            else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
+            z = max(0.f, z);
+            float w = metal::precise::exp(-0.5f * z);
+
+            float contrib_v = w * local_r * c;
+            float contrib_a = w * local_r;
+            if (channel == 0)      { val0 += contrib_v; acc0 += contrib_a; }
+            else if (channel == 1) { val1 += contrib_v; acc1 += contrib_a; }
+            else                   { val2 += contrib_v; acc2 += contrib_a; }
+        }
+    }
+
+    uint base = (local_i * p.Ws + hr_j) * p.nch;
+    if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
+    if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
+    if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
+}
+
+// Alg. 11 — merge.cpp accumulate_ref (incl. accumulated-robustness denoise)
+kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
+                                 device float* den [[buffer(1)]],
+                                 device const float* img [[buffer(2)]],
+                                 device const float* covs [[buffer(3)]],
+                                 device const float* acc_rob [[buffer(4)]],
+                                 constant MergeRefParams& p [[buffer(5)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    uint hr_j = gid.x;
+    uint local_i = gid.y;
+    if (hr_j >= p.Ws || local_i >= p.band_h) return;
+
+    int hr_i = int(p.y0 + local_i);
+    float coarse_x = float(hr_j) / p.scale;
+    float coarse_y = float(hr_i) / p.scale;
+
+    float local_acc_r = 0.f;
+    float additional_denoise_power = 1.f;
+    int rad = 1;
+    if (p.robustness_denoise) {
+        // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
+        int ay = min(int(round(coarse_y)), int(p.acc_h) - 1);
+        int ax = min(int(round(coarse_x)), int(p.acc_w) - 1);
+        local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
+        additional_denoise_power =
+            (local_acc_r <= p.max_frame_count) ? p.max_multiplier : 1.f;
+        rad = (local_acc_r <= p.max_frame_count) ? int(p.rad_max) : 1;
+    }
+
+    float ixx = 0.f, ixy = 0.f, iyy = 0.f;
+    if (!p.iso) {
+        float kmap_j, kmap_i;
+        if (p.bayer) {
+            kmap_j = (coarse_x - 0.5f) / 2.f;
+            kmap_i = (coarse_y - 0.5f) / 2.f;
+        } else {
+            kmap_j = coarse_x;
+            kmap_i = coarse_y;
+        }
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false);
+    }
+
+    int center_j = int(round(coarse_x));
+    int center_i = int(round(coarse_y));
+
+    float val0 = 0.f, val1 = 0.f, val2 = 0.f;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    for (int di = -rad; di <= rad; ++di) {
+        for (int dj = -rad; dj <= rad; ++dj) {
+            int j = center_j + dj;
+            int i = center_i + di;
+            if (!(j >= 0 && j < int(p.lr_w) && i >= 0 && i < int(p.lr_h))) continue;
+
+            int channel = cfa_channel_ref(p, i, j);
+            float c = img[uint(i) * p.lr_w + uint(j)];
+            float dist_x = float(j) - coarse_x;
+            float dist_y = float(i) - coarse_y;
+            float y;
+            if (p.iso) y = max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
+            else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
+                                    iyy * dist_y * dist_y);
+            y /= additional_denoise_power;
+            float w = metal::precise::exp(-0.5f * y);
+
+            if (channel == 0)      { val0 += c * w; acc0 += w; }
+            else if (channel == 1) { val1 += c * w; acc1 += w; }
+            else                   { val2 += c * w; acc2 += w; }
+        }
+    }
+
+    bool overwrite = p.robustness_denoise && (local_acc_r < p.max_frame_count);
+    uint base = (local_i * p.Ws + hr_j) * p.nch;
+    if (overwrite) {
+        if (p.nch >= 1) { num[base + 0] = val0; den[base + 0] = acc0; }
+        if (p.nch >= 2) { num[base + 1] = val1; den[base + 1] = acc1; }
+        if (p.nch >= 3) { num[base + 2] = val2; den[base + 2] = acc2; }
+    } else {
+        if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
+        if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
+        if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
+    }
 }

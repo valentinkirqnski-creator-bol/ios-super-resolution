@@ -76,7 +76,7 @@ static inline void apply_smoothstep_rgb(float& r, float& g, float& b) {
     if (paths.count < 2) return NO;
     if (previewOut) *previewOut = nil;
 
-    // Grey-FFT + L2 BM require Metal (no CPU fallback).
+    // Grey-FFT + L2 BM + merge accumulate require Metal (no CPU fallback).
     if (!metal_gpu_init()) return NO;
 
     std::vector<std::string> vpaths;
