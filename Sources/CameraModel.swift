@@ -276,6 +276,13 @@ final class CameraModel: NSObject, ObservableObject {
         applyShutter()
     }
 
+    /// Force Auto shutter UI + continuous AE when the camera screen appears.
+    func ensureShutterAutoOnLaunch() {
+        shutterIsAuto = true
+        applyShutter()
+        startAutoExposureSyncIfNeeded()
+    }
+
     func applyManualShutterFromSlider() {
         guard !isBusy else { return }
         if shutterIsAuto { shutterIsAuto = false }
@@ -519,6 +526,8 @@ final class CameraModel: NSObject, ObservableObject {
         ensureReadyBurstDir()
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
+            self.shutterIsAuto = true
+            self.applyShutter()
             self.startAutoExposureSyncIfNeeded()
             if self.cachedRawPixelFormat == nil {
                 self.statusText = "RAW capture not supported on this camera"
@@ -553,6 +562,7 @@ final class CameraModel: NSObject, ObservableObject {
         session.commitConfiguration()
         ensureReadyBurstDir()
         DispatchQueue.main.async {
+            if self.shutterIsAuto { self.applyShutter() }
             self.startAutoExposureSyncIfNeeded()
             if self.cachedRawPixelFormat == nil {
                 self.statusText = "RAW not supported on \(selection.label)"
@@ -635,6 +645,10 @@ final class CameraModel: NSObject, ObservableObject {
         if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
         if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+        // Default launch path: continuous AE (shutterIsAuto starts true).
+        if shutterIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
+            d.exposureMode = .continuousAutoExposure
         }
         d.isSubjectAreaChangeMonitoringEnabled = false
         d.unlockForConfiguration()
@@ -1095,7 +1109,11 @@ final class CameraModel: NSObject, ObservableObject {
 
             var saveURL = url
             var tempJPEG: URL?
-            if format == .jpg {
+            if format == .dng {
+                // DNG-only asset: embed tone-mapped JPEG SubIFD so Photos can
+                // thumbnail (ImageIO cannot decode Deflate LinearRaw IFD0).
+                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 4096)
+            } else if format == .jpg {
                 if let jpg = Self.renderExportJPEG(fromDNG: url) {
                     saveURL = jpg
                     tempJPEG = jpg
@@ -1125,6 +1143,9 @@ final class CameraModel: NSObject, ObservableObject {
                 let req = PHAssetCreationRequest.forAsset()
                 let opts = PHAssetResourceCreationOptions()
                 opts.shouldMoveFile = false
+                if format == .dng {
+                    opts.uniformTypeIdentifier = "com.adobe.raw-image"
+                }
                 req.addResource(with: .photo, fileURL: saveURL, options: opts)
                 if let maskJPEG {
                     let mreq = PHAssetCreationRequest.forAsset()

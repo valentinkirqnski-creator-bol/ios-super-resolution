@@ -415,6 +415,12 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                               const HessianField& hessian,
                               FlowField& flow, int tile_size, int n_iter,
                               int num_threads) {
+#ifdef __APPLE__
+    // Metal ica_kernel_8/16 — same math/order as CPU path below / Python ICA.py.
+    if (ica_refine_level_metal(ref, gradx, grady, hessian.data, moving, flow,
+                               tile_size, n_iter))
+        return;
+#endif
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     const bool clamp_edge = (ts == 8);

@@ -14,6 +14,13 @@ bool write_linear_dng(const std::string& path, const Image& rgb,
 bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb,
                            int& W, int& H);
 
+// Embed a complete JPEG bitstream as DNG SubIFD preview (NewSubfileType=1,
+// Compression=7). Keeps IFD0 LinearRaw for Lightroom; Photos/ImageIO use the
+// preview for thumbnail / display when they cannot decode Deflate LinearRaw.
+bool embed_dng_jpeg_preview(const std::string& path,
+                            const uint8_t* jpeg, size_t jpeg_len,
+                            int jpeg_w, int jpeg_h);
+
 // Same as load_linear_dng_rgb16, plus WB gains (green-normalized) and cam→sRGB 3×3
 // when written by DngStreamWriter (private tags). Falls back to identity / 1,1,1.
 bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,

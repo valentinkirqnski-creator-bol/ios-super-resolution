@@ -7,6 +7,10 @@ struct CameraView: View {
     @State private var showSettings = false
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
+    /// True only while the user is actively dragging the shutter slider.
+    @State private var shutterSliderDragging = false
+    @State private var shutterSliderDragStart: Double?
+    @State private var didApplyLaunchShutter = false
 
     var body: some View {
         GeometryReader { geo in
@@ -39,7 +43,13 @@ struct CameraView: View {
                 }
             }
         }
-        .onAppear { cam.start() }
+        .onAppear {
+            if !didApplyLaunchShutter {
+                cam.ensureShutterAutoOnLaunch()
+                didApplyLaunchShutter = true
+            }
+            cam.start()
+        }
         .onDisappear { cam.stop() }
         .onChange(of: scenePhase) { phase in
             cam.setAppActive(phase == .active)
@@ -146,11 +156,28 @@ struct CameraView: View {
                     get: { cam.shutterSlider },
                     set: { value in
                         guard !cam.isBusy else { return }
+                        // Ignore programmatic AE sync updates while Auto is on.
+                        guard shutterSliderDragging || !cam.shutterIsAuto else { return }
                         cam.shutterSlider = value
-                        cam.applyManualShutterFromSlider()
                     }
                 ),
-                in: 0...1
+                in: 0...1,
+                onEditingChanged: { editing in
+                    guard !cam.isBusy else { return }
+                    if editing {
+                        // Finger down — do not leave Auto until the value actually moves.
+                        shutterSliderDragging = true
+                        shutterSliderDragStart = cam.shutterSlider
+                    } else {
+                        let start = shutterSliderDragStart
+                        shutterSliderDragging = false
+                        shutterSliderDragStart = nil
+                        // Leave Auto only after a real user drag (not SwiftUI appear noise).
+                        if let start, abs(cam.shutterSlider - start) > 0.002 {
+                            cam.applyManualShutterFromSlider()
+                        }
+                    }
+                }
             )
             .tint(.yellow)
             .opacity(cam.isBusy ? 0.4 : 1)
@@ -445,7 +472,7 @@ struct CameraView: View {
                     }
                     .pickerStyle(.segmented)
                     Text(cam.exportFormat == .dng
-                         ? "LinearRaw DNG only (open in Lightroom / RAW apps; Photos may show a grey thumbnail)."
+                         ? "LinearRaw DNG with embedded tone-mapped JPEG preview (Photos thumbnail; Lightroom reads the raw)."
                          : "Tone-mapped JPEG: WB + matrix + sRGB gamma + soft S-curve + vibrance (no shadow lift / sharpen).")
                         .font(.footnote)
                         .foregroundColor(.secondary)

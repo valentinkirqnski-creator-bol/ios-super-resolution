@@ -32,6 +32,14 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow);
 
+// ICA refine one pyramid level (ICA.py ica_kernel_8/16). Same bilinear rules,
+// modf/trunc, butterfly reduce order, and Ax=B update as align.cpp / Python.
+// hess: packed [ny*nx*4] = 00,01,10,11. Returns false if ts not in {8,16}.
+bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
+                            const std::vector<float>& hess_packed,
+                            const Image& moving, FlowField& flow,
+                            int tile_size, int n_iter);
+
 // Alg. 5 kernel covariance on GPU. Empty CovField on failure.
 CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
 

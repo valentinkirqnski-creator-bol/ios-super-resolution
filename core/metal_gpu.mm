@@ -122,7 +122,7 @@ static MetalCtx& ctx() {
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
-            "rob_make_mask", "rob_local_min_5x5", "l1_bm_ts16",
+            "rob_make_mask", "rob_local_min_5x5", "l1_bm_ts16", "ica_refine_tile",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -1201,6 +1201,76 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
     NSUInteger tg = std::min(ntiles, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
     if (tg == 0) tg = 1;
     [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
+    return true;
+}
+
+bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
+                            const std::vector<float>& hess_packed,
+                            const Image& moving, FlowField& flow,
+                            int tile_size, int n_iter) {
+    if (!metal_gpu_init()) return false;
+    // Default pyramid uses ts∈{8,16} (ica_kernel_8 / ica_kernel_16).
+    if (tile_size != 8 && tile_size != 16) return false;
+    if (n_iter < 0) return false;
+    const int ny = flow.ny, nx = flow.nx;
+    if (ny <= 0 || nx <= 0) return true;
+    const size_t ntiles = (size_t)ny * (size_t)nx;
+    if (hess_packed.size() < ntiles * 4) return false;
+    if (gradx.h != ref.h || gradx.w != ref.w || grady.h != ref.h || grady.w != ref.w)
+        return false;
+    auto& c = ctx();
+
+    struct IcaParamsCPU {
+        uint32_t ref_h, ref_w, mov_h, mov_w;
+        uint32_t ny, nx, ts, n_iter;
+        uint32_t clamp_edge;
+        uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
+    };
+    static_assert(sizeof(IcaParamsCPU) == 48, "IcaParamsCPU layout");
+
+    IcaParamsCPU p{};
+    p.ref_h = (uint32_t)ref.h;
+    p.ref_w = (uint32_t)ref.w;
+    p.mov_h = (uint32_t)moving.h;
+    p.mov_w = (uint32_t)moving.w;
+    p.ny = (uint32_t)ny;
+    p.nx = (uint32_t)nx;
+    p.ts = (uint32_t)tile_size;
+    p.n_iter = (uint32_t)n_iter;
+    p.clamp_edge = (tile_size == 8) ? 1u : 0u;
+
+    id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
+    id<MTLBuffer> b_gx = buf(gradx.data.data(), gradx.data.size() * sizeof(float));
+    id<MTLBuffer> b_gy = buf(grady.data.data(), grady.data.size() * sizeof(float));
+    id<MTLBuffer> b_hess = buf(hess_packed.data(), hess_packed.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    if (!b_ref || !b_gx || !b_gy || !b_hess || !b_mov || !b_flow) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_ref offset:0 atIndex:0];
+    [enc setBuffer:b_gx offset:0 atIndex:1];
+    [enc setBuffer:b_gy offset:0 atIndex:2];
+    [enc setBuffer:b_hess offset:0 atIndex:3];
+    [enc setBuffer:b_mov offset:0 atIndex:4];
+    [enc setBuffer:b_flow offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    id<MTLComputePipelineState> pipe = c.pipe("ica_refine_tile");
+    if (!pipe) return false;
+    [enc setComputePipelineState:pipe];
+    const NSUInteger n = (NSUInteger)ntiles;
+    NSUInteger tg = std::min(n, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
+    if (tg == 0) tg = 1;
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     [cmd commit];

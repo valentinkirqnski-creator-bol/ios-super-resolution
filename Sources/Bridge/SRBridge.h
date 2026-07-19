@@ -23,6 +23,12 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
                          toPath:(NSString *)jpgPath;
 
+/// Tone-map the LinearRaw DNG (same look as export JPEG), encode a JPEG preview
+/// (longest side ≤ maxSide), and embed it as a DNG SubIFD so Photos can thumbnail
+/// a DNG-only asset. Lightroom still reads the LinearRaw IFD0.
++ (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath
+                      maxSide:(NSInteger)maxSide;
+
 @end
 
 NS_ASSUME_NONNULL_END

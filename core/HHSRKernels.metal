@@ -1268,3 +1268,134 @@ kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
     flow[tid * 2u + 0u] = float(flow_dx + min_shift_x);
     flow[tid * 2u + 1u] = float(flow_dy + min_shift_y);
 }
+
+// ---------------------------------------------------------------------------
+// ICA refine (ICA.py ica_kernel_8 / ica_kernel_16) — one thread per tile.
+// Butterfly reduce order matches align.cpp butterfly_reduce_sum (same as CUDA
+// shared-mem while N>0 tree). Bilinear: ts==8 clamp-to-edge; else OOB→0.
+// ---------------------------------------------------------------------------
+struct IcaParams {
+    uint ref_h, ref_w, mov_h, mov_w;
+    uint ny, nx, ts, n_iter;
+    uint clamp_edge; // 1 → ica_kernel_8 clamp; 0 → ica_kernel_16 zero-OOB
+    uint _pad0, _pad1, _pad2; // 48 bytes for setBytes
+};
+
+inline float sample_mov(device const float* mov, int y, int x,
+                        int H, int W, bool clamp_edge) {
+    if (clamp_edge) {
+        int yy = clamp(y, 0, H - 1);
+        int xx = clamp(x, 0, W - 1);
+        return mov[uint(yy) * uint(W) + uint(xx)];
+    }
+    if (y < 0 || y >= H || x < 0 || x >= W) return 0.f;
+    return mov[uint(y) * uint(W) + uint(x)];
+}
+
+inline float bilinear_ica_metal(device const float* mov, int py, int px,
+                                int floor_off_y, int floor_off_x,
+                                float frac_x, float frac_y,
+                                int H, int W, bool clamp_edge) {
+    int floor_y = py + floor_off_y;
+    int floor_x = px + floor_off_x;
+    float m00, m01, m10, m11;
+    if (clamp_edge) {
+        int fy = clamp(floor_y, 0, H - 1);
+        int fx = clamp(floor_x, 0, W - 1);
+        int cy = clamp(fy + 1, 0, H - 1);
+        int cx = clamp(fx + 1, 0, W - 1);
+        m00 = mov[uint(fy) * uint(W) + uint(fx)];
+        m01 = mov[uint(fy) * uint(W) + uint(cx)];
+        m10 = mov[uint(cy) * uint(W) + uint(fx)];
+        m11 = mov[uint(cy) * uint(W) + uint(cx)];
+    } else {
+        m00 = sample_mov(mov, floor_y + 0, floor_x + 0, H, W, false);
+        m01 = sample_mov(mov, floor_y + 0, floor_x + 1, H, W, false);
+        m10 = sample_mov(mov, floor_y + 1, floor_x + 0, H, W, false);
+        m11 = sample_mov(mov, floor_y + 1, floor_x + 1, H, W, false);
+    }
+    float lerpx_top = m00 + (m01 - m00) * frac_x;
+    float lerpx_bot = m10 + (m11 - m10) * frac_x;
+    return lerpx_top + (lerpx_bot - lerpx_top) * frac_y;
+}
+
+// Same addition order as align.cpp butterfly_reduce_sum / CUDA shared tree.
+inline float butterfly_reduce_sum_metal(thread float* s, int n) {
+    for (int N = n / 2; N > 0; N /= 2) {
+        for (int tid = 0; tid < N; ++tid)
+            s[tid] += s[tid + N];
+    }
+    return s[0];
+}
+
+kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
+                            device const float* gradx [[buffer(1)]],
+                            device const float* grady [[buffer(2)]],
+                            device const float* hess [[buffer(3)]],
+                            device const float* mov [[buffer(4)]],
+                            device float* flow [[buffer(5)]],
+                            constant IcaParams& p [[buffer(6)]],
+                            uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.ny * p.nx) return;
+    uint ty = tid / p.nx;
+    uint tx = tid % p.nx;
+    int ts = int(p.ts);
+    if (ts != 8 && ts != 16) return; // default pyramid sizes only
+    int n_pix = ts * ts;
+    int oy = int(ty) * ts;
+    int ox = int(tx) * ts;
+    bool clamp_edge = (p.clamp_edge != 0u);
+    int RH = int(p.ref_h), RW = int(p.ref_w);
+    int MH = int(p.mov_h), MW = int(p.mov_w);
+
+    uint ho = tid * 4u;
+    float h00 = hess[ho + 0u], h01 = hess[ho + 1u];
+    float h10 = hess[ho + 2u], h11 = hess[ho + 3u];
+    float det = h00 * h11 - h01 * h10;
+    if (fabs(det) < 1e-10f) return; // leave flow unchanged (Python early exit)
+    float det_inv = 1.f / det;
+
+    float fx = flow[tid * 2u + 0u];
+    float fy = flow[tid * 2u + 1u];
+
+    // Max ts=16 → 256; ts=8 uses first 64.
+    float s_B0[256];
+    float s_B1[256];
+
+    for (uint it = 0u; it < p.n_iter; ++it) {
+        // math.modf + int() truncation toward zero (ICA.py)
+        float floor_fx = trunc(fx);
+        float floor_fy = trunc(fy);
+        float frac_x = fx - floor_fx;
+        float frac_y = fy - floor_fy;
+        int floor_off_x = int(floor_fx);
+        int floor_off_y = int(floor_fy);
+
+        for (int i = 0; i < ts; ++i) {
+            int py = oy + i;
+            for (int j = 0; j < ts; ++j) {
+                int px = ox + j;
+                int tpix = i * ts + j;
+                if (py >= RH || px >= RW) {
+                    s_B0[tpix] = 0.f;
+                    s_B1[tpix] = 0.f;
+                    continue;
+                }
+                float mov_interp = bilinear_ica_metal(
+                    mov, py, px, floor_off_y, floor_off_x, frac_x, frac_y,
+                    MH, MW, clamp_edge);
+                uint ro = uint(py) * p.ref_w + uint(px);
+                float gradt = mov_interp - ref[ro];
+                s_B0[tpix] = -gradx[ro] * gradt;
+                s_B1[tpix] = -grady[ro] * gradt;
+            }
+        }
+        float B0 = butterfly_reduce_sum_metal(s_B0, n_pix);
+        float B1 = butterfly_reduce_sum_metal(s_B1, n_pix);
+        fx += det_inv * (h11 * B0 - h01 * B1);
+        fy += det_inv * (-h10 * B0 + h00 * B1);
+    }
+
+    flow[tid * 2u + 0u] = fx;
+    flow[tid * 2u + 1u] = fy;
+}

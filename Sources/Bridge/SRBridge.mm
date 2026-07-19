@@ -3,6 +3,7 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -217,6 +218,106 @@ static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount
     CFRelease(dest);
     CGImageRelease(cgOut);
     return ok;
+}
+
++ (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath maxSide:(NSInteger)maxSide {
+    if (dngPath.length == 0) return NO;
+    if (maxSide < 256) maxSide = 256;
+
+    std::vector<uint16_t> rgb;
+    int W = 0, H = 0;
+    float wb[3] = {1.f, 1.f, 1.f};
+    float m[9] = {1,0,0, 0,1,0, 0,0,1};
+    bool has_color = false;
+    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+        W <= 0 || H <= 0)
+        return NO;
+
+    const int long_side = std::max(W, H);
+    const float scale = (long_side > (int)maxSide)
+        ? ((float)maxSide / (float)long_side) : 1.f;
+    const int ow = std::max(1, (int)std::lround(W * scale));
+    const int oh = std::max(1, (int)std::lround(H * scale));
+
+    std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
+    auto sample_tonemap = [&](int sx, int sy, float& sr, float& sg, float& sb) {
+        sx = std::max(0, std::min(W - 1, sx));
+        sy = std::max(0, std::min(H - 1, sy));
+        size_t i = (size_t)sy * (size_t)W + (size_t)sx;
+        float r = rgb[i * 3 + 0] * (1.f / 65535.f);
+        float g = rgb[i * 3 + 1] * (1.f / 65535.f);
+        float b = rgb[i * 3 + 2] * (1.f / 65535.f);
+        float wr = r * wb[0], wg = g * wb[1], wb_ = b * wb[2];
+        if (has_color) {
+            sr = m[0] * wr + m[1] * wg + m[2] * wb_;
+            sg = m[3] * wr + m[4] * wg + m[5] * wb_;
+            sb = m[6] * wr + m[7] * wg + m[8] * wb_;
+        } else {
+            sr = wr; sg = wg; sb = wb_;
+        }
+        auto rolloff = [](float v) {
+            if (v <= 1.f) return clampf(v, 0.f, 1.f);
+            return 1.f - 1.f / (1.f + (v - 1.f) * 2.5f);
+        };
+        sr = to_srgb_gamma(rolloff(sr));
+        sg = to_srgb_gamma(rolloff(sg));
+        sb = to_srgb_gamma(rolloff(sb));
+        sr = tone_s_curve(sr);
+        sg = tone_s_curve(sg);
+        sb = tone_s_curve(sb);
+        apply_vibrance_rgb(sr, sg, sb, 0.28f);
+    };
+
+    for (int y = 0; y < oh; ++y) {
+        int sy = (scale < 1.f) ? (int)((y + 0.5f) / scale) : y;
+        for (int x = 0; x < ow; ++x) {
+            int sx = (scale < 1.f) ? (int)((x + 0.5f) / scale) : x;
+            float sr, sg, sb;
+            sample_tonemap(sx, sy, sr, sg, sb);
+            size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 4;
+            srgb[o + 0] = (uint8_t)std::lround(sr * 255.f);
+            srgb[o + 1] = (uint8_t)std::lround(sg * 255.f);
+            srgb[o + 2] = (uint8_t)std::lround(sb * 255.f);
+            srgb[o + 3] = 255;
+        }
+    }
+    rgb.clear();
+    rgb.shrink_to_fit();
+
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return NO;
+    NSData* data = [NSData dataWithBytes:srgb.data() length:srgb.size()];
+    srgb.clear();
+    srgb.shrink_to_fit();
+
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+    CGImageRef cgOut = CGImageCreate(
+        ow, oh, 8, 32, ow * 4, cs,
+        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast,
+        provider, NULL, false, kCGRenderingIntentDefault);
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(cs);
+    if (!cgOut) return NO;
+
+    NSMutableData* jpegData = [NSMutableData data];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+        (__bridge CFMutableDataRef)jpegData, CFSTR("public.jpeg"), 1, NULL);
+    if (!dest) {
+        CGImageRelease(cgOut);
+        return NO;
+    }
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.90};
+    CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
+    BOOL enc_ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CGImageRelease(cgOut);
+    if (!enc_ok || jpegData.length < 4) return NO;
+
+    return embed_dng_jpeg_preview(std::string(dngPath.UTF8String),
+                                  (const uint8_t*)jpegData.bytes,
+                                  (size_t)jpegData.length,
+                                  ow, oh) ? YES : NO;
 }
 
 @end

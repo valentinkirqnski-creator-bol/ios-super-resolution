@@ -8,6 +8,9 @@
 #include <ctime>
 #include <utility>
 #include <zlib.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace hhsr {
 
@@ -403,6 +406,173 @@ DngStreamWriter::~DngStreamWriter() {
         z_stream_ = nullptr;
     }
     if (f_) fclose(f_);
+}
+
+bool embed_dng_jpeg_preview(const std::string& path,
+                            const uint8_t* jpeg, size_t jpeg_len,
+                            int jpeg_w, int jpeg_h) {
+    if (!jpeg || jpeg_len < 4 || jpeg_w <= 0 || jpeg_h <= 0) return false;
+    // SOI marker
+    if (jpeg[0] != 0xFF || jpeg[1] != 0xD8) return false;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long fsz = ftell(f);
+    if (fsz < 16) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    std::vector<uint8_t> file((size_t)fsz);
+    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return false; }
+    fclose(f);
+
+    if (file[0] != 'I' || file[1] != 'I' || r16(file.data() + 2) != 42) return false;
+    uint32_t ifd0 = r32(file.data() + 4);
+    if (ifd0 + 2 > file.size()) return false;
+    uint16_t nent = r16(file.data() + ifd0);
+    if (ifd0 + 2u + (uint32_t)nent * 12u + 4u > file.size()) return false;
+
+    // Already has SubIFDs — leave alone (idempotent).
+    for (uint16_t i = 0; i < nent; ++i) {
+        const uint8_t* e = file.data() + ifd0 + 2 + i * 12;
+        if (r16(e) == 330) return true;
+    }
+
+    uint32_t strip_off = 0, strip_bc = 0;
+    IFD ifd;
+    for (uint16_t i = 0; i < nent; ++i) {
+        const uint8_t* e = file.data() + ifd0 + 2 + i * 12;
+        uint16_t tag = r16(e), type = r16(e + 2);
+        uint32_t count = r32(e + 4), val = r32(e + 8);
+        if (tag == 330) continue; // replace below
+        Entry ent;
+        ent.tag = tag;
+        ent.type = type;
+        ent.count = count;
+        uint32_t nbytes = count * type_size(type);
+        if (nbytes <= 4) {
+            ent.inlineval = val;
+        } else {
+            if (val + nbytes > file.size()) return false;
+            ent.payload.assign(file.begin() + val, file.begin() + val + nbytes);
+            ent.inlineval = 0;
+        }
+        ifd.e.push_back(std::move(ent));
+        if (tag == 273 && type == T_LONG && count == 1) strip_off = val;
+        if (tag == 279 && type == T_LONG && count == 1) strip_bc = val;
+        if (tag == 273 && type == T_SHORT && count == 1) strip_off = val & 0xFFFF;
+        if (tag == 279 && type == T_SHORT && count == 1) strip_bc = val & 0xFFFF;
+    }
+    if (strip_off == 0 || strip_bc == 0 || strip_off + strip_bc > file.size()) return false;
+
+    // Placeholder SubIFDs — patched after layout.
+    ifd.longv(330, 0);
+
+    std::sort(ifd.e.begin(), ifd.e.end(), [](const Entry& a, const Entry& b) {
+        return a.tag < b.tag;
+    });
+
+    const uint32_t n = (uint32_t)ifd.e.size();
+    const uint32_t ifd_offset = 8;
+    const uint32_t ifd_size = 2 + n * 12 + 4;
+    const uint32_t heap_base = ifd_offset + ifd_size;
+
+    std::vector<uint8_t> heap;
+    int strip_off_entry = -1;
+    int subifd_entry = -1;
+    for (int i = 0; i < (int)ifd.e.size(); ++i) {
+        auto& e = ifd.e[(size_t)i];
+        if (e.tag == 273) strip_off_entry = i;
+        if (e.tag == 330) subifd_entry = i;
+        if (!e.payload.empty()) {
+            if (heap.size() & 1) heap.push_back(0);
+            e.inlineval = heap_base + (uint32_t)heap.size();
+            heap.insert(heap.end(), e.payload.begin(), e.payload.end());
+        }
+    }
+    uint32_t new_strip = heap_base + (uint32_t)heap.size();
+    if (new_strip & 1) new_strip += 1;
+    if (strip_off_entry >= 0) ifd.e[(size_t)strip_off_entry].inlineval = new_strip;
+
+    uint32_t jpeg_off = new_strip + strip_bc;
+    if (jpeg_off & 1) jpeg_off += 1;
+
+    // IFD1 (JPEG preview) after JPEG payload
+    IFD prev;
+    prev.longv(254, 1); // NewSubfileType = Reduced resolution
+    prev.longv(256, (uint32_t)jpeg_w);
+    prev.longv(257, (uint32_t)jpeg_h);
+    prev.shorts(258, {8, 8, 8});
+    prev.shortv(259, 7);              // JPEG
+    prev.shortv(262, 6);              // YCbCr
+    prev.longv(273, jpeg_off);        // StripOffsets
+    prev.shortv(277, 3);
+    prev.longv(278, (uint32_t)jpeg_h);
+    prev.longv(279, (uint32_t)jpeg_len);
+    prev.shortv(284, 1);
+    prev.shorts(530, {2, 2});         // YCbCrSubSampling 4:2:0-ish (common)
+    prev.shortv(531, 1);              // YCbCrPositioning = centered
+    std::sort(prev.e.begin(), prev.e.end(), [](const Entry& a, const Entry& b) {
+        return a.tag < b.tag;
+    });
+
+    const uint32_t ifd1_offset = jpeg_off + (uint32_t)jpeg_len;
+    const uint32_t ifd1_aligned = (ifd1_offset + 1u) & ~1u;
+    if (subifd_entry >= 0) ifd.e[(size_t)subifd_entry].inlineval = ifd1_aligned;
+
+    std::vector<uint8_t> out;
+    out.reserve((size_t)new_strip + strip_bc + jpeg_len + 512);
+    out.push_back('I'); out.push_back('I');
+    w16(out, 42);
+    w32(out, ifd_offset);
+    w16(out, (uint16_t)n);
+    for (const auto& e : ifd.e) {
+        w16(out, e.tag);
+        w16(out, e.type);
+        w32(out, e.count);
+        w32(out, e.inlineval);
+    }
+    w32(out, 0); // next IFD
+    out.insert(out.end(), heap.begin(), heap.end());
+    while (out.size() < new_strip) out.push_back(0);
+    out.insert(out.end(), file.begin() + strip_off, file.begin() + strip_off + strip_bc);
+    while (out.size() < jpeg_off) out.push_back(0);
+    out.insert(out.end(), jpeg, jpeg + jpeg_len);
+    while (out.size() < ifd1_aligned) out.push_back(0);
+
+    // Write IFD1 (all values inline — no heap for this small IFD)
+    w16(out, (uint16_t)prev.e.size());
+    for (const auto& e : prev.e) {
+        w16(out, e.tag);
+        w16(out, e.type);
+        w32(out, e.count);
+        w32(out, e.inlineval);
+    }
+    w32(out, 0);
+
+    std::string tmp = path + ".preview.tmp";
+    FILE* fo = fopen(tmp.c_str(), "wb");
+    if (!fo) return false;
+    if (fwrite(out.data(), 1, out.size(), fo) != out.size()) {
+        fclose(fo);
+        std::remove(tmp.c_str());
+        return false;
+    }
+    fclose(fo);
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+#else
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(path.c_str());
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+            std::remove(tmp.c_str());
+            return false;
+        }
+    }
+#endif
+    return true;
 }
 
 bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, int& W, int& H) {
