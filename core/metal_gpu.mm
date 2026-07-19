@@ -1140,8 +1140,9 @@ static std::vector<float> scipy_gaussian_kernel1d_metal(float sigma, int radius)
 }
 
 // GPU valid-gauss + stride. Same math as grey_pyramid.cpp downsample_by.
+// __strong out-param: ARC requires it for id& (same as merge robustness helpers).
 static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
-                               id<MTLBuffer>& dst, int& dh, int& dw) {
+                               __strong id<MTLBuffer>& dst, int& dh, int& dw) {
     if (factor <= 1) {
         dst = src;
         dh = sh;
