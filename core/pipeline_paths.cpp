@@ -17,6 +17,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cmath>
+#include <future>
 #if defined(__APPLE__)
 #include <thread>
 #endif
@@ -192,11 +193,14 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
+    // Same math: CPU robustness init ∥ GPU kernel estimate (no extra frame RAM).
+    std::future<CovField> ref_cov_fut =
+        std::async(std::launch::async, [&]() { return estimate_kernels(ref, work); });
     RefStats ref_stats = init_robustness(ref, work);
-    CovField ref_covs = estimate_kernels(ref, work);
+    CovField ref_covs = ref_cov_fut.get();
 
     // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
-    // Peak during analyze ≈ ref + one comparison frame.
+    // Peak during analyze ≈ ref + one comparison (+ optional prefetch on 2×).
 
     fs::path cache = fs::path(dng_path).parent_path() /
                      (fs::path(dng_path).stem().string() + "_cache");
@@ -214,19 +218,44 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     cached.reserve((size_t)std::max(0, n - 1));
     cached_meta.reserve((size_t)std::max(0, n - 1));
 
+    // Prefetch next LibRaw decode only on lighter crops (2×). Full 1× keeps a
+    // single comparison resident so we do not jetsam during analyze.
+    const bool prefetch_next = ((size_t)ref_h * (size_t)ref_w) < 8ull * 1000ull * 1000ull;
+    int pref_k = -1;
+    std::future<Image> pref_fut;
+
     int n_comp_ok = 0;
     for (int k = 1; k < n; ++k) {
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.08f + 0.35f * (float)(k - 1) / std::max(1, n - 1));
 
-        Image comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
+        Image comp;
+        if (prefetch_next && pref_k == k && pref_fut.valid()) {
+            comp = pref_fut.get();
+            pref_k = -1;
+        } else {
+            comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
+        }
         if (comp.h <= 0) continue;
+
+        // Kick next decode while this frame runs on CPU/GPU (2× only).
+        if (prefetch_next && k + 1 < n) {
+            const int nk = k + 1;
+            pref_k = nk;
+            pref_fut = std::async(std::launch::async, [&, nk]() {
+                return load_raw_frame(paths[nk], work, false, ref_h, ref_w);
+            });
+        }
 
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        comp_grey = Image(); // free before robustness/kernels peak
+
+        // Same math: CPU robustness ∥ GPU Alg. 5 kernels (independent after align).
+        std::future<CovField> cov_fut =
+            std::async(std::launch::async, [&]() { return estimate_kernels(comp, work); });
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
-        CovField covs = estimate_kernels(comp, work);
-        comp_grey = Image();
+        CovField covs = cov_fut.get();
 
         if (stream_comp_raw) {
             // Spill Bayer only; keep flow/R/cov in RAM (small vs RAW).
@@ -251,6 +280,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             n_comp_ok++;
         }
     }
+    if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
     if (n_comp_ok < 1) {
         if (stream_comp_raw) fs::remove_all(cache, ec);
