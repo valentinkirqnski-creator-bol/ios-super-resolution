@@ -19,7 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
         previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 
 /// Decode our LinearRaw Deflate DNG and write a tone-mapped JPEG
-/// WB + color matrix + sRGB gamma + soft S-curve + vibrance (no CI sharpen / HS).
+/// WB + matrix + Highlights −70 + contrast + vibrance (no CI sharpen / HS).
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
                          toPath:(NSString *)jpgPath;
 

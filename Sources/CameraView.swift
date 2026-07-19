@@ -473,7 +473,7 @@ struct CameraView: View {
                     .pickerStyle(.segmented)
                     Text(cam.exportFormat == .dng
                          ? "LinearRaw DNG with embedded tone-mapped JPEG preview (Photos thumbnail; Lightroom reads the raw)."
-                         : "Tone-mapped JPEG: WB + matrix + sRGB gamma + soft S-curve + vibrance (no shadow lift / sharpen).")
+                         : "Tone-mapped JPEG: WB + matrix + Highlights −70 + contrast + vibrance (no sharpen).")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }

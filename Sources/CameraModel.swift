@@ -1081,9 +1081,9 @@ final class CameraModel: NSObject, ObservableObject {
         return UIImage(cgImage: cg)
     }
 
-    /// Lightroom-like finish from the SR DNG: Highlights −100, Shadows +60,
-    /// Contrast +5, Sharpening 0, Noise Reduction 0 → JPEG.
-    /// Uses our own Deflate LinearRaw decoder (ImageIO cannot read these DNGs).
+    /// Lightroom-like finish from the SR DNG: Highlights −70, stronger contrast
+    /// + vibrance (no sharpen / NR). Uses our own Deflate LinearRaw decoder
+    /// (ImageIO cannot read these DNGs).
     private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
