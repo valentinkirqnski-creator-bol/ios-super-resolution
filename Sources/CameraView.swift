@@ -452,6 +452,11 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Fallback Denoiser")) {
+                    Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
+                    Text("When on, also saves a grayscale robustness mask to Photos after processing.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     Toggle("Enable Motion Denoiser", isOn: $cam.tuningParams.accumulated_robustness_denoiser_enabled)
                     
                     if cam.tuningParams.accumulated_robustness_denoiser_enabled {

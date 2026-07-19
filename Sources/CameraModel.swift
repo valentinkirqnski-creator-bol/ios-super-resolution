@@ -67,6 +67,7 @@ struct TuningParams: Equatable, Codable {
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
     var snr_auto_tune: Bool = false
+    var robustness_save_mask: Bool = true
     var accumulated_robustness_denoiser_enabled: Bool = true
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 1.8
@@ -113,7 +114,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 3
+        let defaultsVersion = 4
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -389,16 +390,16 @@ final class CameraModel: NSObject, ObservableObject {
         guard zslDir != nil else { return }
         zslCapturing = true
         captureKind = .zsl
-        _ = captureNextRaw(isZSL: true)
+        if !captureNextRaw(isZSL: true) {
+            // captureNextRaw cleared flags; retry ASAP.
+            scheduleNextZSL()
+        }
     }
 
     private func scheduleNextZSL() {
         guard zslWanted, !pipelineBusy, !zslPausedForPipeline else { return }
-        // Fill quickly, then refresh slower once primed so continuous DNG writes
-        // don't thermally throttle the following LibRaw + Metal merge.
-        let primed = zslRing.count >= activeFrameCount
-        let delay = primed ? 0.28 : 0.09
-        sessionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+        // No artificial pacing — fire as soon as the session queue can run.
+        sessionQueue.async { [weak self] in
             guard let self, self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
             self.pumpZSL()
         }
@@ -971,6 +972,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
+            "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier),
@@ -1003,8 +1005,9 @@ final class CameraModel: NSObject, ObservableObject {
         }
 
         if ok {
-            let robURL = URL(fileURLWithPath:
-                outURL.deletingPathExtension().path + "_robustness.pgm")
+            let robURL: URL? = tuningParams.robustness_save_mask
+                ? URL(fileURLWithPath: outURL.deletingPathExtension().path + "_robustness.pgm")
+                : nil
             saveToPhotos(url: outURL, robustnessMask: robURL, preview: preview, burstDir: burstDir)
         } else {
             removeBurstDir(burstDir)
@@ -1206,30 +1209,25 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
     }
 
     private func handleZSLPhoto(_ photo: AVCapturePhoto, error: Error?) {
-        defer {
-            zslCapturing = false
-            if captureKind == .zsl { captureKind = .none }
-            // Never keep pumping while a burst is processing.
-            if !pipelineBusy && !zslPausedForPipeline {
-                scheduleNextZSL()
-            }
-        }
-        if pipelineBusy || zslPausedForPipeline { return }
+        // Next capture is started from didFinishCaptureFor (sensor free) so we
+        // do not wait on DNG encode/write before grabbing the following frame.
         if error != nil || !photo.isRawPhoto { return }
-        guard let dir = zslDir else { return }
-        autoreleasepool {
-            guard let data = photo.fileDataRepresentation() else { return }
-            zslSeq += 1
-            let url = dir.appendingPathComponent("zsl_\(zslSeq).dng")
+        // Pull bytes off the photo callback queue, then mutate the ring on sessionQueue.
+        let data: Data? = autoreleasepool { photo.fileDataRepresentation() }
+        guard let data else { return }
+        sessionQueue.async {
+            guard !self.pipelineBusy, !self.zslPausedForPipeline, let dir = self.zslDir else { return }
+            self.zslSeq += 1
+            let url = dir.appendingPathComponent("zsl_\(self.zslSeq).dng")
             do {
                 try data.write(to: url)
-                zslRing.append(url)
-                let cap = max(activeFrameCount, 2)
-                while zslRing.count > cap {
-                    let old = zslRing.removeFirst()
+                self.zslRing.append(url)
+                let cap = max(self.activeFrameCount, 2)
+                while self.zslRing.count > cap {
+                    let old = self.zslRing.removeFirst()
                     try? FileManager.default.removeItem(at: old)
                 }
-                let n = zslRing.count
+                let n = self.zslRing.count
                 DispatchQueue.main.async { self.zslBufferReady = n }
             } catch {
                 try? FileManager.default.removeItem(at: url)
@@ -1240,9 +1238,23 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
-        if error != nil { return }
-        if captureKind == .burst, capturesRequested < currentBurstTotal {
-            _ = captureNextRaw(isZSL: false)
+        sessionQueue.async {
+            if self.captureKind == .burst {
+                if error == nil, self.capturesRequested < self.currentBurstTotal {
+                    _ = self.captureNextRaw(isZSL: false)
+                }
+                return
+            }
+            // ZSL: re-arm immediately when the camera is free (before DNG write finishes).
+            guard self.captureKind == .zsl || self.zslCapturing else { return }
+            self.zslCapturing = false
+            if self.captureKind == .zsl { self.captureKind = .none }
+            guard self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
+            if error != nil {
+                self.scheduleNextZSL()
+            } else {
+                self.pumpZSL()
+            }
         }
     }
 }

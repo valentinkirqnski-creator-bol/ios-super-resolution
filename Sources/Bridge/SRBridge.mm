@@ -107,6 +107,8 @@ static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount
         if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
         if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
         if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+        if (tuning[@"robustness_save_mask"])
+            cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
         if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
             cfg.accumulated_robustness_denoiser_enabled = tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
         }
