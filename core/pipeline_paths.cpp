@@ -1,6 +1,6 @@
 // Burst processing for memory-constrained mobile targets (iOS).
-// ≤8 comps: keep RAW+analysis in RAM. Larger bursts: spill Bayer to disk only.
-// On Apple, frames are prefetched to the GPU before the merge band loop.
+// Full-res (1×) and large bursts: spill comparison Bayer to disk after analyze.
+// Lighter 2× crops keep RAW+analysis in RAM. Apple: GPU merge prefetch after analyze.
 #include "pipeline.h"
 #include "stages.h"
 #include "dng_writer.h"
@@ -193,11 +193,24 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
-    // Same math: CPU robustness init ∥ GPU kernel estimate (no extra frame RAM).
-    std::future<CovField> ref_cov_fut =
-        std::async(std::launch::async, [&]() { return estimate_kernels(ref, work); });
-    RefStats ref_stats = init_robustness(ref, work);
-    CovField ref_covs = ref_cov_fut.get();
+
+    // Full-res (~12MP Bayer) cannot hold every comparison RAW + dual Metal peaks.
+    const bool full_res =
+        ((size_t)ref_h * (size_t)ref_w) >= 8ull * 1000ull * 1000ull;
+
+    // Same math; sequential on Apple Metal (rob + kernels both GPU — overlap
+    // doubles peak and races shared scratch). Light crops may still overlap.
+    RefStats ref_stats;
+    CovField ref_covs;
+    if (full_res) {
+        ref_stats = init_robustness(ref, work);
+        ref_covs = estimate_kernels(ref, work);
+    } else {
+        std::future<CovField> ref_cov_fut =
+            std::async(std::launch::async, [&]() { return estimate_kernels(ref, work); });
+        ref_stats = init_robustness(ref, work);
+        ref_covs = ref_cov_fut.get();
+    }
 
     // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
     // Peak during analyze ≈ ref + one comparison (+ optional prefetch on 2×).
@@ -207,20 +220,18 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     std::error_code ec;
     fs::remove_all(cache, ec);
 
-    // Keep analysis in RAM. Only spill RAW to disk when the burst is large.
-    // (Old path wrote everything to disk then re-read it — that was "Loading frames".)
+    // Spill Bayer on full-res (any burst size) or when comps > 8. Keeps flow/R/cov.
     std::vector<CachedCompFrame> cached;
     std::vector<CachedCompMeta> cached_meta;
-    const bool stream_comp_raw = (n - 1) > 8; // ≤8 frames: full RAM path
+    const bool stream_comp_raw = full_res || (n - 1) > 8;
     if (stream_comp_raw)
         fs::create_directories(cache, ec);
 
     cached.reserve((size_t)std::max(0, n - 1));
     cached_meta.reserve((size_t)std::max(0, n - 1));
 
-    // Prefetch next LibRaw decode only on lighter crops (2×). Full 1× keeps a
-    // single comparison resident so we do not jetsam during analyze.
-    const bool prefetch_next = ((size_t)ref_h * (size_t)ref_w) < 8ull * 1000ull * 1000ull;
+    // Prefetch next LibRaw decode only on lighter crops (2×).
+    const bool prefetch_next = !full_res;
     int pref_k = -1;
     std::future<Image> pref_fut;
 
@@ -251,17 +262,25 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         comp_grey = Image(); // free before robustness/kernels peak
 
-        // Same math: CPU robustness ∥ GPU Alg. 5 kernels (independent after align).
-        std::future<CovField> cov_fut =
-            std::async(std::launch::async, [&]() { return estimate_kernels(comp, work); });
-        Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
-        CovField covs = cov_fut.get();
+        Image rob;
+        CovField covs;
+        if (full_res) {
+            rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+            covs = estimate_kernels(comp, work);
+        } else {
+            // Same math; overlap only when peak RAM is affordable (2× crop).
+            std::future<CovField> cov_fut =
+                std::async(std::launch::async, [&]() { return estimate_kernels(comp, work); });
+            rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+            covs = cov_fut.get();
+        }
 
         if (stream_comp_raw) {
-            // Spill Bayer only; keep flow/R/cov in RAM (small vs RAW).
+            // Spill Bayer only; keep flow/R/cov in RAM (needed for merge).
             if (!save_image(cache / ("f" + std::to_string(k) + ".raw"), comp)) {
                 continue;
             }
+            comp = Image(); // drop host Bayer immediately (save keeps a disk copy)
             CachedCompMeta meta;
             meta.index = k;
             meta.flow = std::move(flow);
@@ -279,6 +298,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             cached.push_back(std::move(fc));
             n_comp_ok++;
         }
+#if defined(__APPLE__)
+        // Full-res: drop grow-only L2/Alg. 5 GPU scratch before the next frame.
+        if (full_res) metal_trim_analyze_scratch();
+#endif
     }
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
@@ -345,22 +368,34 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     Image comp_scratch;
 #if defined(__APPLE__)
-    // Upload all comparison frames to GPU before the band loop so merge isn't
-    // stalled on the first band's PCIe copies.
+    // Upload comparison frames to GPU before the band loop so merge isn't
+    // stalled on the first band's PCIe copies. On full-res, drop host R/cov
+    // after each upload so we never hold host+GPU copies of every frame.
     report("Preparing GPU merge", 0.46f);
     metal_merge_set_single_acc_slot(heavy_1x);
     metal_merge_begin_burst();
     if (stream_comp_raw) {
-        for (const CachedCompMeta& meta : cached_meta) {
+        for (CachedCompMeta& meta : cached_meta) {
             if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
-            metal_merge_prefetch_frame(comp_scratch, meta.flow, meta.covs, meta.rob,
-                                       meta.index);
+            if (metal_merge_prefetch_frame(comp_scratch, meta.flow, meta.covs, meta.rob,
+                                           meta.index)) {
+                meta.rob = Image();
+                meta.covs = CovField();
+                meta.flow = FlowField();
+            }
+            if (heavy_1x) comp_scratch = Image();
         }
-        comp_scratch = Image(); // free host RAW; GPU holds copies
+        comp_scratch = Image();
     } else {
         for (CachedCompFrame& fc : cached) {
-            if (metal_merge_prefetch_frame(fc.comp, fc.flow, fc.covs, fc.rob, fc.index))
-                fc.comp = Image(); // host RAW freed; GPU holds the copy
+            if (metal_merge_prefetch_frame(fc.comp, fc.flow, fc.covs, fc.rob, fc.index)) {
+                fc.comp = Image();
+                if (heavy_1x) {
+                    fc.rob = Image();
+                    fc.covs = CovField();
+                    fc.flow = FlowField();
+                }
+            }
         }
     }
 #endif

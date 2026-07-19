@@ -61,6 +61,9 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
 // Drop previous burst's GPU merge cache (call once before prefetching a new shot).
 void metal_merge_begin_burst();
 
+// Free grow-only L2 / Alg. 5 scratch between full-res analyze frames (jetsam).
+void metal_trim_analyze_scratch();
+
 // When true, reuse one GPU num/den slot (wait each band). Cuts peak RAM ~2× so
 // full-res 1× can use larger bands without jetsam. Default false (2× double-buffer).
 void metal_merge_set_single_acc_slot(bool enabled);

@@ -1498,6 +1498,16 @@ void metal_merge_set_single_acc_slot(bool enabled) {
     g_merge_single_slot = enabled;
 }
 
+void metal_trim_analyze_scratch() {
+    auto& c = ctx();
+    c.kern_raw = nil; c.kern_vst = nil; c.kern_grey = nil;
+    c.kern_grad = nil; c.kern_cov = nil;
+    c.kern_raw_b = c.kern_vst_b = c.kern_grey_b = 0;
+    c.kern_grad_b = c.kern_cov_b = 0;
+    c.l2[0] = {};
+    c.l2[1] = {};
+}
+
 void metal_merge_begin_burst() {
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
@@ -1510,12 +1520,8 @@ void metal_merge_begin_burst() {
     // keeping them across shots causes jetsam on the next full-res merge).
     g_merge_acc[0] = {};
     g_merge_acc[1] = {};
-    // Drop Alg. 5 scratch so merge prefetch is not fighting kernel temps for RAM.
-    auto& c = ctx();
-    c.kern_raw = nil; c.kern_vst = nil; c.kern_grey = nil;
-    c.kern_grad = nil; c.kern_cov = nil;
-    c.kern_raw_b = c.kern_vst_b = c.kern_grey_b = 0;
-    c.kern_grad_b = c.kern_cov_b = 0;
+    // Drop analyze scratch so merge prefetch is not fighting L2/Alg. 5 temps.
+    metal_trim_analyze_scratch();
 }
 
 bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
