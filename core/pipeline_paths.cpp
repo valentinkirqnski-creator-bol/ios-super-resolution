@@ -297,18 +297,21 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // Larger bands on Apple → fewer GPU sync/readback round-trips.
-    // 1× (~8k) aims for ~2–4 bands; 2× crop often fits in one band.
+    // Band size: 2× crop can use large bands; full 1× must stay smaller or iOS jetsams
+    // (host×2 + GPU×2 num/den + RGB16 + prefetched frames easily exceeds 1–2 GB).
+    const size_t out_px = (size_t)Hs * (size_t)Ws;
+    const bool heavy_1x = out_px >= 28ull * 1000ull * 1000ull; // ~full-res scale-2
 #if defined(__APPLE__)
-    // Prefer fewer, larger bands so Deflate/encode runs in bigger chunks.
-    const size_t band_budget = 512u * 1024u * 1024u;
+    const size_t band_budget = heavy_1x ? (96u * 1024u * 1024u) : (384u * 1024u * 1024u);
 #else
     const size_t band_budget = 64u * 1024u * 1024u;
 #endif
-    const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2;
+    const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2; // num+den float row
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
-    std::vector<uint16_t> row16((size_t)band_rows * Ws * 3);
+    // Hard cap rows so a single host band pair cannot balloon on wide sensors.
+    if (heavy_1x) band_rows = std::min(band_rows, 384);
+    std::vector<uint16_t> row16((size_t)band_rows * (size_t)Ws * 3u);
 
     Image comp_scratch;
 #if defined(__APPLE__)
@@ -333,12 +336,14 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     AccumDiag diag;
 #if defined(__APPLE__)
-    // Double-buffer host bands + async DNG encode thread: GPU band N overlaps
-    // CPU color-convert/Deflate of band N-1 (same pixels; scheduling only).
+    // Double-buffer host bands. Async encode only on lighter (2×) outputs — on 1×
+    // keep encode synchronous to avoid a third full-band RGB16 allocation + jetsam.
     Image num_bands[2], den_bands[2];
     std::vector<uint16_t> row16_async[2];
-    row16_async[0].resize(row16.size());
-    row16_async[1].resize(row16.size());
+    if (!heavy_1x) {
+        row16_async[0].resize(row16.size());
+        row16_async[1].resize(row16.size());
+    }
     int cur = 0;
     bool have_ready = false;
     int ready = 0, ready_y0 = 0, ready_bh = 0;
@@ -350,13 +355,20 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
         const int bh = std::min(band_rows, Hs - y0);
         cur ^= 1;
-        // Ensure a prior encode is not still using this host band slot.
         join_encode();
         Image& num_band = num_bands[cur];
         Image& den_band = den_bands[cur];
         if (num_band.h != bh || num_band.w != Ws || num_band.c != nch) {
-            num_band = Image(bh, Ws, nch);
-            den_band = Image(bh, Ws, nch);
+            try {
+                num_band = Image(bh, Ws, nch);
+                den_band = Image(bh, Ws, nch);
+            } catch (...) {
+                report("Error: out of memory during merge", 1.f);
+                join_encode();
+                writer.close();
+                if (stream_comp_raw) fs::remove_all(cache, ec);
+                return Image();
+            }
         }
 
         if (stream_comp_raw) {
@@ -386,19 +398,32 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
 
         // Async commit; resolves previous in-flight band into its host images.
-        if (!merge_ref_band_metal(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr))
-            continue;
+        if (!merge_ref_band_metal(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr)) {
+            report("Error: GPU merge failed (memory?)", 1.f);
+            join_encode();
+            writer.close();
+            if (stream_comp_raw) fs::remove_all(cache, ec);
+            return Image();
+        }
 
         if (have_ready) {
             const int er = ready, ey0 = ready_y0, ebh = ready_bh;
-            std::vector<uint16_t>& out16 = row16_async[er];
-            if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
-                out16.resize((size_t)ebh * (size_t)Ws * 3u);
-            encode_thr = std::thread([&, er, ey0, ebh]() {
+            if (heavy_1x) {
+                if (row16.size() < (size_t)ebh * (size_t)Ws * 3u)
+                    row16.resize((size_t)ebh * (size_t)Ws * 3u);
                 encode_band_rows(num_bands[er], den_bands[er], ey0, ebh, work, nch,
-                                 preview, pscale, ph, pw, Ws, out16);
-                writer.write_rows(out16.data(), ebh);
-            });
+                                 preview, pscale, ph, pw, Ws, row16);
+                writer.write_rows(row16.data(), ebh);
+            } else {
+                std::vector<uint16_t>& out16 = row16_async[er];
+                if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
+                    out16.resize((size_t)ebh * (size_t)Ws * 3u);
+                encode_thr = std::thread([&, er, ey0, ebh]() {
+                    encode_band_rows(num_bands[er], den_bands[er], ey0, ebh, work, nch,
+                                     preview, pscale, ph, pw, Ws, out16);
+                    writer.write_rows(out16.data(), ebh);
+                });
+            }
             report("Merging output", 0.48f + 0.50f * (float)(ey0 + ebh) / Hs);
         }
         ready = cur;
@@ -411,6 +436,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         Image& rn = num_bands[ready];
         Image& rd = den_bands[ready];
         accumulate_diag(rn, rd, diag);
+        if (row16.size() < (size_t)ready_bh * (size_t)Ws * 3u)
+            row16.resize((size_t)ready_bh * (size_t)Ws * 3u);
         encode_band_rows(rn, rd, ready_y0, ready_bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), ready_bh);
         report("Merging output", 0.48f + 0.50f * (float)(ready_y0 + ready_bh) / Hs);

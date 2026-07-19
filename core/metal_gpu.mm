@@ -1213,9 +1213,11 @@ void metal_merge_begin_burst() {
     // First band XORs to slot 0.
     g_merge_write_slot = 1;
     g_merge_need_zero = false;
-    // Keep grow-only acc buffers; next ensure_acc will blit-zero.
-    // Drop Alg. 5 scratch so merge prefetch is not fighting kernel temps for RAM
-    // (that pressure was making the merge phase slower after GPU kernels landed).
+    // Drop previous burst's grow-only acc slots (1× bands can be hundreds of MB;
+    // keeping them across shots causes jetsam on the next full-res merge).
+    g_merge_acc[0] = {};
+    g_merge_acc[1] = {};
+    // Drop Alg. 5 scratch so merge prefetch is not fighting kernel temps for RAM.
     auto& c = ctx();
     c.kern_raw = nil; c.kern_vst = nil; c.kern_grey = nil;
     c.kern_grad = nil; c.kern_cov = nil;
