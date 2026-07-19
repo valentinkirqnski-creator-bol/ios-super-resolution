@@ -831,7 +831,8 @@ static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32
 }
 
 static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
-                                id<MTLBuffer>& b_means, id<MTLBuffer>& b_vars,
+                                __strong id<MTLBuffer>& b_means,
+                                __strong id<MTLBuffer>& b_vars,
                                 int& guide_h, int& guide_w, int& nch,
                                 id<MTLCommandBuffer> cmd) {
     auto& c = ctx();
@@ -889,7 +890,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     return true;
 }
 
-static bool rob_dogson(id<MTLBuffer> b_in, id<MTLBuffer>& b_out,
+static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd) {
