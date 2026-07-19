@@ -453,6 +453,16 @@ struct CameraView: View {
                         Text(String(format: "%.1f", cam.tuningParams.k_stretch))
                     }
                     Slider(value: $cam.tuningParams.k_stretch, in: 1.0...10.0)
+
+                    HStack {
+                        Text("Shrink (k_shrink)")
+                        Spacer()
+                        Text(String(format: "%.1f", cam.tuningParams.k_shrink))
+                    }
+                    Slider(value: $cam.tuningParams.k_shrink, in: 1.0...5.0)
+                    Text("Higher shrink sharpens across edges (helps small text). Default 2.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                 }
                 
                 Section(header: Text("Capture")) {

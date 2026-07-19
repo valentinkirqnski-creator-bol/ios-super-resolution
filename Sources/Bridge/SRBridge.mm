@@ -147,6 +147,7 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
         if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
         if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
         if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
+        if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
         if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
         if (tuning[@"robustness_save_mask"])
             cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;

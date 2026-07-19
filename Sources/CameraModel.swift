@@ -66,6 +66,7 @@ struct TuningParams: Equatable, Codable {
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
+    var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = false
     var robustness_save_mask: Bool = true
     var accumulated_robustness_denoiser_enabled: Bool = true
@@ -114,7 +115,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 4
+        let defaultsVersion = 5
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -985,6 +986,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
+            "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
