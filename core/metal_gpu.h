@@ -43,13 +43,14 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
 // Exact cuda_downsample / grey_pyramid.cpp downsample_by (valid gauss + stride).
 bool downsample_by_metal(const Image& src, int factor, Image& out);
 
-// GPU-resident moving pyramid + ref Sobel/Hessian + BM→ICA + flow upscale
-// (same math as align()). Uses sticky grey from compute_grey_fft_metal when
-// dims match. Downloads final flow only. Returns false → caller uses CPU align.
+// GPU-resident moving pyramid + per-level Sobel/Hessian + BM→ICA + flow upscale
+// (same math as align()). Sobel/Hess are computed one pyramid level at a time
+// (no all-level sticky cache — that jetsams at 1×). Uses sticky grey from
+// compute_grey_fft_metal when dims match. Downloads final flow only.
 bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out);
 
-// Drop sticky GPU ref Sobel/Hessian (pair with clear_align_ref_ica_cache).
+// No-op retained for clear_align_ref_ica_cache pairing (host cache is separate).
 void metal_clear_ref_ica_cache();
 
 // num/den → packed RGB16 (same math as encode_band_rows DNG path). Preview

@@ -71,16 +71,6 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
-    // Ref Sobel/Hessian per pyramid level (reuse across comparison frames).
-    struct RefIcaGpuLev {
-        __strong id<MTLBuffer> ref = nil;
-        __strong id<MTLBuffer> gx = nil;
-        __strong id<MTLBuffer> gy = nil;
-        __strong id<MTLBuffer> hess = nil;
-        int h = 0, w = 0, ny = 0, nx = 0, ts = 0;
-    };
-    const void* sticky_ref_pyr = nullptr;
-    std::vector<RefIcaGpuLev> sticky_ref_ica;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -1456,97 +1446,67 @@ struct AlignUpscaleParamsCPU {
 };
 static_assert(sizeof(AlignUpscaleParamsCPU) == 32, "AlignUpscaleParamsCPU");
 
-static bool ensure_ref_ica_gpu(const Pyramid& ref_pyr, const Config& cfg, int tile_size) {
+// One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
+// retain all levels at once (full-res sticky cache jetsams on 1×).
+static bool prep_level_ica_gpu(const Image& r, int ts,
+                               __strong id<MTLBuffer>& b_ref,
+                               __strong id<MTLBuffer>& b_gx,
+                               __strong id<MTLBuffer>& b_gy,
+                               __strong id<MTLBuffer>& b_hess,
+                               int& ny, int& nx) {
     auto& c = ctx();
-    const int nlev = (int)ref_pyr.levels.size();
-    if (c.sticky_ref_pyr == (const void*)&ref_pyr &&
-        (int)c.sticky_ref_ica.size() == nlev)
-        return true;
+    ny = r.h / ts;
+    nx = r.w / ts;
+    if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) return false;
+    b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
+    const size_t pix_b = (size_t)r.h * (size_t)r.w * sizeof(float);
+    const size_t hess_b = (size_t)ny * (size_t)nx * 4u * sizeof(float);
+    b_gx = buf(nullptr, pix_b);
+    b_gy = buf(nullptr, pix_b);
+    b_hess = buf(nullptr, hess_b);
+    if (!b_ref || !b_gx || !b_gy || !b_hess) return false;
 
-    c.sticky_ref_pyr = nullptr;
-    c.sticky_ref_ica.clear();
-    c.sticky_ref_ica.assign((size_t)nlev, MetalCtx::RefIcaGpuLev{});
+    id<MTLComputePipelineState> px = c.pipe("align_sobel_x");
+    id<MTLComputePipelineState> py = c.pipe("align_sobel_y");
+    id<MTLComputePipelineState> ph = c.pipe("align_hessian");
+    if (!px || !py || !ph) return false;
 
-    for (int lvl = 0; lvl < nlev; ++lvl) {
-        const Image& r = ref_pyr.levels[(size_t)lvl];
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
-        int ny = r.h / ts;
-        int nx = r.w / ts;
-        if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) {
-            c.sticky_ref_ica.clear();
-            return false;
-        }
+    AlignImgParamsCPU ip{};
+    ip.h = (uint32_t)r.h;
+    ip.w = (uint32_t)r.w;
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_ref offset:0 atIndex:0];
+    [enc setBuffer:b_gx offset:0 atIndex:1];
+    [enc setBytes:&ip length:sizeof(ip) atIndex:2];
+    dispatch2(enc, px, (NSUInteger)r.w, (NSUInteger)r.h);
+    [enc setBuffer:b_ref offset:0 atIndex:0];
+    [enc setBuffer:b_gy offset:0 atIndex:1];
+    [enc setBytes:&ip length:sizeof(ip) atIndex:2];
+    dispatch2(enc, py, (NSUInteger)r.w, (NSUInteger)r.h);
 
-        MetalCtx::RefIcaGpuLev& L = c.sticky_ref_ica[(size_t)lvl];
-        L.h = r.h;
-        L.w = r.w;
-        L.ny = ny;
-        L.nx = nx;
-        L.ts = ts;
-        L.ref = buf(r.data.data(), r.data.size() * sizeof(float));
-        const size_t pix_b = (size_t)r.h * (size_t)r.w * sizeof(float);
-        const size_t hess_b = (size_t)ny * (size_t)nx * 4u * sizeof(float);
-        L.gx = buf(nullptr, pix_b);
-        L.gy = buf(nullptr, pix_b);
-        L.hess = buf(nullptr, hess_b);
-        if (!L.ref || !L.gx || !L.gy || !L.hess) {
-            c.sticky_ref_ica.clear();
-            return false;
-        }
-
-        AlignImgParamsCPU ip{};
-        ip.h = (uint32_t)r.h;
-        ip.w = (uint32_t)r.w;
-        id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
-        if (!cmd) {
-            c.sticky_ref_ica.clear();
-            return false;
-        }
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        if (!enc) {
-            c.sticky_ref_ica.clear();
-            return false;
-        }
-        [enc setBuffer:L.ref offset:0 atIndex:0];
-        [enc setBuffer:L.gx offset:0 atIndex:1];
-        [enc setBytes:&ip length:sizeof(ip) atIndex:2];
-        dispatch2(enc, c.pipe("align_sobel_x"), (NSUInteger)r.w, (NSUInteger)r.h);
-        [enc setBuffer:L.ref offset:0 atIndex:0];
-        [enc setBuffer:L.gy offset:0 atIndex:1];
-        [enc setBytes:&ip length:sizeof(ip) atIndex:2];
-        dispatch2(enc, c.pipe("align_sobel_y"), (NSUInteger)r.w, (NSUInteger)r.h);
-
-        AlignHessParamsCPU hp{};
-        hp.h = (uint32_t)r.h;
-        hp.w = (uint32_t)r.w;
-        hp.ny = (uint32_t)ny;
-        hp.nx = (uint32_t)nx;
-        hp.ts = (uint32_t)ts;
-        [enc setBuffer:L.gx offset:0 atIndex:0];
-        [enc setBuffer:L.gy offset:0 atIndex:1];
-        [enc setBuffer:L.hess offset:0 atIndex:2];
-        [enc setBytes:&hp length:sizeof(hp) atIndex:3];
-        id<MTLComputePipelineState> hpipe = c.pipe("align_hessian");
-        if (!hpipe) {
-            c.sticky_ref_ica.clear();
-            return false;
-        }
-        [enc setComputePipelineState:hpipe];
-        const NSUInteger ntiles = (NSUInteger)ny * (NSUInteger)nx;
-        NSUInteger tg = std::min(ntiles, (NSUInteger)hpipe.maxTotalThreadsPerThreadgroup);
-        if (tg == 0) tg = 1;
-        [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-        if (cmd.status != MTLCommandBufferStatusCompleted) {
-            c.sticky_ref_ica.clear();
-            return false;
-        }
-    }
-    c.sticky_ref_pyr = (const void*)&ref_pyr;
-    return true;
+    AlignHessParamsCPU hp{};
+    hp.h = (uint32_t)r.h;
+    hp.w = (uint32_t)r.w;
+    hp.ny = (uint32_t)ny;
+    hp.nx = (uint32_t)nx;
+    hp.ts = (uint32_t)ts;
+    [enc setBuffer:b_gx offset:0 atIndex:0];
+    [enc setBuffer:b_gy offset:0 atIndex:1];
+    [enc setBuffer:b_hess offset:0 atIndex:2];
+    [enc setBytes:&hp length:sizeof(hp) atIndex:3];
+    [enc setComputePipelineState:ph];
+    const NSUInteger ntiles = (NSUInteger)ny * (NSUInteger)nx;
+    NSUInteger tg = std::min(ntiles, (NSUInteger)ph.maxTotalThreadsPerThreadgroup);
+    if (tg == 0) tg = 1;
+    [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
 
 // __strong out-param: ARC requires it for id& (same as gpu_downsample_buf).
@@ -1577,11 +1537,12 @@ static bool upscale_flow_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
+    id<MTLComputePipelineState> pipe = c.pipe("align_upscale_flow");
+    if (!pipe) return false;
     [enc setBuffer:b_in offset:0 atIndex:0];
     [enc setBuffer:b_out offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("align_upscale_flow"),
-              (NSUInteger)target_nx, (NSUInteger)target_ny);
+    dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
@@ -1604,8 +1565,6 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
         if (metric == "L1" && (ts != 16 || radius > 1)) return false;
     }
-
-    if (!ensure_ref_ica_gpu(ref_pyr, cfg, tile_size)) return false;
 
     auto& c = ctx();
     id<MTLBuffer> mov0 = nil;
@@ -1649,13 +1608,15 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
     int flow_ny = 0, flow_nx = 0;
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
+        const Image& r = ref_pyr.levels[(size_t)lvl];
         const Lev& m = mov_pyr[(size_t)lvl];
-        const MetalCtx::RefIcaGpuLev& ic = c.sticky_ref_ica[(size_t)lvl];
-        int ts = ic.ts;
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
-        int ny = ic.ny;
-        int nx = ic.nx;
-        if (ny <= 0 || nx <= 0 || !ic.ref || !ic.gx || !ic.gy || !ic.hess) return false;
+
+        id<MTLBuffer> b_ref = nil, b_gx = nil, b_gy = nil, b_hess = nil;
+        int ny = 0, nx = 0;
+        if (!prep_level_ica_gpu(r, ts, b_ref, b_gx, b_gy, b_hess, ny, nx))
+            return false;
 
         if (!b_flow) {
             flow_ny = ny;
@@ -1681,14 +1642,15 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
         bool bm_ok = false;
         if (metric == "L1")
-            bm_ok = l1_bufs(ic.ref, m.img, b_flow, ic.h, ic.w, m.h, m.w, ts, radius, ny, nx);
+            bm_ok = l1_bufs(b_ref, m.img, b_flow, r.h, r.w, m.h, m.w, ts, radius, ny, nx);
         else
-            bm_ok = l2_bufs(ic.ref, m.img, b_flow, ic.h, ic.w, m.h, m.w, ts, radius, ny, nx);
+            bm_ok = l2_bufs(b_ref, m.img, b_flow, r.h, r.w, m.h, m.w, ts, radius, ny, nx);
         if (!bm_ok) return false;
 
-        if (!ica_bufs(ic.ref, ic.gx, ic.gy, ic.hess, m.img, b_flow,
-                      ic.h, ic.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))
+        if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, m.img, b_flow,
+                      r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))
             return false;
+        // Level ICA buffers drop here — only flow stays resident.
     }
 
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
@@ -1699,10 +1661,7 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
 }
 
 void metal_clear_ref_ica_cache() {
-    if (!metal_gpu_init()) return;
-    auto& c = ctx();
-    c.sticky_ref_pyr = nullptr;
-    c.sticky_ref_ica.clear();
+    // Per-level ICA temps are not retained across frames.
 }
 
 bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
