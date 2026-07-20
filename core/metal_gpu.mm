@@ -1549,8 +1549,9 @@ static bool ensure_ref_ica_gpu(const Pyramid& ref_pyr, const Config& cfg, int ti
     return true;
 }
 
+// __strong out-param: ARC requires it for id& (same as gpu_downsample_buf).
 static bool upscale_flow_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
-                              id<MTLBuffer>& b_out, int target_ny, int target_nx,
+                              __strong id<MTLBuffer>& b_out, int target_ny, int target_nx,
                               int upsample_factor, int new_tile_size, int prev_tile_size) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
