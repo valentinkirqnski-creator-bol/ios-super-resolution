@@ -57,19 +57,30 @@ static inline float highlight_rolloff_overrange(float v) {
     return 1.f - 1.f / (1.f + (v - 1.f) * 2.5f);
 }
 
-// Approximate Lightroom Highlights (negative). amount 1.0 ≈ −100, 0.7 ≈ −70:
-// compress upper tones without flattening the whole image.
+// Approximate Lightroom Highlights −100: compress upper tones aggressively.
 static inline float apply_highlights_neg(float v, float amount) {
     v = clampf(v, 0.f, 1.f);
     amount = clampf(amount, 0.f, 1.f);
     if (amount <= 0.f) return v;
-    const float knee = 0.48f;
+    const float knee = 0.35f; // start compressing earlier than before
     if (v <= knee) return v;
     float t = (v - knee) / (1.f - knee); // 0..1 in highlight zone
-    t = t * t; // weight brightest more (LR-like)
-    // Pull highlights down; −70 keeps more sparkle than −100.
-    float compressed = knee + (v - knee) * (1.f - amount * 0.62f * t);
+    // Stronger curve: cube for aggressive rolloff on the brightest tones.
+    float t3 = t * t * t;
+    float compressed = knee + (v - knee) * (1.f - amount * 0.78f * t3);
     return clampf(compressed, 0.f, 1.f);
+}
+
+// Approximate Lightroom Shadows +60: lift dark tones without washing out mids.
+static inline float apply_shadows_lift(float v, float amount) {
+    v = clampf(v, 0.f, 1.f);
+    if (amount <= 0.f) return v;
+    // Only boost below the upper shoulder (keep highlights untouched).
+    const float shoulder = 0.55f;
+    if (v >= shoulder) return v;
+    float t = 1.f - v / shoulder; // 1 at black, 0 at shoulder
+    float lift = amount * t * t * 0.28f; // quadratic fade-in from darks
+    return clampf(v + lift, 0.f, shoulder);
 }
 
 // Display S-curve + mild midtone contrast (LR Contrast-ish, no CI filters).
@@ -77,8 +88,8 @@ static inline float tone_s_curve(float v) {
     v = clampf(v, 0.f, 1.f);
     const float s = v * v * (3.f - 2.f * v);
     v = clampf(v * 0.30f + s * 0.70f, 0.f, 1.f);
-    // Extra pivot contrast around midtones.
-    v = clampf((v - 0.5f) * 1.12f + 0.5f, 0.f, 1.f);
+    // Gentler pivot contrast so shadows don't get re-crushed.
+    v = clampf((v - 0.5f) * 1.06f + 0.5f, 0.f, 1.f);
     return v;
 }
 
@@ -94,18 +105,27 @@ static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount
     b = clampf(y + (b - y) * boost, 0.f, 1.f);
 }
 
-// Shared JPG / DNG-preview finish: Highlights −70, stronger contrast + vibrance.
+// Shared JPG / DNG-preview finish: Highlights −100, Shadows +60, contrast + vibrance.
 static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
+    // Clamp negative channels BEFORE rolloff — after the cam→sRGB matrix,
+    // R or B can go negative while G stays positive, producing green speckles.
+    sr = std::max(0.f, sr);
+    sg = std::max(0.f, sg);
+    sb = std::max(0.f, sb);
     sr = highlight_rolloff_overrange(sr);
     sg = highlight_rolloff_overrange(sg);
     sb = highlight_rolloff_overrange(sb);
     sr = to_srgb_gamma(sr);
     sg = to_srgb_gamma(sg);
     sb = to_srgb_gamma(sb);
-    constexpr float kHighlightsNeg = 0.70f; // Lightroom Highlights −70
+    constexpr float kHighlightsNeg = 1.00f; // Lightroom Highlights −100
     sr = apply_highlights_neg(sr, kHighlightsNeg);
     sg = apply_highlights_neg(sg, kHighlightsNeg);
     sb = apply_highlights_neg(sb, kHighlightsNeg);
+    constexpr float kShadowsLift = 1.00f; // Lightroom Shadows +60
+    sr = apply_shadows_lift(sr, kShadowsLift);
+    sg = apply_shadows_lift(sg, kShadowsLift);
+    sb = apply_shadows_lift(sb, kShadowsLift);
     sr = tone_s_curve(sr);
     sg = tone_s_curve(sg);
     sb = tone_s_curve(sb);

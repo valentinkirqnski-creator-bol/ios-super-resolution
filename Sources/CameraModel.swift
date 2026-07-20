@@ -879,7 +879,7 @@ final class CameraModel: NSObject, ObservableObject {
         let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
         settings.flashMode = .off
         settings.photoQualityPrioritization = .speed
-        settings.isAutoStillImageStabilizationEnabled = false
+        settings.isAutoStillImageStabilizationEnabled = true
         applyRawCaptureLimits(to: settings)
         applyShutterSoundSuppression(to: settings)
         photoOutput.capturePhoto(with: settings, delegate: self)
