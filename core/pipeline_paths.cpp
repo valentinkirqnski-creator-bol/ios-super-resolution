@@ -104,11 +104,22 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
     const int y_step = std::max(1, x_step);
     const f32* nump = num_band.data.data();
     const f32* denp = den_band.data.data();
-    uint16_t* outp = row16.data();
     const bool bake = work.bake_srgb && nch >= 3;
     const f32* m = work.cam_to_srgb;
     const f32 wb0 = work.white_balance[0], wb1 = work.white_balance[1], wb2 = work.white_balance[2];
     const bool prev_color = !bake && nch >= 3 && work.has_cam_to_srgb;
+
+#if defined(__APPLE__)
+    // Dense DNG band on GPU (1:1); sparse preview stays on CPU below.
+    const bool gpu_rgb = metal_normalize_band_rgb16(num_band, den_band, work, row16);
+#else
+    const bool gpu_rgb = false;
+#endif
+    uint16_t* outp = row16.data();
+    if (!gpu_rgb) {
+        row16.resize((size_t)bh * (size_t)Ws * 3u);
+        outp = row16.data();
+    }
 
     parallel_rows(bh, work.num_threads, [&](int i) {
         const int gy = y0 + i;
@@ -116,19 +127,20 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
         const int py = std::min(ph - 1, (int)(gy * pscale));
         const size_t row_off = (size_t)i * (size_t)Ws * (size_t)nch;
         for (int x = 0; x < Ws; ++x) {
+            const bool need_prev = do_prev_row && (x % x_step) == 0;
+            if (gpu_rgb && !need_prev) continue;
+
             const size_t pi = row_off + (size_t)x * (size_t)nch;
-            f32 cn0 = 0.f, cn1 = 0.f, cn2 = 0.f;
-            {
-                f32 d0 = denp[pi];
-                cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
-                if (nch >= 2) {
-                    f32 d1 = denp[pi + 1];
-                    cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
-                }
-                if (nch >= 3) {
-                    f32 d2 = denp[pi + 2];
-                    cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
-                }
+            f32 d0 = denp[pi];
+            f32 cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
+            f32 cn1 = 0.f, cn2 = 0.f;
+            if (nch >= 2) {
+                f32 d1 = denp[pi + 1];
+                cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
+            }
+            if (nch >= 3) {
+                f32 d2 = denp[pi + 2];
+                cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
             }
             f32 lin0, lin1, lin2;
             if (bake) {
@@ -141,15 +153,16 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
             } else {
                 lin0 = lin1 = lin2 = cn0;
             }
-            const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0, 0.f, 1.f);
-            const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1, 0.f, 1.f);
-            const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2, 0.f, 1.f);
-            const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
-            outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
-            outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
-            outp[base + 2] = (uint16_t)(v2 * 65535.f + 0.5f);
-
-            if (do_prev_row && (x % x_step) == 0) {
+            if (!gpu_rgb) {
+                const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0, 0.f, 1.f);
+                const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1, 0.f, 1.f);
+                const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2, 0.f, 1.f);
+                const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
+                outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
+                outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
+                outp[base + 2] = (uint16_t)(v2 * 65535.f + 0.5f);
+            }
+            if (need_prev) {
                 f32 preview_lin[3] = {lin0, lin1, lin2};
                 if (prev_color) {
                     f32 wr = cn0 * wb0, wg = cn1 * wb1, wb = cn2 * wb2;

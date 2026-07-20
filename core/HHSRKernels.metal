@@ -1450,3 +1450,150 @@ kernel void pyr_subsample(device const float* in [[buffer(0)]],
     out[gid.y * p.out_w + gid.x] =
         in[(gid.y * p.factor) * p.in_w + (gid.x * p.factor)];
 }
+
+// ---------------------------------------------------------------------------
+// Align extras — 1:1 with align.cpp Sobel / Hessian / upscale_flow
+// ---------------------------------------------------------------------------
+struct AlignImgParams {
+    uint h, w;
+    uint _pad0, _pad1;
+};
+
+// compute_sobel_gradx: out = -I[y,x-1] + I[y,x+1], OOB → 0
+kernel void align_sobel_x(device const float* img [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant AlignImgParams& p [[buffer(2)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    float vm = (gid.x >= 1u) ? img[gid.y * p.w + (gid.x - 1u)] : 0.f;
+    float vp = (gid.x + 1u < p.w) ? img[gid.y * p.w + (gid.x + 1u)] : 0.f;
+    out[gid.y * p.w + gid.x] = -vm + vp;
+}
+
+// compute_sobel_grady: out = -I[y-1,x] + I[y+1,x], OOB → 0
+kernel void align_sobel_y(device const float* img [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant AlignImgParams& p [[buffer(2)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    float vm = (gid.y >= 1u) ? img[(gid.y - 1u) * p.w + gid.x] : 0.f;
+    float vp = (gid.y + 1u < p.h) ? img[(gid.y + 1u) * p.w + gid.x] : 0.f;
+    out[gid.y * p.w + gid.x] = -vm + vp;
+}
+
+struct AlignHessParams {
+    uint h, w, ny, nx, ts;
+    uint _pad0, _pad1, _pad2;
+};
+
+// compute_hessian: one thread per tile → hess[ty,tx] = Σ [gx², gx·gy, gx·gy, gy²]
+kernel void align_hessian(device const float* gx [[buffer(0)]],
+                          device const float* gy [[buffer(1)]],
+                          device float* hess [[buffer(2)]],
+                          constant AlignHessParams& p [[buffer(3)]],
+                          uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.ny * p.nx) return;
+    uint ty = tid / p.nx;
+    uint tx = tid - ty * p.nx;
+    uint oy = ty * p.ts;
+    uint ox = tx * p.ts;
+    float h00 = 0.f, h01 = 0.f, h11 = 0.f;
+    for (uint i = 0u; i < p.ts; ++i) {
+        uint py = oy + i;
+        if (py >= p.h) break;
+        for (uint j = 0u; j < p.ts; ++j) {
+            uint px = ox + j;
+            if (px >= p.w) break;
+            uint idx = py * p.w + px;
+            float gxv = gx[idx];
+            float gyv = gy[idx];
+            h00 += gxv * gxv;
+            h01 += gxv * gyv;
+            h11 += gyv * gyv;
+        }
+    }
+    uint o = tid * 4u;
+    hess[o + 0u] = h00;
+    hess[o + 1u] = h01;
+    hess[o + 2u] = h01;
+    hess[o + 3u] = h11;
+}
+
+struct AlignUpscaleParams {
+    uint in_ny, in_nx;
+    uint target_ny, target_nx;
+    uint upsample_factor, repeat_factor;
+    uint up_ny, up_nx;
+};
+
+// upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
+kernel void align_upscale_flow(device const float* in_flow [[buffer(0)]],
+                               device float* out_flow [[buffer(1)]],
+                               constant AlignUpscaleParams& p [[buffer(2)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.target_nx || gid.y >= p.target_ny) return;
+    uint o = (gid.y * p.target_nx + gid.x) * 2u;
+    if (gid.y < p.up_ny && gid.x < p.up_nx) {
+        uint sy = min(p.in_ny - 1u, gid.y / p.repeat_factor);
+        uint sx = min(p.in_nx - 1u, gid.x / p.repeat_factor);
+        uint s = (sy * p.in_nx + sx) * 2u;
+        float sfac = float(p.upsample_factor);
+        out_flow[o + 0u] = in_flow[s + 0u] * sfac;
+        out_flow[o + 1u] = in_flow[s + 1u] * sfac;
+    } else {
+        out_flow[o + 0u] = 0.f;
+        out_flow[o + 1u] = 0.f;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// merge normalize — 1:1 encode_band_rows num/den → RGB16 (DNG band)
+// ---------------------------------------------------------------------------
+struct MergeNormParams {
+    uint bh, Ws, nch, bake;
+    float wb0, wb1, wb2;
+    float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+};
+
+inline float norm_to_srgb(float v) {
+    v = clamp(v, 0.f, 1.f);
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * pow(v, 1.f / 2.4f) - 0.055f;
+}
+
+kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
+                                  device const float* den [[buffer(1)]],
+                                  device ushort* out [[buffer(2)]],
+                                  constant MergeNormParams& p [[buffer(3)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.Ws || gid.y >= p.bh) return;
+    uint pi = (gid.y * p.Ws + gid.x) * p.nch;
+    float d0 = den[pi];
+    float cn0 = (d0 > 0.f) ? num[pi] / d0 : 0.f;
+    float cn1 = 0.f, cn2 = 0.f;
+    if (p.nch >= 2u) {
+        float d1 = den[pi + 1u];
+        cn1 = (d1 > 0.f) ? num[pi + 1u] / d1 : 0.f;
+    }
+    if (p.nch >= 3u) {
+        float d2 = den[pi + 2u];
+        cn2 = (d2 > 0.f) ? num[pi + 2u] / d2 : 0.f;
+    }
+    float lin0, lin1, lin2;
+    if (p.bake != 0u && p.nch >= 3u) {
+        float wr = cn0 * p.wb0, wg = cn1 * p.wb1, wb = cn2 * p.wb2;
+        lin0 = p.m00 * wr + p.m01 * wg + p.m02 * wb;
+        lin1 = p.m10 * wr + p.m11 * wg + p.m12 * wb;
+        lin2 = p.m20 * wr + p.m21 * wg + p.m22 * wb;
+    } else if (p.nch >= 3u) {
+        lin0 = cn0; lin1 = cn1; lin2 = cn2;
+    } else {
+        lin0 = lin1 = lin2 = cn0;
+    }
+    float v0 = (p.bake != 0u) ? norm_to_srgb(lin0) : clamp(lin0, 0.f, 1.f);
+    float v1 = (p.bake != 0u) ? norm_to_srgb(lin1) : clamp(lin1, 0.f, 1.f);
+    float v2 = (p.bake != 0u) ? norm_to_srgb(lin2) : clamp(lin2, 0.f, 1.f);
+    uint o = (gid.y * p.Ws + gid.x) * 3u;
+    out[o + 0u] = ushort(v0 * 65535.f + 0.5f);
+    out[o + 1u] = ushort(v1 * 65535.f + 0.5f);
+    out[o + 2u] = ushort(v2 * 65535.f + 0.5f);
+}

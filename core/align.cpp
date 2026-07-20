@@ -575,6 +575,9 @@ static RefIcaBurstCache g_ref_ica_cache;
 
 void clear_align_ref_ica_cache() {
     g_ref_ica_cache = {};
+#ifdef __APPLE__
+    metal_clear_ref_ica_cache();
+#endif
 }
 
 // ============================================================================
@@ -586,6 +589,16 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     (void)ref_grey; // pyramid already built from padded ref
     int nlev = (int)ref_pyr.levels.size();
 
+#ifdef __APPLE__
+    // GPU: Sobel/Hessian + resident pyramid/BM/ICA/flow-upscale (1:1 CPU math).
+    {
+        FlowField flow_gpu;
+        if (align_metal(ref_pyr, moving_grey, cfg, tile_size, flow_gpu))
+            return flow_gpu;
+    }
+#endif
+
+    // CPU path: cache ref Sobel+Hessian across comparison frames.
     if (g_ref_ica_cache.key != (const void*)&ref_pyr ||
         (int)g_ref_ica_cache.levels.size() != nlev) {
         g_ref_ica_cache.key = (const void*)&ref_pyr;
@@ -600,23 +613,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             L.hess = compute_hessian(L.gx, L.gy, ts);
         }
     }
-
-#ifdef __APPLE__
-    // Resident moving pyramid + BM→ICA (same math as CPU path below).
-    {
-        std::vector<AlignIcaLevelHost> ica((size_t)nlev);
-        for (int lvl = 0; lvl < nlev; ++lvl) {
-            const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
-            ica[(size_t)lvl].gx = &L.gx;
-            ica[(size_t)lvl].gy = &L.gy;
-            ica[(size_t)lvl].hess = L.hess.data.data();
-            ica[(size_t)lvl].hess_floats = L.hess.data.size();
-        }
-        FlowField flow_gpu;
-        if (align_metal(ref_pyr, moving_grey, ica, cfg, tile_size, flow_gpu))
-            return flow_gpu;
-    }
-#endif
 
     // Moving: unpadded grey → pyramid (matches Python align())
     Pyramid mov_pyr = build_pyramid(moving_grey, cfg.bm_factors);
