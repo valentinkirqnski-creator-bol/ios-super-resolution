@@ -14,28 +14,51 @@ struct KernelParams {
     int iso_kernel;
 };
 
-inline void eigen_elmts_2x2(float a, float b, float c, float d,
-                            thread float2& l, thread float2& e1, thread float2& e2) {
-    float tr = a + d;
-    float det = a * d - b * c;
-    float delta = sqrt(max(tr * tr - 4.0f * det, 0.0f));
-
-    l.x = 0.5f * (tr + delta);
-    l.y = 0.5f * (tr - delta);
-
-    if (abs(b) > 1e-6f) {
-        float norm1 = sqrt(b * b + (l.x - a) * (l.x - a));
-        e1 = float2(b, l.x - a) / norm1;
-        float norm2 = sqrt(b * b + (l.y - a) * (l.y - a));
-        e2 = float2(b, l.y - a) / norm2;
-    } else if (abs(c) > 1e-6f) {
-        float norm1 = sqrt((l.x - d) * (l.x - d) + c * c);
-        e1 = float2(l.x - d, c) / norm1;
-        float norm2 = sqrt((l.y - d) * (l.y - d) + c * c);
-        e2 = float2(l.y - d, c) / norm2;
+// Matches core/linalg.h and Python get_eigen_elmts_2x2.
+inline void real_polyroots_2(float a, float b, float c, thread float roots[2]) {
+    float delta = max(b * b - 4.0f * a * c, 0.0f);
+    float s = sqrt(delta);
+    float r1 = (-b + s) / (2.0f * a);
+    float r2 = (-b - s) / (2.0f * a);
+    if (abs(r1) >= abs(r2)) {
+        roots[0] = r1;
+        roots[1] = r2;
     } else {
+        roots[0] = r2;
+        roots[1] = r1;
+    }
+}
+
+inline void eigen_val_2x2(float m00, float m01, float m10, float m11, thread float l[2]) {
+    float b = -(m00 + m11);
+    float c = m00 * m11 - m01 * m10;
+    real_polyroots_2(1.0f, b, c, l);
+}
+
+inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
+                            thread float l[2], thread float2& e1, thread float2& e2) {
+    eigen_val_2x2(m00, m01, m10, m11, l);
+
+    if (m01 == 0.0f && m00 == m11) {
         e1 = float2(1.0f, 0.0f);
         e2 = float2(0.0f, 1.0f);
+        return;
+    }
+
+    float v1x = m00 + m01 - l[1];
+    float v1y = m10 + m11 - l[1];
+
+    if (v1x == 0.0f) {
+        e1 = float2(0.0f, 1.0f);
+        e2 = float2(1.0f, 0.0f);
+    } else if (v1y == 0.0f) {
+        e1 = float2(1.0f, 0.0f);
+        e2 = float2(0.0f, 1.0f);
+    } else {
+        float norm = sqrt(v1x * v1x + v1y * v1y);
+        e1 = float2(v1x / norm, v1y / norm);
+        float sign = copysign(1.0f, e1.x);
+        e2 = float2(-e1.y * sign, abs(e1.x));
     }
 }
 
@@ -66,7 +89,8 @@ kernel void kernel_compute_covariances(
         }
     }
 
-    float2 l, e1, e2;
+    float l[2];
+    float2 e1, e2;
     eigen_elmts_2x2(s00, s01, s01, s11, l, e1, e2);
 
     float k1, k2;
@@ -74,9 +98,11 @@ kernel void kernel_compute_covariances(
         k1 = params.k_detail;
         k2 = params.k_detail;
     } else {
-        float sum = l.x + l.y;
-        float A = 1.0f + sqrt(max((l.x - l.y) / (sum == 0.0f ? 1e-12f : sum), 0.0f));
-        float D = clamp(1.0f - sqrt(max(l.x, 0.0f)) / params.D_tr + params.D_th, 0.0f, 1.0f);
+        float l1 = l[0];
+        float l2 = l[1];
+        float sum = l1 + l2;
+        float A = 1.0f + sqrt(max((l1 - l2) / (sum == 0.0f ? 1e-12f : sum), 0.0f));
+        float D = clamp(1.0f - sqrt(max(l1, 0.0f)) / params.D_tr + params.D_th, 0.0f, 1.0f);
 
         float kk1, kk2;
         if (params.selection_law == 1) {

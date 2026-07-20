@@ -60,6 +60,12 @@ FlowField upscale_alignment_flow(const FlowField& in, int target_ny, int target_
                                  int prev_tile_size);
 
 // ---- robustness.cpp -----------------------------------------------------
+struct NoiseCurves {
+    std::vector<f32> std_curve;
+    std::vector<f32> diff_curve;
+};
+NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta);
+
 struct RefStats { Image means; Image stds; }; // raw resolution [h, w, ch]
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 

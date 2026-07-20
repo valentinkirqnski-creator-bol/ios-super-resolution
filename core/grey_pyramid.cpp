@@ -105,32 +105,33 @@ void fftshift2d(std::vector<std::complex<f32>>& data, int h, int w) {
 }
 
 // Alg. 3 FFT grey — matches utils_image.compute_grey_images(method="FFT").
+// Python: fft2 on original (h,w), fftshift, zero outer quarter bands, ifft2, .real
 Image compute_grey_fft(const Image& raw) {
     const int h = raw.h, w = raw.w;
-    const int ph = next_pow2(h), pw = next_pow2(w);
-    std::vector<std::complex<f32>> buf((size_t)ph * pw, {0.f, 0.f});
+    std::vector<std::complex<f32>> buf((size_t)h * w);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            buf[(size_t)y * pw + x] = {raw.at(y, x), 0.f};
+            buf[(size_t)y * w + x] = {raw.at(y, x), 0.f};
 
-    fft2d(buf, ph, pw, false);
-    fftshift2d(buf, ph, pw);
+    fft2d(buf, h, w, false);
+    fftshift2d(buf, h, w);
 
-    const int y0 = ph / 4, x0 = pw / 4;
-    for (int y = 0; y < ph; ++y) {
-        for (int x = 0; x < pw; ++x) {
-            if (y < y0 || y >= ph - y0 || x < x0 || x >= pw - x0)
-                buf[(size_t)y * pw + x] = {0.f, 0.f};
+    const int y_cut = h / 4;
+    const int x_cut = w / 4;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (y < y_cut || y >= h - y_cut || x < x_cut || x >= w - x_cut)
+                buf[(size_t)y * w + x] = {0.f, 0.f};
         }
     }
 
-    fftshift2d(buf, ph, pw);
-    fft2d(buf, ph, pw, true);
+    fftshift2d(buf, h, w);
+    fft2d(buf, h, w, true);
 
     Image grey(h, w, 1);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            grey.at(y, x) = buf[(size_t)y * pw + x].real();
+            grey.at(y, x) = buf[(size_t)y * w + x].real();
     return grey;
 }
 

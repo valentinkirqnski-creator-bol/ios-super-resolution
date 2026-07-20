@@ -1,4 +1,4 @@
-// Disk-backed Metal pipeline: align, robustness, merge on GPU with CPU fallback.
+// Disk-backed Metal pipeline: CPU alignment (Python parity), GPU robustness/kernels/merge.
 #include "MetalContext.h"
 #include "../stages.h"
 #include "../pipeline.h"
@@ -17,12 +17,6 @@ namespace fs = std::filesystem;
 
 namespace hhsr {
 
-struct NoiseCurves {
-    std::vector<f32> std_curve;
-    std::vector<f32> diff_curve;
-};
-NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta);
-
 #ifdef __OBJC__
 
 namespace {
@@ -33,7 +27,6 @@ static const std::vector<std::string> kRequiredKernels = {
     "kernel_local_stats_3x3", "kernel_upscale_warp_stats", "kernel_build_dp_guide",
     "kernel_apply_noise_model", "kernel_compute_flow_S", "kernel_robustness_threshold",
     "kernel_local_min_5x5", "kernel_compute_covariances",
-    "kernel_block_match_L1", "kernel_compute_sobel", "kernel_ica_refine",
     "kernel_accumulate_comp_band", "kernel_accumulate_ref_band"
 };
 
@@ -182,7 +175,6 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 struct RefGpuState {
     id<MTLTexture> raw;
     Pyramid ref_pyr;
-    std::vector<id<MTLBuffer>> ref_hess_buf;
     id<MTLTexture> guide;
     id<MTLTexture> means_guide;
     id<MTLTexture> vars_guide;
@@ -315,124 +307,6 @@ static bool estimate_covs_from_raw_metal(id<MTLTexture> raw, bool bayer_mode, f3
     return compute_covs_metal(grey, grad, covs_out, k_params_buf, ctx);
 }
 
-static std::vector<id<MTLBuffer>> precompute_ref_hessian_bufs(
-    const Pyramid& ref_pyr, const Config& cfg, int tile_size, MetalContext& ctx) {
-    std::vector<id<MTLBuffer>> hess_bufs;
-    hess_bufs.reserve(ref_pyr.levels.size());
-    for (size_t lvl = 0; lvl < ref_pyr.levels.size(); ++lvl) {
-        const Image& r = ref_pyr.levels[lvl];
-        int ts = (lvl < cfg.bm_tile_sizes.size()) ? std::max(4, cfg.bm_tile_sizes[lvl])
-                                                  : std::max(4, tile_size);
-        int ny = std::max(1, r.h / ts);
-        int nx = std::max(1, r.w / ts);
-        Image gx = compute_sobel_gradx(r);
-        Image gy = compute_sobel_grady(r);
-        std::vector<f32> hess;
-        compute_hessian_inverse(r, gx, gy, ts, ny, nx, hess);
-        id<MTLBuffer> buf = [ctx.device() newBufferWithBytes:hess.data()
-                                                      length:hess.size() * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-        hess_bufs.push_back(buf);
-    }
-    return hess_bufs;
-}
-
-static FlowField align_hybrid(const Pyramid& ref_pyr,
-                              const std::vector<id<MTLBuffer>>& ref_hess_buf,
-                              const Pyramid& mov_pyr,
-                              const Config& cfg, int tile_size, MetalContext& ctx) {
-    int nlev = (int)ref_pyr.levels.size();
-    FlowField flow_cpu;
-    for (int lvl = nlev - 1; lvl >= 0; --lvl) {
-        const Image& r = ref_pyr.levels[lvl];
-        const Image& m = mov_pyr.levels[lvl];
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? std::max(4, cfg.bm_tile_sizes[lvl])
-                                                       : std::max(4, tile_size);
-        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
-        int ny = std::max(1, r.h / ts);
-        int nx = std::max(1, r.w / ts);
-
-        if (flow_cpu.nx == 0) {
-            flow_cpu = FlowField(ny, nx);
-        } else {
-            int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size()) ? cfg.bm_factors[lvl + 1] : 1;
-            int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl + 1] : ts;
-            flow_cpu = upscale_alignment_flow(flow_cpu, ny, nx, upsample_factor, ts, prev_ts);
-        }
-
-        std::string metric = (lvl < (int)cfg.bm_metrics.size()) ? cfg.bm_metrics[lvl] : "L2";
-        if (metric == "L1") {
-            id<MTLTexture> r_tex = ctx.create_texture(r);
-            id<MTLTexture> m_tex = ctx.create_texture(m);
-            id<MTLTexture> flow = ctx.create_texture_from_flow(flow_cpu);
-            id<MTLTexture> out_bm = ctx.create_empty_texture(nx, ny, 2, true);
-            id<MTLComputePipelineState> pso_bm = ctx.get_pipeline_state("kernel_block_match_L1");
-            struct { int ts; int search_radius; } p_bm = { ts, radius };
-            id<MTLBuffer> bm_buf = [ctx.device() newBufferWithBytes:&p_bm length:sizeof(p_bm)
-                                                            options:MTLResourceStorageModeShared];
-            id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            if (!begin_kernel(enc, pso_bm) || !r_tex || !m_tex || !flow || !out_bm) return FlowField();
-            [enc setTexture:r_tex atIndex:0];
-            [enc setTexture:m_tex atIndex:1];
-            [enc setTexture:flow atIndex:2];
-            [enc setTexture:out_bm atIndex:3];
-            [enc setBuffer:bm_buf offset:0 atIndex:0];
-            dispatch_kernel(enc, nx, ny);
-            [enc endEncoding];
-            if (!run_cmd(cmd)) return FlowField();
-            ctx.read_flow_texture(out_bm, flow_cpu);
-        } else {
-            block_match_level_L2(r, m, ts, radius, flow_cpu, cfg.num_threads);
-        }
-
-        id<MTLTexture> r_tex = ctx.create_texture(r);
-        id<MTLTexture> m_tex = ctx.create_texture(m);
-        id<MTLTexture> flow = ctx.create_texture_from_flow(flow_cpu);
-        id<MTLTexture> gx = ctx.create_empty_texture(r.w, r.h, 1, true);
-        id<MTLTexture> gy = ctx.create_empty_texture(r.w, r.h, 1, true);
-        id<MTLComputePipelineState> pso_sobel = ctx.get_pipeline_state("kernel_compute_sobel");
-        {
-            id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            if (!begin_kernel(enc, pso_sobel) || !r_tex || !m_tex || !flow || !gx || !gy) return FlowField();
-            [enc setTexture:r_tex atIndex:0];
-            [enc setTexture:gx atIndex:1];
-            [enc setTexture:gy atIndex:2];
-            dispatch_kernel(enc, r.w, r.h);
-            [enc endEncoding];
-            if (!run_cmd(cmd)) return FlowField();
-        }
-
-        id<MTLTexture> out_ica = ctx.create_empty_texture(nx, ny, 2, false);
-        struct { int ts; int n_iter; int img_w; int img_h; } p_ica = {
-            ts, cfg.ica_n_iter, r.w, r.h
-        };
-        id<MTLBuffer> ica_buf = [ctx.device() newBufferWithBytes:&p_ica length:sizeof(p_ica)
-                                                         options:MTLResourceStorageModeShared];
-        id<MTLComputePipelineState> pso_ica = ctx.get_pipeline_state("kernel_ica_refine");
-        id<MTLBuffer> hess_buf = (lvl < (int)ref_hess_buf.size()) ? ref_hess_buf[lvl] : nil;
-        {
-            id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            if (!begin_kernel(enc, pso_ica) || !hess_buf) return FlowField();
-            [enc setTexture:r_tex atIndex:0];
-            [enc setTexture:gx atIndex:1];
-            [enc setTexture:gy atIndex:2];
-            [enc setTexture:m_tex atIndex:3];
-            [enc setTexture:flow atIndex:4];
-            [enc setTexture:out_ica atIndex:5];
-            [enc setBuffer:hess_buf offset:0 atIndex:0];
-            [enc setBuffer:ica_buf offset:0 atIndex:1];
-            dispatch_kernel(enc, nx, ny);
-            [enc endEncoding];
-            if (!run_cmd(cmd)) return FlowField();
-        }
-        ctx.read_flow_texture(out_ica, flow_cpu);
-    }
-    return flow_cpu;
-}
-
 static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, int tile_size,
                          RefGpuState& ref, id<MTLBuffer> guide_buf, id<MTLBuffer> k_params_buf,
                          MetalContext& ctx) {
@@ -440,9 +314,6 @@ static bool init_ref_gpu(const Image& ref_raw, const Config& cfg, int tile_size,
     ref_grey = pad_grey_circular(ref_grey, tile_size);
     ref.ref_pyr = build_pyramid(ref_grey, cfg.bm_factors);
     if (ref.ref_pyr.levels.empty()) return false;
-
-    ref.ref_hess_buf = precompute_ref_hessian_bufs(ref.ref_pyr, cfg, tile_size, ctx);
-    if (ref.ref_hess_buf.size() != ref.ref_pyr.levels.size()) return false;
 
     ref.raw = ctx.create_texture(ref_raw);
     if (!ref.raw) return false;
@@ -745,7 +616,7 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
 
     int n_comp_ok = 0;
     for (int k = 1; k < n; ++k) {
-        report("Frame " + std::to_string(k + 1) + ": GPU analyze",
+        report("Frame " + std::to_string(k + 1) + ": CPU align + GPU robustness/kernels",
                0.08f + 0.35f * (float)(k - 1) / std::max(1, n - 1));
 
         Image comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
@@ -755,11 +626,8 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
         if (!comp_raw) continue;
 
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
-        Pyramid comp_pyr = build_pyramid(comp_grey, work.bm_factors);
-        if (comp_pyr.levels.empty()) continue;
-
-        FlowField flow = align_hybrid(ref_gpu.ref_pyr, ref_gpu.ref_hess_buf, comp_pyr,
-                                      work, tile_size, ctx);
+        FlowField flow = align(ref_gpu.ref_pyr, ref_gpu.ref_pyr.levels[0], comp_grey,
+                               work, tile_size);
         if (flow.nx <= 0) continue;
         id<MTLTexture> flow_tex = ctx.create_texture_from_flow(flow);
         if (!flow_tex) continue;
@@ -800,7 +668,6 @@ bool try_process_burst_paths_metal(const std::vector<std::string>& paths, const 
     }
 
     ref_gpu.ref_pyr = Pyramid();
-    ref_gpu.ref_hess_buf.clear();
 
     if (n_comp_ok < 1) {
         fs::remove_all(cache, ec);

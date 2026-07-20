@@ -5,6 +5,7 @@
 #include "dng_writer.h"
 #include "snr_tuning.h"
 #include "raw_io.h"
+#include "metal/MetalContext.h"
 #include "parallel.h"
 #include <vector>
 #include <array>
@@ -204,6 +205,13 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
+
+    if (work.use_metal) {
+        Image metal_preview;
+        if (try_process_burst_paths_metal(paths, work, dng_path, progress, maxPreviewDim, metal_preview))
+            return metal_preview;
+        report("Metal unavailable, using CPU", 0.03f);
+    }
 
     report("Loading reference frame", 0.02f);
     Image ref = load_raw_frame(paths[0], work, true);

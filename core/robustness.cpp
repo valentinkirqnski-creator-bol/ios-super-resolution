@@ -336,4 +336,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     return local_min_5x5(R);
 }
 
+NoiseCurves make_noise_curves_cpu(f32 alpha, f32 beta) {
+    return make_noise_curves(alpha, beta);
+}
+
 } // namespace hhsr

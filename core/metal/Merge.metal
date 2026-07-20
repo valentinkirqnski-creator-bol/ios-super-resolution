@@ -79,9 +79,8 @@ kernel void kernel_accumulate_comp(
     float2 flow = flowTex.read(uint2(tpx, tpy)).rg;
     float flowx = flow.x, flowy = flow.y;
     
-    float rob_scale = (params.bayer_mode == 1) ? 0.5f : 1.0f;
-    int i_r = min((int)(lr_y * rob_scale), (int)robTex.get_height() - 1);
-    int j_r = min((int)(lr_x * rob_scale), (int)robTex.get_width() - 1);
+    int i_r = min((int)lr_y, (int)robTex.get_height() - 1);
+    int j_r = min((int)lr_x, (int)robTex.get_width() - 1);
     float local_r = robTex.read(uint2(j_r, i_r)).r;
     
     float lr_mov_x = lr_x + flowx;
@@ -190,13 +189,13 @@ kernel void kernel_accumulate_ref(
     
     float additional_denoise_power = 1.0f;
     int rad = 1;
+    float local_acc_r = 0.0f;
     
     if (params.acc_rob_enabled == 1) {
-        float rob_scale = (params.bayer_mode == 1) ? 0.5f : 1.0f;
-        int ay = min((int)round(coarse_y * rob_scale), (int)accRobTex.get_height() - 1);
-        int ax = min((int)round(coarse_x * rob_scale), (int)accRobTex.get_width() - 1);
+        int ay = min((int)round(coarse_y), (int)accRobTex.get_height() - 1);
+        int ax = min((int)round(coarse_x), (int)accRobTex.get_width() - 1);
         
-        float local_acc_r = accRobTex.read(uint2(max(0, ax), max(0, ay))).r;
+        local_acc_r = accRobTex.read(uint2(max(0, ax), max(0, ay))).r;
         if (local_acc_r <= params.max_frame_count) {
             additional_denoise_power = params.max_multiplier;
             rad = params.rad_max;
@@ -210,8 +209,8 @@ kernel void kernel_accumulate_ref(
             kmap_j = coarse_x / 2.0f - 0.5f;
             kmap_i = coarse_y / 2.0f - 0.5f;
         } else {
-            kmap_j = coarse_x;
-            kmap_i = coarse_y;
+            kmap_j = coarse_x - 0.5f;
+            kmap_i = coarse_y - 0.5f;
         }
         interp_inv_cov(covTex, kmap_i, kmap_j, ixx, ixy, iyy);
     }
@@ -261,9 +260,14 @@ kernel void kernel_accumulate_ref(
     
     float4 prev_num = numTex.read(gid);
     float4 prev_den = denTex.read(gid);
-    
-    numTex.write(prev_num + float4(val.x, val.y, val.z, 0), gid);
-    denTex.write(prev_den + float4(acc.x, acc.y, acc.z, 0), gid);
+    float4 out_num = prev_num + float4(val.x, val.y, val.z, 0);
+    float4 out_den = prev_den + float4(acc.x, acc.y, acc.z, 0);
+    if (params.acc_rob_enabled == 1 && local_acc_r < params.max_frame_count) {
+        out_num = float4(val.x, val.y, val.z, 0);
+        out_den = float4(acc.x, acc.y, acc.z, 0);
+    }
+    numTex.write(out_num, gid);
+    denTex.write(out_den, gid);
 }
 
 // Normalize and Bayer Demosaic (Simple fallback or exactly matching CPU?)
@@ -314,9 +318,8 @@ kernel void kernel_accumulate_comp_band(
     float2 flow = flowTex.read(uint2(tpx, tpy)).rg;
     float flowx = flow.x, flowy = flow.y;
 
-    float rob_scale = (params.bayer_mode == 1) ? 0.5f : 1.0f;
-    int i_r = min((int)(lr_y * rob_scale), (int)robTex.get_height() - 1);
-    int j_r = min((int)(lr_x * rob_scale), (int)robTex.get_width() - 1);
+    int i_r = min((int)lr_y, (int)robTex.get_height() - 1);
+    int j_r = min((int)lr_x, (int)robTex.get_width() - 1);
     float local_r = robTex.read(uint2(j_r, i_r)).r;
 
     float lr_mov_x = lr_x + flowx;
@@ -334,16 +337,16 @@ kernel void kernel_accumulate_comp_band(
             kmap_j = lr_mov_x / 2.0f - 0.5f;
             kmap_i = lr_mov_y / 2.0f - 0.5f;
         } else {
-            kmap_j = lr_mov_x;
-            kmap_i = lr_mov_y;
+            kmap_j = lr_mov_x - 0.5f;
+            kmap_i = lr_mov_y - 0.5f;
         }
         interp_inv_cov(covTex, kmap_i, kmap_j, ixx, ixy, iyy);
     }
 
     int center_j = (int)lr_mov_x;
     int center_i = (int)lr_mov_y;
-    float lr_mov_j = lr_mov_x;
-    float lr_mov_i = lr_mov_y;
+    float lr_mov_j = lr_mov_x - 0.5f;
+    float lr_mov_i = lr_mov_y - 0.5f;
 
     float3 val = float3(0.0f);
     float3 acc = float3(0.0f);
@@ -412,10 +415,9 @@ kernel void kernel_accumulate_ref_band(
     int rad = 1;
     float local_acc_r = 0.0f;
 
-    if (params.acc_rob_enabled == 1 && accRobTex.get_width() > 1) {
-        float rob_scale = (params.bayer_mode == 1) ? 0.5f : 1.0f;
-        int ay = min((int)round(coarse_y * rob_scale), (int)accRobTex.get_height() - 1);
-        int ax = min((int)round(coarse_x * rob_scale), (int)accRobTex.get_width() - 1);
+    if (params.acc_rob_enabled == 1) {
+        int ay = min((int)round(coarse_y), (int)accRobTex.get_height() - 1);
+        int ax = min((int)round(coarse_x), (int)accRobTex.get_width() - 1);
 
         local_acc_r = accRobTex.read(uint2(max(0, ax), max(0, ay))).r;
         if (local_acc_r <= params.max_frame_count) {
@@ -439,8 +441,8 @@ kernel void kernel_accumulate_ref_band(
 
     int center_j = python_round(coarse_x);
     int center_i = python_round(coarse_y);
-    float coarse_j = coarse_x - 0.5f;
-    float coarse_i = coarse_y - 0.5f;
+    float coarse_j = coarse_x;
+    float coarse_i = coarse_y;
 
     float3 val = float3(0.0f);
     float3 acc = float3(0.0f);

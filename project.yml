@@ -49,6 +49,10 @@ targets:
           - "raw_io.cpp"
           - "dng_writer.cpp"
           - "snr_tuning.cpp"
+      - path: core/metal
+        includes:
+          - "**/*.mm"
+          - "**/*.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.
@@ -58,6 +62,8 @@ targets:
         excludes:
           - "**/*_ph.cpp"
         optional: true
+    dependencies:
+      - sdk: Metal.framework
     info:
       path: Sources/Info.plist
       properties:
