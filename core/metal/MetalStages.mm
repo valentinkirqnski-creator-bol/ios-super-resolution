@@ -480,6 +480,9 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         if (!run_cmd(cmd)) return false;
     }
     {
+        int num_channels = cfg.bayer_mode ? 3 : 1;
+        id<MTLBuffer> nc_buf = [ctx.device() newBufferWithBytes:&num_channels length:sizeof(num_channels)
+                                                        options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!begin_kernel(enc, pso_noise)) return false;
@@ -490,6 +493,7 @@ static bool compute_robustness_metal(id<MTLTexture> comp_raw, id<MTLTexture> flo
         [enc setTexture:sigma_sq atIndex:4];
         [enc setBuffer:std_buf offset:0 atIndex:0];
         [enc setBuffer:diff_buf offset:0 atIndex:1];
+        [enc setBuffer:nc_buf offset:0 atIndex:2];
         dispatch_kernel(enc, raw_w, raw_h);
         [enc endEncoding];
         if (!run_cmd(cmd)) return false;

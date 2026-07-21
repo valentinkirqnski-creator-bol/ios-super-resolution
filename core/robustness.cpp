@@ -2,6 +2,7 @@
 #include "parallel.h"
 #include <random>
 #include <cmath>
+#include <limits>
 
 namespace hhsr {
 
@@ -19,11 +20,6 @@ static int bayer_upscale_factor(const Image& guide_stats, int raw_h, int raw_w) 
     return 1;
 }
 
-struct NoiseCurves {
-    std::vector<f32> std_curve;
-    std::vector<f32> diff_curve;
-};
-
 static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32& xmax) {
     f32 tol_sq = tol * tol;
     xmin = tol_sq / 2.f * (alpha + std::sqrt(tol_sq * alpha * alpha + 4.f * beta));
@@ -32,7 +28,7 @@ static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32
 }
 
 static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean) {
-    const int n_patches = 10000; // 10k is plenty for stable curves and very fast
+    const int n_patches = 100000; // matches Python fast_monte_carlo.n_patches
     f32 scale = std::sqrt(std::max(0.f, alpha * b + beta));
     
     std::mt19937 gen(1337 + (int)(b * 1000)); 
@@ -91,21 +87,23 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     });
 
     if (imin < imax && imin <= 1000 && imax >= 0) {
+        // Matches fast_monte_carlo.interp_MC: normalize using brightness endpoints
+        // brigntess[imin-1] .. brigntess[imax+1], overwrite indices imin..imax.
         f32 s_min = nc.std_curve[imin];
         f32 s_max = nc.std_curve[imax];
         f32 d_min = nc.diff_curve[imin];
         f32 d_max = nc.diff_curve[imax];
-        f32 b_min = imin / 1000.f;
-        f32 b_max = imax / 1000.f;
+        f32 b_lo = (imin - 1) / 1000.f;
+        f32 b_hi = (imax + 1) / 1000.f;
+        f32 b_span = std::max(1e-6f, b_hi - b_lo);
 
         f32 s2_min = s_min * s_min;
         f32 s2_max = s_max * s_max;
         f32 d2_min = d_min * d_min;
         f32 d2_max = d_max * d_max;
 
-        for (int i = imin + 1; i < imax; ++i) {
-            f32 b = i / 1000.f;
-            f32 norm_b = (b - b_min) / std::max(1e-6f, b_max - b_min);
+        for (int i = imin; i <= imax; ++i) {
+            f32 norm_b = (i / 1000.f - b_lo) / b_span;
             f32 s2 = norm_b * (s2_max - s2_min) + s2_min;
             f32 d2 = norm_b * (d2_max - d2_min) + d2_min;
             nc.std_curve[i] = std::sqrt(std::max(0.f, s2));
@@ -167,9 +165,9 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
-        return 1e30f;
-    int center_y = (int)std::nearbyint(LR_y);
-    int center_x = (int)std::nearbyint(LR_x);
+        return std::numeric_limits<f32>::infinity();
+    int center_y = (int)std::round(LR_y);
+    int center_x = (int)std::round(LR_x);
     f32 w_acc = 0.f, buf = 0.f;
     for (int i = -1; i <= 1; ++i) {
         int y_ = (int)clampf((f32)(center_y + i), 0.f, (f32)(stats.h - 1));
@@ -183,13 +181,14 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
             w_acc += w;
         }
     }
-    return (w_acc > 1e-12f) ? buf / w_acc : 1e30f;
+    return (w_acc > 1e-12f) ? buf / w_acc : std::numeric_limits<f32>::infinity();
 }
 
 static Image upscale_warp_stats(const Image& guide_stats, int raw_h, int raw_w,
                                 bool is_ref, const FlowField* flow, int tile_size,
                                 int num_threads) {
     const int nc = guide_stats.c;
+    // Python cuda_uspcale_dogson hardcodes s=2 (Bayer path); mono uses upscale=1.
     const int s = bayer_upscale_factor(guide_stats, raw_h, raw_w);
     Image out(raw_h, raw_w, nc);
 
@@ -197,17 +196,24 @@ static Image upscale_warp_stats(const Image& guide_stats, int raw_h, int raw_w,
         for (int x = 0; x < raw_w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
             if (!is_ref && flow) {
-                int patch_idy = std::min(y / tile_size, flow->ny - 1);
-                int patch_idx = std::min(x / tile_size, flow->nx - 1);
+                // Flow is defined on the raw image basis (Python robustness.py).
+                int patch_idy = y / tile_size;
+                int patch_idx = x / tile_size;
                 flow_x = flow->dx(patch_idy, patch_idx);
                 flow_y = flow->dy(patch_idy, patch_idx);
             }
             f32 LR_y = (y + flow_y + 0.5f) / (f32)s - 0.5f;
             f32 LR_x = (x + flow_x + 0.5f) / (f32)s - 0.5f;
-            for (int ch = 0; ch < nc; ++ch) {
-                f32 v = sample_dogson(guide_stats, LR_y, LR_x, ch);
-                out.at(y, x, ch) = v;
+
+            if (!(LR_y >= 0.f && LR_y < (f32)guide_stats.h &&
+                  LR_x >= 0.f && LR_x < (f32)guide_stats.w)) {
+                for (int ch = 0; ch < nc; ++ch)
+                    out.at(y, x, ch) = std::numeric_limits<f32>::infinity();
+                continue;
             }
+
+            for (int ch = 0; ch < nc; ++ch)
+                out.at(y, x, ch) = sample_dogson(guide_stats, LR_y, LR_x, ch);
         }
     });
     return out;
@@ -223,7 +229,7 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
             f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
             for (int ch = 0; ch < nc_ch; ++ch) {
                 f32 brightness = ref_means.at(y, x, ch);
-                int id_noise = (int)std::nearbyint(1000.f * brightness);
+                int id_noise = (int)std::round(1000.f * brightness);
                 id_noise = std::max(0, std::min(1000, id_noise));
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
@@ -241,10 +247,11 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 }
 
 static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2) {
+    const f32 inf = std::numeric_limits<f32>::infinity();
     std::vector<f32> S((size_t)flow.ny * flow.nx, s2);
     for (int ty = 0; ty < flow.ny; ++ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
-            f32 mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+            f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
             for (int i = -1; i <= 1; ++i) {
                 for (int j = -1; j <= 1; ++j) {
                     int yy = ty + i, xx = tx + j;
@@ -264,10 +271,11 @@ static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2)
 }
 
 static Image local_min_5x5(const Image& R) {
+    const f32 inf = std::numeric_limits<f32>::infinity();
     Image r(R.h, R.w, 1);
     for (int y = 0; y < R.h; ++y) {
         for (int x = 0; x < R.w; ++x) {
-            f32 mn = 1e30f;
+            f32 mn = inf;
             for (int i = -2; i <= 2; ++i) {
                 int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
                 for (int j = -2; j <= 2; ++j) {
@@ -326,8 +334,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image R(comp_raw.h, comp_raw.w, 1);
     for (int y = 0; y < comp_raw.h; ++y) {
         for (int x = 0; x < comp_raw.w; ++x) {
-            int patch_idy = std::min(y / tile_size, flow.ny - 1);
-            int patch_idx = std::min(x / tile_size, flow.nx - 1);
+            int patch_idy = y / tile_size;
+            int patch_idx = x / tile_size;
             f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
             f32 sig = sigma_sq.at(y, x);
             R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);

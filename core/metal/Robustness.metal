@@ -78,7 +78,7 @@ kernel void kernel_local_stats_3x3(
 
 inline float sample_dogson_ch(texture2d<float, access::read> tex, float LR_y, float LR_x, int ch) {
     if (LR_y < 0.0f || LR_y >= (float)tex.get_height() || LR_x < 0.0f || LR_x >= (float)tex.get_width())
-        return 1e30f;
+        return 1.0f / 0.0f;
 
     int center_y = (int)round(LR_y);
     int center_x = (int)round(LR_x);
@@ -100,7 +100,7 @@ inline float sample_dogson_ch(texture2d<float, access::read> tex, float LR_y, fl
             w_acc += w;
         }
     }
-    return (w_acc > 1e-12f) ? buf / w_acc : 1e30f;
+    return (w_acc > 1e-12f) ? buf / w_acc : (1.0f / 0.0f);
 }
 
 struct WarpStatsParams {
@@ -126,8 +126,8 @@ kernel void kernel_upscale_warp_stats(
     float flow_x = 0.0f;
     float flow_y = 0.0f;
     if (params.is_ref == 0) {
-        int patch_idy = min(y / params.tile_size, (int)flowTex.get_height() - 1);
-        int patch_idx = min(x / params.tile_size, (int)flowTex.get_width() - 1);
+        int patch_idy = y / params.tile_size;
+        int patch_idx = x / params.tile_size;
         float2 flow = flowTex.read(uint2(patch_idx, patch_idy)).rg;
         flow_x = flow.x;
         flow_y = flow.y;
@@ -135,6 +135,12 @@ kernel void kernel_upscale_warp_stats(
 
     float LR_y = (y + flow_y + 0.5f) / (float)params.upscale - 0.5f;
     float LR_x = (x + flow_x + 0.5f) / (float)params.upscale - 0.5f;
+
+    if (!(LR_y >= 0.0f && LR_y < (float)statsTex.get_height() &&
+          LR_x >= 0.0f && LR_x < (float)statsTex.get_width())) {
+        outTex.write(float4(1.0f / 0.0f, 1.0f / 0.0f, 1.0f / 0.0f, 1.0f), gid);
+        return;
+    }
 
     float3 out_v = float3(
         sample_dogson_ch(statsTex, LR_y, LR_x, 0),
@@ -173,6 +179,7 @@ kernel void kernel_apply_noise_model(
     constant float* diff_curve [[buffer(1)]],
     texture2d<float, access::write> d_sq_Tex [[texture(3)]],
     texture2d<float, access::write> sigma_sq_Tex [[texture(4)]],
+    constant int& num_channels [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= d_sq_Tex.get_width() || gid.y >= d_sq_Tex.get_height()) return;
@@ -184,7 +191,8 @@ kernel void kernel_apply_noise_model(
     float d_sq_acc = 0.0f;
     float sigma_sq_acc = 0.0f;
 
-    for (int c = 0; c < 3; ++c) {
+    int nc = max(num_channels, 1);
+    for (int c = 0; c < nc; ++c) {
         float brightness = ref_means[c];
         int id_noise = clamp((int)round(1000.0f * brightness), 0, 1000);
 
@@ -218,7 +226,7 @@ kernel void kernel_compute_flow_S(
 ) {
     if (gid.x >= flowTex.get_width() || gid.y >= flowTex.get_height()) return;
 
-    float mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+    float mnx = INFINITY, mny = INFINITY, mxx = -INFINITY, mxy = -INFINITY;
 
     for (int i = -1; i <= 1; ++i) {
         for (int j = -1; j <= 1; ++j) {
@@ -260,8 +268,8 @@ kernel void kernel_robustness_threshold(
     float d_sq = d_sq_Tex.read(gid).r;
     float sigma_sq = sigma_sq_Tex.read(gid).r;
 
-    int patch_idy = min((int)gid.y / params.tile_size, (int)sTex.get_height() - 1);
-    int patch_idx = min((int)gid.x / params.tile_size, (int)sTex.get_width() - 1);
+    int patch_idy = (int)gid.y / params.tile_size;
+    int patch_idx = (int)gid.x / params.tile_size;
 
     float s = sTex.read(uint2(patch_idx, patch_idy)).r;
     float R_val = clamp(s * exp(-d_sq / sigma_sq) - params.t, 0.0f, 1.0f);
@@ -275,7 +283,7 @@ kernel void kernel_local_min_5x5(
 ) {
     if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
 
-    float mn = 1e38f;
+    float mn = INFINITY;
     for (int i = -2; i <= 2; ++i) {
         int yy = clamp((int)gid.y + i, 0, (int)inTex.get_height() - 1);
         for (int j = -2; j <= 2; ++j) {
