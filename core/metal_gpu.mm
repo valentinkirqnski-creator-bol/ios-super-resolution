@@ -1686,9 +1686,9 @@ bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
     p.Ws = (uint32_t)Ws;
     p.nch = (uint32_t)nch;
     p.bake = (cfg.bake_srgb && nch >= 3) ? 1u : 0u;
-    p.wb0 = cfg.white_balance[0];
-    p.wb1 = cfg.white_balance[1];
-    p.wb2 = cfg.white_balance[2];
+    p.wb0 = cfg.raw_prewhitened ? 1.f : cfg.white_balance[0];
+    p.wb1 = cfg.raw_prewhitened ? 1.f : cfg.white_balance[1];
+    p.wb2 = cfg.raw_prewhitened ? 1.f : cfg.white_balance[2];
     const float* m = cfg.cam_to_srgb;
     p.m00 = m[0]; p.m01 = m[1]; p.m02 = m[2];
     p.m10 = m[3]; p.m11 = m[4]; p.m12 = m[5];

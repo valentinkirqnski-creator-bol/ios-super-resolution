@@ -118,7 +118,17 @@ struct Config {
     float k_shrink  = 2.0f;
 
     CFA cfa;
+    // Gains relative to green (cam_mul[c]/cam_mul[G]). Used by robustness guide
+    // to undo pre-pipeline WB (Python utils_dng / robustness.compute_guide).
     float white_balance[3] = {1.f, 1.f, 1.f};
+    // True after load_raw applies per-channel black + WB like Python utils_dng.
+    // Merge output is then already white-balanced — preview/bake/DNG AsShot must
+    // not apply those gains again (use 1,1,1 for display / private tag).
+    bool  raw_prewhitened = false;
+    // Ref-frame blacks (per color R,G,B) + white; reused for all burst frames.
+    bool  has_black_levels = false;
+    float black_levels[3] = {0.f, 0.f, 0.f};
+    float white_level = 0.f;
 
     int   orientation = 1;
     bool  has_color_matrix = false;

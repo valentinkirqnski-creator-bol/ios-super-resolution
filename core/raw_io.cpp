@@ -3,6 +3,10 @@
 #include <cmath>
 #include <algorithm>
 #include <memory>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+#include <cstdint>
 
 #ifdef HAVE_LIBRAW
 // LibRaw pulls in <windows.h> on Windows, which defines min/max macros that
@@ -51,8 +55,67 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed) {
 }
 
 #ifdef HAVE_LIBRAW
+
+// Best-effort DNG NoiseProfile (0xC61A) / 0xC761: average RGB α,β like Python.
+// iPhone / most DNGs are little-endian; BE files are skipped.
+static bool try_read_dng_noise_profile(const std::string& path, float& alpha, float& beta) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    uint8_t hdr[8];
+    if (std::fread(hdr, 1, 8, f) != 8) { std::fclose(f); return false; }
+    if (!(hdr[0] == 'I' && hdr[1] == 'I')) { std::fclose(f); return false; } // LE only
+    uint32_t ifd0 = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
+                    ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+
+    auto read_ifd = [&](uint32_t off, float& a_out, float& b_out) -> bool {
+        if (std::fseek(f, (long)off, SEEK_SET) != 0) return false;
+        uint16_t nent = 0;
+        if (std::fread(&nent, 2, 1, f) != 1) return false;
+        if (nent == 0 || nent > 512) return false;
+        for (uint16_t i = 0; i < nent; ++i) {
+            uint8_t e[12];
+            if (std::fread(e, 1, 12, f) != 12) return false;
+            uint16_t tag = (uint16_t)e[0] | ((uint16_t)e[1] << 8);
+            uint16_t typ = (uint16_t)e[2] | ((uint16_t)e[3] << 8);
+            uint32_t cnt = (uint32_t)e[4] | ((uint32_t)e[5] << 8) |
+                           ((uint32_t)e[6] << 16) | ((uint32_t)e[7] << 24);
+            uint32_t val = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                           ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+            // 0xC61A = NoiseProfile (DNG), 0xC761 = tag used by some stacks / exifread
+            if ((tag != 0xC61A && tag != 0xC761) || cnt < 2 || typ != 12) continue;
+            const long data_off = (cnt * 8u > 4u)
+                ? (long)val
+                : (long)(off + 2u + (uint32_t)i * 12u + 8u);
+            std::vector<double> doubles(cnt);
+            if (std::fseek(f, data_off, SEEK_SET) != 0) continue;
+            if (std::fread(doubles.data(), 8, cnt, f) != cnt) continue;
+            const uint32_t nplanes = cnt / 2u;
+            if (nplanes < 1) continue;
+            double sa = 0, sb = 0;
+            const uint32_t use = (nplanes >= 3) ? 3u : nplanes;
+            for (uint32_t p = 0; p < use; ++p) {
+                sa += doubles[2 * p + 0];
+                sb += doubles[2 * p + 1];
+            }
+            a_out = (float)(sa / (double)use);
+            b_out = (float)(sb / (double)use);
+            if (a_out > 0.f && std::isfinite(a_out) && std::isfinite(b_out))
+                return true;
+        }
+        return false;
+    };
+
+    float a = 0, b = 0;
+    bool ok = read_ifd(ifd0, a, b);
+    std::fclose(f);
+    if (!ok) return false;
+    alpha = a;
+    beta = b;
+    return true;
+}
+
 static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
-                             int crop_h, int crop_w) {
+                             int crop_h, int crop_w, const std::string& path) {
     Image img;
     if (raw.imgdata.rawdata.raw_image == nullptr) return img;
 
@@ -63,15 +126,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     int vw = S.width & ~1, vh = S.height & ~1;
     img = Image(vh, vw, 1);
 
-    float maxv = (float)C.maximum > 0 ? (float)C.maximum : 65535.f;
-    float black = (float)C.black;
-    float denom = std::max(1.f, maxv - black);
-    for (int y = 0; y < img.h; ++y)
-        for (int x = 0; x < img.w; ++x)
-            img.at(y, x) = clampf(
-                ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - black) / denom,
-                0.f, 1.f);
-
+    // Metadata first so CFA/WB exist for this frame (and for comps after ref).
     if (is_reference) {
         if (raw.imgdata.idata.make[0])
             cfg.camera_make = raw.imgdata.idata.make;
@@ -110,7 +165,80 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             case 6:  cfg.orientation = 6; break;
             default: cfg.orientation = 1; break;
         }
+        float na = 0.f, nb = 0.f;
+        if (try_read_dng_noise_profile(path, na, nb)) {
+            cfg.alpha = na;
+            cfg.beta = nb;
+        }
+
+        // Python: black_level_per_channel[R,G,B,(G2)]; index by CFA color.
+        float black_ch[4];
+        bool have_cblack = false;
+        for (int i = 0; i < 4; ++i) {
+            if (C.cblack[i] != 0) have_cblack = true;
+            black_ch[i] = (float)C.black + (float)C.cblack[i];
+        }
+        if (!have_cblack) {
+            for (int i = 0; i < 4; ++i) black_ch[i] = (float)C.black;
+        }
+        cfg.black_levels[0] = black_ch[0];
+        cfg.black_levels[1] = black_ch[1];
+        cfg.black_levels[2] = black_ch[2];
+        cfg.white_level = (float)C.maximum > 0 ? (float)C.maximum : 65535.f;
+        cfg.has_black_levels = true;
     }
+
+    // Python utils_dng: per-channel black, (v-black)/(white-black), then * (wb[c]/wb[G]).
+    float maxv = cfg.has_black_levels && cfg.white_level > 0.f
+        ? cfg.white_level
+        : ((float)C.maximum > 0 ? (float)C.maximum : 65535.f);
+    float bl_rgb[3];
+    if (cfg.has_black_levels) {
+        bl_rgb[0] = cfg.black_levels[0];
+        bl_rgb[1] = cfg.black_levels[1];
+        bl_rgb[2] = cfg.black_levels[2];
+    } else {
+        float black_ch[4];
+        bool have_cblack = false;
+        for (int i = 0; i < 4; ++i) {
+            if (C.cblack[i] != 0) have_cblack = true;
+            black_ch[i] = (float)C.black + (float)C.cblack[i];
+        }
+        if (!have_cblack) {
+            for (int i = 0; i < 4; ++i) black_ch[i] = (float)C.black;
+        }
+        bl_rgb[0] = black_ch[0];
+        bl_rgb[1] = black_ch[1];
+        bl_rgb[2] = black_ch[2];
+    }
+    float site_black[2][2];
+    float site_wb[2][2];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            int c = (int)cfg.cfa.p[i][j];
+            if (c < 0) c = 0;
+            if (c > 2) c = 1;
+            site_black[i][j] = bl_rgb[c];
+            float w = cfg.white_balance[c];
+            if (!(w > 0.f) || !std::isfinite(w)) w = 1.f;
+            site_wb[i][j] = w;
+        }
+    }
+
+    for (int y = 0; y < img.h; ++y) {
+        const int fi = y & 1;
+        for (int x = 0; x < img.w; ++x) {
+            const int fj = x & 1;
+            float bl = site_black[fi][fj];
+            float denom = std::max(1.f, maxv - bl);
+            // Match Python: no pre-WB clamp to 1 (WB may push highlights > 1).
+            float v = ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - bl) / denom;
+            v *= site_wb[fi][fj];
+            if (!std::isfinite(v) || v < 0.f) v = 0.f;
+            img.at(y, x) = v;
+        }
+    }
+    cfg.raw_prewhitened = true;
 
     if (cfg.input_crop_factor > 1) {
         const int factor = cfg.input_crop_factor;
@@ -148,7 +276,7 @@ Image load_raw_frame(const std::string& path, Config& cfg, bool is_reference,
     std::unique_ptr<LibRaw> raw(new LibRaw());
     if (raw->open_file(path.c_str()) != LIBRAW_SUCCESS) return Image();
     if (raw->unpack() != LIBRAW_SUCCESS) { raw->recycle(); return Image(); }
-    Image img = decode_raw_file(*raw, cfg, is_reference, crop_h, crop_w);
+    Image img = decode_raw_file(*raw, cfg, is_reference, crop_h, crop_w, path);
     raw->recycle();
     return img;
 #else

@@ -106,7 +106,10 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
     const f32* denp = den_band.data.data();
     const bool bake = work.bake_srgb && nch >= 3;
     const f32* m = work.cam_to_srgb;
-    const f32 wb0 = work.white_balance[0], wb1 = work.white_balance[1], wb2 = work.white_balance[2];
+    // Pre-whitened RAW already has WB baked in (Python utils_dng order).
+    const f32 wb0 = work.raw_prewhitened ? 1.f : work.white_balance[0];
+    const f32 wb1 = work.raw_prewhitened ? 1.f : work.white_balance[1];
+    const f32 wb2 = work.raw_prewhitened ? 1.f : work.white_balance[2];
     const bool prev_color = !bake && nch >= 3 && work.has_cam_to_srgb;
 
 #if defined(__APPLE__)
@@ -377,9 +380,15 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
+    // Private tag / AsShotNeutral: identity when pixels are already WB'd.
+    const float wb_out[3] = {
+        work.raw_prewhitened ? 1.f : work.white_balance[0],
+        work.raw_prewhitened ? 1.f : work.white_balance[1],
+        work.raw_prewhitened ? 1.f : work.white_balance[2],
+    };
     if (!writer.open(dng_path, Ws, Hs, model, work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
-                     work.white_balance,
+                     wb_out,
                      work.bake_srgb, make,
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
         if (stream_comp_raw) fs::remove_all(cache, ec);

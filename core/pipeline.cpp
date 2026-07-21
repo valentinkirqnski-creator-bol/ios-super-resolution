@@ -186,9 +186,14 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     int Ws = (int)std::lround(work.scale * ref.w);
 
     DngStreamWriter writer;
+    const float wb_out[3] = {
+        work.raw_prewhitened ? 1.f : work.white_balance[0],
+        work.raw_prewhitened ? 1.f : work.white_balance[1],
+        work.raw_prewhitened ? 1.f : work.white_balance[2],
+    };
     if (!writer.open(dng_path, Ws, Hs, "HandheldSR-x2", work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
-                     work.bayer_mode ? work.white_balance : nullptr,
+                     work.bayer_mode ? wb_out : nullptr,
                      work.bake_srgb, "HandheldSR",
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
         report("Error: cannot open output DNG", 1.0f);
@@ -232,9 +237,12 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 }
                 f32 outc[3];
                 if (work.bake_srgb && nch >= 3) {
-                    f32 wr = cn[0] * work.white_balance[0];
-                    f32 wg = cn[1] * work.white_balance[1];
-                    f32 wb = cn[2] * work.white_balance[2];
+                    const f32 g0 = work.raw_prewhitened ? 1.f : work.white_balance[0];
+                    const f32 g1 = work.raw_prewhitened ? 1.f : work.white_balance[1];
+                    const f32 g2 = work.raw_prewhitened ? 1.f : work.white_balance[2];
+                    f32 wr = cn[0] * g0;
+                    f32 wg = cn[1] * g1;
+                    f32 wb = cn[2] * g2;
                     const f32* m = work.cam_to_srgb;
                     outc[0] = m[0] * wr + m[1] * wg + m[2] * wb;
                     outc[1] = m[3] * wr + m[4] * wg + m[5] * wb;
