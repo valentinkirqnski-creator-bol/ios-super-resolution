@@ -299,8 +299,8 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                     }
                 }
             }
-            flow.dx(ty, tx) = (f32)(flow_dx + best_dx);
-            flow.dy(ty, tx) = (f32)(flow_dy + best_dy);
+            flow.dx(ty, tx) += (f32)best_dx;
+            flow.dy(ty, tx) += (f32)best_dy;
         }
     });
 #endif // !__APPLE__

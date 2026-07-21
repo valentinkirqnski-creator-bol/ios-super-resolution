@@ -377,11 +377,6 @@ kernel void l2_argmin(device float* flow [[buffer(0)]],
     int crop0 = crop + 1;
     uint base = local * uint(N * N);
 
-    float fdx = flow[tid * 2u + 0u];
-    float fdy = flow[tid * 2u + 1u];
-    int flow_dx = int(rint(fdx));
-    int flow_dy = int(rint(fdy));
-
     float best = 1e30f;
     int best_dy = 0, best_dx = 0;
     for (int i = 0; i < corr_size; ++i) {
@@ -401,8 +396,8 @@ kernel void l2_argmin(device float* flow [[buffer(0)]],
             }
         }
     }
-    flow[tid * 2u + 0u] = float(flow_dx + best_dx);
-    flow[tid * 2u + 1u] = float(flow_dy + best_dy);
+    flow[tid * 2u + 0u] += float(best_dx);
+    flow[tid * 2u + 1u] += float(best_dy);
 }
 
 kernel void fftshift2d_real(device float* out [[buffer(0)]],
