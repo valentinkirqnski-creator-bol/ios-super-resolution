@@ -202,15 +202,17 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
     {
-        char buf[256];
+        f32 sum = 0.f;
+        for (f32 v : ref.data) sum += v;
+        const f32 brightness = ref.data.empty() ? 0.f : sum / (f32)ref.data.size();
+        const f32 sigma = noise_std_at_brightness(brightness, work.alpha, work.beta);
+        const f32 snr = (sigma > 1e-8f) ? brightness / sigma : 0.f;
+        char buf[288];
         const int t0 = work.bm_tile_sizes.size() > 0 ? work.bm_tile_sizes[0] : -1;
-        const int t1 = work.bm_tile_sizes.size() > 1 ? work.bm_tile_sizes[1] : -1;
-        const int t2 = work.bm_tile_sizes.size() > 2 ? work.bm_tile_sizes[2] : -1;
-        const int t3 = work.bm_tile_sizes.size() > 3 ? work.bm_tile_sizes[3] : -1;
         std::snprintf(buf, sizeof(buf),
-            "Noise %s α=%.3g β=%.3g  tiles=[%d,%d,%d,%d]  r_t=%.2f",
+            "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f",
             work.has_noise_profile ? "OK" : "FALLBACK",
-            work.alpha, work.beta, t0, t1, t2, t3, work.r_t);
+            work.alpha, work.beta, brightness, sigma, snr, t0, work.r_t);
         report(buf, 0.03f);
     }
 

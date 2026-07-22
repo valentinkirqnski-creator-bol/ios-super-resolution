@@ -98,6 +98,9 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
         if (std::fread(bytes.data(), 8, cnt, f) != cnt) return false;
         double sa = 0, sb = 0;
         const uint32_t nplanes = cnt / 2u;
+        // Python super_resolution.py (bayer): always sum(::2)/3 and sum(1::2)/3 —
+        // even when the tag has only one plane. Dividing by nplanes alone made α≈3×
+        // too large on Apple DNGs → whitened robustness masks.
         const uint32_t use = (nplanes >= 3) ? 3u : nplanes;
         for (uint32_t pi = 0; pi < use; ++pi) {
             for (int k = 0; k < 2; ++k) {
@@ -113,8 +116,8 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
                 if (k == 0) sa += d; else sb += d;
             }
         }
-        a_out = (float)(sa / (double)use);
-        b_out = (float)(sb / (double)use);
+        a_out = (float)(sa / 3.0);
+        b_out = (float)(sb / 3.0);
         return a_out > 0.f && std::isfinite(a_out) && std::isfinite(b_out);
     };
 
