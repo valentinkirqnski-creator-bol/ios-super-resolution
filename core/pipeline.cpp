@@ -186,16 +186,12 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     int Ws = (int)std::lround(work.scale * ref.w);
 
     DngStreamWriter writer;
-    const float wb_out[3] = {
-        work.raw_prewhitened ? 1.f : work.white_balance[0],
-        work.raw_prewhitened ? 1.f : work.white_balance[1],
-        work.raw_prewhitened ? 1.f : work.white_balance[2],
-    };
     if (!writer.open(dng_path, Ws, Hs, "HandheldSR-x2", work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
-                     work.bayer_mode ? wb_out : nullptr,
+                     work.bayer_mode ? work.white_balance : nullptr,
                      work.bake_srgb, "HandheldSR",
-                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
+                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
+                     work.raw_prewhitened)) {
         report("Error: cannot open output DNG", 1.0f);
         return Image();
     }

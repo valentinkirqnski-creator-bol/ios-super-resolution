@@ -955,6 +955,8 @@ static size_t g_rob_ref_bytes = 0;
 static id<MTLBuffer> g_rob_std_curve = nil;
 static id<MTLBuffer> g_rob_diff_curve = nil;
 static size_t g_rob_curve_n = 0;
+static float g_rob_curve_alpha = std::numeric_limits<float>::quiet_NaN();
+static float g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 
 static void clear_rob_ref_gpu() {
     g_rob_ref_m = nil;
@@ -964,6 +966,8 @@ static void clear_rob_ref_gpu() {
     g_rob_std_curve = nil;
     g_rob_diff_curve = nil;
     g_rob_curve_n = 0;
+    g_rob_curve_alpha = std::numeric_limits<float>::quiet_NaN();
+    g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 }
 
 RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
@@ -1065,10 +1069,13 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     } else {
         return Image();
     }
-    if (g_rob_curve_n != std_curve.size() || !g_rob_std_curve || !g_rob_diff_curve) {
+    if (g_rob_curve_n != std_curve.size() || !g_rob_std_curve || !g_rob_diff_curve ||
+        g_rob_curve_alpha != cfg.alpha || g_rob_curve_beta != cfg.beta) {
         g_rob_std_curve = buf(std_curve.data(), std_curve.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_curve.data(), diff_curve.size() * sizeof(float));
         g_rob_curve_n = std_curve.size();
+        g_rob_curve_alpha = cfg.alpha;
+        g_rob_curve_beta = cfg.beta;
     }
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;

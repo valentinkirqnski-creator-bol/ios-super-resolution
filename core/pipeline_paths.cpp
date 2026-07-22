@@ -380,17 +380,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
-    // Private tag / AsShotNeutral: identity when pixels are already WB'd.
-    const float wb_out[3] = {
-        work.raw_prewhitened ? 1.f : work.white_balance[0],
-        work.raw_prewhitened ? 1.f : work.white_balance[1],
-        work.raw_prewhitened ? 1.f : work.white_balance[2],
-    };
     if (!writer.open(dng_path, Ws, Hs, model, work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
-                     wb_out,
+                     work.white_balance,
                      work.bake_srgb, make,
-                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr)) {
+                     work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
+                     work.raw_prewhitened)) {
         if (stream_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
         return Image();

@@ -57,7 +57,8 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed) {
 #ifdef HAVE_LIBRAW
 
 // Best-effort DNG NoiseProfile (0xC61A) / 0xC761: average RGB α,β like Python.
-// iPhone / most DNGs are little-endian; BE files are skipped.
+// Walks IFD0, SubIFDs (tag 330), and the IFD chain — NoiseProfile usually lives
+// in the raw SubIFD, not IFD0. iPhone / most DNGs are little-endian.
 static bool try_read_dng_noise_profile(const std::string& path, float& alpha, float& beta) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -67,11 +68,33 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
     uint32_t ifd0 = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
                     ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
 
-    auto read_ifd = [&](uint32_t off, float& a_out, float& b_out) -> bool {
+    auto parse_noise_at = [&](uint32_t data_off, uint32_t cnt, float& a_out, float& b_out) -> bool {
+        std::vector<double> doubles(cnt);
+        if (std::fseek(f, (long)data_off, SEEK_SET) != 0) return false;
+        if (std::fread(doubles.data(), 8, cnt, f) != cnt) return false;
+        const uint32_t nplanes = cnt / 2u;
+        if (nplanes < 1) return false;
+        double sa = 0, sb = 0;
+        const uint32_t use = (nplanes >= 3) ? 3u : nplanes;
+        for (uint32_t p = 0; p < use; ++p) {
+            sa += doubles[2 * p + 0];
+            sb += doubles[2 * p + 1];
+        }
+        a_out = (float)(sa / (double)use);
+        b_out = (float)(sb / (double)use);
+        return a_out > 0.f && std::isfinite(a_out) && std::isfinite(b_out);
+    };
+
+    // Returns true if NoiseProfile found. Also appends SubIFD offsets (tag 330).
+    auto scan_ifd = [&](uint32_t off, float& a_out, float& b_out,
+                        std::vector<uint32_t>& subifds, uint32_t& next_ifd) -> bool {
+        next_ifd = 0;
+        if (off == 0) return false;
         if (std::fseek(f, (long)off, SEEK_SET) != 0) return false;
         uint16_t nent = 0;
         if (std::fread(&nent, 2, 1, f) != 1) return false;
         if (nent == 0 || nent > 512) return false;
+        bool found = false;
         for (uint16_t i = 0; i < nent; ++i) {
             uint8_t e[12];
             if (std::fread(e, 1, 12, f) != 12) return false;
@@ -81,32 +104,55 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
                            ((uint32_t)e[6] << 16) | ((uint32_t)e[7] << 24);
             uint32_t val = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
                            ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
-            // 0xC61A = NoiseProfile (DNG), 0xC761 = tag used by some stacks / exifread
-            if ((tag != 0xC61A && tag != 0xC761) || cnt < 2 || typ != 12) continue;
-            const long data_off = (cnt * 8u > 4u)
-                ? (long)val
-                : (long)(off + 2u + (uint32_t)i * 12u + 8u);
-            std::vector<double> doubles(cnt);
-            if (std::fseek(f, data_off, SEEK_SET) != 0) continue;
-            if (std::fread(doubles.data(), 8, cnt, f) != cnt) continue;
-            const uint32_t nplanes = cnt / 2u;
-            if (nplanes < 1) continue;
-            double sa = 0, sb = 0;
-            const uint32_t use = (nplanes >= 3) ? 3u : nplanes;
-            for (uint32_t p = 0; p < use; ++p) {
-                sa += doubles[2 * p + 0];
-                sb += doubles[2 * p + 1];
+            if (tag == 330 && cnt >= 1) { // SubIFDs
+                if (cnt == 1 && typ == 4) {
+                    subifds.push_back(val);
+                } else if (typ == 4) {
+                    std::vector<uint32_t> offs(cnt);
+                    if (std::fseek(f, (long)val, SEEK_SET) == 0 &&
+                        std::fread(offs.data(), 4, cnt, f) == cnt) {
+                        for (uint32_t o : offs) subifds.push_back(o);
+                    }
+                    // Reseek to continue entries: after this entry in IFD
+                    long ent_end = (long)off + 2 + (long)(i + 1) * 12;
+                    if (std::fseek(f, ent_end, SEEK_SET) != 0) return found;
+                }
             }
-            a_out = (float)(sa / (double)use);
-            b_out = (float)(sb / (double)use);
-            if (a_out > 0.f && std::isfinite(a_out) && std::isfinite(b_out))
-                return true;
+            // 0xC61A = NoiseProfile (DNG), 0xC761 = tag used by some stacks / exifread
+            if (!found && (tag == 0xC61A || tag == 0xC761) && cnt >= 2 && typ == 12) {
+                const uint32_t data_off = (cnt * 8u > 4u)
+                    ? val
+                    : (off + 2u + (uint32_t)i * 12u + 8u);
+                float a = 0, b = 0;
+                if (parse_noise_at(data_off, cnt, a, b)) {
+                    a_out = a; b_out = b; found = true;
+                }
+                long ent_end = (long)off + 2 + (long)(i + 1) * 12;
+                if (std::fseek(f, ent_end, SEEK_SET) != 0) return found;
+            }
         }
-        return false;
+        if (std::fread(&next_ifd, 4, 1, f) != 1) next_ifd = 0;
+        return found;
     };
 
     float a = 0, b = 0;
-    bool ok = read_ifd(ifd0, a, b);
+    std::vector<uint32_t> queue;
+    queue.push_back(ifd0);
+    std::vector<uint32_t> visited;
+    bool ok = false;
+    for (size_t qi = 0; qi < queue.size() && qi < 32; ++qi) {
+        uint32_t cur = queue[qi];
+        bool seen = false;
+        for (uint32_t v : visited) if (v == cur) { seen = true; break; }
+        if (seen || cur == 0) continue;
+        visited.push_back(cur);
+        std::vector<uint32_t> subs;
+        uint32_t next = 0;
+        if (scan_ifd(cur, a, b, subs, next)) ok = true;
+        for (uint32_t s : subs) queue.push_back(s);
+        if (next) queue.push_back(next);
+        if (ok) break;
+    }
     std::fclose(f);
     if (!ok) return false;
     alpha = a;

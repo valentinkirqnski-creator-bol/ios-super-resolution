@@ -34,6 +34,9 @@ public:
     // colorMatrixXYZtoCam: 9 floats row-major (optional).
     // wbGainsGreenNorm: RGB gains, G≈1 (optional).
     // camToSrgb: 9 floats LibRaw rgb_cam (optional; used by JPEG export).
+    // pixelsPrewhitened: merge RGB already has WB baked (Python utils_dng order).
+    //   → AsShotNeutral=1,1,1 + AnalogBalance=gains (tag 50727); private WB=1,1,1.
+    //   Otherwise AsShotNeutral=1/gains and private tag stores gains for JPEG.
     bool open(const std::string& path, int W, int H,
               const std::string& camera_model = "HandheldSR-x2",
               int orientation = 1,
@@ -41,7 +44,8 @@ public:
               const float* wbGainsGreenNorm = nullptr,
               bool bakedSrgb = false,
               const std::string& camera_make = "HandheldSR",
-              const float* camToSrgb = nullptr);
+              const float* camToSrgb = nullptr,
+              bool pixelsPrewhitened = false);
 
     bool write_rows(const uint16_t* rgb16, int nrows);
     bool close();

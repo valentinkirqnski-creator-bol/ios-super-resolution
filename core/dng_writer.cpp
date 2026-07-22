@@ -145,6 +145,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const float* wb,
                                              bool baked_srgb,
                                              const float* cam_to_srgb,
+                                             bool pixels_prewhitened,
                                              uint32_t& strip_offset_out,
                                              uint32_t& strip_byte_counts_offset_out) {
     IFD ifd;
@@ -199,8 +200,19 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                 float n = (g > 1e-6f) ? (1.f / g) : 1.f;
                 return {(uint32_t)std::lround(n * 10000.f), 10000u};
             };
-            auto r = to_rat(wb[0]), g = to_rat(wb[1]), b = to_rat(wb[2]);
-            ifd.rational(50728, {r.first, r.second, g.first, g.second, b.first, b.second});
+            auto gain_rat = [](float g) -> std::pair<uint32_t, uint32_t> {
+                float v = (g > 1e-6f) ? g : 1.f;
+                return {(uint32_t)std::lround(v * 10000.f), 10000u};
+            };
+            if (pixels_prewhitened) {
+                // Python utils_dng: pixels already × WB → AsShotNeutral=1 + AnalogBalance=gains.
+                ifd.rational(50728, {10000, 10000, 10000, 10000, 10000, 10000});
+                auto ar = gain_rat(wb[0]), ag = gain_rat(wb[1]), ab = gain_rat(wb[2]);
+                ifd.rational(50727, {ar.first, ar.second, ag.first, ag.second, ab.first, ab.second});
+            } else {
+                auto r = to_rat(wb[0]), g = to_rat(wb[1]), b = to_rat(wb[2]);
+                ifd.rational(50728, {r.first, r.second, g.first, g.second, b.first, b.second});
+            }
         }
         ifd.shortv(50831, 1);          // ColorimetricReference = scene referred
     }
@@ -208,7 +220,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     if (wb || cam_to_srgb) {
         std::vector<uint8_t> blob;
         blob.reserve(48);
-        for (int i = 0; i < 3; ++i) append_f32_le(blob, wb ? wb[i] : 1.f);
+        // JPEG/preview must not apply WB again when pixels are already pre-whitened.
+        for (int i = 0; i < 3; ++i)
+            append_f32_le(blob, (wb && !pixels_prewhitened) ? wb[i] : 1.f);
         for (int i = 0; i < 9; ++i) {
             float v = 0.f;
             if (cam_to_srgb) v = cam_to_srgb[i];
@@ -285,7 +299,8 @@ bool write_linear_dng(const std::string& path, const Image& rgb, const std::stri
 bool DngStreamWriter::open(const std::string& path, int W, int H, const std::string& camera_model,
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
-                           const std::string& camera_make, const float* camToSrgb) {
+                           const std::string& camera_make, const float* camToSrgb,
+                           bool pixelsPrewhitened) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
     compressed_bytes_ = 0;
@@ -295,8 +310,8 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
-                                                   bakedSrgb, camToSrgb, strip_offset,
-                                                   strip_byte_counts_offset_);
+                                                   bakedSrgb, camToSrgb, pixelsPrewhitened,
+                                                   strip_offset, strip_byte_counts_offset_);
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
     // Large stdio buffer — fewer syscalls during streaming Deflate.

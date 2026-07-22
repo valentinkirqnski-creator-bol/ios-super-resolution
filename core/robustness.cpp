@@ -467,8 +467,10 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
     // Empty flow (e.g. grey/align failed) — do not index flow.flow.data()==nullptr.
     if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) {
+        // Do not fully trust comps when alignment produced no flow (Python has no
+        // such bandage; ones here made the mask white and let ghosts through).
         Image r(comp_raw.h, comp_raw.w, 1);
-        std::fill(r.data.begin(), r.data.end(), 1.f);
+        std::fill(r.data.begin(), r.data.end(), 0.f);
         return r;
     }
 
