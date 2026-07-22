@@ -262,17 +262,35 @@ struct CameraView: View {
 
     private var bottomPanel: some View {
         VStack(spacing: 0) {
+            if !cam.noiseDiagText.isEmpty, cam.isProcessing || !cam.isBusy {
+                Text(cam.noiseDiagText)
+                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                    .foregroundColor(cam.noiseDiagText.contains("FALLBACK")
+                        ? .orange.opacity(0.95)
+                        : .white.opacity(0.7))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.7)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 4)
+            }
             if cam.isProcessing, !cam.statusText.isEmpty {
                 Text(cam.statusText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.75)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
                     .padding(.bottom, 6)
             } else if !cam.statusText.isEmpty, !cam.isBusy {
                 Text(cam.statusText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.75)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
                     .padding(.bottom, 6)
             }
 

@@ -91,6 +91,8 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var isCapturing = false
     @Published var isProcessing = false
     @Published var statusText = ""
+    /// Sticky NoiseProfile OK/FALLBACK line (not overwritten by Frame N: analyze).
+    @Published var noiseDiagText = ""
     @Published var progress: Float = 0
     @Published var lastThumbnail: UIImage?
     @Published var permissionDenied = false
@@ -976,6 +978,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.isCapturing = false
             self.isProcessing = true
             self.statusText = "Processing…"
+            self.noiseDiagText = ""
             self.progress = 0.15
         }
 
@@ -1008,7 +1011,11 @@ final class CameraModel: NSObject, ObservableObject {
             progress: { [weak self] stage, frac in
                 DispatchQueue.main.async {
                     self?.progress = 0.15 + frac * 0.85
-                    self?.statusText = stage
+                    if stage.hasPrefix("Noise ") {
+                        self?.noiseDiagText = stage
+                    } else {
+                        self?.statusText = stage
+                    }
                 }
             },
             previewImage: &preview
@@ -1179,6 +1186,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.isProcessing = false
             self.progress = success ? 1 : 0
             self.statusText = message
+            // Keep noiseDiagText until next burst so you can read OK/FALLBACK after Done.
         }
         sessionQueue.async {
             self.resumeZSLAfterProcessing()
