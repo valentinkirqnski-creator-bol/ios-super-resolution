@@ -81,8 +81,10 @@ struct Config {
     GreyMethod grey_method = GreyMethod::FFT;
 
     // Noise model: sigma^2 = alpha * I + beta   (already scaled for ISO).
+    // Defaults are Pixel-ish fallbacks; overwritten from DNG NoiseProfile (0xC761).
     float alpha = 1.80710882e-4f;
-    float beta  = 3.1937599182128e-6f; // matches monte_carlo_simulation.py / fast_monte_carlo.py
+    float beta  = 3.1937599182128e-6f;
+    bool  has_noise_profile = false;
 
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};

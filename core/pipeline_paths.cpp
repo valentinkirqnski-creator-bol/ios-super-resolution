@@ -200,6 +200,19 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     if (ref.h <= 0 || ref.w <= 0) return Image();
     tune_config_snr(ref, work);
 
+    // Diagnose mask parity: if NoiseProfile FALLBACK, α/β are Pixel defaults ≠ Python EXIF.
+    std::fprintf(stderr,
+        "[HHSR] noise α=%g β=%g (NoiseProfile %s) snr_auto=%d tiles=[%d,%d,%d,%d] "
+        "r_t=%.3f s1=%.2f s2=%.1f Mt=%.2f\n",
+        work.alpha, work.beta,
+        work.has_noise_profile ? "OK" : "FALLBACK",
+        (int)work.snr_auto_tune,
+        work.bm_tile_sizes.size() > 0 ? work.bm_tile_sizes[0] : -1,
+        work.bm_tile_sizes.size() > 1 ? work.bm_tile_sizes[1] : -1,
+        work.bm_tile_sizes.size() > 2 ? work.bm_tile_sizes[2] : -1,
+        work.bm_tile_sizes.size() > 3 ? work.bm_tile_sizes[3] : -1,
+        work.r_t, work.r_s1, work.r_s2, work.r_Mt);
+
     const int ref_h = ref.h, ref_w = ref.w;
     const int n = (int)paths.size();
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
