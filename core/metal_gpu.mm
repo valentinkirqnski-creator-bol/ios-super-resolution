@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include "metal_gpu.h"
+#include "debug_utils.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -1558,12 +1559,15 @@ static bool upscale_flow_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
 
 } // namespace
 
+static bool g_dumped_ref_grads = false;
+
 bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out) {
     if (!metal_gpu_init()) return false;
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
     if (moving_grey.h <= 0 || moving_grey.w <= 0) return false;
+    // Fine-first levels[]: params arrays are fine→coarse, so index with lvl.
     for (int lvl = 0; lvl < nlev; ++lvl) {
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         if (ts != 8 && ts != 16) return false;
@@ -1625,6 +1629,15 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         if (!prep_level_ica_gpu(r, ts, b_ref, b_gx, b_gy, b_hess, ny, nx))
             return false;
 
+        // Match Python dump at coarse-first i==0 = coarsest = C++ lvl nlev-1.
+        if (lvl == nlev - 1 && !g_dumped_ref_grads && b_gx && b_gy) {
+            debug_dump_bin("cpp_gradx_0", (const float*)[b_gx contents],
+                           (size_t)r.h * (size_t)r.w);
+            debug_dump_bin("cpp_grady_0", (const float*)[b_gy contents],
+                           (size_t)r.h * (size_t)r.w);
+            g_dumped_ref_grads = true;
+        }
+
         if (!b_flow) {
             flow_ny = ny;
             flow_nx = nx;
@@ -1668,7 +1681,7 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
 }
 
 void metal_clear_ref_ica_cache() {
-    // Per-level ICA temps are not retained across frames.
+    g_dumped_ref_grads = false;
 }
 
 bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,

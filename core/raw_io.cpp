@@ -209,8 +209,11 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             cfg.camera_make = raw.imgdata.idata.make;
         if (raw.imgdata.idata.model[0])
             cfg.camera_model = raw.imgdata.idata.model;
+        // Python utils_dng: store raw camera_whitebalance (not /green).
+        // Load multiplies by (wb[c]/wb[G]); guide undoes with /wb[c].
         for (int i = 0; i < 3; ++i)
-            if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i] / C.cam_mul[1];
+            if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i];
+        if (!(cfg.white_balance[1] > 0.f)) cfg.white_balance[1] = 1.f;
         for (int i = 0; i < 2; ++i)
             for (int j = 0; j < 2; ++j) {
                 int c = raw.COLOR(i, j);
@@ -293,13 +296,15 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     }
     float site_black[2][2];
     float site_wb[2][2];
+    const float wb_g = (cfg.white_balance[1] > 0.f) ? cfg.white_balance[1] : 1.f;
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             int c = (int)cfg.cfa.p[i][j];
             if (c < 0) c = 0;
             if (c > 2) c = 1;
             site_black[i][j] = bl_rgb[c];
-            float w = cfg.white_balance[c];
+            // Python: k = white_balance[channel] / white_balance[1]
+            float w = cfg.white_balance[c] / wb_g;
             if (!(w > 0.f) || !std::isfinite(w)) w = 1.f;
             site_wb[i][j] = w;
         }

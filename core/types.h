@@ -94,24 +94,24 @@ struct Config {
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
 
-    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). App defaults.
+    // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    float r_t  = 1.0f;
-    float r_s1 = 1.52f;
-    float r_s2 = 2.1f;
-    float r_Mt = 1.0f;
+    float r_t  = 0.12f;
+    float r_s1 = 2.0f;
+    float r_s2 = 12.0f;
+    float r_Mt = 0.8f;
 
-    // accumulated_robustness_denoiser.merge
-    bool  accumulated_robustness_denoiser_enabled = true;
+    // accumulated_robustness_denoiser.merge — off in default.yaml
+    bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
-    float acc_rob_max_multiplier = 1.8f;
-    float acc_rob_max_frame_count = 1.0f;
+    float acc_rob_max_multiplier = 8.0f;
+    float acc_rob_max_frame_count = 2.0f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;
-    bool  snr_auto_tune = false;
+    bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
     float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
@@ -120,8 +120,8 @@ struct Config {
     float k_shrink  = 2.0f;
 
     CFA cfa;
-    // Gains relative to green (cam_mul[c]/cam_mul[G]). Used by robustness guide
-    // to undo pre-pipeline WB (Python utils_dng / robustness.compute_guide).
+    // Raw AsShot-style gains (cam_mul), same as Python camera_whitebalance.
+    // Load applies k = wb[c]/wb[G]; robustness guide undoes with wb[c] (raw).
     float white_balance[3] = {1.f, 1.f, 1.f};
     // True after load_raw applies per-channel black + WB like Python utils_dng.
     // Merge output is then already white-balanced — preview/bake/DNG AsShot must

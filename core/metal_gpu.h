@@ -1,11 +1,11 @@
 #pragma once
 //
 // Metal GPU backend for grey-FFT, L2 BM, kernel covariance, robustness, and merge.
-// FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein, same
-// twiddle recurrence and scaling). L2 matches Torch rfft2/irfft2 path.
+// FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein).
+// L2 BM matches Torch rfft2/irfft2/fftshift math; Metal FFT ≠ Torch float stream.
+// Prefer HHSR_L2_CPU=1 / HHSR_ALIGN_CPU=1 for closer CPU/vDSP parity on dumps.
 // Kernels match kernels.cpp estimate_kernels (GAT + decimate + grads + cov).
 // Merge matches merge.cpp accumulate_comp / accumulate_ref (incl. robustness).
-// No CPU fallback on Apple: failure returns empty / false.
 //
 #include "types.h"
 #include "stages.h"

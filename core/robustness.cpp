@@ -1,8 +1,12 @@
 #include "stages.h"
 #include "parallel.h"
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <cmath>
+#include <string>
 #include <vector>
 #ifdef __APPLE__
 #include "metal_gpu.h"
@@ -33,8 +37,15 @@ static constexpr f32 k_tol = 3.f;
 // ============================================================================
 // NumPy RandomState (legacy / frozen @ 1.16) — MT19937 + polar Box-Muller.
 // Same generator family as np.random.randn. Seeded per brightness for a
-// deterministic app; stock Python is unseeded + multiprocessed so curves
-// cannot bit-match without baking a dumped table from a Python run.
+// deterministic app default.
+//
+// Stock Python run_fast_MC is *unseeded* + multiprocessed, so curves differ
+// every Python run. Bit-match a specific Python run by loading a dump:
+//   HHSR_NOISE_CURVES_DIR=/path  with std_curve.bin + diff_curve.bin
+//   (1001 float32 each) and optional meta.txt (alpha=… / beta=…).
+// Export without editing the Python package:
+//   tools/export_noise_curves.py
+//   tools/run_sr_dump_noise_curves.py  (captures curves from one pipeline run)
 // ============================================================================
 struct NumpyRandomState {
     static constexpr int N = 624;
@@ -194,15 +205,81 @@ static void interp_MC_range(NoiseCurves& nc, int imin, int imax) {
     }
 }
 
+static bool read_f32_bin(const std::string& path, std::vector<f32>& out, size_t expect) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    out.resize(expect);
+    size_t n = std::fread(out.data(), sizeof(f32), expect, f);
+    std::fclose(f);
+    return n == expect;
+}
+
+static bool meta_matches(const std::string& dir, f32 alpha, f32 beta) {
+    std::string path = dir + "/meta.txt";
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return true; // no meta → accept dump as authoritative
+    double a = 0.0, b = 0.0;
+    char line[256];
+    bool got_a = false, got_b = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::sscanf(line, "alpha=%lf", &a) == 1) got_a = true;
+        if (std::sscanf(line, "beta=%lf", &b) == 1) got_b = true;
+    }
+    std::fclose(f);
+    if (!got_a || !got_b) return true;
+    // Relative tolerance — DNG α/β are float32-ish.
+    auto close = [](double x, double y) {
+        double d = std::fabs(x - y);
+        return d <= 1e-9 || d <= 1e-5 * std::max(std::fabs(x), std::fabs(y));
+    };
+    return close(a, (double)alpha) && close(b, (double)beta);
+}
+
+static std::string noise_curves_search_dir() {
+    if (const char* env = std::getenv("HHSR_NOISE_CURVES_DIR"))
+        return std::string(env);
+    if (const char* dbg = std::getenv("HHSR_DEBUG_DIR"))
+        return std::string(dbg) + "/noise_curves";
+#ifdef __APPLE__
+    if (const char* home = std::getenv("HOME"))
+        return std::string(home) + "/Documents/noise_curves";
+#endif
+    return "noise_curves";
+}
+
+// Load Python-dumped curves (same unseeded np.random stream as that run).
+static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
+    const std::string dir = noise_curves_search_dir();
+    if (!meta_matches(dir, alpha, beta)) return false;
+    const size_t n = (size_t)k_n_brightness + 1;
+    std::vector<f32> stdc, diffc;
+    if (!read_f32_bin(dir + "/std_curve.bin", stdc, n)) return false;
+    if (!read_f32_bin(dir + "/diff_curve.bin", diffc, n)) return false;
+    nc.std_curve = std::move(stdc);
+    nc.diff_curve = std::move(diffc);
+    std::printf("[noise] Loaded Python curves from %s (%zu bins)\n", dir.c_str(), n);
+    return true;
+}
+
 static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     // Cache like Python (curves built once per alpha/beta, reused every frame).
     static NoiseCurves cached;
     static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
     static f32 cached_beta  = std::numeric_limits<f32>::quiet_NaN();
+    static bool cached_from_file = false;
     if (alpha == cached_alpha && beta == cached_beta)
         return cached;
 
     NoiseCurves nc;
+    if (try_load_python_noise_curves(alpha, beta, nc)) {
+        cached = nc;
+        cached_alpha = alpha;
+        cached_beta = beta;
+        cached_from_file = true;
+        return cached;
+    }
+    (void)cached_from_file;
+
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
 
@@ -218,14 +295,14 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     if (full_mc) {
         parallel_rows(k_n_brightness + 1, 0, [&](int i) {
             f32 b = i / (f32)k_n_brightness;
-            unitary_MC(alpha, beta, b, nc.diff_curve[i], nc.std_curve[i]);
+            unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i]);
         });
     } else {
         // MC on non-linear parts: [0, imin] and [imax, 1000]
         parallel_rows(k_n_brightness + 1, 0, [&](int i) {
             if (i <= imin || i >= imax) {
                 f32 b = i / (f32)k_n_brightness;
-                unitary_MC(alpha, beta, b, nc.diff_curve[i], nc.std_curve[i]);
+                unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i]);
             }
         });
         // Overwrite [imin, imax] inclusive (matches run_fast_MC)
@@ -235,6 +312,7 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
     cached = nc;
     cached_alpha = alpha;
     cached_beta = beta;
+    cached_from_file = false;
     return nc;
 }
 
@@ -377,8 +455,15 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
             f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
             for (int ch = 0; ch < nc_ch; ++ch) {
                 f32 brightness = ref_means.at(y, x, ch);
-                // Python: id_noise = round(1000 * brightness) — no clamp
+                // Python: id_noise = round(1000 * brightness) — no clamp.
                 int id_noise = (int)std::lround(1000.f * brightness);
+                // Host: same bins as Python for finite brightness in range; avoid crash on +inf.
+                if (!std::isfinite(brightness))
+                    id_noise = 0;
+                else if (id_noise < 0)
+                    id_noise = 0;
+                else if (id_noise >= (int)nc.std_curve.size())
+                    id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);

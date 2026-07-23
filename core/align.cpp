@@ -1,7 +1,9 @@
 #include "stages.h"
 #include "parallel.h"
+#include "debug_utils.h"
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -187,20 +189,18 @@ static inline f32 bilinear_ica(const Image& img, int pixel_y, int pixel_x,
 }
 
 // ============================================================================
-// L2 BM — Torch: rfft2 / irfft2 / fftshift path
-// On Apple: Metal GPU only (same math). No CPU fallback.
+// L2 BM — Torch: rfft2 / irfft2 / fftshift / L2_search-2*corr / argmin
+// Metal uses the same formulas; FFT numerics ≠ Torch. Set HHSR_L2_CPU=1 to
+// force the vDSP CPU path (closer to Torch; still float ε vs CUDA).
 // ============================================================================
-static void block_match_level_L2(const Image& ref, const Image& moving,
-                                  int tile_size, int search_radius,
-                                  FlowField& flow, int num_threads) {
-#ifdef __APPLE__
-    (void)num_threads;
-    if (!block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow)) {
-        // Leave flow unchanged on failure.
-        return;
-    }
-    return;
-#else
+static bool env_flag_on(const char* name) {
+    const char* e = std::getenv(name);
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
+                                     int tile_size, int search_radius,
+                                     FlowField& flow, int num_threads) {
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
@@ -226,12 +226,12 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
     };
 
     std::vector<RowBuffers> buffers;
-    buffers.reserve(ny);
+    buffers.reserve((size_t)ny);
     for (int i = 0; i < ny; ++i)
         buffers.emplace_back(N, corr_size, wh);
 
     parallel_rows(ny, num_threads, [&](int ty) {
-        RowBuffers& b = buffers[ty];
+        RowBuffers& b = buffers[(size_t)ty];
         for (int tx = 0; tx < nx; ++tx) {
             int oy = ty * ts;
             int ox = tx * ts;
@@ -303,7 +303,19 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
             flow.dy(ty, tx) += (f32)best_dy;
         }
     });
-#endif // !__APPLE__
+}
+
+static void block_match_level_L2(const Image& ref, const Image& moving,
+                                  int tile_size, int search_radius,
+                                  FlowField& flow, int num_threads) {
+#ifdef __APPLE__
+    // Default: Metal (same math, different FFT). HHSR_L2_CPU=1 → vDSP path.
+    if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
+        if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow))
+            return;
+    }
+#endif
+    block_match_level_L2_cpu(ref, moving, tile_size, search_radius, flow, num_threads);
 }
 
 // ============================================================================
@@ -358,6 +370,11 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                         }
                         l1_sum = warp_then_block_reduce_sum(per_thread, 1024);
                     } else {
+                        // ts==16 Python cuda_L1_local_search16 loads shared mov
+                        // WITHOUT -search_radius, then indexes with +search_radius
+                        // → effective sample at (ry+flow+sdy+R, rx+flow+sdx+R).
+                        // ts==32/64 load with -R so the +R index is correct L1.
+                        const int off = (ts == 16) ? R : 0;
                         const int n_threads = ts * ts;
                         if ((int)per_thread.size() < n_threads)
                             per_thread.resize((size_t)n_threads);
@@ -368,8 +385,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                                 int rx = ox + j;
                                 int tid = i * ts + j;
                                 f32 rv = (ry < ref.h && rx < ref.w) ? ref.at(ry, rx) : 0.f;
-                                int my = ry + flow_dy + sdy;
-                                int mx = rx + flow_dx + sdx;
+                                int my = ry + flow_dy + sdy + off;
+                                int mx = rx + flow_dx + sdx + off;
                                 f32 mv = (my >= 0 && my < moving.h && mx >= 0 && mx < moving.w)
                                              ? moving.at(my, mx) : 0.f;
                                 per_thread[(size_t)tid] = std::fabs(rv - mv);
@@ -590,8 +607,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     int nlev = (int)ref_pyr.levels.size();
 
 #ifdef __APPLE__
-    // GPU: Sobel/Hessian + resident pyramid/BM/ICA/flow-upscale (1:1 CPU math).
-    {
+    // GPU path. HHSR_ALIGN_CPU=1 forces CPU (L1 bugs + vDSP L2 closer to Torch).
+    if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
         if (align_metal(ref_pyr, moving_grey, cfg, tile_size, flow_gpu))
             return flow_gpu;
@@ -599,6 +616,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 #endif
 
     // CPU path: cache ref Sobel+Hessian across comparison frames.
+    // C++ pyramid is fine-first (levels[0]=finest). Python build_gaussian_pyramid
+    // returns coarse-first (pyramid[::-1]); its list_id = n-1-l then maps
+    // coarse→params[n-1], fine→params[0]. With fine-first storage that is simply
+    // params[lvl] (arrays are fine→coarse in default.yaml).
     if (g_ref_ica_cache.key != (const void*)&ref_pyr ||
         (int)g_ref_ica_cache.levels.size() != nlev) {
         g_ref_ica_cache.key = (const void*)&ref_pyr;
@@ -611,6 +632,12 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             L.gx = compute_sobel_gradx(r);
             L.gy = compute_sobel_grady(r);
             L.hess = compute_hessian(L.gx, L.gy, ts);
+        }
+        // Python dumps pyramid/grads at enum i==0 after reverse = coarsest.
+        if (nlev > 0) {
+            const RefIcaLevel& Lc = g_ref_ica_cache.levels[(size_t)nlev - 1];
+            debug_dump_bin("cpp_gradx_0", Lc.gx.data.data(), Lc.gx.data.size());
+            debug_dump_bin("cpp_grady_0", Lc.gy.data.data(), Lc.gy.data.size());
         }
     }
 

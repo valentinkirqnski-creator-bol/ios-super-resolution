@@ -50,6 +50,7 @@ targets:
           - "dng_writer.cpp"
           - "snr_tuning.cpp"
           - "metal_gpu.mm"
+          - "debug_utils.mm"
           - "HHSRKernels.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
@@ -67,6 +68,8 @@ targets:
         NSCameraUsageDescription: "The camera is used to capture a short RAW burst for multi-frame super-resolution."
         NSPhotoLibraryAddUsageDescription: "Used to save the final super-resolution DNG or JPG to your photo library."
         UILaunchScreen: {}
+        UIFileSharingEnabled: YES
+        LSSupportsOpeningDocumentsInPlace: YES
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
     settings:

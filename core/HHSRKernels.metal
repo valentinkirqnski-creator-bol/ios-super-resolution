@@ -1141,9 +1141,17 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
+        // Python: id_noise = round(1000 * brightness) — no clamp.
         int id_noise = lround_away(1000.f * brightness);
-        // Valid brightness ∈[0,1] → id 0..1000; clamp only avoids GPU OOB on +inf tiles.
-        uint id = uint(clamp(id_noise, 0, int(p.curve_n) - 1));
+        // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
+        // Finite brightness in [0,1] → id in [0,1000] unchanged (same as Python).
+        if (!isfinite(brightness))
+            id_noise = 0;
+        else if (id_noise < 0)
+            id_noise = 0;
+        else if (id_noise >= int(p.curve_n))
+            id_noise = int(p.curve_n) - 1;
+        uint id = uint(id_noise);
         float sigma_t = std_curve[id];
         float d_t = diff_curve[id];
         float sigma_p_sq = ref_vars[o];
@@ -1242,8 +1250,10 @@ kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
                     int tidp = i * ts + j;
                     float rv = (ry < int(p.ref_h) && rx < int(p.ref_w))
                                    ? ref[uint(ry) * p.ref_w + uint(rx)] : 0.f;
-                    int my = ry + flow_dy + sdy;
-                    int mx = rx + flow_dx + sdx;
+                    // cuda_L1_local_search16: shared load omits -R, index adds +R
+                    // → sample at (ry+flow+sdy+R, rx+flow+sdx+R).
+                    int my = ry + flow_dy + sdy + R;
+                    int mx = rx + flow_dx + sdx + R;
                     float mv = (my >= 0 && my < int(p.mov_h) && mx >= 0 && mx < int(p.mov_w))
                                    ? mov[uint(my) * p.mov_w + uint(mx)] : 0.f;
                     per[tidp] = fabs(rv - mv);

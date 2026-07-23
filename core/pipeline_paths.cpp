@@ -7,6 +7,7 @@
 #include "snr_tuning.h"
 #include "raw_io.h"
 #include "parallel.h"
+#include "debug_utils.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #endif
@@ -196,6 +197,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
 
     report("Loading reference frame", 0.02f);
+    {
+        std::string listing = "ref_index=0\n";
+        for (size_t i = 0; i < paths.size(); ++i)
+            listing += std::to_string(i) + " " + paths[i] + "\n";
+        debug_dump_text("cpp_burst_paths", listing);
+    }
     Image ref = load_raw_frame(paths[0], work, true);
     if (ref.h <= 0 || ref.w <= 0) return Image();
     tune_config_snr(ref, work);
@@ -224,8 +231,14 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     report("Reference: grey + pyramid", 0.05f);
     // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
+    if (!ref_pyr.levels.empty()) {
+        // Match Python py_pyramid_0: first after pyramid[::-1] = coarsest.
+        const Image& coarse = ref_pyr.levels.back();
+        debug_dump_bin("cpp_pyramid_0", coarse.data.data(), coarse.data.size());
+    }
     ref_grey = Image(); // align uses pyramid only
 
     // Full-res (~12MP Bayer) cannot hold every comparison RAW + dual Metal peaks.
@@ -308,7 +321,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
 
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        debug_dump_bin("cpp_mov_grey_" + std::to_string(k - 1),
+                       comp_grey.data.data(), comp_grey.data.size());
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        debug_dump_bin("cpp_flow_" + std::to_string(k - 1),
+                       flow.flow.data(), flow.flow.size());
         comp_grey = Image(); // free before robustness/kernels peak
 
         // Full-res: decode next while Metal rob/kernels run (grey already freed).
@@ -333,6 +350,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
             covs = cov_fut.get();
         }
+        debug_dump_bin("cpp_mask_" + std::to_string(k - 1),
+                       rob.data.data(), rob.data.size());
 
         if (stream_comp_raw) {
             // Spill Bayer async (overlaps next decode already in flight). Keep

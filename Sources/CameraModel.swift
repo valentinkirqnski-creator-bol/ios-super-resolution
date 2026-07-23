@@ -59,20 +59,21 @@ enum LensZoomMode: Equatable {
 
 /// Holds the C++ algorithm tuning parameters for live adjustments.
 struct TuningParams: Equatable, Codable {
-    var r_t: Float = 1.0
-    var r_s1: Float = 1.52
-    var r_s2: Float = 2.1
-    var r_Mt: Float = 1.0
+    // Match Python configs/default.yaml
+    var r_t: Float = 0.12
+    var r_s1: Float = 2.0
+    var r_s2: Float = 12.0
+    var r_Mt: Float = 0.8
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
     var k_shrink: Float = 2.0
-    var snr_auto_tune: Bool = false
+    var snr_auto_tune: Bool = true
     var robustness_save_mask: Bool = true
-    var accumulated_robustness_denoiser_enabled: Bool = true
+    var accumulated_robustness_denoiser_enabled: Bool = false
     var acc_rob_rad_max: Float = 2.0
-    var acc_rob_max_multiplier: Float = 1.8
-    var acc_rob_max_frame_count: Float = 1.0
+    var acc_rob_max_multiplier: Float = 8.0
+    var acc_rob_max_frame_count: Float = 2.0
 
     /// App defaults — also applied by the settings Reset button.
     static let appDefaults = TuningParams()
@@ -117,7 +118,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 5
+        let defaultsVersion = 6
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -963,7 +964,21 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func processBurst() {
-        let paths = capturedDNGs.map { $0.path }
+        var paths = capturedDNGs.map { $0.path }
+
+        // DEBUG: if Documents contains ≥2 DNGs, process those (sorted) instead of the camera burst.
+        let fm = FileManager.default
+        if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
+           let items = try? fm.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) {
+            let docDNGs = items.filter { $0.pathExtension.lowercased() == "dng" }
+                .map { $0.path }
+                .sorted()
+            if docDNGs.count >= 2 {
+                paths = docDNGs
+                print("DEBUG OVERRIDE: Using \(paths.count) DNGs from Documents (ref=paths[0])")
+            }
+        }
+
         let burstDir = self.burstDir
         guard paths.count >= 2 else {
             removeBurstDir(burstDir)
@@ -1000,7 +1015,9 @@ final class CameraModel: NSObject, ObservableObject {
         ]
 
         var preview: UIImage?
-        let cropFactor = Int32(lensZoomMode.cropFactor)
+        // Documents debug DNGs: no center-crop (match Python full-frame run).
+        let usingDocDNGs = paths != capturedDNGs.map(\.path)
+        let cropFactor = usingDocDNGs ? Int32(1) : Int32(lensZoomMode.cropFactor)
         let inputURLs = capturedDNGs
         let ok = SRBridge.processDNGs(
             paths,
