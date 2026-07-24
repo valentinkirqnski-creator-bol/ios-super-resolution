@@ -126,7 +126,8 @@ static MetalCtx& ctx() {
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
-            "rob_make_mask", "rob_local_min_5x5", "l1_bm_ts16", "ica_refine_tile",
+            "rob_make_mask", "rob_local_min_5x5",
+            "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian", "align_upscale_flow",
             "merge_normalize_rgb16",
@@ -1265,7 +1266,14 @@ static bool l2_bufs(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer> 
 static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
                     int ref_h, int ref_w, int mov_h, int mov_w,
                     int tile_size, int search_radius, int ny, int nx) {
-    if (tile_size != 16 || search_radius < 0 || search_radius > 1) return false;
+    if (search_radius < 0) return false;
+    if (tile_size == 16) {
+        if (2 * search_radius + 16 > 32) return false;
+    } else if (tile_size == 32 || tile_size == 64) {
+        if (2 * search_radius > 16) return false;
+    } else {
+        return false;
+    }
     if (ny <= 0 || nx <= 0) return true;
     auto& c = ctx();
     struct L1BmParamsCPU {
@@ -1290,7 +1298,9 @@ static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_fl
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    id<MTLComputePipelineState> pipe = c.pipe("l1_bm_ts16");
+    const char* pipe_name = tile_size == 16 ? "l1_bm_ts16" :
+                            tile_size == 32 ? "l1_bm_ts32" : "l1_bm_ts64";
+    id<MTLComputePipelineState> pipe = c.pipe(pipe_name);
     if (!pipe) return false;
     [enc setComputePipelineState:pipe];
     const NSUInteger ntiles = (NSUInteger)ny * (NSUInteger)nx;
@@ -1308,7 +1318,8 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
                      id<MTLBuffer> b_hess, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
                      int ref_h, int ref_w, int mov_h, int mov_w,
                      int ny, int nx, int tile_size, int n_iter) {
-    if (tile_size != 8 && tile_size != 16) return false;
+    if (tile_size != 8 && tile_size != 16 && tile_size != 32 && tile_size != 64)
+        return false;
     if (n_iter < 0) return false;
     if (ny <= 0 || nx <= 0) return true;
     auto& c = ctx();
@@ -1377,7 +1388,14 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow) {
     if (!metal_gpu_init()) return false;
-    if (tile_size != 16 || search_radius < 0 || search_radius > 1) return false;
+    if (search_radius < 0) return false;
+    if (tile_size == 16) {
+        if (2 * search_radius + 16 > 32) return false;
+    } else if (tile_size == 32 || tile_size == 64) {
+        if (2 * search_radius > 16) return false;
+    } else {
+        return false;
+    }
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
     id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
@@ -1396,7 +1414,8 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
                             const Image& moving, FlowField& flow,
                             int tile_size, int n_iter) {
     if (!metal_gpu_init()) return false;
-    if (tile_size != 8 && tile_size != 16) return false;
+    if (tile_size != 8 && tile_size != 16 && tile_size != 32 && tile_size != 64)
+        return false;
     if (n_iter < 0) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
@@ -1570,11 +1589,20 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
     // Fine-first levels[]: params arrays are fine→coarse, so index with lvl.
     for (int lvl = 0; lvl < nlev; ++lvl) {
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
-        if (ts != 8 && ts != 16) return false;
+        if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
-        if (metric == "L1" && (ts != 16 || radius > 1)) return false;
+        if (metric == "L1") {
+            if (radius < 0) return false;
+            if (ts == 16) {
+                if (2 * radius + 16 > 32) return false;
+            } else if (ts == 32 || ts == 64) {
+                if (2 * radius > 16) return false;
+            } else {
+                return false;
+            }
+        }
     }
 
     auto& c = ctx();

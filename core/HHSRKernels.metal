@@ -552,21 +552,6 @@ struct MergeRefParams {
     uint _pad2;
 };
 
-inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
-    const float k_max_abs = 32.f;
-    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
-    if (!(m > k_max_abs) || !isfinite(m)) {
-        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
-            ixx = 2.f; ixy = 0.f; iyy = 2.f;
-        }
-        return;
-    }
-    float s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
-}
-
 inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx) {
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
@@ -606,14 +591,10 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     float yy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 3);
     if (raw_det) {
         float det = xx * yy - xy * xy;
-        if (fabs(det) > 1e-10f) {
-            float inv_det = 1.f / det;
-            ixx =  inv_det * yy;
-            ixy = -inv_det * xy;
-            iyy =  inv_det * xx;
-        } else {
-            ixx = 1.f; ixy = 0.f; iyy = 1.f;
-        }
+        float inv_det = 1.f / det;
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
     } else {
         // invert_sym_2x2 / invert_2x2 with EPSILON_DIV
         float det = xx * yy - xy * xy;
@@ -626,7 +607,6 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
-    soften_inv_cov(ixx, ixy, iyy);
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -714,8 +694,7 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
             z = max(0.f, z);
-            // Same formula as CPU std::exp (fast path; was precise::exp).
-            float w = exp(-0.5f * z);
+            float w = precise::exp(-0.5f * z);
 
             float contrib_v = w * local_r * c;
             float contrib_a = w * local_r;
@@ -793,7 +772,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
-            float w = exp(-0.5f * y);
+            float w = precise::exp(-0.5f * y);
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }
@@ -815,7 +794,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
 }
 
 // =============================================================================
-// Alg. 5 — estimate_kernels (matches kernels.cpp exactly, incl. float guards)
+// Alg. 5 — estimate_kernels (matches kernels.cpp exactly)
 // =============================================================================
 
 struct KernelEstParams {
@@ -874,17 +853,10 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
     }
 }
 
-// kernels.cpp compute_k (incl. flat-tensor + k_min guards)
+// kernels.py compute_k / hard_threshold / linear
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
-    l1 = max(0.f, l1);
-    l2 = max(0.f, l2);
-    float sum = l1 + l2;
-    if (sum < 1e-12f) {
-        k1 = k2 = p.k_detail * p.k_denoise;
-        return;
-    }
-    float A = 1.f + sqrt(max(0.f, (l1 - l2) / sum));
+    float A = 1.f + sqrt((l1 - l2) / (l1 + l2));
     float D = clamp(1.f - sqrt(l1) / p.D_tr + p.D_th, 0.f, 1.f);
     float kk1, kk2;
     if (p.selection == 0u) {
@@ -896,9 +868,6 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
-    constexpr float k_min = 0.15f;
-    k1 = max(k1, k_min);
-    k2 = max(k2, k_min);
 }
 
 kernel void kernel_gat(device float* out [[buffer(0)]],
@@ -1143,14 +1112,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float brightness = ref_means[o];
         // Python: id_noise = round(1000 * brightness) — no clamp.
         int id_noise = lround_away(1000.f * brightness);
-        // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
-        // Finite brightness in [0,1] → id in [0,1000] unchanged (same as Python).
-        if (!isfinite(brightness))
-            id_noise = 0;
-        else if (id_noise < 0)
-            id_noise = 0;
-        else if (id_noise >= int(p.curve_n))
-            id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
         float sigma_t = std_curve[id];
         float d_t = diff_curve[id];
@@ -1216,6 +1177,15 @@ inline float warp_then_block_reduce_256(thread float* vals /*256*/) {
     return total;
 }
 
+inline float warp_then_block_reduce_1024(thread float* vals /*1024*/) {
+    float warp_sums[32];
+    for (int w = 0; w < 32; ++w)
+        warp_sums[w] = cuda_shfl_down_warp_sum_lane0_local(vals + w * 32);
+    float total = warp_sums[0];
+    for (int w = 1; w < 32; ++w) total += warp_sums[w];
+    return total;
+}
+
 kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
                        device const float* mov [[buffer(1)]],
                        device float* flow [[buffer(2)]],
@@ -1236,9 +1206,8 @@ kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
     int flow_dx = int(round(fdx));
     int flow_dy = int(round(fdy));
 
-    float s_err[9]; // R<=1 → corr<=3; default R=1. Cap at 9 for stack.
-    // General R: use max corr 9 (R<=4 would need more — only dispatch for R<=1).
-    if (corr > 9) return;
+    float s_err[289]; // Python ts==16 supports 2*R+16 <= 32 -> corr <= 17.
+    if (corr > 17) return;
 
     float per[256];
     for (int sdy = -R; sdy <= R; ++sdy) {
@@ -1284,6 +1253,128 @@ kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
 // Butterfly reduce order matches align.cpp butterfly_reduce_sum (same as CUDA
 // shared-mem while N>0 tree). Bilinear: ts==8 clamp-to-edge; else OOB→0.
 // ---------------------------------------------------------------------------
+kernel void l1_bm_ts32(device const float* ref [[buffer(0)]],
+                       device const float* mov [[buffer(1)]],
+                       device float* flow [[buffer(2)]],
+                       constant L1BmParams& p [[buffer(3)]],
+                       uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.ny * p.nx) return;
+    uint ty = tid / p.nx;
+    uint tx = tid % p.nx;
+    int ts = 32;
+    int R = int(p.R);
+    int corr = 2 * R + 1;
+    if (corr > 17) return;
+    int oy = int(ty) * ts;
+    int ox = int(tx) * ts;
+
+    float fdx = flow[tid * 2u + 0u];
+    float fdy = flow[tid * 2u + 1u];
+    int flow_dx = int(round(fdx));
+    int flow_dy = int(round(fdy));
+
+    float s_err[289];
+    float per[1024];
+    for (int sdy = -R; sdy <= R; ++sdy) {
+        for (int sdx = -R; sdx <= R; ++sdx) {
+            for (int i = 0; i < 32; ++i) {
+                int ry = oy + i;
+                for (int j = 0; j < 32; ++j) {
+                    int rx = ox + j;
+                    int tidp = i * 32 + j;
+                    float rv = (ry < int(p.ref_h) && rx < int(p.ref_w))
+                                   ? ref[uint(ry) * p.ref_w + uint(rx)] : 0.f;
+                    int my = ry + flow_dy + sdy;
+                    int mx = rx + flow_dx + sdx;
+                    float mv = (my >= 0 && my < int(p.mov_h) && mx >= 0 && mx < int(p.mov_w))
+                                   ? mov[uint(my) * p.mov_w + uint(mx)] : 0.f;
+                    per[tidp] = fabs(rv - mv);
+                }
+            }
+            s_err[(sdy + R) * corr + (sdx + R)] = warp_then_block_reduce_1024(per);
+        }
+    }
+
+    float err = INFINITY;
+    int min_shift_x = 0, min_shift_y = 0;
+    for (int i = 0; i < corr; ++i) {
+        for (int j = 0; j < corr; ++j) {
+            float min_v = s_err[i * corr + j];
+            if (err < min_v) {
+                min_shift_y = i - R;
+                min_shift_x = j - R;
+            }
+        }
+    }
+    flow[tid * 2u + 0u] = float(flow_dx + min_shift_x);
+    flow[tid * 2u + 1u] = float(flow_dy + min_shift_y);
+}
+
+kernel void l1_bm_ts64(device const float* ref [[buffer(0)]],
+                       device const float* mov [[buffer(1)]],
+                       device float* flow [[buffer(2)]],
+                       constant L1BmParams& p [[buffer(3)]],
+                       uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.ny * p.nx) return;
+    uint ty = tid / p.nx;
+    uint tx = tid % p.nx;
+    int ts = 64;
+    int R = int(p.R);
+    int corr = 2 * R + 1;
+    if (corr > 17) return;
+    int oy = int(ty) * ts;
+    int ox = int(tx) * ts;
+
+    float fdx = flow[tid * 2u + 0u];
+    float fdy = flow[tid * 2u + 1u];
+    int flow_dx = int(round(fdx));
+    int flow_dy = int(round(fdy));
+
+    float s_err[289];
+    float per[1024];
+    for (int sdy = -R; sdy <= R; ++sdy) {
+        for (int sdx = -R; sdx <= R; ++sdx) {
+            (void)sdy;
+            (void)sdx;
+            for (int tyy = 0; tyy < 16; ++tyy) {
+                for (int txx = 0; txx < 64; ++txx) {
+                    int ti = tyy * 64 + txx;
+                    int px = ox + txx;
+                    int py0 = oy + tyy * 4;
+                    float acc = 0.f;
+                    for (int k = 0; k < 4; ++k) {
+                        int py = py0 + k;
+                        float rv = (py < int(p.ref_h) && px < int(p.ref_w))
+                                       ? ref[uint(py) * p.ref_w + uint(px)] : 0.f;
+                        int my = py + flow_dy;
+                        int mx = px + flow_dx;
+                        float mv = (my >= 0 && my < int(p.mov_h) &&
+                                    mx >= 0 && mx < int(p.mov_w))
+                                       ? mov[uint(my) * p.mov_w + uint(mx)] : 0.f;
+                        acc += fabs(rv - mv);
+                    }
+                    per[ti] = acc;
+                }
+            }
+            s_err[(sdy + R) * corr + (sdx + R)] = warp_then_block_reduce_1024(per);
+        }
+    }
+
+    float err = INFINITY;
+    int min_shift_x = 0, min_shift_y = 0;
+    for (int i = 0; i < corr; ++i) {
+        for (int j = 0; j < corr; ++j) {
+            float min_v = s_err[i * corr + j];
+            if (err < min_v) {
+                min_shift_y = i - R;
+                min_shift_x = j - R;
+            }
+        }
+    }
+    flow[tid * 2u + 0u] = float(flow_dx + min_shift_x);
+    flow[tid * 2u + 1u] = float(flow_dy + min_shift_y);
+}
+
 struct IcaParams {
     uint ref_h, ref_w, mov_h, mov_w;
     uint ny, nx, ts, n_iter;
@@ -1350,7 +1441,7 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     uint ty = tid / p.nx;
     uint tx = tid % p.nx;
     int ts = int(p.ts);
-    if (ts != 8 && ts != 16) return; // default pyramid sizes only
+    if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return;
     int n_pix = ts * ts;
     int oy = int(ty) * ts;
     int ox = int(tx) * ts;
@@ -1367,6 +1458,68 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 
     float fx = flow[tid * 2u + 0u];
     float fy = flow[tid * 2u + 1u];
+
+    if (ts == 32 || ts == 64) {
+        for (uint it = 0u; it < p.n_iter; ++it) {
+            float floor_fx = trunc(fx);
+            float floor_fy = trunc(fy);
+            float frac_x = fx - floor_fx;
+            float frac_y = fy - floor_fy;
+            int floor_off_x = int(floor_fx);
+            int floor_off_y = int(floor_fy);
+
+            float B0 = 0.f;
+            float B1 = 0.f;
+            if (ts == 32) {
+                for (int i = 0; i < 32; ++i) {
+                    int py = oy + i;
+                    for (int j = 0; j < 32; ++j) {
+                        int px = ox + j;
+                        if (py >= RH || px >= RW) continue;
+                        float mov_interp = bilinear_ica_metal(
+                            mov, py, px, floor_off_y, floor_off_x, frac_x, frac_y,
+                            MH, MW, false);
+                        uint ro = uint(py) * p.ref_w + uint(px);
+                        float gradt = mov_interp - ref[ro];
+                        B0 += -gradx[ro] * gradt;
+                        B1 += -grady[ro] * gradt;
+                    }
+                }
+            } else {
+                for (int tyy = 0; tyy < 16; ++tyy) {
+                    for (int txx = 0; txx < 64; ++txx) {
+                        int px = ox + txx;
+                        int py0 = oy + tyy * 4;
+                        int floor_x = px + floor_off_x;
+                        int floor_y = py0 + floor_off_y;
+                        float m10 = sample_mov(mov, floor_y, floor_x, MH, MW, false);
+                        float m11 = sample_mov(mov, floor_y, floor_x + 1, MH, MW, false);
+                        float lerpx_bot = m10 + (m11 - m10) * frac_x;
+                        for (int k = 0; k < 4; ++k) {
+                            int py = py0 + k;
+                            floor_y += 1;
+                            m10 = sample_mov(mov, floor_y + 1, floor_x, MH, MW, false);
+                            m11 = sample_mov(mov, floor_y + 1, floor_x + 1, MH, MW, false);
+                            float lerpx_top = lerpx_bot;
+                            lerpx_bot = m10 + (m11 - m10) * frac_x;
+                            float mov_interp = lerpx_top + (lerpx_bot - lerpx_top) * frac_y;
+                            if (py < RH && px < RW) {
+                                uint ro = uint(py) * p.ref_w + uint(px);
+                                float gradt = mov_interp - ref[ro];
+                                B0 += -gradx[ro] * gradt;
+                                B1 += -grady[ro] * gradt;
+                            }
+                        }
+                    }
+                }
+            }
+            fx += det_inv * (h11 * B0 - h01 * B1);
+            fy += det_inv * (-h10 * B0 + h00 * B1);
+        }
+        flow[tid * 2u + 0u] = fx;
+        flow[tid * 2u + 1u] = fy;
+        return;
+    }
 
     // Max ts=16 → 256; ts=8 uses first 64.
     float s_B0[256];
@@ -1577,16 +1730,13 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
                                   uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.Ws || gid.y >= p.bh) return;
     uint pi = (gid.y * p.Ws + gid.x) * p.nch;
-    float d0 = den[pi];
-    float cn0 = (d0 > 0.f) ? num[pi] / d0 : 0.f;
+    float cn0 = num[pi] / den[pi];
     float cn1 = 0.f, cn2 = 0.f;
     if (p.nch >= 2u) {
-        float d1 = den[pi + 1u];
-        cn1 = (d1 > 0.f) ? num[pi + 1u] / d1 : 0.f;
+        cn1 = num[pi + 1u] / den[pi + 1u];
     }
     if (p.nch >= 3u) {
-        float d2 = den[pi + 2u];
-        cn2 = (d2 > 0.f) ? num[pi + 2u] / d2 : 0.f;
+        cn2 = num[pi + 2u] / den[pi + 2u];
     }
     float lin0, lin1, lin2;
     if (p.bake != 0u && p.nch >= 3u) {

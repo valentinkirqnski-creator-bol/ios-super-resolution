@@ -457,13 +457,6 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 f32 brightness = ref_means.at(y, x, ch);
                 // Python: id_noise = round(1000 * brightness) — no clamp.
                 int id_noise = (int)std::lround(1000.f * brightness);
-                // Host: same bins as Python for finite brightness in range; avoid crash on +inf.
-                if (!std::isfinite(brightness))
-                    id_noise = 0;
-                else if (id_noise < 0)
-                    id_noise = 0;
-                else if (id_noise >= (int)nc.std_curve.size())
-                    id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);

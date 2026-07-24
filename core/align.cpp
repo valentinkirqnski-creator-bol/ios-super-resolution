@@ -325,7 +325,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
 #ifdef __APPLE__
-    if (block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow))
+    if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&
+        block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow))
         return;
 #endif
     int ny = flow.ny, nx = flow.nx;
@@ -607,7 +608,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     int nlev = (int)ref_pyr.levels.size();
 
 #ifdef __APPLE__
-    // GPU path. HHSR_ALIGN_CPU=1 forces CPU (L1 bugs + vDSP L2 closer to Torch).
+    // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
         if (align_metal(ref_pyr, moving_grey, cfg, tile_size, flow_gpu))

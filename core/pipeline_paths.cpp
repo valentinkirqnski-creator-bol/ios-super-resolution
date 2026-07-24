@@ -135,16 +135,13 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
             if (gpu_rgb && !need_prev) continue;
 
             const size_t pi = row_off + (size_t)x * (size_t)nch;
-            f32 d0 = denp[pi];
-            f32 cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
+            f32 cn0 = nump[pi] / denp[pi];
             f32 cn1 = 0.f, cn2 = 0.f;
             if (nch >= 2) {
-                f32 d1 = denp[pi + 1];
-                cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
+                cn1 = nump[pi + 1] / denp[pi + 1];
             }
             if (nch >= 3) {
-                f32 d2 = denp[pi + 2];
-                cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
+                cn2 = nump[pi + 2] / denp[pi + 2];
             }
             f32 lin0, lin1, lin2;
             if (bake) {
