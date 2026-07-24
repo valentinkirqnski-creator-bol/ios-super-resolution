@@ -45,7 +45,8 @@ bool downsample_by_metal(const Image& src, int factor, Image& out);
 // (same math as align()). Sobel/Hess are computed one pyramid level at a time
 // (no all-level sticky cache — that jetsams at 1×). Uses sticky grey from
 // compute_grey_fft_metal when dims match. Downloads final flow only.
-bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
+bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
+                 const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out);
 
 // No-op retained for clear_align_ref_ica_cache pairing (host cache is separate).

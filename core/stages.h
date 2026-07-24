@@ -45,7 +45,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 void clear_align_ref_ica_cache();
 
 // ---- robustness.cpp -----------------------------------------------------
-struct RefStats { Image means; Image stds; }; // raw resolution [h, w, ch]
+struct RefStats { Image means; Image stds; }; // guide resolution [h/2, w/2, ch] for Bayer
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).

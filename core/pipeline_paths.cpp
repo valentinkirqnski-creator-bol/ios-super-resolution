@@ -424,15 +424,13 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
-    ref_grey = pad_image_circular(ref_grey, tile_size);
-    Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
+    Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
+    Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
     if (!ref_pyr.levels.empty()) {
         // Match Python py_pyramid_0: first after pyramid[::-1] = coarsest.
         const Image& coarse = ref_pyr.levels.back();
         debug_dump_bin("cpp_pyramid_0", coarse.data.data(), coarse.data.size());
     }
-    ref_grey = Image(); // align uses pyramid only
-
     // Full-res (~12MP Bayer) cannot hold every comparison RAW + dual Metal peaks.
     const bool full_res =
         ((size_t)ref_h * (size_t)ref_w) >= 8ull * 1000ull * 1000ull;

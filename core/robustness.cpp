@@ -8,6 +8,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <utility>
 #ifdef __APPLE__
 #include "metal_gpu.h"
 #endif
@@ -537,8 +538,10 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     Image guide = compute_guide(ref_raw, cfg);
     Image means, vars;
     local_stats_3x3(guide, means, vars);
-    st.means = upscale_warp_stats(means, true, nullptr, 0, cfg.num_threads);
-    st.stds  = upscale_warp_stats(vars, true, nullptr, 0, cfg.num_threads);
+    // 460-main keeps robustness local statistics on the guide grid
+    // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
+    st.means = std::move(means);
+    st.stds  = std::move(vars);
     return st;
 #endif
 }
@@ -546,7 +549,8 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg) {
     if (!cfg.robustness_enabled) {
-        Image r(comp_raw.h, comp_raw.w, 1);
+        Image guide = compute_guide(comp_raw, cfg);
+        Image r(guide.h, guide.w, 1);
         std::fill(r.data.begin(), r.data.end(), 1.f);
         return r;
     }
@@ -554,7 +558,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) {
         // Do not fully trust comps when alignment produced no flow (Python has no
         // such bandage; ones here made the mask white and let ghosts through).
-        Image r(comp_raw.h, comp_raw.w, 1);
+        Image guide = compute_guide(comp_raw, cfg);
+        Image r(guide.h, guide.w, 1);
         std::fill(r.data.begin(), r.data.end(), 0.f);
         return r;
     }
@@ -573,14 +578,33 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     local_stats_3x3(guide, comp_means, comp_vars);
     // Python discards comp local stds
     (void)comp_vars;
-    comp_means = upscale_warp_stats(comp_means, false, &flow, tile_size, cfg.num_threads);
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            for (int ch = 0; ch < d_p.c; ++ch)
-                d_p.at(y, x, ch) = std::fabs(ref_stats.means.at(y, x, ch) - comp_means.at(y, x, ch));
+            f32 flow_x = 0.f, flow_y = 0.f;
+            int patch_idy = 0, patch_idx = 0;
+            if (d_p.c == 1) {
+                patch_idy = y / tile_size;
+                patch_idx = x / tile_size;
+                flow_x = flow.dx(patch_idy, patch_idx);
+                flow_y = flow.dy(patch_idy, patch_idx);
+            } else {
+                patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
+                patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
+                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+            }
+
+            const int new_x = (int)std::lround((f32)x + flow_x);
+            const int new_y = (int)std::lround((f32)y + flow_y);
+            const bool inbound = (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h);
+            for (int ch = 0; ch < d_p.c; ++ch) {
+                d_p.at(y, x, ch) = inbound
+                    ? std::fabs(ref_stats.means.at(y, x, ch) - comp_means.at(new_y, new_x, ch))
+                    : std::numeric_limits<f32>::infinity();
+            }
         }
     }
 
@@ -592,9 +616,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image R(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            // Python: patch_idy = int(idy // tile_size)  (no clamp)
-            int patch_idy = y / tile_size;
-            int patch_idx = x / tile_size;
+            int patch_idy, patch_idx;
+            if (ref_stats.means.c == 3) {
+                patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
+                patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
+            } else {
+                patch_idy = y / tile_size;
+                patch_idx = x / tile_size;
+            }
             f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
             f32 sig = sigma_sq.at(y, x);
             R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);

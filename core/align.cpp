@@ -98,9 +98,9 @@ struct HessianField {
 };
 
 static HessianField compute_hessian(const Image& gradx, const Image& grady, int ts) {
-    // Python init_ica: ny, nx = h // tile_size, w // tile_size
-    int ny = gradx.h / ts;
-    int nx = gradx.w / ts;
+    // Python init_ICA: ny, nx = ceil(h / tile_size), ceil(w / tile_size).
+    int ny = (gradx.h + ts - 1) / ts;
+    int nx = (gradx.w + ts - 1) / ts;
     HessianField H;
     H.ny = ny;
     H.nx = nx;
@@ -721,15 +721,13 @@ void clear_align_ref_ica_cache() {
 // ============================================================================
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg, int tile_size) {
-    (void)ref_grey; // pyramid already built from padded ref
     int nlev = (int)ref_pyr.levels.size();
 
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
-        Image moving_padded_gpu = pad_image_circular(moving_grey, tile_size);
-        if (align_metal(ref_pyr, moving_padded_gpu, cfg, tile_size, flow_gpu))
+        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu))
             return flow_gpu;
     }
 #endif
@@ -739,8 +737,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // returns coarse-first (pyramid[::-1]); its list_id = n-1-l then maps
     // coarse→params[n-1], fine→params[0]. With fine-first storage that is simply
     // params[lvl] (arrays are fine→coarse in default.yaml).
-    if (g_ref_ica_cache.key != (const void*)&ref_pyr ||
-        (int)g_ref_ica_cache.levels.size() != nlev) {
+    if (false && (g_ref_ica_cache.key != (const void*)&ref_pyr ||
+        (int)g_ref_ica_cache.levels.size() != nlev)) {
         g_ref_ica_cache.key = (const void*)&ref_pyr;
         g_ref_ica_cache.levels.assign((size_t)nlev, RefIcaLevel{});
         for (int lvl = 0; lvl < nlev; ++lvl) {
@@ -799,11 +797,15 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg.num_threads);
 
-        const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
-        ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts, cfg.ica_n_iter,
-                         cfg.num_threads);
     }
 
+    Image gx = compute_sobel_gradx(ref_grey);
+    Image gy = compute_sobel_grady(ref_grey);
+    HessianField hess = compute_hessian(gx, gy, tile_size);
+    debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
+    debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
+    ica_refine_level(ref_grey, gx, gy, moving_grey, hess, flow, tile_size,
+                     cfg.ica_n_iter, cfg.num_threads);
     return flow;
 }
 

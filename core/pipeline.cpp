@@ -70,8 +70,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     report("Reference: grey + pyramid", 0.02f);
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
-    ref_grey = pad_image_circular(ref_grey, tile_size);
-    Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
+    Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
+    Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
 
     report("Reference: local stats", 0.05f);
     RefStats ref_stats = init_robustness(ref, work);
@@ -147,8 +147,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     report("Reference: grey + pyramid", 0.02f);
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
-    ref_grey = pad_image_circular(ref_grey, tile_size);
-    Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
+    Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
+    Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);
 

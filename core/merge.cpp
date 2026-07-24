@@ -87,8 +87,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            const f32 lr_x = (hr_j + 0.5f) / scale;
-            const f32 lr_y = (hr_i + 0.5f) / scale;
+            // Python accumulate(): coarse_ref_sub_pos = output_pixel / scale.
+            const f32 lr_x = (f32)hr_j / scale;
+            const f32 lr_y = (f32)hr_i / scale;
 
             // Python: px = int(lr_x // tile_size); no clamp on flow tile index
             const int px = (int)(lr_x / (f32)tile_size);
@@ -96,8 +97,16 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 flowx = flow.dx(py, px);
             const f32 flowy = flow.dy(py, px);
 
-            const int i_r = std::min((int)lr_y, lr_h - 1);
-            const int j_r = std::min((int)lr_x, lr_w - 1);
+            int i_r, j_r;
+            if (cfg.bayer_mode) {
+                i_r = std::min(std::max(cuda_round_to_int((lr_y - 0.5f) / 2.f), 0),
+                               robustness.h - 1);
+                j_r = std::min(std::max(cuda_round_to_int((lr_x - 0.5f) / 2.f), 0),
+                               robustness.w - 1);
+            } else {
+                i_r = std::min(std::max(cuda_round_to_int(lr_y), 0), robustness.h - 1);
+                j_r = std::min(std::max(cuda_round_to_int(lr_x), 0), robustness.w - 1);
+            }
             const f32 local_r = robustness.at(i_r, j_r);
 
             const f32 lr_mov_x = lr_x + flowx;
@@ -119,10 +128,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
 
-            const int center_j = (int)lr_mov_x;
-            const int center_i = (int)lr_mov_y;
-            const f32 lr_mov_j = lr_mov_x - 0.5f;
-            const f32 lr_mov_i = lr_mov_y - 0.5f;
+            const int center_j = cuda_round_to_int(lr_mov_x);
+            const int center_i = cuda_round_to_int(lr_mov_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
@@ -134,8 +141,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
                     const f32 c = img.at(i, j);
 
-                    const f32 dist_x = (f32)j - lr_mov_j;
-                    const f32 dist_y = (f32)i - lr_mov_i;
+                    const f32 dist_x = (f32)j - lr_mov_x;
+                    const f32 dist_y = (f32)i - lr_mov_y;
                     f32 z;
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
@@ -181,8 +188,14 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             if (robustness_denoise && acc_rob) {
                 // Python: acc_rob[min(round(coarse_y), h-1), min(round(coarse_x), w-1)]
                 // (high clamp only — no max(0,·))
-                const int ay = std::min(cuda_round_to_int(coarse_y), acc_rob->h - 1);
-                const int ax = std::min(cuda_round_to_int(coarse_x), acc_rob->w - 1);
+                f32 acc_y = coarse_y;
+                f32 acc_x = coarse_x;
+                if (cfg.bayer_mode) {
+                    acc_y = (coarse_y - 0.5f) / 2.f;
+                    acc_x = (coarse_x - 0.5f) / 2.f;
+                }
+                const int ay = std::min(std::max(cuda_round_to_int(acc_y), 0), acc_rob->h - 1);
+                const int ax = std::min(std::max(cuda_round_to_int(acc_x), 0), acc_rob->w - 1);
                 local_acc_r = acc_rob->at(ay, ax);
                 additional_denoise_power =
                     denoise_power_merge(local_acc_r, max_multiplier, max_frame_count);

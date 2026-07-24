@@ -562,6 +562,8 @@ struct MergeCompParams {
     uint y0;
     uint lr_h;
     uint lr_w;
+    uint rob_h;
+    uint rob_w;
     uint flow_ny;
     uint flow_nx;
     uint cov_h;
@@ -577,6 +579,8 @@ struct MergeCompParams {
     uint cfa11;
     uint _pad0;
     uint _pad1;
+    uint _pad2;
+    uint _pad3;
 };
 
 struct MergeRefParams {
@@ -605,6 +609,11 @@ struct MergeRefParams {
     uint _pad1;
     uint _pad2;
 };
+
+// std::lround half-away-from-zero.
+inline int lround_away(float x) {
+    return (x >= 0.f) ? int(floor(x + 0.5f)) : int(ceil(x - 0.5f));
+}
 
 inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx) {
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
@@ -699,8 +708,8 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
     if (hr_j >= p.Ws || local_i >= p.band_h) return;
 
     int hr_i = int(p.y0 + local_i);
-    float lr_x = (float(hr_j) + 0.5f) / p.scale;
-    float lr_y = (float(hr_i) + 0.5f) / p.scale;
+    float lr_x = float(hr_j) / p.scale;
+    float lr_y = float(hr_i) / p.scale;
 
     // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
     int px = int(lr_x / float(p.tile_size));
@@ -708,9 +717,15 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
     float flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
     float flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
 
-    int i_r = min(int(lr_y), int(p.lr_h) - 1);
-    int j_r = min(int(lr_x), int(p.lr_w) - 1);
-    float local_r = robustness[uint(i_r) * p.lr_w + uint(j_r)];
+    int i_r, j_r;
+    if (p.bayer) {
+        i_r = min(max(lround_away((lr_y - 0.5f) / 2.f), 0), int(p.rob_h) - 1);
+        j_r = min(max(lround_away((lr_x - 0.5f) / 2.f), 0), int(p.rob_w) - 1);
+    } else {
+        i_r = min(max(lround_away(lr_y), 0), int(p.rob_h) - 1);
+        j_r = min(max(lround_away(lr_x), 0), int(p.rob_w) - 1);
+    }
+    float local_r = robustness[uint(i_r) * p.rob_w + uint(j_r)];
 
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
@@ -731,10 +746,8 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
-    int center_j = int(lr_mov_x);
-    int center_i = int(lr_mov_y);
-    float lr_mov_j = lr_mov_x - 0.5f;
-    float lr_mov_i = lr_mov_y - 0.5f;
+    int center_j = lround_away(lr_mov_x);
+    int center_i = lround_away(lr_mov_y);
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -746,8 +759,8 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
 
             int channel = cfa_channel(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
-            float dist_x = float(j) - lr_mov_j;
-            float dist_y = float(i) - lr_mov_i;
+            float dist_x = float(j) - lr_mov_x;
+            float dist_y = float(i) - lr_mov_y;
             float z;
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
@@ -789,8 +802,10 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
     int rad = 1;
     if (p.robustness_denoise) {
         // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
-        int ay = min(int(round(coarse_y)), int(p.acc_h) - 1);
-        int ax = min(int(round(coarse_x)), int(p.acc_w) - 1);
+        float acc_y = p.bayer ? (coarse_y - 0.5f) / 2.f : coarse_y;
+        float acc_x = p.bayer ? (coarse_x - 0.5f) / 2.f : coarse_x;
+        int ay = min(max(lround_away(acc_y), 0), int(p.acc_h) - 1);
+        int ax = min(max(lround_away(acc_x), 0), int(p.acc_w) - 1);
         local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
         additional_denoise_power =
             (local_acc_r <= p.max_frame_count) ? p.max_multiplier : 1.f;
@@ -1030,10 +1045,12 @@ struct RobDogsonParams {
 struct RobMaskParams {
     uint h, w, nch;
     uint tile_size;
+    uint flow_ny;
     uint flow_nx;
     uint curve_n;     // 1001
+    uint bayer;
     float r_t;
-    uint _pad0;
+    uint _pad0, _pad1, _pad2;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1041,11 +1058,6 @@ inline float dogson_quadratic(float x) {
     if (ax <= 0.5f) return -2.f * ax * ax + 1.f;
     if (ax <= 1.5f) return ax * ax - 2.5f * ax + 1.5f;
     return 0.f;
-}
-
-// std::lround half-away-from-zero (not banker's round)
-inline int lround_away(float x) {
-    return (x >= 0.f) ? int(floor(x + 0.5f)) : int(ceil(x - 0.5f));
 }
 
 inline int clamp_edge(int v, int hi) {
@@ -1155,10 +1167,32 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* std_curve [[buffer(4)]],
                           device const float* diff_curve [[buffer(5)]],
                           device const float* S [[buffer(6)]],
-                          constant RobMaskParams& p [[buffer(7)]],
+                          device const float* flow [[buffer(7)]],
+                          constant RobMaskParams& p [[buffer(8)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
+    int patch_idy;
+    int patch_idx;
+    float flow_x;
+    float flow_y;
+    if (p.nch == 1u) {
+        patch_idy = int(gid.y) / int(p.tile_size);
+        patch_idx = int(gid.x) / int(p.tile_size);
+        uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
+        flow_x = flow[fi + 0u];
+        flow_y = flow[fi + 1u];
+    } else {
+        patch_idy = int((2.f * float(gid.y) + 0.5f) / float(p.tile_size));
+        patch_idx = int((2.f * float(gid.x) + 0.5f) / float(p.tile_size));
+        uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
+        flow_x = 0.5f * flow[fi + 0u];
+        flow_y = 0.5f * flow[fi + 1u];
+    }
+    int new_idx = lround_away(float(gid.x) + flow_x);
+    int new_idy = lround_away(float(gid.y) + flow_y);
+    bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
+                    0 <= new_idy && new_idy < int(p.h));
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -1177,13 +1211,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_t = diff_curve[id];
         float sigma_p_sq = ref_vars[o];
         sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-        float d_p_ = fabs(ref_means[o] - comp_means[o]);
+        float d_p_ = inbound
+            ? fabs(ref_means[o] - comp_means[(uint(new_idy) * p.w + uint(new_idx)) * p.nch + ch])
+            : INFINITY;
         float d_p_sq = d_p_ * d_p_;
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
         d_sq_ += d_p_sq * shrink * shrink;
     }
-    int patch_idy = int(gid.y) / int(p.tile_size);
-    int patch_idx = int(gid.x) / int(p.tile_size);
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     R[gid.y * p.w + gid.x] = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);

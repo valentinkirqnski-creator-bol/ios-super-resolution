@@ -815,11 +815,11 @@ struct RobDogsonParamsCPU {
 static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 
 struct RobMaskParamsCPU {
-    uint32_t h, w, nch, tile_size, flow_nx, curve_n;
+    uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
     float r_t;
-    uint32_t _pad0 = 0;
+    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 32, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 48, "RobMaskParamsCPU");
 
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2) {
     const f32 inf = std::numeric_limits<f32>::infinity();
@@ -987,33 +987,25 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     if (!rob_run_guide_stats(ref_raw, cfg, b_means, b_vars, gh, gw, nch, cmd))
         return RefStats();
 
-    id<MTLBuffer> b_out_m = nil, b_out_v = nil;
-    int oh = 0, ow = 0;
-    if (!rob_dogson(b_means, b_out_m, gh, gw, nch, true, nullptr, 0, oh, ow, cmd))
-        return RefStats();
-    int oh2 = 0, ow2 = 0;
-    if (!rob_dogson(b_vars, b_out_v, gh, gw, nch, true, nullptr, 0, oh2, ow2, cmd))
-        return RefStats();
-
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return RefStats();
 
-    // Pin Dogson outputs for all comparison frames (same math, no re-upload).
-    g_rob_ref_m = b_out_m;
-    g_rob_ref_v = b_out_v;
-    g_rob_ref_h = oh;
-    g_rob_ref_w = ow;
+    // Pin guide-grid local stats for all comparison frames (460-main robustness).
+    g_rob_ref_m = b_means;
+    g_rob_ref_v = b_vars;
+    g_rob_ref_h = gh;
+    g_rob_ref_w = gw;
     g_rob_ref_c = nch;
-    g_rob_ref_bytes = (size_t)oh * (size_t)ow * (size_t)nch * sizeof(float);
+    g_rob_ref_bytes = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
 
     RefStats st;
-    st.means = Image(oh, ow, nch);
-    st.stds = Image(oh2, ow2, nch);
+    st.means = Image(gh, gw, nch);
+    st.stds = Image(gh, gw, nch);
     const size_t mb = st.means.data.size() * sizeof(float);
     const size_t vb = st.stds.data.size() * sizeof(float);
-    memcpy(st.means.data.data(), [b_out_m contents], mb);
-    memcpy(st.stds.data.data(), [b_out_v contents], vb);
+    memcpy(st.means.data.data(), [b_means contents], mb);
+    memcpy(st.stds.data.data(), [b_vars contents], vb);
     return st;
 }
 
@@ -1052,20 +1044,15 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
         return Image();
     (void)b_gvars;
 
-    id<MTLBuffer> b_comp = nil;
-    int oh = 0, ow = 0;
-    if (!rob_dogson(b_gmeans, b_comp, gh, gw, nch, false, &flow, tile_size, oh, ow, cmd))
+    if (gh != ref_stats.means.h || gw != ref_stats.means.w || nch != ref_stats.means.c)
         return Image();
 
-    if (oh != ref_stats.means.h || ow != ref_stats.means.w || nch != ref_stats.means.c)
-        return Image();
-
-    const size_t ref_b = (size_t)oh * (size_t)ow * (size_t)nch * sizeof(float);
-    const size_t mask_b = (size_t)oh * (size_t)ow * sizeof(float);
+    const size_t ref_b = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
+    const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_ref_m = nil;
     id<MTLBuffer> b_ref_v = nil;
     if (g_rob_ref_m && g_rob_ref_v && g_rob_ref_bytes == ref_b &&
-        g_rob_ref_h == oh && g_rob_ref_w == ow && g_rob_ref_c == nch) {
+        g_rob_ref_h == gh && g_rob_ref_w == gw && g_rob_ref_c == nch) {
         b_ref_m = g_rob_ref_m;
         b_ref_v = g_rob_ref_v;
     } else if (!ref_stats.means.data.empty() && !ref_stats.stds.data.empty()) {
@@ -1085,35 +1072,40 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
-    if (!b_ref_m || !b_ref_v || !b_std || !b_diff || !b_S || !b_R || !b_out) return Image();
+    if (!b_ref_m || !b_ref_v || !b_std || !b_diff || !b_S || !b_flow || !b_R || !b_out)
+        return Image();
 
     RobMaskParamsCPU mp{};
-    mp.h = (uint32_t)oh;
-    mp.w = (uint32_t)ow;
+    mp.h = (uint32_t)gh;
+    mp.w = (uint32_t)gw;
     mp.nch = (uint32_t)nch;
     mp.tile_size = (uint32_t)tile_size;
+    mp.flow_ny = (uint32_t)flow.ny;
     mp.flow_nx = (uint32_t)flow.nx;
     mp.curve_n = (uint32_t)std_curve.size();
+    mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
-    [enc setBuffer:b_comp offset:0 atIndex:1];
+    [enc setBuffer:b_gmeans offset:0 atIndex:1];
     [enc setBuffer:b_ref_m offset:0 atIndex:2];
     [enc setBuffer:b_ref_v offset:0 atIndex:3];
     [enc setBuffer:b_std offset:0 atIndex:4];
     [enc setBuffer:b_diff offset:0 atIndex:5];
     [enc setBuffer:b_S offset:0 atIndex:6];
-    [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+    [enc setBuffer:b_flow offset:0 atIndex:7];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
     RobStatsParamsCPU sp{};
-    sp.h = (uint32_t)oh;
-    sp.w = (uint32_t)ow;
+    sp.h = (uint32_t)gh;
+    sp.w = (uint32_t)gw;
     sp.nch = 1u;
     enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1127,7 +1119,7 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    Image r(oh, ow, 1);
+    Image r(gh, gw, 1);
     memcpy(r.data.data(), [b_out contents], mask_b);
     return r;
 }
@@ -1525,8 +1517,8 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
                                __strong id<MTLBuffer>& b_hess,
                                int& ny, int& nx) {
     auto& c = ctx();
-    ny = r.h / ts;
-    nx = r.w / ts;
+    ny = (r.h + ts - 1) / ts;
+    nx = (r.w + ts - 1) / ts;
     if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) return false;
     b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
     const size_t pix_b = (size_t)r.h * (size_t)r.w * sizeof(float);
@@ -1634,12 +1626,14 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
 
 static bool g_dumped_ref_grads = false;
 
-bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
+bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
+                 const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out) {
     if (!metal_gpu_init()) return false;
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
-    if (moving_grey.h <= 0 || moving_grey.w <= 0) return false;
+    if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
+        moving_grey.h <= 0 || moving_grey.w <= 0) return false;
     // Fine-first levels[]: params arrays are fine→coarse, so index with lvl.
     for (int lvl = 0; lvl < nlev; ++lvl) {
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
@@ -1652,13 +1646,9 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
     }
 
     auto& c = ctx();
-    id<MTLBuffer> mov0 = nil;
-    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
-        c.sticky_grey_w == moving_grey.w) {
-        mov0 = c.sticky_grey;
-    } else {
-        mov0 = buf(moving_grey.data.data(), moving_grey.data.size() * sizeof(float));
-    }
+    Image moving_padded_grey = pad_image_circular(moving_grey, tile_size);
+    id<MTLBuffer> mov0 = buf(moving_padded_grey.data.data(),
+                             moving_padded_grey.data.size() * sizeof(float));
     if (!mov0) return false;
 
     struct Lev {
@@ -1666,14 +1656,14 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         int h = 0, w = 0;
     };
     std::vector<Lev> mov_pyr((size_t)nlev);
-    mov_pyr[0] = {mov0, moving_grey.h, moving_grey.w};
+    mov_pyr[0] = {mov0, moving_padded_grey.h, moving_padded_grey.w};
     for (int i = 0; i < nlev; ++i) {
         int f = (i < (int)cfg.bm_factors.size()) ? cfg.bm_factors[i] : 1;
         if (i == 0 && f == 1) continue;
         if (i == 0) {
             id<MTLBuffer> dst = nil;
             int dh = 0, dw = 0;
-            if (!gpu_downsample_buf(mov0, moving_grey.h, moving_grey.w, f, dst, dh, dw))
+            if (!gpu_downsample_buf(mov0, moving_padded_grey.h, moving_padded_grey.w, f, dst, dh, dw))
                 return false;
             mov_pyr[0] = {dst, dh, dw};
         } else {
@@ -1698,19 +1688,11 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
-        id<MTLBuffer> b_ref = nil, b_gx = nil, b_gy = nil, b_hess = nil;
-        int ny = 0, nx = 0;
-        if (!prep_level_ica_gpu(r, ts, b_ref, b_gx, b_gy, b_hess, ny, nx))
-            return false;
-
-        // Match Python dump at coarse-first i==0 = coarsest = C++ lvl nlev-1.
-        if (lvl == nlev - 1 && !g_dumped_ref_grads && b_gx && b_gy) {
-            debug_dump_bin("cpp_gradx_0", (const float*)[b_gx contents],
-                           (size_t)r.h * (size_t)r.w);
-            debug_dump_bin("cpp_grady_0", (const float*)[b_gy contents],
-                           (size_t)r.h * (size_t)r.w);
-            g_dumped_ref_grads = true;
-        }
+        id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
+        if (!b_ref) return false;
+        int ny = r.h / ts;
+        int nx = r.w / ts;
+        if (ny <= 0 || nx <= 0) return false;
 
         if (!b_flow) {
             flow_ny = ny;
@@ -1744,13 +1726,36 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
-        if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, m.img, b_flow,
-                      r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))
-            return false;
         // Level ICA buffers drop here — only flow stays resident.
     }
 
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
+    id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
+    int ica_ny = 0, ica_nx = 0;
+    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
+                            ica_ny, ica_nx))
+        return false;
+    if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
+    if (!g_dumped_ref_grads && b_gx && b_gy) {
+        debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        g_dumped_ref_grads = true;
+    }
+    id<MTLBuffer> b_mov_native = nil;
+    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
+        b_mov_native = c.sticky_grey;
+    } else {
+        b_mov_native = buf(moving_grey.data.data(), moving_grey.data.size() * sizeof(float));
+    }
+    if (!b_mov_native) return false;
+    if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
+                  ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
+                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
+        return false;
+
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
@@ -1820,13 +1825,14 @@ namespace {
 // (including 16-byte padding for constant-buffer setBytes).
 struct MergeCompParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
+    uint32_t rob_h, rob_w;
     uint32_t flow_ny, flow_nx, cov_h, cov_w;
     uint32_t nch, bayer, iso, tile_size;
     float scale;
     uint32_t cfa00, cfa01, cfa10, cfa11;
-    uint32_t _pad0 = 0, _pad1 = 0;
+    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0, _pad3 = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 80, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -1859,6 +1865,7 @@ struct MergeInflight {
 struct MergeFrameGpu {
     int key = -1; // >=0: frame_id; -1: pointer-keyed
     int lr_h = 0, lr_w = 0;
+    int rob_h = 0, rob_w = 0;
     int flow_ny = 0, flow_nx = 0;
     int cov_h = 0, cov_w = 0;
     const f32* img = nullptr;
@@ -1992,6 +1999,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.key = frame_key;
             e.lr_h = img.h;
             e.lr_w = img.w;
+            e.rob_h = rob.h;
+            e.rob_w = rob.w;
             e.flow_ny = flow.ny;
             e.flow_nx = flow.nx;
             e.cov_h = covs.h;
@@ -2038,6 +2047,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         e.b_flow = buf(fp, flow_b);
         e.b_cov = cov_b ? buf(cp, cov_b) : nil;
         e.b_rob = buf(rp, rob_b);
+        e.rob_h = rob.h;
+        e.rob_w = rob.w;
         e.flow = fp;
         e.cov = cp;
         e.rob = rp;
@@ -2058,6 +2069,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.key = -1;
     e.lr_h = img.h;
     e.lr_w = img.w;
+    e.rob_h = rob.h;
+    e.rob_w = rob.w;
     e.flow_ny = flow.ny;
     e.flow_nx = flow.nx;
     e.cov_h = covs.h;
@@ -2289,6 +2302,8 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
         p.lr_w = (uint32_t)comp_raw.w;
+        p.rob_h = (uint32_t)robustness.h;
+        p.rob_w = (uint32_t)robustness.w;
         p.flow_ny = (uint32_t)flow.ny;
         p.flow_nx = (uint32_t)flow.nx;
         p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
@@ -2301,6 +2316,8 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         if (!hit || hit->lr_h <= 0 || hit->lr_w <= 0) return false;
         p.lr_h = (uint32_t)hit->lr_h;
         p.lr_w = (uint32_t)hit->lr_w;
+        p.rob_h = (uint32_t)std::max(1, hit->rob_h);
+        p.rob_w = (uint32_t)std::max(1, hit->rob_w);
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
