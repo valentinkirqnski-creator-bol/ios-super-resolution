@@ -214,7 +214,8 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         // Python utils_dng: store raw camera_whitebalance (not /green).
         // Load multiplies by (wb[c]/wb[G]); guide undoes with /wb[c].
         for (int i = 0; i < 3; ++i)
-            cfg.white_balance[i] = C.cam_mul[i];
+            if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i];
+        if (!(cfg.white_balance[1] > 0.f)) cfg.white_balance[1] = 1.f;
         for (int i = 0; i < 2; ++i)
             for (int j = 0; j < 2; ++j) {
                 int c = raw.COLOR(i, j);
@@ -297,7 +298,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     }
     float site_black[2][2];
     float site_wb[2][2];
-    const float wb_g = cfg.white_balance[1];
+    const float wb_g = (cfg.white_balance[1] > 0.f) ? cfg.white_balance[1] : 1.f;
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             int c = (int)cfg.cfa.p[i][j];
@@ -306,6 +307,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             site_black[i][j] = bl_rgb[c];
             // Python: k = white_balance[channel] / white_balance[1]
             float w = cfg.white_balance[c] / wb_g;
+            if (!(w > 0.f) || !std::isfinite(w)) w = 1.f;
             site_wb[i][j] = w;
         }
     }
@@ -315,10 +317,11 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         for (int x = 0; x < img.w; ++x) {
             const int fj = x & 1;
             float bl = site_black[fi][fj];
-            float denom = maxv - bl;
+            float denom = std::max(1.f, maxv - bl);
             // Match Python: no pre-WB clamp to 1 (WB may push highlights > 1).
             float v = ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - bl) / denom;
             v *= site_wb[fi][fj];
+            if (!std::isfinite(v) || v < 0.f) v = 0.f;
             img.at(y, x) = v;
         }
     }

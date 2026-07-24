@@ -24,9 +24,16 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         return out;
     };
-    // Matches kernels.py compute_k / hard_threshold / linear.
+    // Matches kernels.py compute_k / hard_threshold / linear (+ C++ float guards).
     auto compute_k = [](f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
-        f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
+        l1 = std::max(0.f, l1);
+        l2 = std::max(0.f, l2);
+        f32 sum = l1 + l2;
+        if (sum < 1e-12f) {
+            k1 = k2 = cfg.k_detail * cfg.k_denoise;
+            return;
+        }
+        f32 A = 1.f + std::sqrt(std::max(0.f, (l1 - l2) / sum));
         f32 D = clampf(1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
         f32 kk1, kk2;
         if (cfg.selection == SelectionLaw::HardThreshold) {
@@ -38,6 +45,9 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
+        constexpr f32 k_min = 0.15f;
+        k1 = std::max(k1, k_min);
+        k2 = std::max(k2, k_min);
     };
 
     Image vst = apply_gat(raw, cfg.alpha, cfg.beta);

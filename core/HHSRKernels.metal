@@ -556,6 +556,21 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
 
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
+    const float k_max_abs = 32.f;
+    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
+    if (!(m > k_max_abs) || !isfinite(m)) {
+        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+            ixx = 2.f; ixy = 0.f; iyy = 2.f;
+        }
+        return;
+    }
+    float s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
 inline float cov_lerp2(device const float* covs, uint cov_w,
                        int fy, int fx, int cy, int cx,
                        float frac_x, float frac_y, int idx) {
@@ -591,10 +606,14 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     float yy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 3);
     if (raw_det) {
         float det = xx * yy - xy * xy;
-        float inv_det = 1.f / det;
-        ixx =  inv_det * yy;
-        ixy = -inv_det * xy;
-        iyy =  inv_det * xx;
+        if (fabs(det) > 1e-10f) {
+            float inv_det = 1.f / det;
+            ixx =  inv_det * yy;
+            ixy = -inv_det * xy;
+            iyy =  inv_det * xx;
+        } else {
+            ixx = 1.f; ixy = 0.f; iyy = 1.f;
+        }
     } else {
         // invert_sym_2x2 / invert_2x2 with EPSILON_DIV
         float det = xx * yy - xy * xy;
@@ -607,6 +626,7 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -853,10 +873,17 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
     }
 }
 
-// kernels.py compute_k / hard_threshold / linear
+// kernels.cpp compute_k (incl. flat-tensor + k_min guards)
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
-    float A = 1.f + sqrt((l1 - l2) / (l1 + l2));
+    l1 = max(0.f, l1);
+    l2 = max(0.f, l2);
+    float sum = l1 + l2;
+    if (sum < 1e-12f) {
+        k1 = k2 = p.k_detail * p.k_denoise;
+        return;
+    }
+    float A = 1.f + sqrt(max(0.f, (l1 - l2) / sum));
     float D = clamp(1.f - sqrt(l1) / p.D_tr + p.D_th, 0.f, 1.f);
     float kk1, kk2;
     if (p.selection == 0u) {
@@ -868,6 +895,9 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
+    constexpr float k_min = 0.15f;
+    k1 = max(k1, k_min);
+    k2 = max(k2, k_min);
 }
 
 kernel void kernel_gat(device float* out [[buffer(0)]],
@@ -1112,6 +1142,14 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float brightness = ref_means[o];
         // Python: id_noise = round(1000 * brightness) — no clamp.
         int id_noise = lround_away(1000.f * brightness);
+        // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
+        // Finite brightness in [0,1] -> id in [0,1000] unchanged (same as Python).
+        if (!isfinite(brightness))
+            id_noise = 0;
+        else if (id_noise < 0)
+            id_noise = 0;
+        else if (id_noise >= int(p.curve_n))
+            id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
         float sigma_t = std_curve[id];
         float d_t = diff_curve[id];
@@ -1730,13 +1768,16 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
                                   uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.Ws || gid.y >= p.bh) return;
     uint pi = (gid.y * p.Ws + gid.x) * p.nch;
-    float cn0 = num[pi] / den[pi];
+    float d0 = den[pi];
+    float cn0 = (d0 > 0.f) ? num[pi] / d0 : 0.f;
     float cn1 = 0.f, cn2 = 0.f;
     if (p.nch >= 2u) {
-        cn1 = num[pi + 1u] / den[pi + 1u];
+        float d1 = den[pi + 1u];
+        cn1 = (d1 > 0.f) ? num[pi + 1u] / d1 : 0.f;
     }
     if (p.nch >= 3u) {
-        cn2 = num[pi + 2u] / den[pi + 2u];
+        float d2 = den[pi + 2u];
+        cn2 = (d2 > 0.f) ? num[pi + 2u] / d2 : 0.f;
     }
     float lin0, lin1, lin2;
     if (p.bake != 0u && p.nch >= 3u) {
