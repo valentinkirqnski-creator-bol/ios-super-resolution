@@ -20,6 +20,8 @@
 #include <cmath>
 #include <future>
 #include <memory>
+#include <limits>
+#include <sstream>
 #if defined(__APPLE__)
 #include <thread>
 #endif
@@ -66,6 +68,192 @@ struct CachedCompMeta {
 
 static bool load_cached_comp_raw(const fs::path& cache, int k, Image& comp) {
     return load_image(cache / ("f" + std::to_string(k) + ".raw"), comp) && comp.h > 0;
+}
+
+struct DebugImageStats {
+    f32 min_v = std::numeric_limits<f32>::infinity();
+    f32 max_v = -std::numeric_limits<f32>::infinity();
+    double mean = 0.0;
+    size_t nonfinite = 0;
+};
+
+static DebugImageStats image_stats(const Image& im) {
+    DebugImageStats s;
+    if (im.data.empty()) {
+        s.min_v = 0.f;
+        s.max_v = 0.f;
+        return s;
+    }
+    double sum = 0.0;
+    size_t finite_n = 0;
+    for (f32 v : im.data) {
+        if (!std::isfinite(v)) {
+            ++s.nonfinite;
+            continue;
+        }
+        s.min_v = std::min(s.min_v, v);
+        s.max_v = std::max(s.max_v, v);
+        sum += v;
+        ++finite_n;
+    }
+    if (finite_n == 0) {
+        s.min_v = 0.f;
+        s.max_v = 0.f;
+    }
+    s.mean = finite_n ? sum / (double)finite_n : 0.0;
+    return s;
+}
+
+struct DebugCovStats {
+    f32 min_det = std::numeric_limits<f32>::infinity();
+    f32 max_det = -std::numeric_limits<f32>::infinity();
+    size_t det_nonfinite = 0;
+    size_t det_nonpositive = 0;
+    size_t det_tiny = 0;
+};
+
+static DebugCovStats cov_stats(const CovField& covs) {
+    DebugCovStats s;
+    if (covs.cov.empty()) {
+        s.min_det = 0.f;
+        s.max_det = 0.f;
+        return s;
+    }
+    const size_t n = (size_t)covs.h * (size_t)covs.w;
+    for (size_t i = 0; i < n; ++i) {
+        const f32* c = &covs.cov[i * 4u];
+        f32 det = c[0] * c[3] - c[1] * c[1];
+        if (!std::isfinite(det)) {
+            ++s.det_nonfinite;
+            continue;
+        }
+        s.min_det = std::min(s.min_det, det);
+        s.max_det = std::max(s.max_det, det);
+        if (det <= 0.f) ++s.det_nonpositive;
+        else if (det < 1e-12f) ++s.det_tiny;
+    }
+    if (!std::isfinite(s.min_det)) s.min_det = 0.f;
+    if (!std::isfinite(s.max_det)) s.max_det = 0.f;
+    return s;
+}
+
+struct MergeDebugStats {
+    size_t pixels = 0;
+    size_t channel_zero[3] = {0, 0, 0};
+    size_t channel_tiny[3] = {0, 0, 0};
+    size_t channel_nonfinite[3] = {0, 0, 0};
+    size_t all_zero = 0;
+    size_t only_green = 0;
+    f32 min_den[3] = {
+        std::numeric_limits<f32>::infinity(),
+        std::numeric_limits<f32>::infinity(),
+        std::numeric_limits<f32>::infinity()
+    };
+    f32 max_den[3] = {
+        -std::numeric_limits<f32>::infinity(),
+        -std::numeric_limits<f32>::infinity(),
+        -std::numeric_limits<f32>::infinity()
+    };
+    std::string samples;
+    size_t sample_count = 0;
+};
+
+static bool analyze_merge_band(const Image& num, const Image& den, int y0,
+                               MergeDebugStats& total) {
+    constexpr f32 tiny = 1e-12f;
+    bool suspicious_band = false;
+    const int nch = std::min(3, den.c);
+    for (int y = 0; y < den.h; ++y) {
+        for (int x = 0; x < den.w; ++x) {
+            ++total.pixels;
+            f32 d[3] = {0.f, 0.f, 0.f};
+            f32 n[3] = {0.f, 0.f, 0.f};
+            bool bad_pixel = false;
+            for (int ch = 0; ch < nch; ++ch) {
+                d[ch] = den.at(y, x, ch);
+                n[ch] = num.at(y, x, ch);
+                if (std::isfinite(d[ch])) {
+                    total.min_den[ch] = std::min(total.min_den[ch], d[ch]);
+                    total.max_den[ch] = std::max(total.max_den[ch], d[ch]);
+                    if (d[ch] == 0.f) {
+                        ++total.channel_zero[ch];
+                        bad_pixel = true;
+                    } else if (d[ch] > 0.f && d[ch] < tiny) {
+                        ++total.channel_tiny[ch];
+                        bad_pixel = true;
+                    }
+                } else {
+                    ++total.channel_nonfinite[ch];
+                    bad_pixel = true;
+                }
+            }
+            const bool r_bad = nch > 0 && (!std::isfinite(d[0]) || d[0] <= tiny);
+            const bool g_ok = nch > 1 && std::isfinite(d[1]) && d[1] > tiny;
+            const bool b_bad = nch > 2 && (!std::isfinite(d[2]) || d[2] <= tiny);
+            const bool all_bad = (nch == 1)
+                ? r_bad
+                : (r_bad && (!g_ok) && b_bad);
+            const bool only_g = (nch >= 3 && r_bad && g_ok && b_bad);
+            if (all_bad) {
+                ++total.all_zero;
+                bad_pixel = true;
+            }
+            if (only_g) {
+                ++total.only_green;
+                bad_pixel = true;
+            }
+            if (bad_pixel) {
+                suspicious_band = true;
+                if (total.sample_count < 2000) {
+                    char line[320];
+                    std::snprintf(line, sizeof(line),
+                        "y=%d x=%d den=(%.9g,%.9g,%.9g) num=(%.9g,%.9g,%.9g)\n",
+                        y0 + y, x, d[0], d[1], d[2], n[0], n[1], n[2]);
+                    total.samples += line;
+                    ++total.sample_count;
+                }
+            }
+        }
+    }
+    return suspicious_band;
+}
+
+static void append_image_summary(std::ostringstream& ss, const char* name, const Image& im) {
+    DebugImageStats s = image_stats(im);
+    ss << name << " shape=" << im.h << "x" << im.w << "x" << im.c
+       << " min=" << s.min_v << " max=" << s.max_v
+       << " mean=" << s.mean << " nonfinite=" << s.nonfinite << "\n";
+}
+
+static void append_cov_summary(std::ostringstream& ss, const char* name, const CovField& covs) {
+    DebugCovStats s = cov_stats(covs);
+    ss << name << " shape=" << covs.h << "x" << covs.w
+       << " det_min=" << s.min_det << " det_max=" << s.max_det
+       << " det_nonfinite=" << s.det_nonfinite
+       << " det_nonpositive=" << s.det_nonpositive
+       << " det_tiny=" << s.det_tiny << "\n";
+}
+
+static void append_merge_summary(std::ostringstream& ss, const MergeDebugStats& s) {
+    ss << "merge_pixels=" << s.pixels << "\n";
+    const char* channel_name[3] = {"R", "G", "B"};
+    for (int ch = 0; ch < 3; ++ch) {
+        const f32 min_den = std::isfinite(s.min_den[ch]) ? s.min_den[ch] : 0.f;
+        const f32 max_den = std::isfinite(s.max_den[ch]) ? s.max_den[ch] : 0.f;
+        ss << "den_ch" << ch << "_" << channel_name[ch]
+           << " min=" << min_den
+           << " max=" << max_den
+           << " zero=" << s.channel_zero[ch]
+           << " tiny=" << s.channel_tiny[ch]
+           << " nonfinite=" << s.channel_nonfinite[ch] << "\n";
+    }
+    ss << "den_all_zero=" << s.all_zero << "\n";
+    ss << "den_only_green=" << s.only_green << "\n";
+    ss << "den_sample_count=" << s.sample_count << "\n";
+    if (!s.samples.empty()) {
+        ss << "den_samples\n";
+        ss << s.samples;
+    }
 }
 
 static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) {
@@ -192,6 +380,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
+    std::ostringstream debug_summary;
+    debug_summary << "cpp_debug_summary\n";
 
     report("Loading reference frame", 0.02f);
     {
@@ -202,6 +392,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
     Image ref = load_raw_frame(paths[0], work, true);
     if (ref.h <= 0 || ref.w <= 0) return Image();
+    debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
+    append_image_summary(debug_summary, "raw_ref", ref);
     tune_config_snr(ref, work);
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
@@ -255,6 +447,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         ref_stats = init_robustness(ref, work);
         ref_covs = ref_cov_fut.get();
     }
+    append_cov_summary(debug_summary, "cov_ref", ref_covs);
 #if defined(__APPLE__)
     // GPU already holds ref means/vars; drop host copies to cut peak RAM.
     metal_release_host_ref_stats(ref_stats);
@@ -307,6 +500,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
         }
         if (comp.h <= 0) continue;
+        debug_dump_bin("cpp_raw_comp_" + std::to_string(k - 1),
+                       comp.data.data(), comp.data.size());
+        const std::string raw_name = "raw_comp_" + std::to_string(k - 1);
+        append_image_summary(debug_summary, raw_name.c_str(), comp);
 
         // 2×: decode next during align. 1×: wait until after grey (lower peak).
         if (!full_res && k + 1 < n) {
@@ -349,6 +546,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
         debug_dump_bin("cpp_mask_" + std::to_string(k - 1),
                        rob.data.data(), rob.data.size());
+        const std::string mask_name = "mask_" + std::to_string(k - 1);
+        const std::string cov_name = "cov_comp_" + std::to_string(k - 1);
+        append_image_summary(debug_summary, mask_name.c_str(), rob);
+        append_cov_summary(debug_summary, cov_name.c_str(), covs);
 
         if (stream_comp_raw) {
             // Spill Bayer async (overlaps next decode already in flight). Keep
@@ -408,6 +609,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     bool have_acc_rob = false;
     build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
     const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
+    if (have_acc_rob) {
+        debug_dump_bin("cpp_acc_rob", acc_rob.data.data(), acc_rob.data.size());
+        append_image_summary(debug_summary, "acc_rob", acc_rob);
+    }
 
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
@@ -479,6 +684,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 #endif
 
     AccumDiag diag;
+    MergeDebugStats merge_debug;
 #if defined(__APPLE__)
     // Dual host bands + async Deflate for both 1× and 2×. 1× still uses a
     // single GPU acc slot (ensure_acc waits/readbacks before reuse).
@@ -553,6 +759,13 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         // ping-pong resolved (2×). Encode it while this band's GPU runs.
         if (have_ready) {
             const int er = ready, ey0 = ready_y0, ebh = ready_bh;
+            if (analyze_merge_band(num_bands[er], den_bands[er], ey0, merge_debug)) {
+                const std::string ys = std::to_string(ey0);
+                debug_dump_bin("cpp_num_bad_band_y" + ys,
+                               num_bands[er].data.data(), num_bands[er].data.size());
+                debug_dump_bin("cpp_den_bad_band_y" + ys,
+                               den_bands[er].data.data(), den_bands[er].data.size());
+            }
             std::vector<uint16_t>& out16 = row16_async[er];
             if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
                 out16.resize((size_t)ebh * (size_t)Ws * 3u);
@@ -573,6 +786,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         Image& rn = num_bands[ready];
         Image& rd = den_bands[ready];
         accumulate_diag(rn, rd, diag);
+        if (analyze_merge_band(rn, rd, ready_y0, merge_debug)) {
+            const std::string ys = std::to_string(ready_y0);
+            debug_dump_bin("cpp_num_bad_band_y" + ys, rn.data.data(), rn.data.size());
+            debug_dump_bin("cpp_den_bad_band_y" + ys, rd.data.data(), rd.data.size());
+        }
         if (row16.size() < (size_t)ready_bh * (size_t)Ws * 3u)
             row16.resize((size_t)ready_bh * (size_t)Ws * 3u);
         encode_band_rows(rn, rd, ready_y0, ready_bh, work, nch, preview, pscale, ph, pw, Ws, row16);
@@ -608,6 +826,13 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
         if (y0 + bh >= Hs)
             accumulate_diag(num_band, den_band, diag);
+        if (analyze_merge_band(num_band, den_band, y0, merge_debug)) {
+            const std::string ys = std::to_string(y0);
+            debug_dump_bin("cpp_num_bad_band_y" + ys,
+                           num_band.data.data(), num_band.data.size());
+            debug_dump_bin("cpp_den_bad_band_y" + ys,
+                           den_band.data.data(), den_band.data.size());
+        }
 
         encode_band_rows(num_band, den_band, y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
         writer.write_rows(row16.data(), bh);
@@ -626,6 +851,8 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     ref_covs = CovField();
     if (stream_comp_raw) fs::remove_all(cache, ec);
     report(format_accum_diag(diag), 0.99f);
+    append_merge_summary(debug_summary, merge_debug);
+    debug_dump_text("cpp_debug_summary", debug_summary.str());
     report("Done", 1.f);
     return preview;
 }
