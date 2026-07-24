@@ -35,7 +35,9 @@ enum CameraSelection: String, CaseIterable, Identifiable {
     }
 }
 
-/// Lens/zoom mode for back-camera RAW capture (2× = center crop before SR).
+/// Lens/zoom mode for back-camera RAW capture.
+/// 2× feeds a CFA-aligned center crop into SR so the algorithm processes the
+/// actual zoomed raw region instead of the full 1× frame.
 enum LensZoomMode: Equatable {
     case ultraWide
     case wide1x
@@ -1015,9 +1017,9 @@ final class CameraModel: NSObject, ObservableObject {
         ]
 
         var preview: UIImage?
-        // Documents debug DNGs: no center-crop (match Python full-frame run).
-        let usingDocDNGs = paths != capturedDNGs.map(\.path)
-        let cropFactor = usingDocDNGs ? Int32(1) : Int32(lensZoomMode.cropFactor)
+        // 2× processes the actual center-cropped raw region. The crop is
+        // CFA-aligned in C++ so downstream stages see a normal Bayer frame.
+        let cropFactor = Int32(lensZoomMode.cropFactor)
         let inputURLs = capturedDNGs
         let ok = SRBridge.processDNGs(
             paths,

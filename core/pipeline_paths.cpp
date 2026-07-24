@@ -719,6 +719,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
                 if (stream_comp_raw) fs::remove_all(cache, ec);
                 return Image();
             }
+        } else {
+            std::fill(num_band.data.begin(), num_band.data.end(), 0.f);
+            std::fill(den_band.data.begin(), den_band.data.end(), 0.f);
         }
 
         if (stream_comp_raw) {

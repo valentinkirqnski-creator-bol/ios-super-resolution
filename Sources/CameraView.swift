@@ -74,6 +74,8 @@ struct CameraView: View {
                 showFocusIndicator(at: localPoint)
             }
             .frame(width: width, height: height)
+            .scaleEffect(cam.lensZoomMode == .wide2x ? 2.0 : 1.0)
+            .animation(.easeInOut(duration: 0.16), value: cam.lensZoomMode)
             .clipped()
 
             if cam.isProcessing {
