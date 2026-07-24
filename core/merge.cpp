@@ -13,24 +13,6 @@ namespace hhsr {
 
 namespace {
 
-// Cap inverse-covariance entries so steerable kernels cannot become so sharp
-// that only one Bayer site in the 3x3 gets non-zero weight (R/B den -> green).
-// Kept compiled on Apple too so CPU remains the golden reference for validation.
-static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
-    constexpr f32 k_max_abs = 32.f; // iso path uses ~2 on the diagonal
-    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
-    if (!(m > k_max_abs) || !std::isfinite(m)) {
-        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-            ixx = 2.f; ixy = 0.f; iyy = 2.f; // iso-like fallback
-        }
-        return;
-    }
-    f32 s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
-}
-
 static inline f32 denoise_power_merge(f32 r_acc, f32 power_max, f32 max_frame_count) {
     return (r_acc <= max_frame_count) ? power_max : 1.f;
 }
@@ -75,8 +57,6 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
     if (raw_det) {
-        // Python uses bare 1/det; on device that becomes Inf/NaN. Guard with
-        // isotropic fallback so flat/singular patches don't punch black/green holes.
         f32 det = xx * yy - xy * xy;
         if (std::fabs(det) > 1e-10f) {
             f32 inv_det = 1.f / det;
@@ -91,7 +71,6 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().

@@ -68,7 +68,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
 
     report("Reference: grey + pyramid", 0.02f);
-    // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
+    // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
@@ -145,7 +145,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
 
     report("Reference: grey + pyramid", 0.02f);
-    // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
+    // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     ref_grey = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);

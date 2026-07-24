@@ -730,7 +730,7 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     p.grey_h = (uint32_t)grey_h;
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
-    p.selection = (cfg.selection == SelectionLaw::HardThreshold) ? 0u : 1u;
+    p.selection = 0u; // 460-main kernels.py always uses hard thresholding.
     p.alpha = cfg.alpha;
     p.beta = cfg.beta;
     p.k_detail = cfg.k_detail;
@@ -746,7 +746,7 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
 
     id<MTLBuffer> b_raw = c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
-    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, raw_b);
+    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, grey_b);
     id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
     id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
     id<MTLBuffer> b_cov = c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
@@ -756,21 +756,22 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return CovField();
 
-    // One encoder: Metal tracks RAW hazards between dispatches (same math, less overhead).
+    // One encoder: Metal tracks hazards between dispatches (same math, less overhead).
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
-    [enc setBuffer:b_vst offset:0 atIndex:0];
-    [enc setBuffer:b_raw offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("kernel_gat"), p.raw_w, p.raw_h);
 
     [enc setBuffer:b_grey offset:0 atIndex:0];
-    [enc setBuffer:b_vst offset:0 atIndex:1];
+    [enc setBuffer:b_raw offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
-    [enc setBuffer:b_grad offset:0 atIndex:0];
+    [enc setBuffer:b_vst offset:0 atIndex:0];
     [enc setBuffer:b_grey offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat"), p.grey_w, p.grey_h);
+
+    [enc setBuffer:b_grad offset:0 atIndex:0];
+    [enc setBuffer:b_vst offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
 

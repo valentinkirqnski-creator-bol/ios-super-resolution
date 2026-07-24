@@ -24,37 +24,22 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         return out;
     };
-    // Matches kernels.py compute_k / hard_threshold / linear (+ C++ float guards).
+    // Matches 460-main kernels.py compute_k.
     auto compute_k = [](f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
-        l1 = std::max(0.f, l1);
-        l2 = std::max(0.f, l2);
-        f32 sum = l1 + l2;
-        if (sum < 1e-12f) {
-            k1 = k2 = cfg.k_detail * cfg.k_denoise;
-            return;
-        }
-        f32 A = 1.f + std::sqrt(std::max(0.f, (l1 - l2) / sum));
-        f32 D = clampf(1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th, 0.f, 1.f);
+        f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
+        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.selection == SelectionLaw::HardThreshold) {
-            if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
-            else           { kk1 = 1.f; kk2 = 1.f; }
-        } else {
-            kk1 = 1.f + A / 2.f * (1.f / cfg.k_shrink - 1.f);
-            kk2 = 1.f + A / 2.f * (cfg.k_stretch - 1.f);
-        }
+        if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
+        else           { kk1 = 1.f; kk2 = 1.f; }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
-        constexpr f32 k_min = 0.15f;
-        k1 = std::max(k1, k_min);
-        k2 = std::max(k2, k_min);
     };
 
-    Image vst = apply_gat(raw, cfg.alpha, cfg.beta);
-    Image grey = compute_grey_decimate(vst, cfg.bayer_mode);
-    Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
+    Image grey = compute_grey_decimate(raw, cfg.bayer_mode);
+    Image vst = apply_gat(grey, cfg.alpha, cfg.beta);
+    Image grad = compute_gradients(vst); // [gh-1, gw-1, 2]
 
-    int H = grey.h, W = grey.w;
+    int H = vst.h, W = vst.w;
     CovField covs(H, W);
 
     parallel_rows(H, cfg.num_threads, [&](int y) {

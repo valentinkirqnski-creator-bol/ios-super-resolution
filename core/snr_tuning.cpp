@@ -31,6 +31,9 @@ void tune_config_snr(const Image& ref_raw, Config& cfg) {
     cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
 
     int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;
+    // 460-main falls back to 32 because its block matching kernels do not
+    // support tiles larger than that.
+    if (Ts > 32) Ts = 32;
     cfg.bm_tile_sizes.clear();
     cfg.bm_tile_sizes.reserve(cfg.bm_tile_size_factors.size());
     for (f32 f : cfg.bm_tile_size_factors)

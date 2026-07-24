@@ -610,21 +610,6 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
 
-inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
-    const float k_max_abs = 32.f;
-    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
-    if (!(m > k_max_abs) || !isfinite(m)) {
-        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
-            ixx = 2.f; ixy = 0.f; iyy = 2.f;
-        }
-        return;
-    }
-    float s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
-}
-
 inline float cov_lerp2(device const float* covs, uint cov_w,
                        int fy, int fx, int cy, int cx,
                        float frac_x, float frac_y, int idx) {
@@ -680,7 +665,6 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
-    soften_inv_cov(ixx, ixy, iyy);
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -873,8 +857,8 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
 
 struct KernelEstParams {
     uint raw_h, raw_w, grey_h, grey_w;
-    uint bayer;     // 1 = decimate 2x2 after GAT
-    uint selection; // 0 = HardThreshold, 1 = Linear (C++ enum order)
+    uint bayer;     // 1 = decimate 2x2 raw to grey before GAT
+    uint selection; // retained for CPU layout; 460-main always hard-thresholds
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint _pad0, _pad1; // 64 bytes total for setBytes
@@ -889,7 +873,7 @@ inline float gat_sample(float v, float alpha, float beta) {
 
 // linalg.h real_polyroots_2 / eigen_val / eigen_vect / eigen_elmts
 inline void real_polyroots_2(float a, float b, float c, thread float roots[2]) {
-    float delta = max(b * b - 4.f * a * c, 0.f);
+    float delta = b * b - 4.f * a * c;
     float r1 = (-b + sqrt(delta)) / (2.f * a);
     float r2 = (-b - sqrt(delta)) / (2.f * a);
     if (fabs(r1) >= fabs(r2)) { roots[0] = r1; roots[1] = r2; }
@@ -927,55 +911,40 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
     }
 }
 
-// kernels.cpp compute_k (incl. flat-tensor + k_min guards)
+// 460-main kernels.py compute_k
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
-    l1 = max(0.f, l1);
-    l2 = max(0.f, l2);
-    float sum = l1 + l2;
-    if (sum < 1e-12f) {
-        k1 = k2 = p.k_detail * p.k_denoise;
-        return;
-    }
-    float A = 1.f + sqrt(max(0.f, (l1 - l2) / sum));
-    float D = clamp(1.f - sqrt(l1) / p.D_tr + p.D_th, 0.f, 1.f);
+    float A = 1.f + sqrt((l1 - l2) / (l1 + l2));
+    float D = min(1.f, max(0.f, 1.f - sqrt(l1) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.selection == 0u) {
-        if (A > 1.95f) { kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch; }
-        else           { kk1 = 1.f; kk2 = 1.f; }
-    } else {
-        kk1 = 1.f + A / 2.f * (1.f / p.k_shrink - 1.f);
-        kk2 = 1.f + A / 2.f * (p.k_stretch - 1.f);
-    }
+    if (A > 1.95f) { kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch; }
+    else           { kk1 = 1.f; kk2 = 1.f; }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
-    constexpr float k_min = 0.15f;
-    k1 = max(k1, k_min);
-    k2 = max(k2, k_min);
 }
 
 kernel void kernel_gat(device float* out [[buffer(0)]],
-                       device const float* raw [[buffer(1)]],
+                       device const float* grey [[buffer(1)]],
                        constant KernelEstParams& p [[buffer(2)]],
                        uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
-    uint i = gid.y * p.raw_w + gid.x;
-    out[i] = gat_sample(raw[i], p.alpha, p.beta);
+    if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
+    uint i = gid.y * p.grey_w + gid.x;
+    out[i] = gat_sample(grey[i], p.alpha, p.beta);
 }
 
 kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],
-                                 device const float* vst [[buffer(1)]],
+                                 device const float* raw [[buffer(1)]],
                                  constant KernelEstParams& p [[buffer(2)]],
                                  uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
     uint y = gid.y, x = gid.x;
     if (p.bayer) {
         uint y0 = y * 2u, x0 = x * 2u;
-        float s = vst[y0 * p.raw_w + x0] + vst[y0 * p.raw_w + x0 + 1u] +
-                  vst[(y0 + 1u) * p.raw_w + x0] + vst[(y0 + 1u) * p.raw_w + x0 + 1u];
+        float s = raw[y0 * p.raw_w + x0] + raw[y0 * p.raw_w + x0 + 1u] +
+                  raw[(y0 + 1u) * p.raw_w + x0] + raw[(y0 + 1u) * p.raw_w + x0 + 1u];
         grey[y * p.grey_w + x] = 0.25f * s;
     } else {
-        grey[y * p.grey_w + x] = vst[y * p.raw_w + x];
+        grey[y * p.grey_w + x] = raw[y * p.raw_w + x];
     }
 }
 
@@ -1090,7 +1059,6 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
                             uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.guide_w || gid.y >= p.guide_h) return;
     uint cfa[2][2] = {{p.cfa00, p.cfa01}, {p.cfa10, p.cfa11}};
-    float wb[3] = {p.wb0, p.wb1, p.wb2};
     uint o = (gid.y * p.guide_w + gid.x) * 3u;
     guide[o + 0u] = 0.f;
     guide[o + 1u] = 0.f;
@@ -1099,7 +1067,7 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             uint c = cfa[i][j];
-            float v = raw[(gid.y * 2u + uint(i)) * p.raw_w + (gid.x * 2u + uint(j))] / wb[c];
+            float v = raw[(gid.y * 2u + uint(i)) * p.raw_w + (gid.x * 2u + uint(j))];
             if (c == 1u) gsum += v;
             else guide[o + c] = v;
         }

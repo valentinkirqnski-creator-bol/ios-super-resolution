@@ -59,7 +59,7 @@ enum LensZoomMode: Equatable {
 
 /// Holds the C++ algorithm tuning parameters for live adjustments.
 struct TuningParams: Equatable, Codable {
-    // Match Python configs/default.yaml
+    // Match 460-main params.py
     var r_t: Float = 0.12
     var r_s1: Float = 2.0
     var r_s2: Float = 12.0
@@ -70,10 +70,10 @@ struct TuningParams: Equatable, Codable {
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
     var robustness_save_mask: Bool = true
-    var accumulated_robustness_denoiser_enabled: Bool = false
+    var accumulated_robustness_denoiser_enabled: Bool = true
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 8.0
-    var acc_rob_max_frame_count: Float = 2.0
+    var acc_rob_max_frame_count: Float = 8.0
 
     /// App defaults — also applied by the settings Reset button.
     static let appDefaults = TuningParams()
@@ -118,7 +118,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 6
+        let defaultsVersion = 7
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

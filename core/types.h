@@ -102,15 +102,15 @@ struct Config {
     float r_s2 = 12.0f;
     float r_Mt = 0.8f;
 
-    // accumulated_robustness_denoiser.merge — off in default.yaml
-    bool  accumulated_robustness_denoiser_enabled = false;
+    // accumulated_robustness_denoiser.merge — on in 460-main params.py
+    bool  accumulated_robustness_denoiser_enabled = true;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
-    float acc_rob_max_frame_count = 2.0f;
+    float acc_rob_max_frame_count = 8.0f;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
-    SelectionLaw selection = SelectionLaw::Linear;
+    SelectionLaw selection = SelectionLaw::HardThreshold;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune

@@ -421,7 +421,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int nch = work.bayer_mode ? 3 : 1;
 
     report("Reference: grey + pyramid", 0.05f);
-    // Python init_alignment: circular-pad REF only, then pyramid. Moving stays unpadded.
+    // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
     ref_grey = pad_image_circular(ref_grey, tile_size);

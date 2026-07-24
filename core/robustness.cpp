@@ -349,7 +349,7 @@ static Image compute_guide(const Image& raw, const Config& cfg) {
             for (int i = 0; i < 2; ++i) {
                 for (int j = 0; j < 2; ++j) {
                     uint8_t c = cfg.cfa.p[i][j];
-                    f32 v = raw.at(2 * y + i, 2 * x + j) / cfg.white_balance[c];
+                    f32 v = raw.at(2 * y + i, 2 * x + j);
                     if (c == 1) gsum += v;
                     else        guide.at(y, x, c) = v;
                 }

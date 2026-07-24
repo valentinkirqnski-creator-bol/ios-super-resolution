@@ -212,7 +212,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         if (raw.imgdata.idata.model[0])
             cfg.camera_model = raw.imgdata.idata.model;
         // Python utils_dng: store raw camera_whitebalance (not /green).
-        // Load multiplies by (wb[c]/wb[G]); guide undoes with /wb[c].
+        // Load multiplies by (wb[c]/wb[G]); later stages consume those values directly.
         for (int i = 0; i < 3; ++i)
             if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i];
         if (!(cfg.white_balance[1] > 0.f)) cfg.white_balance[1] = 1.f;
@@ -318,10 +318,10 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             const int fj = x & 1;
             float bl = site_black[fi][fj];
             float denom = std::max(1.f, maxv - bl);
-            // Match Python: no pre-WB clamp to 1 (WB may push highlights > 1).
             float v = ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - bl) / denom;
             v *= site_wb[fi][fj];
             if (!std::isfinite(v) || v < 0.f) v = 0.f;
+            else if (v > 1.f) v = 1.f;
             img.at(y, x) = v;
         }
     }

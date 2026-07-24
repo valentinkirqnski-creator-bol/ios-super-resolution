@@ -3,7 +3,7 @@
 // Metal GPU backend for grey-FFT, 460-main alignment, kernel covariance, robustness, and merge.
 // FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein).
 // Alignment uses 460-main's direct L1/L2 local search and adaptive flow upsample.
-// Kernels match kernels.cpp estimate_kernels (GAT + decimate + grads + cov).
+// Kernels match kernels.cpp estimate_kernels (decimate + GAT + grads + cov).
 // Merge matches merge.cpp accumulate_comp / accumulate_ref (incl. robustness).
 //
 #include "types.h"

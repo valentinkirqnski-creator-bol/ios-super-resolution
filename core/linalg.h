@@ -55,7 +55,7 @@ inline f32 quad_mat_prod_sym(f32 ixx, f32 ixy, f32 iyy, f32 x1, f32 x2) {
 
 // get_real_polyroots_2 — roots[0] has largest |·|
 inline void real_polyroots_2(f32 a, f32 b, f32 c, f32 roots[2]) {
-    f32 delta = std::max(b * b - 4.f * a * c, 0.f);
+    f32 delta = b * b - 4.f * a * c;
     f32 r1 = (-b + std::sqrt(delta)) / (2.f * a);
     f32 r2 = (-b - std::sqrt(delta)) / (2.f * a);
     if (std::fabs(r1) >= std::fabs(r2)) { roots[0] = r1; roots[1] = r2; }
