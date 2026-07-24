@@ -1261,9 +1261,8 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
     out[gid.y * p.w + gid.x] = mn;
 }
 
-// L1 BM for ts==16: one thread per tile. Per-shift costs use the same
-// warp-then-block reduce order as align.cpp; argmin matches the Python
-// CUDA bug (err fixed at s_err[0], update when err < min_v).
+// Specialized L1 BM kernels. The active app path uses align_local_search_460,
+// but these follow 460-main's direct local-search minimum for wrapper parity.
 struct L1BmParams {
     uint ref_h, ref_w, mov_h, mov_w;
     uint ny, nx, ts, R;
@@ -1333,10 +1332,9 @@ kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
                     int tidp = i * ts + j;
                     float rv = (ry < int(p.ref_h) && rx < int(p.ref_w))
                                    ? ref[uint(ry) * p.ref_w + uint(rx)] : 0.f;
-                    // cuda_L1_local_search16: shared load omits -R, index adds +R
-                    // → sample at (ry+flow+sdy+R, rx+flow+sdx+R).
-                    int my = ry + flow_dy + sdy + R;
-                    int mx = rx + flow_dx + sdx + R;
+                    // 460-main cuda_L1_local_search samples at ref+flow+shift.
+                    int my = ry + flow_dy + sdy;
+                    int mx = rx + flow_dx + sdx;
                     float mv = (my >= 0 && my < int(p.mov_h) && mx >= 0 && mx < int(p.mov_w))
                                    ? mov[uint(my) * p.mov_w + uint(mx)] : 0.f;
                     per[tidp] = fabs(rv - mv);
@@ -1346,13 +1344,13 @@ kernel void l1_bm_ts16(device const float* ref [[buffer(0)]],
         }
     }
 
-    // Python CUDA argmin bug for ts==16
-    float err = s_err[0];
+    float err = INFINITY;
     int min_shift_x = 0, min_shift_y = 0;
     for (int i = 0; i < corr; ++i) {
         for (int j = 0; j < corr; ++j) {
             float min_v = s_err[i * corr + j];
-            if (err < min_v) {
+            if (min_v < err) {
+                err = min_v;
                 min_shift_y = i - R;
                 min_shift_x = j - R;
             }
@@ -1414,7 +1412,8 @@ kernel void l1_bm_ts32(device const float* ref [[buffer(0)]],
     for (int i = 0; i < corr; ++i) {
         for (int j = 0; j < corr; ++j) {
             float min_v = s_err[i * corr + j];
-            if (err < min_v) {
+            if (min_v < err) {
+                err = min_v;
                 min_shift_y = i - R;
                 min_shift_x = j - R;
             }
@@ -1448,8 +1447,6 @@ kernel void l1_bm_ts64(device const float* ref [[buffer(0)]],
     float per[1024];
     for (int sdy = -R; sdy <= R; ++sdy) {
         for (int sdx = -R; sdx <= R; ++sdx) {
-            (void)sdy;
-            (void)sdx;
             for (int tyy = 0; tyy < 16; ++tyy) {
                 for (int txx = 0; txx < 64; ++txx) {
                     int ti = tyy * 64 + txx;
@@ -1460,8 +1457,8 @@ kernel void l1_bm_ts64(device const float* ref [[buffer(0)]],
                         int py = py0 + k;
                         float rv = (py < int(p.ref_h) && px < int(p.ref_w))
                                        ? ref[uint(py) * p.ref_w + uint(px)] : 0.f;
-                        int my = py + flow_dy;
-                        int mx = px + flow_dx;
+                        int my = py + flow_dy + sdy;
+                        int mx = px + flow_dx + sdx;
                         float mv = (my >= 0 && my < int(p.mov_h) &&
                                     mx >= 0 && mx < int(p.mov_w))
                                        ? mov[uint(my) * p.mov_w + uint(mx)] : 0.f;
@@ -1479,7 +1476,8 @@ kernel void l1_bm_ts64(device const float* ref [[buffer(0)]],
     for (int i = 0; i < corr; ++i) {
         for (int j = 0; j < corr; ++j) {
             float min_v = s_err[i * corr + j];
-            if (err < min_v) {
+            if (min_v < err) {
+                err = min_v;
                 min_shift_y = i - R;
                 min_shift_x = j - R;
             }

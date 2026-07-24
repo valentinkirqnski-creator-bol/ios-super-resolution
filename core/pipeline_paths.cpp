@@ -234,6 +234,146 @@ static void append_cov_summary(std::ostringstream& ss, const char* name, const C
        << " det_tiny=" << s.det_tiny << "\n";
 }
 
+static int merge_round_to_int(f32 x) {
+    return (int)std::lround(x);
+}
+
+static void append_merge_sampled_robustness_summary(std::ostringstream& ss,
+                                                    const char* name,
+                                                    const Image& rob,
+                                                    int Hs, int Ws,
+                                                    const Config& cfg) {
+    if (rob.h <= 0 || rob.w <= 0 || rob.data.empty() || Hs <= 0 || Ws <= 0) {
+        ss << name << " merge_local_r empty\n";
+        return;
+    }
+    if (!(cfg.scale > 0.f) || !std::isfinite(cfg.scale)) {
+        ss << name << " merge_local_r invalid_scale=" << cfg.scale << "\n";
+        return;
+    }
+    std::vector<int> sample_y((size_t)Hs);
+    std::vector<int> sample_x((size_t)Ws);
+    for (int y = 0; y < Hs; ++y) {
+        const f32 lr_y = (f32)y / cfg.scale;
+        sample_y[(size_t)y] = cfg.bayer_mode
+            ? std::min(std::max(merge_round_to_int((lr_y - 0.5f) / 2.f), 0), rob.h - 1)
+            : std::min(std::max(merge_round_to_int(lr_y), 0), rob.h - 1);
+    }
+    for (int x = 0; x < Ws; ++x) {
+        const f32 lr_x = (f32)x / cfg.scale;
+        sample_x[(size_t)x] = cfg.bayer_mode
+            ? std::min(std::max(merge_round_to_int((lr_x - 0.5f) / 2.f), 0), rob.w - 1)
+            : std::min(std::max(merge_round_to_int(lr_x), 0), rob.w - 1);
+    }
+    constexpr f32 pgm_black = 0.5f / 255.f;
+    size_t n = 0;
+    size_t exact_zero = 0;
+    size_t near_zero = 0;
+    size_t pgm_black_nonzero = 0;
+    size_t one_or_more = 0;
+    size_t nonfinite = 0;
+    f32 min_v = std::numeric_limits<f32>::infinity();
+    f32 max_v = -std::numeric_limits<f32>::infinity();
+    double sum = 0.0;
+    for (int y = 0; y < Hs; ++y) {
+        const int iy = sample_y[(size_t)y];
+        for (int x = 0; x < Ws; ++x) {
+            const int ix = sample_x[(size_t)x];
+            const f32 v = rob.at(iy, ix);
+            ++n;
+            if (!std::isfinite(v)) {
+                ++nonfinite;
+                continue;
+            }
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+            sum += v;
+            if (v == 0.f) ++exact_zero;
+            if (v > 0.f && v < 1e-6f) ++near_zero;
+            if (v > 0.f && v < pgm_black) ++pgm_black_nonzero;
+            if (v >= 1.f) ++one_or_more;
+        }
+    }
+    if (!std::isfinite(min_v)) min_v = 0.f;
+    if (!std::isfinite(max_v)) max_v = 0.f;
+    const size_t finite_n = n - nonfinite;
+    ss << name << " merge_local_r"
+       << " sampled_pixels=" << n
+       << " min=" << min_v
+       << " max=" << max_v
+       << " mean=" << (finite_n ? sum / (double)finite_n : 0.0)
+       << " exact_zero=" << exact_zero
+       << " nonzero_lt_1e-6=" << near_zero
+       << " nonzero_pgm_black=" << pgm_black_nonzero
+       << " ge_1=" << one_or_more
+       << " nonfinite=" << nonfinite << "\n";
+}
+
+static void append_merge_ref_overwrite_summary(std::ostringstream& ss,
+                                               const Image& acc_rob,
+                                               int Hs, int Ws,
+                                               const Config& cfg) {
+    if (!cfg.accumulated_robustness_denoiser_enabled ||
+        acc_rob.h <= 0 || acc_rob.w <= 0 || acc_rob.data.empty()) {
+        ss << "acc_rob merge_ref_overwrite inactive\n";
+        return;
+    }
+    if (!(cfg.scale > 0.f) || !std::isfinite(cfg.scale)) {
+        ss << "acc_rob merge_ref_overwrite invalid_scale=" << cfg.scale << "\n";
+        return;
+    }
+    std::vector<int> sample_y((size_t)Hs);
+    std::vector<int> sample_x((size_t)Ws);
+    for (int y = 0; y < Hs; ++y) {
+        const f32 coarse_y = (f32)y / cfg.scale;
+        const f32 acc_y = cfg.bayer_mode ? (coarse_y - 0.5f) / 2.f : coarse_y;
+        sample_y[(size_t)y] =
+            std::min(std::max(merge_round_to_int(acc_y), 0), acc_rob.h - 1);
+    }
+    for (int x = 0; x < Ws; ++x) {
+        const f32 coarse_x = (f32)x / cfg.scale;
+        const f32 acc_x = cfg.bayer_mode ? (coarse_x - 0.5f) / 2.f : coarse_x;
+        sample_x[(size_t)x] =
+            std::min(std::max(merge_round_to_int(acc_x), 0), acc_rob.w - 1);
+    }
+    size_t n = 0;
+    size_t overwrite = 0;
+    size_t keep_comps = 0;
+    size_t nonfinite = 0;
+    f32 min_v = std::numeric_limits<f32>::infinity();
+    f32 max_v = -std::numeric_limits<f32>::infinity();
+    double sum = 0.0;
+    for (int y = 0; y < Hs; ++y) {
+        const int ay = sample_y[(size_t)y];
+        for (int x = 0; x < Ws; ++x) {
+            const int ax = sample_x[(size_t)x];
+            const f32 v = acc_rob.at(ay, ax);
+            ++n;
+            if (!std::isfinite(v)) {
+                ++nonfinite;
+                continue;
+            }
+            min_v = std::min(min_v, v);
+            max_v = std::max(max_v, v);
+            sum += v;
+            if (v < cfg.acc_rob_max_frame_count) ++overwrite;
+            else ++keep_comps;
+        }
+    }
+    if (!std::isfinite(min_v)) min_v = 0.f;
+    if (!std::isfinite(max_v)) max_v = 0.f;
+    const size_t finite_n = n - nonfinite;
+    ss << "acc_rob merge_ref_overwrite"
+       << " sampled_pixels=" << n
+       << " min=" << min_v
+       << " max=" << max_v
+       << " mean=" << (finite_n ? sum / (double)finite_n : 0.0)
+       << " overwrite_ref_only=" << overwrite
+       << " keep_comparison_accum=" << keep_comps
+       << " threshold=" << cfg.acc_rob_max_frame_count
+       << " nonfinite=" << nonfinite << "\n";
+}
+
 static void append_merge_summary(std::ostringstream& ss, const MergeDebugStats& s) {
     ss << "merge_pixels=" << s.pixels << "\n";
     const char* channel_name[3] = {"R", "G", "B"};
@@ -604,6 +744,20 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const int Hs = (int)std::lround(work.scale * ref.h);
     const int Ws = (int)std::lround(work.scale * ref.w);
 
+    if (stream_comp_raw) {
+        for (const CachedCompMeta& meta : cached_meta) {
+            const std::string name = "mask_" + std::to_string(meta.index - 1);
+            append_merge_sampled_robustness_summary(debug_summary, name.c_str(),
+                                                    meta.rob, Hs, Ws, work);
+        }
+    } else {
+        for (const CachedCompFrame& fc : cached) {
+            const std::string name = "mask_" + std::to_string(fc.index - 1);
+            append_merge_sampled_robustness_summary(debug_summary, name.c_str(),
+                                                    fc.rob, Hs, Ws, work);
+        }
+    }
+
     const bool accumulate_r =
         work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
     Image acc_rob;
@@ -613,6 +767,9 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     if (have_acc_rob) {
         debug_dump_bin("cpp_acc_rob", acc_rob.data.data(), acc_rob.data.size());
         append_image_summary(debug_summary, "acc_rob", acc_rob);
+        append_merge_sampled_robustness_summary(debug_summary, "acc_rob",
+                                                acc_rob, Hs, Ws, work);
+        append_merge_ref_overwrite_summary(debug_summary, acc_rob, Hs, Ws, work);
     }
 
     DngStreamWriter writer;
