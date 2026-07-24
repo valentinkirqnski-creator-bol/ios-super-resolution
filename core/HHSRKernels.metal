@@ -311,6 +311,60 @@ struct L2Params {
     uint tile_base, tile_count;
 };
 
+struct AlignLocalSearch460Params {
+    uint ny, nx;
+    int ts, R;
+    int ref_h, ref_w, mov_h, mov_w;
+    uint l1;
+};
+
+kernel void align_local_search_460(device const float* ref [[buffer(0)]],
+                                   device const float* mov [[buffer(1)]],
+                                   device float* flow [[buffer(2)]],
+                                   constant AlignLocalSearch460Params& p [[buffer(3)]],
+                                   uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.ny * p.nx) return;
+    uint ty = tid / p.nx;
+    uint tx = tid % p.nx;
+    int ox = int(tx) * p.ts;
+    int oy = int(ty) * p.ts;
+    float local_fx = flow[tid * 2u + 0u];
+    float local_fy = flow[tid * 2u + 1u];
+    float min_dist = INFINITY;
+    int min_shift_x = 0;
+    int min_shift_y = 0;
+    for (int sdy = -p.R; sdy <= p.R; ++sdy) {
+        for (int sdx = -p.R; sdx <= p.R; ++sdx) {
+            float dist = 0.f;
+            bool valid = true;
+            for (int i = 0; i < p.ts && valid; ++i) {
+                for (int j = 0; j < p.ts; ++j) {
+                    int rx = ox + j;
+                    int ry = oy + i;
+                    int mx = rx + int(local_fx) + sdx;
+                    int my = ry + int(local_fy) + sdy;
+                    if (!(rx >= 0 && rx < p.ref_w && ry >= 0 && ry < p.ref_h &&
+                          mx >= 0 && mx < p.mov_w && my >= 0 && my < p.mov_h)) {
+                        valid = false;
+                        break;
+                    }
+                    float diff = ref[uint(ry) * uint(p.ref_w) + uint(rx)] -
+                                 mov[uint(my) * uint(p.mov_w) + uint(mx)];
+                    dist += (p.l1 != 0u) ? fabs(diff) : diff * diff;
+                }
+            }
+            if (!valid) dist = INFINITY;
+            if (dist < min_dist) {
+                min_dist = dist;
+                min_shift_y = sdy;
+                min_shift_x = sdx;
+            }
+        }
+    }
+    flow[tid * 2u + 0u] = local_fx + float(min_shift_x);
+    flow[tid * 2u + 1u] = local_fy + float(min_shift_y);
+}
+
 kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
                           device float* mov_patch [[buffer(1)]],
                           device const float* ref [[buffer(2)]],
@@ -1491,7 +1545,7 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     float h00 = hess[ho + 0u], h01 = hess[ho + 1u];
     float h10 = hess[ho + 2u], h11 = hess[ho + 3u];
     float det = h00 * h11 - h01 * h10;
-    if (fabs(det) < 1e-10f) return; // leave flow unchanged (Python early exit)
+    if (fabs(det) < 1e-5f) return; // leave flow unchanged (460-main Python early exit)
     float det_inv = 1.f / det;
 
     float fx = flow[tid * 2u + 0u];
@@ -1725,6 +1779,8 @@ struct AlignUpscaleParams {
     uint target_ny, target_nx;
     uint upsample_factor, repeat_factor;
     uint up_ny, up_nx;
+    int ts;
+    int ref_h, ref_w, mov_h, mov_w;
 };
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
@@ -1745,6 +1801,70 @@ kernel void align_upscale_flow(device const float* in_flow [[buffer(0)]],
         out_flow[o + 0u] = 0.f;
         out_flow[o + 1u] = 0.f;
     }
+}
+
+kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
+                                   device const float* ref [[buffer(1)]],
+                                   device const float* mov [[buffer(2)]],
+                                   device float* out_flow [[buffer(3)]],
+                                   constant AlignUpscaleParams& p [[buffer(4)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.target_nx || gid.y >= p.target_ny) return;
+    uint o = (gid.y * p.target_nx + gid.x) * 2u;
+    if (gid.y >= p.repeat_factor * p.in_ny || gid.x >= p.repeat_factor * p.in_nx) {
+        out_flow[o + 0u] = 0.f;
+        out_flow[o + 1u] = 0.f;
+        return;
+    }
+
+    uint prev_x = gid.x / p.repeat_factor;
+    uint prev_y = gid.y / p.repeat_factor;
+    uint ups_x = gid.x % p.repeat_factor;
+    uint ups_y = gid.y % p.repeat_factor;
+    int x_shift = (2u * ups_x + 1u > p.repeat_factor) ? 1 : -1;
+    int y_shift = (2u * ups_y + 1u > p.repeat_factor) ? 1 : -1;
+    uint cand_y = uint(clamp(int(prev_y) + y_shift, 0, int(p.in_ny) - 1));
+    uint cand_x = uint(clamp(int(prev_x) + x_shift, 0, int(p.in_nx) - 1));
+
+    float sfac = float(p.upsample_factor);
+    float2 cand0 = float2(in_flow[(prev_y * p.in_nx + prev_x) * 2u + 0u] * sfac,
+                          in_flow[(prev_y * p.in_nx + prev_x) * 2u + 1u] * sfac);
+    float2 cand1 = float2(in_flow[(cand_y * p.in_nx + prev_x) * 2u + 0u] * sfac,
+                          in_flow[(cand_y * p.in_nx + prev_x) * 2u + 1u] * sfac);
+    float2 cand2 = float2(in_flow[(prev_y * p.in_nx + cand_x) * 2u + 0u] * sfac,
+                          in_flow[(prev_y * p.in_nx + cand_x) * 2u + 1u] * sfac);
+
+    int ox = int(gid.x) * p.ts;
+    int oy = int(gid.y) * p.ts;
+    float best = INFINITY;
+    float2 best_flow = cand0;
+    for (uint ci = 0u; ci < 3u; ++ci) {
+        float2 c = (ci == 0u) ? cand0 : ((ci == 1u) ? cand1 : cand2);
+        float dist = 0.f;
+        bool valid = true;
+        for (int i = 0; i < p.ts && valid; ++i) {
+            for (int j = 0; j < p.ts; ++j) {
+                int rx = ox + j;
+                int ry = oy + i;
+                int mx = rx + int(c.x);
+                int my = ry + int(c.y);
+                if (!(rx >= 0 && rx < p.ref_w && ry >= 0 && ry < p.ref_h &&
+                      mx >= 0 && mx < p.mov_w && my >= 0 && my < p.mov_h)) {
+                    valid = false;
+                    break;
+                }
+                dist += fabs(ref[uint(ry) * uint(p.ref_w) + uint(rx)] -
+                             mov[uint(my) * uint(p.mov_w) + uint(mx)]);
+            }
+        }
+        if (!valid) dist = INFINITY;
+        if (dist < best) {
+            best = dist;
+            best_flow = c;
+        }
+    }
+    out_flow[o + 0u] = best_flow.x;
+    out_flow[o + 1u] = best_flow.y;
 }
 
 // ---------------------------------------------------------------------------

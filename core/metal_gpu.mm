@@ -120,6 +120,7 @@ static MetalCtx& ctx() {
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
             "fftshift2d_c", "zero_fft_borders", "extract_real",
+            "align_local_search_460",
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
@@ -129,7 +130,8 @@ static MetalCtx& ctx() {
             "rob_make_mask", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
-            "align_sobel_x", "align_sobel_y", "align_hessian", "align_upscale_flow",
+            "align_sobel_x", "align_sobel_y", "align_hessian",
+            "align_upscale_flow", "align_upscale_flow_460",
             "merge_normalize_rgb16",
             nullptr};
         for (int i = 0; need[i]; ++i) {
@@ -1263,6 +1265,50 @@ static bool l2_bufs(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer> 
     return wait_slot(0) && wait_slot(1);
 }
 
+static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
+                                  id<MTLBuffer> b_flow,
+                                  int ref_h, int ref_w, int mov_h, int mov_w,
+                                  int tile_size, int search_radius,
+                                  int ny, int nx, bool l1) {
+    if (search_radius < 0 || tile_size <= 0) return false;
+    if (ny <= 0 || nx <= 0) return true;
+    auto& c = ctx();
+    struct AlignLocalSearch460ParamsCPU {
+        uint32_t ny, nx;
+        int32_t ts, R;
+        int32_t ref_h, ref_w, mov_h, mov_w;
+        uint32_t l1;
+    };
+    static_assert(sizeof(AlignLocalSearch460ParamsCPU) == 36,
+                  "AlignLocalSearch460ParamsCPU layout");
+    AlignLocalSearch460ParamsCPU p{};
+    p.ny = (uint32_t)ny;
+    p.nx = (uint32_t)nx;
+    p.ts = (int32_t)tile_size;
+    p.R = (int32_t)search_radius;
+    p.ref_h = (int32_t)ref_h;
+    p.ref_w = (int32_t)ref_w;
+    p.mov_h = (int32_t)mov_h;
+    p.mov_w = (int32_t)mov_w;
+    p.l1 = l1 ? 1u : 0u;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    id<MTLComputePipelineState> pipe = c.pipe("align_local_search_460");
+    if (!pipe) return false;
+    [enc setBuffer:b_ref offset:0 atIndex:0];
+    [enc setBuffer:b_mov offset:0 atIndex:1];
+    [enc setBuffer:b_flow offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    dispatch1(enc, pipe, (NSUInteger)ny * (NSUInteger)nx);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
+}
+
 static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
                     int ref_h, int ref_w, int mov_h, int mov_w,
                     int tile_size, int search_radius, int ny, int nx) {
@@ -1377,8 +1423,9 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     if (!ref_img || !mov_img || !flow_b) return false;
-    if (!l2_bufs(ref_img, mov_img, flow_b, ref.h, ref.w, moving.h, moving.w,
-                 tile_size, search_radius, ny, nx))
+    if (!local_search_460_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
+                               moving.h, moving.w, tile_size, search_radius,
+                               ny, nx, false))
         return false;
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
     return true;
@@ -1388,22 +1435,15 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow) {
     if (!metal_gpu_init()) return false;
-    if (search_radius < 0) return false;
-    if (tile_size == 16) {
-        if (2 * search_radius + 16 > 32) return false;
-    } else if (tile_size == 32 || tile_size == 64) {
-        if (2 * search_radius > 16) return false;
-    } else {
-        return false;
-    }
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
     id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
     id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     if (!b_ref || !b_mov || !b_flow) return false;
-    if (!l1_bufs(b_ref, b_mov, b_flow, ref.h, ref.w, moving.h, moving.w,
-                 tile_size, search_radius, ny, nx))
+    if (!local_search_460_bufs(b_ref, b_mov, b_flow, ref.h, ref.w,
+                               moving.h, moving.w, tile_size, search_radius,
+                               ny, nx, true))
         return false;
     memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
     return true;
@@ -1470,8 +1510,10 @@ static_assert(sizeof(AlignHessParamsCPU) == 32, "AlignHessParamsCPU");
 struct AlignUpscaleParamsCPU {
     uint32_t in_ny, in_nx, target_ny, target_nx;
     uint32_t upsample_factor, repeat_factor, up_ny, up_nx;
+    int32_t ts;
+    int32_t ref_h, ref_w, mov_h, mov_w;
 };
-static_assert(sizeof(AlignUpscaleParamsCPU) == 32, "AlignUpscaleParamsCPU");
+static_assert(sizeof(AlignUpscaleParamsCPU) == 52, "AlignUpscaleParamsCPU");
 
 // One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
 // retain all levels at once (full-res sticky cache jetsams on 1×).
@@ -1537,9 +1579,13 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
 }
 
 // __strong out-param: ARC requires it for id& (same as gpu_downsample_buf).
-static bool upscale_flow_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
-                              __strong id<MTLBuffer>& b_out, int target_ny, int target_nx,
-                              int upsample_factor, int new_tile_size, int prev_tile_size) {
+static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
+                                  id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
+                                  __strong id<MTLBuffer>& b_out,
+                                  int target_ny, int target_nx,
+                                  int upsample_factor, int new_tile_size,
+                                  int prev_tile_size,
+                                  int ref_h, int ref_w, int mov_h, int mov_w) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -1559,16 +1605,23 @@ static bool upscale_flow_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     p.repeat_factor = (uint32_t)repeat_factor;
     p.up_ny = (uint32_t)up_ny;
     p.up_nx = (uint32_t)up_nx;
+    p.ts = (int32_t)new_tile_size;
+    p.ref_h = (int32_t)ref_h;
+    p.ref_w = (int32_t)ref_w;
+    p.mov_h = (int32_t)mov_h;
+    p.mov_w = (int32_t)mov_w;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
-    id<MTLComputePipelineState> pipe = c.pipe("align_upscale_flow");
+    id<MTLComputePipelineState> pipe = c.pipe("align_upscale_flow_460");
     if (!pipe) return false;
     [enc setBuffer:b_in offset:0 atIndex:0];
-    [enc setBuffer:b_out offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    [enc setBuffer:b_ref offset:0 atIndex:1];
+    [enc setBuffer:b_mov offset:0 atIndex:2];
+    [enc setBuffer:b_out offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     [cmd commit];
@@ -1593,16 +1646,8 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
-        if (metric == "L1") {
-            if (radius < 0) return false;
-            if (ts == 16) {
-                if (2 * radius + 16 > 32) return false;
-            } else if (ts == 32 || ts == 64) {
-                if (2 * radius > 16) return false;
-            } else {
-                return false;
-            }
-        }
+        if (metric != "L1" && metric != "L2") return false;
+        if (radius < 0) return false;
     }
 
     auto& c = ctx();
@@ -1678,8 +1723,9 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1] : ts;
             id<MTLBuffer> b_up = nil;
-            if (!upscale_flow_bufs(b_flow, flow_ny, flow_nx, b_up, ny, nx,
-                                   upsample_factor, ts, prev_ts) || !b_up)
+            if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
+                                       b_up, ny, nx, upsample_factor, ts, prev_ts,
+                                       r.h, r.w, m.h, m.w) || !b_up)
                 return false;
             b_flow = b_up;
             flow_ny = ny;
@@ -1690,9 +1736,11 @@ bool align_metal(const Pyramid& ref_pyr, const Image& moving_grey,
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
         bool bm_ok = false;
         if (metric == "L1")
-            bm_ok = l1_bufs(b_ref, m.img, b_flow, r.h, r.w, m.h, m.w, ts, radius, ny, nx);
+            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
+                                          m.h, m.w, ts, radius, ny, nx, true);
         else
-            bm_ok = l2_bufs(b_ref, m.img, b_flow, r.h, r.w, m.h, m.w, ts, radius, ny, nx);
+            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
+                                          m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
         if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, m.img, b_flow,

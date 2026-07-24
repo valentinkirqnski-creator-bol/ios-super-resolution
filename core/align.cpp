@@ -305,17 +305,64 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
     });
 }
 
+static void block_match_level_direct_460(const Image& ref, const Image& moving,
+                                         int tile_size, int search_radius,
+                                         FlowField& flow, bool l1, int num_threads) {
+    const int ny = flow.ny, nx = flow.nx;
+    const int ts = tile_size;
+    const int R = search_radius;
+    parallel_rows(ny, num_threads, [&](int ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            const int oy = ty * ts;
+            const int ox = tx * ts;
+            const f32 local_fx = flow.dx(ty, tx);
+            const f32 local_fy = flow.dy(ty, tx);
+            f32 min_dist = std::numeric_limits<f32>::infinity();
+            int min_shift_x = 0, min_shift_y = 0;
+            for (int sdy = -R; sdy <= R; ++sdy) {
+                for (int sdx = -R; sdx <= R; ++sdx) {
+                    f32 dist = 0.f;
+                    bool valid = true;
+                    for (int i = 0; i < ts && valid; ++i) {
+                        for (int j = 0; j < ts; ++j) {
+                            const int rx = ox + j;
+                            const int ry = oy + i;
+                            const int mx = rx + (int)local_fx + sdx;
+                            const int my = ry + (int)local_fy + sdy;
+                            if (!(rx >= 0 && rx < ref.w && ry >= 0 && ry < ref.h &&
+                                  mx >= 0 && mx < moving.w && my >= 0 && my < moving.h)) {
+                                valid = false;
+                                break;
+                            }
+                            const f32 diff = ref.at(ry, rx) - moving.at(my, mx);
+                            dist += l1 ? std::fabs(diff) : diff * diff;
+                        }
+                    }
+                    if (!valid) dist = std::numeric_limits<f32>::infinity();
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        min_shift_y = sdy;
+                        min_shift_x = sdx;
+                    }
+                }
+            }
+            flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
+            flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+        }
+    });
+}
+
 static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
 #ifdef __APPLE__
-    // Default: Metal (same math, different FFT). HHSR_L2_CPU=1 → vDSP path.
+    // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
         if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow))
             return;
     }
 #endif
-    block_match_level_L2_cpu(ref, moving, tile_size, search_radius, flow, num_threads);
+    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow, false, num_threads);
 }
 
 // ============================================================================
@@ -329,6 +376,8 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
         block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow))
         return;
 #endif
+    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow, true, num_threads);
+    return;
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
@@ -455,7 +504,7 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             const f32* h = hessian.at(ty, tx);
             f32 h00 = h[0], h01 = h[1], h10 = h[2], h11 = h[3];
             f32 det = h00 * h11 - h01 * h10;
-            if (std::fabs(det) < 1e-10f) continue;
+            if (std::fabs(det) < 1e-5f) continue;
             f32 det_inv = 1.f / det;
 
             f32 fx = flow.dx(ty, tx);
@@ -579,6 +628,74 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
     return out;
 }
 
+static FlowField upscale_flow_460(const Image& ref, const Image& moving,
+                                  const FlowField& in, int target_ny, int target_nx,
+                                  int upsample_factor, int new_tile_size,
+                                  int prev_tile_size) {
+    int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
+    int repeat_factor = upsample_factor / std::max(1, tile_ratio);
+    if (repeat_factor < 1) repeat_factor = 1;
+
+    FlowField out(target_ny, target_nx);
+    for (int ty = 0; ty < target_ny; ++ty) {
+        for (int tx = 0; tx < target_nx; ++tx) {
+            if (tx >= repeat_factor * in.nx || ty >= repeat_factor * in.ny) {
+                out.dx(ty, tx) = 0.f;
+                out.dy(ty, tx) = 0.f;
+                continue;
+            }
+
+            const int prev_x = tx / repeat_factor;
+            const int prev_y = ty / repeat_factor;
+            const int ups_x = tx % repeat_factor;
+            const int ups_y = ty % repeat_factor;
+            const int x_shift = (2 * ups_x + 1 > repeat_factor) ? 1 : -1;
+            const int y_shift = (2 * ups_y + 1 > repeat_factor) ? 1 : -1;
+            const int cand_y = std::max(0, std::min(in.ny - 1, prev_y + y_shift));
+            const int cand_x = std::max(0, std::min(in.nx - 1, prev_x + x_shift));
+            f32 cand[3][2] = {
+                {in.dx(prev_y, prev_x) * (f32)upsample_factor,
+                 in.dy(prev_y, prev_x) * (f32)upsample_factor},
+                {in.dx(cand_y, prev_x) * (f32)upsample_factor,
+                 in.dy(cand_y, prev_x) * (f32)upsample_factor},
+                {in.dx(prev_y, cand_x) * (f32)upsample_factor,
+                 in.dy(prev_y, cand_x) * (f32)upsample_factor},
+            };
+
+            const int ox = tx * new_tile_size;
+            const int oy = ty * new_tile_size;
+            f32 best_dist = std::numeric_limits<f32>::infinity();
+            int best_i = 0;
+            for (int ci = 0; ci < 3; ++ci) {
+                f32 dist = 0.f;
+                bool valid = true;
+                for (int i = 0; i < new_tile_size && valid; ++i) {
+                    for (int j = 0; j < new_tile_size; ++j) {
+                        const int rx = ox + j;
+                        const int ry = oy + i;
+                        const int mx = rx + (int)cand[ci][0];
+                        const int my = ry + (int)cand[ci][1];
+                        if (!(rx >= 0 && rx < ref.w && ry >= 0 && ry < ref.h &&
+                              mx >= 0 && mx < moving.w && my >= 0 && my < moving.h)) {
+                            valid = false;
+                            break;
+                        }
+                        dist += std::fabs(ref.at(ry, rx) - moving.at(my, mx));
+                    }
+                }
+                if (!valid) dist = std::numeric_limits<f32>::infinity();
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_i = ci;
+                }
+            }
+            out.dx(ty, tx) = cand[best_i][0];
+            out.dy(ty, tx) = cand[best_i][1];
+        }
+    }
+    return out;
+}
+
 // Ref Sobel+Hessian are independent of the moving frame — reuse across
 // comparison frames in one burst. Cleared before merge (see clear_align_ref_ica_cache).
 struct RefIcaLevel {
@@ -611,7 +728,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
-        if (align_metal(ref_pyr, moving_grey, cfg, tile_size, flow_gpu))
+        Image moving_padded_gpu = pad_image_circular(moving_grey, tile_size);
+        if (align_metal(ref_pyr, moving_padded_gpu, cfg, tile_size, flow_gpu))
             return flow_gpu;
     }
 #endif
@@ -642,8 +760,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         }
     }
 
-    // Moving: unpadded grey → pyramid (matches Python align())
-    Pyramid mov_pyr = build_pyramid(moving_grey, cfg.bm_factors);
+    // 460-main pads alternate images circularly before pyramid construction.
+    Image moving_padded = pad_image_circular(moving_grey, tile_size);
+    Pyramid mov_pyr = build_pyramid(moving_padded, cfg.bm_factors);
 
     FlowField flow;
 
@@ -668,7 +787,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1]
                           : ts;
-            flow = upscale_flow(flow, ny, nx, upsample_factor, ts, prev_ts);
+            flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
         }
 
         std::string metric = "L2";

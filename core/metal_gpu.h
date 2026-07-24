@@ -1,9 +1,8 @@
 #pragma once
 //
-// Metal GPU backend for grey-FFT, L2 BM, kernel covariance, robustness, and merge.
+// Metal GPU backend for grey-FFT, 460-main alignment, kernel covariance, robustness, and merge.
 // FFT matches grey_pyramid.cpp (fft1d_pow2_inplace_ref + Bluestein).
-// L2 BM matches Torch rfft2/irfft2/fftshift math; Metal FFT ≠ Torch float stream.
-// Prefer HHSR_L2_CPU=1 / HHSR_ALIGN_CPU=1 for closer CPU/vDSP parity on dumps.
+// Alignment uses 460-main's direct L1/L2 local search and adaptive flow upsample.
 // Kernels match kernels.cpp estimate_kernels (GAT + decimate + grads + cov).
 // Merge matches merge.cpp accumulate_comp / accumulate_ref (incl. robustness).
 //
@@ -20,21 +19,20 @@ bool metal_gpu_init();
 // Alg. 3 FFT grey on GPU. Empty image on failure.
 Image compute_grey_fft_metal(const Image& raw);
 
-// L2 block-match one pyramid level on GPU (updates flow in place).
+// 460-main L2 local-search block-match one pyramid level on GPU.
 // Returns false on failure (caller must not fall back to CPU).
 bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow);
 
-// L1 BM for ts==16 (default finest level). Same warp-reduce + broken argmin
-// as align.cpp. Returns false if unsupported (ts!=16 or R>1) or GPU fail.
+// 460-main L1 local-search block-match one pyramid level on GPU.
 bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow);
 
-// ICA refine one pyramid level (ICA.py ica_kernel_8/16). Same bilinear rules,
+// ICA refine one pyramid level. Same bilinear rules,
 // modf/trunc, butterfly reduce order, and Ax=B update as align.cpp / Python.
-// hess: packed [ny*nx*4] = 00,01,10,11. Returns false if ts not in {8,16}.
+// hess: packed [ny*nx*4] = 00,01,10,11.
 bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
                             const std::vector<float>& hess_packed,
                             const Image& moving, FlowField& flow,
