@@ -619,6 +619,23 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
 
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
+    const float k_max_abs = 32.f;
+    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
+    if (!(m > k_max_abs) || !isfinite(m)) {
+        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
+        return;
+    }
+    float s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
 inline float cov_lerp2(device const float* covs, uint cov_w,
                        int fy, int fx, int cy, int cx,
                        float frac_x, float frac_y, int idx) {
@@ -674,6 +691,7 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {

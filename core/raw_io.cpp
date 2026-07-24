@@ -191,6 +191,40 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
     beta = b;
     return true;
 }
+
+static float rawpy_white_level(const LibRaw& raw) {
+    const auto& C = raw.imgdata.color;
+    const auto& D = C.dng_levels;
+    if ((D.parsedfields & LIBRAW_DNGFM_WHITE) && D.dng_whitelevel[0] > 0)
+        return (float)D.dng_whitelevel[0];
+    if (C.maximum > 0) return (float)C.maximum;
+    return 65535.f;
+}
+
+static void rawpy_black_level_per_channel(const LibRaw& raw, float black_ch[4]) {
+    const auto& C = raw.imgdata.color;
+    const auto& D = C.dng_levels;
+    if (D.parsedfields & LIBRAW_DNGFM_BLACK) {
+        const float base = (D.dng_fblack != 0.f) ? D.dng_fblack : (float)D.dng_black;
+        for (int i = 0; i < 4; ++i) {
+            const float delta = (D.dng_fcblack[i] != 0.f)
+                ? D.dng_fcblack[i]
+                : (float)D.dng_cblack[i];
+            black_ch[i] = base + delta;
+        }
+        return;
+    }
+
+    bool have_cblack = false;
+    for (int i = 0; i < 4; ++i) {
+        if (C.cblack[i] != 0) have_cblack = true;
+        black_ch[i] = (float)C.black + (float)C.cblack[i];
+    }
+    if (!have_cblack) {
+        for (int i = 0; i < 4; ++i) black_ch[i] = (float)C.black;
+    }
+}
+
 static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
                              int crop_h, int crop_w, const std::string& path) {
     Image img;
@@ -202,7 +236,7 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     // Python utils_dng.py uses raw.raw_image.copy(), not raw_image_visible.
     // Use LibRaw's full raw buffer so the algorithm sees the same raw geometry.
     int top = 0, left = 0;
-    int vw = S.raw_width & ~1, vh = S.raw_height & ~1;
+    int vw = S.raw_width, vh = S.raw_height;
     img = Image(vh, vw, 1);
 
     // Metadata first so CFA/WB exist for this frame (and for comps after ref).
@@ -214,8 +248,15 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         // Python utils_dng: store raw camera_whitebalance (not /green).
         // Load multiplies by (wb[c]/wb[G]); later stages consume those values directly.
         for (int i = 0; i < 3; ++i)
-            if (C.cam_mul[i] > 0) cfg.white_balance[i] = C.cam_mul[i];
-        if (!(cfg.white_balance[1] > 0.f)) cfg.white_balance[1] = 1.f;
+            cfg.white_balance[i] = C.cam_mul[i];
+        // Impossible metadata guard only. For valid camera_whitebalance values,
+        // the Python ratio wb[c] / wb[1] below is unchanged.
+        bool wb_ok = std::isfinite(cfg.white_balance[1]) && cfg.white_balance[1] > 0.f;
+        for (int i = 0; i < 3; ++i)
+            wb_ok = wb_ok && std::isfinite(cfg.white_balance[i]) && cfg.white_balance[i] > 0.f;
+        if (!wb_ok) {
+            for (int i = 0; i < 3; ++i) cfg.white_balance[i] = 1.f;
+        }
         for (int i = 0; i < 2; ++i)
             for (int j = 0; j < 2; ++j) {
                 int c = raw.COLOR(i, j);
@@ -258,25 +299,16 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
 
         // Python: black_level_per_channel[R,G,B,(G2)]; index by CFA color.
         float black_ch[4];
-        bool have_cblack = false;
-        for (int i = 0; i < 4; ++i) {
-            if (C.cblack[i] != 0) have_cblack = true;
-            black_ch[i] = (float)C.black + (float)C.cblack[i];
-        }
-        if (!have_cblack) {
-            for (int i = 0; i < 4; ++i) black_ch[i] = (float)C.black;
-        }
+        rawpy_black_level_per_channel(raw, black_ch);
         cfg.black_levels[0] = black_ch[0];
         cfg.black_levels[1] = black_ch[1];
         cfg.black_levels[2] = black_ch[2];
-        cfg.white_level = (float)C.maximum > 0 ? (float)C.maximum : 65535.f;
+        cfg.white_level = rawpy_white_level(raw);
         cfg.has_black_levels = true;
     }
 
     // Python utils_dng: per-channel black, (v-black)/(white-black), then * (wb[c]/wb[G]).
-    float maxv = cfg.has_black_levels && cfg.white_level > 0.f
-        ? cfg.white_level
-        : ((float)C.maximum > 0 ? (float)C.maximum : 65535.f);
+    float maxv = cfg.has_black_levels ? cfg.white_level : rawpy_white_level(raw);
     float bl_rgb[3];
     if (cfg.has_black_levels) {
         bl_rgb[0] = cfg.black_levels[0];
@@ -284,31 +316,30 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         bl_rgb[2] = cfg.black_levels[2];
     } else {
         float black_ch[4];
-        bool have_cblack = false;
-        for (int i = 0; i < 4; ++i) {
-            if (C.cblack[i] != 0) have_cblack = true;
-            black_ch[i] = (float)C.black + (float)C.cblack[i];
-        }
-        if (!have_cblack) {
-            for (int i = 0; i < 4; ++i) black_ch[i] = (float)C.black;
-        }
+        rawpy_black_level_per_channel(raw, black_ch);
         bl_rgb[0] = black_ch[0];
         bl_rgb[1] = black_ch[1];
         bl_rgb[2] = black_ch[2];
     }
     float site_black[2][2];
+    float site_denom[2][2];
     float site_wb[2][2];
-    const float wb_g = (cfg.white_balance[1] > 0.f) ? cfg.white_balance[1] : 1.f;
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             int c = (int)cfg.cfa.p[i][j];
             if (c < 0) c = 0;
             if (c > 2) c = 1;
             site_black[i][j] = bl_rgb[c];
+            site_denom[i][j] = maxv - site_black[i][j];
+            // Impossible metadata guard only. With valid rawpy metadata,
+            // denominator stays exactly white_level - black_levels[channel].
+            if (!(site_denom[i][j] > 0.f) || !std::isfinite(site_denom[i][j]) ||
+                !std::isfinite(site_black[i][j])) {
+                site_black[i][j] = 0.f;
+                site_denom[i][j] = (std::isfinite(maxv) && maxv > 0.f) ? maxv : 65535.f;
+            }
             // Python: k = white_balance[channel] / white_balance[1]
-            float w = cfg.white_balance[c] / wb_g;
-            if (!(w > 0.f) || !std::isfinite(w)) w = 1.f;
-            site_wb[i][j] = w;
+            site_wb[i][j] = cfg.white_balance[c] / cfg.white_balance[1];
         }
     }
 
@@ -317,12 +348,11 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         for (int x = 0; x < img.w; ++x) {
             const int fj = x & 1;
             float bl = site_black[fi][fj];
-            float denom = std::max(1.f, maxv - bl);
+            float denom = site_denom[fi][fj];
             float v = ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - bl) / denom;
             v *= site_wb[fi][fj];
-            if (!std::isfinite(v) || v < 0.f) v = 0.f;
-            else if (v > 1.f) v = 1.f;
-            img.at(y, x) = v;
+            if (!std::isfinite(v)) v = 0.f;
+            img.at(y, x) = clampf(v, 0.f, 1.f);
         }
     }
     cfg.raw_prewhitened = true;
@@ -343,8 +373,8 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     }
 
     if (crop_h > 0 && crop_w > 0 && (img.h > crop_h || img.w > crop_w)) {
-        int mh = std::min(img.h, crop_h) & ~1;
-        int mw = std::min(img.w, crop_w) & ~1;
+        int mh = std::min(img.h, crop_h);
+        int mw = std::min(img.w, crop_w);
         Image c(mh, mw, 1);
         for (int y = 0; y < mh; ++y)
             for (int x = 0; x < mw; ++x)

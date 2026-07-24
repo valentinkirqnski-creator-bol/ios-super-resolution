@@ -21,6 +21,26 @@ static inline int denoise_range_merge(f32 r_acc, int rad_max, f32 max_frame_coun
     return (r_acc <= max_frame_count) ? rad_max : 1;
 }
 
+// Guard against singular/near-singular covariance inversions producing
+// infinitely sharp kernels. That can leave R/B denominators at zero while G
+// receives weight, showing up as green or black speckles.
+static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
+    constexpr f32 k_max_abs = 32.f;
+    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
+    if (!(m > k_max_abs) || !std::isfinite(m)) {
+        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
+        return;
+    }
+    f32 s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
 static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -71,6 +91,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
