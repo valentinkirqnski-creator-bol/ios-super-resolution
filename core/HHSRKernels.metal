@@ -657,8 +657,8 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     float frac_y = kmap_i - trunc(kmap_i);
     int fx, fy;
     if (raw_det) {
-        fx = max(int(kmap_j), 0);
-        fy = max(int(kmap_i), 0);
+        fx = max(int(floor(kmap_j)), 0);
+        fy = max(int(floor(kmap_i)), 0);
     } else {
         fx = max(int(floor(kmap_j)), 0);
         fy = max(int(floor(kmap_i)), 0);
@@ -755,11 +755,13 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
     if (!p.iso) {
         float kmap_j, kmap_i;
         if (p.bayer) {
-            kmap_j = lr_mov_x / 2.f - 0.5f;
-            kmap_i = lr_mov_y / 2.f - 0.5f;
+            // Python: grey_pos = (patch_center_pos - 0.5) / 2.
+            kmap_j = (lr_mov_x - 0.5f) / 2.f;
+            kmap_i = (lr_mov_y - 0.5f) / 2.f;
         } else {
-            kmap_j = lr_mov_x - 0.5f;
-            kmap_i = lr_mov_y - 0.5f;
+            // Python: grey_pos is exactly the coarse/warped grid.
+            kmap_j = lr_mov_x;
+            kmap_i = lr_mov_y;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
     }

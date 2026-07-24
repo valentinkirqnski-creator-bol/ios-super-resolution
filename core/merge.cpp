@@ -55,9 +55,9 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     f32 frac_y = kmap_i - std::trunc(kmap_i);
     int fx, fy;
     if (raw_det) {
-        // Python accumulate: floor_x = max(int(kmap_j), 0) — no high clamp
-        fx = std::max((int)kmap_j, 0);
-        fy = std::max((int)kmap_i, 0);
+        // Python accumulate: floor_x = int(max(math.floor(grey_pos), 0))
+        fx = std::max((int)std::floor(kmap_j), 0);
+        fy = std::max((int)std::floor(kmap_i), 0);
     } else {
         // Python accumulate_ref: floor_x = int(max(math.floor(grey_pos), 0))
         fx = std::max((int)std::floor(kmap_j), 0);
@@ -140,11 +140,13 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             if (!iso) {
                 f32 kmap_j, kmap_i;
                 if (cfg.bayer_mode) {
-                    kmap_j = lr_mov_x / 2.f - 0.5f;
-                    kmap_i = lr_mov_y / 2.f - 0.5f;
+                    // Python: grey_pos = (patch_center_pos - 0.5) / 2.
+                    kmap_j = (lr_mov_x - 0.5f) / 2.f;
+                    kmap_i = (lr_mov_y - 0.5f) / 2.f;
                 } else {
-                    kmap_j = lr_mov_x - 0.5f;
-                    kmap_i = lr_mov_y - 0.5f;
+                    // Python: grey_pos is exactly the coarse/warped grid.
+                    kmap_j = lr_mov_x;
+                    kmap_i = lr_mov_y;
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
