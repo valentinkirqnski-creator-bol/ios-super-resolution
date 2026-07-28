@@ -386,6 +386,37 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     }
 }
 
+static Image local_lowpass_3x3(const Image& guide) {
+    Image out(guide.h, guide.w, guide.c);
+    for (int ch = 0; ch < guide.c; ++ch) {
+        for (int y = 0; y < guide.h; ++y) {
+            for (int x = 0; x < guide.w; ++x) {
+                f32 s = 0.f;
+                for (int i = -1; i <= 1; ++i) {
+                    int yy = (int)clampf((f32)(y + i), 0.f, (f32)(guide.h - 1));
+                    for (int j = -1; j <= 1; ++j) {
+                        int xx = (int)clampf((f32)(x + j), 0.f, (f32)(guide.w - 1));
+                        s += guide.at(yy, xx, ch);
+                    }
+                }
+                out.at(y, x, ch) = s / 9.f;
+            }
+        }
+    }
+    return out;
+}
+
+static bool high_frequency_variance_loss(const Image& vars, const Image& lp_vars,
+                                         int y, int x, const Config& cfg) {
+    f32 var = 0.f, lp_var = 0.f;
+    for (int ch = 0; ch < vars.c; ++ch) {
+        var += std::max(vars.at(y, x, ch), 0.f);
+        lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
+    }
+    if (var <= cfg.hf_variance_floor) return false;
+    return (var - lp_var) > cfg.hf_variance_loss_threshold * var;
+}
+
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     // Python OOB: HR[...] = 1/0  (+inf)
     if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
@@ -480,9 +511,11 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     }
 }
 
-static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2) {
+static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
+                                  std::vector<uint32_t>* irregular_out = nullptr) {
     const f32 inf = std::numeric_limits<f32>::infinity();
     std::vector<f32> S((size_t)flow.ny * flow.nx, s2);
+    if (irregular_out) irregular_out->assign((size_t)flow.ny * flow.nx, 0u);
     for (int ty = 0; ty < flow.ny; ++ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             // Python: mini = +1/0, maxi = -1/0
@@ -499,7 +532,10 @@ static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2)
                 }
             }
             f32 d0 = mxx - mnx, d1 = mxy - mny;
-            S[(size_t)ty * flow.nx + tx] = (d0 * d0 + d1 * d1 > Mt * Mt) ? s1 : s2;
+            const bool irregular = d0 * d0 + d1 * d1 > Mt * Mt;
+            const size_t idx = (size_t)ty * flow.nx + tx;
+            S[idx] = irregular ? s1 : s2;
+            if (irregular_out) (*irregular_out)[idx] = irregular ? 1u : 0u;
         }
     }
     return S;
@@ -576,8 +612,12 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-    // Python discards comp local stds
-    (void)comp_vars;
+    Image comp_lp_vars;
+    if (cfg.hf_artifact_removal_enabled) {
+        Image lp_guide = local_lowpass_3x3(guide);
+        Image lp_means;
+        local_stats_3x3(lp_guide, lp_means, comp_lp_vars);
+    }
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
@@ -611,7 +651,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image d_sq, sigma_sq;
     apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc, d_sq, sigma_sq);
 
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                   cfg.hf_artifact_removal_enabled ? &motion_irregular : nullptr);
 
     Image R(h, w, 1);
     for (int y = 0; y < h; ++y) {
@@ -624,9 +666,17 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
             }
-            f32 s = S[(size_t)patch_idy * flow.nx + patch_idx];
+            const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
+            const bool hf_reject =
+                cfg.hf_artifact_removal_enabled &&
+                pidx < motion_irregular.size() &&
+                motion_irregular[pidx] != 0u &&
+                high_frequency_variance_loss(comp_vars, comp_lp_vars, y, x, cfg);
+            f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
-            R.at(y, x) = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            R.at(y, x) = hf_reject
+                ? 0.f
+                : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
         }
     }
     return local_min_5x5(R);

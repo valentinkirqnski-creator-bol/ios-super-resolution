@@ -164,6 +164,12 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
         if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
         if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
         if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
+        if (tuning[@"hf_artifact_removal_enabled"])
+            cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
+        if (tuning[@"hf_variance_loss_threshold"])
+            cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
+        if (tuning[@"hf_variance_floor"])
+            cfg.hf_variance_floor = tuning[@"hf_variance_floor"].floatValue;
         if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
         if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
         if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;

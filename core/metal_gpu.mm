@@ -6,6 +6,7 @@
 #include "metal_gpu.h"
 #include "debug_utils.h"
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -126,7 +127,7 @@ static MetalCtx& ctx() {
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
-            "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
+            "rob_guide_bayer", "rob_local_stats_3x3", "rob_lowpass_3x3", "rob_upscale_dogson",
             "rob_make_mask", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
@@ -817,13 +818,18 @@ static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
     float r_t;
-    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
+    uint32_t hf_enabled = 0;
+    float hf_variance_loss_threshold = 0.f;
+    float hf_variance_floor = 0.f;
+    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0, _pad3 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 48, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 64, "RobMaskParamsCPU");
 
-static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2) {
+static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
+                                      std::vector<uint32_t>* irregular_out = nullptr) {
     const f32 inf = std::numeric_limits<f32>::infinity();
     std::vector<f32> S((size_t)flow.ny * (size_t)flow.nx, s2);
+    if (irregular_out) irregular_out->assign((size_t)flow.ny * (size_t)flow.nx, 0u);
     for (int ty = 0; ty < flow.ny; ++ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
@@ -839,14 +845,17 @@ static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32
                 }
             }
             f32 d0 = mxx - mnx, d1 = mxy - mny;
-            S[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
-                (d0 * d0 + d1 * d1 > Mt * Mt) ? s1 : s2;
+            const bool irregular = d0 * d0 + d1 * d1 > Mt * Mt;
+            const size_t idx = (size_t)ty * (size_t)flow.nx + (size_t)tx;
+            S[idx] = irregular ? s1 : s2;
+            if (irregular_out) (*irregular_out)[idx] = irregular ? 1u : 0u;
         }
     }
     return S;
 }
 
 static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
+                                __strong id<MTLBuffer>& b_guide,
                                 __strong id<MTLBuffer>& b_means,
                                 __strong id<MTLBuffer>& b_vars,
                                 int& guide_h, int& guide_w, int& nch,
@@ -861,7 +870,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     const size_t raw_b = raw.data.size() * sizeof(float);
     const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
     id<MTLBuffer> b_raw = buf(raw.data.data(), raw_b);
-    id<MTLBuffer> b_guide = buf(nullptr, guide_b);
+    b_guide = buf(nullptr, guide_b);
     b_means = buf(nullptr, guide_b);
     b_vars = buf(nullptr, guide_b);
     if (!b_raw || !b_guide || !b_means || !b_vars) return false;
@@ -982,9 +991,9 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return RefStats();
 
-    id<MTLBuffer> b_means = nil, b_vars = nil;
+    id<MTLBuffer> b_guide = nil, b_means = nil, b_vars = nil;
     int gh = 0, gw = 0, nch = 0;
-    if (!rob_run_guide_stats(ref_raw, cfg, b_means, b_vars, gh, gw, nch, cmd))
+    if (!rob_run_guide_stats(ref_raw, cfg, b_guide, b_means, b_vars, gh, gw, nch, cmd))
         return RefStats();
 
     [cmd commit];
@@ -1033,22 +1042,53 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     fetch_noise_curves(cfg.alpha, cfg.beta, std_curve, diff_curve);
     if (std_curve.empty() || diff_curve.empty()) return Image();
 
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                       cfg.hf_artifact_removal_enabled ? &motion_irregular : nullptr);
+    if (!cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
 
-    id<MTLBuffer> b_gmeans = nil, b_gvars = nil;
+    id<MTLBuffer> b_guide = nil, b_gmeans = nil, b_gvars = nil;
     int gh = 0, gw = 0, nch = 0;
-    if (!rob_run_guide_stats(comp_raw, cfg, b_gmeans, b_gvars, gh, gw, nch, cmd))
+    if (!rob_run_guide_stats(comp_raw, cfg, b_guide, b_gmeans, b_gvars, gh, gw, nch, cmd))
         return Image();
-    (void)b_gvars;
 
     if (gh != ref_stats.means.h || gw != ref_stats.means.w || nch != ref_stats.means.c)
         return Image();
 
     const size_t ref_b = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
     const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
+    id<MTLBuffer> b_lp_vars = b_gvars;
+    if (cfg.hf_artifact_removal_enabled) {
+        id<MTLBuffer> b_lp_guide = buf(nullptr, ref_b);
+        id<MTLBuffer> b_lp_means = buf(nullptr, ref_b);
+        b_lp_vars = buf(nullptr, ref_b);
+        if (!b_lp_guide || !b_lp_means || !b_lp_vars) return Image();
+
+        RobStatsParamsCPU hfsp{};
+        hfsp.h = (uint32_t)gh;
+        hfsp.w = (uint32_t)gw;
+        hfsp.nch = (uint32_t)nch;
+        id<MTLComputeCommandEncoder> hfenc = [cmd computeCommandEncoder];
+        if (!hfenc) return Image();
+        [hfenc setBuffer:b_lp_guide offset:0 atIndex:0];
+        [hfenc setBuffer:b_guide offset:0 atIndex:1];
+        [hfenc setBytes:&hfsp length:sizeof(hfsp) atIndex:2];
+        dispatch2(hfenc, c.pipe("rob_lowpass_3x3"), hfsp.w, hfsp.h);
+        [hfenc endEncoding];
+
+        hfenc = [cmd computeCommandEncoder];
+        if (!hfenc) return Image();
+        [hfenc setBuffer:b_lp_means offset:0 atIndex:0];
+        [hfenc setBuffer:b_lp_vars offset:0 atIndex:1];
+        [hfenc setBuffer:b_lp_guide offset:0 atIndex:2];
+        [hfenc setBytes:&hfsp length:sizeof(hfsp) atIndex:3];
+        dispatch2(hfenc, c.pipe("rob_local_stats_3x3"), hfsp.w, hfsp.h);
+        [hfenc endEncoding];
+    }
     id<MTLBuffer> b_ref_m = nil;
     id<MTLBuffer> b_ref_v = nil;
     if (g_rob_ref_m && g_rob_ref_v && g_rob_ref_bytes == ref_b &&
@@ -1072,10 +1112,12 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
+    id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
-    if (!b_ref_m || !b_ref_v || !b_std || !b_diff || !b_S || !b_flow || !b_R || !b_out)
+    if (!b_ref_m || !b_ref_v || !b_std || !b_diff || !b_S || !b_motion ||
+        !b_flow || !b_R || !b_out || !b_lp_vars)
         return Image();
 
     RobMaskParamsCPU mp{};
@@ -1088,18 +1130,24 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     mp.curve_n = (uint32_t)std_curve.size();
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.hf_variance_floor = cfg.hf_variance_floor;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_gmeans offset:0 atIndex:1];
-    [enc setBuffer:b_ref_m offset:0 atIndex:2];
-    [enc setBuffer:b_ref_v offset:0 atIndex:3];
-    [enc setBuffer:b_std offset:0 atIndex:4];
-    [enc setBuffer:b_diff offset:0 atIndex:5];
-    [enc setBuffer:b_S offset:0 atIndex:6];
-    [enc setBuffer:b_flow offset:0 atIndex:7];
-    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
+    [enc setBuffer:b_gvars offset:0 atIndex:2];
+    [enc setBuffer:b_lp_vars offset:0 atIndex:3];
+    [enc setBuffer:b_ref_m offset:0 atIndex:4];
+    [enc setBuffer:b_ref_v offset:0 atIndex:5];
+    [enc setBuffer:b_std offset:0 atIndex:6];
+    [enc setBuffer:b_diff offset:0 atIndex:7];
+    [enc setBuffer:b_S offset:0 atIndex:8];
+    [enc setBuffer:b_motion offset:0 atIndex:9];
+    [enc setBuffer:b_flow offset:0 atIndex:10];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

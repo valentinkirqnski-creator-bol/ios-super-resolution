@@ -446,6 +446,26 @@ struct CameraView: View {
                         Text(String(format: "%.2f", cam.tuningParams.r_Mt))
                     }
                     Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
+
+                    Toggle("High-Frequency Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
+
+                    if cam.tuningParams.hf_artifact_removal_enabled {
+                        HStack {
+                            Text("Variance Loss")
+                            Spacer()
+                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_loss_threshold))
+                        }
+                        Slider(value: $cam.tuningParams.hf_variance_loss_threshold, in: 0.0...1.0)
+
+                        HStack {
+                            Text("Variance Floor")
+                            Spacer()
+                            Text(String(format: "%.0e", cam.tuningParams.hf_variance_floor))
+                        }
+                        Slider(value: $cam.tuningParams.hf_variance_floor,
+                               in: 0.0...0.0001,
+                               step: 0.000001)
+                    }
                 }
                 
                 Section(header: Text("Steerable Kernels (Merging)")) {

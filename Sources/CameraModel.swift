@@ -64,6 +64,9 @@ struct TuningParams: Equatable, Codable {
     var r_s1: Float = 2.0
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
+    var hf_artifact_removal_enabled: Bool = true
+    var hf_variance_loss_threshold: Float = 0.55
+    var hf_variance_floor: Float = 0.00001
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
@@ -118,7 +121,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 7
+        let defaultsVersion = 8
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -1002,6 +1005,9 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s1": NSNumber(value: tuningParams.r_s1),
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
+            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
+            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
+            "hf_variance_floor": NSNumber(value: tuningParams.hf_variance_floor),
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
