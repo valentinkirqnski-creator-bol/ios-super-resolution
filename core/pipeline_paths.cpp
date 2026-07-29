@@ -383,11 +383,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
 
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
+    const bool debug = debug_dumps_enabled();
     std::ostringstream debug_summary;
-    debug_summary << "cpp_debug_summary\n";
+    if (debug) debug_summary << "cpp_debug_summary\n";
 
     report("Loading reference frame", 0.02f);
-    {
+    if (debug) {
         std::string listing = "ref_index=0\n";
         for (size_t i = 0; i < paths.size(); ++i)
             listing += std::to_string(i) + " " + paths[i] + "\n";
@@ -396,7 +397,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     Image ref = load_raw_frame(paths[0], work, true);
     if (ref.h <= 0 || ref.w <= 0) return Image();
     debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
-    append_image_summary(debug_summary, "raw_ref", ref);
+    if (debug) append_image_summary(debug_summary, "raw_ref", ref);
     tune_config_snr(ref, work);
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
@@ -426,7 +427,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
     Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
-    if (!ref_pyr.levels.empty()) {
+    if (debug && !ref_pyr.levels.empty()) {
         // Match Python py_pyramid_0: first after pyramid[::-1] = coarsest.
         const Image& coarse = ref_pyr.levels.back();
         debug_dump_bin("cpp_pyramid_0", coarse.data.data(), coarse.data.size());
@@ -448,7 +449,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         ref_stats = init_robustness(ref, work);
         ref_covs = ref_cov_fut.get();
     }
-    append_cov_summary(debug_summary, "cov_ref", ref_covs);
+    if (debug) append_cov_summary(debug_summary, "cov_ref", ref_covs);
 #if defined(__APPLE__)
     // GPU already holds ref means/vars; drop host copies to cut peak RAM.
     metal_release_host_ref_stats(ref_stats);
@@ -503,8 +504,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         if (comp.h <= 0) continue;
         debug_dump_bin("cpp_raw_comp_" + std::to_string(k - 1),
                        comp.data.data(), comp.data.size());
-        const std::string raw_name = "raw_comp_" + std::to_string(k - 1);
-        append_image_summary(debug_summary, raw_name.c_str(), comp);
+        if (debug) {
+            const std::string raw_name = "raw_comp_" + std::to_string(k - 1);
+            append_image_summary(debug_summary, raw_name.c_str(), comp);
+        }
 
         // 2×: decode next during align. 1×: wait until after grey (lower peak).
         if (!full_res && k + 1 < n) {
@@ -522,6 +525,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         debug_dump_bin("cpp_flow_" + std::to_string(k - 1),
                        flow.flow.data(), flow.flow.size());
         comp_grey = Image(); // free before robustness/kernels peak
+        if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) {
+            report("Frame " + std::to_string(k + 1) + ": Metal alignment failed",
+                   0.08f + 0.35f * (float)k / std::max(1, n - 1));
+            continue;
+        }
 
         // Full-res: decode next while Metal rob/kernels run (grey already freed).
         if (full_res && k + 1 < n) {
@@ -547,10 +555,12 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         }
         debug_dump_bin("cpp_mask_" + std::to_string(k - 1),
                        rob.data.data(), rob.data.size());
-        const std::string mask_name = "mask_" + std::to_string(k - 1);
-        const std::string cov_name = "cov_comp_" + std::to_string(k - 1);
-        append_image_summary(debug_summary, mask_name.c_str(), rob);
-        append_cov_summary(debug_summary, cov_name.c_str(), covs);
+        if (debug) {
+            const std::string mask_name = "mask_" + std::to_string(k - 1);
+            const std::string cov_name = "cov_comp_" + std::to_string(k - 1);
+            append_image_summary(debug_summary, mask_name.c_str(), rob);
+            append_cov_summary(debug_summary, cov_name.c_str(), covs);
+        }
 
         if (stream_comp_raw) {
             // Spill Bayer async (overlaps next decode already in flight). Keep
@@ -612,7 +622,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
     if (have_acc_rob) {
         debug_dump_bin("cpp_acc_rob", acc_rob.data.data(), acc_rob.data.size());
-        append_image_summary(debug_summary, "acc_rob", acc_rob);
+        if (debug) append_image_summary(debug_summary, "acc_rob", acc_rob);
     }
 
     DngStreamWriter writer;
@@ -760,7 +770,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         // ping-pong resolved (2×). Encode it while this band's GPU runs.
         if (have_ready) {
             const int er = ready, ey0 = ready_y0, ebh = ready_bh;
-            if (analyze_merge_band(num_bands[er], den_bands[er], ey0, merge_debug)) {
+            if (debug && analyze_merge_band(num_bands[er], den_bands[er], ey0, merge_debug)) {
                 const std::string ys = std::to_string(ey0);
                 debug_dump_bin("cpp_num_bad_band_y" + ys,
                                num_bands[er].data.data(), num_bands[er].data.size());
@@ -787,7 +797,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         Image& rn = num_bands[ready];
         Image& rd = den_bands[ready];
         accumulate_diag(rn, rd, diag);
-        if (analyze_merge_band(rn, rd, ready_y0, merge_debug)) {
+        if (debug && analyze_merge_band(rn, rd, ready_y0, merge_debug)) {
             const std::string ys = std::to_string(ready_y0);
             debug_dump_bin("cpp_num_bad_band_y" + ys, rn.data.data(), rn.data.size());
             debug_dump_bin("cpp_den_bad_band_y" + ys, rd.data.data(), rd.data.size());
@@ -827,7 +837,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
         if (y0 + bh >= Hs)
             accumulate_diag(num_band, den_band, diag);
-        if (analyze_merge_band(num_band, den_band, y0, merge_debug)) {
+        if (debug && analyze_merge_band(num_band, den_band, y0, merge_debug)) {
             const std::string ys = std::to_string(y0);
             debug_dump_bin("cpp_num_bad_band_y" + ys,
                            num_band.data.data(), num_band.data.size());
@@ -852,8 +862,10 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     ref_covs = CovField();
     if (stream_comp_raw) fs::remove_all(cache, ec);
     report(format_accum_diag(diag), 0.99f);
-    append_merge_summary(debug_summary, merge_debug);
-    debug_dump_text("cpp_debug_summary", debug_summary.str());
+    if (debug) {
+        append_merge_summary(debug_summary, merge_debug);
+        debug_dump_text("cpp_debug_summary", debug_summary.str());
+    }
     report("Done", 1.f);
     return preview;
 }

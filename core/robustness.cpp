@@ -262,7 +262,7 @@ static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
     return true;
 }
 
-static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
+static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
     // Cache like Python (curves built once per alpha/beta, reused every frame).
     static NoiseCurves cached;
     static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
@@ -273,7 +273,7 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
 
     NoiseCurves nc;
     if (try_load_python_noise_curves(alpha, beta, nc)) {
-        cached = nc;
+        cached = std::move(nc);
         cached_alpha = alpha;
         cached_beta = beta;
         cached_from_file = true;
@@ -310,25 +310,25 @@ static NoiseCurves make_noise_curves(f32 alpha, f32 beta) {
         interp_MC_range(nc, imin, imax);
     }
 
-    cached = nc;
+    cached = std::move(nc);
     cached_alpha = alpha;
     cached_beta = beta;
     cached_from_file = false;
-    return nc;
+    return cached;
 }
 
 } // namespace
 
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
     // Python: id_noise = round(1000*brightness); std = std_curve[id_noise] — no clamp
-    NoiseCurves nc = make_noise_curves(alpha, beta);
+    const NoiseCurves& nc = make_noise_curves(alpha, beta);
     int id = (int)std::lround(1000.f * brightness);
     return nc.std_curve[(size_t)id];
 }
 
 void fetch_noise_curves(f32 alpha, f32 beta,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
-    NoiseCurves nc = make_noise_curves(alpha, beta);
+    const NoiseCurves& nc = make_noise_curves(alpha, beta);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
 }
@@ -386,35 +386,43 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     }
 }
 
-static Image local_lowpass_3x3(const Image& guide) {
+static Image local_lowpass_gaussian5x5(const Image& guide) {
+    static constexpr f32 k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
     Image out(guide.h, guide.w, guide.c);
     for (int ch = 0; ch < guide.c; ++ch) {
         for (int y = 0; y < guide.h; ++y) {
             for (int x = 0; x < guide.w; ++x) {
                 f32 s = 0.f;
-                for (int i = -1; i <= 1; ++i) {
+                for (int i = -2; i <= 2; ++i) {
                     int yy = (int)clampf((f32)(y + i), 0.f, (f32)(guide.h - 1));
-                    for (int j = -1; j <= 1; ++j) {
+                    f32 wy = k[i + 2];
+                    for (int j = -2; j <= 2; ++j) {
                         int xx = (int)clampf((f32)(x + j), 0.f, (f32)(guide.w - 1));
-                        s += guide.at(yy, xx, ch);
+                        s += wy * k[j + 2] * guide.at(yy, xx, ch);
                     }
                 }
-                out.at(y, x, ch) = s / 9.f;
+                out.at(y, x, ch) = s / 256.f;
             }
         }
     }
     return out;
 }
 
-static bool high_frequency_variance_loss(const Image& vars, const Image& lp_vars,
-                                         int y, int x, const Config& cfg) {
-    f32 var = 0.f, lp_var = 0.f;
-    for (int ch = 0; ch < vars.c; ++ch) {
-        var += std::max(vars.at(y, x, ch), 0.f);
-        lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
+static Image high_frequency_loss_map(const Image& vars, const Image& lp_vars, const Config& cfg) {
+    Image loss(vars.h, vars.w, 1);
+    for (int y = 0; y < vars.h; ++y) {
+        for (int x = 0; x < vars.w; ++x) {
+            f32 var = 0.f, lp_var = 0.f;
+            for (int ch = 0; ch < vars.c; ++ch) {
+                var += std::max(vars.at(y, x, ch), 0.f);
+                lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
+            }
+            loss.at(y, x) = (var > cfg.hf_variance_floor)
+                ? std::max((var - lp_var) / var, 0.f)
+                : 0.f;
+        }
     }
-    if (var <= cfg.hf_variance_floor) return false;
-    return (var - lp_var) > cfg.hf_variance_loss_threshold * var;
+    return loss;
 }
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
@@ -574,6 +582,12 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     Image guide = compute_guide(ref_raw, cfg);
     Image means, vars;
     local_stats_3x3(guide, means, vars);
+    if (cfg.hf_artifact_removal_enabled) {
+        Image lp_guide = local_lowpass_gaussian5x5(guide);
+        Image lp_means, lp_vars;
+        local_stats_3x3(lp_guide, lp_means, lp_vars);
+        st.hf_loss = high_frequency_loss_map(vars, lp_vars, cfg);
+    }
     // 460-main keeps robustness local statistics on the guide grid
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
@@ -607,16 +621,17 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     return Image();
 #else
 
-    const NoiseCurves nc = make_noise_curves(cfg.alpha, cfg.beta);
+    const NoiseCurves& nc = make_noise_curves(cfg.alpha, cfg.beta);
 
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-    Image comp_lp_vars;
+    Image comp_hf_loss;
     if (cfg.hf_artifact_removal_enabled) {
-        Image lp_guide = local_lowpass_3x3(guide);
-        Image lp_means;
-        local_stats_3x3(lp_guide, lp_means, comp_lp_vars);
+        Image lp_guide = local_lowpass_gaussian5x5(guide);
+        Image lp_means, lp_vars;
+        local_stats_3x3(lp_guide, lp_means, lp_vars);
+        comp_hf_loss = high_frequency_loss_map(comp_vars, lp_vars, cfg);
     }
 
     const int h = comp_means.h, w = comp_means.w;
@@ -666,12 +681,28 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
             }
+            f32 flow_x = 0.f, flow_y = 0.f;
+            if (ref_stats.means.c == 3) {
+                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+            } else {
+                flow_x = flow.dx(patch_idy, patch_idx);
+                flow_y = flow.dy(patch_idy, patch_idx);
+            }
+            const int new_x = (int)std::lround((f32)x + flow_x);
+            const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
             const bool hf_reject =
                 cfg.hf_artifact_removal_enabled &&
                 pidx < motion_irregular.size() &&
                 motion_irregular[pidx] != 0u &&
-                high_frequency_variance_loss(comp_vars, comp_lp_vars, y, x, cfg);
+                (
+                    (!ref_stats.hf_loss.data.empty() &&
+                     ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold) ||
+                    (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h &&
+                     !comp_hf_loss.data.empty() &&
+                     comp_hf_loss.at(new_y, new_x) > cfg.hf_variance_loss_threshold)
+                );
             f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
             R.at(y, x) = hf_reject

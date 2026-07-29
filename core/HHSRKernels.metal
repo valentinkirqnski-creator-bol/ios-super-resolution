@@ -1051,6 +1051,11 @@ struct RobStatsParams {
     uint _pad0;
 };
 
+struct RobVarianceLossParams {
+    uint h, w, nch;
+    float variance_floor;
+};
+
 struct RobDogsonParams {
     uint in_h, in_w, out_h, out_w, nch;
     uint is_ref;      // 1 = no flow
@@ -1134,24 +1139,43 @@ kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
     }
 }
 
-kernel void rob_lowpass_3x3(device float* out [[buffer(0)]],
-                            device const float* guide [[buffer(1)]],
-                            constant RobStatsParams& p [[buffer(2)]],
-                            uint2 gid [[thread_position_in_grid]]) {
+kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
+                                    device const float* guide [[buffer(1)]],
+                                    constant RobStatsParams& p [[buffer(2)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     int y = int(gid.y), x = int(gid.x);
     int H = int(p.h), W = int(p.w);
+    float k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
     for (uint ch = 0u; ch < p.nch; ++ch) {
         float s = 0.f;
-        for (int i = -1; i <= 1; ++i) {
+        for (int i = -2; i <= 2; ++i) {
             int yy = clamp_edge(y + i, H - 1);
-            for (int j = -1; j <= 1; ++j) {
+            float wy = k[i + 2];
+            for (int j = -2; j <= 2; ++j) {
                 int xx = clamp_edge(x + j, W - 1);
-                s += guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
+                s += wy * k[j + 2] * guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
             }
         }
-        out[(gid.y * p.w + gid.x) * p.nch + ch] = s / 9.f;
+        out[(gid.y * p.w + gid.x) * p.nch + ch] = s / 256.f;
     }
+}
+
+kernel void rob_variance_loss(device float* loss [[buffer(0)]],
+                              device const float* vars [[buffer(1)]],
+                              device const float* lp_vars [[buffer(2)]],
+                              constant RobVarianceLossParams& p [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    float var_sum = 0.f, lp_var_sum = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+        var_sum += max(vars[o], 0.f);
+        lp_var_sum += max(lp_vars[o], 0.f);
+    }
+    loss[gid.y * p.w + gid.x] = (var_sum > p.variance_floor)
+        ? max((var_sum - lp_var_sum) / var_sum, 0.f)
+        : 0.f;
 }
 
 kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
@@ -1203,10 +1227,10 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
-                          device const float* comp_vars [[buffer(2)]],
-                          device const float* comp_lp_vars [[buffer(3)]],
-                          device const float* ref_means [[buffer(4)]],
-                          device const float* ref_vars [[buffer(5)]],
+                          device const float* comp_hf_loss [[buffer(2)]],
+                          device const float* ref_means [[buffer(3)]],
+                          device const float* ref_vars [[buffer(4)]],
+                          device const float* ref_hf_loss [[buffer(5)]],
                           device const float* std_curve [[buffer(6)]],
                           device const float* diff_curve [[buffer(7)]],
                           device const float* S [[buffer(8)]],
@@ -1237,13 +1261,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     int new_idy = lround_away(float(gid.y) + flow_y);
     bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
                     0 <= new_idy && new_idy < int(p.h));
-    float var_sum = 0.f, lp_var_sum = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-        if (p.hf_enabled != 0u) {
-            var_sum += max(comp_vars[o], 0.f);
-            lp_var_sum += max(comp_lp_vars[o], 0.f);
-        }
         float brightness = ref_means[o];
         // Python: id_noise = round(1000 * brightness) — no clamp.
         int id_noise = lround_away(1000.f * brightness);
@@ -1271,8 +1290,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
     bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u && var_sum > p.hf_variance_floor) {
-        hf_reject = (var_sum - lp_var_sum) > p.hf_variance_loss_threshold * var_sum;
+    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
+        float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
+        if (inbound) {
+            hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
+        }
+        hf_reject = hf_loss > p.hf_variance_loss_threshold;
     }
     R[gid.y * p.w + gid.x] = hf_reject
         ? 0.f

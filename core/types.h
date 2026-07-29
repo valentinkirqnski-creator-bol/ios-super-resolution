@@ -102,8 +102,8 @@ struct Config {
     float r_s2 = 12.0f;
     float r_Mt = 0.8f;
     bool  hf_artifact_removal_enabled = true;
-    float hf_variance_loss_threshold = 0.55f;
-    float hf_variance_floor = 1.0e-5f;
+    float hf_variance_loss_threshold = 0.97f;
+    float hf_variance_floor = 1.0e-4f;
 
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
     bool  accumulated_robustness_denoiser_enabled = true;

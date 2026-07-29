@@ -22,6 +22,7 @@ enum ExportFormat: String, CaseIterable, Identifiable, Codable {
 enum CameraSelection: String, CaseIterable, Identifiable {
     case wide
     case ultraWide
+    case telephoto
     case front
 
     var id: String { rawValue }
@@ -30,6 +31,7 @@ enum CameraSelection: String, CaseIterable, Identifiable {
         switch self {
         case .wide: return "1×"
         case .ultraWide: return "0.5×"
+        case .telephoto: return "Tele"
         case .front: return "Front"
         }
     }
@@ -40,12 +42,14 @@ enum LensZoomMode: Equatable {
     case ultraWide
     case wide1x
     case wide2x
+    case telephoto
 
     var label: String {
         switch self {
         case .ultraWide: return "0.5×"
         case .wide1x: return "1×"
         case .wide2x: return "2×"
+        case .telephoto: return "Tele"
         }
     }
 
@@ -65,8 +69,8 @@ struct TuningParams: Equatable, Codable {
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
     var hf_artifact_removal_enabled: Bool = true
-    var hf_variance_loss_threshold: Float = 0.55
-    var hf_variance_floor: Float = 0.00001
+    var hf_variance_loss_threshold: Float = 0.97
+    var hf_variance_floor: Float = 0.0001
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
@@ -121,7 +125,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 8
+        let defaultsVersion = 9
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -144,25 +148,47 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
     @Published var availableCameras: [CameraSelection] = [.wide]
-    @Published var frameCount: Int = 4 {
+    @Published var telephotoLensLabel = "Tele"
+    @Published var frameCount: Int = CameraModel.persistedFrameCount() {
         didSet {
             let clamped = min(Self.maxFrameCount, max(Self.minFrameCount, frameCount))
             if frameCount != clamped {
                 frameCount = clamped
                 return
             }
+            UserDefaults.standard.set(clamped, forKey: Self.frameCountDefaultsKey)
             sessionQueue.async { self.activeFrameCount = clamped }
         }
     }
 
     // Shutter: Auto (A), or manual via log-scaled slider (0…1). Default = AE on.
-    @Published var shutterIsAuto = true
-    @Published var shutterSlider: Double = 0.5
+    @Published var shutterIsAuto = CameraModel.persistedShutterIsAuto()
+    @Published var shutterSlider: Double = CameraModel.persistedShutterSlider()
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
 
     static let minFrameCount = 2
     static let maxFrameCount = 8
+    private static let frameCountDefaultsKey = "FrameCount"
+    private static let shutterAutoDefaultsKey = "ShutterIsAuto"
+    private static let shutterSliderDefaultsKey = "ShutterSlider"
+
+    private static func persistedFrameCount() -> Int {
+        guard UserDefaults.standard.object(forKey: frameCountDefaultsKey) != nil else { return 4 }
+        let saved = UserDefaults.standard.integer(forKey: frameCountDefaultsKey)
+        return min(maxFrameCount, max(minFrameCount, saved))
+    }
+
+    private static func persistedShutterIsAuto() -> Bool {
+        guard UserDefaults.standard.object(forKey: shutterAutoDefaultsKey) != nil else { return true }
+        return UserDefaults.standard.bool(forKey: shutterAutoDefaultsKey)
+    }
+
+    private static func persistedShutterSlider() -> Double {
+        guard UserDefaults.standard.object(forKey: shutterSliderDefaultsKey) != nil else { return 0.5 }
+        let saved = UserDefaults.standard.double(forKey: shutterSliderDefaultsKey)
+        return min(1.0, max(0.0, saved))
+    }
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session", qos: .userInteractive)
@@ -173,8 +199,8 @@ final class CameraModel: NSObject, ObservableObject {
     private var activeCameraSelection: CameraSelection = .wide
     private var lastBackSelection: CameraSelection = .wide
 
-    private var activeFrameCount = 4
-    private var currentBurstTotal = 4
+    private var activeFrameCount = CameraModel.persistedFrameCount()
+    private var currentBurstTotal = CameraModel.persistedFrameCount()
     private var capturesRequested = 0
     private var capturesProcessed = 0
     private var capturedDNGs: [URL] = []
@@ -280,20 +306,34 @@ final class CameraModel: NSObject, ObservableObject {
 
     func setShutterAuto(_ auto: Bool) {
         shutterIsAuto = auto
+        persistShutterState()
         applyShutter()
+        if auto {
+            startAutoExposureSyncIfNeeded()
+        } else {
+            exposureSyncTimer?.invalidate()
+            exposureSyncTimer = nil
+        }
     }
 
-    /// Force Auto shutter UI + continuous AE when the camera screen appears.
+    /// Apply the persisted shutter UI state when the camera screen appears.
     func ensureShutterAutoOnLaunch() {
-        shutterIsAuto = true
         applyShutter()
-        startAutoExposureSyncIfNeeded()
+        if shutterIsAuto { startAutoExposureSyncIfNeeded() }
     }
 
     func applyManualShutterFromSlider() {
         guard !isBusy else { return }
         if shutterIsAuto { shutterIsAuto = false }
+        persistShutterState()
         applyShutter()
+        exposureSyncTimer?.invalidate()
+        exposureSyncTimer = nil
+    }
+
+    private func persistShutterState() {
+        UserDefaults.standard.set(shutterIsAuto, forKey: Self.shutterAutoDefaultsKey)
+        UserDefaults.standard.set(min(1.0, max(0.0, shutterSlider)), forKey: Self.shutterSliderDefaultsKey)
     }
 
     private func applyShutterSoundSuppression(to settings: AVCapturePhotoSettings) {
@@ -443,7 +483,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.activeCameraSelection = selection
             DispatchQueue.main.async {
                 self.cameraSelection = selection
-                if selection == .ultraWide { self.lensZoomMode = .ultraWide }
+                self.syncLensModeForCameraSelection(selection)
             }
             self.switchCameraDevice(to: selection)
         }
@@ -451,14 +491,19 @@ final class CameraModel: NSObject, ObservableObject {
 
     func setLensZoom(_ mode: LensZoomMode) {
         guard !isBusy else { return }
-        lensZoomMode = mode
         switch mode {
         case .ultraWide:
             guard availableCameras.contains(.ultraWide) else { return }
+            lensZoomMode = mode
             setCamera(.ultraWide)
         case .wide1x, .wide2x:
             guard availableCameras.contains(.wide) else { return }
+            lensZoomMode = mode
             setCamera(.wide)
+        case .telephoto:
+            guard availableCameras.contains(.telephoto) else { return }
+            lensZoomMode = mode
+            setCamera(.telephoto)
         }
     }
 
@@ -479,17 +524,44 @@ final class CameraModel: NSObject, ObservableObject {
         guard selection != activeCameraSelection else { return }
         if selection != .front { lastBackSelection = selection }
         activeCameraSelection = selection
-        DispatchQueue.main.async { self.cameraSelection = selection }
+        DispatchQueue.main.async {
+            self.cameraSelection = selection
+            self.syncLensModeForCameraSelection(selection)
+        }
         switchCameraDevice(to: selection)
+    }
+
+    private func syncLensModeForCameraSelection(_ selection: CameraSelection) {
+        switch selection {
+        case .ultraWide:
+            lensZoomMode = .ultraWide
+        case .telephoto:
+            lensZoomMode = .telephoto
+        case .wide:
+            if lensZoomMode == .ultraWide || lensZoomMode == .telephoto {
+                lensZoomMode = .wide1x
+            }
+        case .front:
+            break
+        }
     }
 
     private func discoverCamerasAfterSetup() {
         var found: [CameraSelection] = []
         if device(for: .wide) != nil { found.append(.wide) }
         if device(for: .ultraWide) != nil { found.append(.ultraWide) }
+        if device(for: .telephoto) != nil { found.append(.telephoto) }
         if device(for: .front) != nil { found.append(.front) }
         if found.isEmpty { found = [.wide] }
-        DispatchQueue.main.async { self.availableCameras = found }
+        let teleLabel = inferredTelephotoLensLabel()
+        DispatchQueue.main.async {
+            self.availableCameras = found
+            self.telephotoLensLabel = teleLabel
+            if !found.contains(self.cameraSelection) {
+                self.cameraSelection = found.first ?? .wide
+                self.syncLensModeForCameraSelection(self.cameraSelection)
+            }
+        }
     }
 
     private func configureSession() {
@@ -533,9 +605,13 @@ final class CameraModel: NSObject, ObservableObject {
         ensureReadyBurstDir()
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
-            self.shutterIsAuto = true
             self.applyShutter()
-            self.startAutoExposureSyncIfNeeded()
+            if self.shutterIsAuto {
+                self.startAutoExposureSyncIfNeeded()
+            } else {
+                self.exposureSyncTimer?.invalidate()
+                self.exposureSyncTimer = nil
+            }
             if self.cachedRawPixelFormat == nil {
                 self.statusText = "RAW capture not supported on this camera"
             }
@@ -569,8 +645,13 @@ final class CameraModel: NSObject, ObservableObject {
         session.commitConfiguration()
         ensureReadyBurstDir()
         DispatchQueue.main.async {
-            if self.shutterIsAuto { self.applyShutter() }
-            self.startAutoExposureSyncIfNeeded()
+            self.applyShutter()
+            if self.shutterIsAuto {
+                self.startAutoExposureSyncIfNeeded()
+            } else {
+                self.exposureSyncTimer?.invalidate()
+                self.exposureSyncTimer = nil
+            }
             if self.cachedRawPixelFormat == nil {
                 self.statusText = "RAW not supported on \(selection.label)"
             } else {
@@ -642,9 +723,22 @@ final class CameraModel: NSObject, ObservableObject {
             return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
         case .ultraWide:
             return AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back)
+        case .telephoto:
+            return AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back)
         case .front:
             return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
         }
+    }
+
+    private func inferredTelephotoLensLabel() -> String {
+        guard let wide = device(for: .wide),
+              let tele = device(for: .telephoto) else { return "Tele" }
+        let wideFOV = Double(wide.activeFormat.videoFieldOfView) * .pi / 180.0
+        let teleFOV = Double(tele.activeFormat.videoFieldOfView) * .pi / 180.0
+        guard wideFOV > 0, teleFOV > 0, teleFOV < wideFOV else { return "Tele" }
+        let zoom = tan(wideFOV * 0.5) / tan(teleFOV * 0.5)
+        guard zoom.isFinite, zoom >= 2.0 else { return "Tele" }
+        return "\(Int(zoom.rounded()))×"
     }
 
     private func applyDefaultDeviceModes() {
@@ -653,7 +747,7 @@ final class CameraModel: NSObject, ObservableObject {
         if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
         }
-        // Default launch path: continuous AE (shutterIsAuto starts true).
+        // Persisted Auto path: continuous AE only when the UI state says Auto.
         if shutterIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
             d.exposureMode = .continuousAutoExposure
         }
@@ -664,6 +758,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func startAutoExposureSyncIfNeeded() {
         exposureSyncTimer?.invalidate()
+        guard shutterIsAuto else { return }
         guard isAppActive, !previewSuspended else { return }
         exposureSyncTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             self?.pollAutoExposureForSlider()
@@ -967,20 +1062,7 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func processBurst() {
-        var paths = capturedDNGs.map { $0.path }
-
-        // DEBUG: if Documents contains ≥2 DNGs, process those (sorted) instead of the camera burst.
-        let fm = FileManager.default
-        if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
-           let items = try? fm.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) {
-            let docDNGs = items.filter { $0.pathExtension.lowercased() == "dng" }
-                .map { $0.path }
-                .sorted()
-            if docDNGs.count >= 2 {
-                paths = docDNGs
-                print("DEBUG OVERRIDE: Using \(paths.count) DNGs from Documents (ref=paths[0])")
-            }
-        }
+        let paths = capturedDNGs.map { $0.path }
 
         let burstDir = self.burstDir
         guard paths.count >= 2 else {
@@ -1021,9 +1103,9 @@ final class CameraModel: NSObject, ObservableObject {
         ]
 
         var preview: UIImage?
-        // Documents debug DNGs: no center-crop (match Python full-frame run).
-        let usingDocDNGs = paths != capturedDNGs.map(\.path)
-        let cropFactor = usingDocDNGs ? Int32(1) : Int32(lensZoomMode.cropFactor)
+        let cropFactor = activeCameraSelection != .wide
+            ? Int32(1)
+            : Int32(lensZoomMode.cropFactor)
         let inputURLs = capturedDNGs
         let ok = SRBridge.processDNGs(
             paths,

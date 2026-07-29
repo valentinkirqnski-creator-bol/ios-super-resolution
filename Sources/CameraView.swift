@@ -232,6 +232,11 @@ struct CameraView: View {
                         cam.setLensZoom(.wide2x)
                     }
                 }
+                if cam.availableCameras.contains(.telephoto) {
+                    lensChip(title: cam.telephotoLensLabel, selected: cam.lensZoomMode == .telephoto) {
+                        cam.setLensZoom(.telephoto)
+                    }
+                }
             }
             HStack(spacing: 18) {
                 lensChip(title: "DNG", selected: cam.exportFormat == .dng) {
@@ -463,7 +468,7 @@ struct CameraView: View {
                             Text(String(format: "%.0e", cam.tuningParams.hf_variance_floor))
                         }
                         Slider(value: $cam.tuningParams.hf_variance_floor,
-                               in: 0.0...0.0001,
+                               in: 0.0...0.001,
                                step: 0.000001)
                     }
                 }

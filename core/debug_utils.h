@@ -5,6 +5,9 @@
 
 namespace hhsr {
 
+// Off by default in production. Enable with HHSR_ENABLE_DEBUG_DUMPS=1 or HHSR_DEBUG_DIR.
+bool debug_dumps_enabled();
+
 // Writes float32 dumps under Documents/debug_dumps (iOS) or $HHSR_DEBUG_DIR / debug_dumps.
 void debug_ensure_dir();
 void debug_dump_bin(const std::string& name, const float* data, size_t size);
