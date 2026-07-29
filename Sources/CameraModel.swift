@@ -1062,7 +1062,20 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func processBurst() {
-        let paths = capturedDNGs.map { $0.path }
+        var paths = capturedDNGs.map { $0.path }
+
+        // DEBUG: if Documents contains ≥2 DNGs, process those (sorted) instead of the camera burst.
+        let fm = FileManager.default
+        if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
+           let items = try? fm.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) {
+            let docDNGs = items.filter { $0.pathExtension.lowercased() == "dng" }
+                .map { $0.path }
+                .sorted()
+            if docDNGs.count >= 2 {
+                paths = docDNGs
+                print("DEBUG OVERRIDE: Using \(paths.count) DNGs from Documents (ref=paths[0])")
+            }
+        }
 
         let burstDir = self.burstDir
         guard paths.count >= 2 else {
@@ -1103,7 +1116,9 @@ final class CameraModel: NSObject, ObservableObject {
         ]
 
         var preview: UIImage?
-        let cropFactor = activeCameraSelection != .wide
+        // Documents debug DNGs: no center-crop (match Python full-frame run).
+        let usingDocDNGs = paths != capturedDNGs.map(\.path)
+        let cropFactor = (usingDocDNGs || activeCameraSelection != .wide)
             ? Int32(1)
             : Int32(lensZoomMode.cropFactor)
         let inputURLs = capturedDNGs

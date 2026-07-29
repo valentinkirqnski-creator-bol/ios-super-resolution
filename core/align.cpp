@@ -729,7 +729,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu))
             return flow_gpu;
-        return FlowField();
     }
 #endif
 
