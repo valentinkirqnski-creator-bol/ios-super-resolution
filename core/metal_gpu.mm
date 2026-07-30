@@ -127,8 +127,7 @@ static MetalCtx& ctx() {
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
-            "rob_guide_bayer", "rob_local_stats_3x3", "rob_lowpass_gaussian5x5",
-            "rob_variance_loss", "rob_upscale_dogson",
+            "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_make_mask", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
@@ -808,12 +807,6 @@ struct RobStatsParamsCPU {
 };
 static_assert(sizeof(RobStatsParamsCPU) == 16, "RobStatsParamsCPU");
 
-struct RobVarianceLossParamsCPU {
-    uint32_t h, w, nch;
-    float variance_floor;
-};
-static_assert(sizeof(RobVarianceLossParamsCPU) == 16, "RobVarianceLossParamsCPU");
-
 struct RobDogsonParamsCPU {
     uint32_t in_h, in_w, out_h, out_w, nch;
     uint32_t is_ref, tile_size, flow_ny, flow_nx;
@@ -825,9 +818,9 @@ static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
     float r_t;
-    uint32_t hf_enabled = 0;
-    float hf_variance_loss_threshold = 0.f;
-    float hf_variance_floor = 0.f;
+    uint32_t motion_edge_enabled = 0;
+    float motion_edge_threshold = 0.f;
+    float motion_edge_residual_threshold = 0.f;
     uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0, _pad3 = 0;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 64, "RobMaskParamsCPU");
@@ -922,57 +915,6 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     return true;
 }
 
-static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_vars,
-                            __strong id<MTLBuffer>& b_loss,
-                            int guide_h, int guide_w, int nch,
-                            const Config& cfg, id<MTLCommandBuffer> cmd) {
-    auto& c = ctx();
-    const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
-    const size_t loss_b = (size_t)guide_h * (size_t)guide_w * sizeof(float);
-    id<MTLBuffer> b_lp_guide = buf(nullptr, guide_b);
-    id<MTLBuffer> b_lp_means = buf(nullptr, guide_b);
-    id<MTLBuffer> b_lp_vars = buf(nullptr, guide_b);
-    b_loss = buf(nullptr, loss_b);
-    if (!b_guide || !b_vars || !b_lp_guide || !b_lp_means || !b_lp_vars || !b_loss)
-        return false;
-
-    RobStatsParamsCPU sp{};
-    sp.h = (uint32_t)guide_h;
-    sp.w = (uint32_t)guide_w;
-    sp.nch = (uint32_t)nch;
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
-    [enc setBuffer:b_lp_guide offset:0 atIndex:0];
-    [enc setBuffer:b_guide offset:0 atIndex:1];
-    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
-    dispatch2(enc, c.pipe("rob_lowpass_gaussian5x5"), sp.w, sp.h);
-    [enc endEncoding];
-
-    enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
-    [enc setBuffer:b_lp_means offset:0 atIndex:0];
-    [enc setBuffer:b_lp_vars offset:0 atIndex:1];
-    [enc setBuffer:b_lp_guide offset:0 atIndex:2];
-    [enc setBytes:&sp length:sizeof(sp) atIndex:3];
-    dispatch2(enc, c.pipe("rob_local_stats_3x3"), sp.w, sp.h);
-    [enc endEncoding];
-
-    RobVarianceLossParamsCPU vp{};
-    vp.h = (uint32_t)guide_h;
-    vp.w = (uint32_t)guide_w;
-    vp.nch = (uint32_t)nch;
-    vp.variance_floor = cfg.hf_variance_floor;
-    enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
-    [enc setBuffer:b_loss offset:0 atIndex:0];
-    [enc setBuffer:b_vars offset:0 atIndex:1];
-    [enc setBuffer:b_lp_vars offset:0 atIndex:2];
-    [enc setBytes:&vp length:sizeof(vp) atIndex:3];
-    dispatch2(enc, c.pipe("rob_variance_loss"), vp.w, vp.h);
-    [enc endEncoding];
-    return true;
-}
-
 static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
@@ -1022,10 +964,8 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
 // Sticky ref means/vars for compute_robustness_metal (avoid re-upload + free host).
 static id<MTLBuffer> g_rob_ref_m = nil;
 static id<MTLBuffer> g_rob_ref_v = nil;
-static id<MTLBuffer> g_rob_ref_hf = nil;
 static int g_rob_ref_h = 0, g_rob_ref_w = 0, g_rob_ref_c = 0;
 static size_t g_rob_ref_bytes = 0;
-static size_t g_rob_ref_hf_bytes = 0;
 static id<MTLBuffer> g_rob_std_curve = nil;
 static id<MTLBuffer> g_rob_diff_curve = nil;
 static size_t g_rob_curve_n = 0;
@@ -1035,10 +975,8 @@ static float g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 static void clear_rob_ref_gpu() {
     g_rob_ref_m = nil;
     g_rob_ref_v = nil;
-    g_rob_ref_hf = nil;
     g_rob_ref_h = g_rob_ref_w = g_rob_ref_c = 0;
     g_rob_ref_bytes = 0;
-    g_rob_ref_hf_bytes = 0;
     g_rob_std_curve = nil;
     g_rob_diff_curve = nil;
     g_rob_curve_n = 0;
@@ -1057,10 +995,6 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     int gh = 0, gw = 0, nch = 0;
     if (!rob_run_guide_stats(ref_raw, cfg, b_guide, b_means, b_vars, gh, gw, nch, cmd))
         return RefStats();
-    id<MTLBuffer> b_hf_loss = nil;
-    if (cfg.hf_artifact_removal_enabled &&
-        !rob_run_hf_loss(b_guide, b_vars, b_hf_loss, gh, gw, nch, cfg, cmd))
-        return RefStats();
 
     // No CPU readback follows. Commit without waiting; subsequent work on the
     // same queue observes these pinned buffers after this command completes.
@@ -1073,11 +1007,9 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     g_rob_ref_w = gw;
     g_rob_ref_c = nch;
     g_rob_ref_bytes = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
-    g_rob_ref_hf = b_hf_loss;
-    g_rob_ref_hf_bytes = (size_t)gh * (size_t)gw * sizeof(float);
 
     RefStats st;
-    // Keep only dimensions on the CPU. The actual reference means/vars/HF loss
+    // Keep only dimensions on the CPU. The actual reference means/vars
     // stay resident in pinned Metal buffers above; copying them back here is an
     // avoidable readback and peak-RAM spike on full-res bursts.
     st.means.h = gh;
@@ -1086,11 +1018,6 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
     st.stds.h = gh;
     st.stds.w = gw;
     st.stds.c = nch;
-    if (b_hf_loss) {
-        st.hf_loss.h = gh;
-        st.hf_loss.w = gw;
-        st.hf_loss.c = 1;
-    }
     return st;
 }
 
@@ -1098,19 +1025,14 @@ void metal_release_host_ref_stats(RefStats& ref_stats) {
     // Keep h/w/c for dimension checks; drop ~2× full-res 3ch float host copies.
     const int mh = ref_stats.means.h, mw = ref_stats.means.w, mc = ref_stats.means.c;
     const int sh = ref_stats.stds.h, sw = ref_stats.stds.w, sc = ref_stats.stds.c;
-    const int hh = ref_stats.hf_loss.h, hw = ref_stats.hf_loss.w, hc = ref_stats.hf_loss.c;
     ref_stats.means = Image();
     ref_stats.stds = Image();
-    ref_stats.hf_loss = Image();
     ref_stats.means.h = mh;
     ref_stats.means.w = mw;
     ref_stats.means.c = mc;
     ref_stats.stds.h = sh;
     ref_stats.stds.w = sw;
     ref_stats.stds.c = sc;
-    ref_stats.hf_loss.h = hh;
-    ref_stats.hf_loss.w = hw;
-    ref_stats.hf_loss.c = hc;
 }
 
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
@@ -1121,8 +1043,8 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
 
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                       cfg.hf_artifact_removal_enabled ? &motion_irregular : nullptr);
-    if (!cfg.hf_artifact_removal_enabled)
+                                       cfg.motion_edge_rejection_enabled ? &motion_irregular : nullptr);
+    if (!cfg.motion_edge_rejection_enabled)
         motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1138,30 +1060,18 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
 
     const size_t ref_b = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
     const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
-    id<MTLBuffer> b_comp_hf = b_gvars;
-    if (cfg.hf_artifact_removal_enabled) {
-        if (!rob_run_hf_loss(b_guide, b_gvars, b_comp_hf, gh, gw, nch, cfg, cmd))
-            return Image();
-    }
     id<MTLBuffer> b_ref_m = nil;
     id<MTLBuffer> b_ref_v = nil;
-    id<MTLBuffer> b_ref_hf = nil;
     if (g_rob_ref_m && g_rob_ref_v && g_rob_ref_bytes == ref_b &&
         g_rob_ref_h == gh && g_rob_ref_w == gw && g_rob_ref_c == nch) {
         b_ref_m = g_rob_ref_m;
         b_ref_v = g_rob_ref_v;
-        if (g_rob_ref_hf && g_rob_ref_hf_bytes == mask_b)
-            b_ref_hf = g_rob_ref_hf;
     } else if (!ref_stats.means.data.empty() && !ref_stats.stds.data.empty()) {
         b_ref_m = buf(ref_stats.means.data.data(), ref_b);
         b_ref_v = buf(ref_stats.stds.data.data(), ref_b);
-        if (!ref_stats.hf_loss.data.empty())
-            b_ref_hf = buf(ref_stats.hf_loss.data.data(), mask_b);
     } else {
         return Image();
     }
-    if (cfg.hf_artifact_removal_enabled && !b_ref_hf) return Image();
-    if (!cfg.hf_artifact_removal_enabled) b_ref_hf = b_ref_v;
 
     if (!g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_alpha != cfg.alpha || g_rob_curve_beta != cfg.beta) {
@@ -1182,8 +1092,8 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
-    if (!b_ref_m || !b_ref_v || !b_ref_hf || !b_std || !b_diff || !b_S ||
-        !b_motion || !b_flow || !b_R || !b_out || !b_comp_hf)
+    if (!b_ref_m || !b_ref_v || !b_std || !b_diff || !b_S ||
+        !b_motion || !b_flow || !b_R || !b_out)
         return Image();
 
     RobMaskParamsCPU mp{};
@@ -1196,24 +1106,22 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
-    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
-    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
-    mp.hf_variance_floor = cfg.hf_variance_floor;
+    mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
+    mp.motion_edge_threshold = cfg.motion_edge_threshold;
+    mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_gmeans offset:0 atIndex:1];
-    [enc setBuffer:b_comp_hf offset:0 atIndex:2];
-    [enc setBuffer:b_ref_m offset:0 atIndex:3];
-    [enc setBuffer:b_ref_v offset:0 atIndex:4];
-    [enc setBuffer:b_ref_hf offset:0 atIndex:5];
-    [enc setBuffer:b_std offset:0 atIndex:6];
-    [enc setBuffer:b_diff offset:0 atIndex:7];
-    [enc setBuffer:b_S offset:0 atIndex:8];
-    [enc setBuffer:b_motion offset:0 atIndex:9];
-    [enc setBuffer:b_flow offset:0 atIndex:10];
-    [enc setBytes:&mp length:sizeof(mp) atIndex:11];
+    [enc setBuffer:b_ref_m offset:0 atIndex:2];
+    [enc setBuffer:b_ref_v offset:0 atIndex:3];
+    [enc setBuffer:b_std offset:0 atIndex:4];
+    [enc setBuffer:b_diff offset:0 atIndex:5];
+    [enc setBuffer:b_S offset:0 atIndex:6];
+    [enc setBuffer:b_motion offset:0 atIndex:7];
+    [enc setBuffer:b_flow offset:0 atIndex:8];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:9];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

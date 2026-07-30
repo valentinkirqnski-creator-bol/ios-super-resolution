@@ -452,24 +452,26 @@ struct CameraView: View {
                     }
                     Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
 
-                    Toggle("High-Frequency Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
+                    Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
-                    if cam.tuningParams.hf_artifact_removal_enabled {
+                    if cam.tuningParams.motion_edge_rejection_enabled {
                         HStack {
-                            Text("Variance Loss")
+                            Text("Edge Threshold")
                             Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_loss_threshold))
+                            Text(String(format: "%.3f", cam.tuningParams.motion_edge_threshold))
                         }
-                        Slider(value: $cam.tuningParams.hf_variance_loss_threshold, in: 0.0...1.0)
+                        Slider(value: $cam.tuningParams.motion_edge_threshold,
+                               in: 0.0...0.12,
+                               step: 0.001)
 
                         HStack {
-                            Text("Variance Floor")
+                            Text("Residual Threshold")
                             Spacer()
-                            Text(String(format: "%.0e", cam.tuningParams.hf_variance_floor))
+                            Text(String(format: "%.1f", cam.tuningParams.motion_edge_residual_threshold))
                         }
-                        Slider(value: $cam.tuningParams.hf_variance_floor,
-                               in: 0.0...0.001,
-                               step: 0.000001)
+                        Slider(value: $cam.tuningParams.motion_edge_residual_threshold,
+                               in: 0.5...8.0,
+                               step: 0.1)
                     }
                 }
                 

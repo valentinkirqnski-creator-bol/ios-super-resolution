@@ -1051,11 +1051,6 @@ struct RobStatsParams {
     uint _pad0;
 };
 
-struct RobVarianceLossParams {
-    uint h, w, nch;
-    float variance_floor;
-};
-
 struct RobDogsonParams {
     uint in_h, in_w, out_h, out_w, nch;
     uint is_ref;      // 1 = no flow
@@ -1073,9 +1068,9 @@ struct RobMaskParams {
     uint curve_n;     // 1001
     uint bayer;
     float r_t;
-    uint hf_enabled;
-    float hf_variance_loss_threshold;
-    float hf_variance_floor;
+    uint motion_edge_enabled;
+    float motion_edge_threshold;
+    float motion_edge_residual_threshold;
     uint _pad0, _pad1, _pad2, _pad3;
 };
 
@@ -1089,6 +1084,24 @@ inline float dogson_quadratic(float x) {
 inline int clamp_edge(int v, int hi) {
     float f = clamp(float(v), 0.f, float(hi));
     return int(f);
+}
+
+inline float rob_edge_strength_sq(device const float* means,
+                                  uint h, uint w, uint nch,
+                                  int y, int x) {
+    int xm = clamp_edge(x - 1, int(w) - 1);
+    int xp = clamp_edge(x + 1, int(w) - 1);
+    int ym = clamp_edge(y - 1, int(h) - 1);
+    int yp = clamp_edge(y + 1, int(h) - 1);
+    float edge_sq = 0.f;
+    for (uint ch = 0u; ch < nch; ++ch) {
+        float gx = 0.5f * (means[(uint(y) * w + uint(xp)) * nch + ch] -
+                           means[(uint(y) * w + uint(xm)) * nch + ch]);
+        float gy = 0.5f * (means[(uint(yp) * w + uint(x)) * nch + ch] -
+                           means[(uint(ym) * w + uint(x)) * nch + ch]);
+        edge_sq = max(edge_sq, gx * gx + gy * gy);
+    }
+    return edge_sq;
 }
 
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
@@ -1137,45 +1150,6 @@ kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
         means[o] = m;
         vars[o] = s2 / 9.f - m * m;
     }
-}
-
-kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
-                                    device const float* guide [[buffer(1)]],
-                                    constant RobStatsParams& p [[buffer(2)]],
-                                    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    int y = int(gid.y), x = int(gid.x);
-    int H = int(p.h), W = int(p.w);
-    float k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        float s = 0.f;
-        for (int i = -2; i <= 2; ++i) {
-            int yy = clamp_edge(y + i, H - 1);
-            float wy = k[i + 2];
-            for (int j = -2; j <= 2; ++j) {
-                int xx = clamp_edge(x + j, W - 1);
-                s += wy * k[j + 2] * guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
-            }
-        }
-        out[(gid.y * p.w + gid.x) * p.nch + ch] = s / 256.f;
-    }
-}
-
-kernel void rob_variance_loss(device float* loss [[buffer(0)]],
-                              device const float* vars [[buffer(1)]],
-                              device const float* lp_vars [[buffer(2)]],
-                              constant RobVarianceLossParams& p [[buffer(3)]],
-                              uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    float var_sum = 0.f, lp_var_sum = 0.f;
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-        var_sum += max(vars[o], 0.f);
-        lp_var_sum += max(lp_vars[o], 0.f);
-    }
-    loss[gid.y * p.w + gid.x] = (var_sum > p.variance_floor)
-        ? max((var_sum - lp_var_sum) / var_sum, 0.f)
-        : 0.f;
 }
 
 kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
@@ -1227,16 +1201,14 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
-                          device const float* comp_hf_loss [[buffer(2)]],
-                          device const float* ref_means [[buffer(3)]],
-                          device const float* ref_vars [[buffer(4)]],
-                          device const float* ref_hf_loss [[buffer(5)]],
-                          device const float* std_curve [[buffer(6)]],
-                          device const float* diff_curve [[buffer(7)]],
-                          device const float* S [[buffer(8)]],
-                          device const uint* motion_irregular [[buffer(9)]],
-                          device const float* flow [[buffer(10)]],
-                          constant RobMaskParams& p [[buffer(11)]],
+                          device const float* ref_means [[buffer(2)]],
+                          device const float* ref_vars [[buffer(3)]],
+                          device const float* std_curve [[buffer(4)]],
+                          device const float* diff_curve [[buffer(5)]],
+                          device const float* S [[buffer(6)]],
+                          device const uint* motion_irregular [[buffer(7)]],
+                          device const float* flow [[buffer(8)]],
+                          constant RobMaskParams& p [[buffer(9)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1289,15 +1261,24 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
-    bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
-        float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
-        if (inbound) {
-            hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
+    bool edge_reject = false;
+    if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
+        float ratio = (sig > 0.f && isfinite(sig))
+            ? d_sq_ / sig
+            : (d_sq_ > 0.f ? INFINITY : 0.f);
+        if (isfinite(ratio) && ratio > p.motion_edge_residual_threshold) {
+            float edge_sq = rob_edge_strength_sq(ref_means, p.h, p.w, p.nch,
+                                                 int(gid.y), int(gid.x));
+            if (inbound) {
+                edge_sq = max(edge_sq,
+                              rob_edge_strength_sq(comp_means, p.h, p.w, p.nch,
+                                                   new_idy, new_idx));
+            }
+            float th = max(p.motion_edge_threshold, 0.f);
+            edge_reject = edge_sq > th * th;
         }
-        hf_reject = hf_loss > p.hf_variance_loss_threshold;
     }
-    R[gid.y * p.w + gid.x] = hf_reject
+    R[gid.y * p.w + gid.x] = edge_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
 }

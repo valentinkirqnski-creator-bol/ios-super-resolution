@@ -386,43 +386,36 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     }
 }
 
-static Image local_lowpass_gaussian5x5(const Image& guide) {
-    static constexpr f32 k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
-    Image out(guide.h, guide.w, guide.c);
-    for (int ch = 0; ch < guide.c; ++ch) {
-        for (int y = 0; y < guide.h; ++y) {
-            for (int x = 0; x < guide.w; ++x) {
-                f32 s = 0.f;
-                for (int i = -2; i <= 2; ++i) {
-                    int yy = (int)clampf((f32)(y + i), 0.f, (f32)(guide.h - 1));
-                    f32 wy = k[i + 2];
-                    for (int j = -2; j <= 2; ++j) {
-                        int xx = (int)clampf((f32)(x + j), 0.f, (f32)(guide.w - 1));
-                        s += wy * k[j + 2] * guide.at(yy, xx, ch);
-                    }
-                }
-                out.at(y, x, ch) = s / 256.f;
-            }
-        }
+static f32 guide_edge_strength_sq(const Image& means, int y, int x) {
+    if (means.h <= 0 || means.w <= 0 || means.c <= 0) return 0.f;
+    const int xm = (int)clampf((f32)(x - 1), 0.f, (f32)(means.w - 1));
+    const int xp = (int)clampf((f32)(x + 1), 0.f, (f32)(means.w - 1));
+    const int ym = (int)clampf((f32)(y - 1), 0.f, (f32)(means.h - 1));
+    const int yp = (int)clampf((f32)(y + 1), 0.f, (f32)(means.h - 1));
+    f32 edge_sq = 0.f;
+    for (int ch = 0; ch < means.c; ++ch) {
+        const f32 gx = 0.5f * (means.at(y, xp, ch) - means.at(y, xm, ch));
+        const f32 gy = 0.5f * (means.at(yp, x, ch) - means.at(ym, x, ch));
+        edge_sq = std::max(edge_sq, gx * gx + gy * gy);
     }
-    return out;
+    return edge_sq;
 }
 
-static Image high_frequency_loss_map(const Image& vars, const Image& lp_vars, const Config& cfg) {
-    Image loss(vars.h, vars.w, 1);
-    for (int y = 0; y < vars.h; ++y) {
-        for (int x = 0; x < vars.w; ++x) {
-            f32 var = 0.f, lp_var = 0.f;
-            for (int ch = 0; ch < vars.c; ++ch) {
-                var += std::max(vars.at(y, x, ch), 0.f);
-                lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
-            }
-            loss.at(y, x) = (var > cfg.hf_variance_floor)
-                ? std::max((var - lp_var) / var, 0.f)
-                : 0.f;
-        }
-    }
-    return loss;
+static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
+                               const std::vector<uint32_t>& motion_irregular,
+                               size_t pidx, int y, int x, int new_y, int new_x,
+                               f32 residual_ratio, const Config& cfg) {
+    if (!cfg.motion_edge_rejection_enabled) return false;
+    if (pidx >= motion_irregular.size() || motion_irregular[pidx] == 0u) return false;
+    if (!std::isfinite(residual_ratio) ||
+        residual_ratio <= cfg.motion_edge_residual_threshold)
+        return false;
+
+    f32 edge_sq = guide_edge_strength_sq(ref_means, y, x);
+    if (new_y >= 0 && new_y < comp_means.h && new_x >= 0 && new_x < comp_means.w)
+        edge_sq = std::max(edge_sq, guide_edge_strength_sq(comp_means, new_y, new_x));
+    const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
+    return edge_sq > th * th;
 }
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
@@ -582,12 +575,6 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     Image guide = compute_guide(ref_raw, cfg);
     Image means, vars;
     local_stats_3x3(guide, means, vars);
-    if (cfg.hf_artifact_removal_enabled) {
-        Image lp_guide = local_lowpass_gaussian5x5(guide);
-        Image lp_means, lp_vars;
-        local_stats_3x3(lp_guide, lp_means, lp_vars);
-        st.hf_loss = high_frequency_loss_map(vars, lp_vars, cfg);
-    }
     // 460-main keeps robustness local statistics on the guide grid
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
@@ -626,13 +613,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-    Image comp_hf_loss;
-    if (cfg.hf_artifact_removal_enabled) {
-        Image lp_guide = local_lowpass_gaussian5x5(guide);
-        Image lp_means, lp_vars;
-        local_stats_3x3(lp_guide, lp_means, lp_vars);
-        comp_hf_loss = high_frequency_loss_map(comp_vars, lp_vars, cfg);
-    }
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
@@ -668,7 +648,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   cfg.hf_artifact_removal_enabled ? &motion_irregular : nullptr);
+                                   cfg.motion_edge_rejection_enabled ? &motion_irregular : nullptr);
+    if (!cfg.motion_edge_rejection_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     Image R(h, w, 1);
     for (int y = 0; y < h; ++y) {
@@ -692,20 +674,15 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const int new_x = (int)std::lround((f32)x + flow_x);
             const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
-            const bool hf_reject =
-                cfg.hf_artifact_removal_enabled &&
-                pidx < motion_irregular.size() &&
-                motion_irregular[pidx] != 0u &&
-                (
-                    (!ref_stats.hf_loss.data.empty() &&
-                     ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold) ||
-                    (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h &&
-                     !comp_hf_loss.data.empty() &&
-                     comp_hf_loss.at(new_y, new_x) > cfg.hf_variance_loss_threshold)
-                );
             f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
-            R.at(y, x) = hf_reject
+            const f32 ratio = (sig > 0.f && std::isfinite(sig))
+                ? d_sq.at(y, x) / sig
+                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
+            const bool edge_reject =
+                motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
+                                   pidx, y, x, new_y, new_x, ratio, cfg);
+            R.at(y, x) = edge_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
         }
