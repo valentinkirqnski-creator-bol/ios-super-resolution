@@ -68,6 +68,9 @@ struct TuningParams: Equatable, Codable {
     var r_s1: Float = 2.0
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
+    var hf_artifact_removal_enabled: Bool = true
+    var hf_variance_loss_threshold: Float = 0.90
+    var hf_noise_floor_multiplier: Float = 6.0
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -125,7 +128,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 11
+        let defaultsVersion = 12
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -1100,6 +1103,9 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s1": NSNumber(value: tuningParams.r_s1),
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
+            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
+            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
+            "hf_noise_floor_multiplier": NSNumber(value: tuningParams.hf_noise_floor_multiplier),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
