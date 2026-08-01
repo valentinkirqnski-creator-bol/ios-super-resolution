@@ -376,10 +376,10 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 
 } // namespace
 
-Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
-                                 const std::string& dng_path, const ProgressFn& progress,
-                                 int maxPreviewDim) {
-    if (paths.size() < 2) return Image();
+Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
+                                  const Config& cfg, const std::string& dng_path,
+                                  const ProgressFn& progress, int maxPreviewDim) {
+    if (frame_count < 2 || !loader) return Image();
 
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
@@ -390,11 +390,11 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     report("Loading reference frame", 0.02f);
     if (debug) {
         std::string listing = "ref_index=0\n";
-        for (size_t i = 0; i < paths.size(); ++i)
-            listing += std::to_string(i) + " " + paths[i] + "\n";
+        for (int i = 0; i < frame_count; ++i)
+            listing += std::to_string(i) + " provider_frame\n";
         debug_dump_text("cpp_burst_paths", listing);
     }
-    Image ref = load_raw_frame(paths[0], work, true);
+    Image ref = loader(0, work, true, 0, 0);
     if (ref.h <= 0 || ref.w <= 0) return Image();
     debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
     if (debug) append_image_summary(debug_summary, "raw_ref", ref);
@@ -417,7 +417,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
 
     const int ref_h = ref.h, ref_w = ref.w;
-    const int n = (int)paths.size();
+    const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
     const int nch = work.bayer_mode ? 3 : 1;
 
@@ -499,7 +499,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             comp = pref_fut.get();
             pref_k = -1;
         } else {
-            comp = load_raw_frame(paths[k], work, false, ref_h, ref_w);
+            comp = loader(k, work, false, ref_h, ref_w);
         }
         if (comp.h <= 0) continue;
         debug_dump_bin("cpp_raw_comp_" + std::to_string(k - 1),
@@ -514,7 +514,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             const int nk = k + 1;
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
-                return load_raw_frame(paths[nk], work, false, ref_h, ref_w);
+                return loader(nk, work, false, ref_h, ref_w);
             });
         }
 
@@ -536,7 +536,7 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
             const int nk = k + 1;
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
-                return load_raw_frame(paths[nk], work, false, ref_h, ref_w);
+                return loader(nk, work, false, ref_h, ref_w);
             });
         }
 
@@ -868,6 +868,18 @@ Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Co
     }
     report("Done", 1.f);
     return preview;
+}
+
+Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
+                                 const std::string& dng_path, const ProgressFn& progress,
+                                 int maxPreviewDim) {
+    return process_burst_loader_to_dng(
+        (int)paths.size(),
+        [&](int index, Config& work, bool is_reference, int crop_h, int crop_w) {
+            if (index < 0 || index >= (int)paths.size()) return Image();
+            return load_raw_frame(paths[(size_t)index], work, is_reference, crop_h, crop_w);
+        },
+        cfg, dng_path, progress, maxPreviewDim);
 }
 
 } // namespace hhsr

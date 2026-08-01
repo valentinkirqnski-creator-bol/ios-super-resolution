@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cstring>
 
 #include "core/types.h"
 #include "core/pipeline.h"
@@ -132,6 +133,295 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
     apply_vibrance_rgb(sr, sg, sb, 0.48f);
 }
 
+static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
+    if (!tuning) return;
+    if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
+    if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
+    if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
+    if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
+    if (tuning[@"hf_artifact_removal_enabled"])
+        cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
+    if (tuning[@"hf_variance_loss_threshold"])
+        cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
+    if (tuning[@"hf_noise_floor_multiplier"])
+        cfg.hf_noise_floor_multiplier = tuning[@"hf_noise_floor_multiplier"].floatValue;
+    if (tuning[@"motion_edge_rejection_enabled"])
+        cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
+    if (tuning[@"motion_edge_threshold"])
+        cfg.motion_edge_threshold = tuning[@"motion_edge_threshold"].floatValue;
+    if (tuning[@"motion_edge_residual_threshold"])
+        cfg.motion_edge_residual_threshold = tuning[@"motion_edge_residual_threshold"].floatValue;
+    if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
+    if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
+    if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
+    if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
+    if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+    if (tuning[@"robustness_save_mask"])
+        cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
+    if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
+        cfg.accumulated_robustness_denoiser_enabled =
+            tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
+    }
+    if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
+    if (tuning[@"acc_rob_max_multiplier"])
+        cfg.acc_rob_max_multiplier = tuning[@"acc_rob_max_multiplier"].floatValue;
+    if (tuning[@"acc_rob_max_frame_count"])
+        cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
+}
+
+static std::string NSStringToStd(id value) {
+    if (![value isKindOfClass:NSString.class]) return std::string();
+    return std::string([(NSString *)value UTF8String]);
+}
+
+static NSDictionary *DictValue(NSDictionary *dict, NSString *key) {
+    id v = dict[key];
+    return [v isKindOfClass:NSDictionary.class] ? (NSDictionary *)v : nil;
+}
+
+static id FirstValueForKeys(NSDictionary *dict, NSArray<NSString *> *keys) {
+    if (!dict) return nil;
+    for (NSString *key in keys) {
+        id v = dict[key];
+        if (v) return v;
+    }
+    return nil;
+}
+
+static void CollectNumbers(id obj, std::vector<double>& out) {
+    if (!obj || obj == (id)kCFNull) return;
+    if ([obj isKindOfClass:NSNumber.class]) {
+        out.push_back([(NSNumber *)obj doubleValue]);
+    } else if ([obj isKindOfClass:NSArray.class]) {
+        for (id item in (NSArray *)obj) CollectNumbers(item, out);
+    }
+}
+
+static float FirstNumber(id obj, float fallback) {
+    std::vector<double> vals;
+    CollectNumbers(obj, vals);
+    if (vals.empty() || !std::isfinite(vals[0])) return fallback;
+    return (float)vals[0];
+}
+
+static NSDictionary *DNGMetadata(NSDictionary *metadata) {
+    if (!metadata) return nil;
+    NSDictionary *dng = DictValue(metadata, (__bridge NSString *)kCGImagePropertyDNGDictionary);
+    if (dng) return dng;
+    return DictValue(metadata, @"{DNG}");
+}
+
+static NSDictionary *TIFFMetadata(NSDictionary *metadata) {
+    if (!metadata) return nil;
+    NSDictionary *tiff = DictValue(metadata, (__bridge NSString *)kCGImagePropertyTIFFDictionary);
+    if (tiff) return tiff;
+    return DictValue(metadata, @"{TIFF}");
+}
+
+static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) {
+    NSDictionary *metadata = DictValue(frame, @"metadata");
+    NSDictionary *dng = DNGMetadata(metadata);
+    NSDictionary *tiff = TIFFMetadata(metadata);
+
+    cfg.camera_make = NSStringToStd(FirstValueForKeys(tiff, @[
+        (__bridge NSString *)kCGImagePropertyTIFFMake, @"Make"
+    ]));
+    cfg.camera_model = NSStringToStd(FirstValueForKeys(tiff, @[
+        (__bridge NSString *)kCGImagePropertyTIFFModel, @"Model"
+    ]));
+
+    id orientation = FirstValueForKeys(metadata, @[
+        (__bridge NSString *)kCGImagePropertyOrientation, @"Orientation"
+    ]);
+    if (!orientation) orientation = FirstValueForKeys(tiff, @[@"Orientation"]);
+    if ([orientation isKindOfClass:NSNumber.class])
+        cfg.orientation = [(NSNumber *)orientation intValue];
+
+    NSArray *cfa = frame[@"cfa"];
+    if ([cfa isKindOfClass:NSArray.class] && cfa.count >= 4) {
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                int c = [cfa[(NSUInteger)(i * 2 + j)] intValue];
+                cfg.cfa.p[i][j] = (uint8_t)std::max(0, std::min(2, c));
+            }
+        }
+    }
+
+    std::vector<double> neutral;
+    CollectNumbers(FirstValueForKeys(dng, @[@"AsShotNeutral"]), neutral);
+    if (neutral.size() >= 3 && neutral[0] > 0.0 && neutral[1] > 0.0 && neutral[2] > 0.0) {
+        cfg.white_balance[0] = (float)(1.0 / neutral[0]);
+        cfg.white_balance[1] = (float)(1.0 / neutral[1]);
+        cfg.white_balance[2] = (float)(1.0 / neutral[2]);
+    } else {
+        cfg.white_balance[0] = 1.f;
+        cfg.white_balance[1] = 1.f;
+        cfg.white_balance[2] = 1.f;
+    }
+
+    bool wb_ok = std::isfinite(cfg.white_balance[1]) && cfg.white_balance[1] > 0.f;
+    for (int i = 0; i < 3; ++i)
+        wb_ok = wb_ok && std::isfinite(cfg.white_balance[i]) && cfg.white_balance[i] > 0.f;
+    if (!wb_ok) {
+        cfg.white_balance[0] = 1.f;
+        cfg.white_balance[1] = 1.f;
+        cfg.white_balance[2] = 1.f;
+    }
+
+    std::vector<double> black;
+    CollectNumbers(FirstValueForKeys(dng, @[@"BlackLevel"]), black);
+    if (black.size() >= 4) {
+        double sum[3] = {0.0, 0.0, 0.0};
+        int count[3] = {0, 0, 0};
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                int c = (int)cfg.cfa.p[i][j];
+                c = std::max(0, std::min(2, c));
+                sum[c] += black[(size_t)(i * 2 + j)];
+                count[c] += 1;
+            }
+        }
+        for (int c = 0; c < 3; ++c)
+            cfg.black_levels[c] = count[c] > 0 ? (float)(sum[c] / (double)count[c]) : 0.f;
+        cfg.has_black_levels = true;
+    } else if (black.size() >= 3) {
+        cfg.black_levels[0] = (float)black[0];
+        cfg.black_levels[1] = (float)black[1];
+        cfg.black_levels[2] = (float)black[2];
+        cfg.has_black_levels = true;
+    } else if (black.size() == 1) {
+        cfg.black_levels[0] = cfg.black_levels[1] = cfg.black_levels[2] = (float)black[0];
+        cfg.has_black_levels = true;
+    } else {
+        cfg.black_levels[0] = cfg.black_levels[1] = cfg.black_levels[2] = 0.f;
+        cfg.has_black_levels = true;
+    }
+    cfg.white_level = FirstNumber(FirstValueForKeys(dng, @[@"WhiteLevel"]), 65535.f);
+    if (!(cfg.white_level > 0.f) || !std::isfinite(cfg.white_level))
+        cfg.white_level = 65535.f;
+
+    std::vector<double> noise;
+    CollectNumbers(FirstValueForKeys(dng, @[@"NoiseProfile"]), noise);
+    if (noise.size() >= 2) {
+        const size_t nplanes = noise.size() / 2u;
+        const size_t use = std::min<size_t>(3u, nplanes);
+        double sa = 0.0, sb = 0.0;
+        for (size_t i = 0; i < use; ++i) {
+            sa += noise[i * 2u + 0u];
+            sb += noise[i * 2u + 1u];
+        }
+        cfg.alpha = (float)(sa / 3.0);
+        cfg.beta = (float)(sb / 3.0);
+        cfg.has_noise_profile =
+            cfg.alpha > 0.f && std::isfinite(cfg.alpha) && std::isfinite(cfg.beta);
+    } else {
+        cfg.has_noise_profile = false;
+    }
+
+    std::vector<double> color;
+    CollectNumbers(FirstValueForKeys(dng, @[@"ColorMatrix1", @"ColorMatrix2"]), color);
+    if (color.size() >= 9) {
+        cfg.has_color_matrix = true;
+        for (int i = 0; i < 9; ++i) cfg.color_matrix[i] = (float)color[(size_t)i];
+    }
+}
+
+static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
+                                      bool is_reference, int crop_h, int crop_w) {
+    Image img;
+    NSData *data = frame[@"data"];
+    if (![data isKindOfClass:NSData.class]) {
+        NSString *path = frame[@"path"];
+        if ([path isKindOfClass:NSString.class]) {
+            data = [NSData dataWithContentsOfFile:path
+                                          options:NSDataReadingMappedIfSafe
+                                            error:nil];
+        }
+    }
+    NSNumber *wn = frame[@"width"];
+    NSNumber *hn = frame[@"height"];
+    NSNumber *bn = frame[@"bytesPerRow"];
+    if (![data isKindOfClass:NSData.class] ||
+        ![wn isKindOfClass:NSNumber.class] ||
+        ![hn isKindOfClass:NSNumber.class] ||
+        ![bn isKindOfClass:NSNumber.class])
+        return img;
+
+    const int w = wn.intValue;
+    const int h = hn.intValue;
+    const int bytes_per_row = bn.intValue;
+    if (w <= 0 || h <= 0 || bytes_per_row < w * 2 ||
+        data.length < (NSUInteger)((size_t)bytes_per_row * (size_t)h))
+        return img;
+
+    if (is_reference)
+        FillReferenceMetadataFromRawFrame(frame, cfg);
+
+    float maxv = cfg.has_black_levels ? cfg.white_level : 65535.f;
+    float site_black[2][2];
+    float site_denom[2][2];
+    float site_wb[2][2];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            int c = (int)cfg.cfa.p[i][j];
+            c = std::max(0, std::min(2, c));
+            const float bl = cfg.has_black_levels ? cfg.black_levels[c] : 0.f;
+            float denom = maxv - bl;
+            if (!(denom > 0.f) || !std::isfinite(denom) || !std::isfinite(bl)) {
+                site_black[i][j] = 0.f;
+                site_denom[i][j] = (std::isfinite(maxv) && maxv > 0.f) ? maxv : 65535.f;
+            } else {
+                site_black[i][j] = bl;
+                site_denom[i][j] = denom;
+            }
+            site_wb[i][j] = cfg.white_balance[c] / cfg.white_balance[1];
+        }
+    }
+
+    img = Image(h, w, 1);
+    const uint8_t *base = (const uint8_t *)data.bytes;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t *row = base + (size_t)y * (size_t)bytes_per_row;
+        const int fi = y & 1;
+        for (int x = 0; x < w; ++x) {
+            uint16_t rawv = 0;
+            std::memcpy(&rawv, row + (size_t)x * 2u, sizeof(rawv));
+            const int fj = x & 1;
+            float v = ((float)rawv - site_black[fi][fj]) / site_denom[fi][fj];
+            v *= site_wb[fi][fj];
+            if (!std::isfinite(v)) v = 0.f;
+            img.at(y, x) = clampf(v, 0.f, 1.f);
+        }
+    }
+    cfg.raw_prewhitened = true;
+
+    if (cfg.input_crop_factor > 1) {
+        const int factor = cfg.input_crop_factor;
+        int ch = (img.h / factor) & ~1;
+        int cw = (img.w / factor) & ~1;
+        int y0 = ((img.h - ch) / 2) & ~1;
+        int x0 = ((img.w - cw) / 2) & ~1;
+        if (ch > 0 && cw > 0) {
+            Image cropped(ch, cw, 1);
+            for (int y = 0; y < ch; ++y)
+                for (int x = 0; x < cw; ++x)
+                    cropped.at(y, x) = img.at(y0 + y, x0 + x);
+            img = std::move(cropped);
+        }
+    }
+
+    if (crop_h > 0 && crop_w > 0 && (img.h > crop_h || img.w > crop_w)) {
+        int mh = std::min(img.h, crop_h);
+        int mw = std::min(img.w, crop_w);
+        Image c(mh, mw, 1);
+        for (int y = 0; y < mh; ++y)
+            for (int x = 0; x < mw; ++x)
+                c.at(y, x) = img.at(y, x);
+        img = std::move(c);
+    }
+    return img;
+}
+
 @implementation SRBridge
 
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
@@ -159,37 +449,7 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
     cfg.use_gpu = false;
     cfg.num_threads = 0;     // all CPU cores during active processing
 
-    if (tuning) {
-        if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
-        if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
-        if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
-        if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
-        if (tuning[@"hf_artifact_removal_enabled"])
-            cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
-        if (tuning[@"hf_variance_loss_threshold"])
-            cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
-        if (tuning[@"hf_noise_floor_multiplier"])
-            cfg.hf_noise_floor_multiplier = tuning[@"hf_noise_floor_multiplier"].floatValue;
-        if (tuning[@"motion_edge_rejection_enabled"])
-            cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
-        if (tuning[@"motion_edge_threshold"])
-            cfg.motion_edge_threshold = tuning[@"motion_edge_threshold"].floatValue;
-        if (tuning[@"motion_edge_residual_threshold"])
-            cfg.motion_edge_residual_threshold = tuning[@"motion_edge_residual_threshold"].floatValue;
-        if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
-        if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
-        if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
-        if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
-        if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
-        if (tuning[@"robustness_save_mask"])
-            cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
-        if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
-            cfg.accumulated_robustness_denoiser_enabled = tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
-        }
-        if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
-        if (tuning[@"acc_rob_max_multiplier"]) cfg.acc_rob_max_multiplier = tuning[@"acc_rob_max_multiplier"].floatValue;
-        if (tuning[@"acc_rob_max_frame_count"]) cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
-    }
+    ApplyTuningParams(tuning, cfg);
 
     ProgressFn cb = nullptr;
     if (progress) {
@@ -204,6 +464,57 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
     @autoreleasepool {
         preview = process_burst_paths_to_dng(
             vpaths, cfg, std::string(outPath.UTF8String), cb, 256);
+    }
+
+    if (preview.w <= 0) return NO;
+
+    if (previewOut) *previewOut = UIImageFromPreview(preview);
+    return YES;
+}
+
++ (BOOL)processRawFrames:(NSArray<NSDictionary<NSString *, id> *> *)frames
+                  toPath:(NSString *)outPath
+                   scale:(float)scale
+              cropFactor:(int)cropFactor
+            tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
+                progress:(void (^)(NSString *, float))progress
+             previewImage:(UIImage * _Nullable * _Nullable)previewOut {
+    if (frames.count < 2) return NO;
+    if (previewOut) *previewOut = nil;
+
+    if (!metal_gpu_init()) return NO;
+
+    Config cfg;
+    cfg.scale = scale;
+    cfg.input_crop_factor = std::max(1, cropFactor);
+    cfg.bayer_mode = true;
+    cfg.bake_srgb = false;
+    cfg.use_gpu = false;
+    cfg.num_threads = 0;
+    ApplyTuningParams(tuning, cfg);
+
+    ProgressFn cb = nullptr;
+    if (progress) {
+        cb = [progress](const std::string &stage, float f) {
+            @autoreleasepool {
+                progress([NSString stringWithUTF8String:stage.c_str()], f);
+            }
+        };
+    }
+
+    NSArray<NSDictionary<NSString *, id> *> *heldFrames = frames;
+    RawFrameLoaderFn loader =
+        [heldFrames](int index, Config& work, bool is_reference, int crop_h, int crop_w) {
+            if (index < 0 || index >= (int)heldFrames.count) return Image();
+            NSDictionary *frame = heldFrames[(NSUInteger)index];
+            if (![frame isKindOfClass:NSDictionary.class]) return Image();
+            return DecodeRawFrameDictionary(frame, work, is_reference, crop_h, crop_w);
+        };
+
+    Image preview;
+    @autoreleasepool {
+        preview = process_burst_loader_to_dng(
+            (int)frames.count, loader, cfg, std::string(outPath.UTF8String), cb, 256);
     }
 
     if (preview.w <= 0) return NO;

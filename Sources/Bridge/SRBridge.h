@@ -18,6 +18,17 @@ NS_ASSUME_NONNULL_BEGIN
            progress:(nullable void (^)(NSString *stage, float fraction))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 
+// Same pipeline/output as processDNGs, but frames are already captured RAW Bayer
+// buffers. Each frame dictionary contains: data or path, width, height,
+// bytesPerRow, cfa ([R,G,G,B] color indices), and metadata.
++ (BOOL)processRawFrames:(NSArray<NSDictionary<NSString *, id> *> *)frames
+                  toPath:(NSString *)outPath
+                   scale:(float)scale
+              cropFactor:(int)cropFactor
+            tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
+                progress:(nullable void (^)(NSString *stage, float fraction))progress
+             previewImage:(UIImage * _Nullable * _Nullable)previewOut;
+
 /// Decode our LinearRaw Deflate DNG and write a tone-mapped JPEG
 /// WB + matrix + Highlights −70 + contrast + vibrance (no CI sharpen / HS).
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath

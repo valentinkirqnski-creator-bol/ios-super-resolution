@@ -10,6 +10,9 @@ namespace hhsr {
 
 // Progress callback: (stageName, fraction 0..1).
 using ProgressFn = std::function<void(const std::string&, float)>;
+using RawFrameLoaderFn = std::function<Image(int index, Config& cfg,
+                                             bool is_reference,
+                                             int crop_h, int crop_w)>;
 
 // Per-comparison-frame data precomputed once and kept resident while the output
 // is accumulated band-by-band. Shared with the GPU merge backend.
@@ -39,6 +42,13 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
                                  const std::string& dng_path, const ProgressFn& progress,
                                  int maxPreviewDim = 512);
+
+// Same low-memory mobile path, but frames are supplied by a caller-owned loader.
+// This lets iOS feed RAW pixel buffers directly while preserving the exact same
+// alignment, robustness, merge, and DNG output stages.
+Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
+                                  const Config& cfg, const std::string& dng_path,
+                                  const ProgressFn& progress, int maxPreviewDim = 512);
 
 // Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
 // Path: replace ".dng" with "_robustness.pgm", or append that suffix.

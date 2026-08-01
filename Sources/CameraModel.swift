@@ -2,6 +2,7 @@ import AVFoundation
 import Photos
 import UIKit
 import Combine
+import ImageIO
 
 /// Final save format after SR (DNG always produced; JPG is a tone-mapped export).
 enum ExportFormat: String, CaseIterable, Identifiable, Codable {
@@ -193,6 +194,112 @@ final class CameraModel: NSObject, ObservableObject {
         return min(1.0, max(0.0, saved))
     }
 
+    private static func fourCCString(_ code: OSType) -> String {
+        let chars: [UInt8] = [
+            UInt8((code >> 24) & 0xff),
+            UInt8((code >> 16) & 0xff),
+            UInt8((code >> 8) & 0xff),
+            UInt8(code & 0xff)
+        ]
+        return String(bytes: chars.map { (32...126).contains($0) ? $0 : 46 },
+                      encoding: .ascii) ?? ""
+    }
+
+    private static func collectInts(_ value: Any?, into out: inout [Int]) {
+        if let n = value as? NSNumber {
+            out.append(n.intValue)
+        } else if let arr = value as? [Any] {
+            for v in arr { collectInts(v, into: &out) }
+        }
+    }
+
+    private static func dngMetadata(from metadata: [String: Any]) -> [String: Any]? {
+        (metadata["{DNG}"] as? [String: Any])
+            ?? (metadata[kCGImagePropertyDNGDictionary as String] as? [String: Any])
+    }
+
+    private static func hasEssentialDirectRawMetadata(_ metadata: [String: Any]) -> Bool {
+        guard let dng = dngMetadata(from: metadata) else { return false }
+        guard dng["AsShotNeutral"] != nil,
+              dng["BlackLevel"] != nil,
+              dng["WhiteLevel"] != nil,
+              dng["NoiseProfile"] != nil else {
+            return false
+        }
+        return dng["ColorMatrix1"] != nil || dng["ColorMatrix2"] != nil
+    }
+
+    private static func cfaPattern(for pixelFormat: OSType,
+                                   metadata: [String: Any]) -> [NSNumber]? {
+        let fourCC = fourCCString(pixelFormat).lowercased()
+        if fourCC.hasPrefix("rgg") { return [0, 1, 1, 2].map { NSNumber(value: $0) } }
+        if fourCC.hasPrefix("bgg") { return [2, 1, 1, 0].map { NSNumber(value: $0) } }
+        if fourCC.hasPrefix("grb") { return [1, 0, 2, 1].map { NSNumber(value: $0) } }
+        if fourCC.hasPrefix("gbr") { return [1, 2, 0, 1].map { NSNumber(value: $0) } }
+
+        let dng = dngMetadata(from: metadata)
+        var nums: [Int] = []
+        collectInts(dng?["CFAPattern"], into: &nums)
+        guard nums.count >= 4 else { return nil }
+        let first = nums.prefix(4).map { min(2, max(0, $0)) }
+        return first.map { NSNumber(value: $0) }
+    }
+
+    private func rawFrameDictionary(from photo: AVCapturePhoto, writingTo url: URL? = nil) -> [String: Any]? {
+        guard photo.isRawPhoto, let pixelBuffer = photo.pixelBuffer else { return nil }
+        let metadata = photo.metadata
+        guard Self.hasEssentialDirectRawMetadata(metadata) else { return nil }
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard let cfa = Self.cfaPattern(for: format, metadata: metadata) else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let planeCount = CVPixelBufferGetPlaneCount(pixelBuffer)
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let baseAddress: UnsafeMutableRawPointer?
+        if planeCount > 0 {
+            width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+            height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+            bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+        } else {
+            width = CVPixelBufferGetWidth(pixelBuffer)
+            height = CVPixelBufferGetHeight(pixelBuffer)
+            bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer)
+        }
+        guard let baseAddress,
+              width > 0, height > 0,
+              bytesPerRow >= width * MemoryLayout<UInt16>.stride else {
+            return nil
+        }
+
+        let byteCount = bytesPerRow * height
+        let data = Data(bytes: baseAddress, count: byteCount)
+        var frame: [String: Any] = [
+            "width": NSNumber(value: width),
+            "height": NSNumber(value: height),
+            "bytesPerRow": NSNumber(value: bytesPerRow),
+            "pixelFormat": NSNumber(value: format),
+            "cfa": cfa,
+            "metadata": metadata as NSDictionary
+        ]
+        if let url {
+            do {
+                try data.write(to: url, options: [])
+                frame["path"] = url.path
+            } catch {
+                return nil
+            }
+        } else {
+            frame["data"] = data
+        }
+        return frame
+    }
+
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "camera.session", qos: .userInteractive)
     private let processingQueue = DispatchQueue(label: "handheldsr.processing", qos: .userInitiated)
@@ -206,6 +313,7 @@ final class CameraModel: NSObject, ObservableObject {
     private var currentBurstTotal = CameraModel.persistedFrameCount()
     private var capturesRequested = 0
     private var capturesProcessed = 0
+    private var capturedRawFrames: [[String: Any]] = []
     private var capturedDNGs: [URL] = []
     private var burstDir: URL?
     /// Pre-created empty folder so mkdir is off the shutter critical path.
@@ -217,11 +325,14 @@ final class CameraModel: NSObject, ObservableObject {
     private var exposureSyncTimer: Timer?
 
     private enum CaptureKind { case none, burst, zsl }
+    private enum BurstInputMode { case undecided, directRaw, dngFallback }
     private var captureKind: CaptureKind = .none
+    private var burstInputMode: BurstInputMode = .undecided
     private var zslWanted = false
     private var zslCapturing = false
     /// True while a burst is capturing/processing — ZSL ring + system ZSL stay off.
     private var zslPausedForPipeline = false
+    private var zslRawRing: [[String: Any]] = []
     private var zslRing: [URL] = []
     private var zslDir: URL?
     private var zslSeq = 0
@@ -426,6 +537,8 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func clearZSLRing() {
         let urls = zslRing
+        let rawPaths = zslRawRing.compactMap { $0["path"] as? String }
+        zslRawRing.removeAll(keepingCapacity: true)
         zslRing.removeAll(keepingCapacity: true)
         zslCapturing = false
         captureKind = .none
@@ -433,6 +546,7 @@ final class CameraModel: NSObject, ObservableObject {
         zslDir = nil
         processingQueue.async {
             for u in urls { try? FileManager.default.removeItem(at: u) }
+            for p in rawPaths { try? FileManager.default.removeItem(atPath: p) }
             if let dir { try? FileManager.default.removeItem(at: dir) }
         }
     }
@@ -837,33 +951,45 @@ final class CameraModel: NSObject, ObservableObject {
             }
 
             // ZSL path: process ring DNGs in place (no copyItem — that was the slow path).
-            if self.zslEnabled && self.zslRing.count >= self.activeFrameCount {
+            let zslRawReady = self.zslRawRing.count >= self.activeFrameCount
+            let zslDNGReady = self.zslRing.count >= self.activeFrameCount
+            if self.zslEnabled && (zslRawReady || zslDNGReady) {
                 self.zslCapturing = false
                 self.captureKind = .none
                 let n = self.activeFrameCount
-                let take = Array(self.zslRing.suffix(n))
-                self.zslRing.removeLast(n)
-                let readyLeft = self.zslRing.count
+                let takeRaw = zslRawReady ? Array(self.zslRawRing.suffix(n)) : []
+                let takeDNG = zslRawReady ? [] : Array(self.zslRing.suffix(n))
+                if zslRawReady {
+                    self.zslRawRing.removeLast(n)
+                } else {
+                    self.zslRing.removeLast(n)
+                }
+                let readyLeft = max(self.zslRawRing.count, self.zslRing.count)
                 // Output-only folder (inputs stay in the ZSL ring dir until processBurst cleans up).
                 self.ensureReadyBurstDir()
                 guard let dir = self.readyBurstDir else {
                     // Put frames back so the buffer is not lost on folder failure.
-                    self.zslRing.append(contentsOf: take)
+                    if zslRawReady {
+                        self.zslRawRing.append(contentsOf: takeRaw)
+                    } else {
+                        self.zslRing.append(contentsOf: takeDNG)
+                    }
                     self.resumeZSLAfterProcessing()
                     DispatchQueue.main.async {
                         self.isBusy = false
                         self.isCapturing = false
-                        self.zslBufferReady = self.zslRing.count
+                        self.zslBufferReady = max(self.zslRawRing.count, self.zslRing.count)
                         self.statusText = "Could not create capture folder"
                     }
                     return
                 }
                 self.burstDir = dir
                 self.readyBurstDir = nil
-                self.capturedDNGs = take
+                self.capturedRawFrames = takeRaw
+                self.capturedDNGs = takeDNG
                 DispatchQueue.main.async {
                     self.zslBufferReady = readyLeft
-                    self.statusText = "ZSL \(take.count) frames · \(lens)"
+                    self.statusText = "ZSL \(n) frames · \(lens)"
                     self.progress = 0.12
                     self.isCapturing = false
                     self.isProcessing = true
@@ -889,7 +1015,9 @@ final class CameraModel: NSObject, ObservableObject {
             }
             self.burstDir = dir
             self.readyBurstDir = nil
+            self.capturedRawFrames.removeAll(keepingCapacity: true)
             self.capturedDNGs.removeAll(keepingCapacity: true)
+            self.burstInputMode = .undecided
             self.currentBurstTotal = self.activeFrameCount
             self.capturesRequested = 0
             self.capturesProcessed = 0
@@ -908,7 +1036,9 @@ final class CameraModel: NSObject, ObservableObject {
             self.burstDir = nil
             self.capturesRequested = self.currentBurstTotal
             self.capturesProcessed = self.currentBurstTotal
+            self.capturedRawFrames.removeAll(keepingCapacity: true)
             self.capturedDNGs.removeAll(keepingCapacity: true)
+            self.burstInputMode = .undecided
             self.captureKind = .none
             self.removeBurstDir(dir)
             self.ensureReadyBurstDir()
@@ -1065,7 +1195,9 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func processBurst() {
+        let rawFrames = capturedRawFrames
         var paths = capturedDNGs.map { $0.path }
+        var usingDocDNGs = false
 
         // DEBUG: if Documents contains ≥2 DNGs, process those (sorted) instead of the camera burst.
         let fm = FileManager.default
@@ -1076,12 +1208,13 @@ final class CameraModel: NSObject, ObservableObject {
                 .sorted()
             if docDNGs.count >= 2 {
                 paths = docDNGs
+                usingDocDNGs = true
                 print("DEBUG OVERRIDE: Using \(paths.count) DNGs from Documents (ref=paths[0])")
             }
         }
 
         let burstDir = self.burstDir
-        guard paths.count >= 2 else {
+        guard rawFrames.count >= 2 || paths.count >= 2 else {
             removeBurstDir(burstDir)
             self.burstDir = nil
             finish(success: false, message: "Not enough frames captured")
@@ -1123,35 +1256,53 @@ final class CameraModel: NSObject, ObservableObject {
 
         var preview: UIImage?
         // Documents debug DNGs: no center-crop (match Python full-frame run).
-        let usingDocDNGs = paths != capturedDNGs.map(\.path)
         let cropFactor = (usingDocDNGs || activeCameraSelection != .wide)
             ? Int32(1)
             : Int32(lensZoomMode.cropFactor)
         let inputURLs = capturedDNGs
-        let ok = SRBridge.processDNGs(
-            paths,
-            toPath: outURL.path,
-            scale: 2.0,
-            cropFactor: cropFactor,
-            tuningParams: tuningDict,
-            progress: { [weak self] stage, frac in
-                DispatchQueue.main.async {
-                    self?.progress = 0.15 + frac * 0.85
-                    if stage.hasPrefix("Noise ") {
-                        self?.noiseDiagText = stage
-                    } else {
-                        self?.statusText = stage
-                    }
+        let rawInputPaths = rawFrames.compactMap { $0["path"] as? String }
+        let progressBlock: (String, Float) -> Void = { [weak self] stage, frac in
+            DispatchQueue.main.async {
+                self?.progress = 0.15 + frac * 0.85
+                if stage.hasPrefix("Noise ") {
+                    self?.noiseDiagText = stage
+                } else {
+                    self?.statusText = stage
                 }
-            },
-            previewImage: &preview
-        )
+            }
+        }
+        let ok: Bool
+        if !usingDocDNGs && rawFrames.count >= 2 {
+            ok = SRBridge.processRawFrames(
+                rawFrames,
+                toPath: outURL.path,
+                scale: 2.0,
+                cropFactor: cropFactor,
+                tuningParams: tuningDict,
+                progress: progressBlock,
+                previewImage: &preview
+            )
+        } else {
+            ok = SRBridge.processDNGs(
+                paths,
+                toPath: outURL.path,
+                scale: 2.0,
+                cropFactor: cropFactor,
+                tuningParams: tuningDict,
+                progress: progressBlock,
+                previewImage: &preview
+            )
+        }
 
+        capturedRawFrames.removeAll()
         capturedDNGs.removeAll()
         // Free ZSL ring inputs (and non-ZSL frame_*.dng) as soon as LibRaw is done.
         // Non-ZSL files also live under burstDir; removeBurstDir later is then cheaper.
         for u in inputURLs {
             try? FileManager.default.removeItem(at: u)
+        }
+        for p in rawInputPaths {
+            try? FileManager.default.removeItem(atPath: p)
         }
 
         if ok {
@@ -1323,6 +1474,23 @@ final class CameraModel: NSObject, ObservableObject {
 // MARK: - AVCapturePhotoCaptureDelegate
 
 extension CameraModel: AVCapturePhotoCaptureDelegate {
+    private func appendDNGPhoto(_ photo: AVCapturePhoto, to dir: URL) -> Bool {
+        guard let data = photo.fileDataRepresentation() else {
+            abortBurst("Could not read RAW data")
+            return false
+        }
+        let idx = capturedDNGs.count
+        let url = dir.appendingPathComponent("frame_\(idx).dng")
+        do {
+            try data.write(to: url)
+            capturedDNGs.append(url)
+            return true
+        } catch {
+            abortBurst("Write error: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
@@ -1336,22 +1504,35 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             return
         }
 
+        var storedFrame = false
         if photo.isRawPhoto, let dir = burstDir {
             autoreleasepool {
-                guard let data = photo.fileDataRepresentation() else {
-                    abortBurst("Could not read RAW data")
-                    return
-                }
-                let idx = capturedDNGs.count
-                let url = dir.appendingPathComponent("frame_\(idx).dng")
-                do {
-                    try data.write(to: url)
-                    capturedDNGs.append(url)
-                } catch {
-                    abortBurst("Write error: \(error.localizedDescription)")
-                    return
+                switch burstInputMode {
+                case .undecided:
+                    let rawURL = dir.appendingPathComponent("frame_\(capturedRawFrames.count).raw16")
+                    if let rawFrame = rawFrameDictionary(from: photo, writingTo: rawURL) {
+                        burstInputMode = .directRaw
+                        capturedRawFrames.append(rawFrame)
+                        storedFrame = true
+                    } else {
+                        try? FileManager.default.removeItem(at: rawURL)
+                        burstInputMode = .dngFallback
+                        storedFrame = appendDNGPhoto(photo, to: dir)
+                    }
+                case .directRaw:
+                    let rawURL = dir.appendingPathComponent("frame_\(capturedRawFrames.count).raw16")
+                    guard let rawFrame = rawFrameDictionary(from: photo, writingTo: rawURL) else {
+                        try? FileManager.default.removeItem(at: rawURL)
+                        abortBurst("RAW pixel buffer unavailable")
+                        return
+                    }
+                    capturedRawFrames.append(rawFrame)
+                    storedFrame = true
+                case .dngFallback:
+                    storedFrame = appendDNGPhoto(photo, to: dir)
                 }
             }
+            if !storedFrame { return }
         }
 
         capturesProcessed += 1
@@ -1370,7 +1551,34 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
         // Next capture is started from didFinishCaptureFor (sensor free) so we
         // do not wait on DNG encode/write before grabbing the following frame.
         if error != nil || !photo.isRawPhoto { return }
-        // Pull bytes off the photo callback queue, then mutate the ring on sessionQueue.
+        let rawURL = zslDir?.appendingPathComponent("zsl_raw_\(UUID().uuidString).raw16")
+        if let rawURL,
+           let rawFrame = autoreleasepool(invoking: { rawFrameDictionary(from: photo, writingTo: rawURL) }) {
+            sessionQueue.async {
+                guard !self.pipelineBusy, !self.zslPausedForPipeline else {
+                    if let path = rawFrame["path"] as? String {
+                        try? FileManager.default.removeItem(atPath: path)
+                    }
+                    return
+                }
+                self.zslRawRing.append(rawFrame)
+                let cap = max(self.activeFrameCount, 2)
+                while self.zslRawRing.count > cap {
+                    let old = self.zslRawRing.removeFirst()
+                    if let path = old["path"] as? String {
+                        try? FileManager.default.removeItem(atPath: path)
+                    }
+                }
+                let n = max(self.zslRawRing.count, self.zslRing.count)
+                DispatchQueue.main.async { self.zslBufferReady = n }
+            }
+            return
+        }
+        if let rawURL {
+            try? FileManager.default.removeItem(at: rawURL)
+        }
+
+        // Fallback: pull DNG bytes off the photo callback queue, then mutate the ring.
         let data: Data? = autoreleasepool { photo.fileDataRepresentation() }
         guard let data else { return }
         sessionQueue.async {
@@ -1385,7 +1593,7 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                     let old = self.zslRing.removeFirst()
                     try? FileManager.default.removeItem(at: old)
                 }
-                let n = self.zslRing.count
+                let n = max(self.zslRawRing.count, self.zslRing.count)
                 DispatchQueue.main.async { self.zslBufferReady = n }
             } catch {
                 try? FileManager.default.removeItem(at: url)
