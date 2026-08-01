@@ -831,7 +831,8 @@ struct RobMaskParamsCPU {
     float motion_edge_threshold = 0.f;
     float motion_edge_residual_threshold = 0.f;
     float hf_variance_loss_threshold = 0.f;
-    uint32_t _pad0 = 0, _pad1 = 0;
+    float alpha = 0.f;
+    float beta = 0.f;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 64, "RobMaskParamsCPU");
 
@@ -1210,6 +1211,8 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     mp.motion_edge_threshold = cfg.motion_edge_threshold;
     mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
     mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.alpha = cfg.alpha;
+    mp.beta = cfg.beta;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();

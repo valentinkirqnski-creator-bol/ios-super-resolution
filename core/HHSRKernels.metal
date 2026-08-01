@@ -1027,7 +1027,7 @@ struct RobMaskParams {
     float motion_edge_threshold;
     float motion_edge_residual_threshold;
     float hf_variance_loss_threshold;
-    uint _pad0, _pad1;
+    float alpha, beta;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1058,6 +1058,16 @@ inline float rob_edge_strength_sq(device const float* means,
         edge_sq = max(edge_sq, gx * gx + gy * gy);
     }
     return edge_sq;
+}
+
+inline float rob_brightness(device const float* means,
+                            uint h, uint w, uint nch,
+                            int y, int x) {
+    if (y < 0 || y >= int(h) || x < 0 || x >= int(w) || nch == 0u) return 0.f;
+    float sum = 0.f;
+    for (uint ch = 0u; ch < nch; ++ch)
+        sum += means[(uint(y) * w + uint(x)) * nch + ch];
+    return clamp(sum / float(nch), 0.f, 1.f);
 }
 
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
@@ -1287,7 +1297,16 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                               rob_edge_strength_sq(comp_means, p.h, p.w, p.nch,
                                                    new_idy, new_idx));
             }
-            float th = max(p.motion_edge_threshold, 0.f);
+            float brightness = rob_brightness(ref_means, p.h, p.w, p.nch,
+                                              int(gid.y), int(gid.x));
+            if (inbound) {
+                brightness = max(brightness,
+                                 rob_brightness(comp_means, p.h, p.w, p.nch,
+                                                new_idy, new_idx));
+            }
+            float noise_var = max(p.alpha * brightness + p.beta, 0.f);
+            float noise_edge_floor = 2.f * sqrt(noise_var);
+            float th = max(max(p.motion_edge_threshold, 0.f), noise_edge_floor);
             edge_reject = edge_sq > th * th;
         }
     }

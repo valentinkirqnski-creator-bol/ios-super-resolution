@@ -453,6 +453,16 @@ static f32 guide_edge_strength_sq(const Image& means, int y, int x) {
     return edge_sq;
 }
 
+static f32 guide_brightness(const Image& means, int y, int x) {
+    if (means.h <= 0 || means.w <= 0 || means.c <= 0 ||
+        y < 0 || y >= means.h || x < 0 || x >= means.w)
+        return 0.f;
+    f32 sum = 0.f;
+    for (int ch = 0; ch < means.c; ++ch)
+        sum += means.at(y, x, ch);
+    return clampf(sum / (f32)means.c, 0.f, 1.f);
+}
+
 static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
                                const std::vector<uint32_t>& motion_irregular,
                                size_t pidx, int y, int x, int new_y, int new_x,
@@ -464,10 +474,17 @@ static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
         return false;
 
     f32 edge_sq = guide_edge_strength_sq(ref_means, y, x);
+    f32 brightness = guide_brightness(ref_means, y, x);
     if (new_y >= 0 && new_y < comp_means.h && new_x >= 0 && new_x < comp_means.w)
+    {
         edge_sq = std::max(edge_sq, guide_edge_strength_sq(comp_means, new_y, new_x));
+        brightness = std::max(brightness, guide_brightness(comp_means, new_y, new_x));
+    }
+    const f32 noise_var = std::max(0.f, cfg.alpha * brightness + cfg.beta);
+    const f32 noise_edge_floor = 2.f * std::sqrt(noise_var);
     const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
-    return edge_sq > th * th;
+    const f32 effective_th = std::max(th, noise_edge_floor);
+    return edge_sq > effective_th * effective_th;
 }
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
