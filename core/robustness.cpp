@@ -453,6 +453,19 @@ static f32 guide_edge_strength_sq(const Image& means, int y, int x) {
     return edge_sq;
 }
 
+static f32 guide_edge_strength_sq_neighborhood(const Image& means, int y, int x, int radius) {
+    radius = std::max(0, std::min(2, radius));
+    f32 edge_sq = 0.f;
+    for (int dy = -radius; dy <= radius; ++dy) {
+        const int yy = (int)clampf((f32)(y + dy), 0.f, (f32)(means.h - 1));
+        for (int dx = -radius; dx <= radius; ++dx) {
+            const int xx = (int)clampf((f32)(x + dx), 0.f, (f32)(means.w - 1));
+            edge_sq = std::max(edge_sq, guide_edge_strength_sq(means, yy, xx));
+        }
+    }
+    return edge_sq;
+}
+
 static f32 guide_brightness(const Image& means, int y, int x) {
     if (means.h <= 0 || means.w <= 0 || means.c <= 0 ||
         y < 0 || y >= means.h || x < 0 || x >= means.w)
@@ -473,15 +486,19 @@ static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
         residual_ratio <= cfg.motion_edge_residual_threshold)
         return false;
 
-    f32 edge_sq = guide_edge_strength_sq(ref_means, y, x);
+    const int edge_radius = std::max(0, cfg.motion_edge_neighborhood_radius);
+    f32 edge_sq = guide_edge_strength_sq_neighborhood(ref_means, y, x, edge_radius);
     f32 brightness = guide_brightness(ref_means, y, x);
     if (new_y >= 0 && new_y < comp_means.h && new_x >= 0 && new_x < comp_means.w)
     {
-        edge_sq = std::max(edge_sq, guide_edge_strength_sq(comp_means, new_y, new_x));
+        edge_sq = std::max(edge_sq,
+                           guide_edge_strength_sq_neighborhood(comp_means, new_y, new_x,
+                                                               edge_radius));
         brightness = std::max(brightness, guide_brightness(comp_means, new_y, new_x));
     }
     const f32 noise_var = std::max(0.f, cfg.alpha * brightness + cfg.beta);
-    const f32 noise_edge_floor = 2.f * std::sqrt(noise_var);
+    const f32 noise_edge_floor =
+        std::max(0.f, cfg.motion_edge_noise_floor_multiplier) * std::sqrt(noise_var);
     const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
     const f32 effective_th = std::max(th, noise_edge_floor);
     return edge_sq > effective_th * effective_th;

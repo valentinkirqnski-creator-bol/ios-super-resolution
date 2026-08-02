@@ -53,6 +53,35 @@ static inline float to_srgb_gamma(float v) {
     return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
 }
 
+static inline float render_luminance(float r, float g, float b) {
+    return std::max(0.f, 0.2126f * r + 0.7152f * g + 0.0722f * b);
+}
+
+static inline float render_aces_filmic(float x) {
+    x = std::max(0.f, x);
+    constexpr float a = 2.51f;
+    constexpr float b = 0.03f;
+    constexpr float c = 2.43f;
+    constexpr float d = 0.59f;
+    constexpr float e = 0.14f;
+    return clampf((x * (a * x + b)) / (x * (c * x + d) + e), 0.f, 1.f);
+}
+
+static inline void render_desaturate_to_luma(float& r, float& g, float& b, float amount) {
+    amount = clampf(amount, 0.f, 1.f);
+    const float y = render_luminance(r, g, b);
+    r = y + (r - y) * (1.f - amount);
+    g = y + (g - y) * (1.f - amount);
+    b = y + (b - y) * (1.f - amount);
+}
+
+static inline float render_s_curve_luma(float y) {
+    y = clampf(y, 0.f, 1.f);
+    const float smooth = y * y * (3.f - 2.f * y);
+    y = y * 0.72f + smooth * 0.28f;
+    return clampf((y - 0.5f) * 1.08f + 0.5f, 0.f, 1.f);
+}
+
 // Soft over-range rolloff (linear > 1) before display gamma.
 static inline float highlight_rolloff_overrange(float v) {
     if (v <= 1.f) return clampf(v, 0.f, 1.f);
@@ -109,6 +138,59 @@ static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount
 
 // Shared JPG / DNG-preview finish: Highlights −100, Shadows +60, contrast + vibrance.
 static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
+    sr = std::max(0.f, sr);
+    sg = std::max(0.f, sg);
+    sb = std::max(0.f, sb);
+
+    constexpr float kExposure = 1.18f;
+    sr *= kExposure;
+    sg *= kExposure;
+    sb *= kExposure;
+
+    const float hi = std::max(sr, std::max(sg, sb));
+    if (hi > 0.82f)
+        render_desaturate_to_luma(sr, sg, sb, 0.80f * smoothstepf(0.82f, 1.02f, hi));
+
+    const float old_y = render_luminance(sr, sg, sb);
+    float new_y = render_aces_filmic(old_y);
+    const float shadow = 1.f - smoothstepf(0.10f, 0.48f, new_y);
+    new_y = clampf(new_y * (1.f + 0.38f * shadow), 0.f, 1.f);
+    new_y = render_s_curve_luma(new_y);
+
+    const float lum_scale = new_y / (old_y + 1e-6f);
+    sr *= lum_scale;
+    sg *= lum_scale;
+    sb *= lum_scale;
+
+    const float y = render_luminance(sr, sg, sb);
+    const float mx0 = std::max(sr, std::max(sg, sb));
+    const float mn0 = std::min(sr, std::min(sg, sb));
+    const float sat = (mx0 > 1e-6f) ? (mx0 - mn0) / (mx0 + 1e-6f) : 0.f;
+    const float vibrance = 1.f + 0.18f * (1.f - sat);
+    sr = y + (sr - y) * vibrance;
+    sg = y + (sg - y) * vibrance;
+    sb = y + (sb - y) * vibrance;
+
+    sr = std::max(0.f, sr);
+    sg = std::max(0.f, sg);
+    sb = std::max(0.f, sb);
+    float mx = std::max(sr, std::max(sg, sb));
+    if (mx > 1.f) {
+        render_desaturate_to_luma(sr, sg, sb, smoothstepf(1.f, 1.35f, mx));
+        mx = std::max(sr, std::max(sg, sb));
+        if (mx > 1.f) {
+            const float s = 1.f / mx;
+            sr *= s;
+            sg *= s;
+            sb *= s;
+        }
+    }
+
+    sr = to_srgb_gamma(sr);
+    sg = to_srgb_gamma(sg);
+    sb = to_srgb_gamma(sb);
+    return;
+#if 0
     // Clamp negative channels BEFORE rolloff — after the cam→sRGB matrix,
     // R or B can go negative while G stays positive, producing green speckles.
     sr = std::max(0.f, sr);
@@ -132,6 +214,7 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
     sg = tone_s_curve(sg);
     sb = tone_s_curve(sb);
     apply_vibrance_rgb(sr, sg, sb, 0.48f);
+#endif
 }
 
 static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
@@ -152,6 +235,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_edge_threshold = tuning[@"motion_edge_threshold"].floatValue;
     if (tuning[@"motion_edge_residual_threshold"])
         cfg.motion_edge_residual_threshold = tuning[@"motion_edge_residual_threshold"].floatValue;
+    if (tuning[@"motion_edge_noise_floor_multiplier"])
+        cfg.motion_edge_noise_floor_multiplier =
+            tuning[@"motion_edge_noise_floor_multiplier"].floatValue;
+    if (tuning[@"motion_edge_neighborhood_radius"])
+        cfg.motion_edge_neighborhood_radius =
+            std::max(0, std::min(2, tuning[@"motion_edge_neighborhood_radius"].intValue));
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;

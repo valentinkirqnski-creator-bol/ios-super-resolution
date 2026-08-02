@@ -107,6 +107,8 @@ struct Config {
     bool  motion_edge_rejection_enabled = true;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
+    float motion_edge_noise_floor_multiplier = 1.0f;
+    int   motion_edge_neighborhood_radius = 1;
 
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
     bool  accumulated_robustness_denoiser_enabled = true;

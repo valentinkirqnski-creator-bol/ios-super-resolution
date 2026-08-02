@@ -1102,6 +1102,8 @@ struct RobMaskParams {
     float motion_edge_residual_threshold;
     float hf_variance_loss_threshold;
     float alpha, beta;
+    float motion_edge_noise_floor_multiplier;
+    uint motion_edge_neighborhood_radius;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1130,6 +1132,21 @@ inline float rob_edge_strength_sq(device const float* means,
         float gy = 0.5f * (means[(uint(yp) * w + uint(x)) * nch + ch] -
                            means[(uint(ym) * w + uint(x)) * nch + ch]);
         edge_sq = max(edge_sq, gx * gx + gy * gy);
+    }
+    return edge_sq;
+}
+
+inline float rob_edge_strength_sq_neighborhood(device const float* means,
+                                               uint h, uint w, uint nch,
+                                               int y, int x, uint radius) {
+    float edge_sq = 0.f;
+    int r = int(min(radius, 2u));
+    for (int dy = -r; dy <= r; ++dy) {
+        int yy = clamp_edge(y + dy, int(h) - 1);
+        for (int dx = -r; dx <= r; ++dx) {
+            int xx = clamp_edge(x + dx, int(w) - 1);
+            edge_sq = max(edge_sq, rob_edge_strength_sq(means, h, w, nch, yy, xx));
+        }
     }
     return edge_sq;
 }
@@ -1364,12 +1381,14 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             ? d_sq_ / sig
             : (d_sq_ > 0.f ? INFINITY : 0.f);
         if (isfinite(ratio) && ratio > p.motion_edge_residual_threshold) {
-            float edge_sq = rob_edge_strength_sq(ref_means, p.h, p.w, p.nch,
-                                                 int(gid.y), int(gid.x));
+            float edge_sq = rob_edge_strength_sq_neighborhood(
+                ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
+                p.motion_edge_neighborhood_radius);
             if (inbound) {
                 edge_sq = max(edge_sq,
-                              rob_edge_strength_sq(comp_means, p.h, p.w, p.nch,
-                                                   new_idy, new_idx));
+                              rob_edge_strength_sq_neighborhood(
+                                  comp_means, p.h, p.w, p.nch, new_idy, new_idx,
+                                  p.motion_edge_neighborhood_radius));
             }
             float brightness = rob_brightness(ref_means, p.h, p.w, p.nch,
                                               int(gid.y), int(gid.x));
@@ -1379,7 +1398,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                                                 new_idy, new_idx));
             }
             float noise_var = max(p.alpha * brightness + p.beta, 0.f);
-            float noise_edge_floor = 2.f * sqrt(noise_var);
+            float noise_edge_floor = max(p.motion_edge_noise_floor_multiplier, 0.f) *
+                                     sqrt(noise_var);
             float th = max(max(p.motion_edge_threshold, 0.f), noise_edge_floor);
             edge_reject = edge_sq > th * th;
         }

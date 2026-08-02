@@ -62,6 +62,28 @@ enum LensZoomMode: Equatable {
     }
 }
 
+/// Algorithm zoom/output size for the 1x wide camera.
+enum OutputResolutionMode: String, CaseIterable, Identifiable {
+    case native12mp
+    case super48mp
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .native12mp: return "12MP"
+        case .super48mp: return "48MP"
+        }
+    }
+
+    var algorithmScale: Float {
+        switch self {
+        case .native12mp: return 1.0
+        case .super48mp: return 2.0
+        }
+    }
+}
+
 /// Holds the C++ algorithm tuning parameters for live adjustments.
 struct TuningParams: Equatable, Codable {
     // Match 460-main params.py
@@ -75,6 +97,8 @@ struct TuningParams: Equatable, Codable {
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
+    var motion_edge_noise_floor_multiplier: Float = 1.0
+    var motion_edge_neighborhood_radius: Int = 1
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
@@ -91,6 +115,45 @@ struct TuningParams: Equatable, Codable {
 
     /// Legacy name used by the Reset button.
     static let ghostReductionPreset = TuningParams.appDefaults
+
+    enum CodingKeys: String, CodingKey {
+        case r_t, r_s1, r_s2, r_Mt
+        case hf_artifact_removal_enabled, hf_variance_loss_threshold, hf_noise_floor_multiplier
+        case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
+        case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
+        case k_detail, k_denoise, k_stretch, k_shrink
+        case snr_auto_tune, robustness_save_mask
+        case accumulated_robustness_denoiser_enabled
+        case acc_rob_rad_max, acc_rob_max_multiplier, acc_rob_max_frame_count
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        r_t = try c.decodeIfPresent(Float.self, forKey: .r_t) ?? r_t
+        r_s1 = try c.decodeIfPresent(Float.self, forKey: .r_s1) ?? r_s1
+        r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
+        r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
+        hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
+        hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
+        hf_noise_floor_multiplier = try c.decodeIfPresent(Float.self, forKey: .hf_noise_floor_multiplier) ?? hf_noise_floor_multiplier
+        motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
+        motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
+        motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
+        motion_edge_noise_floor_multiplier = try c.decodeIfPresent(Float.self, forKey: .motion_edge_noise_floor_multiplier) ?? motion_edge_noise_floor_multiplier
+        motion_edge_neighborhood_radius = try c.decodeIfPresent(Int.self, forKey: .motion_edge_neighborhood_radius) ?? motion_edge_neighborhood_radius
+        k_detail = try c.decodeIfPresent(Float.self, forKey: .k_detail) ?? k_detail
+        k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
+        k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
+        k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
+        snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
+        robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
+        accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
+        acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
+        acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
+        acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
+    }
 }
 
 /// Owns the capture session, performs a Bayer RAW (DNG) burst, then runs
@@ -110,6 +173,15 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var permissionDenied = false
     @Published var cameraSelection: CameraSelection = .wide
     @Published var lensZoomMode: LensZoomMode = .wide1x
+    @Published var outputResolutionMode: OutputResolutionMode = {
+        if let raw = UserDefaults.standard.string(forKey: "OutputResolutionMode"),
+           let mode = OutputResolutionMode(rawValue: raw) {
+            return mode
+        }
+        return .super48mp
+    }() {
+        didSet { UserDefaults.standard.set(outputResolutionMode.rawValue, forKey: "OutputResolutionMode") }
+    }
     @Published var exportFormat: ExportFormat = {
         if let raw = UserDefaults.standard.string(forKey: "ExportFormat"),
            let fmt = ExportFormat(rawValue: raw) {
@@ -1220,8 +1292,15 @@ final class CameraModel: NSObject, ObservableObject {
             finish(success: false, message: "Not enough frames captured")
             return
         }
+        let useSelectedOutputScale = !usingDocDNGs &&
+            activeCameraSelection == .wide &&
+            lensZoomMode == .wide1x
+        let algorithmScale: Float = useSelectedOutputScale
+            ? outputResolutionMode.algorithmScale
+            : 2.0
+        let outputName = algorithmScale <= 1.01 ? "handheld_sr_x1.dng" : "handheld_sr_x2.dng"
         let outURL = (burstDir ?? FileManager.default.temporaryDirectory)
-            .appendingPathComponent("handheld_sr_x2.dng")
+            .appendingPathComponent(outputName)
 
         DispatchQueue.main.async {
             self.isCapturing = false
@@ -1242,6 +1321,8 @@ final class CameraModel: NSObject, ObservableObject {
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
+            "motion_edge_noise_floor_multiplier": NSNumber(value: tuningParams.motion_edge_noise_floor_multiplier),
+            "motion_edge_neighborhood_radius": NSNumber(value: tuningParams.motion_edge_neighborhood_radius),
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
@@ -1276,7 +1357,7 @@ final class CameraModel: NSObject, ObservableObject {
             ok = SRBridge.processRawFrames(
                 rawFrames,
                 toPath: outURL.path,
-                scale: 2.0,
+                scale: algorithmScale,
                 cropFactor: cropFactor,
                 tuningParams: tuningDict,
                 progress: progressBlock,
@@ -1286,7 +1367,7 @@ final class CameraModel: NSObject, ObservableObject {
             ok = SRBridge.processDNGs(
                 paths,
                 toPath: outURL.path,
-                scale: 2.0,
+                scale: algorithmScale,
                 cropFactor: cropFactor,
                 tuningParams: tuningDict,
                 progress: progressBlock,

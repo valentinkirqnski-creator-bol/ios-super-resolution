@@ -238,6 +238,15 @@ struct CameraView: View {
                     }
                 }
             }
+            if cam.lensZoomMode == .wide1x {
+                HStack(spacing: 18) {
+                    ForEach(OutputResolutionMode.allCases) { mode in
+                        lensChip(title: mode.label, selected: cam.outputResolutionMode == mode) {
+                            cam.outputResolutionMode = mode
+                        }
+                    }
+                }
+            }
             HStack(spacing: 18) {
                 lensChip(title: "DNG", selected: cam.exportFormat == .dng) {
                     cam.exportFormat = .dng
@@ -489,11 +498,29 @@ struct CameraView: View {
                         HStack {
                             Text("Residual Threshold")
                             Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.motion_edge_residual_threshold))
+                            Text(String(format: "%.2f", cam.tuningParams.motion_edge_residual_threshold))
                         }
                         Slider(value: $cam.tuningParams.motion_edge_residual_threshold,
-                               in: 0.5...8.0,
+                               in: 0.0...8.0,
+                               step: 0.05)
+
+                        HStack {
+                            Text("Edge Noise Floor")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.motion_edge_noise_floor_multiplier))
+                        }
+                        Slider(value: $cam.tuningParams.motion_edge_noise_floor_multiplier,
+                               in: 0.0...2.0,
                                step: 0.1)
+
+                        Stepper(value: $cam.tuningParams.motion_edge_neighborhood_radius,
+                                in: 0...2) {
+                            HStack {
+                                Text("Edge Neighborhood")
+                                Spacer()
+                                Text("\(cam.tuningParams.motion_edge_neighborhood_radius)")
+                            }
+                        }
                     }
                 }
                 

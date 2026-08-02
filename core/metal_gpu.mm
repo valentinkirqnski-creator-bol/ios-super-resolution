@@ -903,8 +903,10 @@ struct RobMaskParamsCPU {
     float hf_variance_loss_threshold = 0.f;
     float alpha = 0.f;
     float beta = 0.f;
+    float motion_edge_noise_floor_multiplier = 1.f;
+    uint32_t motion_edge_neighborhood_radius = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 64, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 72, "RobMaskParamsCPU");
 
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                       std::vector<uint32_t>* irregular_out = nullptr) {
@@ -1283,6 +1285,9 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
     mp.alpha = cfg.alpha;
     mp.beta = cfg.beta;
+    mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
+    mp.motion_edge_neighborhood_radius =
+        (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();

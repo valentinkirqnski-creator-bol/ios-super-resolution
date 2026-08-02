@@ -133,6 +133,61 @@ static void append_f32_le(std::vector<uint8_t>& p, float v) {
     w32(p, u);
 }
 
+static bool invert_3x3(const float* m, float* inv) {
+    const float a = m[0], b = m[1], c = m[2];
+    const float d = m[3], e = m[4], f = m[5];
+    const float g = m[6], h = m[7], i = m[8];
+    const float A = e * i - f * h;
+    const float B = c * h - b * i;
+    const float C = b * f - c * e;
+    const float D = f * g - d * i;
+    const float E = a * i - c * g;
+    const float F = c * d - a * f;
+    const float G = d * h - e * g;
+    const float H = b * g - a * h;
+    const float I = a * e - b * d;
+    const float det = a * A + b * D + c * G;
+    if (!(std::fabs(det) > 1e-8f) || !std::isfinite(det)) return false;
+    const float s = 1.f / det;
+    inv[0] = A * s; inv[1] = B * s; inv[2] = C * s;
+    inv[3] = D * s; inv[4] = E * s; inv[5] = F * s;
+    inv[6] = G * s; inv[7] = H * s; inv[8] = I * s;
+    for (int k = 0; k < 9; ++k)
+        if (!std::isfinite(inv[k])) return false;
+    return true;
+}
+
+static bool derive_cam_to_srgb_from_color_matrix(const float* color_matrix, float* out) {
+    // DNG ColorMatrix is XYZ -> camera. Invert to camera -> XYZ, then convert XYZ to sRGB.
+    float cam_to_xyz[9];
+    if (!color_matrix || !invert_3x3(color_matrix, cam_to_xyz)) return false;
+    constexpr float xyz_to_srgb[9] = {
+         3.2406f, -1.5372f, -0.4986f,
+        -0.9689f,  1.8758f,  0.0415f,
+         0.0557f, -0.2040f,  1.0570f
+    };
+    for (int r = 0; r < 3; ++r) {
+        for (int col = 0; col < 3; ++col) {
+            out[r * 3 + col] =
+                xyz_to_srgb[r * 3 + 0] * cam_to_xyz[0 * 3 + col] +
+                xyz_to_srgb[r * 3 + 1] * cam_to_xyz[1 * 3 + col] +
+                xyz_to_srgb[r * 3 + 2] * cam_to_xyz[2 * 3 + col];
+        }
+    }
+    for (int k = 0; k < 9; ++k)
+        if (!std::isfinite(out[k])) return false;
+    return true;
+}
+
+static bool is_identity_3x3(const float* m) {
+    if (!m) return false;
+    for (int k = 0; k < 9; ++k) {
+        const float target = (k % 4 == 0) ? 1.f : 0.f;
+        if (std::fabs(m[k] - target) > 1e-5f) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 // Builds DNG header. StripByteCounts left as 0 — patched after Deflate finishes.
@@ -148,6 +203,13 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              bool pixels_prewhitened,
                                              uint32_t& strip_offset_out,
                                              uint32_t& strip_byte_counts_offset_out) {
+    float derived_cam_to_srgb[9];
+    const float* jpeg_cam_to_srgb = cam_to_srgb;
+    if (!jpeg_cam_to_srgb && cm &&
+        derive_cam_to_srgb_from_color_matrix(cm, derived_cam_to_srgb)) {
+        jpeg_cam_to_srgb = derived_cam_to_srgb;
+    }
+
     IFD ifd;
     ifd.longv(254, 0);                 // NewSubfileType
     ifd.ascii(271, camera_make.empty() ? "HandheldSR" : camera_make);
@@ -217,7 +279,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
         ifd.shortv(50831, 1);          // ColorimetricReference = scene referred
     }
 
-    if (wb || cam_to_srgb) {
+    if (wb || jpeg_cam_to_srgb) {
         std::vector<uint8_t> blob;
         blob.reserve(48);
         // JPEG/preview must not apply WB again when pixels are already pre-whitened.
@@ -225,7 +287,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
             append_f32_le(blob, (wb && !pixels_prewhitened) ? wb[i] : 1.f);
         for (int i = 0; i < 9; ++i) {
             float v = 0.f;
-            if (cam_to_srgb) v = cam_to_srgb[i];
+            if (jpeg_cam_to_srgb) v = jpeg_cam_to_srgb[i];
             else if (i == 0 || i == 4 || i == 8) v = 1.f;
             append_f32_le(blob, v);
         }
@@ -690,23 +752,53 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
     uint32_t ifd = r32(file.data() + 4);
     if (ifd + 2 > file.size()) return true;
     uint16_t nent = r16(file.data() + ifd);
+    bool private_color = false;
+    bool has_color_matrix = false;
+    float color_matrix[9] = {0};
     for (uint16_t i = 0; i < nent; ++i) {
         const uint8_t* e = file.data() + ifd + 2 + i * 12;
         uint16_t tag = r16(e), type = r16(e + 2);
         uint32_t count = r32(e + 4), val = r32(e + 8);
-        if (tag != 65000 || type != T_BYTE || count < 48) continue;
-        uint32_t off = (count <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
-        if (off + 48 > file.size()) continue;
-        auto read_f = [&](uint32_t o) -> float {
-            uint32_t u = r32(file.data() + o);
-            float v = 0.f;
-            std::memcpy(&v, &u, sizeof(v));
-            return v;
-        };
-        for (int k = 0; k < 3; ++k) wb[k] = read_f(off + (uint32_t)k * 4);
-        for (int k = 0; k < 9; ++k) cam_to_srgb[k] = read_f(off + 12 + (uint32_t)k * 4);
-        has_color = true;
-        break;
+        if (tag == 65000 && type == T_BYTE && count >= 48) {
+            uint32_t off = (count <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 48 <= file.size()) {
+                auto read_f = [&](uint32_t o) -> float {
+                    uint32_t u = r32(file.data() + o);
+                    float v = 0.f;
+                    std::memcpy(&v, &u, sizeof(v));
+                    return v;
+                };
+                for (int k = 0; k < 3; ++k) wb[k] = read_f(off + (uint32_t)k * 4);
+                for (int k = 0; k < 9; ++k) cam_to_srgb[k] = read_f(off + 12 + (uint32_t)k * 4);
+                private_color = true;
+                has_color = true;
+            }
+            continue;
+        }
+        if (tag == 50721 && (type == T_SRATIONAL || type == T_RATIONAL) && count >= 9) {
+            const uint32_t bytes = count * type_size(type);
+            uint32_t off = (bytes <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 9u * 8u <= file.size()) {
+                bool ok = true;
+                for (int k = 0; k < 9; ++k) {
+                    const uint8_t* p = file.data() + off + (uint32_t)k * 8u;
+                    const int32_t num = (type == T_SRATIONAL)
+                        ? (int32_t)r32(p) : (int32_t)(uint32_t)r32(p);
+                    const int32_t den = (int32_t)r32(p + 4);
+                    if (den == 0) { ok = false; break; }
+                    color_matrix[k] = (float)num / (float)den;
+                    ok = ok && std::isfinite(color_matrix[k]);
+                }
+                has_color_matrix = ok;
+            }
+        }
+    }
+    if ((!private_color || is_identity_3x3(cam_to_srgb)) && has_color_matrix) {
+        float derived[9];
+        if (derive_cam_to_srgb_from_color_matrix(color_matrix, derived)) {
+            for (int k = 0; k < 9; ++k) cam_to_srgb[k] = derived[k];
+            has_color = true;
+        }
     }
     return true;
 }
