@@ -144,6 +144,9 @@ struct Config {
     bool  has_cam_to_srgb = false;
     float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
     bool  bake_srgb = false;
+    // Direct RAW app path: full-res streaming can reload the captured uint16 RAW
+    // file instead of spilling/reloading an extra normalized-float cache copy.
+    bool  stream_comp_raw_from_loader = false;
 
     std::string camera_make;
     std::string camera_model;

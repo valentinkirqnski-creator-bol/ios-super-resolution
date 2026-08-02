@@ -13,6 +13,7 @@
 #include "core/pipeline.h"
 #include "core/metal_gpu.h"
 #include "core/dng_writer.h"
+#include "core/parallel.h"
 
 using namespace hhsr;
 
@@ -361,6 +362,9 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     float site_black[2][2];
     float site_denom[2][2];
     float site_wb[2][2];
+    float flat_black[4];
+    float flat_denom[4];
+    float flat_wb[4];
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             int c = (int)cfg.cfa.p[i][j];
@@ -375,23 +379,30 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 site_denom[i][j] = denom;
             }
             site_wb[i][j] = cfg.white_balance[c] / cfg.white_balance[1];
+            const int site = i * 2 + j;
+            flat_black[site] = site_black[i][j];
+            flat_denom[site] = site_denom[i][j];
+            flat_wb[site] = site_wb[i][j];
         }
     }
 
-    img = Image(h, w, 1);
     const uint8_t *base = (const uint8_t *)data.bytes;
-    for (int y = 0; y < h; ++y) {
-        const uint8_t *row = base + (size_t)y * (size_t)bytes_per_row;
-        const int fi = y & 1;
-        for (int x = 0; x < w; ++x) {
-            uint16_t rawv = 0;
-            std::memcpy(&rawv, row + (size_t)x * 2u, sizeof(rawv));
-            const int fj = x & 1;
-            float v = ((float)rawv - site_black[fi][fj]) / site_denom[fi][fj];
-            v *= site_wb[fi][fj];
-            if (!std::isfinite(v)) v = 0.f;
-            img.at(y, x) = clampf(v, 0.f, 1.f);
-        }
+    if (!metal_decode_raw16_to_float(base, (size_t)data.length, h, w, bytes_per_row,
+                                     flat_black, flat_denom, flat_wb, img)) {
+        img = Image(h, w, 1);
+        parallel_rows(h, 0, [&](int y) {
+            const uint8_t *row = base + (size_t)y * (size_t)bytes_per_row;
+            const int fi = y & 1;
+            for (int x = 0; x < w; ++x) {
+                uint16_t rawv = 0;
+                std::memcpy(&rawv, row + (size_t)x * 2u, sizeof(rawv));
+                const int fj = x & 1;
+                float v = ((float)rawv - site_black[fi][fj]) / site_denom[fi][fj];
+                v *= site_wb[fi][fj];
+                if (!std::isfinite(v)) v = 0.f;
+                img.at(y, x) = clampf(v, 0.f, 1.f);
+            }
+        });
     }
     cfg.raw_prewhitened = true;
 
@@ -491,6 +502,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     cfg.bake_srgb = false;
     cfg.use_gpu = false;
     cfg.num_threads = 0;
+    cfg.stream_comp_raw_from_loader = true;
     ApplyTuningParams(tuning, cfg);
 
     ProgressFn cb = nullptr;

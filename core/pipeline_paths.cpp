@@ -56,6 +56,8 @@ struct CachedCompFrame {
     Image rob;
     CovField covs;
     Image comp;
+    std::vector<uint8_t> rob_rows_nonzero;
+    bool rob_has_nonzero = true;
     int index = 0;
 };
 
@@ -63,11 +65,55 @@ struct CachedCompMeta {
     FlowField flow;
     Image rob;
     CovField covs;
+    std::vector<uint8_t> rob_rows_nonzero;
+    bool rob_has_nonzero = true;
     int index = 0;
 };
 
 static bool load_cached_comp_raw(const fs::path& cache, int k, Image& comp) {
     return load_image(cache / ("f" + std::to_string(k) + ".raw"), comp) && comp.h > 0;
+}
+
+static bool robustness_row_activity(const Image& rob, std::vector<uint8_t>& rows) {
+    rows.assign((size_t)std::max(0, rob.h), 0u);
+    if (rob.h <= 0 || rob.w <= 0 || rob.c <= 0 || rob.data.empty())
+        return false;
+    bool any = false;
+    for (int y = 0; y < rob.h; ++y) {
+        bool row_any = false;
+        const size_t base = (size_t)y * (size_t)rob.w * (size_t)std::max(1, rob.c);
+        const size_t count = (size_t)rob.w * (size_t)std::max(1, rob.c);
+        for (size_t i = 0; i < count; ++i) {
+            if (rob.data[base + i] != 0.f) {
+                row_any = true;
+                break;
+            }
+        }
+        rows[(size_t)y] = row_any ? 1u : 0u;
+        any = any || row_any;
+    }
+    return any;
+}
+
+static inline int round_away_to_int(f32 x) {
+    return (int)std::lround(x);
+}
+
+static bool robustness_band_can_contribute(const std::vector<uint8_t>& rows,
+                                           int y0, int bh, float scale,
+                                           bool bayer_mode) {
+    if (rows.empty()) return true;
+    const int rh = (int)rows.size();
+    for (int local_y = 0; local_y < bh; ++local_y) {
+        const f32 lr_y = (f32)(y0 + local_y) / scale;
+        int ry;
+        if (bayer_mode)
+            ry = std::min(std::max(round_away_to_int((lr_y - 0.5f) / 2.f), 0), rh - 1);
+        else
+            ry = std::min(std::max(round_away_to_int(lr_y), 0), rh - 1);
+        if (rows[(size_t)ry]) return true;
+    }
+    return false;
 }
 
 struct DebugImageStats {
@@ -396,6 +442,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     Image ref = loader(0, work, true, 0, 0);
     if (ref.h <= 0 || ref.w <= 0) return Image();
+    clear_align_ref_ica_cache();
     debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
     if (debug) append_image_summary(debug_summary, "raw_ref", ref);
     tune_config_snr(ref, work);
@@ -463,11 +510,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::error_code ec;
     fs::remove_all(cache, ec);
 
-    // Spill Bayer on full-res (any burst size) or when comps > 8. Keeps flow/R/cov.
+    // Stream Bayer on full-res (any burst size) or when comps > 8. Keeps flow/R/cov.
     std::vector<CachedCompFrame> cached;
     std::vector<CachedCompMeta> cached_meta;
     const bool stream_comp_raw = full_res || (n - 1) > 8;
-    if (stream_comp_raw)
+    const bool cache_streamed_comp_raw =
+        stream_comp_raw && !work.stream_comp_raw_from_loader;
+    auto load_streamed_comp_raw = [&](int frame_index, Image& comp) -> bool {
+        if (cache_streamed_comp_raw)
+            return load_cached_comp_raw(cache, frame_index, comp);
+        comp = loader(frame_index, work, false, ref_h, ref_w);
+        return comp.h > 0 && comp.w > 0;
+    };
+    if (cache_streamed_comp_raw)
         fs::create_directories(cache, ec);
 
     cached.reserve((size_t)std::max(0, n - 1));
@@ -542,16 +597,21 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
         Image rob;
         CovField covs;
+        std::vector<uint8_t> rob_rows_nonzero;
+        bool rob_has_nonzero = true;
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
-            covs = estimate_kernels(comp, work);
+            rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
+            if (rob_has_nonzero)
+                covs = estimate_kernels(comp, work);
         } else {
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { return estimate_kernels(comp, work); });
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
             covs = cov_fut.get();
+            rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
         }
         debug_dump_bin("cpp_mask_" + std::to_string(k - 1),
                        rob.data.data(), rob.data.size());
@@ -561,31 +621,39 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, mask_name.c_str(), rob);
             append_cov_summary(debug_summary, cov_name.c_str(), covs);
         }
-
         if (stream_comp_raw) {
-            // Spill Bayer async (overlaps next decode already in flight). Keep
-            // flow/R/cov in RAM. Grow-only L2/Alg.5 scratch stays until merge.
-            const int sk = k;
-            auto spill_img = std::make_shared<Image>(std::move(comp));
-            const fs::path spill_path = cache / ("f" + std::to_string(sk) + ".raw");
-            spill_fut = std::async(std::launch::async, [spill_path, spill_img]() {
-                return save_image(spill_path, *spill_img);
-            });
-            spill_pending = true;
+            // Keep flow/R/cov in RAM. For DNG-file input, spill normalized Bayer
+            // async; for direct RAW, reload the original uint16 frame later.
+            // Grow-only L2/Alg.5 scratch stays until merge.
+            if (cache_streamed_comp_raw && rob_has_nonzero) {
+                const int sk = k;
+                auto spill_img = std::make_shared<Image>(std::move(comp));
+                const fs::path spill_path = cache / ("f" + std::to_string(sk) + ".raw");
+                spill_fut = std::async(std::launch::async, [spill_path, spill_img]() {
+                    return save_image(spill_path, *spill_img);
+                });
+                spill_pending = true;
+            } else {
+                comp = Image();
+            }
             CachedCompMeta meta;
             meta.index = k;
-            meta.flow = std::move(flow);
+            meta.flow = rob_has_nonzero ? std::move(flow) : FlowField();
             meta.rob = std::move(rob);
-            meta.covs = std::move(covs);
+            meta.covs = rob_has_nonzero ? std::move(covs) : CovField();
+            meta.rob_rows_nonzero = std::move(rob_rows_nonzero);
+            meta.rob_has_nonzero = rob_has_nonzero;
             cached_meta.push_back(std::move(meta));
             n_comp_ok++;
         } else {
             CachedCompFrame fc;
             fc.index = k;
-            fc.flow = std::move(flow);
+            fc.flow = rob_has_nonzero ? std::move(flow) : FlowField();
             fc.rob = std::move(rob);
-            fc.covs = std::move(covs);
-            fc.comp = std::move(comp);
+            fc.covs = rob_has_nonzero ? std::move(covs) : CovField();
+            fc.comp = rob_has_nonzero ? std::move(comp) : Image();
+            fc.rob_rows_nonzero = std::move(rob_rows_nonzero);
+            fc.rob_has_nonzero = rob_has_nonzero;
             cached.push_back(std::move(fc));
             n_comp_ok++;
         }
@@ -594,7 +662,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
     if (n_comp_ok < 1) {
-        if (stream_comp_raw) fs::remove_all(cache, ec);
+        if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: could not analyze comparison frames", 1.f);
         return Image();
     }
@@ -606,7 +674,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     ref_stats = RefStats();
 
     if (ref.h <= 0) {
-        if (stream_comp_raw) fs::remove_all(cache, ec);
+        if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: reference frame missing for merge", 1.f);
         return Image();
     }
@@ -634,7 +702,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                      work.bake_srgb, make,
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
                      work.raw_prewhitened)) {
-        if (stream_comp_raw) fs::remove_all(cache, ec);
+        if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
         return Image();
     }
@@ -670,7 +738,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     metal_merge_begin_burst();
     if (stream_comp_raw) {
         for (CachedCompMeta& meta : cached_meta) {
-            if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+            if (!meta.rob_has_nonzero) continue;
+            if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
             if (metal_merge_prefetch_frame(comp_scratch, meta.flow, meta.covs, meta.rob,
                                            meta.index)) {
                 meta.rob = Image();
@@ -682,6 +751,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         comp_scratch = Image();
     } else {
         for (CachedCompFrame& fc : cached) {
+            if (!fc.rob_has_nonzero) continue;
             if (metal_merge_prefetch_frame(fc.comp, fc.flow, fc.covs, fc.rob, fc.index)) {
                 fc.comp = Image();
                 if (heavy_1x) {
@@ -726,25 +796,33 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 join_encode();
                 metal_merge_set_single_acc_slot(false);
                 writer.close();
-                if (stream_comp_raw) fs::remove_all(cache, ec);
+                if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
                 return Image();
             }
         }
 
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
+                if (!meta.rob_has_nonzero ||
+                    !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
+                                                    work.scale, work.bayer_mode))
+                    continue;
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
                     merge_comp_band(empty, meta.flow, meta.covs, meta.rob, tile_size,
                                     num_band, den_band, y0, work, meta.index);
                     continue;
                 }
-                if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+                if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
             for (const CachedCompFrame& fc : cached) {
+                if (!fc.rob_has_nonzero ||
+                    !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
+                                                    work.scale, work.bayer_mode))
+                    continue;
                 if (metal_merge_has_frame(fc.index)) {
                     Image empty;
                     merge_comp_band(empty, fc.flow, fc.covs, fc.rob, tile_size,
@@ -762,7 +840,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             join_encode();
             metal_merge_set_single_acc_slot(false);
             writer.close();
-            if (stream_comp_raw) fs::remove_all(cache, ec);
+            if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
             return Image();
         }
 
@@ -824,14 +902,23 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
-                if (!load_cached_comp_raw(cache, meta.index, comp_scratch)) continue;
+                if (!meta.rob_has_nonzero ||
+                    !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
+                                                    work.scale, work.bayer_mode))
+                    continue;
+                if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
-            for (const CachedCompFrame& fc : cached)
+            for (const CachedCompFrame& fc : cached) {
+                if (!fc.rob_has_nonzero ||
+                    !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
+                                                    work.scale, work.bayer_mode))
+                    continue;
                 merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
                                 num_band, den_band, y0, work, fc.index);
+            }
         }
 
         merge_ref_band(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
@@ -860,7 +947,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     cached_meta.clear();
     ref = Image();
     ref_covs = CovField();
-    if (stream_comp_raw) fs::remove_all(cache, ec);
+    if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
     report(format_accum_diag(diag), 0.99f);
     if (debug) {
         append_merge_summary(debug_summary, merge_debug);

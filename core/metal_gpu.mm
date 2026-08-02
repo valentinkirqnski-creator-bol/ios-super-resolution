@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -73,6 +74,13 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
+    const void* ica_ref_key = nullptr;
+    id<MTLBuffer> ica_ref = nil;
+    id<MTLBuffer> ica_gx = nil;
+    id<MTLBuffer> ica_gy = nil;
+    id<MTLBuffer> ica_hess = nil;
+    int ica_ref_h = 0, ica_ref_w = 0, ica_ref_ts = 0;
+    int ica_ny = 0, ica_nx = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -116,6 +124,7 @@ static MetalCtx& ctx() {
         }
         if (!c.library) return;
         const char* need[] = {
+            "raw16_to_float_bayer",
             "fft1d_pow2_cpp", "fft1d_bitrev", "fft1d_butterfly", "fft_scale_inv", "make_chirp",
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
@@ -632,6 +641,66 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
 } // namespace
 
 bool metal_gpu_init() { return ctx().ok; }
+
+bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
+                                 int h, int w, int bytes_per_row,
+                                 const float site_black[4],
+                                 const float site_denom[4],
+                                 const float site_wb[4],
+                                 Image& out) {
+    if (!metal_gpu_init() || !raw_data || h <= 0 || w <= 0 ||
+        bytes_per_row < w * (int)sizeof(uint16_t) || (bytes_per_row & 1))
+        return false;
+    const size_t need_raw = (size_t)bytes_per_row * (size_t)h;
+    if (raw_bytes < need_raw) return false;
+    for (int i = 0; i < 4; ++i) {
+        if (!(site_denom[i] > 0.f) || !std::isfinite(site_denom[i]) ||
+            !std::isfinite(site_black[i]) || !std::isfinite(site_wb[i]))
+            return false;
+    }
+
+    auto& c = ctx();
+    struct RawDecodeParamsCPU {
+        uint32_t h, w, stride_shorts, pad0;
+        float black[4];
+        float denom[4];
+        float wb[4];
+    };
+    static_assert(sizeof(RawDecodeParamsCPU) == 64, "RawDecodeParamsCPU");
+
+    RawDecodeParamsCPU p{};
+    p.h = (uint32_t)h;
+    p.w = (uint32_t)w;
+    p.stride_shorts = (uint32_t)(bytes_per_row / (int)sizeof(uint16_t));
+    for (int i = 0; i < 4; ++i) {
+        p.black[i] = site_black[i];
+        p.denom[i] = site_denom[i];
+        p.wb[i] = site_wb[i];
+    }
+
+    const size_t out_b = (size_t)h * (size_t)w * sizeof(float);
+    id<MTLBuffer> b_raw = buf(raw_data, need_raw);
+    id<MTLBuffer> b_out = buf(nullptr, out_b);
+    if (!b_raw || !b_out) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_raw offset:0 atIndex:0];
+    [enc setBuffer:b_out offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("raw16_to_float_bayer"), (NSUInteger)w, (NSUInteger)h);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    Image decoded(h, w, 1);
+    memcpy(decoded.data.data(), [b_out contents], out_b);
+    out = std::move(decoded);
+    return true;
+}
 
 Image compute_grey_fft_metal(const Image& raw) {
     if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return Image();
@@ -1649,6 +1718,17 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     ny = (r.h + ts - 1) / ts;
     nx = (r.w + ts - 1) / ts;
     if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) return false;
+    const void* key = r.data.empty() ? nullptr : (const void*)r.data.data();
+    if (key && c.ica_ref && c.ica_gx && c.ica_gy && c.ica_hess &&
+        c.ica_ref_key == key &&
+        c.ica_ref_h == r.h && c.ica_ref_w == r.w &&
+        c.ica_ref_ts == ts && c.ica_ny == ny && c.ica_nx == nx) {
+        b_ref = c.ica_ref;
+        b_gx = c.ica_gx;
+        b_gy = c.ica_gy;
+        b_hess = c.ica_hess;
+        return true;
+    }
     b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
     const size_t pix_b = (size_t)r.h * (size_t)r.w * sizeof(float);
     const size_t hess_b = (size_t)ny * (size_t)nx * 4u * sizeof(float);
@@ -1697,7 +1777,20 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
+    if (ok && key) {
+        c.ica_ref_key = key;
+        c.ica_ref = b_ref;
+        c.ica_gx = b_gx;
+        c.ica_gy = b_gy;
+        c.ica_hess = b_hess;
+        c.ica_ref_h = r.h;
+        c.ica_ref_w = r.w;
+        c.ica_ref_ts = ts;
+        c.ica_ny = ny;
+        c.ica_nx = nx;
+    }
+    return ok;
 }
 
 // __strong out-param: ARC requires it for id& (same as gpu_downsample_buf).
@@ -1892,6 +1985,14 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
 }
 
 void metal_clear_ref_ica_cache() {
+    auto& c = ctx();
+    c.ica_ref_key = nullptr;
+    c.ica_ref = nil;
+    c.ica_gx = nil;
+    c.ica_gy = nil;
+    c.ica_hess = nil;
+    c.ica_ref_h = c.ica_ref_w = c.ica_ref_ts = 0;
+    c.ica_ny = c.ica_nx = 0;
     g_dumped_ref_grads = false;
 }
 
@@ -2365,6 +2466,13 @@ void metal_trim_analyze_scratch() {
     c.l2[1] = {};
     c.sticky_grey = nil;
     c.sticky_grey_h = c.sticky_grey_w = 0;
+    c.ica_ref_key = nullptr;
+    c.ica_ref = nil;
+    c.ica_gx = nil;
+    c.ica_gy = nil;
+    c.ica_hess = nil;
+    c.ica_ref_h = c.ica_ref_w = c.ica_ref_ts = 0;
+    c.ica_ny = c.ica_nx = 0;
     clear_rob_ref_gpu();
 }
 

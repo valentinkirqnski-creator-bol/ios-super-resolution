@@ -17,6 +17,15 @@ namespace hhsr {
 // Returns false if MTL device / pipelines could not be created.
 bool metal_gpu_init();
 
+// Direct RAW app path: uint16 Bayer -> normalized float Bayer with the same
+// black/WB/clamp math as DecodeRawFrameDictionary's CPU fallback.
+bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
+                                 int h, int w, int bytes_per_row,
+                                 const float site_black[4],
+                                 const float site_denom[4],
+                                 const float site_wb[4],
+                                 Image& out);
+
 // Alg. 3 FFT grey on GPU. Empty image on failure.
 Image compute_grey_fft_metal(const Image& raw);
 
@@ -51,7 +60,7 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out);
 
-// No-op retained for clear_align_ref_ica_cache pairing (host cache is separate).
+// Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
 
 // num/den → packed RGB16 (same math as encode_band_rows DNG path). Preview

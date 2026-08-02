@@ -8,6 +8,26 @@ using namespace metal;
 
 constant float PI = 3.14159265358979323846f;
 
+struct RawDecodeParams {
+    uint h, w, stride_shorts, _pad0;
+    float4 black;
+    float4 denom;
+    float4 wb;
+};
+
+kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
+                                 device float* out [[buffer(1)]],
+                                 constant RawDecodeParams& p [[buffer(2)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    uint site = ((gid.y & 1u) << 1u) | (gid.x & 1u);
+    ushort rawv = raw[gid.y * p.stride_shorts + gid.x];
+    float v = (float(rawv) - p.black[site]) / p.denom[site];
+    v *= p.wb[site];
+    if (!isfinite(v)) v = 0.f;
+    out[gid.y * p.w + gid.x] = clamp(v, 0.f, 1.f);
+}
+
 inline float2 cmul(float2 a, float2 b) {
     return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
