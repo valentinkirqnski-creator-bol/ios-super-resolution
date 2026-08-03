@@ -422,6 +422,7 @@ static Image high_frequency_loss_map_adaptive(const Image& means, const Image& v
     Image loss(vars.h, vars.w, 1);
     constexpr f32 kLocalVarianceNoiseScale = 8.f / 9.f;
     constexpr f32 kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
+    constexpr f32 kMinTextureSnr = 4.f;
     for (int y = 0; y < vars.h; ++y) {
         for (int x = 0; x < vars.w; ++x) {
             f32 var = 0.f, lp_var = 0.f;
@@ -435,7 +436,8 @@ static Image high_frequency_loss_map_adaptive(const Image& means, const Image& v
             }
             const f32 signal_var = std::max(var - noise_var, 0.f);
             const f32 signal_lp_var = std::max(lp_var - lp_noise_var, 0.f);
-            loss.at(y, x) = (signal_var > 1.0e-20f)
+            const f32 min_signal_var = kMinTextureSnr * std::max(noise_var, 1.0e-20f);
+            loss.at(y, x) = (signal_var > min_signal_var)
                 ? std::max((signal_var - signal_lp_var) / signal_var, 0.f)
                 : 0.f;
         }
@@ -781,10 +783,18 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const int new_x = (int)std::lround((f32)x + flow_x);
             const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
+            f32 s = S[pidx];
+            f32 sig = sigma_sq.at(y, x);
+            const f32 ratio = (sig > 0.f && std::isfinite(sig))
+                ? d_sq.at(y, x) / sig
+                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
+            const bool residual_high =
+                std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
             const bool hf_reject =
                 cfg.hf_artifact_removal_enabled &&
                 pidx < motion_irregular.size() &&
                 motion_irregular[pidx] != 0u &&
+                residual_high &&
                 (
                     (!ref_stats.hf_loss.data.empty() &&
                      ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold) ||
@@ -792,11 +802,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                      !comp_hf_loss.data.empty() &&
                      comp_hf_loss.at(new_y, new_x) > cfg.hf_variance_loss_threshold)
                 );
-            f32 s = S[pidx];
-            f32 sig = sigma_sq.at(y, x);
-            const f32 ratio = (sig > 0.f && std::isfinite(sig))
-                ? d_sq.at(y, x) / sig
-                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);

@@ -1239,6 +1239,7 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
     constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
+    constexpr float kMinTextureSnr = 4.f;
     float var_sum = 0.f;
     float lp_var_sum = 0.f;
     float noise_var = 0.f;
@@ -1255,7 +1256,8 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
     }
     float signal_var = max(var_sum - noise_var, 0.f);
     float signal_lp_var = max(lp_var_sum - lp_noise_var, 0.f);
-    loss[gid.y * p.w + gid.x] = (signal_var > 1.0e-20f)
+    float min_signal_var = kMinTextureSnr * max(noise_var, 1.0e-20f);
+    loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
         ? max((signal_var - signal_lp_var) / signal_var, 0.f)
         : 0.f;
 }
@@ -1371,8 +1373,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
+    float ratio = (sig > 0.f && isfinite(sig))
+        ? d_sq_ / sig
+        : (d_sq_ > 0.f ? INFINITY : 0.f);
+    bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
     bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
+    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u && residual_high) {
         float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
         if (inbound) {
             hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
@@ -1381,10 +1387,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     }
     bool edge_reject = false;
     if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
-        float ratio = (sig > 0.f && isfinite(sig))
-            ? d_sq_ / sig
-            : (d_sq_ > 0.f ? INFINITY : 0.f);
-        if (isfinite(ratio) && ratio > p.motion_edge_residual_threshold) {
+        if (residual_high) {
             float edge_sq = rob_edge_strength_sq_neighborhood(
                 ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
                 p.motion_edge_neighborhood_radius);
