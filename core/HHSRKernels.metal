@@ -1075,8 +1075,7 @@ struct RobHfLossParams {
     uint h, w, nch;
     uint _pad0;
     float alpha, beta;
-    float noise_floor_multiplier;
-    float _pad1;
+    float _pad1, _pad2;
 };
 
 struct RobDogsonParams {
@@ -1238,9 +1237,12 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
                                  constant RobHfLossParams& p [[buffer(4)]],
                                  uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
+    constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
+    constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
     float var_sum = 0.f;
     float lp_var_sum = 0.f;
-    float noise_floor = 0.f;
+    float noise_var = 0.f;
+    float lp_noise_var = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         var_sum += max(vars[o], 0.f);
@@ -1248,11 +1250,13 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
         float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
         float nv = max(p.alpha * brightness + p.beta, 0.f);
         if (p.nch == 3u && ch == 1u) nv *= 0.5f;
-        noise_floor += nv;
+        noise_var += kLocalVarianceNoiseScale * nv;
+        lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
     }
-    float floor_v = max(p.noise_floor_multiplier, 0.f) * noise_floor;
-    loss[gid.y * p.w + gid.x] = (var_sum > floor_v && var_sum > 1.0e-20f)
-        ? max((var_sum - lp_var_sum) / var_sum, 0.f)
+    float signal_var = max(var_sum - noise_var, 0.f);
+    float signal_lp_var = max(lp_var_sum - lp_noise_var, 0.f);
+    loss[gid.y * p.w + gid.x] = (signal_var > 1.0e-20f)
+        ? max((signal_var - signal_lp_var) / signal_var, 0.f)
         : 0.f;
 }
 

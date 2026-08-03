@@ -420,18 +420,23 @@ static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
 static Image high_frequency_loss_map_adaptive(const Image& means, const Image& vars,
                                               const Image& lp_vars, const Config& cfg) {
     Image loss(vars.h, vars.w, 1);
-    const f32 mult = std::max(cfg.hf_noise_floor_multiplier, 0.f);
+    constexpr f32 kLocalVarianceNoiseScale = 8.f / 9.f;
+    constexpr f32 kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
     for (int y = 0; y < vars.h; ++y) {
         for (int x = 0; x < vars.w; ++x) {
-            f32 var = 0.f, lp_var = 0.f, noise_floor = 0.f;
+            f32 var = 0.f, lp_var = 0.f;
+            f32 noise_var = 0.f, lp_noise_var = 0.f;
             for (int ch = 0; ch < vars.c; ++ch) {
                 var += std::max(vars.at(y, x, ch), 0.f);
                 lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
-                noise_floor += guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch));
+                const f32 n = guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch));
+                noise_var += kLocalVarianceNoiseScale * n;
+                lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * n;
             }
-            const f32 floor = mult * noise_floor;
-            loss.at(y, x) = (var > floor && var > 1.0e-20f)
-                ? std::max((var - lp_var) / var, 0.f)
+            const f32 signal_var = std::max(var - noise_var, 0.f);
+            const f32 signal_lp_var = std::max(lp_var - lp_noise_var, 0.f);
+            loss.at(y, x) = (signal_var > 1.0e-20f)
+                ? std::max((signal_var - signal_lp_var) / signal_var, 0.f)
                 : 0.f;
         }
     }

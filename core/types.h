@@ -110,7 +110,6 @@ struct Config {
     float r_Mt = 0.8f;
     bool  hf_artifact_removal_enabled = true;
     float hf_variance_loss_threshold = 0.90f;
-    float hf_noise_floor_multiplier = 6.0f;
     bool  motion_edge_rejection_enabled = true;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
