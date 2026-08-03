@@ -29,12 +29,12 @@ NS_ASSUME_NONNULL_BEGIN
                 progress:(nullable void (^)(NSString *stage, float fraction))progress
              previewImage:(UIImage * _Nullable * _Nullable)previewOut;
 
-/// Decode our LinearRaw Deflate DNG and write a tone-mapped JPEG
-/// WB + matrix + Highlights −70 + contrast + vibrance (no CI sharpen / HS).
+/// Decode our LinearRaw Deflate DNG and write a calibrated sRGB JPEG.
+/// Uses the same renderer as the embedded DNG preview. No CI sharpen or NR.
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
                          toPath:(NSString *)jpgPath;
 
-/// Tone-map the LinearRaw DNG (same look as export JPEG), encode a JPEG preview
+/// Render the LinearRaw DNG (same look as export JPEG), encode a JPEG preview
 /// (longest side ≤ maxSide), and embed it as a DNG SubIFD so Photos can thumbnail
 /// a DNG-only asset. Lightroom still reads the LinearRaw IFD0.
 + (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath

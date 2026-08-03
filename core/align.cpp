@@ -715,19 +715,51 @@ void clear_align_ref_ica_cache() {
 #endif
 }
 
+FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor,
+                                   int finest_h, int finest_w,
+                                   f32 initial_dx, f32 initial_dy,
+                                   f32 initial_rotation_rad) {
+    FlowField flow(ny, nx);
+    const f32 factor = (f32)std::max(1, abs_factor);
+    const f32 inv_factor = 1.f / factor;
+    const f32 dx = std::isfinite(initial_dx) ? initial_dx : 0.f;
+    const f32 dy = std::isfinite(initial_dy) ? initial_dy : 0.f;
+    const f32 a = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
+    const f32 ca = std::cos(a);
+    const f32 sa = std::sin(a);
+    const f32 cx = 0.5f * (f32)std::max(0, finest_w - 1);
+    const f32 cy = 0.5f * (f32)std::max(0, finest_h - 1);
+
+    for (int ty = 0; ty < ny; ++ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            const f32 x = ((f32)tx * (f32)tile_size + 0.5f * (f32)tile_size) * factor;
+            const f32 y = ((f32)ty * (f32)tile_size + 0.5f * (f32)tile_size) * factor;
+            const f32 rx = x - cx;
+            const f32 ry = y - cy;
+            const f32 rot_x = ca * rx - sa * ry - rx;
+            const f32 rot_y = sa * rx + ca * ry - ry;
+            flow.dx(ty, tx) = (dx + rot_x) * inv_factor;
+            flow.dy(ty, tx) = (dy + rot_y) * inv_factor;
+        }
+    }
+    return flow;
+}
+
 // ============================================================================
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
-                const Image& moving_grey, const Config& cfg, int tile_size) {
+                const Image& moving_grey, const Config& cfg, int tile_size,
+                f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     int nlev = (int)ref_pyr.levels.size();
 
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
-        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu))
+        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
+                        initial_dx, initial_dy, initial_rotation_rad))
             return flow_gpu;
     }
 #endif
@@ -778,7 +810,12 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         int nx = r.w / ts;
 
         if (flow.nx == 0) {
-            flow = FlowField(ny, nx);
+            const int abs_factor = (lvl < (int)ref_pyr.abs_factors.size())
+                                   ? ref_pyr.abs_factors[(size_t)lvl] : 1;
+            flow = make_global_initial_flow(ny, nx, ts, abs_factor,
+                                            ref_grey.h, ref_grey.w,
+                                            initial_dx, initial_dy,
+                                            initial_rotation_rad);
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;

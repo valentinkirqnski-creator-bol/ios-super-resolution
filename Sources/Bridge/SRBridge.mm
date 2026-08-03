@@ -136,8 +136,8 @@ static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount
     b = clampf(y + (b - y) * boost, 0.f, 1.f);
 }
 
-// Shared JPG / DNG-preview finish: Highlights −100, Shadows +60, contrast + vibrance.
-static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
+// Legacy fallback for non-app DNGs with non-neutral WB metadata.
+static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
     sr = std::max(0.f, sr);
     sg = std::max(0.f, sg);
     sb = std::max(0.f, sb);
@@ -217,6 +217,69 @@ static inline void tone_map_display_rgb(float& sr, float& sg, float& sb) {
 #endif
 }
 
+static inline bool render_wb_is_neutral(const float wb[3]) {
+    return std::fabs(wb[0] - 1.f) < 1e-4f &&
+           std::fabs(wb[1] - 1.f) < 1e-4f &&
+           std::fabs(wb[2] - 1.f) < 1e-4f;
+}
+
+static inline void tone_map_calibrated_display_rgb(float& sr, float& sg, float& sb) {
+    sr = std::max(0.f, sr);
+    sg = std::max(0.f, sg);
+    sb = std::max(0.f, sb);
+
+    const float mx = std::max(sr, std::max(sg, sb));
+    if (mx > 1.f) {
+        render_desaturate_to_luma(sr, sg, sb, smoothstepf(1.f, 1.25f, mx));
+        const float mx2 = std::max(sr, std::max(sg, sb));
+        if (mx2 > 1.f) {
+            const float inv = 1.f / mx2;
+            sr *= inv;
+            sg *= inv;
+            sb *= inv;
+        }
+    }
+
+    sr = to_srgb_gamma(sr);
+    sg = to_srgb_gamma(sg);
+    sb = to_srgb_gamma(sb);
+}
+
+static inline void render_linear_dng_pixel(float r, float g, float b,
+                                           const float wb[3], const float m[9],
+                                           bool has_color,
+                                           float& sr, float& sg, float& sb) {
+    if (has_color && render_wb_is_neutral(wb)) {
+        // Calibrated from the supplied HandheldSR linear DNG -> Lightroom iOS JPEG pair.
+        // The SR output is already pre-white-balanced, so using the DNG camera matrix
+        // directly here double-pushes color and causes magenta/green highlight casts.
+        constexpr float kDisplayMatrix[9] = {
+             1.2466443f, -0.4477117f, -0.1773365f,
+            -0.1616100f,  0.8074801f, -0.0321825f,
+            -0.1166101f, -0.1502432f,  0.8686564f
+        };
+        sr = kDisplayMatrix[0] * r + kDisplayMatrix[1] * g + kDisplayMatrix[2] * b;
+        sg = kDisplayMatrix[3] * r + kDisplayMatrix[4] * g + kDisplayMatrix[5] * b;
+        sb = kDisplayMatrix[6] * r + kDisplayMatrix[7] * g + kDisplayMatrix[8] * b;
+        tone_map_calibrated_display_rgb(sr, sg, sb);
+        return;
+    }
+
+    const float wr = r * wb[0];
+    const float wg = g * wb[1];
+    const float wb_ = b * wb[2];
+    if (has_color) {
+        sr = m[0] * wr + m[1] * wg + m[2] * wb_;
+        sg = m[3] * wr + m[4] * wg + m[5] * wb_;
+        sb = m[6] * wr + m[7] * wg + m[8] * wb_;
+    } else {
+        sr = wr;
+        sg = wg;
+        sb = wb_;
+    }
+    tone_map_legacy_camera_rgb(sr, sg, sb);
+}
+
 static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
     if (!tuning) return;
     if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
@@ -246,6 +309,27 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+    if (tuning[@"alignment_tile_size"]) {
+        const int ts = tuning[@"alignment_tile_size"].intValue;
+        cfg.alignment_tile_size =
+            (ts == 8 || ts == 16 || ts == 32 || ts == 64) ? ts : 0;
+    }
+    if (tuning[@"global_prealignment_enabled"])
+        cfg.global_prealignment_enabled = tuning[@"global_prealignment_enabled"].boolValue;
+    if (tuning[@"global_prealignment_choose_reference"])
+        cfg.global_prealignment_choose_reference =
+            tuning[@"global_prealignment_choose_reference"].boolValue;
+    if (tuning[@"global_prealignment_rotation_range_deg"])
+        cfg.global_prealignment_rotation_range_deg =
+            std::max(0.f, std::min(2.f,
+                tuning[@"global_prealignment_rotation_range_deg"].floatValue));
+    if (tuning[@"global_prealignment_rotation_step_deg"])
+        cfg.global_prealignment_rotation_step_deg =
+            std::max(0.05f, std::min(1.f,
+                tuning[@"global_prealignment_rotation_step_deg"].floatValue));
+    if (tuning[@"global_prealignment_max_shift"])
+        cfg.global_prealignment_max_shift =
+            std::max(0, std::min(64, tuning[@"global_prealignment_max_shift"].intValue));
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
     if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
@@ -643,16 +727,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        float wr = r * wb[0], wg = g * wb[1], wb_ = b * wb[2];
         float sr, sg, sb;
-        if (has_color) {
-            sr = m[0] * wr + m[1] * wg + m[2] * wb_;
-            sg = m[3] * wr + m[4] * wg + m[5] * wb_;
-            sb = m[6] * wr + m[7] * wg + m[8] * wb_;
-        } else {
-            sr = wr; sg = wg; sb = wb_;
-        }
-        tone_map_display_rgb(sr, sg, sb);
+        render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
         srgb[i * 4 + 0] = (uint8_t)std::lround(sr * 255.f);
         srgb[i * 4 + 1] = (uint8_t)std::lround(sg * 255.f);
         srgb[i * 4 + 2] = (uint8_t)std::lround(sb * 255.f);
@@ -719,15 +795,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        float wr = r * wb[0], wg = g * wb[1], wb_ = b * wb[2];
-        if (has_color) {
-            sr = m[0] * wr + m[1] * wg + m[2] * wb_;
-            sg = m[3] * wr + m[4] * wg + m[5] * wb_;
-            sb = m[6] * wr + m[7] * wg + m[8] * wb_;
-        } else {
-            sr = wr; sg = wg; sb = wb_;
-        }
-        tone_map_display_rgb(sr, sg, sb);
+        render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
     };
 
     for (int y = 0; y < oh; ++y) {

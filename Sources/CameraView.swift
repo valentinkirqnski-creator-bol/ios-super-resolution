@@ -526,6 +526,52 @@ struct CameraView: View {
                 
                 Section(header: Text("Steerable Kernels (Merging)")) {
                     Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
+
+                    Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
+
+                    if cam.tuningParams.global_prealignment_enabled {
+                        Toggle("Choose Reference Frame", isOn: $cam.tuningParams.global_prealignment_choose_reference)
+
+                        HStack {
+                            Text("Rotation Search")
+                            Spacer()
+                            Text(String(format: "%.1f deg", cam.tuningParams.global_prealignment_rotation_range_deg))
+                        }
+                        Slider(value: $cam.tuningParams.global_prealignment_rotation_range_deg,
+                               in: 0.0...2.0,
+                               step: 0.1)
+
+                        HStack {
+                            Text("Rotation Step")
+                            Spacer()
+                            Text(String(format: "%.2f deg", cam.tuningParams.global_prealignment_rotation_step_deg))
+                        }
+                        Slider(value: $cam.tuningParams.global_prealignment_rotation_step_deg,
+                               in: 0.05...1.0,
+                               step: 0.05)
+
+                        Stepper(value: $cam.tuningParams.global_prealignment_max_shift,
+                                in: 0...64,
+                                step: 4) {
+                            HStack {
+                                Text("Global Shift")
+                                Spacer()
+                                Text("\(cam.tuningParams.global_prealignment_max_shift)")
+                            }
+                        }
+                    }
+
+                    Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
+                        Text("Auto").tag(0)
+                        Text("8").tag(8)
+                        Text("16").tag(16)
+                        Text("32").tag(32)
+                        Text("64").tag(64)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("8 can follow smaller local motion in good light, but is slower and less stable on noise, straight edges, and repeated patterns. Auto keeps the SNR-based choice.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     
                     HStack {
                         Text("Detail Sharpness (k_detail)")

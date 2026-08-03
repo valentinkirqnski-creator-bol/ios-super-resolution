@@ -116,6 +116,277 @@ static bool robustness_band_can_contribute(const std::vector<uint8_t>& rows,
     return false;
 }
 
+struct PrealignTransform {
+    f32 dx = 0.f;      // reference raw/grey coordinate -> moving coordinate
+    f32 dy = 0.f;
+    f32 angle = 0.f;   // radians, positive = counter-clockwise about image center
+    f32 score = -1.f;
+    bool valid = false;
+};
+
+struct PrealignPlan {
+    int reference_index = 0;
+    std::vector<PrealignTransform> to_first;
+    std::vector<PrealignTransform> from_reference;
+};
+
+static inline f32 sample_bilinear_clamped(const Image& im, f32 y, f32 x) {
+    if (im.h <= 0 || im.w <= 0) return 0.f;
+    x = clampf(x, 0.f, (f32)(im.w - 1));
+    y = clampf(y, 0.f, (f32)(im.h - 1));
+    const int fx = (int)std::floor(x);
+    const int fy = (int)std::floor(y);
+    const int cx = std::min(fx + 1, im.w - 1);
+    const int cy = std::min(fy + 1, im.h - 1);
+    const f32 tx = x - (f32)fx;
+    const f32 ty = y - (f32)fy;
+    const f32 top = im.at(fy, fx) + tx * (im.at(fy, cx) - im.at(fy, fx));
+    const f32 bot = im.at(cy, fx) + tx * (im.at(cy, cx) - im.at(cy, fx));
+    return top + ty * (bot - top);
+}
+
+static bool sample_bilinear_inside(const Image& im, f32 y, f32 x, f32& out) {
+    if (im.h <= 1 || im.w <= 1 || x < 0.f || y < 0.f ||
+        x > (f32)(im.w - 1) || y > (f32)(im.h - 1))
+        return false;
+    out = sample_bilinear_clamped(im, y, x);
+    return true;
+}
+
+static Image make_prealign_thumbnail(const Image& raw, const Config& cfg) {
+    if (raw.h <= 0 || raw.w <= 0) return Image();
+    const int max_dim = std::max(96, std::min(512, cfg.global_prealignment_thumb_max_dim));
+    int tw = max_dim;
+    int th = max_dim;
+    if (raw.w >= raw.h) {
+        tw = max_dim;
+        th = std::max(64, (int)std::lround((double)raw.h * (double)max_dim / (double)raw.w));
+    } else {
+        th = max_dim;
+        tw = std::max(64, (int)std::lround((double)raw.w * (double)max_dim / (double)raw.h));
+    }
+    tw = std::min(tw, raw.w);
+    th = std::min(th, raw.h);
+    Image thumb(th, tw, 1);
+    const f32 sx = (f32)raw.w / (f32)tw;
+    const f32 sy = (f32)raw.h / (f32)th;
+    constexpr int S = 4;
+    parallel_rows(th, 0, [&](int y) {
+        for (int x = 0; x < tw; ++x) {
+            f32 sum = 0.f;
+            for (int yy = 0; yy < S; ++yy) {
+                for (int xx = 0; xx < S; ++xx) {
+                    const f32 rx = ((f32)x + ((f32)xx + 0.5f) / (f32)S) * sx - 0.5f;
+                    const f32 ry = ((f32)y + ((f32)yy + 0.5f) / (f32)S) * sy - 0.5f;
+                    sum += sample_bilinear_clamped(raw, ry, rx);
+                }
+            }
+            thumb.at(y, x) = sum * (1.f / (f32)(S * S));
+        }
+    });
+    return gaussian_blur(thumb, 0.6f);
+}
+
+static f32 prealign_ncc_score(const Image& ref, const Image& mov,
+                              f32 dx, f32 dy, f32 angle, int stride) {
+    if (ref.h != mov.h || ref.w != mov.w || ref.h <= 8 || ref.w <= 8)
+        return -std::numeric_limits<f32>::infinity();
+    const f32 ca = std::cos(angle);
+    const f32 sa = std::sin(angle);
+    const f32 cx = 0.5f * (f32)(ref.w - 1);
+    const f32 cy = 0.5f * (f32)(ref.h - 1);
+    const int mx = std::max(4, ref.w / 12);
+    const int my = std::max(4, ref.h / 12);
+    double sr = 0.0, sm = 0.0, srr = 0.0, smm = 0.0, srm = 0.0;
+    int count = 0;
+    for (int y = my; y < ref.h - my; y += stride) {
+        for (int x = mx; x < ref.w - mx; x += stride) {
+            const f32 rx = (f32)x - cx;
+            const f32 ry = (f32)y - cy;
+            const f32 qx = cx + ca * rx - sa * ry + dx;
+            const f32 qy = cy + sa * rx + ca * ry + dy;
+            f32 mv = 0.f;
+            if (!sample_bilinear_inside(mov, qy, qx, mv)) continue;
+            const f32 rv = ref.at(y, x);
+            sr += rv;
+            sm += mv;
+            srr += (double)rv * (double)rv;
+            smm += (double)mv * (double)mv;
+            srm += (double)rv * (double)mv;
+            ++count;
+        }
+    }
+    if (count < 64) return -std::numeric_limits<f32>::infinity();
+    const double n = (double)count;
+    const double cov = srm - (sr * sm) / n;
+    const double vr = srr - (sr * sr) / n;
+    const double vm = smm - (sm * sm) / n;
+    const double denom = std::sqrt(std::max(0.0, vr) * std::max(0.0, vm));
+    if (!(denom > 1e-12) || !std::isfinite(denom))
+        return -std::numeric_limits<f32>::infinity();
+    return (f32)(cov / denom);
+}
+
+static PrealignTransform estimate_prealign_transform(const Image& ref_thumb,
+                                                     const Image& mov_thumb,
+                                                     const Config& cfg) {
+    PrealignTransform best;
+    const int max_shift = std::max(0, std::min(64, cfg.global_prealignment_max_shift));
+    const f32 range_deg = std::max(0.f, std::min(2.f, cfg.global_prealignment_rotation_range_deg));
+    const f32 step_deg = std::max(0.05f, std::min(1.f, cfg.global_prealignment_rotation_step_deg));
+    const int stride = std::max(1, (int)std::ceil(std::sqrt(
+        (double)std::max(1, ref_thumb.h * ref_thumb.w) / 7000.0)));
+    const f32 deg_to_rad = 3.14159265358979323846f / 180.f;
+    auto consider = [&](f32 dx, f32 dy, f32 angle) {
+        const f32 score = prealign_ncc_score(ref_thumb, mov_thumb, dx, dy, angle, stride);
+        if (score > best.score) {
+            best.dx = dx;
+            best.dy = dy;
+            best.angle = angle;
+            best.score = score;
+        }
+    };
+
+    std::vector<f32> angles;
+    if (range_deg <= 0.0001f) {
+        angles.push_back(0.f);
+    } else {
+        for (f32 deg = -range_deg; deg <= range_deg + 0.5f * step_deg; deg += step_deg)
+            angles.push_back(deg * deg_to_rad);
+        angles.push_back(0.f);
+    }
+
+    const int coarse_step = max_shift >= 8 ? 2 : 1;
+    for (f32 a : angles) {
+        for (int sy = -max_shift; sy <= max_shift; sy += coarse_step) {
+            for (int sx = -max_shift; sx <= max_shift; sx += coarse_step) {
+                consider((f32)sx, (f32)sy, a);
+            }
+        }
+    }
+
+    const PrealignTransform coarse = best;
+    const f32 fine_angle_step = range_deg > 0.f ? 0.5f * step_deg * deg_to_rad : 1.f;
+    const int fine_shift = std::max(1, coarse_step);
+    for (f32 da = -fine_angle_step; da <= fine_angle_step + 0.25f * fine_angle_step;
+         da += fine_angle_step) {
+        const f32 a = (range_deg > 0.f)
+            ? std::max(-range_deg * deg_to_rad,
+                       std::min(range_deg * deg_to_rad, coarse.angle + da))
+            : 0.f;
+        for (int sy = (int)std::floor(coarse.dy) - fine_shift;
+             sy <= (int)std::ceil(coarse.dy) + fine_shift; ++sy) {
+            for (int sx = (int)std::floor(coarse.dx) - fine_shift;
+                 sx <= (int)std::ceil(coarse.dx) + fine_shift; ++sx) {
+                if (std::abs(sx) <= max_shift && std::abs(sy) <= max_shift)
+                    consider((f32)sx, (f32)sy, a);
+            }
+        }
+    }
+
+    best.valid = std::isfinite(best.score) && best.score > 0.03f;
+    if (!best.valid) best = PrealignTransform{};
+    return best;
+}
+
+static PrealignPlan build_prealign_plan_from_first(
+    int frame_count, const RawFrameLoaderFn& loader, Config& work,
+    const Image& first_ref, const ProgressFn& progress) {
+    PrealignPlan plan;
+    plan.to_first.assign((size_t)frame_count, PrealignTransform{});
+    plan.from_reference.assign((size_t)frame_count, PrealignTransform{});
+    if (!work.global_prealignment_enabled || frame_count < 2 ||
+        !loader || first_ref.h <= 0 || first_ref.w <= 0)
+        return plan;
+
+    Image ref_thumb = make_prealign_thumbnail(first_ref, work);
+    if (ref_thumb.h <= 0 || ref_thumb.w <= 0)
+        return plan;
+
+    plan.to_first[0].valid = true;
+    plan.to_first[0].score = 1.f;
+    const f32 thumb_to_raw_x = (f32)first_ref.w / (f32)ref_thumb.w;
+    const f32 thumb_to_raw_y = (f32)first_ref.h / (f32)ref_thumb.h;
+    for (int k = 1; k < frame_count; ++k) {
+        if (progress) {
+            progress("Pre-aligning frame " + std::to_string(k + 1),
+                     0.025f + 0.035f * (float)(k - 1) / std::max(1, frame_count - 1));
+        }
+        Image comp = loader(k, work, false, first_ref.h, first_ref.w);
+        if (comp.h <= 0 || comp.w <= 0) continue;
+        Image thumb = make_prealign_thumbnail(comp, work);
+        comp = Image();
+        if (thumb.h != ref_thumb.h || thumb.w != ref_thumb.w) continue;
+        PrealignTransform t = estimate_prealign_transform(ref_thumb, thumb, work);
+        if (t.valid) {
+            t.dx *= thumb_to_raw_x;
+            t.dy *= thumb_to_raw_y;
+        }
+        plan.to_first[(size_t)k] = t;
+    }
+
+    if (work.global_prealignment_choose_reference) {
+        std::vector<PrealignTransform> basic((size_t)std::max(0, frame_count - 1));
+        bool all_adjacent_valid = true;
+        for (int i = 1; i < frame_count; ++i) {
+            const PrealignTransform a = plan.to_first[(size_t)i];
+            const PrealignTransform b = plan.to_first[(size_t)i - 1u];
+            all_adjacent_valid = all_adjacent_valid && a.valid && b.valid;
+            if (a.valid && b.valid) {
+                basic[(size_t)i - 1u].dx = a.dx - b.dx;
+                basic[(size_t)i - 1u].dy = a.dy - b.dy;
+                basic[(size_t)i - 1u].angle = a.angle - b.angle;
+                basic[(size_t)i - 1u].valid = true;
+            }
+        }
+
+        if (all_adjacent_valid && frame_count > 1) {
+            f32 best_len = std::numeric_limits<f32>::infinity();
+            int best_ref = 0;
+            for (int i = 0; i < frame_count - 1; ++i) {
+                f32 ax = 0.f, ay = 0.f;
+                for (int j = 0; j < i; ++j) {
+                    ax -= basic[(size_t)j].dx;
+                    ay -= basic[(size_t)j].dy;
+                }
+                f32 bx = 0.f, by = 0.f;
+                for (int j = i; j < frame_count - 1; ++j) {
+                    bx += basic[(size_t)j].dx;
+                    by += basic[(size_t)j].dy;
+                }
+                const f32 tx = ax + bx;
+                const f32 ty = ay + by;
+                const f32 len = std::sqrt(tx * tx + ty * ty);
+                if (len < best_len) {
+                    best_len = len;
+                    best_ref = i;
+                }
+            }
+            plan.reference_index = best_ref;
+        }
+    }
+
+    const PrealignTransform ref_t = plan.to_first[(size_t)plan.reference_index];
+    for (int k = 0; k < frame_count; ++k) {
+        PrealignTransform rel;
+        if (plan.to_first[(size_t)k].valid && ref_t.valid) {
+            const PrealignTransform tk = plan.to_first[(size_t)k];
+            rel.angle = tk.angle - ref_t.angle;
+            const f32 ca = std::cos(rel.angle);
+            const f32 sa = std::sin(rel.angle);
+            rel.dx = tk.dx - (ca * ref_t.dx - sa * ref_t.dy);
+            rel.dy = tk.dy - (sa * ref_t.dx + ca * ref_t.dy);
+            rel.score = tk.score;
+            rel.valid = true;
+        }
+        plan.from_reference[(size_t)k] = rel;
+    }
+    plan.from_reference[(size_t)plan.reference_index] = PrealignTransform{};
+    plan.from_reference[(size_t)plan.reference_index].valid = true;
+    plan.from_reference[(size_t)plan.reference_index].score = 1.f;
+    return plan;
+}
+
 struct DebugImageStats {
     f32 min_v = std::numeric_limits<f32>::infinity();
     f32 max_v = -std::numeric_limits<f32>::infinity();
@@ -433,18 +704,41 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::ostringstream debug_summary;
     if (debug) debug_summary << "cpp_debug_summary\n";
 
-    report("Loading reference frame", 0.02f);
-    if (debug) {
-        std::string listing = "ref_index=0\n";
-        for (int i = 0; i < frame_count; ++i)
-            listing += std::to_string(i) + " provider_frame\n";
-        debug_dump_text("cpp_burst_paths", listing);
+    report("Loading first frame", 0.02f);
+    Image first_ref = loader(0, work, true, 0, 0);
+    if (first_ref.h <= 0 || first_ref.w <= 0) return Image();
+
+    PrealignPlan prealign = build_prealign_plan_from_first(
+        frame_count, loader, work, first_ref, progress);
+    const int ref_index = std::max(0, std::min(frame_count - 1, prealign.reference_index));
+    Image ref;
+    if (ref_index == 0) {
+        ref = std::move(first_ref);
+    } else {
+        report("Loading selected reference frame", 0.06f);
+        ref = loader(ref_index, work, true, 0, 0);
+        first_ref = Image();
     }
-    Image ref = loader(0, work, true, 0, 0);
     if (ref.h <= 0 || ref.w <= 0) return Image();
+
     clear_align_ref_ica_cache();
     debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
     if (debug) append_image_summary(debug_summary, "raw_ref", ref);
+    if (debug) {
+        std::string listing = "ref_index=" + std::to_string(ref_index) + "\n";
+        for (int i = 0; i < frame_count; ++i) {
+            listing += std::to_string(i) + " provider_frame";
+            if (i < (int)prealign.from_reference.size()) {
+                const PrealignTransform& t = prealign.from_reference[(size_t)i];
+                listing += " pre_dx=" + std::to_string(t.dx);
+                listing += " pre_dy=" + std::to_string(t.dy);
+                listing += " pre_angle_rad=" + std::to_string(t.angle);
+                listing += " score=" + std::to_string(t.score);
+            }
+            listing += "\n";
+        }
+        debug_dump_text("cpp_burst_paths", listing);
+    }
     tune_config_snr(ref, work);
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
@@ -460,15 +754,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f",
             work.has_noise_profile ? "OK" : "FALLBACK",
             work.alpha, work.beta, brightness, sigma, snr, t0, work.r_t);
-        report(buf, 0.03f);
+        report(buf, 0.065f);
     }
 
     const int ref_h = ref.h, ref_w = ref.w;
     const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
     const int nch = work.bayer_mode ? 3 : 1;
+    std::vector<int> comp_indices;
+    comp_indices.reserve((size_t)std::max(0, n - 1));
+    for (int i = 0; i < n; ++i) {
+        if (i != ref_index) comp_indices.push_back(i);
+    }
 
-    report("Reference: grey + pyramid", 0.05f);
+    report("Reference: grey + pyramid", 0.07f);
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
@@ -544,9 +843,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         spill_pending = false;
     };
-    for (int k = 1; k < n; ++k) {
+    for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
+        const int k = comp_indices[(size_t)pos];
         report("Frame " + std::to_string(k + 1) + ": analyze",
-               0.08f + 0.35f * (float)(k - 1) / std::max(1, n - 1));
+               0.08f + 0.35f * (float)pos / std::max(1, n - 1));
         drain_spill();
 
         Image comp;
@@ -557,16 +857,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             comp = loader(k, work, false, ref_h, ref_w);
         }
         if (comp.h <= 0) continue;
-        debug_dump_bin("cpp_raw_comp_" + std::to_string(k - 1),
+        debug_dump_bin("cpp_raw_comp_" + std::to_string(pos),
                        comp.data.data(), comp.data.size());
         if (debug) {
-            const std::string raw_name = "raw_comp_" + std::to_string(k - 1);
+            const std::string raw_name = "raw_comp_" + std::to_string(pos);
             append_image_summary(debug_summary, raw_name.c_str(), comp);
         }
 
         // 2×: decode next during align. 1×: wait until after grey (lower peak).
-        if (!full_res && k + 1 < n) {
-            const int nk = k + 1;
+        if (!full_res && pos + 1 < (int)comp_indices.size()) {
+            const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
                 return loader(nk, work, false, ref_h, ref_w);
@@ -574,21 +874,29 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
 
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
-        debug_dump_bin("cpp_mov_grey_" + std::to_string(k - 1),
+        debug_dump_bin("cpp_mov_grey_" + std::to_string(pos),
                        comp_grey.data.data(), comp_grey.data.size());
-        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
-        debug_dump_bin("cpp_flow_" + std::to_string(k - 1),
+        PrealignTransform init;
+        if (k >= 0 && k < (int)prealign.from_reference.size())
+            init = prealign.from_reference[(size_t)k];
+        const f32 grey_scale_x = ref_w > 0 ? (f32)ref_grey.w / (f32)ref_w : 1.f;
+        const f32 grey_scale_y = ref_h > 0 ? (f32)ref_grey.h / (f32)ref_h : 1.f;
+        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
+                               init.dx * grey_scale_x,
+                               init.dy * grey_scale_y,
+                               init.angle);
+        debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
         comp_grey = Image(); // free before robustness/kernels peak
         if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) {
             report("Frame " + std::to_string(k + 1) + ": Metal alignment failed",
-                   0.08f + 0.35f * (float)k / std::max(1, n - 1));
+                   0.08f + 0.35f * (float)(pos + 1) / std::max(1, n - 1));
             continue;
         }
 
         // Full-res: decode next while Metal rob/kernels run (grey already freed).
-        if (full_res && k + 1 < n) {
-            const int nk = k + 1;
+        if (full_res && pos + 1 < (int)comp_indices.size()) {
+            const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
                 return loader(nk, work, false, ref_h, ref_w);
@@ -613,11 +921,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             covs = cov_fut.get();
             rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
         }
-        debug_dump_bin("cpp_mask_" + std::to_string(k - 1),
+        debug_dump_bin("cpp_mask_" + std::to_string(pos),
                        rob.data.data(), rob.data.size());
         if (debug) {
-            const std::string mask_name = "mask_" + std::to_string(k - 1);
-            const std::string cov_name = "cov_comp_" + std::to_string(k - 1);
+            const std::string mask_name = "mask_" + std::to_string(pos);
+            const std::string cov_name = "cov_comp_" + std::to_string(pos);
             append_image_summary(debug_summary, mask_name.c_str(), rob);
             append_cov_summary(debug_summary, cov_name.c_str(), covs);
         }

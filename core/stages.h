@@ -38,9 +38,15 @@ Image gaussian_blur(const Image& src, float sigma);
 Image pad_image_circular(const Image& img, int tile_size);
 
 // ---- align.cpp ----------------------------------------------------------
+FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor,
+                                   int finest_h, int finest_w,
+                                   f32 initial_dx, f32 initial_dy,
+                                   f32 initial_rotation_rad);
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
-                int tile_size);
+                int tile_size,
+                f32 initial_dx = 0.f, f32 initial_dy = 0.f,
+                f32 initial_rotation_rad = 0.f);
 // Free cached ref Sobel/Hessian (call when reference pyramid is released).
 void clear_align_ref_ica_cache();
 

@@ -104,6 +104,12 @@ struct TuningParams: Equatable, Codable {
     var k_stretch: Float = 4.0
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
+    var alignment_tile_size: Int = 0
+    var global_prealignment_enabled: Bool = true
+    var global_prealignment_choose_reference: Bool = true
+    var global_prealignment_rotation_range_deg: Float = 0.0
+    var global_prealignment_rotation_step_deg: Float = 0.25
+    var global_prealignment_max_shift: Int = 24
     var robustness_save_mask: Bool = true
     var accumulated_robustness_denoiser_enabled: Bool = true
     var acc_rob_rad_max: Float = 2.0
@@ -122,7 +128,11 @@ struct TuningParams: Equatable, Codable {
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, robustness_save_mask
+        case snr_auto_tune, alignment_tile_size
+        case global_prealignment_enabled, global_prealignment_choose_reference
+        case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
+        case global_prealignment_max_shift
+        case robustness_save_mask
         case accumulated_robustness_denoiser_enabled
         case acc_rob_rad_max, acc_rob_max_multiplier, acc_rob_max_frame_count
     }
@@ -148,6 +158,12 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
+        alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
+        global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
+        global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
+        global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
+        global_prealignment_rotation_step_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_step_deg) ?? global_prealignment_rotation_step_deg
+        global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -1328,6 +1344,12 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
+            "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
+            "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
+            "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
+            "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
+            "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
+            "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),

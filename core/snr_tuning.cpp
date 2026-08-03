@@ -13,8 +13,39 @@ static f32 lerpf(f32 x, f32 x0, f32 x1, f32 y0, f32 y1) {
     return y0 + (y1 - y0) * t;
 }
 
+static int sanitize_alignment_tile_size(int tile_size) {
+    switch (tile_size) {
+        case 8:
+        case 16:
+        case 32:
+        case 64:
+            return tile_size;
+        default:
+            return 0;
+    }
+}
+
+static void set_alignment_tile_sizes(Config& cfg, int base_tile_size) {
+    base_tile_size = sanitize_alignment_tile_size(base_tile_size);
+    if (base_tile_size <= 0) return;
+    cfg.bm_tile_sizes.clear();
+    cfg.bm_tile_sizes.reserve(cfg.bm_tile_size_factors.size());
+    for (f32 f : cfg.bm_tile_size_factors) {
+        int ts = (int)(base_tile_size * f);
+        // Keep the Metal alignment path resident for manual 8px tiles: the
+        // coarsest level would otherwise become 4px from the 0.5 factor.
+        ts = std::max(8, ts);
+        cfg.bm_tile_sizes.push_back(ts);
+    }
+}
+
 void tune_config_snr(const Image& ref_raw, Config& cfg) {
-    if (!cfg.snr_auto_tune || ref_raw.data.empty()) return;
+    const int manual_tile_size = sanitize_alignment_tile_size(cfg.alignment_tile_size);
+    if (!cfg.snr_auto_tune || ref_raw.data.empty()) {
+        if (manual_tile_size > 0)
+            set_alignment_tile_sizes(cfg, manual_tile_size);
+        return;
+    }
 
     // Python super_resolution.py: brightness = mean(ref); SNR = brightness / std_curve[round(1000*b)]
     f32 sum = 0.f;
@@ -34,10 +65,7 @@ void tune_config_snr(const Image& ref_raw, Config& cfg) {
     // 460-main falls back to 32 because its block matching kernels do not
     // support tiles larger than that.
     if (Ts > 32) Ts = 32;
-    cfg.bm_tile_sizes.clear();
-    cfg.bm_tile_sizes.reserve(cfg.bm_tile_size_factors.size());
-    for (f32 f : cfg.bm_tile_size_factors)
-        cfg.bm_tile_sizes.push_back(std::max(4, (int)(Ts * f)));
+    set_alignment_tile_sizes(cfg, manual_tile_size > 0 ? manual_tile_size : Ts);
 }
 
 } // namespace hhsr

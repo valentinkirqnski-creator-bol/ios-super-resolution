@@ -93,6 +93,13 @@ struct Config {
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
+    int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
+    bool global_prealignment_enabled = true;
+    bool global_prealignment_choose_reference = true;
+    float global_prealignment_rotation_range_deg = 0.0f;
+    float global_prealignment_rotation_step_deg = 0.25f;
+    int   global_prealignment_max_shift = 24;       // thumbnail pixels
+    int   global_prealignment_thumb_max_dim = 320;
 
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;

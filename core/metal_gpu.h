@@ -58,7 +58,9 @@ bool downsample_by_metal(const Image& src, int factor, Image& out);
 // compute_grey_fft_metal when dims match. Downloads final flow only.
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out);
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 f32 initial_dx = 0.f, f32 initial_dy = 0.f,
+                 f32 initial_rotation_rad = 0.f);
 
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();

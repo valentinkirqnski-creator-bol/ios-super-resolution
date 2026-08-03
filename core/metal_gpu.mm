@@ -1855,7 +1855,8 @@ static bool g_dumped_ref_grads = false;
 
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out) {
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     if (!metal_gpu_init()) return false;
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
@@ -1924,9 +1925,15 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
         if (!b_flow) {
             flow_ny = ny;
             flow_nx = nx;
-            b_flow = buf(nullptr, (size_t)ny * (size_t)nx * 2u * sizeof(float));
+            const int abs_factor = (lvl < (int)ref_pyr.abs_factors.size())
+                                   ? ref_pyr.abs_factors[(size_t)lvl] : 1;
+            FlowField initial = make_global_initial_flow(ny, nx, ts, abs_factor,
+                                                         ref_grey.h, ref_grey.w,
+                                                         initial_dx, initial_dy,
+                                                         initial_rotation_rad);
+            b_flow = buf(initial.flow.data(),
+                         (size_t)ny * (size_t)nx * 2u * sizeof(float));
             if (!b_flow) return false;
-            std::memset([b_flow contents], 0, (size_t)ny * (size_t)nx * 2u * sizeof(float));
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
