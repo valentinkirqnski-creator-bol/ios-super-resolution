@@ -1046,20 +1046,29 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const int pw = std::max(1, (int)(Ws * pscale));
     Image preview(ph, pw, 3);
 
-    // Band size: 2× double-buffers GPU+host. Full 1× keeps one GPU acc slot
-    // (jetsam-safe) but dual host bands so Deflate can overlap the next GPU band.
+    // Band size: both 1× and 2× double-buffer GPU+host.
+    //
+    // Accumulator RAM is (band_budget x slot_count), so a half-size band with
+    // two slots costs exactly what one full-size slot cost before, while
+    // letting band N+1 encode against slot B while band N is still executing
+    // in slot A. Single-slot 1× had to waitUntilCompleted before every band
+    // (ensure_acc_buffers), which serialized the whole merge.
+    //
+    // Host side shrinks outright: num/den dual bands are 4 x band bytes, so
+    // halving the band halves that too (~370MB -> ~185MB at full-res scale-2).
+    // Same math: band height never affects a pixel's accumulation order.
     const size_t out_px = (size_t)Hs * (size_t)Ws;
     const bool heavy_1x = out_px >= 28ull * 1000ull * 1000ull; // ~full-res scale-2
 #if defined(__APPLE__)
-    const size_t band_budget = heavy_1x ? (192u * 1024u * 1024u) : (384u * 1024u * 1024u);
+    const size_t band_budget = heavy_1x ? (96u * 1024u * 1024u) : (384u * 1024u * 1024u);
 #else
     const size_t band_budget = 64u * 1024u * 1024u;
 #endif
     const size_t bytes_per_row = (size_t)Ws * nch * 4 * 2; // num+den float row
     int band_rows = (int)std::max<size_t>(4, band_budget / std::max<size_t>(1, bytes_per_row));
     band_rows = std::min(band_rows, Hs);
-    // ~960 rows fits the 192MB single-slot budget at full-res scale-2.
-    if (heavy_1x) band_rows = std::min(band_rows, 960);
+    // ~480 rows fits the 96MB per-slot budget at full-res scale-2 (2 slots).
+    if (heavy_1x) band_rows = std::min(band_rows, 480);
     std::vector<uint16_t> row16((size_t)band_rows * (size_t)Ws * 3u);
 
     Image comp_scratch;
@@ -1069,7 +1078,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // after each upload so we never hold host+GPU copies of every frame.
     report("Preparing GPU merge", 0.46f);
     const double t_prefetch = prof_now_ms();
-    metal_merge_set_single_acc_slot(heavy_1x);
+    // Double-buffered on 1× too: the band was halved above to keep peak
+    // accumulator RAM identical while restoring cross-band GPU overlap.
+    metal_merge_set_single_acc_slot(false);
     metal_merge_begin_burst();
     if (stream_comp_raw) {
         for (CachedCompMeta& meta : cached_meta) {
