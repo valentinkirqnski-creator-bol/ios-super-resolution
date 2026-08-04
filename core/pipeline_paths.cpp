@@ -905,6 +905,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                init.dy * grey_scale_y,
                                init.angle);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
+        prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
         comp_grey = Image(); // free before robustness/kernels peak

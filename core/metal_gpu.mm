@@ -713,7 +713,7 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
     return true;
 }
 
-Image compute_grey_fft_metal(const Image& raw) {
+static Image compute_grey_fft_metal_impl(const Image& raw) {
     if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return Image();
     auto& c = ctx();
     const uint32_t h = (uint32_t)raw.h, w = (uint32_t)raw.w;
@@ -789,7 +789,7 @@ Image compute_grey_fft_metal(const Image& raw) {
     return grey;
 }
 
-CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
+static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg) {
     if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return CovField();
     auto& c = ctx();
 
@@ -1137,7 +1137,7 @@ static void clear_rob_ref_gpu() {
     g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 }
 
-RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
+static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
     if (!metal_gpu_init() || ref_raw.h <= 0 || ref_raw.w <= 0) return RefStats();
     auto& c = ctx();
     clear_rob_ref_gpu();
@@ -1204,8 +1204,8 @@ void metal_release_host_ref_stats(RefStats& ref_stats) {
     ref_stats.hf_loss.c = hc;
 }
 
-Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg) {
+static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
+                                           const FlowField& flow, int tile_size, const Config& cfg) {
     if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
@@ -1894,7 +1894,7 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
 
 static bool g_dumped_ref_grads = false;
 
-bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
+static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out,
                  f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
@@ -2697,6 +2697,49 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     // Caller must metal_merge_wait_inflight() before reading this band's host images,
     // or start the next band (which resolves this one when the following ref commits).
     return true;
+}
+
+// --- Autorelease boundaries -------------------------------------------------
+//
+// MTLCommandBuffer and MTLComputeCommandEncoder come back autoreleased, and a
+// command buffer retains every resource it references until it is deallocated.
+// align_metal alone opens ~14 command buffers per comparison frame, each holding
+// multi-megabyte grey/flow/gradient buffers, so with no pool on the calling
+// thread a burst accumulated every frame's Metal temporaries before anything was
+// released. Measured peak footprint reached 2784MB with only 287MB of jetsam
+// headroom left, with the peak landing in the analyze loop.
+//
+// These wrappers bound that to one call's worth. The bodies are unchanged; the
+// C++ return values are not autoreleased objects, so constructing them inside
+// the pool and returning after it drains is safe.
+
+Image compute_grey_fft_metal(const Image& raw) {
+    @autoreleasepool { return compute_grey_fft_metal_impl(raw); }
+}
+
+CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
+    @autoreleasepool { return estimate_kernels_metal_impl(raw, cfg); }
+}
+
+RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
+    @autoreleasepool { return init_robustness_metal_impl(ref_raw, cfg); }
+}
+
+Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
+                               const FlowField& flow, int tile_size, const Config& cfg) {
+    @autoreleasepool {
+        return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg);
+    }
+}
+
+bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
+                 const Image& moving_grey,
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
+    @autoreleasepool {
+        return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
+                                flow_out, initial_dx, initial_dy, initial_rotation_rad);
+    }
 }
 
 } // namespace hhsr
