@@ -1318,7 +1318,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         const std::string prof = prof_report() + hdr;
         std::printf("%s", prof.c_str());
         std::fflush(stdout);
-        debug_dump_text("cpp_profile", prof);
+        prof_save_report(prof);
+        // Also surface on-device: a sideloaded build has no attached console.
+        char one_line[192];
+        std::snprintf(one_line, sizeof(one_line),
+                      "%.1fs total, %.0f ms/frame - peak %.0f MB, headroom %.0f MB",
+                      wall / 1000.0, wall / std::max(1, n),
+                      (double)prof_peak_footprint_bytes() / (1024.0 * 1024.0),
+                      (double)prof_min_available_bytes() / (1024.0 * 1024.0));
+        report(one_line, 0.995f);
     }
     report("Done", 1.f);
     return preview;

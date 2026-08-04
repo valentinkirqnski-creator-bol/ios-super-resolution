@@ -88,11 +88,30 @@ void append_table(std::ostringstream& ss, const char* title, const char* unit_co
 }  // namespace
 
 bool prof_enabled() {
+    // Default ON: a sideloaded build has no Xcode scheme to set env vars, so
+    // opt-in gating would silently produce no data. HHSR_PROF=0 disables.
     static const bool on = []() {
         const char* v = std::getenv("HHSR_PROF");
-        return v && v[0] && v[0] != '0';
+        if (!v || !v[0]) return true;
+        return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' ||
+                 v[0] == 'f' || v[0] == 'F');
     }();
     return on;
+}
+
+std::string prof_save_report(const std::string& text) {
+    std::string path;
+#if defined(__APPLE__)
+    if (const char* home = std::getenv("HOME")) {
+        path = std::string(home) + "/Documents/hhsr_profile.txt";
+    }
+#endif
+    if (path.empty()) path = "hhsr_profile.txt";
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return std::string();
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    return path;
 }
 
 double prof_now_ms() {
@@ -167,6 +186,18 @@ void prof_mark_memory(const char* label) {
         s.min_available = avail;
         s.min_label = label ? label : "";
     }
+}
+
+uint64_t prof_peak_footprint_bytes() {
+    ProfState& s = state();
+    std::lock_guard<std::mutex> lk(s.m);
+    return s.peak_footprint;
+}
+
+uint64_t prof_min_available_bytes() {
+    ProfState& s = state();
+    std::lock_guard<std::mutex> lk(s.m);
+    return s.min_available == UINT64_MAX ? 0 : s.min_available;
 }
 
 std::string prof_report() {
