@@ -1,4 +1,5 @@
 #include "raw_io.h"
+#include "parallel.h"
 #include <random>
 #include <cmath>
 #include <algorithm>
@@ -343,18 +344,22 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         }
     }
 
-    for (int y = 0; y < img.h; ++y) {
+    // Row-parallel: every output pixel is written exactly once from one input
+    // sample, so this is bit-identical to the serial loop — no reduction, no
+    // cross-row dependency. Single-threaded here cost a full 12MP pass per frame.
+    const uint16_t* raw_image = raw.imgdata.rawdata.raw_image;
+    parallel_rows(img.h, 0, [&](int y) {
         const int fi = y & 1;
         for (int x = 0; x < img.w; ++x) {
             const int fj = x & 1;
             float bl = site_black[fi][fj];
             float denom = site_denom[fi][fj];
-            float v = ((float)raw.imgdata.rawdata.raw_image[(top + y) * stride + (left + x)] - bl) / denom;
+            float v = ((float)raw_image[(top + y) * stride + (left + x)] - bl) / denom;
             v *= site_wb[fi][fj];
             if (!std::isfinite(v)) v = 0.f;
             img.at(y, x) = clampf(v, 0.f, 1.f);
         }
-    }
+    });
     cfg.raw_prewhitened = true;
 
     if (cfg.input_crop_factor > 1) {
@@ -364,10 +369,13 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         int y0 = ((img.h - ch) / 2) & ~1;
         int x0 = ((img.w - cw) / 2) & ~1;
         if (ch > 0 && cw > 0) {
+            // Single-channel rows are contiguous, so this is a row memcpy
+            // rather than a per-pixel copy. Identical bytes either way.
             Image cropped(ch, cw, 1);
-            for (int y = 0; y < ch; ++y)
-                for (int x = 0; x < cw; ++x)
-                    cropped.at(y, x) = img.at(y0 + y, x0 + x);
+            parallel_rows(ch, 0, [&](int y) {
+                std::memcpy(&cropped.at(y, 0), &img.at(y0 + y, x0),
+                            (size_t)cw * sizeof(f32));
+            });
             img = std::move(cropped);
         }
     }
@@ -375,11 +383,11 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     if (crop_h > 0 && crop_w > 0 && (img.h > crop_h || img.w > crop_w)) {
         int mh = std::min(img.h, crop_h);
         int mw = std::min(img.w, crop_w);
-        Image c(mh, mw, 1);
-        for (int y = 0; y < mh; ++y)
-            for (int x = 0; x < mw; ++x)
-                c.at(y, x) = img.at(y, x);
-        img = std::move(c);
+        Image cropped(mh, mw, 1);
+        parallel_rows(mh, 0, [&](int y) {
+            std::memcpy(&cropped.at(y, 0), &img.at(y, 0), (size_t)mw * sizeof(f32));
+        });
+        img = std::move(cropped);
     }
     return img;
 }
