@@ -11,6 +11,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 #endif
+#if defined(__APPLE__)
+#include <fcntl.h>
+#endif
 
 namespace hhsr {
 
@@ -386,8 +389,15 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                                                    strip_offset, strip_byte_counts_offset_);
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
-    // Large stdio buffer — fewer syscalls during streaming Deflate.
+    // Large stdio buffer — fewer syscalls during streaming writes.
     setvbuf(f_, nullptr, _IOFBF, 1u << 20);
+#if defined(__APPLE__)
+    // Uncompressed strips push ~290MB through the unified buffer cache, and iOS
+    // charges those dirty pages to phys_footprint — the metric jetsam enforces.
+    // Measured +167MB peak / -167MB headroom after switching off Deflate. The
+    // file is written once and not read back here, so keep it out of the cache.
+    (void)fcntl(fileno(f_), F_NOCACHE, 1);
+#endif
     if (fwrite(prefix.data(), 1, prefix.size(), f_) != prefix.size()) {
         fclose(f_); f_ = nullptr;
         return false;
