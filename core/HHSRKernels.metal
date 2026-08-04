@@ -1792,6 +1792,20 @@ inline float butterfly_reduce_sum_metal(thread float* s, int n) {
     return s[0];
 }
 
+// One threadgroup per tile.
+//
+// The ts<=16 path previously declared two 256-float thread-private arrays and
+// reduced them inside a single thread. That is 2KB of per-thread storage, well
+// past what fits in registers, so it spilled to device memory and every element
+// access became a round trip. Staging them in threadgroup memory with one lane
+// per pixel removes the spill and parallelizes the fill.
+//
+// butterfly_reduce_sum_metal pairs s[t] += s[t + N] for t < N with N halving
+// from n_pix/2, which is exactly a threadgroup tree reduction, so the addition
+// order below is unchanged and the sums stay bit-identical. n_pix is 64 (ts=8)
+// or 256 (ts=16) -- both powers of two, as the pairing requires.
+//
+// Host supplies threadgroup memory: [0] and [1] are n_pix floats each.
 kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
                             device const float* gradx [[buffer(1)]],
                             device const float* grady [[buffer(2)]],
@@ -1799,8 +1813,15 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
                             device const float* mov [[buffer(4)]],
                             device float* flow [[buffer(5)]],
                             constant IcaParams& p [[buffer(6)]],
-                            uint tid [[thread_position_in_grid]]) {
-    if (tid >= p.ny * p.nx) return;
+                            threadgroup float* s_B0 [[threadgroup(0)]],
+                            threadgroup float* s_B1 [[threadgroup(1)]],
+                            uint tile_id [[threadgroup_position_in_grid]],
+                            uint lane [[thread_position_in_threadgroup]],
+                            uint lanes [[threads_per_threadgroup]]) {
+    // Every exit below this point is uniform across the threadgroup, so the
+    // barriers further down stay well-formed.
+    if (tile_id >= p.ny * p.nx) return;
+    const uint tid = tile_id;
     uint ty = tid / p.nx;
     uint tx = tid % p.nx;
     int ts = int(p.ts);
@@ -1823,6 +1844,10 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     float fy = flow[tid * 2u + 1u];
 
     if (ts == 32 || ts == 64) {
+        // Unreachable with the shipped bm_tile_sizes ({16,16,16,8}); kept
+        // verbatim and confined to one lane so behaviour is preserved if the
+        // configuration ever selects these sizes.
+        if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
             float floor_fx = trunc(fx);
             float floor_fy = trunc(fy);
@@ -1884,10 +1909,7 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         return;
     }
 
-    // Max ts=16 → 256; ts=8 uses first 64.
-    float s_B0[256];
-    float s_B1[256];
-
+    // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
         // math.modf + int() truncation toward zero (ICA.py)
         float floor_fx = trunc(fx);
@@ -1897,33 +1919,50 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         int floor_off_x = int(floor_fx);
         int floor_off_y = int(floor_fy);
 
-        for (int i = 0; i < ts; ++i) {
+        // Same per-pixel values as the serial i/j fill; only who writes changes.
+        for (int tpix = int(lane); tpix < n_pix; tpix += int(lanes)) {
+            int i = tpix / ts;
+            int j = tpix - i * ts;
             int py = oy + i;
-            for (int j = 0; j < ts; ++j) {
-                int px = ox + j;
-                int tpix = i * ts + j;
-                if (py >= RH || px >= RW) {
-                    s_B0[tpix] = 0.f;
-                    s_B1[tpix] = 0.f;
-                    continue;
-                }
-                float mov_interp = bilinear_ica_metal(
-                    mov, py, px, floor_off_y, floor_off_x, frac_x, frac_y,
-                    MH, MW, clamp_edge);
-                uint ro = uint(py) * p.ref_w + uint(px);
-                float gradt = mov_interp - ref[ro];
-                s_B0[tpix] = -gradx[ro] * gradt;
-                s_B1[tpix] = -grady[ro] * gradt;
+            int px = ox + j;
+            if (py >= RH || px >= RW) {
+                s_B0[tpix] = 0.f;
+                s_B1[tpix] = 0.f;
+                continue;
             }
+            float mov_interp = bilinear_ica_metal(
+                mov, py, px, floor_off_y, floor_off_x, frac_x, frac_y,
+                MH, MW, clamp_edge);
+            uint ro = uint(py) * p.ref_w + uint(px);
+            float gradt = mov_interp - ref[ro];
+            s_B0[tpix] = -gradx[ro] * gradt;
+            s_B1[tpix] = -grady[ro] * gradt;
         }
-        float B0 = butterfly_reduce_sum_metal(s_B0, n_pix);
-        float B1 = butterfly_reduce_sum_metal(s_B1, n_pix);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // butterfly_reduce_sum_metal, unrolled across lanes: identical pairing
+        // and identical addition order, therefore identical sums.
+        for (int N = n_pix / 2; N > 0; N /= 2) {
+            for (int t = int(lane); t < N; t += int(lanes)) {
+                s_B0[t] += s_B0[t + N];
+                s_B1[t] += s_B1[t + N];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Every lane derives the same fx/fy from the same reduced sums, so the
+        // next iteration's fill is consistent without broadcasting them.
+        float B0 = s_B0[0];
+        float B1 = s_B1[0];
         fx += det_inv * (h11 * B0 - h01 * B1);
         fy += det_inv * (-h10 * B0 + h00 * B1);
+        threadgroup_barrier(mem_flags::mem_threadgroup); // before the next refill
     }
 
-    flow[tid * 2u + 0u] = fx;
-    flow[tid * 2u + 1u] = fy;
+    if (lane == 0u) {
+        flow[tid * 2u + 0u] = fx;
+        flow[tid * 2u + 1u] = fy;
+    }
 }
 
 // ---------------------------------------------------------------------------

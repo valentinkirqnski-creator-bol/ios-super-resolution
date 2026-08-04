@@ -1634,11 +1634,21 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
     id<MTLComputePipelineState> pipe = c.pipe("ica_refine_tile");
     if (!pipe) return false;
     [enc setComputePipelineState:pipe];
+    // One threadgroup per tile; lanes cover the tile's pixels and drive the
+    // butterfly reduction. n_pix (64 or 256 for the ts<=16 path) is a power of
+    // two, which the reduction pairing requires.
     const NSUInteger n = (NSUInteger)ny * (NSUInteger)nx;
-    NSUInteger tg = std::min(n, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
-    if (tg == 0) tg = 1;
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    const NSUInteger n_pix = (NSUInteger)tile_size * (NSUInteger)tile_size;
+    auto align16 = [](NSUInteger v) -> NSUInteger { return (v + 15u) & ~(NSUInteger)15u; };
+    const NSUInteger stage_bytes = align16(n_pix * sizeof(float));
+    NSUInteger lanes = n_pix;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    if (2 * stage_bytes > c.device.maxThreadgroupMemoryLength) return false;
+
+    [enc setThreadgroupMemoryLength:stage_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:stage_bytes atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:ica-refine");
     [cmd commit];
