@@ -5,9 +5,9 @@
 
 // Per-stage wall/GPU timing + jetsam-relevant memory watermarks.
 //
-// ON by default on this diagnostic branch, because a sideloaded build has no
-// Xcode scheme to inject environment variables. Set HHSR_PROF=0 to disable.
-// FLIP THIS BACK TO OPT-IN BEFORE MERGING TO A RELEASE BRANCH.
+// Defaults ON for non-release builds (a sideloaded build has no Xcode scheme to
+// inject environment variables, so opt-in gating would silently yield no data)
+// and OFF when NDEBUG is defined. HHSR_PROF=1/0 overrides either way.
 //
 // Deliberately does NOT add GPU synchronization: GPU time is harvested from
 // MTLCommandBuffer completion handlers (GPUStartTime/GPUEndTime), which fire on

@@ -87,12 +87,20 @@ void append_table(std::ostringstream& ss, const char* title, const char* unit_co
 
 }  // namespace
 
+// State when HHSR_PROF is unset. A sideloaded build has no Xcode scheme to
+// inject environment variables, so opt-in gating would silently produce no data
+// during optimization work — hence ON for non-release builds. Release builds
+// default OFF and still honour HHSR_PROF=1 when timings are wanted.
+#if defined(NDEBUG)
+static constexpr bool kProfDefaultOn = false;
+#else
+static constexpr bool kProfDefaultOn = true;
+#endif
+
 bool prof_enabled() {
-    // Default ON: a sideloaded build has no Xcode scheme to set env vars, so
-    // opt-in gating would silently produce no data. HHSR_PROF=0 disables.
     static const bool on = []() {
         const char* v = std::getenv("HHSR_PROF");
-        if (!v || !v[0]) return true;
+        if (!v || !v[0]) return kProfDefaultOn;
         return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' ||
                  v[0] == 'f' || v[0] == 'F');
     }();
