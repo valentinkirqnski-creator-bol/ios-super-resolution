@@ -1511,7 +1511,30 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    dispatch1(enc, pipe, (NSUInteger)ny * (NSUInteger)nx);
+
+    // One threadgroup per tile: lanes split the candidate shifts and the kernel
+    // stages the reference tile on-chip. `lanes` must be a power of two for the
+    // tree reduction, and is capped so the tile plus the two reduction arrays
+    // fit the device's threadgroup memory budget.
+    // Threadgroup allocations must be 16-byte aligned.
+    auto align16 = [](NSUInteger n) -> NSUInteger { return (n + 15u) & ~(NSUInteger)15u; };
+    const NSUInteger tile_bytes =
+        align16((NSUInteger)tile_size * (NSUInteger)tile_size * sizeof(float));
+    const NSUInteger tg_limit = c.device.maxThreadgroupMemoryLength;
+    NSUInteger lanes = 64;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    auto red_bytes = [&](NSUInteger n) -> NSUInteger {
+        return align16(n * sizeof(float)) + align16(n * sizeof(int));
+    };
+    while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
+    if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
+
+    [enc setComputePipelineState:pipe];
+    [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:1];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
     [cmd commit];
