@@ -338,51 +338,123 @@ struct AlignLocalSearch460Params {
     uint l1;
 };
 
+// One threadgroup per tile; threads split the candidate shifts.
+//
+// The previous form ran one thread per tile and looped every candidate serially,
+// re-reading the whole reference tile from device memory (2R+1)^2 times. Here the
+// reference tile is staged once in threadgroup memory and each candidate's SSD/SAD
+// is still summed by a single thread in the original i-then-j order, so every
+// `dist` is bit-identical. Candidates are visited in ascending index and accepted
+// only on strict `<`, and the tree reduction breaks ties toward the lower index,
+// which reproduces the original sdy-outer / sdx-inner first-minimum-wins scan.
+//
+// Threadgroup memory is supplied by the host: [0] = ts*ts floats for the tile,
+// [1]/[2] = one float/int per lane for the reduction. `lanes` must be a power of
+// two (the host enforces this) for the tree reduction to cover every element.
 kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    device const float* mov [[buffer(1)]],
                                    device float* flow [[buffer(2)]],
                                    constant AlignLocalSearch460Params& p [[buffer(3)]],
-                                   uint tid [[thread_position_in_grid]]) {
-    if (tid >= p.ny * p.nx) return;
-    uint ty = tid / p.nx;
-    uint tx = tid % p.nx;
-    int ox = int(tx) * p.ts;
-    int oy = int(ty) * p.ts;
-    float local_fx = flow[tid * 2u + 0u];
-    float local_fy = flow[tid * 2u + 1u];
-    float min_dist = INFINITY;
-    int min_shift_x = 0;
-    int min_shift_y = 0;
-    for (int sdy = -p.R; sdy <= p.R; ++sdy) {
-        for (int sdx = -p.R; sdx <= p.R; ++sdx) {
+                                   threadgroup float* ref_tile [[threadgroup(0)]],
+                                   threadgroup float* red_dist [[threadgroup(1)]],
+                                   threadgroup int* red_cand [[threadgroup(2)]],
+                                   uint tile_id [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_position_in_threadgroup]],
+                                   uint lanes [[threads_per_threadgroup]]) {
+    // Uniform across the threadgroup, so every thread leaves together and the
+    // barriers below stay well-formed.
+    if (tile_id >= p.ny * p.nx) return;
+
+    const int ts = p.ts;
+    const int R = p.R;
+    const int span = 2 * R + 1;
+    const int ncand = span * span;
+    const int kNone = 0x7FFFFFFF;
+
+    const uint ty = tile_id / p.nx;
+    const uint tx = tile_id % p.nx;
+    const int ox = int(tx) * ts;
+    const int oy = int(ty) * ts;
+    const float local_fx = flow[tile_id * 2u + 0u];
+    const float local_fy = flow[tile_id * 2u + 1u];
+
+    // The original invalidated a candidate on its first out-of-bounds sample.
+    // The sampled region is a full rectangle, so that is exactly rectangle
+    // containment — testable up front without touching memory.
+    const bool ref_in = (ox >= 0 && oy >= 0 &&
+                         ox + ts <= p.ref_w && oy + ts <= p.ref_h);
+
+    if (ref_in) {
+        for (int k = int(lane); k < ts * ts; k += int(lanes)) {
+            const int i = k / ts;
+            const int j = k - i * ts;
+            ref_tile[k] = ref[uint(oy + i) * uint(p.ref_w) + uint(ox + j)];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_dist = INFINITY;
+    int best_cand = kNone;
+
+    if (ref_in) {
+        const int ifx = int(local_fx);
+        const int ify = int(local_fy);
+        for (int c = int(lane); c < ncand; c += int(lanes)) {
+            const int row = c / span;
+            const int sdy = row - R;
+            const int sdx = (c - row * span) - R;
+            const int mx0 = ox + ifx + sdx;
+            const int my0 = oy + ify + sdy;
+            // Out-of-bounds candidates scored INFINITY and could never win a
+            // strict `<`, so skipping them is equivalent.
+            if (!(mx0 >= 0 && my0 >= 0 &&
+                  mx0 + ts <= p.mov_w && my0 + ts <= p.mov_h))
+                continue;
+
             float dist = 0.f;
-            bool valid = true;
-            for (int i = 0; i < p.ts && valid; ++i) {
-                for (int j = 0; j < p.ts; ++j) {
-                    int rx = ox + j;
-                    int ry = oy + i;
-                    int mx = rx + int(local_fx) + sdx;
-                    int my = ry + int(local_fy) + sdy;
-                    if (!(rx >= 0 && rx < p.ref_w && ry >= 0 && ry < p.ref_h &&
-                          mx >= 0 && mx < p.mov_w && my >= 0 && my < p.mov_h)) {
-                        valid = false;
-                        break;
-                    }
-                    float diff = ref[uint(ry) * uint(p.ref_w) + uint(rx)] -
-                                 mov[uint(my) * uint(p.mov_w) + uint(mx)];
+            for (int i = 0; i < ts; ++i) {
+                const uint mrow = uint(my0 + i) * uint(p.mov_w);
+                const int trow = i * ts;
+                for (int j = 0; j < ts; ++j) {
+                    const float diff = ref_tile[trow + j] - mov[mrow + uint(mx0 + j)];
                     dist += (p.l1 != 0u) ? fabs(diff) : diff * diff;
                 }
             }
-            if (!valid) dist = INFINITY;
-            if (dist < min_dist) {
-                min_dist = dist;
-                min_shift_y = sdy;
-                min_shift_x = sdx;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_cand = c;
             }
         }
     }
-    flow[tid * 2u + 0u] = local_fx + float(min_shift_x);
-    flow[tid * 2u + 1u] = local_fy + float(min_shift_y);
+
+    red_dist[lane] = best_dist;
+    red_cand[lane] = best_cand;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = lanes >> 1u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            const float od = red_dist[lane + s];
+            const int oc = red_cand[lane + s];
+            if (od < red_dist[lane] ||
+                (od == red_dist[lane] && oc < red_cand[lane])) {
+                red_dist[lane] = od;
+                red_cand[lane] = oc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        const int c = red_cand[0];
+        int sdx = 0, sdy = 0;   // no valid candidate -> unchanged flow, as before
+        if (c != kNone) {
+            const int row = c / span;
+            sdy = row - R;
+            sdx = (c - row * span) - R;
+        }
+        flow[tile_id * 2u + 0u] = local_fx + float(sdx);
+        flow[tile_id * 2u + 1u] = local_fy + float(sdy);
+    }
 }
 
 kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
@@ -803,7 +875,11 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
             z = max(0.f, z);
-            float w = precise::exp(-0.5f * z);
+            // fast::exp maps to the hardware exp2 unit (a few ULP) instead of
+            // precise range reduction. Called 9x per output pixel per frame, so
+            // it is a measurable share of this kernel. The relative error is
+            // ~1e-7, far below one 16-bit LSB; tools/compare_dng.py gates it.
+            float w = fast::exp(-0.5f * z);
 
             float contrib_v = w * local_r * c;
             float contrib_a = w * local_r;
@@ -883,7 +959,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
-            float w = precise::exp(-0.5f * y);
+            float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }
