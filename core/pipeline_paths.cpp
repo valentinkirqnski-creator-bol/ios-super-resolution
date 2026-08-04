@@ -8,6 +8,7 @@
 #include "raw_io.h"
 #include "parallel.h"
 #include "debug_utils.h"
+#include "prof.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #endif
@@ -698,6 +699,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                   const ProgressFn& progress, int maxPreviewDim) {
     if (frame_count < 2 || !loader) return Image();
 
+    prof_reset();
+    const double t_burst = prof_now_ms();
+
     Config work = cfg;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
     const bool debug = debug_dumps_enabled();
@@ -705,7 +709,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (debug) debug_summary << "cpp_debug_summary\n";
 
     report("Loading first frame", 0.02f);
+    const double t_first = prof_now_ms();
     Image first_ref = loader(0, work, true, 0, 0);
+    prof_add_cpu("ref:decode", prof_now_ms() - t_first);
     if (first_ref.h <= 0 || first_ref.w <= 0) return Image();
 
     PrealignPlan prealign = build_prealign_plan_from_first(
@@ -768,11 +774,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
 
     report("Reference: grey + pyramid", 0.07f);
+    prof_mark_memory("ref:start");
+    const double t_ref_grey = prof_now_ms();
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
     Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
+    prof_add_cpu("ref:grey+pyramid", prof_now_ms() - t_ref_grey);
     if (debug && !ref_pyr.levels.empty()) {
         // Match Python py_pyramid_0: first after pyramid[::-1] = coarsest.
         const Image& coarse = ref_pyr.levels.back();
@@ -786,6 +795,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // doubles peak and races shared scratch). Light crops may still overlap.
     RefStats ref_stats;
     CovField ref_covs;
+    const double t_ref_analyze = prof_now_ms();
     if (full_res) {
         ref_stats = init_robustness(ref, work);
         ref_covs = estimate_kernels(ref, work);
@@ -795,6 +805,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         ref_stats = init_robustness(ref, work);
         ref_covs = ref_cov_fut.get();
     }
+    prof_add_cpu("ref:robustness+kernels", prof_now_ms() - t_ref_analyze);
+    prof_mark_memory("ref:analyzed");
     if (debug) append_cov_summary(debug_summary, "cov_ref", ref_covs);
 #if defined(__APPLE__)
     // GPU already holds ref means/vars; drop host copies to cut peak RAM.
@@ -850,11 +862,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         drain_spill();
 
         Image comp;
+        const double t_decode = prof_now_ms();
         if (pref_k == k && pref_fut.valid()) {
             comp = pref_fut.get();
             pref_k = -1;
+            // Stall only. Near-zero here means the prefetch fully hid the decode.
+            prof_add_cpu("comp:decode-wait(prefetched)", prof_now_ms() - t_decode);
         } else {
             comp = loader(k, work, false, ref_h, ref_w);
+            prof_add_cpu("comp:decode(sync)", prof_now_ms() - t_decode);
         }
         if (comp.h <= 0) continue;
         debug_dump_bin("cpp_raw_comp_" + std::to_string(pos),
@@ -873,7 +889,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             });
         }
 
+        const double t_comp_grey = prof_now_ms();
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        prof_add_cpu("comp:grey", prof_now_ms() - t_comp_grey);
         debug_dump_bin("cpp_mov_grey_" + std::to_string(pos),
                        comp_grey.data.data(), comp_grey.data.size());
         PrealignTransform init;
@@ -881,10 +899,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             init = prealign.from_reference[(size_t)k];
         const f32 grey_scale_x = ref_w > 0 ? (f32)ref_grey.w / (f32)ref_w : 1.f;
         const f32 grey_scale_y = ref_h > 0 ? (f32)ref_grey.h / (f32)ref_h : 1.f;
+        const double t_align = prof_now_ms();
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
                                init.dx * grey_scale_x,
                                init.dy * grey_scale_y,
                                init.angle);
+        prof_add_cpu("comp:align", prof_now_ms() - t_align);
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
         comp_grey = Image(); // free before robustness/kernels peak
@@ -909,10 +929,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         bool rob_has_nonzero = true;
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
+            const double t_rob = prof_now_ms();
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+            prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
-            if (rob_has_nonzero)
+            if (rob_has_nonzero) {
+                const double t_kern = prof_now_ms();
                 covs = estimate_kernels(comp, work);
+                prof_add_cpu("comp:kernels", prof_now_ms() - t_kern);
+            }
         } else {
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
@@ -965,6 +990,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             cached.push_back(std::move(fc));
             n_comp_ok++;
         }
+        prof_mark_memory("analyze:frame-end");
     }
     drain_spill();
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
@@ -1042,6 +1068,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // stalled on the first band's PCIe copies. On full-res, drop host R/cov
     // after each upload so we never hold host+GPU copies of every frame.
     report("Preparing GPU merge", 0.46f);
+    const double t_prefetch = prof_now_ms();
     metal_merge_set_single_acc_slot(heavy_1x);
     metal_merge_begin_burst();
     if (stream_comp_raw) {
@@ -1070,6 +1097,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
         }
     }
+    // Includes the disk reload / re-decode of every comparison frame on 1×.
+    prof_add_cpu("merge:gpu-upload", prof_now_ms() - t_prefetch);
+    prof_mark_memory("merge:frames-resident");
 #endif
 
     AccumDiag diag;
@@ -1090,9 +1120,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     };
     report("Merging output", 0.48f);
     for (int y0 = 0; y0 < Hs; y0 += band_rows) {
+        const double t_band = prof_now_ms();
         const int bh = std::min(band_rows, Hs - y0);
         cur ^= 1;
+        const double t_join = prof_now_ms();
         join_encode();
+        prof_add_cpu("merge:wait-dng-encode", prof_now_ms() - t_join);
         Image& num_band = num_bands[cur];
         Image& den_band = den_bands[cur];
         if (num_band.h != bh || num_band.w != Ws || num_band.c != nch) {
@@ -1109,6 +1142,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
         }
 
+        // On 1× (single acc slot) the previous band's waitUntilCompleted +
+        // readback happens inside the first ensure_acc_buffers below, so this
+        // bucket is "GPU stall + encode", not encode alone.
+        const double t_comp_bands = prof_now_ms();
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!meta.rob_has_nonzero ||
@@ -1143,7 +1180,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
         }
 
-        if (!merge_ref_band_metal(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr)) {
+        prof_add_cpu("merge:comp-encode+gpu-stall", prof_now_ms() - t_comp_bands);
+
+        const double t_ref_band = prof_now_ms();
+        const bool ref_band_ok =
+            merge_ref_band_metal(ref, ref_covs, num_band, den_band, y0, work, acc_rob_ptr);
+        prof_add_cpu("merge:ref-encode+commit", prof_now_ms() - t_ref_band);
+        if (!ref_band_ok) {
             report("Error: GPU merge failed (memory?)", 1.f);
             join_encode();
             metal_merge_set_single_acc_slot(false);
@@ -1177,6 +1220,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         ready_y0 = y0;
         ready_bh = bh;
         have_ready = true;
+        prof_add_cpu("merge:band(total)", prof_now_ms() - t_band);
+        prof_mark_memory("merge:band");
     }
     join_encode();
     if (have_ready && metal_merge_wait_inflight()) {
@@ -1260,6 +1305,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (debug) {
         append_merge_summary(debug_summary, merge_debug);
         debug_dump_text("cpp_debug_summary", debug_summary.str());
+    }
+    prof_mark_memory("burst:end");
+    if (prof_enabled()) {
+        // Wall time reported separately: the buckets above overlap (async
+        // decode/encode threads) and must not be summed against it.
+        const double wall = prof_now_ms() - t_burst;
+        char hdr[192];
+        std::snprintf(hdr, sizeof(hdr),
+                      "\nburst wall %.1f ms over %d frames (%.1f ms/frame)\n",
+                      wall, n, wall / std::max(1, n));
+        const std::string prof = prof_report() + hdr;
+        std::printf("%s", prof.c_str());
+        std::fflush(stdout);
+        debug_dump_text("cpp_profile", prof);
     }
     report("Done", 1.f);
     return preview;

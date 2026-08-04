@@ -51,6 +51,7 @@ targets:
           - "snr_tuning.cpp"
           - "metal_gpu.mm"
           - "debug_utils.mm"
+          - "prof.mm"
           - "HHSRKernels.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split

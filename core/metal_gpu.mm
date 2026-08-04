@@ -5,6 +5,7 @@
 
 #include "metal_gpu.h"
 #include "debug_utils.h"
+#include "prof.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -191,6 +192,16 @@ static void dispatch1(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineSta
         [enc dispatchThreadgroups:MTLSizeMake((n + tw - 1) / tw, 1, 1)
             threadsPerThreadgroup:tg];
     }
+}
+
+// Attach a GPU-time probe. Uses the completion handler on work the pipeline
+// already waits for, so it adds no synchronization of its own — measuring must
+// not create the stalls we are trying to measure.
+static void prof_tag_gpu(id<MTLCommandBuffer> cmd, const char* name) {
+    if (!prof_enabled() || !cmd) return;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        prof_add_gpu(name, (done.GPUEndTime - done.GPUStartTime) * 1000.0);
+    }];
 }
 
 // Commit and wait — only for final readback / error boundaries.
@@ -763,6 +774,7 @@ Image compute_grey_fft_metal(const Image& raw) {
     dispatch1(enc, c.pipe("extract_real"), n);
     [enc endEncoding];
 
+    prof_tag_gpu(cmd, "grey:fft");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
@@ -852,6 +864,7 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     dispatch2(enc, c.pipe("kernel_estimate_cov"), p.grey_w, p.grey_h);
     [enc endEncoding];
 
+    prof_tag_gpu(cmd, "kernels:estimate-cov");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return CovField();
@@ -1316,6 +1329,7 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
     [enc endEncoding];
 
+    prof_tag_gpu(cmd, "robustness:all");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
@@ -1418,6 +1432,7 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     [enc setBytes:&ps length:sizeof(ps) atIndex:3];
     dispatch2(enc, c.pipe("pyr_subsample"), (NSUInteger)dw, (NSUInteger)dh);
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:downsample");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
@@ -1498,6 +1513,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBytes:&p length:sizeof(p) atIndex:3];
     dispatch1(enc, pipe, (NSUInteger)ny * (NSUInteger)nx);
     [enc endEncoding];
+    prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1549,6 +1565,7 @@ static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_fl
     [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:l1-block-match");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1600,6 +1617,7 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:ica-refine");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1778,6 +1796,7 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:prep-sobel-hessian");
     [cmd commit];
     [cmd waitUntilCompleted];
     const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
@@ -1842,6 +1861,7 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:upscale-flow");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -2636,6 +2656,8 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
     merge_enc_close();
 
+    // One CB per band, covering every comp dispatch + the ref dispatch.
+    prof_tag_gpu(g_merge_band_cmd, "merge:band-cb");
     [g_merge_band_cmd commit];
     // Resolve any previous in-flight band now (GPU current keeps running).
     if (g_merge_inflight.cmd) {
