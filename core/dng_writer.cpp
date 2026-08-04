@@ -190,7 +190,16 @@ static bool is_identity_3x3(const float* m) {
 
 } // namespace
 
-// Builds DNG header. StripByteCounts left as 0 — patched after Deflate finishes.
+// Deflate of a 48MP LinearRaw strip measured ~8.6s of single-threaded zlib —
+// the single largest item in a burst, and unparallelizable because a zlib
+// stream is inherently serial. On 16-bit linear photographic data it only buys
+// ~1.2-1.5x, so storing uncompressed trades ~90MB of file size for those 8.6s.
+// Decoded pixels are identical either way, and load_linear_dng_rgb16 already
+// handles Compression=1. Flip to true to restore Deflate (the zlib path below
+// is kept intact); a multi-strip parallel Deflate is the eventual middle ground.
+static constexpr bool kDngCompress = false;
+
+// Builds DNG header. StripByteCounts left as 0 — patched once the strip is done.
 // Private tag 65000: 12×f32 LE = wb[3] + cam_to_srgb[9] for JPEG export.
 static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const std::string& camera_make,
@@ -217,7 +226,8 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(256, (uint32_t)W);
     ifd.longv(257, (uint32_t)H);
     ifd.shorts(258, {16, 16, 16});
-    ifd.shortv(259, 8);                // Compression = Adobe Deflate (lossless ZIP)
+    // 8 = Adobe Deflate (lossless ZIP), 1 = uncompressed. Same decoded pixels.
+    ifd.shortv(259, kDngCompress ? 8 : 1);
     if (baked_srgb)
         ifd.shortv(262, 2);            // RGB
     else
@@ -383,6 +393,12 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
         return false;
     }
 
+    if (!kDngCompress) {
+        // Uncompressed: rows go straight to disk, no zlib state at all.
+        deflate_ok_ = true;
+        return true;
+    }
+
     auto* zs = new z_stream();
     std::memset(zs, 0, sizeof(z_stream));
     // Fastest lossless zlib level — same decoded RGB16, much less CPU than Z_BEST/default.
@@ -398,10 +414,19 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
 }
 
 bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
-    if (!f_ || !deflate_ok_ || !z_stream_ || !rgb16 || nrows <= 0) return false;
+    if (!f_ || !deflate_ok_ || !rgb16 || nrows <= 0) return false;
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
 
+    if (!kDngCompress) {
+        const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
+        if (fwrite(rgb16, 1, nbytes, f_) != nbytes) return false;
+        compressed_bytes_ += (uint32_t)nbytes;
+        rows_written_ += nrows;
+        return true;
+    }
+
+    if (!z_stream_) return false;
     auto* zs = static_cast<z_stream*>(z_stream_);
     // Bulk feed (no per-row copy / predictor) — same pixels, far less overhead.
     const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
@@ -433,9 +458,9 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
 
 bool DngStreamWriter::close() {
     if (!f_) return false;
-    bool ok = rows_written_ == H_ && deflate_ok_ && z_stream_;
+    bool ok = rows_written_ == H_ && deflate_ok_ && (!kDngCompress || z_stream_);
 
-    if (ok) {
+    if (ok && kDngCompress) {
         auto* zs = static_cast<z_stream*>(z_stream_);
         int ret;
         do {
@@ -449,19 +474,21 @@ bool DngStreamWriter::close() {
                 compressed_bytes_ += (uint32_t)produced;
             }
         } while (ret != Z_STREAM_END);
+    }
 
-        if (ok && strip_byte_counts_offset_ > 0) {
-            if (fseek(f_, (long)strip_byte_counts_offset_, SEEK_SET) == 0) {
-                uint8_t le[4] = {
-                    (uint8_t)(compressed_bytes_ & 0xFF),
-                    (uint8_t)((compressed_bytes_ >> 8) & 0xFF),
-                    (uint8_t)((compressed_bytes_ >> 16) & 0xFF),
-                    (uint8_t)((compressed_bytes_ >> 24) & 0xFF),
-                };
-                if (fwrite(le, 1, 4, f_) != 4) ok = false;
-            } else {
-                ok = false;
-            }
+    // Patch StripByteCounts for both paths: Deflate accumulates the compressed
+    // size above, uncompressed accumulates the raw size in write_rows.
+    if (ok && strip_byte_counts_offset_ > 0) {
+        if (fseek(f_, (long)strip_byte_counts_offset_, SEEK_SET) == 0) {
+            uint8_t le[4] = {
+                (uint8_t)(compressed_bytes_ & 0xFF),
+                (uint8_t)((compressed_bytes_ >> 8) & 0xFF),
+                (uint8_t)((compressed_bytes_ >> 16) & 0xFF),
+                (uint8_t)((compressed_bytes_ >> 24) & 0xFF),
+            };
+            if (fwrite(le, 1, 4, f_) != 4) ok = false;
+        } else {
+            ok = false;
         }
     }
 
