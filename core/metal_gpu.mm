@@ -72,6 +72,12 @@ struct MetalCtx {
     id<MTLBuffer> kern_grad = nil, kern_cov = nil;
     size_t kern_raw_b = 0, kern_vst_b = 0, kern_grey_b = 0;
     size_t kern_grad_b = 0, kern_cov_b = 0;
+    // Grow-only grey-FFT temps. Each call otherwise allocated the input, the
+    // complex working set and the output fresh — ~190MB at 12MP — and the kernel
+    // has to zero those pages before handing them over, which is CPU time
+    // charged to compute_grey rather than to the GPU.
+    id<MTLBuffer> fft_in = nil, fft_c0 = nil, fft_out = nil;
+    size_t fft_in_b = 0, fft_c0_b = 0, fft_out_b = 0;
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
@@ -723,10 +729,14 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     const size_t cbytes = n * sizeof(float) * 2;
     const size_t col_bytes = (size_t)kFftBatchChunk * h * sizeof(float) * 2;
 
-    id<MTLBuffer> real_in = buf(raw.data.data(), n * sizeof(float));
-    id<MTLBuffer> c0 = buf(nullptr, cbytes);
+    // Pooled rather than freshly allocated: pack_rows_real writes every element
+    // of c0 and extract_real writes every element of the output, so neither
+    // depends on the buffer arriving zeroed.
+    id<MTLBuffer> real_in = c.scratch(c.fft_in, c.fft_in_b, n * sizeof(float));
+    id<MTLBuffer> c0 = c.scratch(c.fft_c0, c.fft_c0_b, cbytes);
     id<MTLBuffer> col_scratch = c.scratch(c.scratch_cols, c.scratch_cols_bytes, col_bytes);
     if (!real_in || !c0 || !col_scratch) return Image();
+    memcpy([real_in contents], raw.data.data(), n * sizeof(float));
 
     // Forward FFT (one full complex + column strip scratch)
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -738,7 +748,7 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     [enc setBytes:&w length:sizeof(w) atIndex:3];
     dispatch2(enc, c.pipe("pack_rows_real"), w, h);
     [enc endEncoding];
-    real_in = nil; // drop early; CB retains until complete
+    real_in = nil; // release the local ref; the pool and the CB keep it alive
     if (!fft2d_gpu(c0, col_scratch, h, w, false, cmd)) return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
@@ -764,7 +774,7 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
 
     if (!fft2d_gpu(c0, col_scratch, h, w, true, cmd)) return Image();
 
-    id<MTLBuffer> real_out = buf(nullptr, n * sizeof(float));
+    id<MTLBuffer> real_out = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
     if (!real_out) return Image();
     enc = [cmd computeCommandEncoder];
     uint32_t count = (uint32_t)n;
@@ -784,8 +794,15 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     c.sticky_grey_h = (int)h;
     c.sticky_grey_w = (int)w;
 
-    Image grey((int)h, (int)w, 1);
-    memcpy(grey.data.data(), [real_out contents], n * sizeof(float));
+    // assign() allocates and fills in one pass. Image(h,w,c) would value-init
+    // the whole vector first, so a 12MP grey wrote ~48MB of zeros that the
+    // following copy immediately overwrote.
+    Image grey;
+    grey.h = (int)h;
+    grey.w = (int)w;
+    grey.c = 1;
+    const float* out_src = (const float*)[real_out contents];
+    grey.data.assign(out_src, out_src + n);
     return grey;
 }
 
@@ -2519,6 +2536,11 @@ void metal_trim_analyze_scratch() {
     c.kern_grad_b = c.kern_cov_b = 0;
     c.l2[0] = {};
     c.l2[1] = {};
+    // Grey-FFT pools are analyze-only (~190MB at 12MP); merge must not inherit them.
+    c.fft_in = nil; c.fft_c0 = nil; c.fft_out = nil;
+    c.fft_in_b = c.fft_c0_b = c.fft_out_b = 0;
+    c.scratch_cols = nil;
+    c.scratch_cols_bytes = 0;
     c.sticky_grey = nil;
     c.sticky_grey_h = c.sticky_grey_w = 0;
     c.ica_ref_key = nullptr;
