@@ -454,8 +454,21 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     return true;
 }
 
-// Set false to fall back to Bluestein for non-power-of-two lengths.
-static constexpr bool kUseStockham = true;
+// DISABLED pending verification of the Metal transcription.
+//
+// The mixed-radix index math is proven correct on the host
+// (tools/verify_stockham_fft.cpp, max relative error ~1.7e-7 against a naive
+// DFT at both pipeline lengths). What was never checked is whether the GPU
+// kernel implements that math correctly — the same gap that made the four-step
+// decomposition 2.6x slower despite verified arithmetic.
+//
+// The grey image feeds block matching, so a wrong grey makes every tile match
+// at an essentially random offset inside the search window. That matches the
+// observed flow exactly: spatially incoherent, magnitudes bounded near the
+// pyramid's total search range, unchanged by reverting the align kernels.
+//
+// Set true to re-enable once the kernel output is compared against Bluestein.
+static constexpr bool kUseStockham = false;
 // DISABLED after measurement: the four-step was 2.6x SLOWER than per-stage
 // Stockham (grey:fft-segments 1582ms -> 4161ms, burst 8570ms -> 11920ms).
 //
