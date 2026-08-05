@@ -474,20 +474,11 @@ struct CameraView: View {
                                step: 0.01)
 
                         HStack {
-                            Text("Variance Noise Mult")
+                            Text("Texture SNR")
                             Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_noise_multiplier))
+                            Text(String(format: "%.1f", cam.tuningParams.hf_texture_snr_threshold))
                         }
-                        Slider(value: $cam.tuningParams.hf_variance_noise_multiplier,
-                               in: 0.25...4.00,
-                               step: 0.05)
-
-                        HStack {
-                            Text("Noise Floor Mult")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.hf_noise_floor_multiplier))
-                        }
-                        Slider(value: $cam.tuningParams.hf_noise_floor_multiplier,
+                        Slider(value: $cam.tuningParams.hf_texture_snr_threshold,
                                in: 0.0...12.0,
                                step: 0.5)
                     }
@@ -579,6 +570,15 @@ struct CameraView: View {
                     }
                     .pickerStyle(.segmented)
                     Text("8 can follow smaller local motion in good light, but is slower and less stable on noise, straight edges, and repeated patterns. Auto keeps the SNR-based choice.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Picker("Alignment Grey", selection: $cam.tuningParams.alignment_grey_method) {
+                        Text("FFT").tag(0)
+                        Text("Bayer Quad").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("FFT keeps the current alignment input. Bayer Quad uses fast 2x2 Bayer luminance decimation and may change alignment, masks, and final detail.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                     

@@ -417,29 +417,29 @@ static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     return v;
 }
 
-static Image high_frequency_loss_map_adaptive(const Image& means, const Image& vars,
-                                              const Image& lp_vars, const Config& cfg) {
+static Image high_frequency_loss_map(const Image& means, const Image& vars,
+                                     const Image& lp_vars, const Config& cfg) {
     Image loss(vars.h, vars.w, 1);
     constexpr f32 kLocalVarianceNoiseScale = 8.f / 9.f;
     constexpr f32 kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    const f32 kMinTextureSnr = std::max(cfg.hf_noise_floor_multiplier, 0.f);
+    const f32 texture_snr = std::max(cfg.hf_texture_snr_threshold, 0.f);
     for (int y = 0; y < vars.h; ++y) {
         for (int x = 0; x < vars.w; ++x) {
             f32 var = 0.f, lp_var = 0.f;
-            f32 noise_var = 0.f, lp_noise_var = 0.f;
+            f32 noise_loss = 0.f;
             for (int ch = 0; ch < vars.c; ++ch) {
                 var += std::max(vars.at(y, x, ch), 0.f);
                 lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
-                const f32 n = guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch)) *
-                              cfg.hf_variance_noise_multiplier;
-                noise_var += kLocalVarianceNoiseScale * n;
-                lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * n;
+                const f32 n = guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch));
+                const f32 noise_var = kLocalVarianceNoiseScale * n;
+                const f32 lp_noise_var =
+                    kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * n;
+                noise_loss += std::max(noise_var - lp_noise_var, 0.f);
             }
-            const f32 signal_var = std::max(var - noise_var, 0.f);
-            const f32 signal_lp_var = std::max(lp_var - lp_noise_var, 0.f);
-            const f32 min_signal_var = kMinTextureSnr * std::max(noise_var, 1.0e-20f);
-            loss.at(y, x) = (signal_var > min_signal_var)
-                ? std::max((signal_var - signal_lp_var) / signal_var, 0.f)
+            const f32 variance_loss = std::max(var - lp_var, 0.f);
+            loss.at(y, x) = (var > 1.0e-20f &&
+                             variance_loss > texture_snr * std::max(noise_loss, 1.0e-20f))
+                ? variance_loss / var
                 : 0.f;
         }
     }
@@ -673,7 +673,7 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         Image lp_guide = local_lowpass_gaussian5x5(guide);
         Image lp_means, lp_vars;
         local_stats_3x3(lp_guide, lp_means, lp_vars);
-        st.hf_loss = high_frequency_loss_map_adaptive(means, vars, lp_vars, cfg);
+        st.hf_loss = high_frequency_loss_map(means, vars, lp_vars, cfg);
     }
     // 460-main keeps robustness local statistics on the guide grid
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
@@ -718,7 +718,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         Image lp_guide = local_lowpass_gaussian5x5(guide);
         Image lp_means, lp_vars;
         local_stats_3x3(lp_guide, lp_means, lp_vars);
-        comp_hf_loss = high_frequency_loss_map_adaptive(comp_means, comp_vars, lp_vars, cfg);
+        comp_hf_loss = high_frequency_loss_map(comp_means, comp_vars, lp_vars, cfg);
     }
 
     const int h = comp_means.h, w = comp_means.w;
@@ -795,7 +795,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 cfg.hf_artifact_removal_enabled &&
                 pidx < motion_irregular.size() &&
                 motion_irregular[pidx] != 0u &&
-                residual_high &&
                 (
                     (!ref_stats.hf_loss.data.empty() &&
                      ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold) ||

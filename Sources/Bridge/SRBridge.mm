@@ -290,10 +290,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
     if (tuning[@"hf_variance_loss_threshold"])
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
-    if (tuning[@"hf_variance_noise_multiplier"])
-        cfg.hf_variance_noise_multiplier = tuning[@"hf_variance_noise_multiplier"].floatValue;
-    if (tuning[@"hf_noise_floor_multiplier"])
-        cfg.hf_noise_floor_multiplier = tuning[@"hf_noise_floor_multiplier"].floatValue;
+    if (tuning[@"hf_texture_snr_threshold"])
+        cfg.hf_texture_snr_threshold = tuning[@"hf_texture_snr_threshold"].floatValue;
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])
@@ -311,6 +309,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+    if (tuning[@"alignment_grey_method"])
+        cfg.grey_method = tuning[@"alignment_grey_method"].intValue == 1
+            ? GreyMethod::Decimate
+            : GreyMethod::FFT;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;
         cfg.alignment_tile_size =

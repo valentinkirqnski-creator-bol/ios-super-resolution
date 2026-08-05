@@ -1354,8 +1354,8 @@ struct RobHfLossParams {
     uint h, w, nch;
     uint _pad0;
     float alpha, beta;
-    float noise_mult;
-    float min_texture_snr;
+    float texture_snr;
+    float _pad1;
 };
 
 struct RobDogsonParams {
@@ -1519,26 +1519,25 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
     constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    const float kMinTextureSnr = max(p.min_texture_snr, 0.f);
+    float texture_snr = max(p.texture_snr, 0.f);
     float var_sum = 0.f;
     float lp_var_sum = 0.f;
-    float noise_var = 0.f;
-    float lp_noise_var = 0.f;
+    float noise_loss = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         var_sum += max(vars[o], 0.f);
         lp_var_sum += max(lp_vars[o], 0.f);
         float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
-        float nv = max((p.alpha * brightness + p.beta) * p.noise_mult, 0.f);
+        float nv = max(p.alpha * brightness + p.beta, 0.f);
         if (p.nch == 3u && ch == 1u) nv *= 0.5f;
-        noise_var += kLocalVarianceNoiseScale * nv;
-        lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
+        float noise_var = kLocalVarianceNoiseScale * nv;
+        float lp_noise_var = kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
+        noise_loss += max(noise_var - lp_noise_var, 0.f);
     }
-    float signal_var = max(var_sum - noise_var, 0.f);
-    float signal_lp_var = max(lp_var_sum - lp_noise_var, 0.f);
-    float min_signal_var = kMinTextureSnr * max(noise_var, 1.0e-20f);
-    loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
-        ? max((signal_var - signal_lp_var) / signal_var, 0.f)
+    float variance_loss = max(var_sum - lp_var_sum, 0.f);
+    loss[gid.y * p.w + gid.x] =
+        (var_sum > 1.0e-20f && variance_loss > texture_snr * max(noise_loss, 1.0e-20f))
+        ? variance_loss / var_sum
         : 0.f;
 }
 
@@ -1658,7 +1657,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         : (d_sq_ > 0.f ? INFINITY : 0.f);
     bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
     bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u && residual_high) {
+    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
         float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
         if (inbound) {
             hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
