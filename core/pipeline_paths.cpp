@@ -780,9 +780,63 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         debug_dump_text("cpp_burst_paths", listing);
     }
+    // Prefetch state for the comparison decodes. The first one is launched
+    // below, once SNR tuning has been joined.
+    int pref_k = -1;
+    std::future<Image> pref_fut;
+
     const double t_snr = prof_now_ms();
     f32 ref_brightness = 0.f;
-    tune_config_snr(ref, work, &ref_brightness);
+    // The SNR scan is a serial sum over 12.2M floats. It cannot be vectorized
+    // (float addition is not associative) and must not be parallelized: its
+    // result picks the alignment tile size and k_detail/k_denoise/D_th/D_tr, so
+    // the summation order is load-bearing. What it can do is run while the GPU
+    // computes the reference grey.
+    //
+    // Safe because the two touch disjoint state: compute_grey reads only
+    // work.bayer_mode and work.grey_method, while tune_config_snr writes only
+    // k_detail, k_denoise, D_th, D_tr and bm_tile_sizes. Distinct non-bitfield
+    // members are separate memory locations, so there is no race, and the sum
+    // itself is byte-for-byte the same sum in the same order.
+    std::future<void> snr_fut = std::async(std::launch::async, [&]() {
+        worker_qos();
+        tune_config_snr(ref, work, &ref_brightness);
+    });
+
+    // Reference grey on the GPU, overlapping the scan above.
+    report("Reference: grey + pyramid", 0.07f);
+    prof_mark_memory("ref:start");
+    const double t_ref_grey = prof_now_ms();
+    // 460-main block matching circular-pads the reference before pyramid construction.
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
+
+    // Everything below needs the tuned tile size, so join here.
+    snr_fut.get();
+
+    // Start the first comparison decode now. It used to run synchronously at
+    // the top of the comparison loop (comp:decode(sync), ~187ms with nothing
+    // overlapping it); the pyramid build plus robustness and kernel estimation
+    // now cover it.
+    //
+    // Deliberately after snr_fut.get() rather than before the reference stage:
+    // the loader takes Config by non-const reference and may write to it, while
+    // tune_config_snr reads cfg.alpha and cfg.beta. Overlapping those two could
+    // race on the noise model, changing the SNR and therefore the alignment
+    // tile size -- an algorithm change, not an optimization.
+    //
+    // Costs one extra resident Bayer frame (~49MB) during the reference stage.
+    // Peak footprint is at merge:band (1861MB), not here, so the peak is
+    // unchanged; headroom to jetsam was 1211MB.
+    for (int i = 0; i < frame_count; ++i) {
+        if (i == ref_index) continue;
+        pref_k = i;
+        pref_fut = std::async(std::launch::async, [&, i]() {
+            worker_qos();
+            return loader(i, work, false, ref.h, ref.w);
+        });
+        break;
+    }
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
     {
@@ -814,12 +868,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         if (i != ref_index) comp_indices.push_back(i);
     }
 
-    report("Reference: grey + pyramid", 0.07f);
-    prof_mark_memory("ref:start");
-    const double t_ref_grey = prof_now_ms();
-    // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
-    debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
     Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
     prof_add_cpu("ref:grey+pyramid", prof_now_ms() - t_ref_grey);
@@ -880,10 +928,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     cached.reserve((size_t)std::max(0, n - 1));
     cached_meta.reserve((size_t)std::max(0, n - 1));
 
-    // Prefetch next LibRaw decode: 2× during whole analyze; 1× only after grey
-    // is freed (overlaps rob/kernels, +1 Bayer peak briefly).
-    int pref_k = -1;
-    std::future<Image> pref_fut;
+    // pref_k / pref_fut are declared above: the first comparison decode is
+    // already in flight, launched before the reference analysis began.
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
