@@ -85,6 +85,23 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
+    // Reference pyramid level uploads, keyed by host pointer. The reference is
+    // identical for every comparison frame, but each level was re-uploaded once
+    // per frame — level 0 is the padded full-res grey, so a burst re-copied
+    // hundreds of MB for data that never changed.
+    static constexpr int kMaxPyrLevels = 8;
+    struct RefLevel {
+        const void* key = nullptr;
+        id<MTLBuffer> img = nil;
+    };
+    RefLevel ref_lvl[kMaxPyrLevels];
+    // Moving grey upload + transient downsample temps, grow-only. The moving
+    // frame changes every call, so this is pooled rather than cached: the
+    // allocation is reused, the contents are overwritten.
+    id<MTLBuffer> align_mov0 = nil;
+    size_t align_mov0_b = 0;
+    id<MTLBuffer> ds_ker = nil, ds_tmp = nil, ds_filt = nil;
+    size_t ds_ker_b = 0, ds_tmp_b = 0, ds_filt_b = 0;
     const void* ica_ref_key = nullptr;
     id<MTLBuffer> ica_ref = nil;
     id<MTLBuffer> ica_gx = nil;
@@ -1534,6 +1551,26 @@ static std::vector<float> scipy_gaussian_kernel1d_metal(float sigma, int radius)
 
 // GPU valid-gauss + stride. Same math as grey_pyramid.cpp downsample_by.
 // __strong out-param: ARC requires it for id& (same as merge robustness helpers).
+// Upload a reference pyramid level once per burst rather than once per
+// comparison frame. Keyed on the host pointer, exactly like the ICA ref cache,
+// and dropped by metal_clear_ref_ica_cache at the same point.
+static id<MTLBuffer> ref_level_buf(const Image& r, int lvl) {
+    const size_t bytes = r.data.size() * sizeof(float);
+    if (bytes == 0) return nil;
+    if (lvl < 0 || lvl >= MetalCtx::kMaxPyrLevels)
+        return buf(r.data.data(), bytes);
+    auto& c = ctx();
+    const void* key = r.data.data();
+    MetalCtx::RefLevel& slot = c.ref_lvl[lvl];
+    if (slot.key == key && slot.img && slot.img.length >= bytes) return slot.img;
+    id<MTLBuffer> b = buf(key, bytes);
+    if (b) {
+        slot.key = key;
+        slot.img = b;
+    }
+    return b;
+}
+
 static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
                                __strong id<MTLBuffer>& dst, int& dh, int& dw) {
     if (factor <= 1) {
@@ -1557,9 +1594,15 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     dw = filt_w / factor;
     if (dh < 1 || dw < 1) return false;
 
-    id<MTLBuffer> b_ker = buf(ker.data(), ker.size() * sizeof(float));
-    id<MTLBuffer> b_tmp = buf(nullptr, (size_t)tmp_h * tmp_w * sizeof(float));
-    id<MTLBuffer> b_filt = buf(nullptr, (size_t)filt_h * filt_w * sizeof(float));
+    // Kernel and the two conv temporaries are transient within this call, so
+    // they come from grow-only pools; both convolutions write every element
+    // they read back, so reuse without clearing is safe. b_out stays a fresh
+    // allocation: it becomes a pyramid level and must outlive the call.
+    const size_t ker_b = ker.size() * sizeof(float);
+    id<MTLBuffer> b_ker = c.scratch(c.ds_ker, c.ds_ker_b, ker_b);
+    if (b_ker) memcpy([b_ker contents], ker.data(), ker_b);
+    id<MTLBuffer> b_tmp = c.scratch(c.ds_tmp, c.ds_tmp_b, (size_t)tmp_h * tmp_w * sizeof(float));
+    id<MTLBuffer> b_filt = c.scratch(c.ds_filt, c.ds_filt_b, (size_t)filt_h * filt_w * sizeof(float));
     id<MTLBuffer> b_out = buf(nullptr, (size_t)dh * dw * sizeof(float));
     if (!b_ker || !b_tmp || !b_filt || !b_out) return false;
 
@@ -2100,9 +2143,12 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
     auto& c = ctx();
     Image moving_padded_grey = pad_image_circular(moving_grey, tile_size);
-    id<MTLBuffer> mov0 = buf(moving_padded_grey.data.data(),
-                             moving_padded_grey.data.size() * sizeof(float));
+    // Pooled: same size every frame, contents overwritten. Previously a fresh
+    // multi-MB allocation per comparison frame.
+    const size_t mov0_bytes = moving_padded_grey.data.size() * sizeof(float);
+    id<MTLBuffer> mov0 = c.scratch(c.align_mov0, c.align_mov0_b, mov0_bytes);
     if (!mov0) return false;
+    memcpy([mov0 contents], moving_padded_grey.data.data(), mov0_bytes);
 
     struct Lev {
         id<MTLBuffer> img = nil;
@@ -2141,7 +2187,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
-        id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
+        // Cached across comparison frames: the reference does not change.
+        id<MTLBuffer> b_ref = ref_level_buf(r, lvl);
         if (!b_ref) return false;
         int ny = r.h / ts;
         int nx = r.w / ts;
@@ -2215,6 +2262,13 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
 void metal_clear_ref_ica_cache() {
     auto& c = ctx();
+    // Reference pyramid uploads have the same lifetime as the ICA ref cache:
+    // valid for one burst, dropped before merge needs the memory.
+    for (int i = 0; i < MetalCtx::kMaxPyrLevels; ++i) c.ref_lvl[i] = {};
+    c.align_mov0 = nil;
+    c.align_mov0_b = 0;
+    c.ds_ker = nil; c.ds_tmp = nil; c.ds_filt = nil;
+    c.ds_ker_b = c.ds_tmp_b = c.ds_filt_b = 0;
     c.ica_ref_key = nullptr;
     c.ica_ref = nil;
     c.ica_gx = nil;
@@ -2702,6 +2756,12 @@ void metal_trim_analyze_scratch() {
     c.scratch_cols_bytes = 0;
     c.sticky_grey = nil;
     c.sticky_grey_h = c.sticky_grey_w = 0;
+    // Align-side caches are analyze-only; merge must not inherit them.
+    for (int i = 0; i < MetalCtx::kMaxPyrLevels; ++i) c.ref_lvl[i] = {};
+    c.align_mov0 = nil;
+    c.align_mov0_b = 0;
+    c.ds_ker = nil; c.ds_tmp = nil; c.ds_filt = nil;
+    c.ds_ker_b = c.ds_tmp_b = c.ds_filt_b = 0;
     c.ica_ref_key = nullptr;
     c.ica_ref = nil;
     c.ica_gx = nil;
