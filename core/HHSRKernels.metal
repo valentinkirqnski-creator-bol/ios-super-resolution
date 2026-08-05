@@ -1367,7 +1367,8 @@ struct RobHfLossParams {
     uint h, w, nch;
     uint _pad0;
     float alpha, beta;
-    float _pad1, _pad2;
+    float noise_mult;   // scales the subtracted noise variance
+    float _pad2;
 };
 
 struct RobDogsonParams {
@@ -1541,7 +1542,7 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
         var_sum += max(vars[o], 0.f);
         lp_var_sum += max(lp_vars[o], 0.f);
         float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
-        float nv = max(p.alpha * brightness + p.beta, 0.f);
+        float nv = max((p.alpha * brightness + p.beta) * p.noise_mult, 0.f);
         if (p.nch == 3u && ch == 1u) nv *= 0.5f;
         noise_var += kLocalVarianceNoiseScale * nv;
         lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;

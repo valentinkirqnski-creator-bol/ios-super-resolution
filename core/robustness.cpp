@@ -430,7 +430,8 @@ static Image high_frequency_loss_map_adaptive(const Image& means, const Image& v
             for (int ch = 0; ch < vars.c; ++ch) {
                 var += std::max(vars.at(y, x, ch), 0.f);
                 lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
-                const f32 n = guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch));
+                const f32 n = guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch)) *
+                              cfg.hf_variance_noise_multiplier;
                 noise_var += kLocalVarianceNoiseScale * n;
                 lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * n;
             }

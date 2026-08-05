@@ -474,6 +474,17 @@ struct CameraView: View {
                                step: 0.01)
                     }
 
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Variance Noise Mult")
+                            Spacer()
+                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_noise_multiplier))
+                        }
+                        Slider(value: $cam.tuningParams.hf_variance_noise_multiplier,
+                               in: 0.25...4.00,
+                               step: 0.05)
+                    }
+
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
                     if cam.tuningParams.motion_edge_rejection_enabled {

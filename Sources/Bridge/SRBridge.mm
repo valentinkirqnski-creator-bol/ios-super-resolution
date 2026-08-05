@@ -290,6 +290,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
     if (tuning[@"hf_variance_loss_threshold"])
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
+    if (tuning[@"hf_variance_noise_multiplier"])
+        cfg.hf_variance_noise_multiplier = tuning[@"hf_variance_noise_multiplier"].floatValue;
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])
