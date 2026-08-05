@@ -210,10 +210,27 @@ static void prof_tag_gpu(id<MTLCommandBuffer> cmd, const char* name) {
     }];
 }
 
+// Label for command buffers that are soft-committed part-way through a stage.
+// prof_tag_gpu is otherwise only attached to the last buffer of a multi-commit
+// sequence, so every earlier segment's GPU time went unrecorded — the grey FFT
+// commits several times per call and was reported as just its tail.
+// thread_local: the 2x path runs estimate_kernels on a std::async thread, so a
+// shared global would race with the stage set on the pipeline thread.
+static thread_local const char* g_prof_stage = nullptr;
+
+struct ProfStageScope {
+    const char* prev;
+    explicit ProfStageScope(const char* s) : prev(g_prof_stage) { g_prof_stage = s; }
+    ~ProfStageScope() { g_prof_stage = prev; }
+    ProfStageScope(const ProfStageScope&) = delete;
+    ProfStageScope& operator=(const ProfStageScope&) = delete;
+};
+
 // Commit and wait — only for final readback / error boundaries.
 static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!cmd) return false;
+    if (g_prof_stage) prof_tag_gpu(cmd, g_prof_stage);
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
@@ -226,6 +243,7 @@ static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
 static bool commit_cmd(__strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!cmd) return false;
+    if (g_prof_stage) prof_tag_gpu(cmd, g_prof_stage);
     [cmd commit];
     cmd = [c.queue commandBuffer];
     return cmd != nil;
@@ -721,6 +739,10 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
 
 static Image compute_grey_fft_metal_impl(const Image& raw) {
     if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return Image();
+    // Attributes the soft-committed FFT segments, which previously vanished
+    // from the profile: comp:grey measured ~750ms/frame against only ~204ms of
+    // tagged GPU, and the gap was never CPU work.
+    ProfStageScope prof_stage("grey:fft-segments");
     auto& c = ctx();
     const uint32_t h = (uint32_t)raw.h, w = (uint32_t)raw.w;
     // In-place fftshift requires even dims (Bayer RAW is even).
@@ -1926,6 +1948,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out,
                  f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     if (!metal_gpu_init()) return false;
+    // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
+    ProfStageScope prof_stage("align:soft-segments");
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
     if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
