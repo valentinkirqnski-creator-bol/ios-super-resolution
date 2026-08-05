@@ -2222,7 +2222,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // Block matching only; ICA runs once below on the finest level.
     }
 
-    if (!align_drain()) return false;
+    // No drain here: nothing below reads GPU memory on the CPU until the flow
+    // readback, and the ICA stages are ordered behind the pyramid work by the
+    // queue. Draining here would stall out most of the async benefit.
     // ICA once on the finest level, matching 63e6919 and align.cpp, rather than
     // once per pyramid level as ac0ff06 did.
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
