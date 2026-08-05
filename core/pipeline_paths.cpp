@@ -24,12 +24,31 @@
 #include <limits>
 #include <sstream>
 #if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+#if defined(__APPLE__)
 #include <thread>
 #endif
 
 namespace fs = std::filesystem;
 
 namespace hhsr {
+
+// std::async and std::thread create raw pthreads. On Apple platforms those
+// start at the default QoS instead of inheriting the dispatch queue that
+// spawned them, so although the burst runs on a .userInitiated queue, the
+// decode prefetch, the Bayer spill, kernel estimation and the DNG encode were
+// all running a tier below the work that blocks on them. A lower QoS is also a
+// scheduling hint toward efficiency cores, which have both lower clocks and
+// less memory bandwidth -- and every one of these workers is bandwidth-bound.
+//
+// Purely a scheduling change: no computation is affected.
+static inline void worker_qos() {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+}
+
 
 namespace {
 
@@ -809,7 +828,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         ref_covs = estimate_kernels(ref, work);
     } else {
         std::future<CovField> ref_cov_fut =
-            std::async(std::launch::async, [&]() { return estimate_kernels(ref, work); });
+            std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(ref, work); });
         ref_stats = init_robustness(ref, work);
         ref_covs = ref_cov_fut.get();
     }
@@ -899,6 +918,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
+                worker_qos();
                 return loader(nk, work, false, ref_h, ref_w);
             });
             prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
@@ -938,6 +958,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
+                worker_qos();
                 return loader(nk, work, false, ref_h, ref_w);
             });
             prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
@@ -961,7 +982,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         } else {
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
-                std::async(std::launch::async, [&]() { return estimate_kernels(comp, work); });
+                std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
             covs = cov_fut.get();
             rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
@@ -984,6 +1005,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 auto spill_img = std::make_shared<Image>(std::move(comp));
                 const fs::path spill_path = cache / ("f" + std::to_string(sk) + ".raw");
                 spill_fut = std::async(std::launch::async, [spill_path, spill_img]() {
+                    worker_qos();
                     return save_image(spill_path, *spill_img);
                 });
                 spill_pending = true;
@@ -1248,6 +1270,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (out16.size() < (size_t)ebh * (size_t)Ws * 3u)
                 out16.resize((size_t)ebh * (size_t)Ws * 3u);
             encode_thr = std::thread([&, er, ey0, ebh]() {
+                worker_qos();
                 encode_band_rows(num_bands[er], den_bands[er], ey0, ebh, work, nch,
                                  preview, pscale, ph, pw, Ws, out16);
                 writer.write_rows(out16.data(), ebh);
