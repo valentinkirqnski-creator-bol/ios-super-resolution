@@ -146,110 +146,6 @@ kernel void fft_stockham_stage(device const float2* src [[buffer(0)]],
     for (uint r = 0u; r < R; ++r) y[base + r * p.Ns] = v[r];
 }
 
-// ---------------------------------------------------------------------------
-// Four-step FFT sub-transform.
-//
-// fft_stockham_stage costs one global read plus one global write per stage, so a
-// 6-stage 4032-point transform touches the array 12 times. Splitting N = N1*N2
-// (4032 = 63*64, 3024 = 54*56) turns it into two passes of small sub-transforms
-// that live entirely in threadgroup memory: 4 touches instead of 12, and these
-// kernels are bandwidth-bound.
-//
-//   n = n1*N2 + n2,  k = k2*N1 + k1
-//   pass A: N2 transforms of size N1 over n1, then twiddle by W_N^(n2*k1)
-//   pass B: N1 transforms of size N2 over n2, written to k2*N1 + k1
-//
-// One kernel serves both passes: the caller supplies the gather/scatter strides.
-// Sub-transform indices are grp.x, the batch row is grp.y. Index math is a
-// transcription of a host prototype checked against a naive DFT.
-//
-// Threadgroup memory is 2*n complex (Stockham ping-pong); at n <= 64 that is 1KB.
-struct SmallFftParams {
-    uint n;             // sub-transform length
-    uint sub_count;     // sub-transforms per row (grid.x)
-    uint row_stride;    // distance between batch rows
-    uint in_b, in_i;    // src = row*row_stride + b*in_b + i*in_i
-    uint out_b, out_k;  // dst = row*row_stride + b*out_b + k*out_k
-    uint twiddle_N;     // 0 = none; else scale output k by W_N^(b*k)
-    uint inverse;
-    uint nrad;
-    uint rad[6];        // radices, applied in order
-    uint _pad0;         // 64 bytes for setBytes
-};
-
-kernel void fft_small_batched(device const float2* src [[buffer(0)]],
-                              device float2* dst [[buffer(1)]],
-                              constant SmallFftParams& p [[buffer(2)]],
-                              threadgroup float2* sh [[threadgroup(0)]],
-                              // MSL requires every grid/threadgroup position
-                              // attribute in a kernel to have the same
-                              // dimensionality, and the grid is 2D here
-                              // (sub-transform, batch row), so these must be
-                              // uint2 even though only .x is meaningful.
-                              uint2 grp [[threadgroup_position_in_grid]],
-                              uint2 tpos [[thread_position_in_threadgroup]],
-                              uint2 tsize [[threads_per_threadgroup]]) {
-    const uint lane = tpos.x;
-    const uint lanes = tsize.x;
-    const uint b = grp.x;
-    const uint row = grp.y;
-    if (b >= p.sub_count) return;   // uniform across the threadgroup
-
-    const uint n = p.n;
-    const uint in_base = row * p.row_stride + b * p.in_b;
-    const uint out_base = row * p.row_stride + b * p.out_b;
-    const float sgn = (p.inverse != 0u) ? 2.f : -2.f;
-
-    threadgroup float2* x = sh;
-    threadgroup float2* y = sh + n;
-
-    for (uint i = lane; i < n; i += lanes) x[i] = src[in_base + i * p.in_i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint Ns = 1u;
-    for (uint s = 0u; s < p.nrad; ++s) {
-        const uint R = p.rad[s];
-        const uint NR = n / R;
-        // Roots of unity for this radix; W[(k*m)%R] reproduces the reference
-        // DFT's values and summation order.
-        float2 W[8];
-        for (uint i = 0u; i < R; ++i) {
-            const float a = sgn * PI * float(i) / float(R);
-            W[i] = float2(cos(a), sin(a));
-        }
-        for (uint t = lane; t < NR; t += lanes) {
-            const uint j = t % Ns;
-            const float ang = sgn * PI * float(j) / float(Ns * R);
-            float2 v[8];
-            for (uint r = 0u; r < R; ++r) {
-                const float a = ang * float(r);
-                v[r] = cmul(x[t + r * NR], float2(cos(a), sin(a)));
-            }
-            float2 tv[8];
-            for (uint i = 0u; i < R; ++i) tv[i] = v[i];
-            for (uint k = 0u; k < R; ++k) {
-                float2 acc = float2(0.f, 0.f);
-                for (uint m = 0u; m < R; ++m) acc += cmul(tv[m], W[(k * m) % R]);
-                v[k] = acc;
-            }
-            const uint base = (t / Ns) * Ns * R + j;
-            for (uint r = 0u; r < R; ++r) y[base + r * Ns] = v[r];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        threadgroup float2* sw = x; x = y; y = sw;
-        Ns *= R;
-    }
-
-    for (uint k = lane; k < n; k += lanes) {
-        float2 val = x[k];
-        if (p.twiddle_N != 0u) {
-            const float a = sgn * PI * float((b * k) % p.twiddle_N) / float(p.twiddle_N);
-            val = cmul(val, float2(cos(a), sin(a)));
-        }
-        dst[out_base + k * p.out_k] = val;
-    }
-}
-
 // Copy a batch of vectors; used when an odd stage count leaves the Stockham
 // result in the ping-pong buffer.
 kernel void fft_copy_batch(device float2* dst [[buffer(0)]],
@@ -299,19 +195,25 @@ kernel void fft1d_butterfly(device float2* data [[buffer(0)]],
     uint group = id / half_n;
     uint k = id % half_n;
     uint i = group * len;
-    float ang = (inverse != 0 ? 2.f : -2.f) * PI / float(len);
-    float2 wlen = float2(cos(ang), sin(ang));
-    // w = wlen^k
-    float2 w = float2(1.f, 0.f);
-    {
-        uint kk = k;
-        float2 b = wlen;
-        while (kk != 0u) {
-            if ((kk & 1u) != 0u) w = cmul(w, b);
-            b = cmul(b, b);
-            kk >>= 1;
-        }
-    }
+
+    // Twiddle w = exp(sign * 2*pi*i*k/len), evaluated directly.
+    //
+    // This previously built wlen = exp(sign*2*pi*i/len) and raised it to the
+    // k-th power by binary exponentiation: up to ~13 complex multiplies plus
+    // ~13 squarings per thread. That is roughly 26 complex multiplies to set up
+    // a butterfly that performs exactly one, so the kernel spent most of its
+    // arithmetic generating twiddles rather than transforming data, and this is
+    // the innermost kernel of every FFT stage in the pipeline.
+    //
+    // wlen^k is exp(i*ang*k) by definition, so evaluating the angle directly is
+    // mathematically the same value. It is also more accurate: repeated squaring
+    // compounds rounding at every step, while this is a single trig evaluation.
+    // Results move in the last few ULPs, well under one 16-bit LSB.
+    //
+    // k < len/2, so the angle stays within [-pi, pi] and needs no reduction.
+    float ang = (inverse != 0 ? 2.f : -2.f) * PI * (float(k) / float(len));
+    float2 w = float2(cos(ang), sin(ang));
+
     device float2* a = data + batch * stride;
     float2 u = a[i + k];
     float2 v = cmul(a[i + k + half_n], w);
@@ -504,28 +406,6 @@ kernel void zero_fft_borders(device float2* data [[buffer(0)]],
         data[y * w + x] = float2(0.f, 0.f);
 }
 
-// zero_fft_borders expressed directly in natural FFT order.
-//
-// The grey FFT ran fftshift_x, fftshift_y, zero_fft_borders, fftshift_x,
-// fftshift_y. Each shift kernel reads and writes the whole frame, so four full
-// passes over ~96MB existed only to state the zeroing in shifted coordinates.
-//
-// fftshift is an involution, so shift -> zero -> shift equals zeroing the
-// corresponding region in natural order. Shifted position i holds natural
-// index (i + n/2) mod n, and the shifted kernel discards i outside the central
-// half; that maps to exactly the central half in natural order, i.e. the same
-// [n/4, n - n/4) expressions used here. Same result, one pass instead of five.
-kernel void zero_fft_borders_natural(device float2* data [[buffer(0)]],
-                                     constant uint& h [[buffer(1)]],
-                                     constant uint& w [[buffer(2)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
-    uint y = gid.y, x = gid.x;
-    if (y >= h || x >= w) return;
-    uint y0 = h / 4u, x0 = w / 4u;
-    if ((y >= y0 && y < h - y0) || (x >= x0 && x < w - x0))
-        data[y * w + x] = float2(0.f, 0.f);
-}
-
 kernel void extract_real(device float* out [[buffer(0)]],
                          device const float2* in [[buffer(1)]],
                          constant uint& count [[buffer(2)]],
@@ -548,51 +428,123 @@ struct AlignLocalSearch460Params {
     uint l1;
 };
 
+// One threadgroup per tile; threads split the candidate shifts.
+//
+// The previous form ran one thread per tile and looped every candidate serially,
+// re-reading the whole reference tile from device memory (2R+1)^2 times. Here the
+// reference tile is staged once in threadgroup memory and each candidate's SSD/SAD
+// is still summed by a single thread in the original i-then-j order, so every
+// `dist` is bit-identical. Candidates are visited in ascending index and accepted
+// only on strict `<`, and the tree reduction breaks ties toward the lower index,
+// which reproduces the original sdy-outer / sdx-inner first-minimum-wins scan.
+//
+// Threadgroup memory is supplied by the host: [0] = ts*ts floats for the tile,
+// [1]/[2] = one float/int per lane for the reduction. `lanes` must be a power of
+// two (the host enforces this) for the tree reduction to cover every element.
 kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    device const float* mov [[buffer(1)]],
                                    device float* flow [[buffer(2)]],
                                    constant AlignLocalSearch460Params& p [[buffer(3)]],
-                                   uint tid [[thread_position_in_grid]]) {
-    if (tid >= p.ny * p.nx) return;
-    uint ty = tid / p.nx;
-    uint tx = tid % p.nx;
-    int ox = int(tx) * p.ts;
-    int oy = int(ty) * p.ts;
-    float local_fx = flow[tid * 2u + 0u];
-    float local_fy = flow[tid * 2u + 1u];
-    float min_dist = INFINITY;
-    int min_shift_x = 0;
-    int min_shift_y = 0;
-    for (int sdy = -p.R; sdy <= p.R; ++sdy) {
-        for (int sdx = -p.R; sdx <= p.R; ++sdx) {
+                                   threadgroup float* ref_tile [[threadgroup(0)]],
+                                   threadgroup float* red_dist [[threadgroup(1)]],
+                                   threadgroup int* red_cand [[threadgroup(2)]],
+                                   uint tile_id [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_position_in_threadgroup]],
+                                   uint lanes [[threads_per_threadgroup]]) {
+    // Uniform across the threadgroup, so every thread leaves together and the
+    // barriers below stay well-formed.
+    if (tile_id >= p.ny * p.nx) return;
+
+    const int ts = p.ts;
+    const int R = p.R;
+    const int span = 2 * R + 1;
+    const int ncand = span * span;
+    const int kNone = 0x7FFFFFFF;
+
+    const uint ty = tile_id / p.nx;
+    const uint tx = tile_id % p.nx;
+    const int ox = int(tx) * ts;
+    const int oy = int(ty) * ts;
+    const float local_fx = flow[tile_id * 2u + 0u];
+    const float local_fy = flow[tile_id * 2u + 1u];
+
+    // The original invalidated a candidate on its first out-of-bounds sample.
+    // The sampled region is a full rectangle, so that is exactly rectangle
+    // containment — testable up front without touching memory.
+    const bool ref_in = (ox >= 0 && oy >= 0 &&
+                         ox + ts <= p.ref_w && oy + ts <= p.ref_h);
+
+    if (ref_in) {
+        for (int k = int(lane); k < ts * ts; k += int(lanes)) {
+            const int i = k / ts;
+            const int j = k - i * ts;
+            ref_tile[k] = ref[uint(oy + i) * uint(p.ref_w) + uint(ox + j)];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_dist = INFINITY;
+    int best_cand = kNone;
+
+    if (ref_in) {
+        const int ifx = int(local_fx);
+        const int ify = int(local_fy);
+        for (int c = int(lane); c < ncand; c += int(lanes)) {
+            const int row = c / span;
+            const int sdy = row - R;
+            const int sdx = (c - row * span) - R;
+            const int mx0 = ox + ifx + sdx;
+            const int my0 = oy + ify + sdy;
+            // Out-of-bounds candidates scored INFINITY and could never win a
+            // strict `<`, so skipping them is equivalent.
+            if (!(mx0 >= 0 && my0 >= 0 &&
+                  mx0 + ts <= p.mov_w && my0 + ts <= p.mov_h))
+                continue;
+
             float dist = 0.f;
-            bool valid = true;
-            for (int i = 0; i < p.ts && valid; ++i) {
-                for (int j = 0; j < p.ts; ++j) {
-                    int rx = ox + j;
-                    int ry = oy + i;
-                    int mx = rx + int(local_fx) + sdx;
-                    int my = ry + int(local_fy) + sdy;
-                    if (!(rx >= 0 && rx < p.ref_w && ry >= 0 && ry < p.ref_h &&
-                          mx >= 0 && mx < p.mov_w && my >= 0 && my < p.mov_h)) {
-                        valid = false;
-                        break;
-                    }
-                    float diff = ref[uint(ry) * uint(p.ref_w) + uint(rx)] -
-                                 mov[uint(my) * uint(p.mov_w) + uint(mx)];
+            for (int i = 0; i < ts; ++i) {
+                const uint mrow = uint(my0 + i) * uint(p.mov_w);
+                const int trow = i * ts;
+                for (int j = 0; j < ts; ++j) {
+                    const float diff = ref_tile[trow + j] - mov[mrow + uint(mx0 + j)];
                     dist += (p.l1 != 0u) ? fabs(diff) : diff * diff;
                 }
             }
-            if (!valid) dist = INFINITY;
-            if (dist < min_dist) {
-                min_dist = dist;
-                min_shift_y = sdy;
-                min_shift_x = sdx;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_cand = c;
             }
         }
     }
-    flow[tid * 2u + 0u] = local_fx + float(min_shift_x);
-    flow[tid * 2u + 1u] = local_fy + float(min_shift_y);
+
+    red_dist[lane] = best_dist;
+    red_cand[lane] = best_cand;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = lanes >> 1u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            const float od = red_dist[lane + s];
+            const int oc = red_cand[lane + s];
+            if (od < red_dist[lane] ||
+                (od == red_dist[lane] && oc < red_cand[lane])) {
+                red_dist[lane] = od;
+                red_cand[lane] = oc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        const int c = red_cand[0];
+        int sdx = 0, sdy = 0;   // no valid candidate -> unchanged flow, as before
+        if (c != kNone) {
+            const int row = c / span;
+            sdy = row - R;
+            sdx = (c - row * span) - R;
+        }
+        flow[tile_id * 2u + 0u] = local_fx + float(sdx);
+        flow[tile_id * 2u + 1u] = local_fy + float(sdy);
+    }
 }
 
 kernel void l2_pack_tiles(device float* ref_pad [[buffer(0)]],
@@ -1289,7 +1241,7 @@ struct RobHfLossParams {
     uint h, w, nch;
     uint _pad0;
     float alpha, beta;
-    float noise_mult;   // scales the subtracted noise variance
+    float noise_mult;      // scales the subtracted noise variance
     float min_texture_snr; // signal must exceed this multiple of the noise floor
 };
 
@@ -1931,6 +1883,20 @@ inline float butterfly_reduce_sum_metal(thread float* s, int n) {
     return s[0];
 }
 
+// One threadgroup per tile.
+//
+// The ts<=16 path previously declared two 256-float thread-private arrays and
+// reduced them inside a single thread. That is 2KB of per-thread storage, well
+// past what fits in registers, so it spilled to device memory and every element
+// access became a round trip. Staging them in threadgroup memory with one lane
+// per pixel removes the spill and parallelizes the fill.
+//
+// butterfly_reduce_sum_metal pairs s[t] += s[t + N] for t < N with N halving
+// from n_pix/2, which is exactly a threadgroup tree reduction, so the addition
+// order below is unchanged and the sums stay bit-identical. n_pix is 64 (ts=8)
+// or 256 (ts=16) -- both powers of two, as the pairing requires.
+//
+// Host supplies threadgroup memory: [0] and [1] are n_pix floats each.
 kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
                             device const float* gradx [[buffer(1)]],
                             device const float* grady [[buffer(2)]],
@@ -1938,8 +1904,15 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
                             device const float* mov [[buffer(4)]],
                             device float* flow [[buffer(5)]],
                             constant IcaParams& p [[buffer(6)]],
-                            uint tid [[thread_position_in_grid]]) {
-    if (tid >= p.ny * p.nx) return;
+                            threadgroup float* s_B0 [[threadgroup(0)]],
+                            threadgroup float* s_B1 [[threadgroup(1)]],
+                            uint tile_id [[threadgroup_position_in_grid]],
+                            uint lane [[thread_position_in_threadgroup]],
+                            uint lanes [[threads_per_threadgroup]]) {
+    // Every exit below this point is uniform across the threadgroup, so the
+    // barriers further down stay well-formed.
+    if (tile_id >= p.ny * p.nx) return;
+    const uint tid = tile_id;
     uint ty = tid / p.nx;
     uint tx = tid % p.nx;
     int ts = int(p.ts);
@@ -1962,6 +1935,10 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     float fy = flow[tid * 2u + 1u];
 
     if (ts == 32 || ts == 64) {
+        // Unreachable with the shipped bm_tile_sizes ({16,16,16,8}); kept
+        // verbatim and confined to one lane so behaviour is preserved if the
+        // configuration ever selects these sizes.
+        if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
             float floor_fx = trunc(fx);
             float floor_fy = trunc(fy);
@@ -2023,10 +2000,7 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         return;
     }
 
-    // Max ts=16 â†’ 256; ts=8 uses first 64.
-    float s_B0[256];
-    float s_B1[256];
-
+    // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
         // math.modf + int() truncation toward zero (ICA.py)
         float floor_fx = trunc(fx);
@@ -2036,33 +2010,50 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         int floor_off_x = int(floor_fx);
         int floor_off_y = int(floor_fy);
 
-        for (int i = 0; i < ts; ++i) {
+        // Same per-pixel values as the serial i/j fill; only who writes changes.
+        for (int tpix = int(lane); tpix < n_pix; tpix += int(lanes)) {
+            int i = tpix / ts;
+            int j = tpix - i * ts;
             int py = oy + i;
-            for (int j = 0; j < ts; ++j) {
-                int px = ox + j;
-                int tpix = i * ts + j;
-                if (py >= RH || px >= RW) {
-                    s_B0[tpix] = 0.f;
-                    s_B1[tpix] = 0.f;
-                    continue;
-                }
-                float mov_interp = bilinear_ica_metal(
-                    mov, py, px, floor_off_y, floor_off_x, frac_x, frac_y,
-                    MH, MW, clamp_edge);
-                uint ro = uint(py) * p.ref_w + uint(px);
-                float gradt = mov_interp - ref[ro];
-                s_B0[tpix] = -gradx[ro] * gradt;
-                s_B1[tpix] = -grady[ro] * gradt;
+            int px = ox + j;
+            if (py >= RH || px >= RW) {
+                s_B0[tpix] = 0.f;
+                s_B1[tpix] = 0.f;
+                continue;
             }
+            float mov_interp = bilinear_ica_metal(
+                mov, py, px, floor_off_y, floor_off_x, frac_x, frac_y,
+                MH, MW, clamp_edge);
+            uint ro = uint(py) * p.ref_w + uint(px);
+            float gradt = mov_interp - ref[ro];
+            s_B0[tpix] = -gradx[ro] * gradt;
+            s_B1[tpix] = -grady[ro] * gradt;
         }
-        float B0 = butterfly_reduce_sum_metal(s_B0, n_pix);
-        float B1 = butterfly_reduce_sum_metal(s_B1, n_pix);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // butterfly_reduce_sum_metal, unrolled across lanes: identical pairing
+        // and identical addition order, therefore identical sums.
+        for (int N = n_pix / 2; N > 0; N /= 2) {
+            for (int t = int(lane); t < N; t += int(lanes)) {
+                s_B0[t] += s_B0[t + N];
+                s_B1[t] += s_B1[t + N];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Every lane derives the same fx/fy from the same reduced sums, so the
+        // next iteration's fill is consistent without broadcasting them.
+        float B0 = s_B0[0];
+        float B1 = s_B1[0];
         fx += det_inv * (h11 * B0 - h01 * B1);
         fy += det_inv * (-h10 * B0 + h00 * B1);
+        threadgroup_barrier(mem_flags::mem_threadgroup); // before the next refill
     }
 
-    flow[tid * 2u + 0u] = fx;
-    flow[tid * 2u + 1u] = fy;
+    if (lane == 0u) {
+        flow[tid * 2u + 0u] = fx;
+        flow[tid * 2u + 1u] = fy;
+    }
 }
 
 // ---------------------------------------------------------------------------

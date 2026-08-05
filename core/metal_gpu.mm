@@ -85,23 +85,6 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
-    // Reference pyramid level uploads, keyed by host pointer. The reference is
-    // identical for every comparison frame, but each level was re-uploaded once
-    // per frame — level 0 is the padded full-res grey, so a burst re-copied
-    // hundreds of MB for data that never changed.
-    static constexpr int kMaxPyrLevels = 8;
-    struct RefLevel {
-        const void* key = nullptr;
-        id<MTLBuffer> img = nil;
-    };
-    RefLevel ref_lvl[kMaxPyrLevels];
-    // Moving grey upload + transient downsample temps, grow-only. The moving
-    // frame changes every call, so this is pooled rather than cached: the
-    // allocation is reused, the contents are overwritten.
-    id<MTLBuffer> align_mov0 = nil;
-    size_t align_mov0_b = 0;
-    id<MTLBuffer> ds_ker = nil, ds_tmp = nil, ds_filt = nil;
-    size_t ds_ker_b = 0, ds_tmp_b = 0, ds_filt_b = 0;
     const void* ica_ref_key = nullptr;
     id<MTLBuffer> ica_ref = nil;
     id<MTLBuffer> ica_gx = nil;
@@ -154,11 +137,11 @@ static MetalCtx& ctx() {
         const char* need[] = {
             "raw16_to_float_bayer",
             "fft1d_pow2_cpp", "fft1d_bitrev", "fft1d_butterfly", "fft_scale_inv", "make_chirp",
-            "fft_stockham_stage", "fft_copy_batch", "fft_small_batched",
+            "fft_stockham_stage", "fft_copy_batch",
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
-            "fftshift2d_c", "zero_fft_borders", "zero_fft_borders_natural", "extract_real",
+            "fftshift2d_c", "zero_fft_borders", "extract_real",
             "align_local_search_460",
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
@@ -454,37 +437,8 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     return true;
 }
 
-// DISABLED pending verification of the Metal transcription.
-//
-// The mixed-radix index math is proven correct on the host
-// (tools/verify_stockham_fft.cpp, max relative error ~1.7e-7 against a naive
-// DFT at both pipeline lengths). What was never checked is whether the GPU
-// kernel implements that math correctly — the same gap that made the four-step
-// decomposition 2.6x slower despite verified arithmetic.
-//
-// The grey image feeds block matching, so a wrong grey makes every tile match
-// at an essentially random offset inside the search window. That matches the
-// observed flow exactly: spatially incoherent, magnitudes bounded near the
-// pyramid's total search range, unchanged by reverting the align kernels.
-//
-// Set true to re-enable once the kernel output is compared against Bluestein.
-static constexpr bool kUseStockham = false;
-// DISABLED after measurement: the four-step was 2.6x SLOWER than per-stage
-// Stockham (grey:fft-segments 1582ms -> 4161ms, burst 8570ms -> 11920ms).
-//
-// It does cut passes from 12 to 4, but it destroys coalescing. Pass A gathers
-// with in_i = N2, so consecutive lanes read addresses N2 floats apart and each
-// touches a separate cache line; pass B scatters with out_k = N1 and has the
-// same problem on the write side. Per-stage Stockham reads x[t + r*NR], which
-// is contiguous across lanes. An uncoalesced access costs roughly an order of
-// magnitude more than a coalesced one here, so 4 scattered passes lose badly to
-// 12 sequential ones.
-//
-// Making it pay off needs explicit transposes between the passes, which add
-// back the traffic the decomposition was meant to remove. The code is kept
-// because the index math is verified (tools/verify_fourstep_fft.cpp); only the
-// memory layout is wrong.
-static constexpr bool kUseFourStep = false;
+// Set false to fall back to Bluestein for non-power-of-two lengths.
+static constexpr bool kUseStockham = true;
 
 // Radices largest-first, matching the verified host prototype. Returns false if
 // anything other than 2/3/5/7 remains, in which case Bluestein still handles it.
@@ -506,11 +460,7 @@ static bool fft_factorize(uint32_t n, uint32_t* out, int cap, int& count) {
 // `data` and `pp`, which must be at least batch*stride complex elements.
 static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
                                uint32_t n, uint32_t stride, uint32_t batch,
-                               bool inverse, __strong id<MTLCommandBuffer>& cmd,
-                               uint32_t elem_off = 0u) {
-    // Byte offset lets a caller transform a sub-range of the batch rows. src and
-    // dst shift together so the ping-pong indices stay aligned.
-    const NSUInteger boff = (NSUInteger)elem_off * sizeof(float) * 2u;
+                               bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!data || !pp || n < 2u || batch == 0u || !cmd) return false;
 
@@ -543,8 +493,8 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:src offset:boff atIndex:0];
-        [enc setBuffer:dst offset:boff atIndex:1];
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
         [enc setBytes:&p length:sizeof(p) atIndex:2];
         dispatch2(enc, pipe, p.NR, batch);
         [enc endEncoding];
@@ -558,8 +508,8 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     if (src != data) {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:data offset:boff atIndex:0];
-        [enc setBuffer:src offset:boff atIndex:1];
+        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBuffer:src offset:0 atIndex:1];
         [enc setBytes:&n length:sizeof(n) atIndex:2];
         [enc setBytes:&stride length:sizeof(stride) atIndex:3];
         [enc setBytes:&batch length:sizeof(batch) atIndex:4];
@@ -568,115 +518,6 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     }
 
     // Same convention as the pow2 and Bluestein paths: the inverse divides by n.
-    if (inverse) {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        if (!enc) return false;
-        [enc setBuffer:data offset:boff atIndex:0];
-        [enc setBytes:&n length:sizeof(n) atIndex:1];
-        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
-        [enc setBytes:&batch length:sizeof(batch) atIndex:3];
-        dispatch2(enc, c.pipe("fft_scale_inv"), n, batch);
-        [enc endEncoding];
-    }
-    return true;
-}
-
-// Largest sub-transform kept on-chip. 2*n complex must fit threadgroup memory
-// (64 -> 1KB), and n=64 covers both pipeline lengths (4032=63*64, 3024=54*56).
-static constexpr uint32_t kMaxSubFft = 64;
-
-// Split n into n1*n2, both factorable and within the on-chip budget, as balanced
-// as possible. Mirrors the host prototype's chooser.
-static bool fft_split(uint32_t n, uint32_t& n1, uint32_t& n2) {
-    uint32_t best_a = 0, best_b = 0;
-    uint32_t rad[24];
-    int nr = 0;
-    for (uint32_t d = 2; d * d <= n; ++d) {
-        if (n % d) continue;
-        const uint32_t a = d, b = n / d;
-        if (a > kMaxSubFft || b > kMaxSubFft) continue;
-        if (!fft_factorize(a, rad, 24, nr)) continue;
-        if (!fft_factorize(b, rad, 24, nr)) continue;
-        if (!best_a || (b - a) < (best_b - best_a)) { best_a = a; best_b = b; }
-    }
-    if (!best_a) return false;
-    n1 = best_a;
-    n2 = best_b;
-    return true;
-}
-
-// One four-step pass: sub_count transforms of length n per batch row.
-static bool fft_small_pass(id<MTLBuffer> src, id<MTLBuffer> dst,
-                           uint32_t n, uint32_t sub_count, uint32_t row_stride,
-                           uint32_t in_b, uint32_t in_i, uint32_t out_b, uint32_t out_k,
-                           uint32_t twiddle_N, uint32_t batch, bool inverse,
-                           __strong id<MTLCommandBuffer>& cmd) {
-    auto& c = ctx();
-    struct SmallFftParamsCPU {
-        uint32_t n, sub_count, row_stride;
-        uint32_t in_b, in_i, out_b, out_k;
-        uint32_t twiddle_N, inverse, nrad;
-        uint32_t rad[6];
-        uint32_t _pad0;
-    };
-    static_assert(sizeof(SmallFftParamsCPU) == 68, "SmallFftParamsCPU layout");
-
-    uint32_t rad[24];
-    int nr = 0;
-    if (!fft_factorize(n, rad, 24, nr) || nr > 6) return false;
-
-    id<MTLComputePipelineState> pipe = c.pipe("fft_small_batched");
-    if (!pipe) return false;
-
-    SmallFftParamsCPU p{};
-    p.n = n;
-    p.sub_count = sub_count;
-    p.row_stride = row_stride;
-    p.in_b = in_b; p.in_i = in_i;
-    p.out_b = out_b; p.out_k = out_k;
-    p.twiddle_N = twiddle_N;
-    p.inverse = inverse ? 1u : 0u;
-    p.nrad = (uint32_t)nr;
-    for (int i = 0; i < nr; ++i) p.rad[i] = rad[i];
-
-    NSUInteger lanes = n;
-    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
-    const NSUInteger sh_bytes = ((2u * (size_t)n * sizeof(float) * 2u) + 15u) & ~(size_t)15u;
-    if (sh_bytes > c.device.maxThreadgroupMemoryLength) return false;
-
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:src offset:0 atIndex:0];
-    [enc setBuffer:dst offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    [enc setThreadgroupMemoryLength:sh_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(sub_count, batch, 1)
-        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
-    [enc endEncoding];
-    return true;
-}
-
-// Four-step: two passes of on-chip sub-transforms instead of one global pass per
-// radix stage. Needs the same ping-pong buffer Stockham uses.
-static bool fft1d_fourstep_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
-                               uint32_t n, uint32_t stride, uint32_t batch,
-                               bool inverse, __strong id<MTLCommandBuffer>& cmd) {
-    auto& c = ctx();
-    uint32_t n1 = 0, n2 = 0;
-    if (!data || !pp || !cmd || !fft_split(n, n1, n2)) return false;
-
-    // Pass A: for each n2, transform over n1; twiddle by W_N^(n2*k1); -> pp.
-    if (!fft_small_pass(data, pp, n1, n2, stride,
-                        /*in_b*/1u, /*in_i*/n2, /*out_b*/1u, /*out_k*/n2,
-                        /*twiddle_N*/n, batch, inverse, cmd))
-        return false;
-    // Pass B: for each k1, transform over n2; scatter to k2*N1 + k1; -> data.
-    if (!fft_small_pass(pp, data, n2, n1, stride,
-                        /*in_b*/n2, /*in_i*/1u, /*out_b*/1u, /*out_k*/n1,
-                        /*twiddle_N*/0u, batch, inverse, cmd))
-        return false;
-
     if (inverse) {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
@@ -691,22 +532,14 @@ static bool fft1d_fourstep_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
 }
 
 static bool fft1d_gpu(id<MTLBuffer> data, id<MTLBuffer> pp, uint32_t n, uint32_t stride,
-                      uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd,
-                      uint32_t elem_off = 0u) {
+                      uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
     if (kUseStockham && pp) {
-        // Four-step keeps both sub-transforms on-chip: 4 global touches per
-        // transform instead of 2 per radix stage. Only worth the two-pass
-        // structure once there are more than a couple of stages.
-        uint32_t n1 = 0, n2 = 0;
-        if (kUseFourStep && n > 256u && fft_split(n, n1, n2) &&
-            fft1d_fourstep_gpu(data, pp, n, stride, batch, inverse, cmd))
-            return true;
         int nrad = 0;
         uint32_t rad[24];
         if (fft_factorize(n, rad, 24, nrad))
-            return fft1d_stockham_gpu(data, pp, n, stride, batch, inverse, cmd, elem_off);
+            return fft1d_stockham_gpu(data, pp, n, stride, batch, inverse, cmd);
     }
     return fft1d_bluestein_gpu(data, n, stride, batch, inverse, cmd);
 }
@@ -731,18 +564,7 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, id<MTLBuffe
     auto& c = ctx();
     // Rows then columns stay on the GPU; Metal tracks buffer hazards in-CB.
     // Soft-commit only to bound encoder size — no waitUntilCompleted mid-FFT.
-    // Inverse: zero_fft_borders_natural zeroed rows [h/4, h - h/4), and the
-    // transform of an all-zero row is all zeros, which is already what those
-    // rows hold. Transforming only the surviving bands is equivalent and halves
-    // this pass. Row ranges match the zeroing kernel's expressions exactly.
-    const uint32_t keep_rows = h / 4u;
-    if (prune_lowpass && inverse && keep_rows > 0u && h > 2u * keep_rows) {
-        if (!fft1d_gpu(cbuf, pp, w, w, keep_rows, inverse, cmd, 0u)) return false;
-        if (!fft1d_gpu(cbuf, pp, w, w, keep_rows, inverse, cmd, (h - keep_rows) * w))
-            return false;
-    } else if (!fft1d_gpu(cbuf, pp, w, w, h, inverse, cmd)) {
-        return false;
-    }
+    if (!fft1d_gpu(cbuf, pp, w, w, h, inverse, cmd)) return false;
     if (!commit_cmd(cmd)) return false;
 
     const bool prune = prune_lowpass && !inverse && w >= 8u;
@@ -1081,10 +903,11 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     [enc endEncoding];
     real_in = nil; // release the local ref; the pool and the CB keep it alive
     // Prune: the border zeroing below discards these columns unconditionally.
-    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, false, cmd)) return Image();
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, false, cmd, /*prune_lowpass*/true))
+        return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
-    // In-place fftshift -> zero borders -> fftshift (even size: shift is involution)
+    // In-place fftshift → zero borders → fftshift (even size: shift is involution)
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:c0 offset:0 atIndex:0];
     [enc setBytes:&h length:sizeof(h) atIndex:1];
@@ -1713,48 +1536,6 @@ static std::vector<float> scipy_gaussian_kernel1d_metal(float sigma, int radius)
 
 // GPU valid-gauss + stride. Same math as grey_pyramid.cpp downsample_by.
 // __strong out-param: ARC requires it for id& (same as merge robustness helpers).
-// Upload a reference pyramid level once per burst rather than once per
-// comparison frame. Keyed on the host pointer, exactly like the ICA ref cache,
-// and dropped by metal_clear_ref_ica_cache at the same point.
-static id<MTLBuffer> ref_level_buf(const Image& r, int lvl) {
-    const size_t bytes = r.data.size() * sizeof(float);
-    if (bytes == 0) return nil;
-    if (lvl < 0 || lvl >= MetalCtx::kMaxPyrLevels)
-        return buf(r.data.data(), bytes);
-    auto& c = ctx();
-    const void* key = r.data.data();
-    MetalCtx::RefLevel& slot = c.ref_lvl[lvl];
-    if (slot.key == key && slot.img && slot.img.length >= bytes) return slot.img;
-    id<MTLBuffer> b = buf(key, bytes);
-    if (b) {
-        slot.key = key;
-        slot.img = b;
-    }
-    return b;
-}
-
-// Align stages commit without stalling the CPU. Command buffers on one queue
-// execute in commit order, so waiting on the most recently committed one implies
-// every earlier stage has finished. Each stage previously did commit +
-// waitUntilCompleted, roughly 14 CPU round trips per comparison frame:
-// comp:align measured 2608ms wall against only 512ms of actual GPU work.
-static __strong id<MTLCommandBuffer> g_align_last_cmd = nil;
-
-static void align_commit(id<MTLCommandBuffer> cmd) {
-    [cmd commit];
-    g_align_last_cmd = cmd;
-}
-
-// Wait for all committed align work. Required before any CPU read of a buffer
-// the align stages wrote.
-static bool align_drain() {
-    if (!g_align_last_cmd) return true;
-    [g_align_last_cmd waitUntilCompleted];
-    const bool ok = (g_align_last_cmd.status == MTLCommandBufferStatusCompleted);
-    g_align_last_cmd = nil;
-    return ok;
-}
-
 static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
                                __strong id<MTLBuffer>& dst, int& dh, int& dw) {
     if (factor <= 1) {
@@ -1778,15 +1559,6 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     dw = filt_w / factor;
     if (dh < 1 || dw < 1) return false;
 
-    // Freshly allocated on purpose, NOT pooled.
-    //
-    // Each pyramid level is its own command buffer, and align no longer waits
-    // between them. Metal tracks hazards within a command buffer but not across
-    // them, so a shared scratch buffer lets level N+1 overwrite temporaries that
-    // level N is still reading. Pooling these while the stages were synchronous
-    // was safe; combined with async commits it corrupted the moving pyramid,
-    // which showed up as a spatially incoherent flow field (neighbouring tiles
-    // disagreeing by ~25px instead of ~1px) and a near-black robustness mask.
     id<MTLBuffer> b_ker = buf(ker.data(), ker.size() * sizeof(float));
     id<MTLBuffer> b_tmp = buf(nullptr, (size_t)tmp_h * tmp_w * sizeof(float));
     id<MTLBuffer> b_filt = buf(nullptr, (size_t)filt_h * filt_w * sizeof(float));
@@ -1835,7 +1607,9 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     dispatch2(enc, c.pipe("pyr_subsample"), (NSUInteger)dw, (NSUInteger)dh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:downsample");
-    align_commit(cmd);
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
     dst = b_out;
     return true;
 }
@@ -1911,11 +1685,35 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    dispatch1(enc, pipe, (NSUInteger)ny * (NSUInteger)nx);
+
+    // One threadgroup per tile: lanes split the candidate shifts and the kernel
+    // stages the reference tile on-chip. `lanes` must be a power of two for the
+    // tree reduction, and is capped so the tile plus the two reduction arrays
+    // fit the device's threadgroup memory budget.
+    // Threadgroup allocations must be 16-byte aligned.
+    auto align16 = [](NSUInteger n) -> NSUInteger { return (n + 15u) & ~(NSUInteger)15u; };
+    const NSUInteger tile_bytes =
+        align16((NSUInteger)tile_size * (NSUInteger)tile_size * sizeof(float));
+    const NSUInteger tg_limit = c.device.maxThreadgroupMemoryLength;
+    NSUInteger lanes = 64;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    auto red_bytes = [&](NSUInteger n) -> NSUInteger {
+        return align16(n * sizeof(float)) + align16(n * sizeof(int));
+    };
+    while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
+    if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
+
+    [enc setComputePipelineState:pipe];
+    [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:1];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
-    align_commit(cmd);
-    return true;
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
 
 static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
@@ -1965,8 +1763,9 @@ static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_fl
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:l1-block-match");
-    align_commit(cmd);
-    return true;
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
 
 static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy,
@@ -2009,15 +1808,26 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
     id<MTLComputePipelineState> pipe = c.pipe("ica_refine_tile");
     if (!pipe) return false;
     [enc setComputePipelineState:pipe];
+    // One threadgroup per tile; lanes cover the tile's pixels and drive the
+    // butterfly reduction. n_pix (64 or 256 for the ts<=16 path) is a power of
+    // two, which the reduction pairing requires.
     const NSUInteger n = (NSUInteger)ny * (NSUInteger)nx;
-    NSUInteger tg = std::min(n, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
-    if (tg == 0) tg = 1;
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    const NSUInteger n_pix = (NSUInteger)tile_size * (NSUInteger)tile_size;
+    auto align16 = [](NSUInteger v) -> NSUInteger { return (v + 15u) & ~(NSUInteger)15u; };
+    const NSUInteger stage_bytes = align16(n_pix * sizeof(float));
+    NSUInteger lanes = n_pix;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    if (2 * stage_bytes > c.device.maxThreadgroupMemoryLength) return false;
+
+    [enc setThreadgroupMemoryLength:stage_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:stage_bytes atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:ica-refine");
-    align_commit(cmd);
-    return true;
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
 
 } // namespace
@@ -2194,9 +2004,10 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:prep-sobel-hessian");
-    align_commit(cmd);
-    const bool ok = true;
-    if (key) {
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
+    if (ok && key) {
         c.ica_ref_key = key;
         c.ica_ref = b_ref;
         c.ica_gx = b_gx;
@@ -2258,8 +2069,9 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:upscale-flow");
-    align_commit(cmd);
-    return true;
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return cmd.status == MTLCommandBufferStatusCompleted;
 }
 
 } // namespace
@@ -2273,11 +2085,6 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!metal_gpu_init()) return false;
     // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
     ProfStageScope prof_stage("align:soft-segments");
-    // Drain, don't just drop the reference: several paths below return early
-    // without reaching the drain at the end, which would leave GPU work in
-    // flight while the memcpy into the pooled moving-grey buffer below
-    // overwrites what that work is still reading.
-    (void)align_drain();
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
     if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
@@ -2295,12 +2102,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
     auto& c = ctx();
     Image moving_padded_grey = pad_image_circular(moving_grey, tile_size);
-    // Pooled: same size every frame, contents overwritten. Previously a fresh
-    // multi-MB allocation per comparison frame.
-    const size_t mov0_bytes = moving_padded_grey.data.size() * sizeof(float);
-    id<MTLBuffer> mov0 = c.scratch(c.align_mov0, c.align_mov0_b, mov0_bytes);
+    id<MTLBuffer> mov0 = buf(moving_padded_grey.data.data(),
+                             moving_padded_grey.data.size() * sizeof(float));
     if (!mov0) return false;
-    memcpy([mov0 contents], moving_padded_grey.data.data(), mov0_bytes);
 
     struct Lev {
         id<MTLBuffer> img = nil;
@@ -2339,8 +2143,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
-        // Cached across comparison frames: the reference does not change.
-        id<MTLBuffer> b_ref = ref_level_buf(r, lvl);
+        id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
         if (!b_ref) return false;
         int ny = r.h / ts;
         int nx = r.w / ts;
@@ -2384,49 +2187,27 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
-        // Block matching only; ICA runs once below on the finest level.
+        id<MTLBuffer> b_ica_ref = nil, b_gx = nil, b_gy = nil, b_hess = nil;
+        int ica_ny = 0, ica_nx = 0;
+        if (!prep_level_ica_gpu(r, ts, b_ica_ref, b_gx, b_gy, b_hess,
+                                ica_ny, ica_nx))
+            return false;
+        if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
+        if (lvl == 0 && !g_dumped_ref_grads && b_gx && b_gy) {
+            debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
+                           (size_t)r.h * (size_t)r.w);
+            debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
+                           (size_t)r.h * (size_t)r.w);
+            g_dumped_ref_grads = true;
+        }
+        if (!ica_bufs(b_ica_ref, b_gx, b_gy, b_hess, m.img, b_flow,
+                      r.h, r.w, m.h, m.w, flow_ny, flow_nx, ts,
+                      cfg.ica_n_iter))
+            return false;
+
+        // Level ICA buffers drop here; refined flow stays resident.
     }
 
-    // ICA on the finest level, matching the CPU path and d5215ec. Per-level
-    // refinement was tried and reverted, so this runs once per comparison frame
-    // instead of once per pyramid level.
-    if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
-    id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
-    int ica_ny = 0, ica_nx = 0;
-    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
-                            ica_ny, ica_nx))
-        return false;
-    if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
-    if (!g_dumped_ref_grads && b_gx && b_gy && debug_dumps_enabled()) {
-        // CPU read of GPU-written buffers: align no longer stalls per stage, so
-        // this debug path drains explicitly. Gated on dumps being enabled so
-        // production never pays for it.
-        if (!align_drain()) return false;
-        debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
-                       (size_t)ref_grey.h * (size_t)ref_grey.w);
-        debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
-                       (size_t)ref_grey.h * (size_t)ref_grey.w);
-        g_dumped_ref_grads = true;
-    }
-    // The moving grey is already resident from compute_grey_fft_metal, so reuse
-    // it rather than re-uploading the full-resolution frame.
-    id<MTLBuffer> b_mov_native = nil;
-    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
-        c.sticky_grey_w == moving_grey.w) {
-        b_mov_native = c.sticky_grey;
-    } else {
-        b_mov_native = buf(moving_grey.data.data(),
-                           moving_grey.data.size() * sizeof(float));
-    }
-    if (!b_mov_native) return false;
-    if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
-                  ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
-                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
-        return false;
-
-    // Single sync point for the whole align: everything above was committed
-    // without stalling, and queue order guarantees it has all completed.
-    if (!align_drain()) return false;
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
@@ -2436,13 +2217,6 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
 void metal_clear_ref_ica_cache() {
     auto& c = ctx();
-    // Reference pyramid uploads have the same lifetime as the ICA ref cache:
-    // valid for one burst, dropped before merge needs the memory.
-    for (int i = 0; i < MetalCtx::kMaxPyrLevels; ++i) c.ref_lvl[i] = {};
-    c.align_mov0 = nil;
-    c.align_mov0_b = 0;
-    c.ds_ker = nil; c.ds_tmp = nil; c.ds_filt = nil;
-    c.ds_ker_b = c.ds_tmp_b = c.ds_filt_b = 0;
     c.ica_ref_key = nullptr;
     c.ica_ref = nil;
     c.ica_gx = nil;
@@ -2930,12 +2704,6 @@ void metal_trim_analyze_scratch() {
     c.scratch_cols_bytes = 0;
     c.sticky_grey = nil;
     c.sticky_grey_h = c.sticky_grey_w = 0;
-    // Align-side caches are analyze-only; merge must not inherit them.
-    for (int i = 0; i < MetalCtx::kMaxPyrLevels; ++i) c.ref_lvl[i] = {};
-    c.align_mov0 = nil;
-    c.align_mov0_b = 0;
-    c.ds_ker = nil; c.ds_tmp = nil; c.ds_filt = nil;
-    c.ds_ker_b = c.ds_tmp_b = c.ds_filt_b = 0;
     c.ica_ref_key = nullptr;
     c.ica_ref = nil;
     c.ica_gx = nil;
