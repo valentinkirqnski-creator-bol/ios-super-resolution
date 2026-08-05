@@ -9,6 +9,7 @@
 #include "parallel.h"
 #include "debug_utils.h"
 #include "prof.h"
+#include "preset_lut.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #endif
@@ -704,8 +705,21 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
                     preview_lin[2] = cn2 * wb2;
                 }
                 const int px = std::min(pw - 1, (int)(x * pscale));
-                for (int k = 0; k < 3; ++k)
-                    preview.at(py, px, k) = to_srgb(clampf(preview_lin[k], 0.f, 1.f));
+                if (preset_lut_enabled()) {
+                    // The LUT was fitted from the DNG's linear values straight
+                    // to final sRGB, so it already contains white balance, the
+                    // colour matrix and gamma. Feed it the unmodified merge
+                    // rather than the matrixed preview_lin above, or those
+                    // steps get applied twice.
+                    const f32 dng_lin[3] = {lin0, lin1, lin2};
+                    f32 srgb[3];
+                    preset_lut_apply(dng_lin, srgb);
+                    for (int k = 0; k < 3; ++k)
+                        preview.at(py, px, k) = clampf(srgb[k], 0.f, 1.f);
+                } else {
+                    for (int k = 0; k < 3; ++k)
+                        preview.at(py, px, k) = to_srgb(clampf(preview_lin[k], 0.f, 1.f));
+                }
             }
         }
     });

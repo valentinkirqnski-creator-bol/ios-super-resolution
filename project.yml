@@ -49,6 +49,7 @@ targets:
           - "raw_io.cpp"
           - "dng_writer.cpp"
           - "snr_tuning.cpp"
+          - "preset_lut.cpp"
           - "metal_gpu.mm"
           - "debug_utils.mm"
           - "prof.mm"
