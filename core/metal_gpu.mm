@@ -1761,15 +1761,18 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     dw = filt_w / factor;
     if (dh < 1 || dw < 1) return false;
 
-    // Kernel and the two conv temporaries are transient within this call, so
-    // they come from grow-only pools; both convolutions write every element
-    // they read back, so reuse without clearing is safe. b_out stays a fresh
-    // allocation: it becomes a pyramid level and must outlive the call.
-    const size_t ker_b = ker.size() * sizeof(float);
-    id<MTLBuffer> b_ker = c.scratch(c.ds_ker, c.ds_ker_b, ker_b);
-    if (b_ker) memcpy([b_ker contents], ker.data(), ker_b);
-    id<MTLBuffer> b_tmp = c.scratch(c.ds_tmp, c.ds_tmp_b, (size_t)tmp_h * tmp_w * sizeof(float));
-    id<MTLBuffer> b_filt = c.scratch(c.ds_filt, c.ds_filt_b, (size_t)filt_h * filt_w * sizeof(float));
+    // Freshly allocated on purpose, NOT pooled.
+    //
+    // Each pyramid level is its own command buffer, and align no longer waits
+    // between them. Metal tracks hazards within a command buffer but not across
+    // them, so a shared scratch buffer lets level N+1 overwrite temporaries that
+    // level N is still reading. Pooling these while the stages were synchronous
+    // was safe; combined with async commits it corrupted the moving pyramid,
+    // which showed up as a spatially incoherent flow field (neighbouring tiles
+    // disagreeing by ~25px instead of ~1px) and a near-black robustness mask.
+    id<MTLBuffer> b_ker = buf(ker.data(), ker.size() * sizeof(float));
+    id<MTLBuffer> b_tmp = buf(nullptr, (size_t)tmp_h * tmp_w * sizeof(float));
+    id<MTLBuffer> b_filt = buf(nullptr, (size_t)filt_h * filt_w * sizeof(float));
     id<MTLBuffer> b_out = buf(nullptr, (size_t)dh * dw * sizeof(float));
     if (!b_ker || !b_tmp || !b_filt || !b_out) return false;
 
@@ -2286,7 +2289,11 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!metal_gpu_init()) return false;
     // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
     ProfStageScope prof_stage("align:soft-segments");
-    g_align_last_cmd = nil;
+    // Drain, don't just drop the reference: several paths below return early
+    // without reaching the drain at the end, which would leave GPU work in
+    // flight while the memcpy into the pooled moving-grey buffer below
+    // overwrites what that work is still reading.
+    (void)align_drain();
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
     if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
