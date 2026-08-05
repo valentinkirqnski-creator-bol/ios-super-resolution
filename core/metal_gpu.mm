@@ -493,7 +493,11 @@ static bool fft_factorize(uint32_t n, uint32_t* out, int cap, int& count) {
 // `data` and `pp`, which must be at least batch*stride complex elements.
 static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
                                uint32_t n, uint32_t stride, uint32_t batch,
-                               bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+                               bool inverse, __strong id<MTLCommandBuffer>& cmd,
+                               uint32_t elem_off = 0u) {
+    // Byte offset lets a caller transform a sub-range of the batch rows. src and
+    // dst shift together so the ping-pong indices stay aligned.
+    const NSUInteger boff = (NSUInteger)elem_off * sizeof(float) * 2u;
     auto& c = ctx();
     if (!data || !pp || n < 2u || batch == 0u || !cmd) return false;
 
@@ -526,8 +530,8 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:src offset:0 atIndex:0];
-        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBuffer:src offset:boff atIndex:0];
+        [enc setBuffer:dst offset:boff atIndex:1];
         [enc setBytes:&p length:sizeof(p) atIndex:2];
         dispatch2(enc, pipe, p.NR, batch);
         [enc endEncoding];
@@ -541,8 +545,8 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     if (src != data) {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:data offset:0 atIndex:0];
-        [enc setBuffer:src offset:0 atIndex:1];
+        [enc setBuffer:data offset:boff atIndex:0];
+        [enc setBuffer:src offset:boff atIndex:1];
         [enc setBytes:&n length:sizeof(n) atIndex:2];
         [enc setBytes:&stride length:sizeof(stride) atIndex:3];
         [enc setBytes:&batch length:sizeof(batch) atIndex:4];
@@ -663,7 +667,7 @@ static bool fft1d_fourstep_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     if (inverse) {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBuffer:data offset:boff atIndex:0];
         [enc setBytes:&n length:sizeof(n) atIndex:1];
         [enc setBytes:&stride length:sizeof(stride) atIndex:2];
         [enc setBytes:&batch length:sizeof(batch) atIndex:3];
@@ -674,7 +678,8 @@ static bool fft1d_fourstep_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
 }
 
 static bool fft1d_gpu(id<MTLBuffer> data, id<MTLBuffer> pp, uint32_t n, uint32_t stride,
-                      uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+                      uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd,
+                      uint32_t elem_off = 0u) {
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
     if (kUseStockham && pp) {
@@ -688,7 +693,7 @@ static bool fft1d_gpu(id<MTLBuffer> data, id<MTLBuffer> pp, uint32_t n, uint32_t
         int nrad = 0;
         uint32_t rad[24];
         if (fft_factorize(n, rad, 24, nrad))
-            return fft1d_stockham_gpu(data, pp, n, stride, batch, inverse, cmd);
+            return fft1d_stockham_gpu(data, pp, n, stride, batch, inverse, cmd, elem_off);
     }
     return fft1d_bluestein_gpu(data, n, stride, batch, inverse, cmd);
 }
@@ -713,7 +718,18 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, id<MTLBuffe
     auto& c = ctx();
     // Rows then columns stay on the GPU; Metal tracks buffer hazards in-CB.
     // Soft-commit only to bound encoder size — no waitUntilCompleted mid-FFT.
-    if (!fft1d_gpu(cbuf, pp, w, w, h, inverse, cmd)) return false;
+    // Inverse: zero_fft_borders_natural zeroed rows [h/4, h - h/4), and the
+    // transform of an all-zero row is all zeros, which is already what those
+    // rows hold. Transforming only the surviving bands is equivalent and halves
+    // this pass. Row ranges match the zeroing kernel's expressions exactly.
+    const uint32_t keep_rows = h / 4u;
+    if (prune_lowpass && inverse && keep_rows > 0u && h > 2u * keep_rows) {
+        if (!fft1d_gpu(cbuf, pp, w, w, keep_rows, inverse, cmd, 0u)) return false;
+        if (!fft1d_gpu(cbuf, pp, w, w, keep_rows, inverse, cmd, (h - keep_rows) * w))
+            return false;
+    } else if (!fft1d_gpu(cbuf, pp, w, w, h, inverse, cmd)) {
+        return false;
+    }
     if (!commit_cmd(cmd)) return false;
 
     const bool prune = prune_lowpass && !inverse && w >= 8u;
@@ -1070,7 +1086,8 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     dispatch2(enc, c.pipe("zero_fft_borders_natural"), w, h);
     [enc endEncoding];
 
-    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd)) return Image();
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd, /*prune_lowpass*/true))
+        return Image();
 
     id<MTLBuffer> real_out = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
     if (!real_out) return Image();
