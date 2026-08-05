@@ -1081,26 +1081,30 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     [enc endEncoding];
     real_in = nil; // release the local ref; the pool and the CB keep it alive
     // Prune: the border zeroing below discards these columns unconditionally.
-    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, false, cmd, /*prune_lowpass*/true))
-        return Image();
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, false, cmd)) return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
-    // Border zeroing, stated in natural order. This replaced
-    // fftshift_x, fftshift_y, zero_fft_borders, fftshift_x, fftshift_y: each
-    // shift kernel reads and writes the whole frame, so four full passes over
-    // the complex buffer existed only to express the zeroing in shifted
-    // coordinates. fftshift is an involution, so shift -> zero -> shift equals
-    // zeroing the corresponding natural-order region, which is the same region
-    // the forward column pruning above already skips. Identical result.
+    // In-place fftshift -> zero borders -> fftshift (even size: shift is involution)
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:c0 offset:0 atIndex:0];
     [enc setBytes:&h length:sizeof(h) atIndex:1];
     [enc setBytes:&w length:sizeof(w) atIndex:2];
-    dispatch2(enc, c.pipe("zero_fft_borders_natural"), w, h);
+    dispatch2(enc, c.pipe("fftshift_swap_x"), w / 2u, h);
+    dispatch2(enc, c.pipe("fftshift_swap_y"), w, h / 2u);
+
+    [enc setBuffer:c0 offset:0 atIndex:0];
+    [enc setBytes:&h length:sizeof(h) atIndex:1];
+    [enc setBytes:&w length:sizeof(w) atIndex:2];
+    dispatch2(enc, c.pipe("zero_fft_borders"), w, h);
+
+    [enc setBuffer:c0 offset:0 atIndex:0];
+    [enc setBytes:&h length:sizeof(h) atIndex:1];
+    [enc setBytes:&w length:sizeof(w) atIndex:2];
+    dispatch2(enc, c.pipe("fftshift_swap_x"), w / 2u, h);
+    dispatch2(enc, c.pipe("fftshift_swap_y"), w, h / 2u);
     [enc endEncoding];
 
-    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd, /*prune_lowpass*/true))
-        return Image();
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd)) return Image();
 
     id<MTLBuffer> real_out = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
     if (!real_out) return Image();
