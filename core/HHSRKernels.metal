@@ -111,19 +111,25 @@ kernel void fft1d_butterfly(device float2* data [[buffer(0)]],
     uint group = id / half_n;
     uint k = id % half_n;
     uint i = group * len;
-    float ang = (inverse != 0 ? 2.f : -2.f) * PI / float(len);
-    float2 wlen = float2(cos(ang), sin(ang));
-    // w = wlen^k
-    float2 w = float2(1.f, 0.f);
-    {
-        uint kk = k;
-        float2 b = wlen;
-        while (kk != 0u) {
-            if ((kk & 1u) != 0u) w = cmul(w, b);
-            b = cmul(b, b);
-            kk >>= 1;
-        }
-    }
+
+    // Twiddle w = exp(sign * 2*pi*i*k/len), evaluated directly.
+    //
+    // This previously built wlen = exp(sign*2*pi*i/len) and raised it to the
+    // k-th power by binary exponentiation: up to ~13 complex multiplies plus
+    // ~13 squarings per thread. That is roughly 26 complex multiplies to set up
+    // a butterfly that performs exactly one, so the kernel spent most of its
+    // arithmetic generating twiddles rather than transforming data, and this is
+    // the innermost kernel of every FFT stage in the pipeline.
+    //
+    // wlen^k is exp(i*ang*k) by definition, so evaluating the angle directly is
+    // mathematically the same value. It is also more accurate: repeated squaring
+    // compounds rounding at every step, while this is a single trig evaluation.
+    // Results move in the last few ULPs, well under one 16-bit LSB.
+    //
+    // k < len/2, so the angle stays within [-pi, pi] and needs no reduction.
+    float ang = (inverse != 0 ? 2.f : -2.f) * PI * (float(k) / float(len));
+    float2 w = float2(cos(ang), sin(ang));
+
     device float2* a = data + batch * stride;
     float2 u = a[i + k];
     float2 v = cmul(a[i + k + half_n], w);
