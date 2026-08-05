@@ -154,7 +154,7 @@ static MetalCtx& ctx() {
         const char* need[] = {
             "raw16_to_float_bayer",
             "fft1d_pow2_cpp", "fft1d_bitrev", "fft1d_butterfly", "fft_scale_inv", "make_chirp",
-            "fft_stockham_stage", "fft_copy_batch",
+            "fft_stockham_stage", "fft_copy_batch", "fft_small_batched",
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
@@ -456,6 +456,8 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
 
 // Set false to fall back to Bluestein for non-power-of-two lengths.
 static constexpr bool kUseStockham = true;
+// Set false to use per-stage Stockham instead of the two-pass four-step form.
+static constexpr bool kUseFourStep = true;
 
 // Radices largest-first, matching the verified host prototype. Returns false if
 // anything other than 2/3/5/7 remains, in which case Bluestein still handles it.
@@ -548,11 +550,127 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     return true;
 }
 
+// Largest sub-transform kept on-chip. 2*n complex must fit threadgroup memory
+// (64 -> 1KB), and n=64 covers both pipeline lengths (4032=63*64, 3024=54*56).
+static constexpr uint32_t kMaxSubFft = 64;
+
+// Split n into n1*n2, both factorable and within the on-chip budget, as balanced
+// as possible. Mirrors the host prototype's chooser.
+static bool fft_split(uint32_t n, uint32_t& n1, uint32_t& n2) {
+    uint32_t best_a = 0, best_b = 0;
+    uint32_t rad[24];
+    int nr = 0;
+    for (uint32_t d = 2; d * d <= n; ++d) {
+        if (n % d) continue;
+        const uint32_t a = d, b = n / d;
+        if (a > kMaxSubFft || b > kMaxSubFft) continue;
+        if (!fft_factorize(a, rad, 24, nr)) continue;
+        if (!fft_factorize(b, rad, 24, nr)) continue;
+        if (!best_a || (b - a) < (best_b - best_a)) { best_a = a; best_b = b; }
+    }
+    if (!best_a) return false;
+    n1 = best_a;
+    n2 = best_b;
+    return true;
+}
+
+// One four-step pass: sub_count transforms of length n per batch row.
+static bool fft_small_pass(id<MTLBuffer> src, id<MTLBuffer> dst,
+                           uint32_t n, uint32_t sub_count, uint32_t row_stride,
+                           uint32_t in_b, uint32_t in_i, uint32_t out_b, uint32_t out_k,
+                           uint32_t twiddle_N, uint32_t batch, bool inverse,
+                           __strong id<MTLCommandBuffer>& cmd) {
+    auto& c = ctx();
+    struct SmallFftParamsCPU {
+        uint32_t n, sub_count, row_stride;
+        uint32_t in_b, in_i, out_b, out_k;
+        uint32_t twiddle_N, inverse, nrad;
+        uint32_t rad[6];
+        uint32_t _pad0;
+    };
+    static_assert(sizeof(SmallFftParamsCPU) == 68, "SmallFftParamsCPU layout");
+
+    uint32_t rad[24];
+    int nr = 0;
+    if (!fft_factorize(n, rad, 24, nr) || nr > 6) return false;
+
+    id<MTLComputePipelineState> pipe = c.pipe("fft_small_batched");
+    if (!pipe) return false;
+
+    SmallFftParamsCPU p{};
+    p.n = n;
+    p.sub_count = sub_count;
+    p.row_stride = row_stride;
+    p.in_b = in_b; p.in_i = in_i;
+    p.out_b = out_b; p.out_k = out_k;
+    p.twiddle_N = twiddle_N;
+    p.inverse = inverse ? 1u : 0u;
+    p.nrad = (uint32_t)nr;
+    for (int i = 0; i < nr; ++i) p.rad[i] = rad[i];
+
+    NSUInteger lanes = n;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    const NSUInteger sh_bytes = ((2u * (size_t)n * sizeof(float) * 2u) + 15u) & ~(size_t)15u;
+    if (sh_bytes > c.device.maxThreadgroupMemoryLength) return false;
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:src offset:0 atIndex:0];
+    [enc setBuffer:dst offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    [enc setThreadgroupMemoryLength:sh_bytes atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(sub_count, batch, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
+    [enc endEncoding];
+    return true;
+}
+
+// Four-step: two passes of on-chip sub-transforms instead of one global pass per
+// radix stage. Needs the same ping-pong buffer Stockham uses.
+static bool fft1d_fourstep_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
+                               uint32_t n, uint32_t stride, uint32_t batch,
+                               bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+    auto& c = ctx();
+    uint32_t n1 = 0, n2 = 0;
+    if (!data || !pp || !cmd || !fft_split(n, n1, n2)) return false;
+
+    // Pass A: for each n2, transform over n1; twiddle by W_N^(n2*k1); -> pp.
+    if (!fft_small_pass(data, pp, n1, n2, stride,
+                        /*in_b*/1u, /*in_i*/n2, /*out_b*/1u, /*out_k*/n2,
+                        /*twiddle_N*/n, batch, inverse, cmd))
+        return false;
+    // Pass B: for each k1, transform over n2; scatter to k2*N1 + k1; -> data.
+    if (!fft_small_pass(pp, data, n2, n1, stride,
+                        /*in_b*/n2, /*in_i*/1u, /*out_b*/1u, /*out_k*/n1,
+                        /*twiddle_N*/0u, batch, inverse, cmd))
+        return false;
+
+    if (inverse) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
+        [enc setBytes:&batch length:sizeof(batch) atIndex:3];
+        dispatch2(enc, c.pipe("fft_scale_inv"), n, batch);
+        [enc endEncoding];
+    }
+    return true;
+}
+
 static bool fft1d_gpu(id<MTLBuffer> data, id<MTLBuffer> pp, uint32_t n, uint32_t stride,
                       uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
     if (kUseStockham && pp) {
+        // Four-step keeps both sub-transforms on-chip: 4 global touches per
+        // transform instead of 2 per radix stage. Only worth the two-pass
+        // structure once there are more than a couple of stages.
+        uint32_t n1 = 0, n2 = 0;
+        if (kUseFourStep && n > 256u && fft_split(n, n1, n2) &&
+            fft1d_fourstep_gpu(data, pp, n, stride, batch, inverse, cmd))
+            return true;
         int nrad = 0;
         uint32_t rad[24];
         if (fft_factorize(n, rad, 24, nrad))

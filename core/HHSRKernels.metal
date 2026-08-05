@@ -146,6 +146,103 @@ kernel void fft_stockham_stage(device const float2* src [[buffer(0)]],
     for (uint r = 0u; r < R; ++r) y[base + r * p.Ns] = v[r];
 }
 
+// ---------------------------------------------------------------------------
+// Four-step FFT sub-transform.
+//
+// fft_stockham_stage costs one global read plus one global write per stage, so a
+// 6-stage 4032-point transform touches the array 12 times. Splitting N = N1*N2
+// (4032 = 63*64, 3024 = 54*56) turns it into two passes of small sub-transforms
+// that live entirely in threadgroup memory: 4 touches instead of 12, and these
+// kernels are bandwidth-bound.
+//
+//   n = n1*N2 + n2,  k = k2*N1 + k1
+//   pass A: N2 transforms of size N1 over n1, then twiddle by W_N^(n2*k1)
+//   pass B: N1 transforms of size N2 over n2, written to k2*N1 + k1
+//
+// One kernel serves both passes: the caller supplies the gather/scatter strides.
+// Sub-transform indices are grp.x, the batch row is grp.y. Index math is a
+// transcription of a host prototype checked against a naive DFT.
+//
+// Threadgroup memory is 2*n complex (Stockham ping-pong); at n <= 64 that is 1KB.
+struct SmallFftParams {
+    uint n;             // sub-transform length
+    uint sub_count;     // sub-transforms per row (grid.x)
+    uint row_stride;    // distance between batch rows
+    uint in_b, in_i;    // src = row*row_stride + b*in_b + i*in_i
+    uint out_b, out_k;  // dst = row*row_stride + b*out_b + k*out_k
+    uint twiddle_N;     // 0 = none; else scale output k by W_N^(b*k)
+    uint inverse;
+    uint nrad;
+    uint rad[6];        // radices, applied in order
+    uint _pad0;         // 64 bytes for setBytes
+};
+
+kernel void fft_small_batched(device const float2* src [[buffer(0)]],
+                              device float2* dst [[buffer(1)]],
+                              constant SmallFftParams& p [[buffer(2)]],
+                              threadgroup float2* sh [[threadgroup(0)]],
+                              uint2 grp [[threadgroup_position_in_grid]],
+                              uint lane [[thread_position_in_threadgroup]],
+                              uint lanes [[threads_per_threadgroup]]) {
+    const uint b = grp.x;
+    const uint row = grp.y;
+    if (b >= p.sub_count) return;   // uniform across the threadgroup
+
+    const uint n = p.n;
+    const uint in_base = row * p.row_stride + b * p.in_b;
+    const uint out_base = row * p.row_stride + b * p.out_b;
+    const float sgn = (p.inverse != 0u) ? 2.f : -2.f;
+
+    threadgroup float2* x = sh;
+    threadgroup float2* y = sh + n;
+
+    for (uint i = lane; i < n; i += lanes) x[i] = src[in_base + i * p.in_i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint Ns = 1u;
+    for (uint s = 0u; s < p.nrad; ++s) {
+        const uint R = p.rad[s];
+        const uint NR = n / R;
+        // Roots of unity for this radix; W[(k*m)%R] reproduces the reference
+        // DFT's values and summation order.
+        float2 W[8];
+        for (uint i = 0u; i < R; ++i) {
+            const float a = sgn * PI * float(i) / float(R);
+            W[i] = float2(cos(a), sin(a));
+        }
+        for (uint t = lane; t < NR; t += lanes) {
+            const uint j = t % Ns;
+            const float ang = sgn * PI * float(j) / float(Ns * R);
+            float2 v[8];
+            for (uint r = 0u; r < R; ++r) {
+                const float a = ang * float(r);
+                v[r] = cmul(x[t + r * NR], float2(cos(a), sin(a)));
+            }
+            float2 tv[8];
+            for (uint i = 0u; i < R; ++i) tv[i] = v[i];
+            for (uint k = 0u; k < R; ++k) {
+                float2 acc = float2(0.f, 0.f);
+                for (uint m = 0u; m < R; ++m) acc += cmul(tv[m], W[(k * m) % R]);
+                v[k] = acc;
+            }
+            const uint base = (t / Ns) * Ns * R + j;
+            for (uint r = 0u; r < R; ++r) y[base + r * Ns] = v[r];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float2* sw = x; x = y; y = sw;
+        Ns *= R;
+    }
+
+    for (uint k = lane; k < n; k += lanes) {
+        float2 val = x[k];
+        if (p.twiddle_N != 0u) {
+            const float a = sgn * PI * float((b * k) % p.twiddle_N) / float(p.twiddle_N);
+            val = cmul(val, float2(cos(a), sin(a)));
+        }
+        dst[out_base + k * p.out_k] = val;
+    }
+}
+
 // Copy a batch of vectors; used when an odd stage count leaves the Stockham
 // result in the ping-pong buffer.
 kernel void fft_copy_batch(device float2* dst [[buffer(0)]],
