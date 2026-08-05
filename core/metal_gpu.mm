@@ -1697,6 +1697,28 @@ static id<MTLBuffer> ref_level_buf(const Image& r, int lvl) {
     return b;
 }
 
+// Align stages commit without stalling the CPU. Command buffers on one queue
+// execute in commit order, so waiting on the most recently committed one implies
+// every earlier stage has finished. Each stage previously did commit +
+// waitUntilCompleted, roughly 14 CPU round trips per comparison frame:
+// comp:align measured 2608ms wall against only 512ms of actual GPU work.
+static __strong id<MTLCommandBuffer> g_align_last_cmd = nil;
+
+static void align_commit(id<MTLCommandBuffer> cmd) {
+    [cmd commit];
+    g_align_last_cmd = cmd;
+}
+
+// Wait for all committed align work. Required before any CPU read of a buffer
+// the align stages wrote.
+static bool align_drain() {
+    if (!g_align_last_cmd) return true;
+    [g_align_last_cmd waitUntilCompleted];
+    const bool ok = (g_align_last_cmd.status == MTLCommandBufferStatusCompleted);
+    g_align_last_cmd = nil;
+    return ok;
+}
+
 static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
                                __strong id<MTLBuffer>& dst, int& dh, int& dw) {
     if (factor <= 1) {
@@ -1774,9 +1796,7 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     dispatch2(enc, c.pipe("pyr_subsample"), (NSUInteger)dw, (NSUInteger)dh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:downsample");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    align_commit(cmd);
     dst = b_out;
     return true;
 }
@@ -1878,9 +1898,8 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
@@ -1930,9 +1949,8 @@ static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_fl
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:l1-block-match");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy,
@@ -1992,9 +2010,8 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:ica-refine");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 } // namespace
@@ -2171,10 +2188,9 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:prep-sobel-hessian");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
-    if (ok && key) {
+    align_commit(cmd);
+    const bool ok = true;
+    if (key) {
         c.ica_ref_key = key;
         c.ica_ref = b_ref;
         c.ica_gx = b_gx;
@@ -2236,9 +2252,8 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:upscale-flow");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 } // namespace
@@ -2252,6 +2267,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!metal_gpu_init()) return false;
     // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
     ProfStageScope prof_stage("align:soft-segments");
+    g_align_last_cmd = nil;
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
     if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
@@ -2364,7 +2380,11 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                 ica_ny, ica_nx))
             return false;
         if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
-        if (lvl == 0 && !g_dumped_ref_grads && b_gx && b_gy) {
+        if (lvl == 0 && !g_dumped_ref_grads && b_gx && b_gy && debug_dumps_enabled()) {
+            // CPU read of GPU-written buffers: the align stages no longer stall,
+            // so this debug path has to drain explicitly. Gated on dumps being
+            // enabled so production never pays for it.
+            if (!align_drain()) return false;
             debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
                            (size_t)r.h * (size_t)r.w);
             debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
@@ -2379,6 +2399,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // Level ICA buffers drop here; refined flow stays resident.
     }
 
+    // Single sync point for the whole align: everything above was committed
+    // without stalling, and queue order guarantees it has all completed.
+    if (!align_drain()) return false;
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
