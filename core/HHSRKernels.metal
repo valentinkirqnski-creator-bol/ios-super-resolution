@@ -181,9 +181,16 @@ kernel void fft_small_batched(device const float2* src [[buffer(0)]],
                               device float2* dst [[buffer(1)]],
                               constant SmallFftParams& p [[buffer(2)]],
                               threadgroup float2* sh [[threadgroup(0)]],
+                              // MSL requires every grid/threadgroup position
+                              // attribute in a kernel to have the same
+                              // dimensionality, and the grid is 2D here
+                              // (sub-transform, batch row), so these must be
+                              // uint2 even though only .x is meaningful.
                               uint2 grp [[threadgroup_position_in_grid]],
-                              uint lane [[thread_position_in_threadgroup]],
-                              uint lanes [[threads_per_threadgroup]]) {
+                              uint2 tpos [[thread_position_in_threadgroup]],
+                              uint2 tsize [[threads_per_threadgroup]]) {
+    const uint lane = tpos.x;
+    const uint lanes = tsize.x;
     const uint b = grp.x;
     const uint row = grp.y;
     if (b >= p.sub_count) return;   // uniform across the threadgroup
