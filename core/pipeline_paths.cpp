@@ -1032,12 +1032,25 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             const double t_rob = prof_now_ms();
             rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
+            // robustness_row_activity is a pure CPU pass over the finished mask,
+            // while estimate_kernels is GPU, so these two can run together. This
+            // is NOT the case the comment above warns about: only one Metal
+            // workload is in flight, so there is no dual Metal peak.
+            //
+            // Kernels are now computed unconditionally instead of behind
+            // rob_has_nonzero. That is not a behaviour change: covs is already
+            // discarded downstream when the mask is empty
+            // (meta.covs = rob_has_nonzero ? std::move(covs) : CovField()), so
+            // the result was never used in that case. It costs a wasted GPU pass
+            // only when a comparison frame's mask is entirely zero, which means
+            // the frame contributes nothing at all -- rare, and it does not
+            // raise the peak because the allocation happens either way here.
+            const double t_kern = prof_now_ms();
+            std::future<CovField> cov_fut =
+                std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
             rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
-            if (rob_has_nonzero) {
-                const double t_kern = prof_now_ms();
-                covs = estimate_kernels(comp, work);
-                prof_add_cpu("comp:kernels", prof_now_ms() - t_kern);
-            }
+            covs = cov_fut.get();
+            prof_add_cpu("comp:kernels", prof_now_ms() - t_kern);
         } else {
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
