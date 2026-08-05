@@ -926,18 +926,23 @@ inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
 }
 
 // Alg. 4 — merge.cpp accumulate_comp
-kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
-                                  device float* den [[buffer(1)]],
-                                  device const float* img [[buffer(2)]],
-                                  device const float* flow [[buffer(3)]],
-                                  device const float* covs [[buffer(4)]],
-                                  device const float* robustness [[buffer(5)]],
-                                  constant MergeCompParams& p [[buffer(6)]],
-                                  uint2 gid [[thread_position_in_grid]]) {
-    uint hr_j = gid.x;
-    uint local_i = gid.y;
-    if (hr_j >= p.Ws || local_i >= p.band_h) return;
-
+// One comparison frame's contribution at one output pixel.
+//
+// Extracted verbatim from merge_accumulate_comp so the single-frame and fused
+// kernels below cannot drift apart -- there is exactly one copy of the math.
+//
+// The nine taps accumulate into locals and are added to the caller's running
+// totals once, at the end. That ordering is what makes fusion exact: the
+// caller sees the same per-frame val/acc it would have added had this frame
+// been its own dispatch.
+static inline void merge_comp_contrib(device const float* img,
+                                      device const float* flow,
+                                      device const float* covs,
+                                      device const float* robustness,
+                                      constant MergeCompParams& p,
+                                      uint hr_j, uint local_i,
+                                      thread float& n0, thread float& n1, thread float& n2,
+                                      thread float& d0, thread float& d1, thread float& d2) {
     int hr_i = int(p.y0 + local_i);
     float lr_x = float(hr_j) / p.scale;
     float lr_y = float(hr_i) / p.scale;
@@ -1010,13 +1015,90 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
         }
     }
 
-    uint base = (local_i * p.Ws + hr_j) * p.nch;
-    if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
-    if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
-    if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
+    n0 += val0; n1 += val1; n2 += val2;
+    d0 += acc0; d1 += acc1; d2 += acc2;
 }
 
-// Alg. 11 — merge.cpp accumulate_ref (incl. accumulated-robustness denoise)
+kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
+                                  device float* den [[buffer(1)]],
+                                  device const float* img [[buffer(2)]],
+                                  device const float* flow [[buffer(3)]],
+                                  device const float* covs [[buffer(4)]],
+                                  device const float* robustness [[buffer(5)]],
+                                  constant MergeCompParams& p [[buffer(6)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    uint hr_j = gid.x;
+    uint local_i = gid.y;
+    if (hr_j >= p.Ws || local_i >= p.band_h) return;
+
+    float v0 = 0.f, v1 = 0.f, v2 = 0.f, a0 = 0.f, a1 = 0.f, a2 = 0.f;
+    merge_comp_contrib(img, flow, covs, robustness, p, hr_j, local_i, v0, v1, v2, a0, a1, a2);
+
+    uint base = (local_i * p.Ws + hr_j) * p.nch;
+    if (p.nch >= 1) { num[base + 0] += v0; den[base + 0] += a0; }
+    if (p.nch >= 2) { num[base + 1] += v1; den[base + 1] += a1; }
+    if (p.nch >= 3) { num[base + 2] += v2; den[base + 2] += a2; }
+}
+
+// Up to MERGE_FUSE_MAX frames per dispatch.
+//
+// The accumulators are read once into registers, every frame adds into them in
+// the same order the separate dispatches used, and they are written back once.
+// A float32 stored to memory and reloaded is bit-exact, so dropping the
+// intermediate round trips cannot change the result -- the sequence of
+// additions is identical. The band is far larger than cache, so those round
+// trips were real DRAM traffic: 48 bytes per output pixel per frame.
+//
+// Frames beyond a group boundary simply store and reload, which is why any
+// group size stays exact and the tail group can be short.
+kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
+                                     device float* den [[buffer(1)]],
+                                     constant MergeCompParams* ps [[buffer(2)]],
+                                     constant uint& nframes [[buffer(3)]],
+                                     device const float* img0 [[buffer(4)]],
+                                     device const float* img1 [[buffer(5)]],
+                                     device const float* img2 [[buffer(6)]],
+                                     device const float* img3 [[buffer(7)]],
+                                     device const float* flow0 [[buffer(8)]],
+                                     device const float* flow1 [[buffer(9)]],
+                                     device const float* flow2 [[buffer(10)]],
+                                     device const float* flow3 [[buffer(11)]],
+                                     device const float* cov0 [[buffer(12)]],
+                                     device const float* cov1 [[buffer(13)]],
+                                     device const float* cov2 [[buffer(14)]],
+                                     device const float* cov3 [[buffer(15)]],
+                                     device const float* rob0 [[buffer(16)]],
+                                     device const float* rob1 [[buffer(17)]],
+                                     device const float* rob2 [[buffer(18)]],
+                                     device const float* rob3 [[buffer(19)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    uint hr_j = gid.x;
+    uint local_i = gid.y;
+    if (hr_j >= ps[0].Ws || local_i >= ps[0].band_h) return;
+
+    device const float* imgs[4] = {img0, img1, img2, img3};
+    device const float* flows[4] = {flow0, flow1, flow2, flow3};
+    device const float* covss[4] = {cov0, cov1, cov2, cov3};
+    device const float* robs[4] = {rob0, rob1, rob2, rob3};
+
+    const uint nch = ps[0].nch;
+    uint base = (local_i * ps[0].Ws + hr_j) * nch;
+
+    float n0 = 0.f, n1 = 0.f, n2 = 0.f, e0 = 0.f, e1 = 0.f, e2 = 0.f;
+    if (nch >= 1) { n0 = num[base + 0]; e0 = den[base + 0]; }
+    if (nch >= 2) { n1 = num[base + 1]; e1 = den[base + 1]; }
+    if (nch >= 3) { n2 = num[base + 2]; e2 = den[base + 2]; }
+
+    for (uint g = 0; g < nframes && g < 4u; ++g) {
+        merge_comp_contrib(imgs[g], flows[g], covss[g], robs[g], ps[g],
+                           hr_j, local_i, n0, n1, n2, e0, e1, e2);
+    }
+
+    if (nch >= 1) { num[base + 0] = n0; den[base + 0] = e0; }
+    if (nch >= 2) { num[base + 1] = n1; den[base + 1] = e1; }
+    if (nch >= 3) { num[base + 2] = n2; den[base + 2] = e2; }
+}
+
 kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
                                  device float* den [[buffer(1)]],
                                  device const float* img [[buffer(2)]],

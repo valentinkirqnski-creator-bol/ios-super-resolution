@@ -142,6 +142,7 @@ static MetalCtx& ctx() {
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
             "fftshift2d_c", "zero_fft_borders", "zero_fft_borders_natural", "extract_real",
+            "merge_accumulate_comp_x4",
             "align_local_search_460",
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
@@ -2405,7 +2406,22 @@ static void merge_enc_close() {
     }
 }
 
+// Comparison frames are batched so a group shares one read-modify-write of the
+// band accumulators instead of one each. See merge_accumulate_comp_x4: the
+// addition order is unchanged, so this is bit-identical, it just stops pushing
+// the accumulators through DRAM once per frame.
+//
+// 4 keeps the binding count at 20, well inside the limit, and already removes
+// most of the traffic: 7 frames go from 7 accumulator round trips to 2.
+static constexpr uint32_t kMergeFuseMax = 4u;
+struct PendingMergeComp {
+    id<MTLBuffer> img = nil, flow = nil, cov = nil, rob = nil;
+    MergeCompParamsCPU p{};
+};
+static std::vector<PendingMergeComp> g_merge_pending;
+
 static void merge_band_cmd_reset() {
+    g_merge_pending.clear();
     merge_enc_close();
     g_merge_band_cmd = nil;
 }
@@ -2433,6 +2449,45 @@ static bool merge_enc_ensure() {
     }
     g_merge_enc = [g_merge_band_cmd computeCommandEncoder];
     return g_merge_enc != nil;
+}
+
+// Comparison frames are batched so a group shares one read-modify-write of the
+// band accumulators instead of one each. See merge_accumulate_comp_x4: the
+// addition order is unchanged, so this is bit-identical, it just stops pushing
+// the accumulators through DRAM once per frame.
+static bool merge_flush_pending() {
+    if (g_merge_pending.empty()) return true;
+    auto& c = ctx();
+    if (!merge_enc_ensure()) {
+        g_merge_pending.clear();
+        merge_band_cmd_reset();
+        return false;
+    }
+    MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
+    id<MTLComputeCommandEncoder> enc = g_merge_enc;
+    const uint32_t nf = (uint32_t)g_merge_pending.size();
+
+    // Metal requires every declared binding to be set even when the loop will
+    // not read it, so unused slots repeat the last real frame. ps[0] also has
+    // to be valid because the kernel takes the band geometry from it.
+    MergeCompParamsCPU ps[kMergeFuseMax];
+    for (uint32_t i = 0; i < kMergeFuseMax; ++i)
+        ps[i] = g_merge_pending[std::min<uint32_t>(i, nf - 1u)].p;
+
+    [enc setBuffer:slot.num offset:0 atIndex:0];
+    [enc setBuffer:slot.den offset:0 atIndex:1];
+    [enc setBytes:ps length:sizeof(ps) atIndex:2];
+    [enc setBytes:&nf length:sizeof(nf) atIndex:3];
+    for (uint32_t i = 0; i < kMergeFuseMax; ++i) {
+        const PendingMergeComp& e = g_merge_pending[std::min<uint32_t>(i, nf - 1u)];
+        [enc setBuffer:e.img  offset:0 atIndex:4u + i];
+        [enc setBuffer:e.flow offset:0 atIndex:8u + i];
+        [enc setBuffer:e.cov  offset:0 atIndex:12u + i];
+        [enc setBuffer:e.rob  offset:0 atIndex:16u + i];
+    }
+    dispatch2(enc, c.pipe("merge_accumulate_comp_x4"), ps[0].Ws, ps[0].band_h);
+    g_merge_pending.clear();
+    return true;
 }
 
 static bool merge_frame_resident(int frame_id) {
@@ -2842,22 +2897,23 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         merge_band_cmd_reset();
         return false;
     }
-    id<MTLComputeCommandEncoder> enc = g_merge_enc;
-    [enc setBuffer:slot.num offset:0 atIndex:0];
-    [enc setBuffer:slot.den offset:0 atIndex:1];
-    [enc setBuffer:b_img offset:0 atIndex:2];
-    [enc setBuffer:b_flow offset:0 atIndex:3];
-    [enc setBuffer:b_cov offset:0 atIndex:4];
-    [enc setBuffer:b_rob offset:0 atIndex:5];
-    [enc setBytes:&p length:sizeof(p) atIndex:6];
-    dispatch2(enc, c.pipe("merge_accumulate_comp"), p.Ws, p.band_h);
-    // Keep encoder open for remaining comps + ref in this band.
+    (void)slot;
+    PendingMergeComp pend;
+    pend.img = b_img; pend.flow = b_flow; pend.cov = b_cov; pend.rob = b_rob;
+    pend.p = p;
+    g_merge_pending.push_back(pend);
+    if (g_merge_pending.size() >= (size_t)kMergeFuseMax && !merge_flush_pending())
+        return false;
+    // Keep encoder open for remaining comps + ref in this band. Any tail group
+    // is flushed by merge_ref_band_metal, which always runs after the comps.
     return true;
 }
 
 bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
                           Image& num_band, Image& den_band, int y0,
                           const Config& cfg, const Image* acc_rob) {
+    // Comps first, then ref -- same order the separate dispatches ran in.
+    if (!merge_flush_pending()) return false;
     if (!metal_gpu_init()) return false;
     if (num_band.h <= 0 || num_band.w <= 0 || ref_raw.h <= 0) return false;
     auto& c = ctx();
