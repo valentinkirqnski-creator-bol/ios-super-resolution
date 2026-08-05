@@ -472,9 +472,7 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.hf_variance_loss_threshold,
                                in: 0.50...0.99,
                                step: 0.01)
-                    }
 
-                    VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("Variance Noise Mult")
                             Spacer()
@@ -483,9 +481,7 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.hf_variance_noise_multiplier,
                                in: 0.25...4.00,
                                step: 0.05)
-                    }
 
-                    VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("Noise Floor Mult")
                             Spacer()
