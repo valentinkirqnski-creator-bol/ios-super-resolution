@@ -1894,30 +1894,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-
-    // One threadgroup per tile: lanes split the candidate shifts and the kernel
-    // stages the reference tile on-chip. `lanes` must be a power of two for the
-    // tree reduction, and is capped so the tile plus the two reduction arrays
-    // fit the device's threadgroup memory budget.
-    // Threadgroup allocations must be 16-byte aligned.
-    auto align16 = [](NSUInteger n) -> NSUInteger { return (n + 15u) & ~(NSUInteger)15u; };
-    const NSUInteger tile_bytes =
-        align16((NSUInteger)tile_size * (NSUInteger)tile_size * sizeof(float));
-    const NSUInteger tg_limit = c.device.maxThreadgroupMemoryLength;
-    NSUInteger lanes = 64;
-    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
-    auto red_bytes = [&](NSUInteger n) -> NSUInteger {
-        return align16(n * sizeof(float)) + align16(n * sizeof(int));
-    };
-    while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
-    if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
-
-    [enc setComputePipelineState:pipe];
-    [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
-    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:1];
-    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
+    dispatch1(enc, pipe, (NSUInteger)ny * (NSUInteger)nx);
     [enc endEncoding];
     prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
     align_commit(cmd);
@@ -2015,21 +1992,11 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
     id<MTLComputePipelineState> pipe = c.pipe("ica_refine_tile");
     if (!pipe) return false;
     [enc setComputePipelineState:pipe];
-    // One threadgroup per tile; lanes cover the tile's pixels and drive the
-    // butterfly reduction. n_pix (64 or 256 for the ts<=16 path) is a power of
-    // two, which the reduction pairing requires.
     const NSUInteger n = (NSUInteger)ny * (NSUInteger)nx;
-    const NSUInteger n_pix = (NSUInteger)tile_size * (NSUInteger)tile_size;
-    auto align16 = [](NSUInteger v) -> NSUInteger { return (v + 15u) & ~(NSUInteger)15u; };
-    const NSUInteger stage_bytes = align16(n_pix * sizeof(float));
-    NSUInteger lanes = n_pix;
-    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
-    if (2 * stage_bytes > c.device.maxThreadgroupMemoryLength) return false;
-
-    [enc setThreadgroupMemoryLength:stage_bytes atIndex:0];
-    [enc setThreadgroupMemoryLength:stage_bytes atIndex:1];
-    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
+    NSUInteger tg = std::min(n, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
+    if (tg == 0) tg = 1;
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:ica-refine");
     align_commit(cmd);
