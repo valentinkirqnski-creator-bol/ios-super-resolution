@@ -456,8 +456,22 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
 
 // Set false to fall back to Bluestein for non-power-of-two lengths.
 static constexpr bool kUseStockham = true;
-// Set false to use per-stage Stockham instead of the two-pass four-step form.
-static constexpr bool kUseFourStep = true;
+// DISABLED after measurement: the four-step was 2.6x SLOWER than per-stage
+// Stockham (grey:fft-segments 1582ms -> 4161ms, burst 8570ms -> 11920ms).
+//
+// It does cut passes from 12 to 4, but it destroys coalescing. Pass A gathers
+// with in_i = N2, so consecutive lanes read addresses N2 floats apart and each
+// touches a separate cache line; pass B scatters with out_k = N1 and has the
+// same problem on the write side. Per-stage Stockham reads x[t + r*NR], which
+// is contiguous across lanes. An uncoalesced access costs roughly an order of
+// magnitude more than a coalesced one here, so 4 scattered passes lose badly to
+// 12 sequential ones.
+//
+// Making it pay off needs explicit transposes between the passes, which add
+// back the traffic the decomposition was meant to remove. The code is kept
+// because the index math is verified (tools/verify_fourstep_fft.cpp); only the
+// memory layout is wrong.
+static constexpr bool kUseFourStep = false;
 
 // Radices largest-first, matching the verified host prototype. Returns false if
 // anything other than 2/3/5/7 remains, in which case Bluestein still handles it.
