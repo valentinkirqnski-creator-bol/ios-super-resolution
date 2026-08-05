@@ -510,6 +510,28 @@ kernel void zero_fft_borders(device float2* data [[buffer(0)]],
         data[y * w + x] = float2(0.f, 0.f);
 }
 
+// zero_fft_borders expressed directly in natural FFT order.
+//
+// The grey FFT ran fftshift_x, fftshift_y, zero_fft_borders, fftshift_x,
+// fftshift_y. Each shift kernel reads and writes the whole frame, so four full
+// passes over ~96MB existed only to state the zeroing in shifted coordinates.
+//
+// fftshift is an involution, so shift -> zero -> shift equals zeroing the
+// corresponding region in natural order. Shifted position i holds natural
+// index (i + n/2) mod n, and the shifted kernel discards i outside the central
+// half; that maps to exactly the central half in natural order, i.e. the same
+// [n/4, n - n/4) expressions used here. Same result, one pass instead of five.
+kernel void zero_fft_borders_natural(device float2* data [[buffer(0)]],
+                                     constant uint& h [[buffer(1)]],
+                                     constant uint& w [[buffer(2)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    uint y = gid.y, x = gid.x;
+    if (y >= h || x >= w) return;
+    uint y0 = h / 4u, x0 = w / 4u;
+    if ((y >= y0 && y < h - y0) || (x >= x0 && x < w - x0))
+        data[y * w + x] = float2(0.f, 0.f);
+}
+
 kernel void extract_real(device float* out [[buffer(0)]],
                          device const float2* in [[buffer(1)]],
                          constant uint& count [[buffer(2)]],
