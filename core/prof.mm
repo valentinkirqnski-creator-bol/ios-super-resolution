@@ -87,15 +87,26 @@ void append_table(std::ostringstream& ss, const char* title, const char* unit_co
 
 }  // namespace
 
-// State when HHSR_PROF is unset. A sideloaded build has no Xcode scheme to
-// inject environment variables, so opt-in gating would silently produce no data
-// during optimization work — hence ON for non-release builds. Release builds
-// default OFF and still honour HHSR_PROF=1 when timings are wanted.
-#if defined(NDEBUG)
-static constexpr bool kProfDefaultOn = false;
-#else
+// State when HHSR_PROF is unset. On unconditionally: the build that matters
+// here is a sideloaded IPA, which has no Xcode scheme to inject environment
+// variables, so anything opt-in produces no data at all on the only hardware
+// the timings are being measured on.
+//
+// This used to key off NDEBUG and default off for release. That was working by
+// accident rather than by design: Xcode does not define NDEBUG for C/C++ in its
+// release configuration the way CMake does, so release builds were profiling
+// anyway. Making it explicit so the reports do not silently stop the day a
+// build setting adds NDEBUG.
+//
+// The cost is negligible and deliberately so. CPU buckets are timestamp reads,
+// GPU timings come from GPUEndTime/GPUStartTime inside an existing completion
+// handler and never add a synchronization point, and the memory marks are a
+// couple of dozen task_info calls per burst.
+//
+// HHSR_PROF=0 disables. This is separate from HHSR_ENABLE_DEBUG_DUMPS, which
+// gates the far more expensive per-image dumps and statistics passes and is
+// off by default.
 static constexpr bool kProfDefaultOn = true;
-#endif
 
 bool prof_enabled() {
     static const bool on = []() {
