@@ -5,6 +5,7 @@
 
 #include "metal_gpu.h"
 #include "debug_utils.h"
+#include "prof.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -71,6 +72,16 @@ struct MetalCtx {
     id<MTLBuffer> kern_grad = nil, kern_cov = nil;
     size_t kern_raw_b = 0, kern_vst_b = 0, kern_grey_b = 0;
     size_t kern_grad_b = 0, kern_cov_b = 0;
+    // Grow-only grey-FFT temps. Each call otherwise allocated the input, the
+    // complex working set and the output fresh — ~190MB at 12MP — and the kernel
+    // has to zero those pages before handing them over, which is CPU time
+    // charged to compute_grey rather than to the GPU.
+    id<MTLBuffer> fft_in = nil, fft_c0 = nil, fft_out = nil;
+    size_t fft_in_b = 0, fft_c0_b = 0, fft_out_b = 0;
+    // Stockham is autosort but out-of-place, so it needs a ping-pong buffer the
+    // size of the largest batch it transforms (the row pass: h*w complex).
+    id<MTLBuffer> fft_pp = nil;
+    size_t fft_pp_b = 0;
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
@@ -126,6 +137,7 @@ static MetalCtx& ctx() {
         const char* need[] = {
             "raw16_to_float_bayer",
             "fft1d_pow2_cpp", "fft1d_bitrev", "fft1d_butterfly", "fft_scale_inv", "make_chirp",
+            "fft_stockham_stage", "fft_copy_batch",
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
@@ -193,10 +205,37 @@ static void dispatch1(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineSta
     }
 }
 
+// Attach a GPU-time probe. Uses the completion handler on work the pipeline
+// already waits for, so it adds no synchronization of its own — measuring must
+// not create the stalls we are trying to measure.
+static void prof_tag_gpu(id<MTLCommandBuffer> cmd, const char* name) {
+    if (!prof_enabled() || !cmd) return;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        prof_add_gpu(name, (done.GPUEndTime - done.GPUStartTime) * 1000.0);
+    }];
+}
+
+// Label for command buffers that are soft-committed part-way through a stage.
+// prof_tag_gpu is otherwise only attached to the last buffer of a multi-commit
+// sequence, so every earlier segment's GPU time went unrecorded — the grey FFT
+// commits several times per call and was reported as just its tail.
+// thread_local: the 2x path runs estimate_kernels on a std::async thread, so a
+// shared global would race with the stage set on the pipeline thread.
+static thread_local const char* g_prof_stage = nullptr;
+
+struct ProfStageScope {
+    const char* prev;
+    explicit ProfStageScope(const char* s) : prev(g_prof_stage) { g_prof_stage = s; }
+    ~ProfStageScope() { g_prof_stage = prev; }
+    ProfStageScope(const ProfStageScope&) = delete;
+    ProfStageScope& operator=(const ProfStageScope&) = delete;
+};
+
 // Commit and wait — only for final readback / error boundaries.
 static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!cmd) return false;
+    if (g_prof_stage) prof_tag_gpu(cmd, g_prof_stage);
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
@@ -209,6 +248,7 @@ static bool flush_cmd(__strong id<MTLCommandBuffer>& cmd) {
 static bool commit_cmd(__strong id<MTLCommandBuffer>& cmd) {
     auto& c = ctx();
     if (!cmd) return false;
+    if (g_prof_stage) prof_tag_gpu(cmd, g_prof_stage);
     [cmd commit];
     cmd = [c.queue commandBuffer];
     return cmd != nil;
@@ -397,25 +437,147 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     return true;
 }
 
-static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t batch,
-                      bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+// Set false to fall back to Bluestein for non-power-of-two lengths.
+static constexpr bool kUseStockham = true;
+
+// Radices largest-first, matching the verified host prototype. Returns false if
+// anything other than 2/3/5/7 remains, in which case Bluestein still handles it.
+static bool fft_factorize(uint32_t n, uint32_t* out, int cap, int& count) {
+    count = 0;
+    uint32_t m = n;
+    const uint32_t radices[] = {7u, 5u, 4u, 3u, 2u};
+    for (uint32_t r : radices) {
+        while (m % r == 0u) {
+            if (count >= cap) return false;
+            out[count++] = r;
+            m /= r;
+        }
+    }
+    return m == 1u && count > 0;
+}
+
+// Mixed-radix Stockham. Autosort, so no digit-reversal pass; ping-pongs between
+// `data` and `pp`, which must be at least batch*stride complex elements.
+static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
+                               uint32_t n, uint32_t stride, uint32_t batch,
+                               bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+    auto& c = ctx();
+    if (!data || !pp || n < 2u || batch == 0u || !cmd) return false;
+
+    uint32_t rad[24];
+    int nrad = 0;
+    if (!fft_factorize(n, rad, 24, nrad)) return false;
+
+    struct StockhamParamsCPU {
+        uint32_t N, R, Ns, NR, stride, batch_count, inverse, _pad0;
+    };
+    static_assert(sizeof(StockhamParamsCPU) == 32, "StockhamParamsCPU layout");
+
+    id<MTLComputePipelineState> pipe = c.pipe("fft_stockham_stage");
+    if (!pipe) return false;
+
+    id<MTLBuffer> src = data;
+    id<MTLBuffer> dst = pp;
+    uint32_t Ns = 1u;
+    for (int s = 0; s < nrad; ++s) {
+        const uint32_t R = rad[s];
+        StockhamParamsCPU p{};
+        p.N = n;
+        p.R = R;
+        p.Ns = Ns;
+        p.NR = n / R;
+        p.stride = stride;
+        p.batch_count = batch;
+        p.inverse = inverse ? 1u : 0u;
+        p._pad0 = 0u;
+
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, pipe, p.NR, batch);
+        [enc endEncoding];
+
+        // Result of this stage is in dst; it becomes the next stage's source.
+        std::swap(src, dst);
+        Ns *= R;
+    }
+
+    // An odd number of stages leaves the result in the ping-pong buffer.
+    if (src != data) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBuffer:src offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc setBytes:&stride length:sizeof(stride) atIndex:3];
+        [enc setBytes:&batch length:sizeof(batch) atIndex:4];
+        dispatch2(enc, c.pipe("fft_copy_batch"), n, batch);
+        [enc endEncoding];
+    }
+
+    // Same convention as the pow2 and Bluestein paths: the inverse divides by n.
+    if (inverse) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
+        [enc setBytes:&batch length:sizeof(batch) atIndex:3];
+        dispatch2(enc, c.pipe("fft_scale_inv"), n, batch);
+        [enc endEncoding];
+    }
+    return true;
+}
+
+static bool fft1d_gpu(id<MTLBuffer> data, id<MTLBuffer> pp, uint32_t n, uint32_t stride,
+                      uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
+    if (kUseStockham && pp) {
+        int nrad = 0;
+        uint32_t rad[24];
+        if (fft_factorize(n, rad, 24, nrad))
+            return fft1d_stockham_gpu(data, pp, n, stride, batch, inverse, cmd);
+    }
     return fft1d_bluestein_gpu(data, n, stride, batch, inverse, cmd);
 }
 
 // 2D FFT with one full-frame complex buffer: row FFTs in place, column FFTs via strips.
-static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h, uint32_t w,
-                      bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+//
+// prune_lowpass is for the grey-FFT caller, whose forward transform is followed
+// by fftshift -> zero_fft_borders -> fftshift. That zeroing keeps only the
+// central half of the shifted spectrum. Shifted position xs holds natural column
+// x = (xs + w/2) mod w, and xs is zeroed when xs < w/4 or xs >= 3w/4, so natural
+// columns [w/4, 3w/4) are zeroed for every row without exception. The shift is a
+// pure permutation, so each untransformed column lands in exactly one position
+// that is then overwritten with zero — skipping their column transform is
+// equivalent, not an approximation.
+//
+// Only the forward direction can prune: by the inverse pass the row transform
+// has already spread the surviving coefficients across every column.
+static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, id<MTLBuffer> pp,
+                      uint32_t h, uint32_t w,
+                      bool inverse, __strong id<MTLCommandBuffer>& cmd,
+                      bool prune_lowpass = false) {
     auto& c = ctx();
     // Rows then columns stay on the GPU; Metal tracks buffer hazards in-CB.
     // Soft-commit only to bound encoder size — no waitUntilCompleted mid-FFT.
-    if (!fft1d_gpu(cbuf, w, w, h, inverse, cmd)) return false;
+    if (!fft1d_gpu(cbuf, pp, w, w, h, inverse, cmd)) return false;
     if (!commit_cmd(cmd)) return false;
+
+    const bool prune = prune_lowpass && !inverse && w >= 8u;
+    const uint32_t keep_lo = w / 4u;        // first discarded column
+    const uint32_t keep_hi = w - w / 4u;    // first kept column again
 
     uint32_t strips = 0;
     for (uint32_t col0 = 0; col0 < w; col0 += kFftBatchChunk) {
         uint32_t ncol = std::min(kFftBatchChunk, w - col0);
+        // Skip only strips lying wholly inside the discarded band; partially
+        // overlapping strips are transformed in full so the kept columns in
+        // them stay exact.
+        if (prune && col0 >= keep_lo && col0 + ncol <= keep_hi) continue;
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setBuffer:col_scratch offset:0 atIndex:0];
         [enc setBuffer:cbuf offset:0 atIndex:1];
@@ -426,7 +588,7 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h,
         dispatch2(enc, c.pipe("gather_cols"), h, ncol);
         [enc endEncoding];
 
-        if (!fft1d_gpu(col_scratch, h, h, ncol, inverse, cmd)) return false;
+        if (!fft1d_gpu(col_scratch, pp, h, h, ncol, inverse, cmd)) return false;
 
         enc = [cmd computeCommandEncoder];
         [enc setBuffer:cbuf offset:0 atIndex:0];
@@ -505,7 +667,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:3];
     dispatch2(enc, c.pipe("pack_tile_rows"), N, row_batch);
     [enc endEncoding];
-    if (!fft1d_gpu(rows, Nu, Nu, row_batch, false, cmd)) return false;
+    if (!fft1d_gpu(rows, nil, Nu, Nu, row_batch, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_ref offset:0 atIndex:0];
@@ -524,7 +686,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("write_rfft_cols_from_half"), N * wh, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(cols, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
+    if (!fft1d_gpu(cols, nil, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_ref offset:0 atIndex:0];
@@ -542,7 +704,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:3];
     dispatch2(enc, c.pipe("pack_tile_rows"), N, row_batch);
     [enc endEncoding];
-    if (!fft1d_gpu(rows, Nu, Nu, row_batch, false, cmd)) return false;
+    if (!fft1d_gpu(rows, nil, Nu, Nu, row_batch, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_mov offset:0 atIndex:0];
@@ -561,7 +723,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("write_rfft_cols_from_half"), N * wh, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(cols, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
+    if (!fft1d_gpu(cols, nil, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_mov offset:0 atIndex:0];
@@ -588,7 +750,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("write_rfft_cols_from_half"), N * wh, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(cols, Nu, Nu, tile_count * wh_u, true, cmd)) return false;
+    if (!fft1d_gpu(cols, nil, Nu, Nu, tile_count * wh_u, true, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_ref offset:0 atIndex:0];
@@ -607,7 +769,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("expand_half_to_full_rows"), N * N, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(full, Nu, Nu, row_batch, true, cmd)) return false;
+    if (!fft1d_gpu(full, nil, Nu, Nu, row_batch, true, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:corr offset:0 atIndex:0];
@@ -702,8 +864,12 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
     return true;
 }
 
-Image compute_grey_fft_metal(const Image& raw) {
+static Image compute_grey_fft_metal_impl(const Image& raw) {
     if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return Image();
+    // Attributes the soft-committed FFT segments, which previously vanished
+    // from the profile: comp:grey measured ~750ms/frame against only ~204ms of
+    // tagged GPU, and the gap was never CPU work.
+    ProfStageScope prof_stage("grey:fft-segments");
     auto& c = ctx();
     const uint32_t h = (uint32_t)raw.h, w = (uint32_t)raw.w;
     // In-place fftshift requires even dims (Bayer RAW is even).
@@ -712,10 +878,18 @@ Image compute_grey_fft_metal(const Image& raw) {
     const size_t cbytes = n * sizeof(float) * 2;
     const size_t col_bytes = (size_t)kFftBatchChunk * h * sizeof(float) * 2;
 
-    id<MTLBuffer> real_in = buf(raw.data.data(), n * sizeof(float));
-    id<MTLBuffer> c0 = buf(nullptr, cbytes);
+    // Pooled rather than freshly allocated: pack_rows_real writes every element
+    // of c0 and extract_real writes every element of the output, so neither
+    // depends on the buffer arriving zeroed.
+    id<MTLBuffer> real_in = c.scratch(c.fft_in, c.fft_in_b, n * sizeof(float));
+    id<MTLBuffer> c0 = c.scratch(c.fft_c0, c.fft_c0_b, cbytes);
     id<MTLBuffer> col_scratch = c.scratch(c.scratch_cols, c.scratch_cols_bytes, col_bytes);
+    // Ping-pong for Stockham. The row pass is the larger of the two batches
+    // (h*w complex vs kFftBatchChunk*h), so sizing to cbytes covers both.
+    // nil is tolerated: fft1d_gpu falls back to Bluestein without it.
+    id<MTLBuffer> fft_pp = c.scratch(c.fft_pp, c.fft_pp_b, cbytes);
     if (!real_in || !c0 || !col_scratch) return Image();
+    memcpy([real_in contents], raw.data.data(), n * sizeof(float));
 
     // Forward FFT (one full complex + column strip scratch)
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -727,8 +901,10 @@ Image compute_grey_fft_metal(const Image& raw) {
     [enc setBytes:&w length:sizeof(w) atIndex:3];
     dispatch2(enc, c.pipe("pack_rows_real"), w, h);
     [enc endEncoding];
-    real_in = nil; // drop early; CB retains until complete
-    if (!fft2d_gpu(c0, col_scratch, h, w, false, cmd)) return Image();
+    real_in = nil; // release the local ref; the pool and the CB keep it alive
+    // Prune: the border zeroing below discards these columns unconditionally.
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, false, cmd, /*prune_lowpass*/true))
+        return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
     // In-place fftshift → zero borders → fftshift (even size: shift is involution)
@@ -751,9 +927,9 @@ Image compute_grey_fft_metal(const Image& raw) {
     dispatch2(enc, c.pipe("fftshift_swap_y"), w, h / 2u);
     [enc endEncoding];
 
-    if (!fft2d_gpu(c0, col_scratch, h, w, true, cmd)) return Image();
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd)) return Image();
 
-    id<MTLBuffer> real_out = buf(nullptr, n * sizeof(float));
+    id<MTLBuffer> real_out = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
     if (!real_out) return Image();
     enc = [cmd computeCommandEncoder];
     uint32_t count = (uint32_t)n;
@@ -763,6 +939,7 @@ Image compute_grey_fft_metal(const Image& raw) {
     dispatch1(enc, c.pipe("extract_real"), n);
     [enc endEncoding];
 
+    prof_tag_gpu(cmd, "grey:fft");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
@@ -772,12 +949,19 @@ Image compute_grey_fft_metal(const Image& raw) {
     c.sticky_grey_h = (int)h;
     c.sticky_grey_w = (int)w;
 
-    Image grey((int)h, (int)w, 1);
-    memcpy(grey.data.data(), [real_out contents], n * sizeof(float));
+    // assign() allocates and fills in one pass. Image(h,w,c) would value-init
+    // the whole vector first, so a 12MP grey wrote ~48MB of zeros that the
+    // following copy immediately overwrote.
+    Image grey;
+    grey.h = (int)h;
+    grey.w = (int)w;
+    grey.c = 1;
+    const float* out_src = (const float*)[real_out contents];
+    grey.data.assign(out_src, out_src + n);
     return grey;
 }
 
-CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
+static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg) {
     if (!metal_gpu_init() || raw.h <= 0 || raw.w <= 0) return CovField();
     auto& c = ctx();
 
@@ -852,6 +1036,7 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
     dispatch2(enc, c.pipe("kernel_estimate_cov"), p.grey_w, p.grey_h);
     [enc endEncoding];
 
+    prof_tag_gpu(cmd, "kernels:estimate-cov");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return CovField();
@@ -1126,7 +1311,7 @@ static void clear_rob_ref_gpu() {
     g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 }
 
-RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
+static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
     if (!metal_gpu_init() || ref_raw.h <= 0 || ref_raw.w <= 0) return RefStats();
     auto& c = ctx();
     clear_rob_ref_gpu();
@@ -1193,8 +1378,8 @@ void metal_release_host_ref_stats(RefStats& ref_stats) {
     ref_stats.hf_loss.c = hc;
 }
 
-Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg) {
+static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
+                                           const FlowField& flow, int tile_size, const Config& cfg) {
     if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
@@ -1318,6 +1503,7 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
     [enc endEncoding];
 
+    prof_tag_gpu(cmd, "robustness:all");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
@@ -1420,6 +1606,7 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     [enc setBytes:&ps length:sizeof(ps) atIndex:3];
     dispatch2(enc, c.pipe("pyr_subsample"), (NSUInteger)dw, (NSUInteger)dh);
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:downsample");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
@@ -1498,8 +1685,32 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    dispatch1(enc, pipe, (NSUInteger)ny * (NSUInteger)nx);
+
+    // One threadgroup per tile: lanes split the candidate shifts and the kernel
+    // stages the reference tile on-chip. `lanes` must be a power of two for the
+    // tree reduction, and is capped so the tile plus the two reduction arrays
+    // fit the device's threadgroup memory budget.
+    // Threadgroup allocations must be 16-byte aligned.
+    auto align16 = [](NSUInteger n) -> NSUInteger { return (n + 15u) & ~(NSUInteger)15u; };
+    const NSUInteger tile_bytes =
+        align16((NSUInteger)tile_size * (NSUInteger)tile_size * sizeof(float));
+    const NSUInteger tg_limit = c.device.maxThreadgroupMemoryLength;
+    NSUInteger lanes = 64;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    auto red_bytes = [&](NSUInteger n) -> NSUInteger {
+        return align16(n * sizeof(float)) + align16(n * sizeof(int));
+    };
+    while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
+    if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
+
+    [enc setComputePipelineState:pipe];
+    [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:1];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1551,6 +1762,7 @@ static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_fl
     [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:l1-block-match");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1596,12 +1808,23 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
     id<MTLComputePipelineState> pipe = c.pipe("ica_refine_tile");
     if (!pipe) return false;
     [enc setComputePipelineState:pipe];
+    // One threadgroup per tile; lanes cover the tile's pixels and drive the
+    // butterfly reduction. n_pix (64 or 256 for the ts<=16 path) is a power of
+    // two, which the reduction pairing requires.
     const NSUInteger n = (NSUInteger)ny * (NSUInteger)nx;
-    NSUInteger tg = std::min(n, (NSUInteger)pipe.maxTotalThreadsPerThreadgroup);
-    if (tg == 0) tg = 1;
-    [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    const NSUInteger n_pix = (NSUInteger)tile_size * (NSUInteger)tile_size;
+    auto align16 = [](NSUInteger v) -> NSUInteger { return (v + 15u) & ~(NSUInteger)15u; };
+    const NSUInteger stage_bytes = align16(n_pix * sizeof(float));
+    NSUInteger lanes = n_pix;
+    while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
+    if (2 * stage_bytes > c.device.maxThreadgroupMemoryLength) return false;
+
+    [enc setThreadgroupMemoryLength:stage_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:stage_bytes atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:ica-refine");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1780,6 +2003,7 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     [enc dispatchThreads:MTLSizeMake(ntiles, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:prep-sobel-hessian");
     [cmd commit];
     [cmd waitUntilCompleted];
     const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
@@ -1844,6 +2068,7 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
+    prof_tag_gpu(cmd, "align:upscale-flow");
     [cmd commit];
     [cmd waitUntilCompleted];
     return cmd.status == MTLCommandBufferStatusCompleted;
@@ -1853,11 +2078,13 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
 
 static bool g_dumped_ref_grads = false;
 
-bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
+static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out,
                  f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     if (!metal_gpu_init()) return false;
+    // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
+    ProfStageScope prof_stage("align:soft-segments");
     const int nlev = (int)ref_pyr.levels.size();
     if (nlev <= 0) return false;
     if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
@@ -1960,9 +2187,11 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
-        // Level ICA buffers drop here — only flow stays resident.
+        // Block matching only; ICA runs once below on the finest level.
     }
 
+    // ICA once on the finest level, matching 63e6919 and align.cpp, rather than
+    // once per pyramid level as ac0ff06 did.
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
     id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
     int ica_ny = 0, ica_nx = 0;
@@ -1977,13 +2206,12 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                        (size_t)ref_grey.h * (size_t)ref_grey.w);
         g_dumped_ref_grads = true;
     }
-    id<MTLBuffer> b_mov_native = nil;
-    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
-        c.sticky_grey_w == moving_grey.w) {
-        b_mov_native = c.sticky_grey;
-    } else {
-        b_mov_native = buf(moving_grey.data.data(), moving_grey.data.size() * sizeof(float));
-    }
+    // Deliberately not reusing c.sticky_grey here. At this commit the grey FFT
+    // output buffer is pooled, and handing a pooled buffer to a later stage is
+    // the pattern that produced the corrupted pyramid earlier on this branch.
+    // A fresh upload costs one copy per frame and removes the hazard entirely.
+    id<MTLBuffer> b_mov_native = buf(moving_grey.data.data(),
+                                     moving_grey.data.size() * sizeof(float));
     if (!b_mov_native) return false;
     if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
@@ -2476,6 +2704,13 @@ void metal_trim_analyze_scratch() {
     c.kern_grad_b = c.kern_cov_b = 0;
     c.l2[0] = {};
     c.l2[1] = {};
+    // Grey-FFT pools are analyze-only (~190MB at 12MP); merge must not inherit them.
+    c.fft_in = nil; c.fft_c0 = nil; c.fft_out = nil;
+    c.fft_in_b = c.fft_c0_b = c.fft_out_b = 0;
+    c.fft_pp = nil;
+    c.fft_pp_b = 0;
+    c.scratch_cols = nil;
+    c.scratch_cols_bytes = 0;
     c.sticky_grey = nil;
     c.sticky_grey_h = c.sticky_grey_w = 0;
     c.ica_ref_key = nullptr;
@@ -2646,6 +2881,8 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
     merge_enc_close();
 
+    // One CB per band, covering every comp dispatch + the ref dispatch.
+    prof_tag_gpu(g_merge_band_cmd, "merge:band-cb");
     [g_merge_band_cmd commit];
     // Resolve any previous in-flight band now (GPU current keeps running).
     if (g_merge_inflight.cmd) {
@@ -2662,6 +2899,49 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     // Caller must metal_merge_wait_inflight() before reading this band's host images,
     // or start the next band (which resolves this one when the following ref commits).
     return true;
+}
+
+// --- Autorelease boundaries -------------------------------------------------
+//
+// MTLCommandBuffer and MTLComputeCommandEncoder come back autoreleased, and a
+// command buffer retains every resource it references until it is deallocated.
+// align_metal alone opens ~14 command buffers per comparison frame, each holding
+// multi-megabyte grey/flow/gradient buffers, so with no pool on the calling
+// thread a burst accumulated every frame's Metal temporaries before anything was
+// released. Measured peak footprint reached 2784MB with only 287MB of jetsam
+// headroom left, with the peak landing in the analyze loop.
+//
+// These wrappers bound that to one call's worth. The bodies are unchanged; the
+// C++ return values are not autoreleased objects, so constructing them inside
+// the pool and returning after it drains is safe.
+
+Image compute_grey_fft_metal(const Image& raw) {
+    @autoreleasepool { return compute_grey_fft_metal_impl(raw); }
+}
+
+CovField estimate_kernels_metal(const Image& raw, const Config& cfg) {
+    @autoreleasepool { return estimate_kernels_metal_impl(raw, cfg); }
+}
+
+RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
+    @autoreleasepool { return init_robustness_metal_impl(ref_raw, cfg); }
+}
+
+Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
+                               const FlowField& flow, int tile_size, const Config& cfg) {
+    @autoreleasepool {
+        return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg);
+    }
+}
+
+bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
+                 const Image& moving_grey,
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
+    @autoreleasepool {
+        return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
+                                flow_out, initial_dx, initial_dy, initial_rotation_rad);
+    }
 }
 
 } // namespace hhsr
