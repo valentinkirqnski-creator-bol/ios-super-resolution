@@ -440,17 +440,38 @@ static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t 
 }
 
 // 2D FFT with one full-frame complex buffer: row FFTs in place, column FFTs via strips.
+//
+// prune_lowpass is for the grey-FFT caller, whose forward transform is followed
+// by fftshift -> zero_fft_borders -> fftshift. That zeroing keeps only the
+// central half of the shifted spectrum. Shifted position xs holds natural column
+// x = (xs + w/2) mod w, and xs is zeroed when xs < w/4 or xs >= 3w/4, so natural
+// columns [w/4, 3w/4) are zeroed for every row without exception. The shift is a
+// pure permutation, so each untransformed column lands in exactly one position
+// that is then overwritten with zero — skipping their column transform is
+// equivalent, not an approximation.
+//
+// Only the forward direction can prune: by the inverse pass the row transform
+// has already spread the surviving coefficients across every column.
 static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h, uint32_t w,
-                      bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+                      bool inverse, __strong id<MTLCommandBuffer>& cmd,
+                      bool prune_lowpass = false) {
     auto& c = ctx();
     // Rows then columns stay on the GPU; Metal tracks buffer hazards in-CB.
     // Soft-commit only to bound encoder size — no waitUntilCompleted mid-FFT.
     if (!fft1d_gpu(cbuf, w, w, h, inverse, cmd)) return false;
     if (!commit_cmd(cmd)) return false;
 
+    const bool prune = prune_lowpass && !inverse && w >= 8u;
+    const uint32_t keep_lo = w / 4u;        // first discarded column
+    const uint32_t keep_hi = w - w / 4u;    // first kept column again
+
     uint32_t strips = 0;
     for (uint32_t col0 = 0; col0 < w; col0 += kFftBatchChunk) {
         uint32_t ncol = std::min(kFftBatchChunk, w - col0);
+        // Skip only strips lying wholly inside the discarded band; partially
+        // overlapping strips are transformed in full so the kept columns in
+        // them stay exact.
+        if (prune && col0 >= keep_lo && col0 + ncol <= keep_hi) continue;
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setBuffer:col_scratch offset:0 atIndex:0];
         [enc setBuffer:cbuf offset:0 atIndex:1];
@@ -771,7 +792,9 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     dispatch2(enc, c.pipe("pack_rows_real"), w, h);
     [enc endEncoding];
     real_in = nil; // release the local ref; the pool and the CB keep it alive
-    if (!fft2d_gpu(c0, col_scratch, h, w, false, cmd)) return Image();
+    // Prune: the border zeroing below discards these columns unconditionally.
+    if (!fft2d_gpu(c0, col_scratch, h, w, false, cmd, /*prune_lowpass*/true))
+        return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
     // In-place fftshift → zero borders → fftshift (even size: shift is involution)
