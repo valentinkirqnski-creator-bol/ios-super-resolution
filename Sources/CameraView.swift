@@ -485,6 +485,17 @@ struct CameraView: View {
                                step: 0.05)
                     }
 
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Noise Floor Mult")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.hf_noise_floor_multiplier))
+                        }
+                        Slider(value: $cam.tuningParams.hf_noise_floor_multiplier,
+                               in: 0.0...12.0,
+                               step: 0.5)
+                    }
+
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
                     if cam.tuningParams.motion_edge_rejection_enabled {

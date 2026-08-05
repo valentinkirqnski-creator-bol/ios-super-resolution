@@ -1368,7 +1368,7 @@ struct RobHfLossParams {
     uint _pad0;
     float alpha, beta;
     float noise_mult;   // scales the subtracted noise variance
-    float _pad2;
+    float min_texture_snr; // signal must exceed this multiple of the noise floor
 };
 
 struct RobDogsonParams {
@@ -1532,7 +1532,7 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
     constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    constexpr float kMinTextureSnr = 4.f;
+    const float kMinTextureSnr = max(p.min_texture_snr, 0.f);
     float var_sum = 0.f;
     float lp_var_sum = 0.f;
     float noise_var = 0.f;

@@ -1225,7 +1225,7 @@ static_assert(sizeof(RobStatsParamsCPU) == 16, "RobStatsParamsCPU");
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch, _pad0 = 0;
     float alpha, beta;
-    float noise_mult = 1.f, _pad2 = 0.f;
+    float noise_mult = 1.f, min_texture_snr = 4.f;
 };
 static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
 
@@ -1384,6 +1384,7 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     hp.nch = (uint32_t)nch;
     hp.alpha = cfg.alpha;
     hp.noise_mult = cfg.hf_variance_noise_multiplier;
+    hp.min_texture_snr = cfg.hf_noise_floor_multiplier;
     hp.beta = cfg.beta;
     enc = [cmd computeCommandEncoder];
     if (!enc) return false;

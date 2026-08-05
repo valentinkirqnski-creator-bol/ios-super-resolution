@@ -422,7 +422,7 @@ static Image high_frequency_loss_map_adaptive(const Image& means, const Image& v
     Image loss(vars.h, vars.w, 1);
     constexpr f32 kLocalVarianceNoiseScale = 8.f / 9.f;
     constexpr f32 kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    constexpr f32 kMinTextureSnr = 4.f;
+    const f32 kMinTextureSnr = std::max(cfg.hf_noise_floor_multiplier, 0.f);
     for (int y = 0; y < vars.h; ++y) {
         for (int x = 0; x < vars.w; ++x) {
             f32 var = 0.f, lp_var = 0.f;
