@@ -75,6 +75,90 @@ kernel void fft1d_pow2_cpp(device float2* data [[buffer(0)]],
 }
 
 // Parallel pow2 FFT (same math as fft1d_pow2_cpp): bit-reverse + butterfly stages.
+// ---------------------------------------------------------------------------
+// Mixed-radix Stockham FFT.
+//
+// The pipeline's transform lengths factor into small primes (3024 = 7*4*4*3*3*3,
+// 4032 = 7*4*4*4*3*3), so Bluestein is unnecessary for them. Bluestein inflated a
+// 4032-point transform into an 8192-point one and ran a forward *and* inverse
+// inside it: 26 butterfly passes over twice the data, where this needs 6 stages
+// over the real length. That is roughly 8x less memory traffic, and these
+// kernels are bandwidth-bound.
+//
+// Stockham is autosort: it ping-pongs between two buffers and needs no bit or
+// digit reversal pass. Index math here is a direct transcription of a host
+// prototype checked against a naive DFT at every length the pipeline uses.
+//
+// One dispatch per stage; thread t handles one radix-R butterfly, gid.y selects
+// the batch row.
+// ---------------------------------------------------------------------------
+struct StockhamParams {
+    uint N;            // transform length
+    uint R;            // radix of this stage
+    uint Ns;           // product of radices already applied
+    uint NR;           // N / R  == number of threads per batch
+    uint stride;       // distance between batch vectors
+    uint batch_count;
+    uint inverse;
+    uint _pad0;        // 32 bytes for setBytes
+};
+
+kernel void fft_stockham_stage(device const float2* src [[buffer(0)]],
+                               device float2* dst [[buffer(1)]],
+                               constant StockhamParams& p [[buffer(2)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    const uint t = gid.x;
+    const uint batch = gid.y;
+    if (t >= p.NR || batch >= p.batch_count) return;
+    const uint R = p.R;
+    if (R < 2u || R > 7u) return;
+
+    device const float2* x = src + batch * p.stride;
+    device float2* y = dst + batch * p.stride;
+
+    const float sgn = (p.inverse != 0u) ? 2.f : -2.f;
+    const uint j = t % p.Ns;
+
+    // Load R inputs, each pre-multiplied by its stage twiddle.
+    const float ang = sgn * PI * float(j) / float(p.Ns * R);
+    float2 v[7];
+    for (uint r = 0u; r < R; ++r) {
+        const float a = ang * float(r);
+        v[r] = cmul(x[t + r * p.NR], float2(cos(a), sin(a)));
+    }
+
+    // Radix-R DFT. W holds the R distinct roots, so the (k*m)%R lookup gives the
+    // same values the host prototype computed, in the same summation order.
+    float2 W[7];
+    for (uint i = 0u; i < R; ++i) {
+        const float a = sgn * PI * float(i) / float(R);
+        W[i] = float2(cos(a), sin(a));
+    }
+    float2 tv[7];
+    for (uint i = 0u; i < R; ++i) tv[i] = v[i];
+    for (uint k = 0u; k < R; ++k) {
+        float2 s = float2(0.f, 0.f);
+        for (uint m = 0u; m < R; ++m) s += cmul(tv[m], W[(k * m) % R]);
+        v[k] = s;
+    }
+
+    const uint base = (t / p.Ns) * p.Ns * R + j;
+    for (uint r = 0u; r < R; ++r) y[base + r * p.Ns] = v[r];
+}
+
+// Copy a batch of vectors; used when an odd stage count leaves the Stockham
+// result in the ping-pong buffer.
+kernel void fft_copy_batch(device float2* dst [[buffer(0)]],
+                           device const float2* src [[buffer(1)]],
+                           constant uint& n [[buffer(2)]],
+                           constant uint& stride [[buffer(3)]],
+                           constant uint& batch_count [[buffer(4)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n || gid.y >= batch_count) return;
+    const uint off = gid.y * stride + gid.x;
+    dst[off] = src[off];
+}
+
 kernel void fft1d_bitrev(device float2* data [[buffer(0)]],
                          constant uint& n [[buffer(1)]],
                          constant uint& stride [[buffer(2)]],

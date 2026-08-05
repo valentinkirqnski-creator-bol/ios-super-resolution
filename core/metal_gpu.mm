@@ -78,6 +78,10 @@ struct MetalCtx {
     // charged to compute_grey rather than to the GPU.
     id<MTLBuffer> fft_in = nil, fft_c0 = nil, fft_out = nil;
     size_t fft_in_b = 0, fft_c0_b = 0, fft_out_b = 0;
+    // Stockham is autosort but out-of-place, so it needs a ping-pong buffer the
+    // size of the largest batch it transforms (the row pass: h*w complex).
+    id<MTLBuffer> fft_pp = nil;
+    size_t fft_pp_b = 0;
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
@@ -133,6 +137,7 @@ static MetalCtx& ctx() {
         const char* need[] = {
             "raw16_to_float_bayer",
             "fft1d_pow2_cpp", "fft1d_bitrev", "fft1d_butterfly", "fft_scale_inv", "make_chirp",
+            "fft_stockham_stage", "fft_copy_batch",
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
@@ -432,10 +437,110 @@ static bool fft1d_bluestein_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride,
     return true;
 }
 
-static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t batch,
-                      bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+// Set false to fall back to Bluestein for non-power-of-two lengths.
+static constexpr bool kUseStockham = true;
+
+// Radices largest-first, matching the verified host prototype. Returns false if
+// anything other than 2/3/5/7 remains, in which case Bluestein still handles it.
+static bool fft_factorize(uint32_t n, uint32_t* out, int cap, int& count) {
+    count = 0;
+    uint32_t m = n;
+    const uint32_t radices[] = {7u, 5u, 4u, 3u, 2u};
+    for (uint32_t r : radices) {
+        while (m % r == 0u) {
+            if (count >= cap) return false;
+            out[count++] = r;
+            m /= r;
+        }
+    }
+    return m == 1u && count > 0;
+}
+
+// Mixed-radix Stockham. Autosort, so no digit-reversal pass; ping-pongs between
+// `data` and `pp`, which must be at least batch*stride complex elements.
+static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
+                               uint32_t n, uint32_t stride, uint32_t batch,
+                               bool inverse, __strong id<MTLCommandBuffer>& cmd) {
+    auto& c = ctx();
+    if (!data || !pp || n < 2u || batch == 0u || !cmd) return false;
+
+    uint32_t rad[24];
+    int nrad = 0;
+    if (!fft_factorize(n, rad, 24, nrad)) return false;
+
+    struct StockhamParamsCPU {
+        uint32_t N, R, Ns, NR, stride, batch_count, inverse, _pad0;
+    };
+    static_assert(sizeof(StockhamParamsCPU) == 32, "StockhamParamsCPU layout");
+
+    id<MTLComputePipelineState> pipe = c.pipe("fft_stockham_stage");
+    if (!pipe) return false;
+
+    id<MTLBuffer> src = data;
+    id<MTLBuffer> dst = pp;
+    uint32_t Ns = 1u;
+    for (int s = 0; s < nrad; ++s) {
+        const uint32_t R = rad[s];
+        StockhamParamsCPU p{};
+        p.N = n;
+        p.R = R;
+        p.Ns = Ns;
+        p.NR = n / R;
+        p.stride = stride;
+        p.batch_count = batch;
+        p.inverse = inverse ? 1u : 0u;
+        p._pad0 = 0u;
+
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch2(enc, pipe, p.NR, batch);
+        [enc endEncoding];
+
+        // Result of this stage is in dst; it becomes the next stage's source.
+        std::swap(src, dst);
+        Ns *= R;
+    }
+
+    // An odd number of stages leaves the result in the ping-pong buffer.
+    if (src != data) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBuffer:src offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc setBytes:&stride length:sizeof(stride) atIndex:3];
+        [enc setBytes:&batch length:sizeof(batch) atIndex:4];
+        dispatch2(enc, c.pipe("fft_copy_batch"), n, batch);
+        [enc endEncoding];
+    }
+
+    // Same convention as the pow2 and Bluestein paths: the inverse divides by n.
+    if (inverse) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
+        [enc setBytes:&batch length:sizeof(batch) atIndex:3];
+        dispatch2(enc, c.pipe("fft_scale_inv"), n, batch);
+        [enc endEncoding];
+    }
+    return true;
+}
+
+static bool fft1d_gpu(id<MTLBuffer> data, id<MTLBuffer> pp, uint32_t n, uint32_t stride,
+                      uint32_t batch, bool inverse, __strong id<MTLCommandBuffer>& cmd) {
     if ((n & (n - 1)) == 0)
         return fft1d_pow2_gpu(data, n, stride, batch, inverse, /*scale*/true, cmd);
+    if (kUseStockham && pp) {
+        int nrad = 0;
+        uint32_t rad[24];
+        if (fft_factorize(n, rad, 24, nrad))
+            return fft1d_stockham_gpu(data, pp, n, stride, batch, inverse, cmd);
+    }
     return fft1d_bluestein_gpu(data, n, stride, batch, inverse, cmd);
 }
 
@@ -452,13 +557,14 @@ static bool fft1d_gpu(id<MTLBuffer> data, uint32_t n, uint32_t stride, uint32_t 
 //
 // Only the forward direction can prune: by the inverse pass the row transform
 // has already spread the surviving coefficients across every column.
-static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h, uint32_t w,
+static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, id<MTLBuffer> pp,
+                      uint32_t h, uint32_t w,
                       bool inverse, __strong id<MTLCommandBuffer>& cmd,
                       bool prune_lowpass = false) {
     auto& c = ctx();
     // Rows then columns stay on the GPU; Metal tracks buffer hazards in-CB.
     // Soft-commit only to bound encoder size — no waitUntilCompleted mid-FFT.
-    if (!fft1d_gpu(cbuf, w, w, h, inverse, cmd)) return false;
+    if (!fft1d_gpu(cbuf, pp, w, w, h, inverse, cmd)) return false;
     if (!commit_cmd(cmd)) return false;
 
     const bool prune = prune_lowpass && !inverse && w >= 8u;
@@ -482,7 +588,7 @@ static bool fft2d_gpu(id<MTLBuffer> cbuf, id<MTLBuffer> col_scratch, uint32_t h,
         dispatch2(enc, c.pipe("gather_cols"), h, ncol);
         [enc endEncoding];
 
-        if (!fft1d_gpu(col_scratch, h, h, ncol, inverse, cmd)) return false;
+        if (!fft1d_gpu(col_scratch, pp, h, h, ncol, inverse, cmd)) return false;
 
         enc = [cmd computeCommandEncoder];
         [enc setBuffer:cbuf offset:0 atIndex:0];
@@ -561,7 +667,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:3];
     dispatch2(enc, c.pipe("pack_tile_rows"), N, row_batch);
     [enc endEncoding];
-    if (!fft1d_gpu(rows, Nu, Nu, row_batch, false, cmd)) return false;
+    if (!fft1d_gpu(rows, nil, Nu, Nu, row_batch, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_ref offset:0 atIndex:0];
@@ -580,7 +686,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("write_rfft_cols_from_half"), N * wh, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(cols, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
+    if (!fft1d_gpu(cols, nil, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_ref offset:0 atIndex:0];
@@ -598,7 +704,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:3];
     dispatch2(enc, c.pipe("pack_tile_rows"), N, row_batch);
     [enc endEncoding];
-    if (!fft1d_gpu(rows, Nu, Nu, row_batch, false, cmd)) return false;
+    if (!fft1d_gpu(rows, nil, Nu, Nu, row_batch, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_mov offset:0 atIndex:0];
@@ -617,7 +723,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("write_rfft_cols_from_half"), N * wh, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(cols, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
+    if (!fft1d_gpu(cols, nil, Nu, Nu, tile_count * wh_u, false, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_mov offset:0 atIndex:0];
@@ -644,7 +750,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("write_rfft_cols_from_half"), N * wh, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(cols, Nu, Nu, tile_count * wh_u, true, cmd)) return false;
+    if (!fft1d_gpu(cols, nil, Nu, Nu, tile_count * wh_u, true, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:F_ref offset:0 atIndex:0];
@@ -663,7 +769,7 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
     [enc setBytes:&nt length:sizeof(nt) atIndex:4];
     dispatch2(enc, c.pipe("expand_half_to_full_rows"), N * N, tile_count);
     [enc endEncoding];
-    if (!fft1d_gpu(full, Nu, Nu, row_batch, true, cmd)) return false;
+    if (!fft1d_gpu(full, nil, Nu, Nu, row_batch, true, cmd)) return false;
 
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:corr offset:0 atIndex:0];
@@ -778,6 +884,10 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     id<MTLBuffer> real_in = c.scratch(c.fft_in, c.fft_in_b, n * sizeof(float));
     id<MTLBuffer> c0 = c.scratch(c.fft_c0, c.fft_c0_b, cbytes);
     id<MTLBuffer> col_scratch = c.scratch(c.scratch_cols, c.scratch_cols_bytes, col_bytes);
+    // Ping-pong for Stockham. The row pass is the larger of the two batches
+    // (h*w complex vs kFftBatchChunk*h), so sizing to cbytes covers both.
+    // nil is tolerated: fft1d_gpu falls back to Bluestein without it.
+    id<MTLBuffer> fft_pp = c.scratch(c.fft_pp, c.fft_pp_b, cbytes);
     if (!real_in || !c0 || !col_scratch) return Image();
     memcpy([real_in contents], raw.data.data(), n * sizeof(float));
 
@@ -793,7 +903,7 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     [enc endEncoding];
     real_in = nil; // release the local ref; the pool and the CB keep it alive
     // Prune: the border zeroing below discards these columns unconditionally.
-    if (!fft2d_gpu(c0, col_scratch, h, w, false, cmd, /*prune_lowpass*/true))
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, false, cmd, /*prune_lowpass*/true))
         return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
@@ -817,7 +927,7 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     dispatch2(enc, c.pipe("fftshift_swap_y"), w, h / 2u);
     [enc endEncoding];
 
-    if (!fft2d_gpu(c0, col_scratch, h, w, true, cmd)) return Image();
+    if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd)) return Image();
 
     id<MTLBuffer> real_out = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
     if (!real_out) return Image();
@@ -2586,6 +2696,8 @@ void metal_trim_analyze_scratch() {
     // Grey-FFT pools are analyze-only (~190MB at 12MP); merge must not inherit them.
     c.fft_in = nil; c.fft_c0 = nil; c.fft_out = nil;
     c.fft_in_b = c.fft_c0_b = c.fft_out_b = 0;
+    c.fft_pp = nil;
+    c.fft_pp_b = 0;
     c.scratch_cols = nil;
     c.scratch_cols_bytes = 0;
     c.sticky_grey = nil;
