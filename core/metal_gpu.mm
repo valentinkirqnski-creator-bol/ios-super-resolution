@@ -1536,6 +1536,31 @@ static std::vector<float> scipy_gaussian_kernel1d_metal(float sigma, int radius)
 
 // GPU valid-gauss + stride. Same math as grey_pyramid.cpp downsample_by.
 // __strong out-param: ARC requires it for id& (same as merge robustness helpers).
+// Align stages commit without stalling the CPU. Command buffers on one queue
+// execute in commit order, so waiting on the most recently committed one implies
+// every earlier stage finished. Each stage previously did commit +
+// waitUntilCompleted: about 14 blocking round trips per comparison frame.
+//
+// Safe only because nothing in the align path shares a buffer across stages any
+// more. Metal tracks hazards within a command buffer but not across them, and an
+// earlier attempt at this raced against pooled downsample scratch.
+static __strong id<MTLCommandBuffer> g_align_last_cmd = nil;
+
+static void align_commit(id<MTLCommandBuffer> cmd) {
+    [cmd commit];
+    g_align_last_cmd = cmd;
+}
+
+// Wait for all committed align work. Required before any CPU read of a buffer
+// the align stages wrote.
+static bool align_drain() {
+    if (!g_align_last_cmd) return true;
+    [g_align_last_cmd waitUntilCompleted];
+    const bool ok = (g_align_last_cmd.status == MTLCommandBufferStatusCompleted);
+    g_align_last_cmd = nil;
+    return ok;
+}
+
 static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
                                __strong id<MTLBuffer>& dst, int& dh, int& dw) {
     if (factor <= 1) {
@@ -1607,9 +1632,7 @@ static bool gpu_downsample_buf(id<MTLBuffer> src, int sh, int sw, int factor,
     dispatch2(enc, c.pipe("pyr_subsample"), (NSUInteger)dw, (NSUInteger)dh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:downsample");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    align_commit(cmd);
     dst = b_out;
     return true;
 }
@@ -1711,9 +1734,8 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, l1 ? "align:local-search-L1" : "align:local-search-L2");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
@@ -1763,9 +1785,8 @@ static bool l1_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov, id<MTLBuffer> b_fl
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:l1-block-match");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy,
@@ -1825,9 +1846,8 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:ica-refine");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 } // namespace
@@ -1846,6 +1866,9 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, false))
         return false;
+    // Single-stage entry point: the helper above now commits without waiting,
+    // so drain before reading the result back to the host.
+    if (!align_drain()) return false;
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
     return true;
 }
@@ -1864,6 +1887,9 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, true))
         return false;
+    // Single-stage entry point: the helper above now commits without waiting,
+    // so drain before reading the result back to the host.
+    if (!align_drain()) return false;
     memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
     return true;
 }
@@ -1892,6 +1918,9 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
     if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, b_mov, b_flow,
                   ref.h, ref.w, moving.h, moving.w, ny, nx, tile_size, n_iter))
         return false;
+    // Single-stage entry point: the helper above now commits without waiting,
+    // so drain before reading the result back to the host.
+    if (!align_drain()) return false;
     memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
     return true;
 }
@@ -1909,6 +1938,9 @@ bool downsample_by_metal(const Image& src, int factor, Image& out) {
     if (!gpu_downsample_buf(b_src, src.h, src.w, factor, b_dst, dh, dw) || !b_dst)
         return false;
     out = Image(dh, dw, 1);
+    // Single-stage entry point: the helper above now commits without waiting,
+    // so drain before reading the result back to the host.
+    if (!align_drain()) return false;
     memcpy(out.data.data(), [b_dst contents], (size_t)dh * dw * sizeof(float));
     return true;
 }
@@ -2004,9 +2036,8 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
    threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:prep-sobel-hessian");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    const bool ok = true;
     if (ok && key) {
         c.ica_ref_key = key;
         c.ica_ref = b_ref;
@@ -2069,9 +2100,8 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:upscale-flow");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return cmd.status == MTLCommandBufferStatusCompleted;
+    align_commit(cmd);
+    return true;
 }
 
 } // namespace
@@ -2100,6 +2130,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         if (radius < 0) return false;
     }
 
+    // Drain any work left in flight by an early return from a previous call.
+    (void)align_drain();
     auto& c = ctx();
     Image moving_padded_grey = pad_image_circular(moving_grey, tile_size);
     id<MTLBuffer> mov0 = buf(moving_padded_grey.data.data(),
@@ -2190,6 +2222,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // Block matching only; ICA runs once below on the finest level.
     }
 
+    if (!align_drain()) return false;
     // ICA once on the finest level, matching 63e6919 and align.cpp, rather than
     // once per pyramid level as ac0ff06 did.
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
@@ -2218,6 +2251,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                   flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
         return false;
 
+    // Single sync point for the whole align before the CPU reads the flow.
+    if (!align_drain()) return false;
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
