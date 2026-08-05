@@ -2391,30 +2391,45 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
-        id<MTLBuffer> b_ica_ref = nil, b_gx = nil, b_gy = nil, b_hess = nil;
-        int ica_ny = 0, ica_nx = 0;
-        if (!prep_level_ica_gpu(r, ts, b_ica_ref, b_gx, b_gy, b_hess,
-                                ica_ny, ica_nx))
-            return false;
-        if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
-        if (lvl == 0 && !g_dumped_ref_grads && b_gx && b_gy && debug_dumps_enabled()) {
-            // CPU read of GPU-written buffers: the align stages no longer stall,
-            // so this debug path has to drain explicitly. Gated on dumps being
-            // enabled so production never pays for it.
-            if (!align_drain()) return false;
-            debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
-                           (size_t)r.h * (size_t)r.w);
-            debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
-                           (size_t)r.h * (size_t)r.w);
-            g_dumped_ref_grads = true;
-        }
-        if (!ica_bufs(b_ica_ref, b_gx, b_gy, b_hess, m.img, b_flow,
-                      r.h, r.w, m.h, m.w, flow_ny, flow_nx, ts,
-                      cfg.ica_n_iter))
-            return false;
-
-        // Level ICA buffers drop here; refined flow stays resident.
+        // Block matching only; ICA runs once below on the finest level.
     }
+
+    // ICA on the finest level, matching the CPU path and d5215ec. Per-level
+    // refinement was tried and reverted, so this runs once per comparison frame
+    // instead of once per pyramid level.
+    if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
+    id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
+    int ica_ny = 0, ica_nx = 0;
+    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
+                            ica_ny, ica_nx))
+        return false;
+    if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
+    if (!g_dumped_ref_grads && b_gx && b_gy && debug_dumps_enabled()) {
+        // CPU read of GPU-written buffers: align no longer stalls per stage, so
+        // this debug path drains explicitly. Gated on dumps being enabled so
+        // production never pays for it.
+        if (!align_drain()) return false;
+        debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        g_dumped_ref_grads = true;
+    }
+    // The moving grey is already resident from compute_grey_fft_metal, so reuse
+    // it rather than re-uploading the full-resolution frame.
+    id<MTLBuffer> b_mov_native = nil;
+    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
+        b_mov_native = c.sticky_grey;
+    } else {
+        b_mov_native = buf(moving_grey.data.data(),
+                           moving_grey.data.size() * sizeof(float));
+    }
+    if (!b_mov_native) return false;
+    if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
+                  ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
+                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
+        return false;
 
     // Single sync point for the whole align: everything above was committed
     // without stalling, and queue order guarantees it has all completed.

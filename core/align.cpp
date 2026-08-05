@@ -834,16 +834,17 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg.num_threads);
 
-        Image gx = compute_sobel_gradx(r);
-        Image gy = compute_sobel_grady(r);
-        HessianField hess = compute_hessian(gx, gy, ts);
-        if (lvl == 0) {
-            debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
-            debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
-        }
-        ica_refine_level(r, gx, gy, m, hess, flow, ts,
-                         cfg.ica_n_iter, cfg.num_threads);
     }
+
+    // ICA runs once on the finest level, not per pyramid level. Per-level
+    // refinement was tried and reverted: this restores the d5215ec behaviour.
+    Image gx = compute_sobel_gradx(ref_grey);
+    Image gy = compute_sobel_grady(ref_grey);
+    HessianField hess = compute_hessian(gx, gy, tile_size);
+    debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
+    debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
+    ica_refine_level(ref_grey, gx, gy, moving_grey, hess, flow, tile_size,
+                     cfg.ica_n_iter, cfg.num_threads);
     return flow;
 }
 

@@ -94,7 +94,10 @@ struct Config {
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
-    bool global_prealignment_enabled = true;
+    // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
+    // With this false the plan stays empty, so every frame enters align() with a
+    // zero initial transform and frame 0 stays the reference.
+    bool global_prealignment_enabled = false;
     bool global_prealignment_choose_reference = true;
     float global_prealignment_rotation_range_deg = 0.0f;
     float global_prealignment_rotation_step_deg = 0.25f;
