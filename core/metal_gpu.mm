@@ -558,7 +558,7 @@ static bool fft1d_stockham_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     if (inverse) {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:data offset:0 atIndex:0];
+        [enc setBuffer:data offset:boff atIndex:0];
         [enc setBytes:&n length:sizeof(n) atIndex:1];
         [enc setBytes:&stride length:sizeof(stride) atIndex:2];
         [enc setBytes:&batch length:sizeof(batch) atIndex:3];
@@ -667,7 +667,7 @@ static bool fft1d_fourstep_gpu(id<MTLBuffer> data, id<MTLBuffer> pp,
     if (inverse) {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
-        [enc setBuffer:data offset:boff atIndex:0];
+        [enc setBuffer:data offset:0 atIndex:0];
         [enc setBytes:&n length:sizeof(n) atIndex:1];
         [enc setBytes:&stride length:sizeof(stride) atIndex:2];
         [enc setBytes:&batch length:sizeof(batch) atIndex:3];
