@@ -748,13 +748,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         debug_dump_text("cpp_burst_paths", listing);
     }
     const double t_snr = prof_now_ms();
-    tune_config_snr(ref, work);
+    f32 ref_brightness = 0.f;
+    tune_config_snr(ref, work, &ref_brightness);
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
     {
-        f32 sum = 0.f;
-        for (f32 v : ref.data) sum += v;
-        const f32 brightness = ref.data.empty() ? 0.f : sum / (f32)ref.data.size();
+        // Same value tune_config_snr just computed. It used to be summed again
+        // here, and the two scans together were the single largest CPU stage in
+        // the burst -- 325ms of serial float adds over 12.2M samples, which the
+        // compiler cannot vectorize because float addition is not associative.
+        // Reusing the result is bit-identical; a parallel reduction would not be.
+        const f32 brightness = ref_brightness;
         const f32 sigma = noise_std_at_brightness(brightness, work.alpha, work.beta);
         const f32 snr = (sigma > 1e-8f) ? brightness / sigma : 0.f;
         char buf[288];
@@ -860,6 +864,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         spill_pending = false;
     };
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
+        const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.08f + 0.35f * (float)pos / std::max(1, n - 1));
@@ -995,6 +1000,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             cached.push_back(std::move(fc));
             n_comp_ok++;
         }
+        prof_add_cpu("comp:frame(total)", prof_now_ms() - t_frame_total);
         prof_mark_memory("analyze:frame-end");
     }
     drain_spill();

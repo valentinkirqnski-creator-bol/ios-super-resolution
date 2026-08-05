@@ -39,8 +39,9 @@ static void set_alignment_tile_sizes(Config& cfg, int base_tile_size) {
     }
 }
 
-void tune_config_snr(const Image& ref_raw, Config& cfg) {
+void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     const int manual_tile_size = sanitize_alignment_tile_size(cfg.alignment_tile_size);
+    if (out_brightness) *out_brightness = 0.f;
     if (!cfg.snr_auto_tune || ref_raw.data.empty()) {
         if (manual_tile_size > 0)
             set_alignment_tile_sizes(cfg, manual_tile_size);
@@ -51,6 +52,7 @@ void tune_config_snr(const Image& ref_raw, Config& cfg) {
     f32 sum = 0.f;
     for (f32 v : ref_raw.data) sum += v;
     f32 brightness = sum / (f32)ref_raw.data.size();
+    if (out_brightness) *out_brightness = brightness;
     f32 sigma = noise_std_at_brightness(brightness, cfg.alpha, cfg.beta);
     f32 snr = (sigma > 1e-8f) ? brightness / sigma : 15.f;
     snr = clampf(snr, 6.f, 30.f);
