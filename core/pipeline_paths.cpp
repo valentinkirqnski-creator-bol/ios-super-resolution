@@ -912,8 +912,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, raw_name.c_str(), comp);
         }
 
-        // 2×: decode next during align. 1×: wait until after grey (lower peak).
-        if (!full_res && pos + 1 < (int)comp_indices.size()) {
+        // Launch the next decode here on both paths, immediately after this
+        // frame's decode, so it overlaps grey + align + robustness + kernels
+        // (~440ms) instead of only robustness + kernels (~55ms). The full-res
+        // path used to defer until after align to hold peak RAM down, and the
+        // cost was comp:decode-wait sitting at 460ms per burst: a ~190ms decode
+        // with ~55ms of cover.
+        //
+        // The extra resident frame is ~49MB of normalized Bayer held across
+        // grey. Peak footprint is reached at merge:band (1861MB), not during
+        // analyze, so this does not move the peak; headroom to jetsam was
+        // 1211MB. Scheduling only -- the same frames are decoded in the same
+        // order and produce the same values.
+        if (pos + 1 < (int)comp_indices.size()) {
             const double t_pf = prof_now_ms();
             const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
@@ -950,18 +961,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             report("Frame " + std::to_string(k + 1) + ": Metal alignment failed",
                    0.08f + 0.35f * (float)(pos + 1) / std::max(1, n - 1));
             continue;
-        }
-
-        // Full-res: decode next while Metal rob/kernels run (grey already freed).
-        if (full_res && pos + 1 < (int)comp_indices.size()) {
-            const double t_pf = prof_now_ms();
-            const int nk = comp_indices[(size_t)pos + 1u];
-            pref_k = nk;
-            pref_fut = std::async(std::launch::async, [&, nk]() {
-                worker_qos();
-                return loader(nk, work, false, ref_h, ref_w);
-            });
-            prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
         }
 
         Image rob;
