@@ -866,9 +866,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
+        const double t_rep = prof_now_ms();
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.08f + 0.35f * (float)pos / std::max(1, n - 1));
+        prof_add_cpu("comp:progress-report", prof_now_ms() - t_rep);
+        const double t_spill = prof_now_ms();
         drain_spill();
+        prof_add_cpu("comp:spill-drain", prof_now_ms() - t_spill);
 
         Image comp;
         const double t_decode = prof_now_ms();
@@ -891,11 +895,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
         // 2×: decode next during align. 1×: wait until after grey (lower peak).
         if (!full_res && pos + 1 < (int)comp_indices.size()) {
+            const double t_pf = prof_now_ms();
             const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
                 return loader(nk, work, false, ref_h, ref_w);
             });
+            prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
         }
 
         const double t_comp_grey = prof_now_ms();
@@ -917,7 +923,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
+        const double t_freeg = prof_now_ms();
         comp_grey = Image(); // free before robustness/kernels peak
+        prof_add_cpu("comp:free-grey", prof_now_ms() - t_freeg);
         if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) {
             report("Frame " + std::to_string(k + 1) + ": Metal alignment failed",
                    0.08f + 0.35f * (float)(pos + 1) / std::max(1, n - 1));
@@ -926,11 +934,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
         // Full-res: decode next while Metal rob/kernels run (grey already freed).
         if (full_res && pos + 1 < (int)comp_indices.size()) {
+            const double t_pf = prof_now_ms();
             const int nk = comp_indices[(size_t)pos + 1u];
             pref_k = nk;
             pref_fut = std::async(std::launch::async, [&, nk]() {
                 return loader(nk, work, false, ref_h, ref_w);
             });
+            prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
         }
 
         Image rob;
@@ -964,6 +974,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, mask_name.c_str(), rob);
             append_cov_summary(debug_summary, cov_name.c_str(), covs);
         }
+        const double t_stash = prof_now_ms();
         if (stream_comp_raw) {
             // Keep flow/R/cov in RAM. For DNG-file input, spill normalized Bayer
             // async; for direct RAW, reload the original uint16 frame later.
@@ -1000,6 +1011,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             cached.push_back(std::move(fc));
             n_comp_ok++;
         }
+        prof_add_cpu("comp:stash+free-raw", prof_now_ms() - t_stash);
         prof_add_cpu("comp:frame(total)", prof_now_ms() - t_frame_total);
         prof_mark_memory("analyze:frame-end");
     }
