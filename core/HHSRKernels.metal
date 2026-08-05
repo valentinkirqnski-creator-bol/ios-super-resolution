@@ -395,6 +395,37 @@ kernel void fftshift2d_c(device float2* out [[buffer(0)]],
     }
 }
 
+// Natural-order equivalent of: fftshift_swap_x -> fftshift_swap_y ->
+// zero_fft_borders -> fftshift_swap_x -> fftshift_swap_y.
+//
+// The two swaps are pairwise element exchanges, so each is its own inverse and
+// the pair is a permutation of the buffer. Zeroing a set of positions in
+// permuted space and then undoing the permutation is exactly zeroing the
+// preimages of those positions in natural space -- the surviving values are
+// carried through untouched either way. So this kernel reproduces the same
+// buffer while touching it once instead of five times.
+//
+// X()/Y() below replicate fftshift_swap_x/y verbatim rather than simplifying to
+// (x + w/2) % w. For odd w that swap leaves the final element in place, which
+// is not what the modular form gives, and the grey FFT pads to whatever size
+// the mixed-radix factorization wants -- not necessarily even.
+kernel void zero_fft_borders_natural(device float2* data [[buffer(0)]],
+                                     constant uint& h [[buffer(1)]],
+                                     constant uint& w [[buffer(2)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    uint y = gid.y, x = gid.x;
+    if (y >= h || x >= w) return;
+    const uint half_w = w / 2u, half_h = h / 2u;
+    // Where this element ends up after the two swaps.
+    const uint xs = (x < half_w) ? (x + half_w)
+                                 : ((x < 2u * half_w) ? (x - half_w) : x);
+    const uint ys = (y < half_h) ? (y + half_h)
+                                 : ((y < 2u * half_h) ? (y - half_h) : y);
+    const uint y0 = h / 4u, x0 = w / 4u;
+    if (ys < y0 || ys >= h - y0 || xs < x0 || xs >= w - x0)
+        data[y * w + x] = float2(0.f, 0.f);
+}
+
 kernel void zero_fft_borders(device float2* data [[buffer(0)]],
                              constant uint& h [[buffer(1)]],
                              constant uint& w [[buffer(2)]],

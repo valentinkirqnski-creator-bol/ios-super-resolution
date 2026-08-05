@@ -141,7 +141,7 @@ static MetalCtx& ctx() {
             "bluestein_pack_A", "bluestein_clear_B", "bluestein_fill_B", "bluestein_extract",
             "cbuf_mul_broadcast_B", "pack_rows_real", "transpose_c",
             "gather_cols", "scatter_cols", "fftshift_swap_x", "fftshift_swap_y",
-            "fftshift2d_c", "zero_fft_borders", "extract_real",
+            "fftshift2d_c", "zero_fft_borders", "zero_fft_borders_natural", "extract_real",
             "align_local_search_460",
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
@@ -907,24 +907,16 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
         return Image();
     // fft2d flushes internally; cmd is a fresh empty buffer — start shift pass on it.
 
-    // In-place fftshift → zero borders → fftshift (even size: shift is involution)
+    // Was fftshift -> zero borders -> fftshift, five full-buffer passes. The two
+    // shifts are permutations that cancel, so the whole sequence collapses to
+    // zeroing the preimages of the border in natural order -- one pass, same
+    // bytes out. At this size the buffer does not fit in cache, so the four
+    // removed passes were four round trips to DRAM.
     enc = [cmd computeCommandEncoder];
     [enc setBuffer:c0 offset:0 atIndex:0];
     [enc setBytes:&h length:sizeof(h) atIndex:1];
     [enc setBytes:&w length:sizeof(w) atIndex:2];
-    dispatch2(enc, c.pipe("fftshift_swap_x"), w / 2u, h);
-    dispatch2(enc, c.pipe("fftshift_swap_y"), w, h / 2u);
-
-    [enc setBuffer:c0 offset:0 atIndex:0];
-    [enc setBytes:&h length:sizeof(h) atIndex:1];
-    [enc setBytes:&w length:sizeof(w) atIndex:2];
-    dispatch2(enc, c.pipe("zero_fft_borders"), w, h);
-
-    [enc setBuffer:c0 offset:0 atIndex:0];
-    [enc setBytes:&h length:sizeof(h) atIndex:1];
-    [enc setBytes:&w length:sizeof(w) atIndex:2];
-    dispatch2(enc, c.pipe("fftshift_swap_x"), w / 2u, h);
-    dispatch2(enc, c.pipe("fftshift_swap_y"), w, h / 2u);
+    dispatch2(enc, c.pipe("zero_fft_borders_natural"), w, h);
     [enc endEncoding];
 
     if (!fft2d_gpu(c0, col_scratch, fft_pp, h, w, true, cmd)) return Image();

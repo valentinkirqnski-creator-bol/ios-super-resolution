@@ -714,8 +714,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_add_cpu("ref:decode", prof_now_ms() - t_first);
     if (first_ref.h <= 0 || first_ref.w <= 0) return Image();
 
+    const double t_prealign = prof_now_ms();
     PrealignPlan prealign = build_prealign_plan_from_first(
         frame_count, loader, work, first_ref, progress);
+    prof_add_cpu("setup:prealign", prof_now_ms() - t_prealign);
     const int ref_index = std::max(0, std::min(frame_count - 1, prealign.reference_index));
     Image ref;
     if (ref_index == 0) {
@@ -745,6 +747,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         debug_dump_text("cpp_burst_paths", listing);
     }
+    const double t_snr = prof_now_ms();
     tune_config_snr(ref, work);
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
@@ -762,6 +765,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             work.alpha, work.beta, brightness, sigma, snr, t0, work.r_t);
         report(buf, 0.065f);
     }
+    prof_add_cpu("setup:snr-tune+brightness", prof_now_ms() - t_snr);
 
     const int ref_h = ref.h, ref_w = ref.w;
     const int n = frame_count;
@@ -1021,13 +1025,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
     Image acc_rob;
     bool have_acc_rob = false;
+    const double t_accrob = prof_now_ms();
     build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
+    prof_add_cpu("merge:acc-rob-sum", prof_now_ms() - t_accrob);
     const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
     if (have_acc_rob) {
         debug_dump_bin("cpp_acc_rob", acc_rob.data.data(), acc_rob.data.size());
         if (debug) append_image_summary(debug_summary, "acc_rob", acc_rob);
     }
 
+    const double t_open = prof_now_ms();
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
@@ -1071,6 +1078,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // ~480 rows fits the 96MB per-slot budget at full-res scale-2 (2 slots).
     if (heavy_1x) band_rows = std::min(band_rows, 480);
     std::vector<uint16_t> row16((size_t)band_rows * (size_t)Ws * 3u);
+    prof_add_cpu("merge:open+alloc", prof_now_ms() - t_open);
 
     Image comp_scratch;
 #if defined(__APPLE__)
@@ -1303,7 +1311,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
 #endif
 
+    const double t_close = prof_now_ms();
     writer.close();
+    prof_add_cpu("out:dng-close(flush)", prof_now_ms() - t_close);
+    const double t_tail = prof_now_ms();
     if (work.robustness_save_mask && have_acc_rob) {
         if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
             report("Wrote robustness mask", 0.985f);
@@ -1313,6 +1324,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     ref = Image();
     ref_covs = CovField();
     if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+    prof_add_cpu("out:mask-pgm+teardown", prof_now_ms() - t_tail);
     report(format_accum_diag(diag), 0.99f);
     if (debug) {
         append_merge_summary(debug_summary, merge_debug);

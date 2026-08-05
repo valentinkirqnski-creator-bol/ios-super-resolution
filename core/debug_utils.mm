@@ -13,16 +13,22 @@
 
 namespace hhsr {
 
-// ON by default on this diagnostic branch: a sideloaded IPA has no Xcode scheme
-// to inject environment variables, so env-only gating produced no data at all.
-// HHSR_ENABLE_DEBUG_DUMPS=0 disables. FLIP BACK TO OPT-IN BEFORE RELEASE.
+// Back to opt-in. This was flipped on to diagnose the dark robustness mask,
+// which is fixed, and leaving it on is expensive in a way that is easy to
+// miss: the flag does not only write files. It also makes the pipeline run
+// append_image_summary / append_cov_summary over every mask and covariance
+// field, and analyze_merge_band over every merge band, all full-image CPU
+// passes that never show up in a GPU trace.
+//
+// Set HHSR_ENABLE_DEBUG_DUMPS=1 to turn it back on. A sideloaded IPA has no
+// Xcode scheme to inject env vars, so flip the default here when diagnosing.
 bool debug_dumps_enabled() {
     static int cached = -1;
     if (cached >= 0) return cached != 0;
-    bool enabled = true;
+    bool enabled = false;
     if (const char* flag = std::getenv("HHSR_ENABLE_DEBUG_DUMPS")) {
-        enabled = !(flag[0] == '0' || flag[0] == 'n' || flag[0] == 'N' ||
-                    flag[0] == 'f' || flag[0] == 'F');
+        enabled = (flag[0] == '1' || flag[0] == 'y' || flag[0] == 'Y' ||
+                   flag[0] == 't' || flag[0] == 'T');
     }
     cached = enabled ? 1 : 0;
     return enabled;
