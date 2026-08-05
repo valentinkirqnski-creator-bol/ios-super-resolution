@@ -1960,28 +1960,36 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
-        id<MTLBuffer> b_ica_ref = nil, b_gx = nil, b_gy = nil, b_hess = nil;
-        int ica_ny = 0, ica_nx = 0;
-        if (!prep_level_ica_gpu(r, ts, b_ica_ref, b_gx, b_gy, b_hess,
-                                ica_ny, ica_nx))
-            return false;
-        if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
-        if (lvl == 0 && !g_dumped_ref_grads && b_gx && b_gy) {
-            debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
-                           (size_t)r.h * (size_t)r.w);
-            debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
-                           (size_t)r.h * (size_t)r.w);
-            g_dumped_ref_grads = true;
-        }
-        if (!ica_bufs(b_ica_ref, b_gx, b_gy, b_hess, m.img, b_flow,
-                      r.h, r.w, m.h, m.w, flow_ny, flow_nx, ts,
-                      cfg.ica_n_iter))
-            return false;
-
-        // Level ICA buffers drop here; refined flow stays resident.
+        // Level ICA buffers drop here — only flow stays resident.
     }
 
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
+    id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
+    int ica_ny = 0, ica_nx = 0;
+    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
+                            ica_ny, ica_nx))
+        return false;
+    if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
+    if (!g_dumped_ref_grads && b_gx && b_gy) {
+        debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        g_dumped_ref_grads = true;
+    }
+    id<MTLBuffer> b_mov_native = nil;
+    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
+        b_mov_native = c.sticky_grey;
+    } else {
+        b_mov_native = buf(moving_grey.data.data(), moving_grey.data.size() * sizeof(float));
+    }
+    if (!b_mov_native) return false;
+    if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
+                  ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
+                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
+        return false;
+
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
