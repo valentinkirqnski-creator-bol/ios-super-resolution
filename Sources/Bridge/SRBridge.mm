@@ -1,5 +1,4 @@
 #import "SRBridge.h"
-#include "mps_fft.h"
 #import <UIKit/UIKit.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -13,6 +12,7 @@
 #include "core/types.h"
 #include "core/pipeline.h"
 #include "core/metal_gpu.h"
+#include "core/mps_fft.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
