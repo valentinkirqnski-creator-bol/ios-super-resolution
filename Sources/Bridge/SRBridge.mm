@@ -635,6 +635,15 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview / JPEG
     cfg.use_gpu = false;
     cfg.num_threads = 0;     // all CPU cores during active processing
+    // Same as the camera path. The loader can re-read the DNG, so there is no
+    // need to spill a normalized copy of every comparison frame to disk.
+    //
+    // This used to be left false because re-decoding a DNG (~190ms) cost more
+    // than reading back a spilled .raw (~85ms). That trade is gone: comparison
+    // frames are uploaded to the GPU as they are analyzed, so neither the spill
+    // nor the reload happens in the normal case, and the reload is only a
+    // fallback for a failed upload.
+    cfg.stream_comp_raw_from_loader = true;
 
     ApplyTuningParams(tuning, cfg);
 
