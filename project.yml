@@ -51,6 +51,7 @@ targets:
           - "snr_tuning.cpp"
           - "preset_lut.cpp"
           - "metal_gpu.mm"
+          - "mps_fft.mm"
           - "debug_utils.mm"
           - "prof.mm"
           - "HHSRKernels.metal"
@@ -83,6 +84,8 @@ targets:
     dependencies:
       - sdk: Accelerate.framework
       - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: MetalPerformanceShadersGraph.framework
       - sdk: Foundation.framework
       - sdk: libz.tbd
       - sdk: CoreImage.framework

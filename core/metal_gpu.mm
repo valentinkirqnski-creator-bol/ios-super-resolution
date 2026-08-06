@@ -6,6 +6,7 @@
 #include "metal_gpu.h"
 #include "debug_utils.h"
 #include "prof.h"
+#include "mps_fft.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -878,6 +879,40 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     const size_t n = (size_t)h * w;
     const size_t cbytes = n * sizeof(float) * 2;
     const size_t col_bytes = (size_t)kFftBatchChunk * h * sizeof(float) * 2;
+
+    // MPSGraph does the same low-pass with real-to-Hermitean and
+    // Hermitean-to-real transforms, so it never spends a pass transforming the
+    // zero imaginary half, and it stores h x (w/2+1) instead of h x w. Falls
+    // through to the Stockham path below on any failure or when unavailable
+    // (the ops are iOS 16+, this project deploys to 15).
+    if (mps_fft_enabled()) {
+        ProfStageScope prof_mps("grey:fft-mpsgraph");
+        Image grey;
+        grey.h = (int)h;
+        grey.w = (int)w;
+        grey.c = 1;
+        grey.data.resize(n);
+        if (mps_grey_lowpass(raw.data.data(), grey.data.data(), (int)h, (int)w)) {
+            // align_metal reuses sticky_grey when the dimensions match, so it
+            // must be refreshed here. Leaving the previous frame's buffer pinned
+            // would silently align every frame against a stale grey.
+            id<MTLBuffer> pinned = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
+            if (pinned) {
+                memcpy([pinned contents], grey.data.data(), n * sizeof(float));
+                c.sticky_grey = pinned;
+                c.sticky_grey_h = (int)h;
+                c.sticky_grey_w = (int)w;
+            } else {
+                c.sticky_grey = nil;
+                c.sticky_grey_h = 0;
+                c.sticky_grey_w = 0;
+            }
+            return grey;
+        }
+        c.sticky_grey = nil;
+        c.sticky_grey_h = 0;
+        c.sticky_grey_w = 0;
+    }
 
     // Pooled rather than freshly allocated: pack_rows_real writes every element
     // of c0 and extract_real writes every element of the output, so neither
