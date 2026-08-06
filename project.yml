@@ -4,7 +4,7 @@ name: HandheldSRCamera
 options:
   bundleIdPrefix: com.handheldsr
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "14.0"
   createIntermediateGroups: true
 
 settings:
