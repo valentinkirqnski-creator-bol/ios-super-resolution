@@ -1946,6 +1946,8 @@ bool downsample_by_metal(const Image& src, int factor, Image& out) {
     return true;
 }
 
+static bool g_dumped_ref_grads = false;
+
 namespace {
 
 struct AlignImgParamsCPU {
@@ -2054,6 +2056,36 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     return ok;
 }
 
+// Lucas-Kanade (ICA) subpixel refine — three warping iterations by default
+// (cfg.ica_n_iter). Shared by Block Match and HDR+ alignment paths.
+static bool align_metal_ica_refine_flow(const Image& ref_grey,
+                                        const Image& moving_grey,
+                                        int tile_size, int n_iter,
+                                        id<MTLBuffer> b_flow,
+                                        int flow_ny, int flow_nx) {
+    if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
+    if (n_iter <= 0) return true;
+    id<MTLBuffer> b_ref = nil, b_gx = nil, b_gy = nil, b_hess = nil;
+    int ica_ny = 0, ica_nx = 0;
+    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref, b_gx, b_gy, b_hess,
+                            ica_ny, ica_nx))
+        return false;
+    if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
+    if (!g_dumped_ref_grads && b_gx && b_gy) {
+        debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
+                       (size_t)ref_grey.h * (size_t)ref_grey.w);
+        g_dumped_ref_grads = true;
+    }
+    id<MTLBuffer> b_mov = buf(moving_grey.data.data(),
+                              moving_grey.data.size() * sizeof(float));
+    if (!b_mov) return false;
+    return ica_bufs(b_ref, b_gx, b_gy, b_hess, b_mov, b_flow,
+                    ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
+                    flow_ny, flow_nx, tile_size, n_iter);
+}
+
 // __strong out-param: ARC requires it for id& (same as gpu_downsample_buf).
 static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
                                   id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
@@ -2106,8 +2138,6 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
 }
 
 } // namespace
-
-static bool g_dumped_ref_grads = false;
 
 namespace {
 
@@ -2503,6 +2533,12 @@ static bool align_metal_hdrplus_impl(const Image& ref_grey, const Image& moving_
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
 
+    const int n_iter = cfg.ica_n_iter > 0 ? cfg.ica_n_iter : 3;
+    if (!align_metal_ica_refine_flow(ref_grey, moving_grey, tile_size, n_iter,
+                                     b_flow, flow_ny, flow_nx))
+        return false;
+
+    if (!align_drain()) return false;
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
@@ -2628,32 +2664,11 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     // No drain here: nothing below reads GPU memory on the CPU until the flow
     // readback, and the ICA stages are ordered behind the pyramid work by the
     // queue. Draining here would stall out most of the async benefit.
-    // ICA once on the finest level, matching 63e6919 and align.cpp, rather than
-    // once per pyramid level as ac0ff06 did.
+    // ICA once on the finest level: Lucas-Kanade warp refinement (default 3 iter).
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
-    id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
-    int ica_ny = 0, ica_nx = 0;
-    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
-                            ica_ny, ica_nx))
-        return false;
-    if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
-    if (!g_dumped_ref_grads && b_gx && b_gy) {
-        debug_dump_bin("cpp_gradx_ica", (const float*)[b_gx contents],
-                       (size_t)ref_grey.h * (size_t)ref_grey.w);
-        debug_dump_bin("cpp_grady_ica", (const float*)[b_gy contents],
-                       (size_t)ref_grey.h * (size_t)ref_grey.w);
-        g_dumped_ref_grads = true;
-    }
-    // Deliberately not reusing c.sticky_grey here. At this commit the grey FFT
-    // output buffer is pooled, and handing a pooled buffer to a later stage is
-    // the pattern that produced the corrupted pyramid earlier on this branch.
-    // A fresh upload costs one copy per frame and removes the hazard entirely.
-    id<MTLBuffer> b_mov_native = buf(moving_grey.data.data(),
-                                     moving_grey.data.size() * sizeof(float));
-    if (!b_mov_native) return false;
-    if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
-                  ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
-                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
+    const int n_iter = cfg.ica_n_iter > 0 ? cfg.ica_n_iter : 3;
+    if (!align_metal_ica_refine_flow(ref_grey, moving_grey, tile_size, n_iter,
+                                     b_flow, flow_ny, flow_nx))
         return false;
 
     // Single sync point for the whole align before the CPU reads the flow.
