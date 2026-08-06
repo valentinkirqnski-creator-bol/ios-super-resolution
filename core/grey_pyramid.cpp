@@ -275,13 +275,16 @@ Image compute_grey_decimate(const Image& raw, bool bayer_mode) {
     if (!bayer_mode) return raw;
     int gh = raw.h / 2, gw = raw.w / 2;
     Image grey(gh, gw, 1);
-    for (int y = 0; y < gh; ++y) {
+    // One output pixel per 2x2 RGGB quad, each summed in a fixed order, so
+    // splitting across rows cannot change any value -- this stays bit-identical
+    // to the serial loop it replaces.
+    parallel_rows(gh, 0, [&](int y) {
         for (int x = 0; x < gw; ++x) {
             f32 s = raw.at(2 * y, 2 * x) + raw.at(2 * y, 2 * x + 1) +
                     raw.at(2 * y + 1, 2 * x) + raw.at(2 * y + 1, 2 * x + 1);
             grey.at(y, x) = 0.25f * s;
         }
-    }
+    });
     return grey;
 }
 

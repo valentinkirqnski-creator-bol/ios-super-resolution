@@ -1039,6 +1039,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                init.dy * grey_scale_y,
                                init.angle);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
+        // Alignment ran on the grey. With the Bayer quad average that is half
+        // resolution, so the flow is on a half-res tile grid with half-res
+        // displacements, while robustness and merge both index it as
+        // raw_coordinate / tile_size and add raw pixels. Convert here, before
+        // anything downstream sees it. No-op when the grey is full resolution,
+        // so the FFT path is unaffected.
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
+                                     comp_grey.h, comp_grey.w, tile_size);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());

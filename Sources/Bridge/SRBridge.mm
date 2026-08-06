@@ -287,6 +287,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
     if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
     if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
+    // Alignment grey: FFT low-pass at full resolution, or the 2x2 Bayer quad
+    // average at half resolution that Wronski et al. describe. The quad average
+    // also constrains displacements to multiples of 2 Bayer pixels, so shifted
+    // samples keep coincident colors.
+    if (tuning[@"alignment_grey_fft"])
+        cfg.grey_method = tuning[@"alignment_grey_fft"].boolValue
+                              ? GreyMethod::FFT : GreyMethod::Decimate;
     if (tuning[@"hf_artifact_removal_enabled"])
         cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
     if (tuning[@"hf_variance_loss_threshold"])

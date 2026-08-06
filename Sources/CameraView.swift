@@ -461,6 +461,11 @@ struct CameraView: View {
                     }
                     Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
 
+                    Toggle("Alignment Grey: FFT", isOn: $cam.tuningParams.alignment_grey_fft)
+                    Text(cam.tuningParams.alignment_grey_fft
+                         ? "Full-res FFT low-pass. Slower."
+                         : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
+                        .font(.caption2).foregroundColor(.secondary)
                     Toggle("High-Frequency Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
 
                     if cam.tuningParams.hf_artifact_removal_enabled {

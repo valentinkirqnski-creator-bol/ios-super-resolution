@@ -28,6 +28,17 @@ Image compute_grey_decimate(const Image& raw, bool bayer_mode);
 Image compute_grey_fft(const Image& raw);
 Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
 
+// Re-express a flow field estimated on the grey onto a raw-resolution tile
+// grid, scaling displacements by the resolution ratio.
+//
+// Alignment runs on the grey, which is half resolution when the Bayer quad
+// average is used. Robustness and merge both index the flow as
+// raw_coordinate / tile_size and add the displacement in raw pixels, so the
+// field has to be converted before either sees it. A no-op when the grey is
+// already full resolution.
+FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
+                                int grey_h, int grey_w, int tile_size);
+
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 
