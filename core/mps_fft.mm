@@ -96,6 +96,14 @@ struct Plan {
 Plan g_plan;
 id<MTLDevice> g_device = nil;
 id<MTLCommandQueue> g_queue = nil;
+// Pooled input/output. The first version allocated a fresh input buffer per
+// frame via newBufferWithBytes and let MPSGraph allocate result storage
+// internally, which cost ~324MB of peak footprint across a burst. These are
+// sized once and reused; both are exactly n floats, so a burst holds 2 x 48.8MB
+// steady instead of churning allocations.
+id<MTLBuffer> g_in_buf = nil;
+id<MTLBuffer> g_out_buf = nil;
+size_t g_buf_elems = 0;
 std::mutex g_mutex;
 
 API_AVAILABLE(ios(16.0), macos(13.0))
@@ -160,6 +168,24 @@ bool build_plan(int h, int w) {
 }
 
 API_AVAILABLE(ios(16.0), macos(13.0))
+bool ensure_buffers(size_t n) {
+    if (g_in_buf && g_out_buf && g_buf_elems >= n) return true;
+    const size_t bytes = n * sizeof(float);
+    g_in_buf = [g_device newBufferWithLength:bytes
+                                     options:MTLResourceStorageModeShared];
+    g_out_buf = [g_device newBufferWithLength:bytes
+                                      options:MTLResourceStorageModeShared];
+    if (!g_in_buf || !g_out_buf) {
+        g_in_buf = nil;
+        g_out_buf = nil;
+        g_buf_elems = 0;
+        return false;
+    }
+    g_buf_elems = n;
+    return true;
+}
+
+API_AVAILABLE(ios(16.0), macos(13.0))
 bool run_plan(const float* in, float* out, int h, int w) {
     if (!build_plan(h, w)) return false;
 
@@ -168,30 +194,50 @@ bool run_plan(const float* in, float* out, int h, int w) {
     MPSGraphTensor* outT = (__bridge MPSGraphTensor*)g_plan.out;
 
     const size_t n = (size_t)h * (size_t)w;
-    id<MTLBuffer> inBuf = [g_device newBufferWithBytes:in
-                                                length:n * sizeof(float)
-                                               options:MTLResourceStorageModeShared];
-    if (!inBuf) return false;
+    if (!ensure_buffers(n)) return false;
+    memcpy([g_in_buf contents], in, n * sizeof(float));
 
     MPSGraphTensorData* inData =
-        [[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
+        [[MPSGraphTensorData alloc] initWithMTLBuffer:g_in_buf
                                                 shape:@[ @(h), @(w) ]
                                              dataType:MPSDataTypeFloat32];
-    if (!inData) return false;
+    MPSGraphTensorData* outData =
+        [[MPSGraphTensorData alloc] initWithMTLBuffer:g_out_buf
+                                                shape:@[ @(h), @(w) ]
+                                             dataType:MPSDataTypeFloat32];
+    if (!inData || !outData) return false;
 
-    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results =
-        [graph runWithMTLCommandQueue:g_queue
-                                feeds:@{ inT : inData }
-                        targetTensors:@[ outT ]
-                     targetOperations:nil];
-    MPSGraphTensorData* outData = results[outT];
-    if (!outData) return false;
+    // Supplying the results dictionary makes the graph write into g_out_buf
+    // rather than allocating its own storage, and lets the result be read
+    // straight from the buffer instead of through readBytes.
+    [graph runWithMTLCommandQueue:g_queue
+                            feeds:@{ inT : inData }
+                 targetOperations:nil
+                resultsDictionary:@{ outT : outData }];
 
-    [[outData mpsndarray] readBytes:out strideBytes:nil];
+    memcpy(out, [g_out_buf contents], n * sizeof(float));
     return true;
 }
 
 }  // namespace
+
+void mps_fft_prewarm(int h, int w) {
+    if (h <= 0 || w <= 0 || (h & 1) || (w & 1)) return;
+    if (!mps_fft_enabled()) return;
+    if (@available(iOS 16.0, macOS 13.0, *)) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_device) {
+            g_device = MTLCreateSystemDefaultDevice();
+            if (!g_device) return;
+            g_queue = [g_device newCommandQueue];
+            if (!g_queue) return;
+        }
+        @autoreleasepool {
+            (void)build_plan(h, w);
+            (void)ensure_buffers((size_t)h * (size_t)w);
+        }
+    }
+}
 
 bool mps_grey_lowpass(const float* in, float* out, int h, int w) {
     if (!in || !out || h <= 0 || w <= 0) return false;
@@ -217,6 +263,7 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w) {
 
 #else  // !HHSR_HAVE_MPSGRAPH
 
+void mps_fft_prewarm(int, int) {}
 bool mps_grey_lowpass(const float*, float*, int, int) { return false; }
 
 #endif

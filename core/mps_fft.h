@@ -37,4 +37,13 @@ bool mps_fft_enabled();
 // must fall back to the Stockham path. Never partially writes `out` on failure.
 bool mps_grey_lowpass(const float* in, float* out, int h, int w);
 
+// Build and cache the graph for these dimensions ahead of time.
+//
+// MPSGraph compiles on first use, which measured ~1100ms for a 12MP frame and
+// landed entirely on the reference frame's grey. Calling this before the burst
+// (ideally when the camera configures, since it only needs the sensor
+// dimensions) moves that off the shutter path. Safe to call repeatedly and from
+// any thread; a no-op once the plan for these dimensions exists.
+void mps_fft_prewarm(int h, int w);
+
 }  // namespace hhsr

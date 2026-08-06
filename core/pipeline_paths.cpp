@@ -9,6 +9,7 @@
 #include "parallel.h"
 #include "debug_utils.h"
 #include "prof.h"
+#include "mps_fft.h"
 #include "preset_lut.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -762,6 +763,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     if (ref.h <= 0 || ref.w <= 0) return Image();
 
+    // MPSGraph compiles its FFT plan on first use (~1100ms at 12MP), and that
+    // landed squarely on the reference grey. Start it here, as soon as the
+    // dimensions are known, so it overlaps everything up to that point. Only a
+    // partial hide -- the compile is longer than the work ahead of it -- so the
+    // real fix is calling mps_fft_prewarm when the camera configures, well
+    // before the shutter. Harmless when MPSGraph is unavailable.
+    std::future<void> mps_warm = std::async(std::launch::async, [&]() {
+        worker_qos();
+        mps_fft_prewarm(ref.h, ref.w);
+    });
+
     clear_align_ref_ica_cache();
     debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
     if (debug) append_image_summary(debug_summary, "raw_ref", ref);
@@ -811,8 +823,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
 
-    // Everything below needs the tuned tile size, so join here.
+    prof_add_cpu("ref:grey(gpu)", prof_now_ms() - t_ref_grey);
+
+    // Everything below needs the tuned tile size, so join here. Timed on its
+    // own: this is the residual wait after the grey, not the scan's whole
+    // duration. Previously this bucket and ref:grey+pyramid both spanned the
+    // grey, so the two double-counted it and the report read as a regression.
+    const double t_snr_join = prof_now_ms();
     snr_fut.get();
+    prof_add_cpu("setup:snr-join(residual)", prof_now_ms() - t_snr_join);
 
     // Start the first comparison decode now. It used to run synchronously at
     // the top of the comparison loop (comp:decode(sync), ~187ms with nothing
@@ -856,7 +875,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             work.alpha, work.beta, brightness, sigma, snr, t0, work.r_t);
         report(buf, 0.065f);
     }
-    prof_add_cpu("setup:snr-tune+brightness", prof_now_ms() - t_snr);
+    (void)t_snr;
 
     const int ref_h = ref.h, ref_w = ref.w;
     const int n = frame_count;
@@ -868,9 +887,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         if (i != ref_index) comp_indices.push_back(i);
     }
 
+    const double t_pyr = prof_now_ms();
     Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
-    prof_add_cpu("ref:grey+pyramid", prof_now_ms() - t_ref_grey);
+    prof_add_cpu("ref:pad+pyramid", prof_now_ms() - t_pyr);
     if (debug && !ref_pyr.levels.empty()) {
         // Match Python py_pyramid_0: first after pyramid[::-1] = coarsest.
         const Image& coarse = ref_pyr.levels.back();
@@ -1110,6 +1130,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_mark_memory("analyze:frame-end");
     }
     drain_spill();
+    if (mps_warm.valid()) mps_warm.get();
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
     if (n_comp_ok < 1) {
