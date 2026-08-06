@@ -962,6 +962,15 @@ static inline void merge_comp_contrib(device const float* img,
         j_r = min(max(lround_away(lr_x), 0), int(p.rob_w) - 1);
     }
     float local_r = robustness[uint(i_r) * p.rob_w + uint(j_r)];
+    // Nothing to accumulate where the frame is fully rejected. Every
+    // contribution is w * local_r * c or w * local_r, so all nine taps produce
+    // exactly zero and the caller's running totals are unchanged.
+    //
+    // Exact, including in floating point: num and den start at +0 (blit-filled)
+    // and every term added is non-negative, since w = exp(...) > 0, local_r >= 0
+    // and the normalized Bayer samples are >= 0. So no -0 can arise, and x + 0
+    // is bit-identical to x for every value these accumulators can hold.
+    if (local_r <= 0.f) return;
 
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
@@ -2357,24 +2366,29 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
     float2 best_flow = cand0;
     for (uint ci = 0u; ci < 3u; ++ci) {
         float2 c = (ci == 0u) ? cand0 : ((ci == 1u) ? cand1 : cand2);
+        // The sampled region is a full ts x ts rectangle in both images, so
+        // "invalidate on the first out-of-bounds sample" is exactly rectangle
+        // containment. Hoisting it removes eight comparisons per pixel from the
+        // inner loop and drops the loop entirely for candidates that cannot
+        // win: those scored INFINITY, and INFINITY < INFINITY is false, so they
+        // could never take `best` anyway. best_flow still defaults to cand0
+        // when every candidate is out of bounds, as before.
+        const int cx = int(c.x);
+        const int cy = int(c.y);
+        const bool inside =
+            (ox >= 0 && oy >= 0 &&
+             ox + p.ts <= p.ref_w && oy + p.ts <= p.ref_h &&
+             ox + cx >= 0 && oy + cy >= 0 &&
+             ox + cx + p.ts <= p.mov_w && oy + cy + p.ts <= p.mov_h);
+        if (!inside) continue;
+
         float dist = 0.f;
-        bool valid = true;
-        for (int i = 0; i < p.ts && valid; ++i) {
-            for (int j = 0; j < p.ts; ++j) {
-                int rx = ox + j;
-                int ry = oy + i;
-                int mx = rx + int(c.x);
-                int my = ry + int(c.y);
-                if (!(rx >= 0 && rx < p.ref_w && ry >= 0 && ry < p.ref_h &&
-                      mx >= 0 && mx < p.mov_w && my >= 0 && my < p.mov_h)) {
-                    valid = false;
-                    break;
-                }
-                dist += fabs(ref[uint(ry) * uint(p.ref_w) + uint(rx)] -
-                             mov[uint(my) * uint(p.mov_w) + uint(mx)]);
-            }
+        for (int i = 0; i < p.ts; ++i) {
+            const uint rrow = uint(oy + i) * uint(p.ref_w) + uint(ox);
+            const uint mrow = uint(oy + cy + i) * uint(p.mov_w) + uint(ox + cx);
+            for (int j = 0; j < p.ts; ++j)
+                dist += fabs(ref[rrow + uint(j)] - mov[mrow + uint(j)]);
         }
-        if (!valid) dist = INFINITY;
         if (dist < best) {
             best = dist;
             best_flow = c;

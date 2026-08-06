@@ -1223,7 +1223,12 @@ final class CameraModel: NSObject, ObservableObject {
                 // press. It takes ~1100ms at 12MP and is otherwise paid by the
                 // reference frame of the first burst after launch. Off the
                 // session queue so it never delays configuration.
-                DispatchQueue.global(qos: .utility).async {
+                // userInitiated, not utility: the profile showed ref:grey(gpu)
+                // at 343ms against 79ms for comparison frames, meaning the
+                // shutter was still waiting on this compile. Utility can be
+                // scheduled onto efficiency cores and preempted, which is
+                // exactly wrong for something the first capture blocks on.
+                DispatchQueue.global(qos: .userInitiated).async {
                     SRBridge.prewarmFFTWidth(Int(dims.width), height: Int(dims.height))
                 }
             }
