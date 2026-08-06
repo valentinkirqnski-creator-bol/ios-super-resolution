@@ -13,7 +13,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-14
     env:
       # Avoid the Homebrew auto-update + "tap trust" check that fails on the
       # runner's pre-installed aws/tap (exit code 74).
