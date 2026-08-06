@@ -309,6 +309,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+    if (tuning[@"alignment_method"])
+        cfg.align_method = tuning[@"alignment_method"].intValue == 1
+            ? AlignMethod::BlockMatch
+            : AlignMethod::HdrPlus;
     if (tuning[@"alignment_grey_method"])
         cfg.grey_method = tuning[@"alignment_grey_method"].intValue == 1
             ? GreyMethod::Decimate

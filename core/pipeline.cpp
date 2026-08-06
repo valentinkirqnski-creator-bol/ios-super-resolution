@@ -94,6 +94,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
 
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        flow = flow_to_raw_tile_grid(flow, ref.h, ref.w, ref_grey.h, ref_grey.w,
+                                     tile_size);
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -166,6 +168,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method);
         FrameData& fd = frames[k - 1];
         fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        fd.flow = flow_to_raw_tile_grid(fd.flow, ref.h, ref.w,
+                                        ref_grey.h, ref_grey.w, tile_size);
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {

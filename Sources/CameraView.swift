@@ -561,6 +561,15 @@ struct CameraView: View {
                         }
                     }
 
+                    Picker("Alignment", selection: $cam.tuningParams.alignment_method) {
+                        Text("HDR+").tag(0)
+                        Text("Block Match").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("HDR+ uses hierarchical tile alignment (avg-pool pyramid). Block Match keeps the previous BM + ICA path.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
                         Text("Auto").tag(0)
                         Text("8").tag(8)

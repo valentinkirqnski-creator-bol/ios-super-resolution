@@ -848,4 +848,34 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     return flow;
 }
 
+FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
+                                int grey_h, int grey_w, int tile_size) {
+    if (flow.nx <= 0 || flow.ny <= 0 || flow.flow.empty() ||
+        raw_h <= 0 || raw_w <= 0 || grey_h <= 0 || grey_w <= 0 ||
+        tile_size <= 0)
+        return flow;
+
+    const f32 sx = (f32)raw_w / (f32)grey_w;
+    const f32 sy = (f32)raw_h / (f32)grey_h;
+    if (std::fabs(sx - 1.f) < 1e-6f && std::fabs(sy - 1.f) < 1e-6f)
+        return flow;
+
+    const int raw_ny = (raw_h + tile_size - 1) / tile_size;
+    const int raw_nx = (raw_w + tile_size - 1) / tile_size;
+    FlowField out(raw_ny, raw_nx);
+    for (int ty = 0; ty < raw_ny; ++ty) {
+        const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
+        const int gy = std::max(0, std::min(flow.ny - 1,
+            (int)std::floor((raw_cy / sy) / (f32)tile_size)));
+        for (int tx = 0; tx < raw_nx; ++tx) {
+            const f32 raw_cx = ((f32)tx + 0.5f) * (f32)tile_size;
+            const int gx = std::max(0, std::min(flow.nx - 1,
+                (int)std::floor((raw_cx / sx) / (f32)tile_size)));
+            out.dx(ty, tx) = flow.dx(gy, gx) * sx;
+            out.dy(ty, tx) = flow.dy(gy, gx) * sy;
+        }
+    }
+    return out;
+}
+
 } // namespace hhsr

@@ -1010,6 +1010,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                init.dx * grey_scale_x,
                                init.dy * grey_scale_y,
                                init.angle);
+        flow = flow_to_raw_tile_grid(flow, ref_h, ref_w, ref_grey.h, ref_grey.w,
+                                     tile_size);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),

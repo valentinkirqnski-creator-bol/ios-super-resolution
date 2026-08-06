@@ -18,8 +18,11 @@ settings:
     # Portable C++ core (vendored into this repo) + vendored LibRaw headers.
     HEADER_SEARCH_PATHS:
       - "$(SRCROOT)"
+      - "$(SRCROOT)/core"
       - "$(SRCROOT)/vendor/LibRaw"
       - "$(SRCROOT)/vendor/LibRaw/libraw"
+    MTL_HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/core"
     GCC_PREPROCESSOR_DEFINITIONS:
       - "$(inherited)"
       - "HAVE_LIBRAW=1"
@@ -54,6 +57,7 @@ targets:
           - "debug_utils.mm"
           - "prof.mm"
           - "HHSRKernels.metal"
+          - "AlignPyramid.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
       # implementations and cause duplicate-symbol link errors.

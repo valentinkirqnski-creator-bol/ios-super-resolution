@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -157,6 +158,14 @@ static MetalCtx& ctx() {
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460",
             "merge_normalize_rgb16",
+            "avg_pool", "avg_pool_normalization",
+            "compute_tile_differences", "compute_tile_differences25",
+            "compute_tile_differences_exposure25",
+            "correct_upsampling_error", "find_best_tile_alignment",
+            "warp_texture_bayer", "warp_texture_xtrans",
+            "upsample_nearest_int", "blur_mosaic_texture",
+            "float_buf_to_texture", "seed_alignment_const",
+            "alignment_to_hhsr_flow",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -2100,6 +2109,408 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
 
 static bool g_dumped_ref_grads = false;
 
+namespace {
+
+static id<MTLTexture> make_tex2d(MTLPixelFormat fmt, int w, int h, bool priv) {
+    if (w <= 0 || h <= 0) return nil;
+    auto& c = ctx();
+    MTLTextureDescriptor* d = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:fmt
+                                     width:(NSUInteger)w
+                                    height:(NSUInteger)h
+                                 mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    d.storageMode = priv ? MTLStorageModePrivate : MTLStorageModeShared;
+    return [c.device newTextureWithDescriptor:d];
+}
+
+static id<MTLTexture> make_tex3d(MTLPixelFormat fmt, int w, int h, int depth) {
+    if (w <= 0 || h <= 0 || depth <= 0) return nil;
+    auto& c = ctx();
+    MTLTextureDescriptor* d = [MTLTextureDescriptor new];
+    d.textureType = MTLTextureType3D;
+    d.pixelFormat = fmt;
+    d.width = (NSUInteger)w;
+    d.height = (NSUInteger)h;
+    d.depth = (NSUInteger)depth;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    d.storageMode = MTLStorageModePrivate;
+    return [c.device newTextureWithDescriptor:d];
+}
+
+static void dispatch3(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p,
+                      NSUInteger w, NSUInteger h, NSUInteger d) {
+    if (w == 0 || h == 0 || d == 0 || !p) return;
+    [enc setComputePipelineState:p];
+    NSUInteger tw = p.threadExecutionWidth;
+    NSUInteger th = std::max<NSUInteger>(1, p.maxTotalThreadsPerThreadgroup / tw);
+    MTLSize tg = MTLSizeMake(tw, th, 1);
+    if (@available(iOS 11.0, *)) {
+        [enc dispatchThreads:MTLSizeMake(w, h, d) threadsPerThreadgroup:tg];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake((w + tw - 1) / tw, (h + th - 1) / th, d)
+            threadsPerThreadgroup:tg];
+    }
+}
+
+static bool encode_float_to_tex(id<MTLCommandBuffer> cmd, id<MTLBuffer> src,
+                                id<MTLTexture> dst, int w, int h) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("float_buf_to_texture");
+    if (!cmd || !src || !dst || !pipe) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    int32_t wi = w, hi = h;
+    [enc setBuffer:src offset:0 atIndex:0];
+    [enc setTexture:dst atIndex:0];
+    [enc setBytes:&wi length:sizeof(wi) atIndex:1];
+    [enc setBytes:&hi length:sizeof(hi) atIndex:2];
+    dispatch2(enc, pipe, (NSUInteger)w, (NSUInteger)h);
+    [enc endEncoding];
+    return true;
+}
+
+static id<MTLTexture> encode_avg_pool(id<MTLCommandBuffer> cmd, id<MTLTexture> in,
+                                      int scale, float black_level) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("avg_pool");
+    if (!cmd || !in || !pipe || scale < 1) return nil;
+    int ow = (int)in.width / scale;
+    int oh = (int)in.height / scale;
+    id<MTLTexture> out = make_tex2d(MTLPixelFormatR16Float, ow, oh, true);
+    if (!out) return nil;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return nil;
+    int32_t sc = scale;
+    float bl = black_level;
+    [enc setTexture:in atIndex:0];
+    [enc setTexture:out atIndex:1];
+    [enc setBytes:&sc length:sizeof(sc) atIndex:0];
+    [enc setBytes:&bl length:sizeof(bl) atIndex:1];
+    dispatch2(enc, pipe, (NSUInteger)ow, (NSUInteger)oh);
+    [enc endEncoding];
+    return out;
+}
+
+static id<MTLTexture> encode_blur2(id<MTLCommandBuffer> cmd, id<MTLTexture> in) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("blur_mosaic_texture");
+    if (!cmd || !in || !pipe) return nil;
+    id<MTLTexture> tmp = make_tex2d(MTLPixelFormatR16Float, (int)in.width, (int)in.height, true);
+    id<MTLTexture> out = make_tex2d(MTLPixelFormatR16Float, (int)in.width, (int)in.height, true);
+    if (!tmp || !out) return nil;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return nil;
+    int32_t ks = 2, mpw = 1, dir0 = 0, dir1 = 1;
+    int32_t tw = (int)in.width, th = (int)in.height;
+    [enc setTexture:in atIndex:0];
+    [enc setTexture:tmp atIndex:1];
+    [enc setBytes:&ks length:sizeof(ks) atIndex:0];
+    [enc setBytes:&mpw length:sizeof(mpw) atIndex:1];
+    [enc setBytes:&tw length:sizeof(tw) atIndex:2];
+    [enc setBytes:&dir0 length:sizeof(dir0) atIndex:3];
+    dispatch2(enc, pipe, in.width, in.height);
+    [enc setTexture:tmp atIndex:0];
+    [enc setTexture:out atIndex:1];
+    [enc setBytes:&th length:sizeof(th) atIndex:2];
+    [enc setBytes:&dir1 length:sizeof(dir1) atIndex:3];
+    dispatch2(enc, pipe, in.width, in.height);
+    [enc endEncoding];
+    return out;
+}
+
+static id<MTLTexture> encode_upsample_nn(id<MTLCommandBuffer> cmd, id<MTLTexture> in,
+                                         int out_w, int out_h) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("upsample_nearest_int");
+    if (!cmd || !in || !pipe || out_w <= 0 || out_h <= 0) return nil;
+    id<MTLTexture> out = make_tex2d(MTLPixelFormatRG16Sint, out_w, out_h, true);
+    if (!out) return nil;
+    float sx = (float)out_w / (float)std::max<NSUInteger>(1, in.width);
+    float sy = (float)out_h / (float)std::max<NSUInteger>(1, in.height);
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return nil;
+    [enc setTexture:in atIndex:0];
+    [enc setTexture:out atIndex:1];
+    [enc setBytes:&sx length:sizeof(sx) atIndex:0];
+    [enc setBytes:&sy length:sizeof(sy) atIndex:1];
+    dispatch2(enc, pipe, (NSUInteger)out_w, (NSUInteger)out_h);
+    [enc endEncoding];
+    return out;
+}
+
+static bool encode_correct_upsampling(id<MTLCommandBuffer> cmd,
+                                      id<MTLTexture> ref_layer, id<MTLTexture> comp_layer,
+                                      id<MTLTexture> prev_in, id<MTLTexture> prev_out,
+                                      int downscale_factor, int tile_size,
+                                      int n_tiles_x, int n_tiles_y,
+                                      bool uniform_exposure, bool use_ssd) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("correct_upsampling_error");
+    if (!cmd || !pipe || !prev_out) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    int32_t df = downscale_factor, ts = tile_size, nx = n_tiles_x, ny = n_tiles_y;
+    int32_t ue = uniform_exposure ? 1 : 0;
+    int32_t ssd = use_ssd ? 1 : 0;
+    [enc setTexture:ref_layer atIndex:0];
+    [enc setTexture:comp_layer atIndex:1];
+    [enc setTexture:prev_in atIndex:2];
+    [enc setTexture:prev_out atIndex:3];
+    [enc setBytes:&df length:sizeof(df) atIndex:0];
+    [enc setBytes:&ts length:sizeof(ts) atIndex:1];
+    [enc setBytes:&nx length:sizeof(nx) atIndex:2];
+    [enc setBytes:&ny length:sizeof(ny) atIndex:3];
+    [enc setBytes:&ue length:sizeof(ue) atIndex:4];
+    [enc setBytes:&ssd length:sizeof(ssd) atIndex:5];
+    dispatch2(enc, pipe, (NSUInteger)n_tiles_x, (NSUInteger)n_tiles_y);
+    [enc endEncoding];
+    return true;
+}
+
+static id<MTLTexture> encode_tile_diff(id<MTLCommandBuffer> cmd,
+                                       id<MTLTexture> ref_layer, id<MTLTexture> comp_layer,
+                                       id<MTLTexture> prev_align,
+                                       int downscale_factor, int tile_size, int search_dist,
+                                       int n_tiles_x, int n_tiles_y,
+                                       bool uniform_exposure, bool use_ssd) {
+    auto& c = ctx();
+    const int n_pos_1d = 2 * search_dist + 1;
+    const int n_pos_2d = n_pos_1d * n_pos_1d;
+    id<MTLTexture> tile_diff = make_tex3d(MTLPixelFormatR32Float, n_pos_2d, n_tiles_x, n_tiles_y);
+    if (!tile_diff) return nil;
+
+    const char* name = (n_pos_2d == 25)
+        ? (uniform_exposure ? "compute_tile_differences25"
+                            : "compute_tile_differences_exposure25")
+        : "compute_tile_differences";
+    id<MTLComputePipelineState> pipe = c.pipe(name);
+    if (!pipe) return nil;
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return nil;
+    int32_t df = downscale_factor, ts = tile_size, sd = search_dist;
+    int32_t ssd = use_ssd ? 1 : 0;
+    [enc setTexture:ref_layer atIndex:0];
+    [enc setTexture:comp_layer atIndex:1];
+    [enc setTexture:prev_align atIndex:2];
+    [enc setTexture:tile_diff atIndex:3];
+    [enc setBytes:&df length:sizeof(df) atIndex:0];
+    [enc setBytes:&ts length:sizeof(ts) atIndex:1];
+    [enc setBytes:&sd length:sizeof(sd) atIndex:2];
+    [enc setBytes:&ssd length:sizeof(ssd) atIndex:3];
+    if (n_pos_2d == 25)
+        dispatch2(enc, pipe, (NSUInteger)n_tiles_x, (NSUInteger)n_tiles_y);
+    else
+        dispatch3(enc, pipe, (NSUInteger)n_tiles_x, (NSUInteger)n_tiles_y, (NSUInteger)n_pos_2d);
+    [enc endEncoding];
+    return tile_diff;
+}
+
+static bool encode_find_best(id<MTLCommandBuffer> cmd, id<MTLTexture> tile_diff,
+                             id<MTLTexture> prev_align, id<MTLTexture> cur_align,
+                             int downscale_factor, int search_dist,
+                             int n_tiles_x, int n_tiles_y) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("find_best_tile_alignment");
+    if (!cmd || !pipe || !cur_align) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    int32_t df = downscale_factor, sd = search_dist;
+    [enc setTexture:tile_diff atIndex:0];
+    [enc setTexture:prev_align atIndex:1];
+    [enc setTexture:cur_align atIndex:2];
+    [enc setBytes:&df length:sizeof(df) atIndex:0];
+    [enc setBytes:&sd length:sizeof(sd) atIndex:1];
+    dispatch2(enc, pipe, (NSUInteger)n_tiles_x, (NSUInteger)n_tiles_y);
+    [enc endEncoding];
+    return true;
+}
+
+// Burst-Photo hierarchical alignment on grey luminance. Produces an HHSR
+// non-overlapping FlowField. FFT vs Bayer-Quad grey stays a separate setting.
+static bool align_metal_hdrplus_impl(const Image& ref_grey, const Image& moving_grey,
+                                     const Config& cfg, int tile_size, FlowField& flow_out,
+                                     f32 initial_dx, f32 initial_dy) {
+    if (!metal_gpu_init()) return false;
+    if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
+        moving_grey.h <= 0 || moving_grey.w <= 0 || tile_size < 8)
+        return false;
+    if (tile_size != 8 && tile_size != 16 && tile_size != 32 && tile_size != 64)
+        return false;
+
+    ProfStageScope prof_stage("align:hdrplus");
+    (void)align_drain();
+    auto& c = ctx();
+
+    // Build pyramid schedule like Burst Photo (search_dist always 2 → 25 kernels).
+    const int search_distance_limit = 64;
+    std::vector<int> downscale_factor_array = {1};
+    std::vector<int> search_dist_array = {2};
+    std::vector<int> tile_size_array = {tile_size};
+    int res = std::min(ref_grey.w, ref_grey.h) / downscale_factor_array[0];
+    while (res > search_distance_limit) {
+        downscale_factor_array.push_back(2);
+        search_dist_array.push_back(2);
+        tile_size_array.push_back(std::max(tile_size_array.back() / 2, 8));
+        res /= 2;
+    }
+    const int nlev = (int)downscale_factor_array.size();
+    if (nlev <= 0) return false;
+
+    int tile_factor = tile_size_array.back();
+    for (int f : downscale_factor_array) tile_factor *= f;
+
+    // Pad so every pyramid level is a multiple of its tile size.
+    auto pad_to_factor = [](const Image& src, int factor) -> Image {
+        int pad_h = (factor - src.h % factor) % factor;
+        int pad_w = (factor - src.w % factor) % factor;
+        if (pad_h == 0 && pad_w == 0) return src;
+        Image out(src.h + pad_h, src.w + pad_w, 1);
+        for (int y = 0; y < out.h; ++y) {
+            int sy = std::min(y, src.h - 1);
+            for (int x = 0; x < out.w; ++x) {
+                int sx = std::min(x, src.w - 1);
+                out.at(y, x) = src.at(sy, sx);
+            }
+        }
+        return out;
+    };
+
+    Image ref_pad = pad_to_factor(ref_grey, tile_factor);
+    Image mov_pad = pad_to_factor(moving_grey, tile_factor);
+    if (ref_pad.h != mov_pad.h || ref_pad.w != mov_pad.w) return false;
+
+    id<MTLBuffer> b_ref = buf(ref_pad.data.data(), ref_pad.data.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(mov_pad.data.data(), mov_pad.data.size() * sizeof(float));
+    if (!b_ref || !b_mov) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+
+    id<MTLTexture> ref_full = make_tex2d(MTLPixelFormatR16Float, ref_pad.w, ref_pad.h, true);
+    id<MTLTexture> mov_full = make_tex2d(MTLPixelFormatR16Float, mov_pad.w, mov_pad.h, true);
+    if (!ref_full || !mov_full) return false;
+    if (!encode_float_to_tex(cmd, b_ref, ref_full, ref_pad.w, ref_pad.h)) return false;
+    if (!encode_float_to_tex(cmd, b_mov, mov_full, mov_pad.w, mov_pad.h)) return false;
+
+    std::vector<id<MTLTexture>> ref_pyr((size_t)nlev);
+    std::vector<id<MTLTexture>> mov_pyr((size_t)nlev);
+    for (int i = 0; i < nlev; ++i) {
+        const int df = downscale_factor_array[(size_t)i];
+        if (i == 0) {
+            ref_pyr[(size_t)i] = encode_avg_pool(cmd, ref_full, df, 0.f);
+            mov_pyr[(size_t)i] = encode_avg_pool(cmd, mov_full, df, 0.f);
+        } else {
+            id<MTLTexture> ref_blur = encode_blur2(cmd, ref_pyr[(size_t)i - 1]);
+            id<MTLTexture> mov_blur = encode_blur2(cmd, mov_pyr[(size_t)i - 1]);
+            if (!ref_blur || !mov_blur) return false;
+            ref_pyr[(size_t)i] = encode_avg_pool(cmd, ref_blur, df, 0.f);
+            mov_pyr[(size_t)i] = encode_avg_pool(cmd, mov_blur, df, 0.f);
+        }
+        if (!ref_pyr[(size_t)i] || !mov_pyr[(size_t)i]) return false;
+    }
+
+    // Absolute downscale from grey to coarsest level.
+    int abs_scale = 1;
+    for (int f : downscale_factor_array) abs_scale *= f;
+    const int seed_dx = (int)std::lround((double)initial_dx / (double)abs_scale);
+    const int seed_dy = (int)std::lround((double)initial_dy / (double)abs_scale);
+
+    id<MTLTexture> current_alignment = make_tex2d(MTLPixelFormatRG16Sint, 1, 1, true);
+    if (!current_alignment) return false;
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        int32_t dx = seed_dx, dy = seed_dy;
+        [enc setTexture:current_alignment atIndex:0];
+        [enc setBytes:&dx length:sizeof(dx) atIndex:0];
+        [enc setBytes:&dy length:sizeof(dy) atIndex:1];
+        dispatch2(enc, c.pipe("seed_alignment_const"), 1, 1);
+        [enc endEncoding];
+    }
+
+    int finest_n_tiles_x = 0, finest_n_tiles_y = 0;
+    for (int i = nlev - 1; i >= 0; --i) {
+        const int ts = tile_size_array[(size_t)i];
+        const int search_dist = search_dist_array[(size_t)i];
+        id<MTLTexture> ref_layer = ref_pyr[(size_t)i];
+        id<MTLTexture> comp_layer = mov_pyr[(size_t)i];
+        const int n_tiles_x = (int)ref_layer.width / (ts / 2) - 1;
+        const int n_tiles_y = (int)ref_layer.height / (ts / 2) - 1;
+        if (n_tiles_x <= 0 || n_tiles_y <= 0) return false;
+        if (i == 0) {
+            finest_n_tiles_x = n_tiles_x;
+            finest_n_tiles_y = n_tiles_y;
+        }
+
+        int downscale_factor = (i < nlev - 1) ? downscale_factor_array[(size_t)i + 1] : 1;
+        id<MTLTexture> prev_alignment =
+            encode_upsample_nn(cmd, current_alignment, n_tiles_x, n_tiles_y);
+        if (!prev_alignment) return false;
+
+        id<MTLTexture> prev_corrected =
+            make_tex2d(MTLPixelFormatRG16Sint, n_tiles_x, n_tiles_y, true);
+        if (!prev_corrected) return false;
+        // L2 (SSD) on coarse levels, L1 on the finest — same as Hasinoff HDR+.
+        const bool use_ssd = (i != 0);
+        if (!encode_correct_upsampling(cmd, ref_layer, comp_layer, prev_alignment,
+                                       prev_corrected, downscale_factor, ts,
+                                       n_tiles_x, n_tiles_y, /*uniform_exposure=*/true,
+                                       use_ssd))
+            return false;
+
+        id<MTLTexture> tile_diff =
+            encode_tile_diff(cmd, ref_layer, comp_layer, prev_corrected,
+                             downscale_factor, ts, search_dist, n_tiles_x, n_tiles_y,
+                             /*uniform_exposure=*/true, use_ssd);
+        if (!tile_diff) return false;
+
+        current_alignment = make_tex2d(MTLPixelFormatRG16Sint, n_tiles_x, n_tiles_y, true);
+        if (!current_alignment) return false;
+        if (!encode_find_best(cmd, tile_diff, prev_corrected, current_alignment,
+                              downscale_factor, search_dist, n_tiles_x, n_tiles_y))
+            return false;
+    }
+
+    // HHSR merge/robustness expect non-overlapping tiles of `tile_size` on the
+    // unpadded grey grid.
+    const int flow_ny = (ref_grey.h + tile_size - 1) / tile_size;
+    const int flow_nx = (ref_grey.w + tile_size - 1) / tile_size;
+    if (flow_ny <= 0 || flow_nx <= 0) return false;
+    (void)finest_n_tiles_x;
+    (void)finest_n_tiles_y;
+
+    id<MTLBuffer> b_flow = buf(nullptr, (size_t)flow_ny * (size_t)flow_nx * 2u * sizeof(float));
+    if (!b_flow) return false;
+    {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        if (!enc) return false;
+        uint32_t nx = (uint32_t)flow_nx, ny = (uint32_t)flow_ny;
+        float scale = 1.f; // alignments are already in finest grey-level pixels
+        [enc setTexture:current_alignment atIndex:0];
+        [enc setBuffer:b_flow offset:0 atIndex:0];
+        [enc setBytes:&nx length:sizeof(nx) atIndex:1];
+        [enc setBytes:&ny length:sizeof(ny) atIndex:2];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:3];
+        dispatch2(enc, c.pipe("alignment_to_hhsr_flow"),
+                  (NSUInteger)flow_nx, (NSUInteger)flow_ny);
+        [enc endEncoding];
+    }
+
+    prof_tag_gpu(cmd, "align:hdrplus");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    flow_out = FlowField(flow_ny, flow_nx);
+    memcpy(flow_out.flow.data(), [b_flow contents],
+           flow_out.flow.size() * sizeof(float));
+    return true;
+}
+
+} // namespace
+
 static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out,
@@ -3023,6 +3434,15 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out,
                  f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     @autoreleasepool {
+        // Default: Burst-Photo hierarchical alignment. Keep the previous BM+ICA
+        // path when AlignMethod::BlockMatch is selected (or HHSR_ALIGN_BM=1).
+        const char* bm_env = std::getenv("HHSR_ALIGN_BM");
+        const bool force_bm = bm_env && bm_env[0] == '1';
+        if (!force_bm && cfg.align_method == AlignMethod::HdrPlus) {
+            if (align_metal_hdrplus_impl(ref_grey, moving_grey, cfg, tile_size,
+                                         flow_out, initial_dx, initial_dy))
+                return true;
+        }
         return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
                                 flow_out, initial_dx, initial_dy, initial_rotation_rad);
     }

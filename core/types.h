@@ -65,6 +65,7 @@ struct CovField {
 };
 
 enum class GreyMethod { FFT, Decimate };
+enum class AlignMethod { HdrPlus, BlockMatch };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };
 
@@ -79,6 +80,9 @@ struct Config {
     int   input_crop_factor = 1; // 2 = center-crop half-res before SR (3 MP -> 12 MP out).
     bool  bayer_mode = true;
     GreyMethod grey_method = GreyMethod::FFT;
+    // HdrPlus: Burst-Photo hierarchical tile alignment (avg-pool pyramid).
+    // BlockMatch: existing coarse-to-fine BM + ICA path.
+    AlignMethod align_method = AlignMethod::HdrPlus;
 
     // Noise model: sigma^2 = alpha * I + beta   (already scaled for ISO).
     // Defaults are Pixel-ish fallbacks; overwritten from DNG NoiseProfile (0xC761).

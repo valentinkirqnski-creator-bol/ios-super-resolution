@@ -47,6 +47,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 int tile_size,
                 f32 initial_dx = 0.f, f32 initial_dy = 0.f,
                 f32 initial_rotation_rad = 0.f);
+FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
+                                int grey_h, int grey_w, int tile_size);
 // Free cached ref Sobel/Hessian (call when reference pyramid is released).
 void clear_align_ref_ica_cache();
 

@@ -104,6 +104,7 @@ struct TuningParams: Equatable, Codable {
     var k_stretch: Float = 4.0
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
+    var alignment_method: Int = 0 // 0 = HDR+ pyramid, 1 = block match + ICA
     var alignment_grey_method: Int = 0
     var alignment_tile_size: Int = 0
     var global_prealignment_enabled: Bool = true
@@ -129,7 +130,7 @@ struct TuningParams: Equatable, Codable {
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, alignment_grey_method, alignment_tile_size
+        case snr_auto_tune, alignment_method, alignment_grey_method, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
@@ -159,6 +160,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
+        alignment_method = try c.decodeIfPresent(Int.self, forKey: .alignment_method) ?? alignment_method
         alignment_grey_method = try c.decodeIfPresent(Int.self, forKey: .alignment_grey_method) ?? alignment_grey_method
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
@@ -219,7 +221,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 12
+        let defaultsVersion = 13
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -1346,6 +1348,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
+            "alignment_method": NSNumber(value: tuningParams.alignment_method),
             "alignment_grey_method": NSNumber(value: tuningParams.alignment_grey_method),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
