@@ -953,6 +953,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
+#if defined(__APPLE__)
+    // Opened here, not at merge time, so each comparison frame can be uploaded
+    // as soon as it is analyzed. set_single_acc_slot must precede begin_burst,
+    // which derives the initial write slot from it.
+    metal_merge_set_single_acc_slot(false);
+    metal_merge_begin_burst();
+#endif
+
     auto drain_spill = [&]() {
         if (!spill_fut.valid()) return;
         const bool ok = spill_fut.get();
@@ -1092,7 +1100,23 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // Keep flow/R/cov in RAM. For DNG-file input, spill normalized Bayer
             // async; for direct RAW, reload the original uint16 frame later.
             // Grow-only L2/Alg.5 scratch stays until merge.
-            if (cache_streamed_comp_raw && rob_has_nonzero) {
+            // Hand the frame to the GPU now. It has to go there before the
+            // merge either way, and doing it here replaces a 48.8MB write to
+            // disk plus the matching read back (comp:spill-drain plus most of
+            // merge:gpu-upload) with the upload that was going to happen anyway.
+            //
+            // Peak footprint is unaffected: these buffers are resident during
+            // merge:band regardless, which is where the peak occurs. This only
+            // moves the allocation earlier, into a phase whose working set is
+            // well below that peak.
+            bool uploaded_to_gpu = false;
+#if defined(__APPLE__)
+            if (rob_has_nonzero && comp.h > 0 && comp.w > 0)
+                uploaded_to_gpu = metal_merge_prefetch_frame(comp, flow, covs, rob, k);
+#endif
+            if (uploaded_to_gpu) {
+                comp = Image();
+            } else if (cache_streamed_comp_raw && rob_has_nonzero) {
                 const int sk = k;
                 auto spill_img = std::make_shared<Image>(std::move(comp));
                 const fs::path spill_path = cache / ("f" + std::to_string(sk) + ".raw");
@@ -1227,11 +1251,22 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const double t_prefetch = prof_now_ms();
     // Double-buffered on 1× too: the band was halved above to keep peak
     // accumulator RAM identical while restoring cross-band GPU overlap.
-    metal_merge_set_single_acc_slot(false);
-    metal_merge_begin_burst();
+    // begin_burst already ran before the analysis loop and would clear the
+    // frames uploaded there. All that is still wanted here is the scratch trim
+    // it used to do, so merge is not fighting the analyze temporaries.
+    metal_trim_analyze_scratch();
     if (stream_comp_raw) {
         for (CachedCompMeta& meta : cached_meta) {
             if (!meta.rob_has_nonzero) continue;
+            if (metal_merge_has_frame(meta.index)) {
+                // Uploaded during analysis; nothing to reload.
+                if (heavy_1x) {
+                    meta.rob = Image();
+                    meta.covs = CovField();
+                    meta.flow = FlowField();
+                }
+                continue;
+            }
             if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
             if (metal_merge_prefetch_frame(comp_scratch, meta.flow, meta.covs, meta.rob,
                                            meta.index)) {
