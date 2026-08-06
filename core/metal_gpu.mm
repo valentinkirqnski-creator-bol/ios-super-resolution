@@ -2842,7 +2842,7 @@ void metal_trim_analyze_scratch() {
     clear_rob_ref_gpu();
 }
 
-void metal_merge_begin_burst() {
+void metal_merge_begin_burst(bool trim_analyze_scratch) {
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
     g_merge_frames.clear();
@@ -2855,7 +2855,10 @@ void metal_merge_begin_burst() {
     g_merge_acc[0] = {};
     g_merge_acc[1] = {};
     // Drop analyze scratch so merge prefetch is not fighting L2/Alg. 5 temps.
-    metal_trim_analyze_scratch();
+    // Skipped when the caller opens the frame table before analysis: this also
+    // clears the reference robustness statistics, whose host copy has already
+    // been released by then.
+    if (trim_analyze_scratch) metal_trim_analyze_scratch();
 }
 
 bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,

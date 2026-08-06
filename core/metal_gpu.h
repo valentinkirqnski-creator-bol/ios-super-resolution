@@ -106,7 +106,14 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
                                 int frame_id);
 
 // Drop previous burst's GPU merge cache (call once before prefetching a new shot).
-void metal_merge_begin_burst();
+// Opens the merge frame table for a new burst.
+//
+// trim_analyze_scratch also drops the reference robustness statistics
+// (clear_rob_ref_gpu). The host copy is released right after the reference is
+// analyzed, so the GPU holds the only one -- pass false when calling this
+// before the comparison frames have been scored, or every mask comes back
+// empty and the merge falls back to the reference alone.
+void metal_merge_begin_burst(bool trim_analyze_scratch = true);
 
 // Free grow-only L2 / Alg. 5 scratch (call before merge prefetch / new burst).
 void metal_trim_analyze_scratch();

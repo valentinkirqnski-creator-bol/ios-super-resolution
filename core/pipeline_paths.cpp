@@ -958,7 +958,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // as soon as it is analyzed. set_single_acc_slot must precede begin_burst,
     // which derives the initial write slot from it.
     metal_merge_set_single_acc_slot(false);
-    metal_merge_begin_burst();
+    // false: the reference robustness statistics live only on the GPU by now
+    // (metal_release_host_ref_stats above), and the analyze trim would clear
+    // them. The trim still runs later, once analysis is finished.
+    metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
 #endif
 
     auto drain_spill = [&]() {
