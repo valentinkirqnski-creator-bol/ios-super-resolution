@@ -1559,8 +1559,16 @@ final class CameraModel: NSObject, ObservableObject {
                 }
                 req.addResource(with: .photo, fileURL: saveURL, options: opts)
                 if let maskJPEG {
+                    // Its own options. Reusing `opts` tagged this JPEG with
+                    // uniformTypeIdentifier "com.adobe.raw-image" whenever the
+                    // export format was DNG, so Photos was told a JPEG was a
+                    // RAW file and rejected the resource -- which is why the
+                    // mask never appeared even with the toggle on. Only the DNG
+                    // export path was affected; JPG export sets no UTI.
+                    let mopts = PHAssetResourceCreationOptions()
+                    mopts.shouldMoveFile = false
                     let mreq = PHAssetCreationRequest.forAsset()
-                    mreq.addResource(with: .photo, fileURL: maskJPEG, options: opts)
+                    mreq.addResource(with: .photo, fileURL: maskJPEG, options: mopts)
                 }
             }, completionHandler: { success, _ in
                 if let maskJPEG { try? FileManager.default.removeItem(at: maskJPEG) }
