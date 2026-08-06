@@ -239,9 +239,30 @@ void mps_fft_prewarm(int h, int w) {
     }
 }
 
-void mps_fft_release_transient() {
+void mps_fft_release_all() {
     if (@available(iOS 16.0, macOS 13.0, *)) {
         std::lock_guard<std::mutex> lock(g_mutex);
+        @autoreleasepool {
+            // __bridge_transfer hands the retain from the raw pointers back to
+            // ARC, which releases them as these locals go out of scope.
+            if (g_plan.graph) {
+                MPSGraph* g = (__bridge_transfer MPSGraph*)g_plan.graph;
+                (void)g;
+                g_plan.graph = nullptr;
+            }
+            if (g_plan.in) {
+                MPSGraphTensor* t = (__bridge_transfer MPSGraphTensor*)g_plan.in;
+                (void)t;
+                g_plan.in = nullptr;
+            }
+            if (g_plan.out) {
+                MPSGraphTensor* t = (__bridge_transfer MPSGraphTensor*)g_plan.out;
+                (void)t;
+                g_plan.out = nullptr;
+            }
+        }
+        g_plan.h = 0;
+        g_plan.w = 0;
         g_in_buf = nil;
         g_out_buf = nil;
         g_buf_elems = 0;
@@ -273,7 +294,7 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w) {
 #else  // !HHSR_HAVE_MPSGRAPH
 
 void mps_fft_prewarm(int, int) {}
-void mps_fft_release_transient() {}
+void mps_fft_release_all() {}
 bool mps_grey_lowpass(const float*, float*, int, int) { return false; }
 
 #endif

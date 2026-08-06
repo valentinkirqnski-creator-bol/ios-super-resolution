@@ -1140,9 +1140,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
 
     // Release reference-side helpers not needed during merge.
-    // The grey FFT is finished for this burst, so its staging buffers are dead
-    // weight through the merge, which is where peak footprint occurs.
-    mps_fft_release_transient();
+    // The grey FFT is finished for this burst, so everything MPSGraph holds --
+    // the compiled plan as well as the staging buffers -- is dead weight through
+    // the merge, which is where peak footprint occurs. Rebuilt after the burst
+    // below, off the shutter path.
+    mps_fft_release_all();
     clear_align_ref_ica_cache();
     ref_grey = Image();
     ref_pyr = Pyramid();
@@ -1467,6 +1469,18 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         append_merge_summary(debug_summary, merge_debug);
         debug_dump_text("cpp_debug_summary", debug_summary.str());
     }
+    // Rebuild the FFT plan now that the burst is done and memory is at its
+    // lowest, so the next shot finds it warm. Detached and by-value so it can
+    // outlive this frame; std::async would block in its future destructor and
+    // defeat the point.
+    if (ref_h > 0 && ref_w > 0) {
+        const int pw_h = ref_h, pw_w = ref_w;
+        std::thread([pw_h, pw_w]() {
+            worker_qos();
+            mps_fft_prewarm(pw_h, pw_w);
+        }).detach();
+    }
+
     prof_mark_memory("burst:end");
     if (prof_enabled()) {
         // Wall time reported separately: the buckets above overlap (async

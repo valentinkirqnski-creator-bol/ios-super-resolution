@@ -46,12 +46,17 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w);
 // any thread; a no-op once the plan for these dimensions exists.
 void mps_fft_prewarm(int h, int w);
 
-// Drop the pooled input/output buffers (2 x h*w floats) while keeping the
-// compiled plan, which is the expensive part to rebuild.
+// Release everything: the compiled plan, its tensors, and the pooled buffers.
 //
-// The grey FFT only runs during frame analysis, but peak footprint occurs later
-// at merge:band, so holding ~98MB of transform staging across the merge costs
-// headroom exactly where it is scarcest. They are reallocated on next use.
-void mps_fft_release_transient();
+// The grey FFT only runs during frame analysis, but peak footprint is reached
+// later at merge:band, so anything MPSGraph holds is dead weight exactly where
+// headroom is scarcest -- and a compiled FFT plan retains considerably more
+// than the staging buffers alone (twiddle tables and intermediate tensors for
+// both transform axes).
+//
+// Pair with mps_fft_prewarm once the burst is finished and memory is low, so
+// the next shot still finds a warm plan. Rebuilding costs ~1100ms but happens
+// off the shutter path.
+void mps_fft_release_all();
 
 }  // namespace hhsr
