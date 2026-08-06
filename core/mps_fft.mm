@@ -239,6 +239,15 @@ void mps_fft_prewarm(int h, int w) {
     }
 }
 
+void mps_fft_release_transient() {
+    if (@available(iOS 16.0, macOS 13.0, *)) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_in_buf = nil;
+        g_out_buf = nil;
+        g_buf_elems = 0;
+    }
+}
+
 bool mps_grey_lowpass(const float* in, float* out, int h, int w) {
     if (!in || !out || h <= 0 || w <= 0) return false;
     // Even dimensions only, matching the Stockham caller: the shift the mask is
@@ -264,6 +273,7 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w) {
 #else  // !HHSR_HAVE_MPSGRAPH
 
 void mps_fft_prewarm(int, int) {}
+void mps_fft_release_transient() {}
 bool mps_grey_lowpass(const float*, float*, int, int) { return false; }
 
 #endif

@@ -1140,6 +1140,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
 
     // Release reference-side helpers not needed during merge.
+    // The grey FFT is finished for this burst, so its staging buffers are dead
+    // weight through the merge, which is where peak footprint occurs.
+    mps_fft_release_transient();
     clear_align_ref_ica_cache();
     ref_grey = Image();
     ref_pyr = Pyramid();

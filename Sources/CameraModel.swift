@@ -1219,6 +1219,13 @@ final class CameraModel: NSObject, ObservableObject {
             cachedMaxPhotoDimensions = preferredRawDimensions()
             if let dims = cachedMaxPhotoDimensions {
                 photoOutput.maxPhotoDimensions = dims
+                // Compile the MPSGraph FFT plan now, seconds before any shutter
+                // press. It takes ~1100ms at 12MP and is otherwise paid by the
+                // reference frame of the first burst after launch. Off the
+                // session queue so it never delays configuration.
+                DispatchQueue.global(qos: .utility).async {
+                    SRBridge.prewarmFFTWidth(Int(dims.width), height: Int(dims.height))
+                }
             }
         } else {
             cachedMaxPhotoDimensions = nil

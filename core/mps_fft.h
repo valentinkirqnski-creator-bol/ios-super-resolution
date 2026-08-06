@@ -46,4 +46,12 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w);
 // any thread; a no-op once the plan for these dimensions exists.
 void mps_fft_prewarm(int h, int w);
 
+// Drop the pooled input/output buffers (2 x h*w floats) while keeping the
+// compiled plan, which is the expensive part to rebuild.
+//
+// The grey FFT only runs during frame analysis, but peak footprint occurs later
+// at merge:band, so holding ~98MB of transform staging across the merge costs
+// headroom exactly where it is scarcest. They are reallocated on next use.
+void mps_fft_release_transient();
+
 }  // namespace hhsr

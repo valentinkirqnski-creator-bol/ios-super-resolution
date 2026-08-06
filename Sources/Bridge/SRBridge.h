@@ -37,6 +37,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// Render the LinearRaw DNG (same look as export JPEG), encode a JPEG preview
 /// (longest side ≤ maxSide), and embed it as a DNG SubIFD so Photos can thumbnail
 /// a DNG-only asset. Lightroom still reads the LinearRaw IFD0.
+// Build the MPSGraph FFT plan for this sensor size ahead of the shutter.
+// MPSGraph compiles on first use (~1100ms at 12MP) and that would otherwise land
+// on the reference frame of the first burst. Safe to call repeatedly.
++ (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height;
+
 + (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath
                       maxSide:(NSInteger)maxSide;
 

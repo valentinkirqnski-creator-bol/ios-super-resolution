@@ -1,4 +1,5 @@
 #import "SRBridge.h"
+#include "mps_fft.h"
 #import <UIKit/UIKit.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -708,6 +709,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
+}
+
++ (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height {
+    hhsr::mps_fft_prewarm((int)height, (int)width);
 }
 
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
