@@ -343,19 +343,18 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
 } // namespace
 
-void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
+bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
                      Image& num_band, Image& den_band, int y0, const Config& cfg,
                      int frame_id) {
 #ifdef __APPLE__
     // Metal GPU only — same Alg. 4 math as accumulate_comp (incl. per-pixel robustness).
-    if (!merge_comp_band_metal(comp_raw, flow, covs, robustness, tile_size,
-                               num_band, den_band, y0, cfg, frame_id)) {
-        return;
-    }
+    return merge_comp_band_metal(comp_raw, flow, covs, robustness, tile_size,
+                                 num_band, den_band, y0, cfg, frame_id);
 #else
     (void)frame_id;
     accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg);
+    return true;
 #endif
 }
 

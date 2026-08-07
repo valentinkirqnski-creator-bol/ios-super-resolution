@@ -1073,6 +1073,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // allocation in the pipeline to hold the same bytes twice.
     Image num_sink, den_sink;
     std::vector<int> online_pending;   // frames queued but not yet committed
+    int online_skip_rejected = 0, online_skip_nodata = 0, online_skip_gpu = 0;
     const int online_fuse = kOnlineFuse;
 
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
@@ -1247,10 +1248,18 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             absorb_robustness_sum(acc_rob, rob, have_acc_rob);
             bool merged = true;
             bool contributed = false;
-            if (rob_has_nonzero && comp.h > 0 && comp.w > 0) {
+            if (!rob_has_nonzero) {
+                online_skip_rejected++;
+            } else if (comp.h <= 0 || comp.w <= 0) {
+                online_skip_nodata++;
+            } else if (!merge_comp_band(comp, flow, covs, rob, tile_size,
+                                        num_sink, den_sink, 0, work, k)) {
+                // The GPU refused the frame -- geometry, an allocation, or the
+                // upload. Dropping that silently is how a burst ends up as the
+                // reference frame alone with nothing reported anywhere.
+                online_skip_gpu++;
+            } else {
                 contributed = true;
-                merge_comp_band(comp, flow, covs, rob, tile_size,
-                                num_sink, den_sink, 0, work, k);
                 online_pending.push_back(k);
                 // Commit in groups, not per frame: the accumulator fusion needs
                 // several frames queued together, and a frame's GPU buffers
@@ -1373,7 +1382,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
     if (n_comp_ok < 1) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
-        report("Error: no comparison frame merged (all rejected?)", 1.f);
+        char why[160];
+        std::snprintf(why, sizeof(why),
+                      "Error: no comparison frame merged (rejected %d, no data %d, gpu %d)",
+                      online_skip_rejected, online_skip_nodata, online_skip_gpu);
+        report(why, 1.f);
 #if defined(__APPLE__)
         metal_merge_end_online();
 #endif

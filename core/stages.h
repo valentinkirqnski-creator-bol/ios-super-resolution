@@ -85,7 +85,11 @@ CovField estimate_kernels(const Image& raw, const Config& cfg);
 
 // ---- merge.cpp ----------------------------------------------------------
 // frame_id: optional stable id for GPU buffer reuse when raw is streamed via scratch.
-void merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
+// Returns false when the frame did not reach the accumulator. The banded
+// callers ignore it -- a band a frame cannot contribute to is normal -- but the
+// online path merges each frame exactly once, so false there means the frame is
+// simply absent from the output.
+bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
                      Image& num_band, Image& den_band, int y0, const Config& cfg,
                      int frame_id = -1);
