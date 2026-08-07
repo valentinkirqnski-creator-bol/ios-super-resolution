@@ -771,8 +771,16 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     const size_t half = (size_t)(raw_h / 2) * (size_t)(raw_w / 2);
     const size_t covs = half * 4 * f;
     const size_t rob = half * f;
-    const size_t frame = covs + rob + (spill ? 0 : raw);
-    const size_t in_flight = raw + covs + rob;
+    // What one comparison frame costs across the whole banded merge.
+    //
+    // Not reduced by spilling. Spilling writes the host Bayer to disk, but the
+    // frame has already been uploaded to the GPU by metal_merge_prefetch_frame
+    // and stays there so every band can reuse it -- and on unified memory that
+    // is the same RAM. Charging only covs+rob here understated a 13-frame burst
+    // by 528MB, which was enough to pick banding and then peak at 2144MB.
+    (void)spill;
+    const size_t frame = raw + covs + rob;
+    const size_t in_flight = frame;
 
     // Reference-side state that survives into the merge.
     const size_t fixed = raw + covs + rob;
@@ -797,7 +805,11 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
                       + raw * 2;                 // current + prefetched frame
 
     const size_t acc_full = (size_t)Hs * Ws * nch * f * 2;
-    const size_t band_acc = (size_t)band_rows * Ws * nch * f * 2 * 2;
+    // Bands exist twice over: the double-buffered host images the encoder reads
+    // and the matching pair of GPU accumulator slots, plus the two staging
+    // buffers of 16-bit output rows.
+    const size_t band_host = (size_t)band_rows * Ws * nch * f * 2 * 2;
+    const size_t band_acc = band_host * 2 + (size_t)band_rows * Ws * 3 * 2 * 2;
     const size_t frames = (size_t)std::max(0, n - 1) * frame;
 
     const size_t banded_peak = std::max(fixed + temp + frames, fixed + band_acc + frames);
