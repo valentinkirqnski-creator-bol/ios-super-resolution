@@ -267,16 +267,22 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    // Shutter: Auto (A), or manual via log-scaled slider (0…1). Default = AE on.
-    @Published var shutterIsAuto = CameraModel.persistedShutterIsAuto()
+    // Shutter: Auto (A), or manual via log-scaled slider (0…1).
+    //
+    // Always starts on. Manual exposure is a deliberate per-shot override, and
+    // restoring it from the previous launch meant the app could open metering a
+    // scene with a shutter speed chosen for a different one, which reads as the
+    // camera being broken rather than as a setting still being in effect. The
+    // slider positions are still persisted, so turning manual back on restores
+    // the last values.
+    @Published var shutterIsAuto = true
     @Published var shutterSlider: Double = CameraModel.persistedShutterSlider()
     /// Manual ISO. Auto by default; when off, isoSlider maps linearly onto the
     /// active format's supported range, which varies per lens and per device.
-    @Published var isoIsAuto: Bool = !UserDefaults.standard.bool(forKey: "IsoManual") {
-        didSet {
-            UserDefaults.standard.set(!isoIsAuto, forKey: "IsoManual")
-            applyShutter()
-        }
+    /// Manual ISO. Starts on auto every launch, for the same reason as the
+    /// shutter above.
+    @Published var isoIsAuto: Bool = true {
+        didSet { applyShutter() }
     }
     @Published var isoSlider: Double = CameraModel.persistedIsoSlider() {
         didSet {
@@ -311,18 +317,12 @@ final class CameraModel: NSObject, ObservableObject {
     /// spilling rather than risking jetsam (see pipeline_paths.cpp).
     static let maxFrameCount = 15
     private static let frameCountDefaultsKey = "FrameCount"
-    private static let shutterAutoDefaultsKey = "ShutterIsAuto"
     private static let shutterSliderDefaultsKey = "ShutterSlider"
 
     private static func persistedFrameCount() -> Int {
         guard UserDefaults.standard.object(forKey: frameCountDefaultsKey) != nil else { return 4 }
         let saved = UserDefaults.standard.integer(forKey: frameCountDefaultsKey)
         return min(maxFrameCount, max(minFrameCount, saved))
-    }
-
-    private static func persistedShutterIsAuto() -> Bool {
-        guard UserDefaults.standard.object(forKey: shutterAutoDefaultsKey) != nil else { return true }
-        return UserDefaults.standard.bool(forKey: shutterAutoDefaultsKey)
     }
 
     private static func persistedShutterSlider() -> Double {
@@ -435,6 +435,17 @@ final class CameraModel: NSObject, ObservableObject {
             frame["data"] = data
         }
         return frame
+    }
+
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(subjectAreaDidChange),
+            name: .AVCaptureDeviceSubjectAreaDidChange, object: nil)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     let session = AVCaptureSession()
@@ -583,7 +594,8 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func persistShutterState() {
-        UserDefaults.standard.set(shutterIsAuto, forKey: Self.shutterAutoDefaultsKey)
+        // Only the slider position: whether exposure is manual deliberately does
+        // not survive a launch.
         UserDefaults.standard.set(min(1.0, max(0.0, shutterSlider)), forKey: Self.shutterSliderDefaultsKey)
     }
 
@@ -1143,17 +1155,29 @@ final class CameraModel: NSObject, ObservableObject {
     // MARK: - Focus / exposure controls
 
     func focus(at devicePoint: CGPoint) {
+        guard !isBusy else { return }
         // A point outside the sensor rectangle is silently ignored by
         // AVFoundation, so clamp rather than letting an edge tap do nothing.
         let p = CGPoint(x: min(1, max(0, devicePoint.x)),
                         y: min(1, max(0, devicePoint.y)))
+
+        // A tap says "work the exposure out for me, here", so it also takes the
+        // sliders back to Auto. Setting isoIsAuto runs its didSet, which
+        // re-applies the exposure mode; the block below then points it at the
+        // tap.
+        if !shutterIsAuto || !isoIsAuto {
+            shutterIsAuto = true
+            isoIsAuto = true
+            persistShutterState()
+        }
+
         sessionQueue.async {
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
 
             if d.isFocusPointOfInterestSupported {
                 d.focusPointOfInterest = p
-                // One-shot autofocus at the tap. Continuous would immediately
-                // re-run over the whole frame and discard the chosen point.
+                // One-shot at the tap, with subject-area monitoring below to
+                // hand focus back to continuous once the scene moves on.
                 if d.isFocusModeSupported(.autoFocus) {
                     d.focusMode = .autoFocus
                 } else if d.isFocusModeSupported(.continuousAutoFocus) {
@@ -1163,22 +1187,46 @@ final class CameraModel: NSObject, ObservableObject {
 
             if d.isExposurePointOfInterestSupported {
                 d.exposurePointOfInterest = p
-                // .autoExpose meters once at the point and holds it.
-                // .continuousAutoExposure -- what this used to set -- goes
-                // straight back to metering the whole scene, so tapping a dark
-                // subject against a bright background changed nothing.
-                if self.shutterIsAuto && self.isoIsAuto {
-                    if d.isExposureModeSupported(.autoExpose) {
-                        d.exposureMode = .autoExpose
-                    } else if d.isExposureModeSupported(.continuousAutoExposure) {
-                        d.exposureMode = .continuousAutoExposure
-                    }
-                }
+            }
+            // .continuousAutoExposure, NOT .autoExpose. autoExpose is one-shot:
+            // it meters once and leaves the device in .locked, so a single tap
+            // froze exposure for the rest of the session -- the camera stopped
+            // responding to light entirely. The point of interest persists under
+            // continuous metering anyway, and the metering stays weighted to it,
+            // so nothing is lost by not locking.
+            if d.isExposureModeSupported(.continuousAutoExposure) {
+                d.exposureMode = .continuousAutoExposure
             }
 
-            // Re-run autofocus when the scene changes, instead of staying locked
-            // on a subject that has moved away.
             d.isSubjectAreaChangeMonitoringEnabled = true
+            d.unlockForConfiguration()
+        }
+
+        // Back on Auto, so the shutter readout has to start tracking again.
+        startAutoExposureSyncIfNeeded()
+    }
+
+    /// The scene changed enough that the tapped subject is probably gone.
+    ///
+    /// Without this observer, isSubjectAreaChangeMonitoringEnabled does nothing
+    /// at all -- it only asks AVFoundation to post the notification. Focus would
+    /// stay fixed wherever it was last tapped.
+    @objc private func subjectAreaDidChange(_ note: Notification) {
+        guard !isBusy else { return }
+        guard let changed = note.object as? AVCaptureDevice else { return }
+        sessionQueue.async {
+            guard let d = self.device, d === changed,
+                  (try? d.lockForConfiguration()) != nil else { return }
+            let centre = CGPoint(x: 0.5, y: 0.5)
+            if d.isFocusPointOfInterestSupported { d.focusPointOfInterest = centre }
+            if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
+            if d.isExposurePointOfInterestSupported { d.exposurePointOfInterest = centre }
+            // Only reclaim exposure if the user has not since gone manual.
+            if self.shutterIsAuto, self.isoIsAuto,
+               d.isExposureModeSupported(.continuousAutoExposure) {
+                d.exposureMode = .continuousAutoExposure
+            }
+            d.isSubjectAreaChangeMonitoringEnabled = false
             d.unlockForConfiguration()
         }
     }
