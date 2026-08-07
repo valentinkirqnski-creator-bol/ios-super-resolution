@@ -741,31 +741,27 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 // "Flat in frame count" is not automatically "smaller": the online accumulator
 // scales with OUTPUT pixels, so at 2x it costs 4x what it does at 1x and loses
 // to banding until the burst is long.
-// Frames committed per command buffer, which trades memory against traffic.
+// Frames committed per command buffer.
 //
-// Flushing after every frame keeps only one frame's GPU upload alive, but it
-// stops merge_flush_pending ever reaching the fusion threshold in metal_gpu.mm,
-// so every frame read-modify-writes the whole accumulator on its own: 15 passes
-// over it at 15 frames instead of 4.
+// One. Committing several together lets merge_flush_pending reach the fusion
+// threshold in metal_gpu.mm, so a group shares one read-modify-write of the
+// accumulator instead of one each -- worth roughly 700ms across a 15-frame
+// burst at 48 MP. But each queued frame's GPU upload stays alive until the
+// commit, and the online accumulator is already resident alongside the whole
+// analysis working set, so those frames land directly on the peak. Three extra
+// frames are 313MB on a ceiling that decides whether online is usable at all.
 //
-// Which way that trade falls depends on how the accumulator compares to a
-// frame, and that changes with output size. At 1x the accumulator is 279MB and
-// three extra frames would be 315MB -- more than doubling the footprint to save
-// about 175ms across a 15-frame burst that already takes seconds. At 2x the
-// accumulator is 1116MB and the same three frames are +28%, against roughly
-// 700ms. So keep the frames in flight to about 40% of the accumulator and let
-// the size decide, rather than fixing the group at either extreme.
-static int online_fuse_group(size_t acc_bytes, size_t frame_bytes) {
-    if (frame_bytes == 0) return 1;
-    const long g = (long)((2 * acc_bytes) / (5 * frame_bytes));   // 0.4 * acc/frame
-    return (int)std::min<long>(std::max<long>(g, 1), 4);          // <= kMergeFuseMax
-}
+// Memory wins: the ceiling is what does not move with burst length, and the
+// traffic cost is spread across a burst already running for seconds.
+static constexpr int kOnlineFuse = 1;
+
 
 // Burst length at or above which the merge goes online.
 static constexpr int kOnlineMinFrames = 6;
 
 static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
-                                bool spill, int band_rows, int raw_h, int raw_w) {
+                                bool spill, int band_rows, int raw_h, int raw_w,
+                                bool fft_grey) {
     if (mode == 1) return false;              // forced banded
     if (mode == 2) return true;               // forced online
     if (n < kOnlineMinFrames) return false;
@@ -793,7 +789,11 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     const size_t temp = half * f                 // grey
                       + half * f * 4 / 3         // pyramid
                       + 2 * half * 3 * f         // means + vars, 3 channels
-                      + raw * 2                  // full-res complex FFT scratch
+                      // The FFT grey needs a full-res complex scratch; the 2x2
+                      // Bayer quad grey does not, and that 93MB at 12MP sits
+                      // directly on the online peak because it is alive while
+                      // the accumulator is.
+                      + (fft_grey ? raw * 2 : 0)
                       + raw * 2;                 // current + prefetched frame
 
     const size_t acc_full = (size_t)Hs * Ws * nch * f * 2;
@@ -802,7 +802,7 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
 
     const size_t banded_peak = std::max(fixed + temp + frames, fixed + band_acc + frames);
     const size_t online_peak = fixed + temp + acc_full
-                             + (size_t)online_fuse_group(acc_full, in_flight) * in_flight;
+                             + (size_t)kOnlineFuse * in_flight;
     if (online_peak >= banded_peak) return false;
 
     // Hard fallback: if the peak will not fit at all, banding is the only thing
@@ -1053,17 +1053,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     bool use_online = false;
 #if defined(__APPLE__)
     use_online = choose_online_merge(work.merge_arch, out_h, out_w, out_nch, n,
-                                     cache_streamed_comp_raw, 480, ref_h, ref_w);
+                                     cache_streamed_comp_raw, 480, ref_h, ref_w,
+                                     work.grey_method == GreyMethod::FFT);
 #endif
     // No host accumulator: the GPU buffer is shared storage, so it is read in
     // place. Allocating a matching host image would double the largest
     // allocation in the pipeline to hold the same bytes twice.
     Image num_sink, den_sink;
     std::vector<int> online_pending;   // frames queued but not yet committed
-    const int online_fuse = online_fuse_group(
-        (size_t)out_h * out_w * out_nch * sizeof(f32) * 2,
-        (size_t)ref_h * ref_w * sizeof(f32)
-            + (size_t)(ref_h / 2) * (ref_w / 2) * 5 * sizeof(f32));
+    const int online_fuse = kOnlineFuse;
 
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
