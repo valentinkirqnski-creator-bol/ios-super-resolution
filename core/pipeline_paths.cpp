@@ -768,40 +768,48 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
                                 bool spill, int band_rows, int raw_h, int raw_w) {
     if (mode == 1) return false;              // forced banded
     if (mode == 2) return true;               // forced online
-
-    const size_t f = sizeof(f32);
-    const size_t acc_full = (size_t)Hs * Ws * nch * f * 2;   // num+den, whole output
-    const size_t raw = (size_t)raw_h * raw_w * f;
-    const size_t covs = (size_t)(raw_h / 2) * (raw_w / 2) * 4 * f;
-    const size_t rob = (size_t)(raw_h / 2) * (raw_w / 2) * f;
-    const size_t per_frame = covs + rob + (spill ? 0 : raw);
-    const size_t banded = (size_t)band_rows * Ws * nch * f * 2 * 2
-                          + (size_t)std::max(0, n - 1) * per_frame;
-    const size_t in_flight = raw + covs + rob;
-    const size_t online = acc_full
-                        + (size_t)online_fuse_group(acc_full, in_flight) * in_flight;
-
-    // Online from six frames up, at either scale.
-    //
-    // Below that a burst is short enough that banding is both smaller and
-    // faster, and flat-in-N has nothing to buy -- the whole value of it is that
-    // a long burst costs what a short one does, which is not a property a short
-    // burst needs. Above it, cost stops growing, which is what keeps a 15-frame
-    // shot alive.
-    //
-    // This is a deliberate choice rather than the smaller of the two: at 2x and
-    // six frames online is the larger (about 1535MB against 897MB). The trade
-    // is consistency and headroom at long bursts, paid for on short ones.
     if (n < kOnlineMinFrames) return false;
 
-    // Still a hard fallback, not a preference: if the accumulator will not fit,
-    // banding is the only option that runs at all. prof_available_bytes returns
-    // 0 where the query is unavailable, which is treated as no constraint --
-    // matching the analysis-phase upload valve.
+    const size_t f = sizeof(f32);
+    const size_t raw = (size_t)raw_h * (size_t)raw_w * f;
+    const size_t half = (size_t)(raw_h / 2) * (size_t)(raw_w / 2);
+    const size_t covs = half * 4 * f;
+    const size_t rob = half * f;
+    const size_t frame = covs + rob + (spill ? 0 : raw);
+    const size_t in_flight = raw + covs + rob;
+
+    // Reference-side state that survives into the merge.
+    const size_t fixed = raw + covs + rob;
+    // Reference-side state released only when the analysis loop ends: the grey,
+    // its pyramid, the local statistics, the FFT scratch, and the frame being
+    // decoded plus the one prefetched behind it.
+    //
+    // This term is why the comparison below is between peaks and not between
+    // merge working sets. Online allocates its accumulator on the first frame,
+    // which is inside the analysis loop, so the accumulator and all of this are
+    // resident at the same time -- they never were under banding, where the
+    // accumulator is band-sized and only appears after this has been freed.
+    // Ignoring the overlap is what put a 48 MP burst at 2240 MB.
+    const size_t temp = half * f                 // grey
+                      + half * f * 4 / 3         // pyramid
+                      + 2 * half * 3 * f         // means + vars, 3 channels
+                      + raw * 2                  // full-res complex FFT scratch
+                      + raw * 2;                 // current + prefetched frame
+
+    const size_t acc_full = (size_t)Hs * Ws * nch * f * 2;
+    const size_t band_acc = (size_t)band_rows * Ws * nch * f * 2 * 2;
+    const size_t frames = (size_t)std::max(0, n - 1) * frame;
+
+    const size_t banded_peak = std::max(fixed + temp + frames, fixed + band_acc + frames);
+    const size_t online_peak = fixed + temp + acc_full
+                             + (size_t)online_fuse_group(acc_full, in_flight) * in_flight;
+    if (online_peak >= banded_peak) return false;
+
+    // Hard fallback: if the peak will not fit at all, banding is the only thing
+    // that runs. 0 means the query is unavailable, i.e. no known constraint.
     const uint64_t avail = prof_available_bytes();
-    constexpr uint64_t kOnlineHeadroom = 700ull * 1024ull * 1024ull;
-    if (avail != 0 && (uint64_t)online + kOnlineHeadroom > avail) return false;
-    (void)banded;
+    constexpr uint64_t kOnlineHeadroom = 400ull * 1024ull * 1024ull;
+    if (avail != 0 && (uint64_t)online_peak + kOnlineHeadroom > avail) return false;
     return true;
 }
 
