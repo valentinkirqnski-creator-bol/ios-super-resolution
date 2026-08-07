@@ -1356,9 +1356,23 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (!rob_run_guide_stats(ref_raw, cfg, b_guide, b_means, b_vars, gh, gw, nch, cmd))
         return RefStats();
 
+    // Must be encoded before the commit below: a committed MTLCommandBuffer
+    // cannot accept further encoders, and doing so is a hard error rather than
+    // a silent no-op. This block previously sat after the commit, which crashed
+    // as soon as high-frequency rejection was switched on.
+    id<MTLBuffer> b_ref_hf_loss = nil;
+    if (cfg.hf_artifact_removal_enabled &&
+        !rob_run_hf_loss(b_guide, b_means, b_vars, b_ref_hf_loss, gh, gw, nch, cfg, cmd))
+        return RefStats();
+
     // No CPU readback follows. Commit without waiting; subsequent work on the
     // same queue observes these pinned buffers after this command completes.
     [cmd commit];
+
+    g_rob_ref_hf = b_ref_hf_loss;
+    g_rob_ref_hf_bytes = b_ref_hf_loss
+        ? (size_t)gh * (size_t)gw * sizeof(float)
+        : 0;
 
     // Pin guide-grid local stats for all comparison frames (460-main robustness).
     g_rob_ref_m = b_means;
@@ -1375,13 +1389,6 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     st.means.h = gh;
     st.means.w = gw;
     st.means.c = nch;
-    if (cfg.hf_artifact_removal_enabled) {
-        id<MTLBuffer> b_hf = nil;
-        if (!rob_run_hf_loss(b_guide, b_means, b_vars, b_hf, gh, gw, nch, cfg, cmd))
-            return RefStats();
-        g_rob_ref_hf = b_hf;
-        g_rob_ref_hf_bytes = (size_t)gh * (size_t)gw * sizeof(float);
-    }
     st.stds.h = gh;
     st.stds.w = gw;
     st.stds.c = nch;

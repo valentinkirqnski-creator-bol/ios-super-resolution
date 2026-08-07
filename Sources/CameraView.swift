@@ -11,6 +11,9 @@ struct CameraView: View {
     @State private var shutterSliderDragging = false
     @State private var shutterSliderDragStart: Double?
     @State private var didApplyLaunchShutter = false
+    /// Manual capture controls (burst length, shutter) shown above the
+    /// viewfinder. Collapsible so the preview can fill the screen.
+    @State private var showCaptureControls = true
 
     var body: some View {
         GeometryReader { geo in
@@ -28,10 +31,16 @@ struct CameraView: View {
                     permissionView
                 } else {
                     VStack(spacing: 0) {
-                        topStrip
-                            .padding(.top, geo.safeAreaInsets.top + 4)
-                            .frame(height: topBarH + geo.safeAreaInsets.top)
-                            .background(Color.black)
+                        Group {
+                            if showCaptureControls {
+                                topStrip
+                            } else {
+                                Color.clear
+                            }
+                        }
+                        .padding(.top, geo.safeAreaInsets.top + 4)
+                        .frame(height: topBarH + geo.safeAreaInsets.top)
+                        .background(Color.black)
 
                         viewfinder(width: vfWidth, height: vfHeight)
 
@@ -116,12 +125,6 @@ struct CameraView: View {
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
-                Button(action: { showSettings = true }) {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 18))
-                        .foregroundColor(.white)
-                }
-                .disabled(cam.isBusy)
                 Text(cam.shutterLabel)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundColor(.white.opacity(0.85))
@@ -218,7 +221,7 @@ struct CameraView: View {
 
     private var backLensPicker: some View {
         VStack(spacing: 8) {
-            HStack(spacing: 18) {
+            HStack(spacing: 6) {
                 if cam.availableCameras.contains(.ultraWide) {
                     lensChip(title: "0.5×", selected: cam.lensZoomMode == .ultraWide) {
                         cam.setLensZoom(.ultraWide)
@@ -238,6 +241,9 @@ struct CameraView: View {
                     }
                 }
             }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(Color.black.opacity(0.45)))
             if cam.lensZoomMode == .wide1x {
                 HStack(spacing: 18) {
                     ForEach(OutputResolutionMode.allCases) { mode in
@@ -265,13 +271,11 @@ struct CameraView: View {
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 13, weight: selected ? .bold : .medium))
-                .foregroundColor(selected ? .black : .white.opacity(0.9))
-                .frame(minWidth: 30)
-                .padding(.vertical, 7)
-                .padding(.horizontal, 4)
+                .font(.system(size: 12, weight: selected ? .bold : .medium))
+                .foregroundColor(selected ? .black : .white.opacity(0.92))
+                .frame(width: 38, height: 38)
                 .background(
-                    Capsule().fill(selected ? Color.white : Color.clear)
+                    Circle().fill(selected ? Color.white : Color.white.opacity(0.14))
                 )
         }
         .disabled(cam.isBusy)
@@ -327,6 +331,20 @@ struct CameraView: View {
                     .frame(width: 72)
             }
             .padding(.horizontal, 28)
+
+            HStack {
+                roundIconButton("gearshape.fill") { showSettings = true }
+                Spacer()
+                roundIconButton(showCaptureControls
+                                ? "slider.horizontal.3"
+                                : "slider.horizontal.below.rectangle") {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        showCaptureControls.toggle()
+                    }
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 14)
         }
         .frame(maxHeight: .infinity, alignment: .top)
     }
@@ -366,6 +384,23 @@ struct CameraView: View {
                         .frame(width: 78, height: 78)
                         .animation(.easeInOut(duration: 0.2), value: cam.progress)
                 }
+            }
+        }
+        .disabled(cam.isBusy)
+    }
+
+    /// Small circular control on a translucent disc, used for the two utility
+    /// buttons that flank the shutter row.
+    private func roundIconButton(_ symbol: String,
+                                 action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 42, height: 42)
+                Image(systemName: symbol)
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(.white)
             }
         }
         .disabled(cam.isBusy)
