@@ -1461,10 +1461,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
-    id<MTLBuffer> b_comp_hf = b_gvars;
-    if (cfg.hf_artifact_removal_enabled &&
-        !rob_run_hf_loss(b_guide, b_gmeans, b_gvars, b_comp_hf, gh, gw, nch, cfg, cmd))
-        return Image();
     id<MTLBuffer> b_ref_hf = b_ref_v;
     if (cfg.hf_artifact_removal_enabled) {
         if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
@@ -1508,7 +1504,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_diff offset:0 atIndex:7];
     [enc setBuffer:b_S offset:0 atIndex:8];
     [enc setBuffer:b_motion offset:0 atIndex:9];
-    [enc setBuffer:b_comp_hf offset:0 atIndex:2];
     [enc setBuffer:b_ref_hf offset:0 atIndex:5];
     [enc setBuffer:b_flow offset:0 atIndex:10];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];

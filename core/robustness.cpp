@@ -746,13 +746,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image d_sq, sigma_sq;
     apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc, d_sq, sigma_sq);
 
-    Image comp_hf_loss;
-    if (cfg.hf_artifact_removal_enabled) {
-        Image lp_guide = local_lowpass_gaussian5x5(guide);
-        Image lp_means, lp_vars;
-        local_stats_3x3(lp_guide, lp_means, lp_vars);
-        comp_hf_loss = high_frequency_loss_map_adaptive(comp_means, comp_vars, lp_vars, cfg);
-    }
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
                                    (cfg.motion_edge_rejection_enabled ||
@@ -799,13 +792,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool hf_reject =
                 cfg.hf_artifact_removal_enabled &&
                 pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
-                (
-                    (!ref_stats.hf_loss.data.empty() &&
-                     ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold) ||
-                    (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h &&
-                     !comp_hf_loss.data.empty() &&
-                     comp_hf_loss.at(new_y, new_x) > cfg.hf_variance_loss_threshold)
-                );
+                !ref_stats.hf_loss.data.empty() &&
+                ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold;
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);

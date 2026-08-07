@@ -1608,7 +1608,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* S [[buffer(8)]],
                           device const uint* motion_irregular [[buffer(9)]],
                           device const float* flow [[buffer(10)]],
-                          device const float* comp_hf_loss [[buffer(2)]],
                           device const float* ref_hf_loss [[buffer(5)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           uint2 gid [[thread_position_in_grid]]) {
@@ -1679,16 +1678,17 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // rob_hf_loss_adaptive drives its loss to zero, so the variance test
     // spares it.
     //
-    // Deliberately NOT gated on the misalignment residual: the aperture
-    // problem is exactly the case where a repetitive pattern locks onto the
-    // wrong period and still matches itself well, so the residual stays low.
+    // The variance-loss map is the reference frame's. The paper describes one
+    // comparison of local variance before and after low-pass filtering, marking
+    // regions of the scene; the reference is the frame the merge is anchored on.
+    //
+    // No misalignment-residual gate. That is not in the paper, and it would
+    // defeat the purpose: the aperture problem is exactly the case where a
+    // repetitive pattern locks onto the wrong period and still matches itself
+    // well, so the residual stays low.
     bool hf_reject = false;
     if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
-        float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
-        if (inbound) {
-            hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
-        }
-        hf_reject = hf_loss > p.hf_variance_loss_threshold;
+        hf_reject = ref_hf_loss[gid.y * p.w + gid.x] > p.hf_variance_loss_threshold;
     }
 
     bool edge_reject = false;
