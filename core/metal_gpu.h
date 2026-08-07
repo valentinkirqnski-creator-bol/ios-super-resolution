@@ -140,9 +140,12 @@ bool metal_merge_wait_inflight();
 // Drop one frame's cached GPU upload. Online merges a frame once, so its
 // buffers are dead the moment its command buffer completes.
 void metal_merge_release_frame(int frame_id);
-void metal_merge_begin_online();
+void metal_merge_begin_online(int out_h, int out_w, int nch);
+// Wait for the merge and hand back the accumulator where it already lives.
+// Shared storage means it is CPU addressable in place, so the caller never
+// needs a full-size host copy of it.
+bool metal_merge_map_online(const float** num, const float** den, size_t* nelem);
 void metal_merge_end_online();
 bool metal_merge_flush_online();
-bool metal_merge_finish_online(Image& num, Image& den);
 
 } // namespace hhsr

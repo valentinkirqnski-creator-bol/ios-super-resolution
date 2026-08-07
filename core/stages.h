@@ -112,6 +112,8 @@ struct AccumDiag {
     size_t rgb_all_zero = 0;
 };
 void accumulate_diag(const Image& num, const Image& den, AccumDiag& d);
+void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n_pixels,
+                         int c, AccumDiag& d);
 std::string format_accum_diag(const AccumDiag& d);
 
 } // namespace hhsr

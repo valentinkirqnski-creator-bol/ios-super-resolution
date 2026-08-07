@@ -2434,6 +2434,9 @@ static bool g_merge_single_slot = false;
 // the accumulator"; online has to separate the two.
 static bool g_merge_online = false;
 static bool g_merge_online_zeroed = false;
+// Online carries its own output geometry, so the caller does not have to hold a
+// full-size host image just to describe the accumulator's shape.
+static int g_online_h = 0, g_online_w = 0, g_online_nch = 0;
 static MergeInflight g_merge_inflight;
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
@@ -2839,7 +2842,10 @@ void metal_merge_release_frame(int frame_id) {
     }
 }
 
-void metal_merge_begin_online() {
+void metal_merge_begin_online(int out_h, int out_w, int nch) {
+    g_online_h = out_h;
+    g_online_w = out_w;
+    g_online_nch = nch;
     // Resolve anything banded still in flight before the accumulator changes
     // meaning, or its readback would land in a band image that has gone.
     (void)metal_merge_wait_inflight_impl();
@@ -2853,6 +2859,22 @@ void metal_merge_begin_online() {
 void metal_merge_end_online() {
     g_merge_online = false;
     g_merge_online_zeroed = false;
+    g_online_h = g_online_w = g_online_nch = 0;
+}
+
+bool metal_merge_map_online(const float** num, const float** den, size_t* nelem) {
+    if (!g_merge_online || !num || !den) return false;
+    if (!metal_merge_flush_online()) return false;
+    if (!g_merge_online_zeroed) return false;      // nothing ever accumulated
+    MergeAccSlot& slot = g_merge_acc[0];
+    if (!slot.num || !slot.den) return false;
+    // MTLResourceStorageModeShared: the contents are already CPU addressable, so
+    // handing back the pointer instead of memcpying into a host image saves a
+    // second copy of the largest allocation in the pipeline. Same bytes.
+    *num = (const float*)[slot.num contents];
+    *den = (const float*)[slot.den contents];
+    if (nelem) *nelem = (size_t)g_online_h * (size_t)g_online_w * (size_t)g_online_nch;
+    return *num != nullptr && *den != nullptr;
 }
 
 bool metal_merge_flush_online() {
@@ -2871,12 +2893,6 @@ bool metal_merge_flush_online() {
     return ok;
 }
 
-bool metal_merge_finish_online(Image& num, Image& den) {
-    if (!g_merge_online) return false;
-    if (!metal_merge_flush_online()) return false;
-    if (!g_merge_online_zeroed) return false;   // nothing ever accumulated
-    return readback_slot(0, num, den);
-}
 
 void metal_merge_set_single_acc_slot(bool enabled) {
     g_merge_single_slot = enabled;
@@ -2950,7 +2966,10 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
                            int tile_size, Image& num_band, Image& den_band,
                            int y0, const Config& cfg, int frame_id) {
     if (!metal_gpu_init()) return false;
-    if (num_band.h <= 0 || num_band.w <= 0) return false;
+    const int acc_h = g_merge_online ? g_online_h : num_band.h;
+    const int acc_w = g_merge_online ? g_online_w : num_band.w;
+    const int acc_c = g_merge_online ? g_online_nch : num_band.c;
+    if (acc_h <= 0 || acc_w <= 0 || acc_c <= 0) return false;
     const bool resident = merge_frame_resident(frame_id);
     if (!resident && (comp_raw.h <= 0 || comp_raw.w <= 0)) return false;
     auto& c = ctx();
@@ -2958,7 +2977,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // New band when no CB is open (previous band finished / burst begin).
     const bool start_band = (g_merge_band_cmd == nil);
 
-    if (!ensure_acc_buffers(num_band.data.size(), start_band)) return false;
+    if (!ensure_acc_buffers((size_t)acc_h * acc_w * acc_c, start_band)) return false;
 
     id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil;
     if (!acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
@@ -2966,10 +2985,10 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         return false;
 
     MergeCompParamsCPU p{};
-    p.band_h = (uint32_t)num_band.h;
-    p.Ws = (uint32_t)num_band.w;
+    p.band_h = (uint32_t)acc_h;
+    p.Ws = (uint32_t)acc_w;
     p.y0 = (uint32_t)y0;
-    p.nch = (uint32_t)num_band.c;
+    p.nch = (uint32_t)acc_c;
     p.bayer = cfg.bayer_mode ? 1u : 0u;
     p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
     p.tile_size = (uint32_t)tile_size;
@@ -3027,12 +3046,15 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     // Comps first, then ref -- same order the separate dispatches ran in.
     if (!merge_flush_pending()) return false;
     if (!metal_gpu_init()) return false;
-    if (num_band.h <= 0 || num_band.w <= 0 || ref_raw.h <= 0) return false;
+    const int acc_h = g_merge_online ? g_online_h : num_band.h;
+    const int acc_w = g_merge_online ? g_online_w : num_band.w;
+    const int acc_c = g_merge_online ? g_online_nch : num_band.c;
+    if (acc_h <= 0 || acc_w <= 0 || acc_c <= 0 || ref_raw.h <= 0) return false;
     auto& c = ctx();
 
     const bool start_band = (g_merge_band_cmd == nil);
 
-    if (!ensure_acc_buffers(num_band.data.size(), start_band)) return false;
+    if (!ensure_acc_buffers((size_t)acc_h * acc_w * acc_c, start_band)) return false;
 
     const bool denoise = cfg.accumulated_robustness_denoiser_enabled && acc_rob &&
                          acc_rob->h > 0 && acc_rob->w > 0;
@@ -3041,8 +3063,8 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
         return false;
 
     MergeRefParamsCPU p{};
-    p.band_h = (uint32_t)num_band.h;
-    p.Ws = (uint32_t)num_band.w;
+    p.band_h = (uint32_t)acc_h;
+    p.Ws = (uint32_t)acc_w;
     p.y0 = (uint32_t)y0;
     p.lr_h = (uint32_t)ref_raw.h;
     p.lr_w = (uint32_t)ref_raw.w;
@@ -3050,7 +3072,7 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     p.cov_w = covs.w > 0 ? (uint32_t)covs.w : 1u;
     p.acc_h = denoise ? (uint32_t)acc_rob->h : 1u;
     p.acc_w = denoise ? (uint32_t)acc_rob->w : 1u;
-    p.nch = (uint32_t)num_band.c;
+    p.nch = (uint32_t)acc_c;
     p.bayer = cfg.bayer_mode ? 1u : 0u;
     p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
     p.robustness_denoise = denoise ? 1u : 0u;
@@ -3081,7 +3103,7 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     merge_enc_close();
 
     // Online: the reference is just the last contribution to a long-lived
-    // accumulator, so leave the command buffer for metal_merge_finish_online to
+    // accumulator, so leave the command buffer for metal_merge_map_online to
     // commit and read back exactly once.
     if (g_merge_online) return true;
 

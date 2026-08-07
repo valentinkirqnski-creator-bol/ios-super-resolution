@@ -385,15 +385,17 @@ void merge_ref(const Image& ref_raw, const CovField& covs,
     merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob);
 }
 
-void accumulate_diag(const Image& num, const Image& den, AccumDiag& d) {
-    const int nch = std::min(3, num.c);
-    const size_t n = (size_t)num.h * (size_t)num.w;
+void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
+                         int c, AccumDiag& d) {
+    Image dummy;
+    (void)dummy;
+    const int nch = std::min(3, c);
     for (size_t p = 0; p < n; ++p) {
         ++d.pixels;
         f32 dens[3] = {0, 0, 0};
         for (int ch = 0; ch < nch; ++ch) {
-            f32 nv = num.data[p * (size_t)num.c + (size_t)ch];
-            f32 dv = den.data[p * (size_t)den.c + (size_t)ch];
+            f32 nv = nump[p * (size_t)c + (size_t)ch];
+            f32 dv = denp[p * (size_t)c + (size_t)ch];
             dens[ch] = dv;
             if (!std::isfinite(nv)) ++d.num_nonfinite[ch];
             if (!std::isfinite(dv)) ++d.den_nonfinite[ch];
@@ -405,6 +407,11 @@ void accumulate_diag(const Image& num, const Image& den, AccumDiag& d) {
             else if (dens[0] == 0.f && dens[1] > 0.f && dens[2] == 0.f) ++d.only_green;
         }
     }
+}
+
+void accumulate_diag(const Image& num, const Image& den, AccumDiag& d) {
+    accumulate_diag_ptr(num.data.data(), den.data.data(),
+                        (size_t)num.h * (size_t)num.w, num.c, d);
 }
 
 std::string format_accum_diag(const AccumDiag& d) {

@@ -754,7 +754,10 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     const size_t banded = (size_t)band_rows * Ws * nch * f * 2 * 2   // double buffered
                           + (size_t)std::max(0, n - 1) * per_frame;
     // Online also holds the host copy the accumulator is read back into.
-    const size_t online = acc_full * 2 + (raw + covs + rob);
+    // Counted once: the accumulator is shared storage and is read in place,
+    // so there is no host copy of it. This is what puts the online path at the
+    // paper's 22 MB per output megapixel rather than twice that.
+    const size_t online = acc_full + (raw + covs + rob);
     return online < banded;
 }
 
@@ -1000,21 +1003,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     use_online = choose_online_merge(work.merge_arch, out_h, out_w, out_nch, n,
                                      cache_streamed_comp_raw, 480, ref_h, ref_w);
 #endif
-    Image num_full, den_full;
-    if (use_online) {
-        try {
-            num_full = Image(out_h, out_w, out_nch);
-            den_full = Image(out_h, out_w, out_nch);
-        } catch (...) {
-            use_online = false;                 // fall back rather than die
-            num_full = Image();
-            den_full = Image();
-        }
-    }
+    // No host accumulator: the GPU buffer is shared storage, so it is read in
+    // place. Allocating a matching host image would double the largest
+    // allocation in the pipeline to hold the same bytes twice.
+    Image num_sink, den_sink;
 #if defined(__APPLE__)
     if (use_online) {
         metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
-        metal_merge_begin_online();
+        metal_merge_begin_online(out_h, out_w, out_nch);
     }
 #endif
 
@@ -1188,7 +1184,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             bool merged = true;
             if (rob_has_nonzero && comp.h > 0 && comp.w > 0) {
                 merge_comp_band(comp, flow, covs, rob, tile_size,
-                                num_full, den_full, 0, work, k);
+                                num_sink, den_sink, 0, work, k);
                 // Commit and wait now: this frame's GPU buffers cannot be
                 // released while its work is still queued, and releasing them
                 // is the entire point of merging online.
@@ -1453,18 +1449,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // robustness, which only exists once every frame has been merged.
         report("Merging output", 0.48f);
         const double t_ref_online = prof_now_ms();
-        merge_ref_band(ref, ref_covs, num_full, den_full, 0, work, acc_rob_ptr);
-        const bool got = metal_merge_finish_online(num_full, den_full);
-        metal_merge_end_online();
+        merge_ref_band(ref, ref_covs, num_sink, den_sink, 0, work, acc_rob_ptr);
+        const f32* nump = nullptr;
+        const f32* denp = nullptr;
+        const bool got = metal_merge_map_online(&nump, &denp, nullptr);
         prof_add_cpu("merge:online-ref+readback", prof_now_ms() - t_ref_online);
         prof_mark_memory("merge:online");
         if (!got) {
             report("Error: GPU merge failed (memory?)", 1.f);
+            metal_merge_end_online();
             writer.close();
             if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
             return Image();
         }
-        accumulate_diag(num_full, den_full, diag);
+        accumulate_diag_ptr(nump, denp, (size_t)Hs * (size_t)Ws, nch, diag);
         // Rows come out of one finished accumulator, so encoding is a plain
         // top-to-bottom sweep. Nothing to overlap it with -- the GPU is idle by
         // now -- which is the cost of not banding.
@@ -1473,14 +1471,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             const int bh = std::min(band_rows, Hs - y0);
             if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
                 row16.resize((size_t)bh * (size_t)Ws * 3u);
-            encode_band_rows_ptr(num_full.data.data() + (size_t)y0 * stride,
-                                 den_full.data.data() + (size_t)y0 * stride,
+            encode_band_rows_ptr(nump + (size_t)y0 * stride,
+                                 denp + (size_t)y0 * stride,
                                  y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
             writer.write_rows(row16.data(), bh);
             report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
         }
-        num_full = Image();
-        den_full = Image();
+        // Accumulator released with the burst, not before: nump/denp point
+        // into it and are used above.
+        metal_merge_end_online();
     } else {
     int cur = 0;
     bool have_ready = false;
