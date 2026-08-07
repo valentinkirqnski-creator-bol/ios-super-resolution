@@ -21,7 +21,15 @@ struct CameraView: View {
             let topBarH: CGFloat = 88
             let bottomH: CGFloat = 96
             let vfWidth = geo.size.width
-            let maxVFHeight = geo.size.height - topBarH - bottomH - geo.safeAreaInsets.bottom
+            // One value for the space below the controls, used both to reserve
+            // it and to apply it. They were computed separately before, and the
+            // panel ended up claiming the safe-area inset twice -- once in its
+            // frame and again as padding -- while the viewfinder only reserved
+            // it once, so the whole stack overflowed by an inset and the shutter
+            // ran under the home indicator. The extra 10 lifts it clear rather
+            // than merely flush.
+            let bottomInset = geo.safeAreaInsets.bottom + 10
+            let maxVFHeight = geo.size.height - topBarH - bottomH - bottomInset
             // Slightly taller than square (4:3) — uses more screen without ultra-wide chrome.
             let vfHeight = min(maxVFHeight, vfWidth * 4 / 3)
 
@@ -40,8 +48,8 @@ struct CameraView: View {
                         viewfinder(width: vfWidth, height: vfHeight)
 
                         bottomPanel
-                            .frame(height: bottomH + geo.safeAreaInsets.bottom)
-                            .padding(.bottom, geo.safeAreaInsets.bottom)
+                            .frame(height: bottomH)
+                            .padding(.bottom, bottomInset)
                             .background(Color.black)
                     }
                 }
