@@ -3,6 +3,7 @@ import Photos
 import UIKit
 import Combine
 import ImageIO
+import AudioToolbox
 
 /// Final save format after SR (DNG always produced; JPG is a tone-mapped export).
 enum ExportFormat: String, CaseIterable, Identifiable, Codable {
@@ -128,6 +129,7 @@ struct TuningParams: Equatable, Codable {
         case r_t, r_s1, r_s2, r_Mt
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
+        case hf_min_texture_snr
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -218,6 +220,13 @@ final class CameraModel: NSObject, ObservableObject {
             sessionQueue.async { self.applyZSLMode() }
         }
     }
+    /// Play a short click when the shutter fires. Defaults on; the key is
+    /// stored inverted so an untouched install gets sound without needing a
+    /// migration (UserDefaults.bool returns false for a missing key).
+    @Published var shutterSoundEnabled: Bool = !UserDefaults.standard.bool(forKey: "ShutterSoundOff") {
+        didSet { UserDefaults.standard.set(!shutterSoundEnabled, forKey: "ShutterSoundOff") }
+    }
+
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
@@ -1018,6 +1027,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     func captureBurst() {
         guard !isBusy else { return }
+        playShutterSound()
 
         let total = frameCount
         let lens = lensZoomMode.label
@@ -1582,6 +1592,14 @@ final class CameraModel: NSObject, ObservableObject {
                 self.burstDir = nil
             })
         }
+    }
+
+    /// 1108 is the system camera-shutter sound. Using it rather than a bundled
+    /// asset keeps the app consistent with the platform and respects the
+    /// device's own shutter policy in regions that mandate it.
+    private func playShutterSound() {
+        guard shutterSoundEnabled else { return }
+        AudioServicesPlaySystemSound(1108)
     }
 
     private func finish(success: Bool, message: String) {

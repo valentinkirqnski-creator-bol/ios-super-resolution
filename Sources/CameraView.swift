@@ -265,9 +265,14 @@ struct CameraView: View {
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 14, weight: selected ? .bold : .medium))
-                .foregroundColor(selected ? .yellow : .white.opacity(0.85))
-                .frame(minWidth: 36)
+                .font(.system(size: 13, weight: selected ? .bold : .medium))
+                .foregroundColor(selected ? .black : .white.opacity(0.9))
+                .frame(minWidth: 30)
+                .padding(.vertical, 7)
+                .padding(.horizontal, 4)
+                .background(
+                    Capsule().fill(selected ? Color.white : Color.clear)
+                )
         }
         .disabled(cam.isBusy)
     }
@@ -309,7 +314,7 @@ struct CameraView: View {
             }
 
             HStack(alignment: .center) {
-                flipCameraButton
+                galleryButton
                     .frame(width: 72)
 
                 Spacer()
@@ -318,7 +323,7 @@ struct CameraView: View {
 
                 Spacer()
 
-                galleryButton
+                flipCameraButton
                     .frame(width: 72)
             }
             .padding(.horizontal, 28)
@@ -327,32 +332,49 @@ struct CameraView: View {
     }
 
     private var flipCameraButton: some View {
-        Button(action: { cam.toggleFrontCamera() }) {
-            Image(systemName: "arrow.triangle.2.circlepath.camera")
-                .font(.system(size: 22, weight: .regular))
-                .foregroundColor(cam.availableCameras.contains(.front) ? .white : .white.opacity(0.2))
+        let enabled = cam.availableCameras.contains(.front) && !cam.isBusy
+        return Button(action: { cam.toggleFrontCamera() }) {
+            ZStack {
+                Circle()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 46, height: 46)
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundColor(enabled ? .white : .white.opacity(0.25))
+            }
         }
-        .disabled(cam.isBusy || !cam.availableCameras.contains(.front))
+        .disabled(!enabled)
     }
 
     private var shutterButton: some View {
         Button(action: { cam.captureBurst() }) {
             ZStack {
                 Circle()
-                    .strokeBorder(Color.white, lineWidth: 4)
-                    .frame(width: 74, height: 74)
+                    .strokeBorder(Color.white.opacity(cam.isBusy ? 0.35 : 1), lineWidth: 5)
+                    .frame(width: 78, height: 78)
                 Circle()
-                    .fill(Color.white.opacity(shutterFillOpacity))
-                    .frame(width: cam.isCapturing ? 56 : 62, height: cam.isCapturing ? 56 : 62)
-                    .animation(.easeInOut(duration: 0.12), value: cam.isCapturing)
+                    .fill(shutterFill)
+                    .frame(width: cam.isCapturing ? 52 : 64, height: cam.isCapturing ? 52 : 64)
+                    .animation(.spring(response: 0.22, dampingFraction: 0.6), value: cam.isCapturing)
+                if cam.isProcessing {
+                    // Progress reads on the control the user is waiting on,
+                    // rather than only in the status line above.
+                    Circle()
+                        .trim(from: 0, to: max(0.02, CGFloat(cam.progress)))
+                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 78, height: 78)
+                        .animation(.easeInOut(duration: 0.2), value: cam.progress)
+                }
             }
         }
         .disabled(cam.isBusy)
     }
 
-    private var shutterFillOpacity: Double {
-        if cam.isBusy { return 0.35 }
-        return 1
+    private var shutterFill: Color {
+        if cam.isProcessing { return Color.white.opacity(0.25) }
+        if cam.isBusy { return Color.white.opacity(0.35) }
+        return .white
     }
 
     private var galleryButton: some View {
@@ -362,7 +384,7 @@ struct CameraView: View {
                     if let thumb = cam.lastThumbnail {
                         Image(uiImage: thumb).resizable().scaledToFill()
                     } else {
-                        RoundedRectangle(cornerRadius: 8)
+                        Circle()
                             .fill(Color.white.opacity(0.1))
                             .overlay(
                                 Image(systemName: "photo")
@@ -372,7 +394,8 @@ struct CameraView: View {
                     }
                 }
                 .frame(width: 46, height: 46)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: 1.5))
 
                 if cam.isBusy {
                     Circle()
@@ -609,6 +632,13 @@ struct CameraView: View {
                 }
                 
                 Section(header: Text("Capture")) {
+                    Toggle("Shutter Sound", isOn: $cam.shutterSoundEnabled)
+                    Text(cam.shutterSoundEnabled
+                         ? "Plays the system camera click when a burst starts."
+                         : "Silent. Some regions require a shutter sound by law; the system may override this.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     Toggle("Zero Shutter Lag (ZSL)", isOn: $cam.zslEnabled)
                     Text(cam.zslEnabled
                          ? "Buffers \(cam.frameCount) RAW frames continuously. Tap shutter to grab them without holding still afterward. Ready: \(cam.zslBufferReady)/\(cam.frameCount)."
