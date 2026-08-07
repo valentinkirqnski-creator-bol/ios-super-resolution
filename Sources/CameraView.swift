@@ -110,7 +110,7 @@ struct CameraView: View {
             // above it, so the preview keeps the full height.
             HStack {
                 edgeSlider(value: $cam.isoSlider,
-                           symbol: "circle.lefthalf.filled",
+                           symbol: "circle.lefthalf.fill",   // .filled variant is iOS 16+
                            active: !cam.isoIsAuto,
                            height: height * 0.42,
                            toggle: { cam.isoIsAuto.toggle() },
