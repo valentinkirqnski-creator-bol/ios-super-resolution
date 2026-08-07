@@ -13,6 +13,7 @@
 #include "core/pipeline.h"
 #include "core/metal_gpu.h"
 #include "core/mps_fft.h"
+#include "core/preset_lut.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -250,6 +251,23 @@ static inline void render_linear_dng_pixel(float r, float g, float b,
                                            const float wb[3], const float m[9],
                                            bool has_color,
                                            float& sr, float& sg, float& sb) {
+    if (has_color && render_wb_is_neutral(wb) && preset_lut_enabled()) {
+        // The fitted table subsumes the matrix and tone curve below: it was
+        // fitted from this exact input -- pre-white-balanced linear DNG RGB --
+        // straight to the target JPEG, so nothing else may be applied on top.
+        //
+        // Gated on the same neutral-white-balance condition as the calibrated
+        // branch, because that is the case it was fitted for. A DNG carrying
+        // real WB gains falls through to the legacy path below.
+        const float lin[3] = {r, g, b};
+        float out[3];
+        preset_lut_apply(lin, out);
+        sr = out[0];
+        sg = out[1];
+        sb = out[2];
+        return;
+    }
+
     if (has_color && render_wb_is_neutral(wb)) {
         // Calibrated from the supplied HandheldSR linear DNG -> Lightroom iOS JPEG pair.
         // The SR output is already pre-white-balanced, so using the DNG camera matrix
