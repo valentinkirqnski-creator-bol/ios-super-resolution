@@ -1007,12 +1007,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // place. Allocating a matching host image would double the largest
     // allocation in the pipeline to hold the same bytes twice.
     Image num_sink, den_sink;
-#if defined(__APPLE__)
-    if (use_online) {
-        metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
-        metal_merge_begin_online(out_h, out_w, out_nch);
-    }
-#endif
 
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
@@ -1031,6 +1025,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // (metal_release_host_ref_stats above), and the analyze trim would clear
     // them. The trim still runs later, once analysis is finished.
     metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
+    // After begin_burst, which clears online state along with the rest of the
+    // merge globals.
+    if (use_online) metal_merge_begin_online(out_h, out_w, out_nch);
 #endif
 
     auto drain_spill = [&]() {
@@ -1300,6 +1297,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (n_comp_ok < 1) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: could not analyze comparison frames", 1.f);
+#if defined(__APPLE__)
+        metal_merge_end_online();
+#endif
         return Image();
     }
 
@@ -1317,6 +1317,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (ref.h <= 0) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: reference frame missing for merge", 1.f);
+#if defined(__APPLE__)
+        metal_merge_end_online();
+#endif
         return Image();
     }
 
@@ -1348,6 +1351,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                      work.raw_prewhitened)) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
+#if defined(__APPLE__)
+        metal_merge_end_online();
+#endif
         return Image();
     }
 

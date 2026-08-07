@@ -2935,6 +2935,12 @@ void metal_trim_analyze_scratch() {
 void metal_merge_begin_burst(bool trim_analyze_scratch) {
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
+    // Clear online state here rather than trusting every exit path to do it.
+    // Leaking it would make the next banded merge take its dispatch geometry
+    // from the previous burst's output size, which is silent corruption.
+    g_merge_online = false;
+    g_merge_online_zeroed = false;
+    g_online_h = g_online_w = g_online_nch = 0;
     g_merge_frames.clear();
     g_merge_ref = {};
     // First band XORs to slot 0 when double-buffered.
