@@ -244,28 +244,7 @@ struct CameraView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 5)
             .background(Capsule().fill(Color.black.opacity(0.45)))
-            if cam.lensZoomMode == .wide1x {
-                HStack(spacing: 18) {
-                    ForEach(OutputResolutionMode.allCases) { mode in
-                        lensChip(title: mode.label, selected: cam.outputResolutionMode == mode) {
-                            cam.outputResolutionMode = mode
-                        }
-                    }
-                }
-            }
-            HStack(spacing: 18) {
-                lensChip(title: "DNG", selected: cam.exportFormat == .dng) {
-                    cam.exportFormat = .dng
-                }
-                lensChip(title: "JPG", selected: cam.exportFormat == .jpg) {
-                    cam.exportFormat = .jpg
-                }
-            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(Color.black.opacity(0.45))
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -683,6 +662,21 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Export")) {
+                    Picker("Resolution", selection: $cam.outputResolutionMode) {
+                        ForEach(OutputResolutionMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(cam.lensZoomMode != .wide1x)
+                    Text(cam.lensZoomMode == .wide1x
+                         ? (cam.outputResolutionMode == .super48mp
+                            ? "Super-resolves to 4x the pixel count. Slower and uses more memory."
+                            : "Merges at sensor resolution. Faster.")
+                         : "Only available on the 1x lens; other lenses always merge at sensor resolution.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     Picker("Format", selection: $cam.exportFormat) {
                         ForEach(ExportFormat.allCases) { fmt in
                             Text(fmt.label).tag(fmt)
