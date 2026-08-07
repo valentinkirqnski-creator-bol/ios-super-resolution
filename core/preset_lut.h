@@ -5,15 +5,15 @@
 // sRGB, absorbing white balance, the colour matrix, gamma and the preset's tone
 // and colour grading in one step.
 //
-// Accuracy on the reference pair, measured after the uint8 quantisation:
-// 14.0 LSB mean over the whole frame, 9.4 LSB over smooth regions, where
-// registration between the two handheld frames cannot bias the number. It is
-// deliberately NOT exact -- the preset was measured to contain content-adaptive
-// processing, so a colour-only mapping cannot reach zero.
+// Accuracy on the reference pair (linear DNG + the target JPEG rendered from
+// it), after the uint8 quantisation and through the real trilinear path:
+// 3.29 LSB mean over the whole frame, 4.15 LSB over a fifth of the frame held
+// out of the fit. It is deliberately NOT exact -- the preset was measured to
+// contain content-adaptive processing, so a colour-only mapping cannot reach
+// zero.
 //
-// See preset_lut.cpp for how the table was repaired and what is still open;
-// the accuracy figures the previous version of this comment quoted were
-// measured on training pixels and understated the real error by 6x.
+// See preset_lut.cpp for how it is fitted, and for why a pair of JPEGs without
+// the DNG is not enough to fit it.
 //
 // Applies to the preview/JPEG only. The DNG is written from the unmodified
 // merge and must stay that way.
