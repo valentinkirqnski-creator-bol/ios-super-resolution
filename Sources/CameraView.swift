@@ -333,10 +333,11 @@ struct CameraView: View {
         return Button(action: { cam.toggleFrontCamera() }) {
             ZStack {
                 Circle()
-                    .fill(Color.white.opacity(0.12))
-                    .frame(width: 46, height: 46)
+                    .strokeBorder(enabled ? Color.white : Color.white.opacity(0.25),
+                                  lineWidth: 2)
+                    .frame(width: 48, height: 48)
                 Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 19, weight: .semibold))
+                    .font(.system(size: 20, weight: .medium))
                     .foregroundColor(enabled ? .white : .white.opacity(0.25))
             }
         }
@@ -351,7 +352,7 @@ struct CameraView: View {
                     .frame(width: 78, height: 78)
                 Circle()
                     .fill(shutterFill)
-                    .frame(width: cam.isCapturing ? 52 : 64, height: cam.isCapturing ? 52 : 64)
+                    .frame(width: cam.isCapturing ? 50 : 58, height: cam.isCapturing ? 50 : 58)
                     .animation(.spring(response: 0.22, dampingFraction: 0.6), value: cam.isCapturing)
                 if cam.isProcessing {
                     // Progress reads on the control the user is waiting on,
@@ -646,6 +647,11 @@ struct CameraView: View {
                 }
                 
                 Section(header: Text("Capture")) {
+                    if cam.frameCount > 10 {
+                        Text("\(cam.frameCount) frames: every frame stays resident through the merge, so long bursts are memory-heavy. If a capture is killed mid-processing, reduce the count or switch to 12MP output.")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
                     Toggle("Shutter Sound", isOn: $cam.shutterSoundEnabled)
                     Text(cam.shutterSoundEnabled
                          ? "Plays the system camera click when a burst starts."

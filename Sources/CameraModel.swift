@@ -273,7 +273,11 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var exposureMaxSec: Double = 1.0 / 15.0
 
     static let minFrameCount = 2
-    static let maxFrameCount = 8
+    /// Long bursts trade memory for noise reduction. The pipeline keeps each
+    /// analyzed frame GPU-resident, so residency grows roughly 110MB per
+    /// comparison frame at 12MP; past a point the early upload backs off to
+    /// spilling rather than risking jetsam (see pipeline_paths.cpp).
+    static let maxFrameCount = 15
     private static let frameCountDefaultsKey = "FrameCount"
     private static let shutterAutoDefaultsKey = "ShutterIsAuto"
     private static let shutterSliderDefaultsKey = "ShutterSlider"

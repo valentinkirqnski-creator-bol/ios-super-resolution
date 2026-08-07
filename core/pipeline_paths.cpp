@@ -1128,7 +1128,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // well below that peak.
             bool uploaded_to_gpu = false;
 #if defined(__APPLE__)
-            if (rob_has_nonzero && comp.h > 0 && comp.w > 0)
+            // Uploading each frame as it is analyzed removes the disk round
+            // trip, but residency grows with the burst -- roughly 110MB per
+            // comparison frame at 12MP once image, covariance and mask are
+            // counted. A 15-frame burst would add about 770MB over an 8-frame
+            // one, which is more than the headroom allows.
+            //
+            // So stop when headroom gets tight and fall back to spilling. A long
+            // burst then degrades in speed rather than being killed, and short
+            // bursts are unaffected. prof_available_bytes returns 0 when the
+            // query is unavailable, which is treated as no constraint.
+            constexpr uint64_t kMinHeadroomForUpload = 700ull * 1024ull * 1024ull;
+            const uint64_t avail = prof_available_bytes();
+            const bool headroom_ok = (avail == 0) || (avail > kMinHeadroomForUpload);
+            if (rob_has_nonzero && comp.h > 0 && comp.w > 0 && headroom_ok)
                 uploaded_to_gpu = metal_merge_prefetch_frame(comp, flow, covs, rob, k);
 #endif
             if (uploaded_to_gpu) {
