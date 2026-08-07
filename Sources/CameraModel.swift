@@ -1774,12 +1774,16 @@ final class CameraModel: NSObject, ObservableObject {
         var preview: UIImage?
         let inputURLs = capturedDNGs
         let rawInputPaths = rawFrames.compactMap { $0["path"] as? String }
+        lastPipelineError = ""
         let progressBlock: (String, Float) -> Void = { [weak self] stage, frac in
             DispatchQueue.main.async {
                 self?.progress = 0.15 + frac * 0.85
                 if stage.hasPrefix("Noise ") {
                     self?.noiseDiagText = stage
                 } else {
+                    // finish() replaces statusText with its own message, so an
+                    // error reported here would vanish before it could be read.
+                    if stage.hasPrefix("Error") { self?.lastPipelineError = stage }
                     self?.statusText = stage
                 }
             }
@@ -1826,7 +1830,8 @@ final class CameraModel: NSObject, ObservableObject {
         } else {
             removeBurstDir(burstDir)
             self.burstDir = nil
-            finish(success: false, message: "Processing failed")
+            finish(success: false,
+                   message: lastPipelineError.isEmpty ? "Processing failed" : lastPipelineError)
         }
     }
 
@@ -1985,6 +1990,10 @@ final class CameraModel: NSObject, ObservableObject {
         AudioServicesPlaySystemSound(1108)
     }
 
+    /// Last "Error…" line the C++ pipeline reported, kept because finish()
+    /// overwrites statusText with its own summary.
+    private var lastPipelineError = ""
+
     private func finish(success: Bool, message: String) {
         // The picker opened a security scope on each imported file; release it
         // now that the pipeline is done reading them.
@@ -1996,6 +2005,11 @@ final class CameraModel: NSObject, ObservableObject {
             self.isProcessing = false
             self.progress = success ? 1 : 0
             self.statusText = message
+            // Errors go next to the noise line, which is deliberately kept until
+            // the next burst, so a failure is still readable after Done.
+            if !success && !self.lastPipelineError.isEmpty {
+                self.noiseDiagText = self.lastPipelineError
+            }
             // Keep noiseDiagText until next burst so you can read OK/FALLBACK after Done.
         }
         sessionQueue.async {
