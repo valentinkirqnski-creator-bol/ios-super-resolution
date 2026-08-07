@@ -85,8 +85,22 @@ struct CameraView: View {
             ) { devicePoint, localPoint in
                 guard !cam.isBusy else { return }
                 cam.focus(at: devicePoint)
-                showFocusIndicator(at: localPoint)
+                // localPoint is in the preview's own unscaled space; the
+                // indicator is drawn in the enclosing frame, so undo the zoom
+                // about the centre or it lands away from the finger.
+                let c = CGPoint(x: width / 2, y: height / 2)
+                showFocusIndicator(at: CGPoint(
+                    x: c.x + (localPoint.x - c.x) * cam.previewZoom,
+                    y: c.y + (localPoint.y - c.y) * cam.previewZoom))
             }
+            .frame(width: width, height: height)
+            // 2x is a processing-side centre crop, so scale the preview to match
+            // the framing that will actually be saved. Animation is driven from
+            // CameraModel, not by an .animation modifier here, so lens switches
+            // can snap where a tween would be wrong.
+            .scaleEffect(cam.previewZoom)
+            // Re-assert the layout box so .clipped() trims the magnified render
+            // back to the viewfinder instead of letting it spill over the UI.
             .frame(width: width, height: height)
             .clipped()
 

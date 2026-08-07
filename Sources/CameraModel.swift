@@ -1,6 +1,7 @@
 import AVFoundation
 import Photos
 import UIKit
+import SwiftUI
 import Combine
 import ImageIO
 import AudioToolbox
@@ -744,19 +745,46 @@ final class CameraModel: NSObject, ObservableObject {
 
     func setLensZoom(_ mode: LensZoomMode) {
         guard !isBusy else { return }
-        switch mode {
-        case .ultraWide:
-            guard availableCameras.contains(.ultraWide) else { return }
-            lensZoomMode = mode
-            setCamera(.ultraWide)
-        case .wide1x, .wide2x:
-            guard availableCameras.contains(.wide) else { return }
-            lensZoomMode = mode
-            setCamera(.wide)
-        case .telephoto:
-            guard availableCameras.contains(.telephoto) else { return }
-            lensZoomMode = mode
-            setCamera(.telephoto)
+        let target = lensCameraSelection(for: mode)
+        guard availableCameras.contains(target) else { return }
+
+        let from = displayedVirtualZoom
+        let to = virtualZoom(mode)
+        lensZoomMode = mode
+        displayedVirtualZoom = to
+
+        if target == cameraSelection {
+            pendingLensSwitch = nil
+            // Same lens (1x <-> 2x): a pure scale change, nothing to swap.
+            withAnimation(.easeInOut(duration: Self.lensZoomDuration)) {
+                previewZoom = max(1, to / nativeZoom(target))
+            }
+            return
+        }
+
+        if to > from {
+            // Zooming in past this lens: ramp the current feed up to the new
+            // framing first, then swap the device underneath at matching scale.
+            // Switching first would hard-cut, since the wider lens cannot show
+            // the tighter framing before the swap.
+            withAnimation(.easeInOut(duration: Self.lensZoomDuration)) {
+                previewZoom = max(1, to / nativeZoom(cameraSelection))
+            }
+            pendingLensSwitch = (mode, target)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.lensZoomDuration) {
+                // A newer tap during the ramp wins, as does a shutter press that
+                // already flushed this switch.
+                guard let pending = self.pendingLensSwitch,
+                      pending.mode == mode else { return }
+                self.pendingLensSwitch = nil
+                self.setCamera(target)
+            }
+        } else {
+            // Zooming out: the wider lens has to be live before it can show the
+            // wider field, so switch now and animate outward on arrival.
+            virtualZoomBeforeSwitch = from
+            pendingLensSwitch = nil
+            setCamera(target)
         }
     }
 
@@ -797,6 +825,53 @@ final class CameraModel: NSObject, ObservableObject {
         case .front:
             break
         }
+        settlePreviewZoom(for: selection)
+    }
+
+    /// Reconcile the preview scale with the lens that just went live.
+    ///
+    /// Runs on the main thread from syncLensModeForCameraSelection, i.e. after
+    /// the session has actually swapped inputs.
+    private func settlePreviewZoom(for selection: CameraSelection) {
+        if selection == .front {
+            virtualZoomBeforeSwitch = nil
+            displayedVirtualZoom = 1
+            previewZoom = 1
+            return
+        }
+        let native = nativeZoom(selection)
+        displayedVirtualZoom = virtualZoom(lensZoomMode)
+        let target = max(1, displayedVirtualZoom / native)
+
+        guard let before = virtualZoomBeforeSwitch else {
+            // Zoom-in ramp already reached this framing, or a switch we did not
+            // initiate: adopt the scale without animating.
+            previewZoom = target
+            return
+        }
+        virtualZoomBeforeSwitch = nil
+        // Start where the old lens left off so the framing is continuous across
+        // the swap, then animate outward. Clamped at 1 because the sensor cannot
+        // supply a wider field than the lens itself sees.
+        previewZoom = max(1, before / native)
+        // Commit the snap before the animated change, or SwiftUI coalesces both
+        // into one update and the animation has nothing to travel.
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: Self.lensZoomDuration)) {
+                self.previewZoom = target
+            }
+        }
+    }
+
+    /// Apply a deferred lens switch immediately.
+    ///
+    /// Both this and setCamera's work land on sessionQueue, and captureBurst
+    /// enqueues its own block afterwards, so the device is swapped before any
+    /// frame is requested.
+    private func flushPendingLensSwitch() {
+        guard let pending = pendingLensSwitch else { return }
+        pendingLensSwitch = nil
+        setCamera(pending.selection)
     }
 
     private func discoverCamerasAfterSetup() {
@@ -807,9 +882,13 @@ final class CameraModel: NSObject, ObservableObject {
         if device(for: .front) != nil { found.append(.front) }
         if found.isEmpty { found = [.wide] }
         let teleLabel = inferredTelephotoLensLabel()
+        let teleZoom = measuredZoomRelativeToWide(.telephoto) ?? 2
+        let uwZoom = measuredZoomRelativeToWide(.ultraWide) ?? 0.5
         DispatchQueue.main.async {
             self.availableCameras = found
             self.telephotoLensLabel = teleLabel
+            self.telephotoNativeZoom = teleZoom
+            self.ultraWideNativeZoom = uwZoom
             if !found.contains(self.cameraSelection) {
                 self.cameraSelection = found.first ?? .wide
                 self.syncLensModeForCameraSelection(self.cameraSelection)
@@ -991,6 +1070,20 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    /// Framing of `selection` in 1x-wide units, from the field of view the
+    /// device reports. nil when either lens is missing or the numbers are not
+    /// usable, in which case the caller keeps its default.
+    private func measuredZoomRelativeToWide(_ selection: CameraSelection) -> CGFloat? {
+        guard let wide = device(for: .wide),
+              let other = device(for: selection) else { return nil }
+        let wideFOV = Double(wide.activeFormat.videoFieldOfView) * .pi / 180.0
+        let otherFOV = Double(other.activeFormat.videoFieldOfView) * .pi / 180.0
+        guard wideFOV > 0, otherFOV > 0 else { return nil }
+        let zoom = tan(wideFOV * 0.5) / tan(otherFOV * 0.5)
+        guard zoom.isFinite, zoom > 0.05, zoom < 100 else { return nil }
+        return CGFloat(zoom)
+    }
+
     private func inferredTelephotoLensLabel() -> String {
         guard let wide = device(for: .wide),
               let tele = device(for: .telephoto) else { return "Tele" }
@@ -1050,19 +1143,103 @@ final class CameraModel: NSObject, ObservableObject {
     // MARK: - Focus / exposure controls
 
     func focus(at devicePoint: CGPoint) {
+        // A point outside the sensor rectangle is silently ignored by
+        // AVFoundation, so clamp rather than letting an edge tap do nothing.
+        let p = CGPoint(x: min(1, max(0, devicePoint.x)),
+                        y: min(1, max(0, devicePoint.y)))
         sessionQueue.async {
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
+
             if d.isFocusPointOfInterestSupported {
-                d.focusPointOfInterest = devicePoint
-                if d.isFocusModeSupported(.autoFocus) { d.focusMode = .autoFocus }
-            }
-            if d.isExposurePointOfInterestSupported {
-                d.exposurePointOfInterest = devicePoint
-                if self.shutterIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
-                    d.exposureMode = .continuousAutoExposure
+                d.focusPointOfInterest = p
+                // One-shot autofocus at the tap. Continuous would immediately
+                // re-run over the whole frame and discard the chosen point.
+                if d.isFocusModeSupported(.autoFocus) {
+                    d.focusMode = .autoFocus
+                } else if d.isFocusModeSupported(.continuousAutoFocus) {
+                    d.focusMode = .continuousAutoFocus
                 }
             }
+
+            if d.isExposurePointOfInterestSupported {
+                d.exposurePointOfInterest = p
+                // .autoExpose meters once at the point and holds it.
+                // .continuousAutoExposure -- what this used to set -- goes
+                // straight back to metering the whole scene, so tapping a dark
+                // subject against a bright background changed nothing.
+                if self.shutterIsAuto && self.isoIsAuto {
+                    if d.isExposureModeSupported(.autoExpose) {
+                        d.exposureMode = .autoExpose
+                    } else if d.isExposureModeSupported(.continuousAutoExposure) {
+                        d.exposureMode = .continuousAutoExposure
+                    }
+                }
+            }
+
+            // Re-run autofocus when the scene changes, instead of staying locked
+            // on a subject that has moved away.
+            d.isSubjectAreaChangeMonitoringEnabled = true
             d.unlockForConfiguration()
+        }
+    }
+
+    // MARK: - Preview zoom
+
+    /// Scale applied to the preview layer, in units of the active device's own
+    /// framing. 1 means "show what this lens sees".
+    ///
+    /// 2x is produced by centre-cropping the RAW during processing, not by the
+    /// device, so without this the preview showed the full wide frame while the
+    /// output was a 2x crop -- the framing on screen was not the framing saved.
+    /// Deliberately not videoZoomFactor: that would risk the device cropping the
+    /// RAW too and compounding with the crop the pipeline already applies.
+    ///
+    /// Animated changes go through withAnimation in the mutating methods; plain
+    /// assignments snap. The view attaches no .animation modifier, so which
+    /// transitions animate is decided here rather than by SwiftUI heuristics.
+    @Published private(set) var previewZoom: CGFloat = 1
+
+    /// Framing currently shown, in 1x-wide units, independent of which physical
+    /// lens is producing it. Lets a lens switch keep the framing continuous.
+    private var displayedVirtualZoom: CGFloat = 1
+    /// Framing shown just before a pending device switch, for the zoom-out case
+    /// where the new lens must start at the old framing and animate outward.
+    private var virtualZoomBeforeSwitch: CGFloat?
+    /// Lens whose switch is deferred until the zoom-in ramp finishes. The UI
+    /// already shows this mode as selected, so a shutter press inside the ramp
+    /// has to apply it first or the burst comes off the previous lens.
+    private var pendingLensSwitch: (mode: LensZoomMode, selection: CameraSelection)?
+
+    static let lensZoomDuration: Double = 0.28
+
+    /// Native framing of each lens in 1x-wide units, measured from field of view
+    /// at discovery. Defaults are the common iPhone values, replaced with real
+    /// numbers once the devices are known.
+    private var ultraWideNativeZoom: CGFloat = 0.5
+    private var telephotoNativeZoom: CGFloat = 2
+
+    private func nativeZoom(_ selection: CameraSelection) -> CGFloat {
+        switch selection {
+        case .ultraWide: return ultraWideNativeZoom
+        case .telephoto: return telephotoNativeZoom
+        case .wide, .front: return 1
+        }
+    }
+
+    private func virtualZoom(_ mode: LensZoomMode) -> CGFloat {
+        switch mode {
+        case .ultraWide: return ultraWideNativeZoom
+        case .wide1x: return 1
+        case .wide2x: return 2
+        case .telephoto: return telephotoNativeZoom
+        }
+    }
+
+    private func lensCameraSelection(for mode: LensZoomMode) -> CameraSelection {
+        switch mode {
+        case .ultraWide: return .ultraWide
+        case .wide1x, .wide2x: return .wide
+        case .telephoto: return .telephoto
         }
     }
 
@@ -1070,6 +1247,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     func captureBurst() {
         guard !isBusy else { return }
+        flushPendingLensSwitch()
         playShutterSound()
 
         let total = frameCount
