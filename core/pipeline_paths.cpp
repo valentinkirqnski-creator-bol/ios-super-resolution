@@ -797,6 +797,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     int pref_k = -1;
     std::future<Image> pref_fut;
 
+    // Accumulated robustness. Summed inside the loop on the streamed path so
+    // each frame's mask can be released as soon as it is on the GPU, rather
+    // than every mask being held until after the loop.
+    Image acc_rob;
+    bool have_acc_rob = false;
+
     const double t_snr = prof_now_ms();
     f32 ref_brightness = 0.f;
     // The SNR scan is a serial sum over 12.2M floats. It cannot be vectorized
@@ -1139,11 +1145,27 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             } else {
                 comp = Image();
             }
+            // Same frames in the same order build_robustness_sum walked, so
+            // the sum is float-for-float what it produced.
+            absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+
             CachedCompMeta meta;
             meta.index = k;
-            meta.flow = rob_has_nonzero ? std::move(flow) : FlowField();
-            meta.rob = std::move(rob);
-            meta.covs = rob_has_nonzero ? std::move(covs) : CovField();
+            if (uploaded_to_gpu) {
+                // The GPU holds img, flow, cov and rob for this frame, and
+                // acquire_frame_gpu serves them from that cache for every band,
+                // so the host copies are dead weight from here to the merge --
+                // about 61MB per frame, 427MB across a burst. Peak footprint
+                // moved to analyze:frame-end once frames began uploading during
+                // analysis, which is exactly where this was accumulating.
+                meta.flow = FlowField();
+                meta.rob = Image();
+                meta.covs = CovField();
+            } else {
+                meta.flow = rob_has_nonzero ? std::move(flow) : FlowField();
+                meta.rob = std::move(rob);
+                meta.covs = rob_has_nonzero ? std::move(covs) : CovField();
+            }
             meta.rob_rows_nonzero = std::move(rob_rows_nonzero);
             meta.rob_has_nonzero = rob_has_nonzero;
             cached_meta.push_back(std::move(meta));
@@ -1196,10 +1218,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
     const bool accumulate_r =
         work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
-    Image acc_rob;
-    bool have_acc_rob = false;
     const double t_accrob = prof_now_ms();
-    build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
+    // Streamed frames were summed in the loop above, as each was released.
+    if (!stream_comp_raw)
+        build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
     prof_add_cpu("merge:acc-rob-sum", prof_now_ms() - t_accrob);
     const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
     if (have_acc_rob) {
