@@ -1246,7 +1246,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // robustness sum is float-for-float what it produces.
             absorb_robustness_sum(acc_rob, rob, have_acc_rob);
             bool merged = true;
+            bool contributed = false;
             if (rob_has_nonzero && comp.h > 0 && comp.w > 0) {
+                contributed = true;
                 merge_comp_band(comp, flow, covs, rob, tile_size,
                                 num_sink, den_sink, 0, work, k);
                 online_pending.push_back(k);
@@ -1273,7 +1275,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
                 return Image();
             }
-            n_comp_ok++;
+            // Only frames that reached the accumulator count. Counting every
+            // analyzed frame meant a burst where none of them merged still
+            // looked fully analysed, and the output -- the reference alone --
+            // came out with no error at all.
+            if (contributed) n_comp_ok++;
 #endif
         } else if (stream_comp_raw) {
             // Keep flow/R/cov in RAM. For DNG-file input, spill normalized Bayer
@@ -1344,7 +1350,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             meta.rob_rows_nonzero = std::move(rob_rows_nonzero);
             meta.rob_has_nonzero = rob_has_nonzero;
             cached_meta.push_back(std::move(meta));
-            n_comp_ok++;
+            if (rob_has_nonzero) n_comp_ok++;
         } else {
             CachedCompFrame fc;
             fc.index = k;
@@ -1355,7 +1361,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             fc.rob_rows_nonzero = std::move(rob_rows_nonzero);
             fc.rob_has_nonzero = rob_has_nonzero;
             cached.push_back(std::move(fc));
-            n_comp_ok++;
+            if (rob_has_nonzero) n_comp_ok++;
         }
         prof_add_cpu("comp:stash+free-raw", prof_now_ms() - t_stash);
         prof_add_cpu("comp:frame(total)", prof_now_ms() - t_frame_total);
@@ -1367,7 +1373,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
     if (n_comp_ok < 1) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
-        report("Error: could not analyze comparison frames", 1.f);
+        report("Error: no comparison frame merged (all rejected?)", 1.f);
 #if defined(__APPLE__)
         metal_merge_end_online();
 #endif
