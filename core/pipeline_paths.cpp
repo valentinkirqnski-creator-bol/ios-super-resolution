@@ -741,24 +741,48 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 // "Flat in frame count" is not automatically "smaller": the online accumulator
 // scales with OUTPUT pixels, so at 2x it costs 4x what it does at 1x and loses
 // to banding until the burst is long.
+// Frames merged per command buffer. Matches kMergeFuseMax in metal_gpu.mm:
+// flushing after every frame would stop merge_flush_pending ever reaching the
+// fusion threshold, and each frame would then read-modify-write the whole
+// accumulator on its own. At 15 frames that is 15 passes over it instead of 4.
+//
+// The cost is that four frames' GPU uploads are alive at once instead of one.
+// Still constant in burst length, which is the property that matters.
+static constexpr int kOnlineFuse = 4;
+
 static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
                                 bool spill, int band_rows, int raw_h, int raw_w) {
     if (mode == 1) return false;              // forced banded
+    if (mode == 2) return true;               // forced online
+
     const size_t f = sizeof(f32);
     const size_t acc_full = (size_t)Hs * Ws * nch * f * 2;   // num+den, whole output
-    if (mode == 2) return true;               // forced online
     const size_t raw = (size_t)raw_h * raw_w * f;
     const size_t covs = (size_t)(raw_h / 2) * (raw_w / 2) * 4 * f;
     const size_t rob = (size_t)(raw_h / 2) * (raw_w / 2) * f;
     const size_t per_frame = covs + rob + (spill ? 0 : raw);
-    const size_t banded = (size_t)band_rows * Ws * nch * f * 2 * 2   // double buffered
+    const size_t banded = (size_t)band_rows * Ws * nch * f * 2 * 2
                           + (size_t)std::max(0, n - 1) * per_frame;
-    // Online also holds the host copy the accumulator is read back into.
-    // Counted once: the accumulator is shared storage and is read in place,
-    // so there is no host copy of it. This is what puts the online path at the
-    // paper's 22 MB per output megapixel rather than twice that.
-    const size_t online = acc_full + (raw + covs + rob);
-    return online < banded;
+    const size_t online = acc_full + (size_t)kOnlineFuse * (raw + covs + rob);
+
+    // Prefer online whenever it fits, rather than only when it is the smaller
+    // of the two. It is the one architecture whose cost does not grow with the
+    // burst, so it is what keeps a 15-frame shot alive; on a short burst it
+    // merely uses memory that was going spare. Banded is the fallback for when
+    // the accumulator genuinely will not fit -- which is a real case, since the
+    // accumulator scales with output pixels and 2x is four times 1x.
+    //
+    // prof_available_bytes returns 0 where the query is unavailable; treat that
+    // as "no constraint known" and fall back to comparing the two sizes, which
+    // is the conservative reading.
+    const uint64_t avail = prof_available_bytes();
+    if (avail == 0) return online < banded;
+
+    // Leave room for everything that is not the accumulator: the reference
+    // frame, the DNG writer, the preview, and whatever the OS wants back.
+    constexpr uint64_t kOnlineHeadroom = 700ull * 1024ull * 1024ull;
+    if ((uint64_t)online + kOnlineHeadroom > avail) return false;
+    return true;
 }
 
 } // namespace
@@ -1007,6 +1031,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // place. Allocating a matching host image would double the largest
     // allocation in the pipeline to hold the same bytes twice.
     Image num_sink, den_sink;
+    std::vector<int> online_pending;   // frames queued but not yet committed
 
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
@@ -1182,10 +1207,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (rob_has_nonzero && comp.h > 0 && comp.w > 0) {
                 merge_comp_band(comp, flow, covs, rob, tile_size,
                                 num_sink, den_sink, 0, work, k);
-                // Commit and wait now: this frame's GPU buffers cannot be
-                // released while its work is still queued, and releasing them
-                // is the entire point of merging online.
-                merged = metal_merge_flush_online();
+                online_pending.push_back(k);
+                // Commit in groups, not per frame: the accumulator fusion needs
+                // several frames queued together, and a frame's GPU buffers
+                // cannot be released until its work has run.
+                if ((int)online_pending.size() >= kOnlineFuse) {
+                    merged = metal_merge_flush_online();
+                    for (int fk : online_pending) metal_merge_release_frame(fk);
+                    online_pending.clear();
+                }
             }
             // Everything this frame owned goes here. Nothing is carried to the
             // merge phase, which is what makes the working set flat in n.
@@ -1195,7 +1225,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             flow = FlowField();
             rob_rows_nonzero.clear();
             rob_rows_nonzero.shrink_to_fit();
-            metal_merge_release_frame(k);
             if (!merged) {
                 report("Error: GPU merge failed (memory?)", 1.f);
                 metal_merge_end_online();
@@ -1455,6 +1484,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // robustness, which only exists once every frame has been merged.
         report("Merging output", 0.48f);
         const double t_ref_online = prof_now_ms();
+        if (!online_pending.empty()) {
+            if (!metal_merge_flush_online()) {
+                report("Error: GPU merge failed (memory?)", 1.f);
+                metal_merge_end_online();
+                writer.close();
+                if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+                return Image();
+            }
+            for (int fk : online_pending) metal_merge_release_frame(fk);
+            online_pending.clear();
+        }
         merge_ref_band(ref, ref_covs, num_sink, den_sink, 0, work, acc_rob_ptr);
         const f32* nump = nullptr;
         const f32* denp = nullptr;
