@@ -761,6 +761,9 @@ static int online_fuse_group(size_t acc_bytes, size_t frame_bytes) {
     return (int)std::min<long>(std::max<long>(g, 1), 4);          // <= kMergeFuseMax
 }
 
+// Burst length at or above which the merge goes online.
+static constexpr int kOnlineMinFrames = 6;
+
 static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
                                 bool spill, int band_rows, int raw_h, int raw_w) {
     if (mode == 1) return false;              // forced banded
@@ -778,23 +781,27 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     const size_t online = acc_full
                         + (size_t)online_fuse_group(acc_full, in_flight) * in_flight;
 
-    // Prefer online whenever it fits, rather than only when it is the smaller
-    // of the two. It is the one architecture whose cost does not grow with the
-    // burst, so it is what keeps a 15-frame shot alive; on a short burst it
-    // merely uses memory that was going spare. Banded is the fallback for when
-    // the accumulator genuinely will not fit -- which is a real case, since the
-    // accumulator scales with output pixels and 2x is four times 1x.
+    // Online from six frames up, at either scale.
     //
-    // prof_available_bytes returns 0 where the query is unavailable; treat that
-    // as "no constraint known" and fall back to comparing the two sizes, which
-    // is the conservative reading.
-    const uint64_t avail = prof_available_bytes();
-    if (avail == 0) return online < banded;
+    // Below that a burst is short enough that banding is both smaller and
+    // faster, and flat-in-N has nothing to buy -- the whole value of it is that
+    // a long burst costs what a short one does, which is not a property a short
+    // burst needs. Above it, cost stops growing, which is what keeps a 15-frame
+    // shot alive.
+    //
+    // This is a deliberate choice rather than the smaller of the two: at 2x and
+    // six frames online is the larger (about 1535MB against 897MB). The trade
+    // is consistency and headroom at long bursts, paid for on short ones.
+    if (n < kOnlineMinFrames) return false;
 
-    // Leave room for everything that is not the accumulator: the reference
-    // frame, the DNG writer, the preview, and whatever the OS wants back.
+    // Still a hard fallback, not a preference: if the accumulator will not fit,
+    // banding is the only option that runs at all. prof_available_bytes returns
+    // 0 where the query is unavailable, which is treated as no constraint --
+    // matching the analysis-phase upload valve.
+    const uint64_t avail = prof_available_bytes();
     constexpr uint64_t kOnlineHeadroom = 700ull * 1024ull * 1024ull;
-    if ((uint64_t)online + kOnlineHeadroom > avail) return false;
+    if (avail != 0 && (uint64_t)online + kOnlineHeadroom > avail) return false;
+    (void)banded;
     return true;
 }
 
