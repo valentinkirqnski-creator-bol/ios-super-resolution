@@ -79,28 +79,22 @@ struct CameraView: View {
 
     private func viewfinder(width: CGFloat, height: CGFloat) -> some View {
         ZStack {
+            // 2x is a processing-side centre crop, so the preview is zoomed to
+            // match the framing that will actually be saved. The zoom is applied
+            // to the preview layer inside CameraPreview, not with .scaleEffect
+            // here: .clipped() clips rendering but not hit testing, so scaling
+            // the view made the magnified preview swallow taps on the settings
+            // button and the exposure sliders.
             CameraPreview(
                 session: cam.session,
-                mirrorFront: cam.cameraSelection == .front
+                mirrorFront: cam.cameraSelection == .front,
+                zoom: cam.previewZoom,
+                zoomDuration: CameraModel.lensZoomDuration
             ) { devicePoint, localPoint in
                 guard !cam.isBusy else { return }
                 cam.focus(at: devicePoint)
-                // localPoint is in the preview's own unscaled space; the
-                // indicator is drawn in the enclosing frame, so undo the zoom
-                // about the centre or it lands away from the finger.
-                let c = CGPoint(x: width / 2, y: height / 2)
-                showFocusIndicator(at: CGPoint(
-                    x: c.x + (localPoint.x - c.x) * cam.previewZoom,
-                    y: c.y + (localPoint.y - c.y) * cam.previewZoom))
+                showFocusIndicator(at: localPoint)
             }
-            .frame(width: width, height: height)
-            // 2x is a processing-side centre crop, so scale the preview to match
-            // the framing that will actually be saved. Animation is driven from
-            // CameraModel, not by an .animation modifier here, so lens switches
-            // can snap where a tween would be wrong.
-            .scaleEffect(cam.previewZoom)
-            // Re-assert the layout box so .clipped() trims the magnified render
-            // back to the viewfinder instead of letting it spill over the UI.
             .frame(width: width, height: height)
             .clipped()
 
@@ -187,30 +181,41 @@ struct CameraView: View {
                     .fill(Color.white.opacity(active ? 0.85 : 0.35))
                     .frame(width: 2, height: h)
                     .frame(maxWidth: .infinity)
-                Button(action: toggle) {
-                    ZStack {
-                        Circle().fill(Color.black.opacity(0.55)).frame(width: knob, height: knob)
-                        Circle().strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
-                            .frame(width: knob, height: knob)
-                        Image(systemName: symbol)
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundColor(active ? .white : .white.opacity(0.55))
-                    }
+                ZStack {
+                    Circle().fill(Color.black.opacity(0.55)).frame(width: knob, height: knob)
+                    Circle().strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
+                        .frame(width: knob, height: knob)
+                    Image(systemName: symbol)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(active ? .white : .white.opacity(0.55))
                 }
-                .buttonStyle(.plain)
                 .position(x: g.size.width / 2, y: y)
             }
             .contentShape(Rectangle())
+            // One gesture handles both roles. The knob used to be a Button,
+            // which swallowed any drag beginning on it -- and the knob is
+            // exactly where a slider gets grabbed, so dragging did nothing.
+            // minimumDistance 0 also means the value tracks the very first
+            // touch instead of only after 4pt of travel.
             .gesture(
-                DragGesture(minimumDistance: 4)
+                DragGesture(minimumDistance: 0)
                     .onChanged { v in
                         guard !cam.isBusy else { return }
+                        // Below the tap threshold this may still turn out to be
+                        // a tap, so do not move the value yet.
+                        guard hypot(v.translation.width, v.translation.height) > 4 else { return }
                         let t = 1 - (v.location.y - knob / 2) / travel
                         value.wrappedValue = min(1, max(0, Double(t)))
                         // Dragging leaves Auto, as the previous slider did --
                         // otherwise the handle has to be tapped first and the
                         // drag silently does nothing.
                         if !active { goManual() }
+                    }
+                    .onEnded { v in
+                        guard !cam.isBusy else { return }
+                        if hypot(v.translation.width, v.translation.height) <= 4 {
+                            toggle()
+                        }
                     }
             )
         }
@@ -234,6 +239,7 @@ struct CameraView: View {
                 // A stack of frames collapsing into one output is the closest
                 // symbol to "merge several files into a larger image".
                 roundIconButton("square.stack.3d.down.right.fill") { showImporter = true }
+                formatButton
                 Spacer()
             }
 
@@ -423,6 +429,26 @@ struct CameraView: View {
 
     /// Small circular control on a translucent disc, used for the two utility
     /// buttons that flank the shutter row.
+    /// DNG/JPG selector, sat alongside the other capture controls above the
+    /// frame count. Two states, so it toggles rather than opening a picker.
+    private var formatButton: some View {
+        Button {
+            cam.exportFormat = (cam.exportFormat == .dng) ? .jpg : .dng
+        } label: {
+            ZStack {
+                Capsule()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 58, height: 42)
+                Text(cam.exportFormat.label)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white)
+            }
+        }
+        .disabled(cam.isBusy)
+        .accessibilityLabel("Output format")
+        .accessibilityValue(cam.exportFormat.label)
+    }
+
     private func roundIconButton(_ symbol: String,
                                  action: @escaping () -> Void) -> some View {
         Button(action: action) {
