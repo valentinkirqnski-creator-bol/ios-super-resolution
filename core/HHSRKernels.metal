@@ -1667,7 +1667,19 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         : (d_sq_ > 0.f ? INFINITY : 0.f);
     bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
     bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u && residual_high) {
+    // Wronski et al., High Frequency Artifacts Removal: reject where there is
+    // variance loss under low-pass filtering AND large local variation in the
+    // alignment vector field. Two conditions, not three.
+    //
+    // This previously also required residual_high (d^2/sigma^2 above the motion
+    // residual threshold), which defeats the purpose. The aperture problem is
+    // precisely the case where a repetitive pattern locks onto the wrong period
+    // and still matches itself well, so the residual stays LOW. Demanding a high
+    // residual meant the test could only fire where alignment was both wrong and
+    // looked wrong -- which ordinary robustness already rejects. residual_high
+    // stays on the motion-edge branch below, where a genuine moving edge does
+    // produce a large residual and the test belongs.
+    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
         float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
         if (inbound) {
             hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
