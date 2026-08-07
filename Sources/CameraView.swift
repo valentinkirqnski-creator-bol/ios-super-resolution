@@ -479,13 +479,6 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.hf_variance_loss_threshold, in: 0.50...0.99, step: 0.01)
 
                         HStack {
-                            Text("Flow Variance")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_flow_variance_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.hf_flow_variance_threshold, in: 0.05...2.00, step: 0.05)
-
-                        HStack {
                             Text("Min Texture SNR")
                             Spacer()
                             Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))

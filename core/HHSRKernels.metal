@@ -1610,7 +1610,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* flow [[buffer(10)]],
                           device const float* comp_hf_loss [[buffer(2)]],
                           device const float* ref_hf_loss [[buffer(5)]],
-                          device const uint* flow_unstable [[buffer(12)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
@@ -1670,8 +1669,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
     // High Frequency Artifacts Removal, Wronski et al. Two conditions, both
     // required: the patch is almost entirely high-frequency (most of its local
-    // variance is destroyed by low-pass filtering), and the flow field is
-    // locally unstable (neighbouring tiles disagree).
+    // variance is destroyed by low-pass filtering), and the alignment vector
+    // field varies a lot locally -- "the same as used in the motion prior",
+    // i.e. the r_Mt test, exactly as the paper specifies.
     //
     // Neither alone is sufficient. Hair and fur are high-frequency but track
     // cleanly, so the flow test spares them. A flat noisy wall has unstable
@@ -1683,7 +1683,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // problem is exactly the case where a repetitive pattern locks onto the
     // wrong period and still matches itself well, so the residual stays low.
     bool hf_reject = false;
-    if (p.hf_enabled != 0u && flow_unstable[pidx] != 0u) {
+    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
         float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
         if (inbound) {
             hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);

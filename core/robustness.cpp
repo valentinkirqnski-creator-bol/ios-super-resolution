@@ -412,33 +412,6 @@ static Image high_frequency_loss_map_adaptive(const Image& means, const Image& v
     return loss;
 }
 
-static std::vector<uint32_t> flow_unstable_map(const FlowField& flow, f32 threshold) {
-    std::vector<uint32_t> out((size_t)flow.ny * (size_t)flow.nx, 0u);
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return out;
-    for (int ty = 0; ty < flow.ny; ++ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            f32 sx = 0.f, sy = 0.f; int cnt = 0;
-            for (int i = -1; i <= 1; ++i) for (int j = -1; j <= 1; ++j) {
-                const int yy = ty + i, xx = tx + j;
-                if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                sx += flow.dx(yy, xx); sy += flow.dy(yy, xx); ++cnt;
-            }
-            if (cnt < 2) continue;
-            const f32 mx = sx / (f32)cnt, my = sy / (f32)cnt;
-            f32 acc = 0.f;
-            for (int i = -1; i <= 1; ++i) for (int j = -1; j <= 1; ++j) {
-                const int yy = ty + i, xx = tx + j;
-                if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                const f32 dx = flow.dx(yy, xx) - mx, dy = flow.dy(yy, xx) - my;
-                acc += dx * dx + dy * dy;
-            }
-            out[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
-                (acc / (f32)cnt > threshold) ? 1u : 0u;
-        }
-    }
-    return out;
-}
-
 static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     means = Image(guide.h, guide.w, guide.c);
     vars  = Image(guide.h, guide.w, guide.c);
@@ -780,19 +753,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         local_stats_3x3(lp_guide, lp_means, lp_vars);
         comp_hf_loss = high_frequency_loss_map_adaptive(comp_means, comp_vars, lp_vars, cfg);
     }
-    // Instability drives only the high-frequency test; the motion prior keeps
-    // its own max-spread measure so Eq. 5 is unchanged.
-    const std::vector<uint32_t> flow_unstable =
-        cfg.hf_artifact_removal_enabled
-            ? flow_unstable_map(flow, cfg.hf_flow_variance_threshold)
-            : std::vector<uint32_t>();
-
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   cfg.motion_edge_rejection_enabled
+                                   (cfg.motion_edge_rejection_enabled ||
+                                    cfg.hf_artifact_removal_enabled)
                                        ? &motion_irregular
                                        : nullptr);
-    if (!cfg.motion_edge_rejection_enabled)
+    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
         motion_irregular.assign(S.size(), 0u);
 
     Image R(h, w, 1);
@@ -825,12 +792,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool residual_high =
                 std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
             // Both required: an almost-entirely-high-frequency patch, and a
-            // locally unstable flow field. Hair is high-frequency but tracks
-            // cleanly; a noisy flat wall has unstable flow but no real
-            // high-frequency signal.
+            // large local variation in the alignment vector field -- "the same
+            // as used in the motion prior", i.e. the r_Mt test. Hair is
+            // high-frequency but tracks cleanly; a noisy flat wall varies but
+            // has no real high-frequency signal.
             const bool hf_reject =
                 cfg.hf_artifact_removal_enabled &&
-                pidx < flow_unstable.size() && flow_unstable[pidx] != 0u &&
+                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
                 (
                     (!ref_stats.hf_loss.data.empty() &&
                      ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold) ||

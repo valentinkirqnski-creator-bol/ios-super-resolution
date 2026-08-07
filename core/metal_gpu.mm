@@ -1181,48 +1181,6 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     return true;
 }
 
-// Flow instability per tile: mean squared deviation of the flow vectors from
-// their own 3x3 neighbourhood mean, in pixels^2.
-//
-// Variance rather than the max-min spread used for the motion prior. Spread is
-// decided by a single extreme tile, so one bad vector condemns its neighbours;
-// a mean squared deviation weighs the whole neighbourhood. A smooth field like
-// (0.20, 0.21, 0.22) scores ~1e-4, while (0.2, 1.8, -0.6, 2.1) scores ~1.3.
-static std::vector<uint32_t> rob_flow_unstable(const FlowField& flow, f32 threshold) {
-    std::vector<uint32_t> out((size_t)flow.ny * (size_t)flow.nx, 0u);
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return out;
-    for (int ty = 0; ty < flow.ny; ++ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            f32 sx = 0.f, sy = 0.f;
-            int cnt = 0;
-            for (int i = -1; i <= 1; ++i) {
-                for (int j = -1; j <= 1; ++j) {
-                    const int yy = ty + i, xx = tx + j;
-                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                    sx += flow.dx(yy, xx);
-                    sy += flow.dy(yy, xx);
-                    ++cnt;
-                }
-            }
-            if (cnt < 2) continue;
-            const f32 mx = sx / (f32)cnt, my = sy / (f32)cnt;
-            f32 acc = 0.f;
-            for (int i = -1; i <= 1; ++i) {
-                for (int j = -1; j <= 1; ++j) {
-                    const int yy = ty + i, xx = tx + j;
-                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                    const f32 dx = flow.dx(yy, xx) - mx;
-                    const f32 dy = flow.dy(yy, xx) - my;
-                    acc += dx * dx + dy * dy;
-                }
-            }
-            out[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
-                (acc / (f32)cnt > threshold) ? 1u : 0u;
-        }
-    }
-    return out;
-}
-
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                       std::vector<uint32_t>* irregular_out = nullptr) {
     const f32 inf = std::numeric_limits<f32>::infinity();
@@ -1452,10 +1410,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                       cfg.motion_edge_rejection_enabled
+                                       (cfg.motion_edge_rejection_enabled ||
+                                        cfg.hf_artifact_removal_enabled)
                                            ? &motion_irregular
                                            : nullptr);
-    if (!cfg.motion_edge_rejection_enabled)
+    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
         motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1499,15 +1458,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
-    // Flow instability drives only the high-frequency test; the motion prior
-    // keeps its own max-spread measure so Eq. 5 is unchanged.
-    std::vector<uint32_t> flow_unstable =
-        cfg.hf_artifact_removal_enabled
-            ? rob_flow_unstable(flow, cfg.hf_flow_variance_threshold)
-            : std::vector<uint32_t>(S.size(), 0u);
-
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
-    id<MTLBuffer> b_unstable = buf(flow_unstable.data(), flow_unstable.size() * sizeof(uint32_t));
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_comp_hf = b_gvars;
@@ -1560,7 +1511,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_comp_hf offset:0 atIndex:2];
     [enc setBuffer:b_ref_hf offset:0 atIndex:5];
     [enc setBuffer:b_flow offset:0 atIndex:10];
-    [enc setBuffer:b_unstable offset:0 atIndex:12];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];

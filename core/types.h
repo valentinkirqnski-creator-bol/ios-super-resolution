@@ -125,7 +125,8 @@ struct Config {
     //
     //   1. the patch is almost entirely high-frequency: most of its local
     //      variance disappears under a low-pass filter, and
-    //   2. the flow field is locally unstable: neighbouring tiles disagree.
+    //   2. the alignment vector field varies a lot locally -- the same r_Mt
+    //      test that drives the motion prior, as the paper specifies.
     //
     // Both are needed. Hair and fur are high-frequency but track cleanly, so
     // condition 2 spares them. A flat noisy wall has unstable flow but no real
@@ -138,11 +139,6 @@ struct Config {
     // on typical content: flat wall ~0.04, face ~0.19, brick ~0.83,
     // checkerboard ~0.92.
     float hf_variance_loss_threshold = 0.75f;
-    // Mean squared deviation of the flow vectors from their neighbourhood mean,
-    // in pixels^2, over a 3x3 tile window. Variance rather than max-min spread:
-    // one outlying tile should not condemn its neighbours. 0.25 is an RMS
-    // deviation of 0.5px.
-    float hf_flow_variance_threshold = 0.25f;
     // The patch is skipped unless its signal variance exceeds this multiple of
     // the estimated sensor noise variance. This is what stops ISO 6400 noise
     // reading as high-frequency detail, and it scales with brightness through
