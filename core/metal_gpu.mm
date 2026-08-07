@@ -2301,12 +2301,21 @@ void metal_clear_ref_ica_cache() {
 
 bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
                                 const Config& cfg, std::vector<uint16_t>& row16) {
-    if (!metal_gpu_init()) return false;
     const int bh = num_band.h, Ws = num_band.w, nch = num_band.c;
     if (bh <= 0 || Ws <= 0 || nch < 1) return false;
     if (den_band.h != bh || den_band.w != Ws || den_band.c != nch) return false;
     const size_t n = (size_t)bh * (size_t)Ws * (size_t)nch;
     if (num_band.data.size() < n || den_band.data.size() < n) return false;
+    return metal_normalize_band_rgb16_ptr(num_band.data.data(), den_band.data.data(),
+                                          bh, Ws, nch, cfg, row16);
+}
+
+bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
+                                    int bh, int Ws, int nch,
+                                    const Config& cfg, std::vector<uint16_t>& row16) {
+    if (!metal_gpu_init()) return false;
+    if (!num_p || !den_p || bh <= 0 || Ws <= 0 || nch < 1) return false;
+    const size_t n = (size_t)bh * (size_t)Ws * (size_t)nch;
 
     row16.resize((size_t)bh * (size_t)Ws * 3u);
     auto& c = ctx();
@@ -2329,8 +2338,8 @@ bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
     p.m10 = m[3]; p.m11 = m[4]; p.m12 = m[5];
     p.m20 = m[6]; p.m21 = m[7]; p.m22 = m[8];
 
-    id<MTLBuffer> b_num = buf(num_band.data.data(), n * sizeof(float));
-    id<MTLBuffer> b_den = buf(den_band.data.data(), n * sizeof(float));
+    id<MTLBuffer> b_num = buf(num_p, n * sizeof(float));
+    id<MTLBuffer> b_den = buf(den_p, n * sizeof(float));
     id<MTLBuffer> b_out = buf(nullptr, row16.size() * sizeof(uint16_t));
     if (!b_num || !b_den || !b_out) return false;
 

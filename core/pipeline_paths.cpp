@@ -640,7 +640,7 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
 
 #if defined(__APPLE__)
     // Dense DNG band on GPU (1:1); sparse preview stays on CPU below.
-    const bool gpu_rgb = metal_normalize_band_rgb16(num_band, den_band, work, row16);
+    const bool gpu_rgb = metal_normalize_band_rgb16_ptr(nump, denp, bh, Ws, nch, work, row16);
 #else
     const bool gpu_rgb = false;
 #endif

@@ -67,6 +67,11 @@ void metal_clear_ref_ica_cache();
 
 // num/den → packed RGB16 (same math as encode_band_rows DNG path). Preview
 // sampling stays on the host. Returns false → caller uses CPU encode.
+// Pointer form, for the online merge: it holds one accumulator for the whole
+// output and offsets a row into it rather than materialising a band image.
+bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
+                                    int bh, int Ws, int nch,
+                                    const Config& cfg, std::vector<uint16_t>& row16);
 bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
                                 const Config& cfg, std::vector<uint16_t>& row16);
 

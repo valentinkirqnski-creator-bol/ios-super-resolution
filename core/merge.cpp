@@ -387,8 +387,6 @@ void merge_ref(const Image& ref_raw, const CovField& covs,
 
 void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
                          int c, AccumDiag& d) {
-    Image dummy;
-    (void)dummy;
     const int nch = std::min(3, c);
     for (size_t p = 0; p < n; ++p) {
         ++d.pixels;
