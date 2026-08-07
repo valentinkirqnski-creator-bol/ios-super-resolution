@@ -737,6 +737,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const double t_burst = prof_now_ms();
 
     Config work = cfg;
+    // Drives the reference-kernel enlargement; not a tuning knob.
+    work.burst_frame_count = frame_count;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
     const bool debug = debug_dumps_enabled();
     std::ostringstream debug_summary;

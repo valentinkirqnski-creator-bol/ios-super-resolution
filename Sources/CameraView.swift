@@ -920,12 +920,9 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
-                        HStack {
-                            Text("Max Frame Count")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.acc_rob_max_frame_count))
-                        }
-                        Slider(value: $cam.tuningParams.acc_rob_max_frame_count, in: 1.0...10.0)
+                        Text("Kernel enlargement is derived from how many frames actually merged at each pixel, relative to the burst length, so there is no threshold to set. Max Multiplier only caps it.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
                     }
                 }
 

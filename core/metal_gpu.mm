@@ -2373,7 +2373,7 @@ struct MergeRefParamsCPU {
     uint32_t nch, bayer, iso, robustness_denoise, rad_max;
     float scale;
     float max_multiplier;
-    float max_frame_count;
+    float burst_frames;
     uint32_t cfa00, cfa01, cfa10, cfa11;
     uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0;
 };
@@ -2988,7 +2988,7 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     p.rad_max = (uint32_t)std::max(0, (int)cfg.acc_rob_rad_max);
     p.scale = cfg.scale;
     p.max_multiplier = cfg.acc_rob_max_multiplier;
-    p.max_frame_count = cfg.acc_rob_max_frame_count;
+    p.burst_frames = (float)cfg.burst_frame_count;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];

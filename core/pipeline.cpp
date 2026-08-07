@@ -59,6 +59,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                     const ProgressFn& progress) {
     if (burst.empty()) return Image();
     Config work = cfg;
+    // Drives the reference-kernel enlargement; not a tuning knob.
+    work.burst_frame_count = (int)burst.size();
     tune_config_snr(burst[0], work);
     const Image& ref = burst[0];
     int n = (int)burst.size();
@@ -137,6 +139,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                            int maxPreviewDim) {
     if (burst.empty()) return Image();
     Config work = cfg;
+    // Drives the reference-kernel enlargement; not a tuning knob.
+    work.burst_frame_count = (int)burst.size();
     tune_config_snr(burst[0], work);
     const Image& ref = burst[0];
     int n = (int)burst.size();

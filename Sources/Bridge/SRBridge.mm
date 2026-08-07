@@ -365,8 +365,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
     if (tuning[@"acc_rob_max_multiplier"])
         cfg.acc_rob_max_multiplier = tuning[@"acc_rob_max_multiplier"].floatValue;
-    if (tuning[@"acc_rob_max_frame_count"])
-        cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
 }
 
 static std::string NSStringToStd(id value) {

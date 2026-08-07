@@ -813,7 +813,7 @@ struct MergeRefParams {
     uint rad_max;
     float scale;
     float max_multiplier;
-    float max_frame_count;
+    float burst_frames;
     uint cfa00;
     uint cfa01;
     uint cfa10;
@@ -1133,9 +1133,25 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
         int ay = min(max(lround_away(acc_y), 0), int(p.acc_h) - 1);
         int ax = min(max(lround_away(acc_x), 0), int(p.acc_w) - 1);
         local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
-        additional_denoise_power =
-            (local_acc_r <= p.max_frame_count) ? p.max_multiplier : 1.f;
-        rad = (local_acc_r <= p.max_frame_count) ? int(p.rad_max) : 1;
+        // Must match denoise_power_merge / denoise_range_merge in merge.cpp.
+        // m = N / (r_acc + 1): kernel area scales as m, merging k frames cuts
+        // noise variance by 1/k, and the reference always contributes so the
+        // effective count here is r_acc + 1. No threshold, and it normalises
+        // itself to burst length.
+        if (p.burst_frames > 1.f) {
+            float effective = max(1.f, local_acc_r + 1.f);
+            float cap = max(1.f, p.max_multiplier);
+            additional_denoise_power = min(max(p.burst_frames / effective, 1.f), cap);
+        } else {
+            additional_denoise_power = 1.f;
+        }
+        // sigma grows as sqrt(m), so the window must too or the widened kernel
+        // is truncated. Floored under two contributing frames: chroma is a
+        // sampling problem, not a noise one, and a 3x3 Bayer window can hold a
+        // single red sample however short the burst was.
+        int r = int(round(sqrt(max(1.f, additional_denoise_power))));
+        if (local_acc_r + 1.f < 2.f) r = max(r, int(p.rad_max));
+        rad = min(max(r, 1), max(1, int(p.rad_max)));
     }
 
     float ixx = 0.f, ixy = 0.f, iyy = 0.f;
@@ -1179,17 +1195,13 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
         }
     }
 
-    bool overwrite = p.robustness_denoise && (local_acc_r < p.max_frame_count);
+    // Always accumulate; see the matching note in accumulate_ref. The
+    // reference's overwrite is a no-op at both ends and only discards real
+    // signal in between, which a continuous enlargement must not do.
     uint base = (local_i * p.Ws + hr_j) * p.nch;
-    if (overwrite) {
-        if (p.nch >= 1) { num[base + 0] = val0; den[base + 0] = acc0; }
-        if (p.nch >= 2) { num[base + 1] = val1; den[base + 1] = acc1; }
-        if (p.nch >= 3) { num[base + 2] = val2; den[base + 2] = acc2; }
-    } else {
-        if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
-        if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
-        if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
-    }
+    if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
+    if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
+    if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
 }
 
 // =============================================================================

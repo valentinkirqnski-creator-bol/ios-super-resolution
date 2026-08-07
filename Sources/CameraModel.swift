@@ -112,7 +112,6 @@ struct TuningParams: Equatable, Codable {
     var accumulated_robustness_denoiser_enabled: Bool = true
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 8.0
-    var acc_rob_max_frame_count: Float = 8.0
 
     /// App defaults — also applied by the settings Reset button.
     static let appDefaults = TuningParams()
@@ -134,7 +133,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_max_shift
         case robustness_save_mask
         case accumulated_robustness_denoiser_enabled
-        case acc_rob_rad_max, acc_rob_max_multiplier, acc_rob_max_frame_count
+        case acc_rob_rad_max, acc_rob_max_multiplier
     }
 
     init() {}
@@ -169,7 +168,6 @@ struct TuningParams: Equatable, Codable {
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
-        acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
     }
 }
 
@@ -1752,8 +1750,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
-            "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier),
-            "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count)
+            "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)
         ]
 
         var preview: UIImage?

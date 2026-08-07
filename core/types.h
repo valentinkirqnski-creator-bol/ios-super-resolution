@@ -158,7 +158,11 @@ struct Config {
     bool  accumulated_robustness_denoiser_enabled = true;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
-    float acc_rob_max_frame_count = 8.0f;
+    // Total frames in the burst, filled in by the pipeline rather than tuned.
+    // The reference-kernel enlargement is derived from this and the accumulated
+    // robustness, so there is no threshold to set. 0 means unknown, which
+    // disables the enlargement rather than guessing.
+    int   burst_frame_count = 0;
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
