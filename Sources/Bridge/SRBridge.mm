@@ -362,6 +362,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.accumulated_robustness_denoiser_enabled =
             tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
     }
+    if (tuning[@"acc_rob_adaptive"])
+        cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
+    if (tuning[@"acc_rob_max_frame_count"])
+        cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
     if (tuning[@"acc_rob_max_multiplier"])
         cfg.acc_rob_max_multiplier = tuning[@"acc_rob_max_multiplier"].floatValue;

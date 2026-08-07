@@ -31,6 +31,17 @@ namespace {
 // threshold, 1 above -- which is a simplification of the same idea. A step also
 // puts a visible seam between enlarged and un-enlarged regions, which this
 // avoids.
+// Reference-implementation behaviour, kept for acc_rob_adaptive == false: full
+// enlargement below a frame-count threshold and none above, with the
+// accumulator overwritten below it.
+static inline f32 denoise_power_step(f32 r_acc, f32 power_max, f32 max_frame_count) {
+    return (r_acc <= max_frame_count) ? power_max : 1.f;
+}
+
+static inline int denoise_range_step(f32 r_acc, int rad_max, f32 max_frame_count) {
+    return (r_acc <= max_frame_count) ? rad_max : 1;
+}
+
 static inline f32 denoise_power_merge(f32 r_acc, f32 power_max, f32 burst_frames) {
     if (!(burst_frames > 1.f)) return 1.f;
     const f32 effective = std::max(1.f, r_acc + 1.f);
@@ -228,6 +239,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     const int rad_max = (int)cfg.acc_rob_rad_max;
     const f32 max_multiplier = cfg.acc_rob_max_multiplier;
     const f32 burst_frames = (f32)cfg.burst_frame_count;
+    const bool adaptive = cfg.acc_rob_adaptive;
+    const f32 max_frame_count = cfg.acc_rob_max_frame_count;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -251,9 +264,15 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 const int ay = std::min(std::max(cuda_round_to_int(acc_y), 0), acc_rob->h - 1);
                 const int ax = std::min(std::max(cuda_round_to_int(acc_x), 0), acc_rob->w - 1);
                 local_acc_r = acc_rob->at(ay, ax);
-                additional_denoise_power =
-                    denoise_power_merge(local_acc_r, max_multiplier, burst_frames);
-                rad = denoise_range_merge(additional_denoise_power, local_acc_r, rad_max);
+                if (adaptive) {
+                    additional_denoise_power =
+                        denoise_power_merge(local_acc_r, max_multiplier, burst_frames);
+                    rad = denoise_range_merge(additional_denoise_power, local_acc_r, rad_max);
+                } else {
+                    additional_denoise_power =
+                        denoise_power_step(local_acc_r, max_multiplier, max_frame_count);
+                    rad = denoise_range_step(local_acc_r, rad_max, max_frame_count);
+                }
             }
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
@@ -299,17 +318,24 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 }
             }
 
-            // Always accumulate. The reference implementation overwrites below
-            // its frame-count threshold, discarding whatever the comparison
-            // frames contributed. That is a no-op at both ends -- where nothing
-            // merged their weights are exactly zero (merge_comp_contrib returns
-            // early on r <= 0), and where everything merged the threshold is not
-            // met -- so it only ever bites in between, where it throws away real
-            // signal. With the enlargement now continuous, a hard data cliff in
-            // the middle of it would defeat the point.
+            // The reference overwrites below its threshold, discarding whatever
+            // the comparison frames contributed. That is a no-op at both ends --
+            // where nothing merged their weights are exactly zero, since
+            // merge_comp_contrib returns early on r <= 0, and where everything
+            // merged the threshold is not met -- so it only ever bites in
+            // between, where it throws away real signal. The adaptive path
+            // therefore always accumulates: a hard data cliff in the middle of a
+            // continuous enlargement would defeat the point.
+            const bool overwrite = !adaptive && robustness_denoise && acc_rob &&
+                                   local_acc_r < max_frame_count;
             for (int ch = 0; ch < nch; ++ch) {
-                num.at(local_i, hr_j, ch) += val[ch];
-                den.at(local_i, hr_j, ch) += acc[ch];
+                if (overwrite) {
+                    num.at(local_i, hr_j, ch) = val[ch];
+                    den.at(local_i, hr_j, ch) = acc[ch];
+                } else {
+                    num.at(local_i, hr_j, ch) += val[ch];
+                    den.at(local_i, hr_j, ch) += acc[ch];
+                }
             }
         }
     });
