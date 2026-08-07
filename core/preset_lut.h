@@ -1,16 +1,19 @@
 #pragma once
 // Fitted look-up table reproducing the user's fixed external preset.
 //
-// Fitted from one DNG/JPEG pair of the same burst (handheld_sr_x2.dng /
-// IMG_6039.JPG). Maps the merged linear RGB this pipeline produces straight to
-// final display sRGB, absorbing white balance, the colour matrix, gamma and the
-// preset's tone and colour grading in one step.
+// Maps the merged linear RGB this pipeline produces straight to final display
+// sRGB, absorbing white balance, the colour matrix, gamma and the preset's tone
+// and colour grading in one step.
 //
-// Accuracy against that pair: mean 6.06 LSB, RMS 8.23, p95 16.1, p99 26.7,
-// 97.2% of variance explained. It is deliberately NOT exact -- the preset was
-// measured to contain content-adaptive processing, so the residual in flat
-// regions stays near 6 LSB no matter how the fit is sliced. Smooth skies and
-// gradients are where that shows.
+// Accuracy on the reference pair, measured after the uint8 quantisation:
+// 14.0 LSB mean over the whole frame, 9.4 LSB over smooth regions, where
+// registration between the two handheld frames cannot bias the number. It is
+// deliberately NOT exact -- the preset was measured to contain content-adaptive
+// processing, so a colour-only mapping cannot reach zero.
+//
+// See preset_lut.cpp for how the table was repaired and what is still open;
+// the accuracy figures the previous version of this comment quoted were
+// measured on training pixels and understated the real error by 6x.
 //
 // Applies to the preview/JPEG only. The DNG is written from the unmodified
 // merge and must stay that way.
