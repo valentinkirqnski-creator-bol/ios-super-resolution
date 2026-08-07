@@ -897,6 +897,18 @@ struct CameraView: View {
                         .foregroundColor(.secondary)
                 }
 
+                Section(header: Text("Merge Architecture")) {
+                    Picker("Merge", selection: $cam.tuningParams.merge_arch) {
+                        Text("Auto").tag(Int32(0))
+                        Text("Banded").tag(Int32(1))
+                        Text("Online").tag(Int32(2))
+                    }
+                    .pickerStyle(.segmented)
+                    Text("Online merges each frame into one full-size accumulator and releases it immediately, so memory does not grow with the burst. Its accumulator scales with output pixels though, so at 2x it costs four times as much and banding wins until the burst is long. Auto compares the two and picks the smaller.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Fallback Denoiser")) {
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                     Text("When on, also saves a grayscale robustness mask to Photos after processing.")

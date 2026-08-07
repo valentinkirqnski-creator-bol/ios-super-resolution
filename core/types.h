@@ -158,6 +158,15 @@ struct Config {
     bool  accumulated_robustness_denoiser_enabled = true;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
+    // How the burst is merged. 0 = pick by working-set size, 1 = force banded
+    // (accumulate a band at a time, every frame resident across the merge),
+    // 2 = force online (one full-size accumulator, each frame released as soon
+    // as it is merged, so the working set is flat in frame count).
+    //
+    // Not simply "online is better": the online accumulator scales with OUTPUT
+    // pixels, so at 2x it costs four times what it does at 1x and loses to
+    // banding until the burst is long. 0 compares the two and picks.
+    int   merge_arch = 0;
     // Adapt the reference-kernel enlargement continuously to the accumulated
     // robustness, instead of the reference implementation's step. Off gives the
     // reference behaviour exactly, including the accumulator overwrite, which is

@@ -110,6 +110,11 @@ struct TuningParams: Equatable, Codable {
     var global_prealignment_max_shift: Int = 24
     var robustness_save_mask: Bool = true
     var accumulated_robustness_denoiser_enabled: Bool = true
+    /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
+    /// band, 2 = always merge online. Online keeps memory flat in frame count
+    /// but its accumulator scales with output pixels, so it is not always the
+    /// smaller of the two.
+    var merge_arch: Int32 = 0
     /// Adapt the enlargement to the merged frame count instead of the
     /// reference implementation's step. Off reproduces the reference exactly.
     var acc_rob_adaptive: Bool = true
@@ -138,6 +143,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_max_shift
         case robustness_save_mask
         case accumulated_robustness_denoiser_enabled
+        case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count
         case acc_rob_rad_max, acc_rob_max_multiplier
     }
@@ -172,6 +178,7 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
+        merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -1757,6 +1764,7 @@ final class CameraModel: NSObject, ObservableObject {
             "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
+            "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),

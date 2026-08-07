@@ -2428,6 +2428,12 @@ static MergeAccSlot g_merge_acc[2];
 static int g_merge_write_slot = 0;
 static bool g_merge_need_zero = false;
 static bool g_merge_single_slot = false;
+// Online merge: one accumulator that outlives its command buffer, so each frame
+// can be committed and its GPU inputs released instead of every frame staying
+// resident until the last band. Banded mode ties "new command buffer" to "zero
+// the accumulator"; online has to separate the two.
+static bool g_merge_online = false;
+static bool g_merge_online_zeroed = false;
 static MergeInflight g_merge_inflight;
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
@@ -2746,7 +2752,17 @@ static bool ensure_acc_buffers(size_t nelem, bool start_band) {
     if (bytes == 0) return false;
     auto& c = ctx();
     if (start_band) {
-        if (g_merge_single_slot) {
+        if (g_merge_online) {
+            // Same slot for the whole burst, zeroed only on the first open.
+            // No wait here: the caller flushes explicitly after each frame, and
+            // waiting through metal_merge_wait_inflight_impl would read the
+            // whole accumulator back once per frame.
+            g_merge_write_slot = 0;
+            if (!g_merge_online_zeroed) {
+                g_merge_need_zero = true;
+                g_merge_online_zeroed = true;
+            }
+        } else if (g_merge_single_slot) {
             // One slot only: always wait previous before reusing (saves ~2× GPU RAM).
             if (g_merge_inflight.cmd) {
                 if (!metal_merge_wait_inflight_impl()) return false;
@@ -2809,6 +2825,57 @@ bool metal_merge_has_frame(int frame_id) {
 
 bool metal_merge_wait_inflight() {
     return metal_merge_wait_inflight_impl();
+}
+
+void metal_merge_release_frame(int frame_id) {
+    // acquire_frame_gpu caches uploads by frame id so every band can reuse
+    // them. Online uses each frame exactly once, so without this the cache
+    // would keep growing and the working set would still scale with the burst,
+    // which is the whole thing online mode exists to avoid.
+    for (size_t i = 0; i < g_merge_frames.size(); ++i) {
+        if (g_merge_frames[i].key != frame_id) continue;
+        g_merge_frames.erase(g_merge_frames.begin() + (long)i);
+        return;
+    }
+}
+
+void metal_merge_begin_online() {
+    // Resolve anything banded still in flight before the accumulator changes
+    // meaning, or its readback would land in a band image that has gone.
+    (void)metal_merge_wait_inflight_impl();
+    merge_band_cmd_reset();
+    g_merge_online = true;
+    g_merge_online_zeroed = false;
+    g_merge_write_slot = 0;
+    g_merge_need_zero = false;
+}
+
+void metal_merge_end_online() {
+    g_merge_online = false;
+    g_merge_online_zeroed = false;
+}
+
+bool metal_merge_flush_online() {
+    if (!g_merge_online) return false;
+    if (!g_merge_band_cmd) return true;
+    if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
+    merge_enc_close();
+    prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
+    id<MTLCommandBuffer> cmd = g_merge_band_cmd;
+    [cmd commit];
+    // Wait rather than pipeline: the point of committing per frame is to free
+    // that frame's GPU buffers, which cannot happen while its work is queued.
+    [cmd waitUntilCompleted];
+    const bool ok = (cmd.status == MTLCommandBufferStatusCompleted);
+    merge_band_cmd_reset();
+    return ok;
+}
+
+bool metal_merge_finish_online(Image& num, Image& den) {
+    if (!g_merge_online) return false;
+    if (!metal_merge_flush_online()) return false;
+    if (!g_merge_online_zeroed) return false;   // nothing ever accumulated
+    return readback_slot(0, num, den);
 }
 
 void metal_merge_set_single_acc_slot(bool enabled) {
@@ -3012,6 +3079,11 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     [enc setBytes:&p length:sizeof(p) atIndex:5];
     dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
     merge_enc_close();
+
+    // Online: the reference is just the last contribution to a long-lived
+    // accumulator, so leave the command buffer for metal_merge_finish_online to
+    // commit and read back exactly once.
+    if (g_merge_online) return true;
 
     // One CB per band, covering every comp dispatch + the ref dispatch.
     prof_tag_gpu(g_merge_band_cmd, "merge:band-cb");

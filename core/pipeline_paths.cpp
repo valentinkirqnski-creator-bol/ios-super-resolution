@@ -619,9 +619,9 @@ static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
     }
 }
 
-static void encode_band_rows(const Image& num_band, const Image& den_band, int y0, int bh,
-                             const Config& work, int nch, Image& preview, float pscale,
-                             int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
+static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int bh,
+                                 const Config& work, int nch, Image& preview, float pscale,
+                                 int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
     // Same num/den → RGB16 math as before; pointer loops + sparse preview only.
     auto to_srgb = [](f32 v) {
         v = clampf(v, 0.f, 1.f);
@@ -630,8 +630,6 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
     const int x_step = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
     // Preview is UI-only; sample a bit more sparsely (DNG pixels unchanged).
     const int y_step = std::max(1, x_step);
-    const f32* nump = num_band.data.data();
-    const f32* denp = den_band.data.data();
     const bool bake = work.bake_srgb && nch >= 3;
     const f32* m = work.cam_to_srgb;
     // Pre-whitened RAW already has WB baked in (Python utils_dng order).
@@ -724,6 +722,40 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
             }
         }
     });
+}
+
+// Banded callers hold a band-shaped image; the online caller holds the whole
+// accumulator and offsets a row into it.
+static void encode_band_rows(const Image& num_band, const Image& den_band, int y0, int bh,
+                             const Config& work, int nch, Image& preview, float pscale,
+                             int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
+    encode_band_rows_ptr(num_band.data.data(), den_band.data.data(), y0, bh,
+                         work, nch, preview, pscale, ph, pw, Ws, row16);
+}
+
+// Working set of each merge architecture, so the cheaper one can be picked
+// rather than assumed. Banded keeps every frame's flow/cov/robustness (and the
+// Bayer too unless it is spilled) alive across the whole merge; online keeps
+// one accumulator sized to the output plus the single frame in flight.
+//
+// "Flat in frame count" is not automatically "smaller": the online accumulator
+// scales with OUTPUT pixels, so at 2x it costs 4x what it does at 1x and loses
+// to banding until the burst is long.
+static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
+                                bool spill, int band_rows, int raw_h, int raw_w) {
+    if (mode == 1) return false;              // forced banded
+    const size_t f = sizeof(f32);
+    const size_t acc_full = (size_t)Hs * Ws * nch * f * 2;   // num+den, whole output
+    if (mode == 2) return true;               // forced online
+    const size_t raw = (size_t)raw_h * raw_w * f;
+    const size_t covs = (size_t)(raw_h / 2) * (raw_w / 2) * 4 * f;
+    const size_t rob = (size_t)(raw_h / 2) * (raw_w / 2) * f;
+    const size_t per_frame = covs + rob + (spill ? 0 : raw);
+    const size_t banded = (size_t)band_rows * Ws * nch * f * 2 * 2   // double buffered
+                          + (size_t)std::max(0, n - 1) * per_frame;
+    // Online also holds the host copy the accumulator is read back into.
+    const size_t online = acc_full * 2 + (raw + covs + rob);
+    return online < banded;
 }
 
 } // namespace
@@ -888,6 +920,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const int ref_h = ref.h, ref_w = ref.w;
     const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+    // Output dimensions are known as soon as the reference is, and the online
+    // merge needs its accumulator before the first frame is analyzed.
+    const int out_h = (int)std::lround(work.scale * (f32)ref_h);
+    const int out_w = (int)std::lround(work.scale * (f32)ref_w);
+    const int out_nch = work.bayer_mode ? 3 : 1;
     const int nch = work.bayer_mode ? 3 : 1;
     std::vector<int> comp_indices;
     comp_indices.reserve((size_t)std::max(0, n - 1));
@@ -953,8 +990,36 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (cache_streamed_comp_raw)
         fs::create_directories(cache, ec);
 
-    cached.reserve((size_t)std::max(0, n - 1));
-    cached_meta.reserve((size_t)std::max(0, n - 1));
+    // Online merges each frame into one full-size accumulator and drops it
+    // immediately, so the working set stops growing with the burst. It is not
+    // free: that accumulator scales with OUTPUT pixels, so at 2x it costs four
+    // times what it does at 1x and loses to banding until the burst is long.
+    // choose_online_merge compares the two rather than assuming.
+    bool use_online = false;
+#if defined(__APPLE__)
+    use_online = choose_online_merge(work.merge_arch, out_h, out_w, out_nch, n,
+                                     cache_streamed_comp_raw, 480, ref_h, ref_w);
+#endif
+    Image num_full, den_full;
+    if (use_online) {
+        try {
+            num_full = Image(out_h, out_w, out_nch);
+            den_full = Image(out_h, out_w, out_nch);
+        } catch (...) {
+            use_online = false;                 // fall back rather than die
+            num_full = Image();
+            den_full = Image();
+        }
+    }
+#if defined(__APPLE__)
+    if (use_online) {
+        metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
+        metal_merge_begin_online();
+    }
+#endif
+
+    cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
+    cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
 
     // pref_k / pref_fut are declared above: the first comparison decode is
     // already in flight, launched before the reference analysis began.
@@ -1115,7 +1180,38 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_cov_summary(debug_summary, cov_name.c_str(), covs);
         }
         const double t_stash = prof_now_ms();
-        if (stream_comp_raw) {
+        if (use_online) {
+#if defined(__APPLE__)
+            // Same frames in the same order the banded path walks, so the
+            // robustness sum is float-for-float what it produces.
+            absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            bool merged = true;
+            if (rob_has_nonzero && comp.h > 0 && comp.w > 0) {
+                merge_comp_band(comp, flow, covs, rob, tile_size,
+                                num_full, den_full, 0, work, k);
+                // Commit and wait now: this frame's GPU buffers cannot be
+                // released while its work is still queued, and releasing them
+                // is the entire point of merging online.
+                merged = metal_merge_flush_online();
+            }
+            // Everything this frame owned goes here. Nothing is carried to the
+            // merge phase, which is what makes the working set flat in n.
+            comp = Image();
+            rob = Image();
+            covs = CovField();
+            flow = FlowField();
+            rob_rows_nonzero.clear();
+            rob_rows_nonzero.shrink_to_fit();
+            metal_merge_release_frame(k);
+            if (!merged) {
+                report("Error: GPU merge failed (memory?)", 1.f);
+                metal_merge_end_online();
+                if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+                return Image();
+            }
+            n_comp_ok++;
+#endif
+        } else if (stream_comp_raw) {
             // Keep flow/R/cov in RAM. For DNG-file input, spill normalized Bayer
             // async; for direct RAW, reload the original uint16 frame later.
             // Grow-only L2/Alg.5 scratch stays until merge.
@@ -1352,6 +1448,40 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::vector<uint16_t> row16_async[2];
     row16_async[0].resize(row16.size());
     row16_async[1].resize(row16.size());
+    if (use_online) {
+        // The reference is the last contribution, and it needs the accumulated
+        // robustness, which only exists once every frame has been merged.
+        report("Merging output", 0.48f);
+        const double t_ref_online = prof_now_ms();
+        merge_ref_band(ref, ref_covs, num_full, den_full, 0, work, acc_rob_ptr);
+        const bool got = metal_merge_finish_online(num_full, den_full);
+        metal_merge_end_online();
+        prof_add_cpu("merge:online-ref+readback", prof_now_ms() - t_ref_online);
+        prof_mark_memory("merge:online");
+        if (!got) {
+            report("Error: GPU merge failed (memory?)", 1.f);
+            writer.close();
+            if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+            return Image();
+        }
+        accumulate_diag(num_full, den_full, diag);
+        // Rows come out of one finished accumulator, so encoding is a plain
+        // top-to-bottom sweep. Nothing to overlap it with -- the GPU is idle by
+        // now -- which is the cost of not banding.
+        const size_t stride = (size_t)Ws * (size_t)nch;
+        for (int y0 = 0; y0 < Hs; y0 += band_rows) {
+            const int bh = std::min(band_rows, Hs - y0);
+            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
+                row16.resize((size_t)bh * (size_t)Ws * 3u);
+            encode_band_rows_ptr(num_full.data.data() + (size_t)y0 * stride,
+                                 den_full.data.data() + (size_t)y0 * stride,
+                                 y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
+            writer.write_rows(row16.data(), bh);
+            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
+        }
+        num_full = Image();
+        den_full = Image();
+    } else {
     int cur = 0;
     bool have_ready = false;
     int ready = 0, ready_y0 = 0, ready_bh = 0;
@@ -1482,6 +1612,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         report("Merging output", 0.48f + 0.50f * (float)(ready_y0 + ready_bh) / Hs);
     }
     metal_merge_set_single_acc_slot(false);
+    }   // else (banded)
 #else
     Image num_band, den_band;
     report("Merging output", 0.48f);

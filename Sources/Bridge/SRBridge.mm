@@ -362,6 +362,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.accumulated_robustness_denoiser_enabled =
             tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
     }
+    if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
     if (tuning[@"acc_rob_adaptive"])
         cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])

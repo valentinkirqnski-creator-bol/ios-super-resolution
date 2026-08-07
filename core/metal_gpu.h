@@ -130,4 +130,19 @@ void metal_merge_set_single_acc_slot(bool enabled);
 // to wait + readback the latest band before using its num/den. No-op if idle.
 bool metal_merge_wait_inflight();
 
+// Online merge. One accumulator sized to the whole output, persisting across
+// command buffers, so a frame can be merged and released instead of staying
+// resident until the last band. Working set stops growing with frame count.
+//
+// begin_online -> (merge_comp_band + flush_online) per frame -> merge_ref_band
+// -> finish_online -> end_online. flush_online waits, because the point of
+// committing per frame is to let that frame's GPU buffers go.
+// Drop one frame's cached GPU upload. Online merges a frame once, so its
+// buffers are dead the moment its command buffer completes.
+void metal_merge_release_frame(int frame_id);
+void metal_merge_begin_online();
+void metal_merge_end_online();
+bool metal_merge_flush_online();
+bool metal_merge_finish_online(Image& num, Image& den);
+
 } // namespace hhsr
