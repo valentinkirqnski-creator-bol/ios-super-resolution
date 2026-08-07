@@ -912,7 +912,11 @@ struct CameraView: View {
                         Text("Online").tag(Int32(2))
                     }
                     .pickerStyle(.segmented)
-                    Text("Online merges each frame into one full-size accumulator and releases it immediately, so memory does not grow with the burst. Its accumulator scales with output pixels though, so at 2x it costs four times as much and banding wins until the burst is long. Auto compares the two and picks the smaller.")
+                    Text(cam.tuningParams.merge_arch == 2
+                         ? "Forced. Online is used whatever the burst length or the memory left, including where Auto would have refused it, so this can run the app out of memory. Use Auto unless you are measuring."
+                         : (cam.tuningParams.merge_arch == 1
+                            ? "Forced. One band at a time, every frame resident until the last one — so memory grows with the burst, but the accumulator stays small."
+                            : "Online keeps one accumulator for the whole output and drops each frame as it merges, so memory stops growing with the burst. That accumulator scales with output pixels, so it costs four times as much at 48MP as at 12MP. Auto projects both peaks, needs at least 6 frames, and falls back to banding if the accumulator would not fit."))
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
