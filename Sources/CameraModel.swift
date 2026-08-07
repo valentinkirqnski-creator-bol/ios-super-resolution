@@ -269,6 +269,37 @@ final class CameraModel: NSObject, ObservableObject {
     // Shutter: Auto (A), or manual via log-scaled slider (0…1). Default = AE on.
     @Published var shutterIsAuto = CameraModel.persistedShutterIsAuto()
     @Published var shutterSlider: Double = CameraModel.persistedShutterSlider()
+    /// Manual ISO. Auto by default; when off, isoSlider maps linearly onto the
+    /// active format's supported range, which varies per lens and per device.
+    @Published var isoIsAuto: Bool = !UserDefaults.standard.bool(forKey: "IsoManual") {
+        didSet {
+            UserDefaults.standard.set(!isoIsAuto, forKey: "IsoManual")
+            applyShutter()
+        }
+    }
+    @Published var isoSlider: Double = CameraModel.persistedIsoSlider() {
+        didSet {
+            UserDefaults.standard.set(isoSlider, forKey: "IsoSlider")
+            if !isoIsAuto { applyShutter() }
+        }
+    }
+    @Published var isoMin: Float = 30
+    @Published var isoMax: Float = 3000
+
+    private static func persistedIsoSlider() -> Double {
+        guard UserDefaults.standard.object(forKey: "IsoSlider") != nil else { return 0.0 }
+        return min(1.0, max(0.0, UserDefaults.standard.double(forKey: "IsoSlider")))
+    }
+
+    var isoLabel: String {
+        if isoIsAuto { return "Auto" }
+        return "\(Int(isoValue.rounded()))"
+    }
+
+    var isoValue: Float {
+        isoMin + Float(min(1.0, max(0.0, isoSlider))) * (isoMax - isoMin)
+    }
+
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
 
@@ -889,6 +920,8 @@ final class CameraModel: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.exposureMinSec = minS
             self.exposureMaxSec = maxS
+            self.isoMin = d.activeFormat.minISO
+            self.isoMax = d.activeFormat.maxISO
         }
     }
 
@@ -919,17 +952,23 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func applyShutterOnSessionQueue(isAuto: Bool, slider: Double, minSec: Double, maxSec: Double) {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
-        if isAuto {
+        if isAuto && isoIsAuto {
             if d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
         } else if d.isExposureModeSupported(.custom) {
             let minD = d.activeFormat.minExposureDuration
             let maxD = d.activeFormat.maxExposureDuration
-            var t = CMTimeMakeWithSeconds(durationFromSlider(slider, minSec: minSec, maxSec: maxSec), preferredTimescale: 1_000_000_000)
+            var t = isAuto
+                ? d.exposureDuration
+                : CMTimeMakeWithSeconds(durationFromSlider(slider, minSec: minSec, maxSec: maxSec),
+                                        preferredTimescale: 1_000_000_000)
             if CMTimeCompare(t, minD) < 0 { t = minD }
             if CMTimeCompare(t, maxD) > 0 { t = maxD }
-            let iso = min(max(d.activeFormat.minISO, d.iso), d.activeFormat.maxISO)
+            // Manual ISO when the user has taken it off auto; otherwise hold
+            // whatever the metering had settled on, as before.
+            let wanted = isoIsAuto ? d.iso : isoValue
+            let iso = min(max(d.activeFormat.minISO, wanted), d.activeFormat.maxISO)
             d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
         } else {
             DispatchQueue.main.async {
@@ -1312,23 +1351,40 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    /// DNGs chosen through the import picker, processed instead of a capture.
+    /// Capped at maxFrameCount; the pipeline holds every frame through the merge.
+    @Published var importedDNGs: [URL] = []
+
+    /// Process a set of DNGs the user picked. Always at 2x, since importing is
+    /// a deliberate act and the extra resolution is the reason to do it.
+    func processImportedDNGs(_ urls: [URL]) {
+        guard !isBusy else { return }
+        let dngs = urls.filter { $0.pathExtension.lowercased() == "dng" }
+        guard dngs.count >= 2 else {
+            finish(success: false, message: "Pick at least 2 DNG files")
+            return
+        }
+        importedDNGs = Array(dngs.prefix(Self.maxFrameCount))
+        outputResolutionMode = .super48mp
+        isBusy = true
+        isCapturing = false
+        isProcessing = true
+        progress = 0
+        statusText = "Processing \(importedDNGs.count) imported DNGs"
+        processingQueue.async { [weak self] in self?.processBurst() }
+    }
+
     private func processBurst() {
         let rawFrames = capturedRawFrames
         var paths = capturedDNGs.map { $0.path }
         var usingDocDNGs = false
 
-        // DEBUG: if Documents contains ≥2 DNGs, process those (sorted) instead of the camera burst.
-        let fm = FileManager.default
-        if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
-           let items = try? fm.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil) {
-            let docDNGs = items.filter { $0.pathExtension.lowercased() == "dng" }
-                .map { $0.path }
-                .sorted()
-            if docDNGs.count >= 2 {
-                paths = docDNGs
-                usingDocDNGs = true
-                print("DEBUG OVERRIDE: Using \(paths.count) DNGs from Documents (ref=paths[0])")
-            }
+        // DNGs the user picked explicitly. This used to scan Documents and
+        // silently take over whenever it found two or more, which meant a
+        // stray file changed what the shutter did.
+        if importedDNGs.count >= 2 {
+            paths = importedDNGs.map { $0.path }.sorted()
+            usingDocDNGs = true
         }
 
         let burstDir = self.burstDir
@@ -1607,6 +1663,10 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func finish(success: Bool, message: String) {
+        // The picker opened a security scope on each imported file; release it
+        // now that the pipeline is done reading them.
+        for url in importedDNGs { url.stopAccessingSecurityScopedResource() }
+        importedDNGs = []
         DispatchQueue.main.async {
             self.isBusy = false
             self.isCapturing = false

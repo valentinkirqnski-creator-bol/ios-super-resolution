@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct CameraView: View {
     @StateObject private var cam = CameraModel()
@@ -13,7 +14,8 @@ struct CameraView: View {
     @State private var didApplyLaunchShutter = false
     /// Manual capture controls (burst length, shutter) shown above the
     /// viewfinder. Collapsible so the preview can fill the screen.
-    @State private var showCaptureControls = true
+    @State private var showImporter = false
+    @State private var showGallery = false
 
     var body: some View {
         GeometryReader { geo in
@@ -31,16 +33,10 @@ struct CameraView: View {
                     permissionView
                 } else {
                     VStack(spacing: 0) {
-                        Group {
-                            if showCaptureControls {
-                                topStrip
-                            } else {
-                                Color.clear
-                            }
-                        }
-                        .padding(.top, geo.safeAreaInsets.top + 4)
-                        .frame(height: topBarH + geo.safeAreaInsets.top)
-                        .background(Color.black)
+                        topStrip
+                            .padding(.top, geo.safeAreaInsets.top + 4)
+                            .frame(height: topBarH + geo.safeAreaInsets.top)
+                            .background(Color.black)
 
                         viewfinder(width: vfWidth, height: vfHeight)
 
@@ -67,6 +63,17 @@ struct CameraView: View {
             cam.setPreviewSuspended(open)
         }
         .sheet(isPresented: $showViewer) { resultViewer }
+        .sheet(isPresented: $showGallery) { GalleryView() }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [.image],
+                      allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result {
+                // Picked files sit outside the sandbox and the pipeline reads
+                // them on a background queue, so the security scope must stay
+                // open past this closure; processImportedDNGs closes it.
+                cam.processImportedDNGs(urls.filter { $0.startAccessingSecurityScopedResource() })
+            }
+        }
         .sheet(isPresented: $showSettings) { tuningSettingsView }
     }
 
@@ -122,6 +129,16 @@ struct CameraView: View {
 
     private var topStrip: some View {
         VStack(spacing: 8) {
+            HStack(spacing: 14) {
+                roundIconButton("gearshape.fill") { showSettings = true }
+                // A stack of frames collapsing into one output is the closest
+                // symbol to "merge several files into a larger image".
+                roundIconButton("square.stack.3d.down.right.fill") { showImporter = true }
+                Spacer()
+            }
+
+            isoRow
+
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
@@ -133,6 +150,30 @@ struct CameraView: View {
             shutterSliderRow
         }
         .padding(.horizontal, 20)
+    }
+
+    private var isoRow: some View {
+        HStack(spacing: 10) {
+            Button { cam.isoIsAuto.toggle() } label: {
+                Text("ISO")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(cam.isoIsAuto ? .black : .white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(cam.isoIsAuto ? Color.yellow : Color.white.opacity(0.15))
+                    .clipShape(Capsule())
+            }
+            .disabled(cam.isBusy)
+
+            Slider(value: $cam.isoSlider, in: 0...1)
+                .disabled(cam.isoIsAuto || cam.isBusy)
+                .opacity(cam.isoIsAuto ? 0.4 : 1)
+
+            Text(cam.isoLabel)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundColor(.white.opacity(0.85))
+                .frame(minWidth: 44, alignment: .trailing)
+        }
     }
 
     private var shutterSliderRow: some View {
@@ -311,19 +352,6 @@ struct CameraView: View {
             }
             .padding(.horizontal, 28)
 
-            HStack {
-                roundIconButton("gearshape.fill") { showSettings = true }
-                Spacer()
-                roundIconButton(showCaptureControls
-                                ? "slider.horizontal.3"
-                                : "slider.horizontal.below.rectangle") {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        showCaptureControls.toggle()
-                    }
-                }
-            }
-            .padding(.horizontal, 28)
-            .padding(.top, 14)
         }
         .frame(maxHeight: .infinity, alignment: .top)
     }
@@ -393,7 +421,7 @@ struct CameraView: View {
     }
 
     private var galleryButton: some View {
-        Button(action: { if cam.lastThumbnail != nil && !cam.isBusy { showViewer = true } }) {
+        Button(action: { if !cam.isBusy { showGallery = true } }) {
             ZStack {
                 Group {
                     if let thumb = cam.lastThumbnail {

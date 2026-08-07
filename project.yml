@@ -70,6 +70,7 @@ targets:
         CFBundleDisplayName: Handheld SR
         NSCameraUsageDescription: "The camera is used to capture a short RAW burst for multi-frame super-resolution."
         NSPhotoLibraryAddUsageDescription: "Used to save the final super-resolution DNG or JPG to your photo library."
+        NSPhotoLibraryUsageDescription: "Used to show your captures in the in-app gallery."
         UILaunchScreen: {}
         UIFileSharingEnabled: YES
         LSSupportsOpeningDocumentsInPlace: YES
