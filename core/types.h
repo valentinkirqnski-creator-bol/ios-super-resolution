@@ -76,7 +76,11 @@ struct CFA {
 // Full pipeline configuration, mirroring configs/default.yaml.
 struct Config {
     float scale = 1.0f;
-    int   input_crop_factor = 1; // 2 = center-crop half-res before SR (3 MP -> 12 MP out).
+    // Centre-crop the Bayer input by this factor before SR, which is how zoom
+    // is realised: at 2.0 a 12 MP sensor frame becomes a 3 MP crop that SR takes
+    // back to 12 MP. Continuous rather than integral, so any magnification works
+    // on the same principle. 1.0 disables it.
+    float input_crop_zoom = 1.f;
     bool  bayer_mode = true;
     GreyMethod grey_method = GreyMethod::FFT;
 

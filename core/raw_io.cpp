@@ -362,10 +362,14 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
     });
     cfg.raw_prewhitened = true;
 
-    if (cfg.input_crop_factor > 1) {
-        const int factor = cfg.input_crop_factor;
-        int ch = (img.h / factor) & ~1;
-        int cw = (img.w / factor) & ~1;
+    if (cfg.input_crop_zoom > 1.f) {
+        const float z = cfg.input_crop_zoom;
+        // Every extent and offset is forced even. That is not tidiness: an odd
+        // origin shifts the Bayer phase, so the CFA under the crop would no
+        // longer be the CFA the pipeline is told it has. The epsilon keeps an
+        // exact ratio from landing just under the integer and losing two rows.
+        int ch = (int)((float)img.h / z + 1e-4f) & ~1;
+        int cw = (int)((float)img.w / z + 1e-4f) & ~1;
         int y0 = ((img.h - ch) / 2) & ~1;
         int x0 = ((img.w - cw) / 2) & ~1;
         if (ch > 0 && cw > 0) {

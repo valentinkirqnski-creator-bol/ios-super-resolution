@@ -56,12 +56,6 @@ enum LensZoomMode: Equatable {
         }
     }
 
-    var cropFactor: Int {
-        switch self {
-        case .wide2x: return 2
-        default: return 1
-        }
-    }
 }
 
 /// Algorithm zoom/output size for the 1x wide camera.
@@ -458,6 +452,9 @@ final class CameraModel: NSObject, ObservableObject {
     private var lastBackSelection: CameraSelection = .wide
 
     private var activeFrameCount = CameraModel.persistedFrameCount()
+    /// Session-queue copy of cropZoom, so capture never reads published state
+    /// from the wrong thread.
+    private var activeCropZoom: CGFloat = 1
     private var currentBurstTotal = CameraModel.persistedFrameCount()
     private var capturesRequested = 0
     private var capturesProcessed = 0
@@ -759,45 +756,8 @@ final class CameraModel: NSObject, ObservableObject {
         guard !isBusy else { return }
         let target = lensCameraSelection(for: mode)
         guard availableCameras.contains(target) else { return }
-
-        let from = displayedVirtualZoom
-        let to = virtualZoom(mode)
         lensZoomMode = mode
-        displayedVirtualZoom = to
-
-        if target == cameraSelection {
-            pendingLensSwitch = nil
-            // Same lens (1x <-> 2x): a pure scale change, nothing to swap.
-            withAnimation(.easeInOut(duration: Self.lensZoomDuration)) {
-                previewZoom = max(1, to / nativeZoom(target))
-            }
-            return
-        }
-
-        if to > from {
-            // Zooming in past this lens: ramp the current feed up to the new
-            // framing first, then swap the device underneath at matching scale.
-            // Switching first would hard-cut, since the wider lens cannot show
-            // the tighter framing before the swap.
-            withAnimation(.easeInOut(duration: Self.lensZoomDuration)) {
-                previewZoom = max(1, to / nativeZoom(cameraSelection))
-            }
-            pendingLensSwitch = (mode, target)
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.lensZoomDuration) {
-                // A newer tap during the ramp wins, as does a shutter press that
-                // already flushed this switch.
-                guard let pending = self.pendingLensSwitch,
-                      pending.mode == mode else { return }
-                self.pendingLensSwitch = nil
-                self.setCamera(target)
-            }
-        } else {
-            // Zooming out: the wider lens has to be live before it can show the
-            // wider field, so switch now and animate outward on arrival.
-            virtualZoomBeforeSwitch = from
-            pendingLensSwitch = nil
-            setCamera(target)
-        }
+        setZoom(virtualZoom(mode), animated: true)
     }
 
     func toggleFrontCamera() {
@@ -825,18 +785,16 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func syncLensModeForCameraSelection(_ selection: CameraSelection) {
-        switch selection {
-        case .ultraWide:
-            lensZoomMode = .ultraWide
-        case .telephoto:
-            lensZoomMode = .telephoto
-        case .wide:
-            if lensZoomMode == .ultraWide || lensZoomMode == .telephoto {
-                lensZoomMode = .wide1x
-            }
-        case .front:
-            break
+        if selection == .front {
+            zoomFactor = 1
+        } else if lensFor(zoomFactor) != selection {
+            // A switch this did not drive -- the front-camera toggle, or
+            // discovery picking a different default -- so adopt the new lens's
+            // own framing instead of keeping a zoom it cannot serve.
+            zoomFactor = nativeZoom(selection)
         }
+        syncLensModeForZoom()
+        publishCropZoom()
         settlePreviewZoom(for: selection)
     }
 
@@ -847,13 +805,11 @@ final class CameraModel: NSObject, ObservableObject {
     private func settlePreviewZoom(for selection: CameraSelection) {
         if selection == .front {
             virtualZoomBeforeSwitch = nil
-            displayedVirtualZoom = 1
             previewZoom = 1
             return
         }
         let native = nativeZoom(selection)
-        displayedVirtualZoom = virtualZoom(lensZoomMode)
-        let target = max(1, displayedVirtualZoom / native)
+        let target = max(1, zoomFactor / native)
 
         guard let before = virtualZoomBeforeSwitch else {
             // Zoom-in ramp already reached this framing, or a switch we did not
@@ -1247,9 +1203,6 @@ final class CameraModel: NSObject, ObservableObject {
     /// transitions animate is decided here rather than by SwiftUI heuristics.
     @Published private(set) var previewZoom: CGFloat = 1
 
-    /// Framing currently shown, in 1x-wide units, independent of which physical
-    /// lens is producing it. Lets a lens switch keep the framing continuous.
-    private var displayedVirtualZoom: CGFloat = 1
     /// Framing shown just before a pending device switch, for the zoom-out case
     /// where the new lens must start at the old framing and animate outward.
     private var virtualZoomBeforeSwitch: CGFloat?
@@ -1260,11 +1213,140 @@ final class CameraModel: NSObject, ObservableObject {
 
     static let lensZoomDuration: Double = 0.28
 
+    // MARK: - Continuous zoom
+
+    /// Magnification in 1x-wide-lens units. The single source of truth for both
+    /// the preview scale and the crop the pipeline applies, so the framing on
+    /// screen is the framing that gets saved at every magnification, not just at
+    /// the 1x and 2x stops.
+    @Published private(set) var zoomFactor: CGFloat = 1
+    /// The zoom slider is transient: a pinch summons it and it fades again.
+    @Published private(set) var zoomUIVisible = false
+    private var zoomHideWork: DispatchWorkItem?
+
+    /// Cropping harder than this off the active lens leaves too little sensor
+    /// for the merge to work with -- at 6x a 12 MP frame is a 0.34 MP crop, and
+    /// even doubled that is under 1.4 MP out.
+    static let maxCropZoom: CGFloat = 6
+
+    var minZoom: CGFloat {
+        availableCameras.contains(.ultraWide) ? ultraWideNativeZoom : 1
+    }
+
+    var maxZoom: CGFloat {
+        let widest: CGFloat = availableCameras.contains(.telephoto) ? telephotoNativeZoom : 1
+        return widest * Self.maxCropZoom
+    }
+
+    /// Whether the zoom is sitting on one of the lens buttons, within a
+    /// tolerance, so the chip can highlight without needing an exact float.
+    func isAtZoom(_ z: CGFloat) -> Bool { abs(zoomFactor - z) < 0.02 }
+
+    /// Longest lens whose own field of view still contains this magnification.
+    ///
+    /// Always the largest that fits, so the crop is inward from a lens that
+    /// really sees the framing rather than an upscale of a narrower one.
+    private func lensFor(_ z: CGFloat) -> CameraSelection {
+        if availableCameras.contains(.telephoto), z >= telephotoNativeZoom - 1e-4 {
+            return .telephoto
+        }
+        if availableCameras.contains(.wide), z >= 1 - 1e-4 { return .wide }
+        if availableCameras.contains(.ultraWide) { return .ultraWide }
+        return .wide
+    }
+
+    /// Crop the pipeline must apply on the active lens to realise `zoomFactor`.
+    /// 1 at each lens's native framing, rising to maxCropZoom before the next
+    /// lens takes over.
+    var cropZoom: CGFloat {
+        guard cameraSelection != .front else { return 1 }
+        return max(1, zoomFactor / nativeZoom(cameraSelection))
+    }
+
+    func setZoom(_ requested: CGFloat, animated: Bool = false) {
+        guard !isBusy else { return }
+        let z = min(maxZoom, max(minZoom, requested))
+        let from = zoomFactor
+        guard abs(z - from) > 1e-5 || lensFor(z) != cameraSelection else { return }
+        let target = lensFor(z)
+        zoomFactor = z
+        syncLensModeForZoom()
+        publishCropZoom()
+
+        if target == cameraSelection {
+            pendingLensSwitch = nil
+            let scale = max(1, z / nativeZoom(target))
+            if animated {
+                withAnimation(.easeInOut(duration: Self.lensZoomDuration)) { previewZoom = scale }
+            } else {
+                previewZoom = scale
+            }
+            return
+        }
+
+        if !animated {
+            // Pinching across a lens boundary. Keep tracking the fingers on the
+            // lens that is still live -- previewZoom is in units of the current
+            // lens, so the framing stays continuous -- and let settlePreviewZoom
+            // re-base it when the new one arrives.
+            previewZoom = max(1, z / nativeZoom(cameraSelection))
+            pendingLensSwitch = nil
+            virtualZoomBeforeSwitch = nil
+            setCamera(target)
+            return
+        }
+
+        if z > from {
+            // Zooming in past this lens: ramp the current feed up to the new
+            // framing first, then swap the device underneath at matching scale.
+            withAnimation(.easeInOut(duration: Self.lensZoomDuration)) {
+                previewZoom = max(1, z / nativeZoom(cameraSelection))
+            }
+            pendingLensSwitch = (lensZoomMode, target)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.lensZoomDuration) {
+                guard let pending = self.pendingLensSwitch, pending.selection == target else { return }
+                self.pendingLensSwitch = nil
+                self.setCamera(target)
+            }
+        } else {
+            virtualZoomBeforeSwitch = from
+            pendingLensSwitch = nil
+            setCamera(target)
+        }
+    }
+
+    /// Reveal the zoom slider and restart its fade-out.
+    func showZoomUI() {
+        zoomHideWork?.cancel()
+        if !zoomUIVisible {
+            withAnimation(.easeOut(duration: 0.18)) { zoomUIVisible = true }
+        }
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.easeInOut(duration: 0.35)) { self?.zoomUIVisible = false }
+        }
+        zoomHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
+    }
+
+    private func syncLensModeForZoom() {
+        if abs(zoomFactor - ultraWideNativeZoom) < 0.02 { lensZoomMode = .ultraWide }
+        else if abs(zoomFactor - 1) < 0.02 { lensZoomMode = .wide1x }
+        else if abs(zoomFactor - 2) < 0.02 { lensZoomMode = .wide2x }
+        else if abs(zoomFactor - telephotoNativeZoom) < 0.02 { lensZoomMode = .telephoto }
+    }
+
+    /// Hand the crop to the session queue, which is where capture reads it.
+    /// Reading the published value from that queue instead would be a race.
+    private func publishCropZoom() {
+        let c = cropZoom
+        sessionQueue.async { self.activeCropZoom = c }
+    }
+
     /// Native framing of each lens in 1x-wide units, measured from field of view
     /// at discovery. Defaults are the common iPhone values, replaced with real
     /// numbers once the devices are known.
-    private var ultraWideNativeZoom: CGFloat = 0.5
-    private var telephotoNativeZoom: CGFloat = 2
+    @Published private(set) var ultraWideNativeZoom: CGFloat = 0.5
+    @Published private(set) var telephotoNativeZoom: CGFloat = 2
 
     private func nativeZoom(_ selection: CameraSelection) -> CGFloat {
         switch selection {
@@ -1299,7 +1381,8 @@ final class CameraModel: NSObject, ObservableObject {
         playShutterSound()
 
         let total = frameCount
-        let lens = lensZoomMode.label
+        let lens = zoomFactor < 1 ? String(format: "%.1fx", Double(zoomFactor))
+                                  : String(format: "%gx", Double((zoomFactor * 10).rounded() / 10))
         isBusy = true
         isCapturing = true
         isProcessing = false
@@ -1620,9 +1703,12 @@ final class CameraModel: NSObject, ObservableObject {
             finish(success: false, message: "Not enough frames captured")
             return
         }
-        let useSelectedOutputScale = !usingDocDNGs &&
-            activeCameraSelection == .wide &&
-            lensZoomMode == .wide1x
+        // Documents debug DNGs: no centre-crop, to match the full-frame Python run.
+        let cropZoomForCapture: Float = usingDocDNGs ? 1 : Float(max(1, activeCropZoom))
+        // The output-resolution choice only means anything when nothing is
+        // cropped away; any zoom is realised as crop-then-2x, which is what the
+        // 2x lens button always did and is now what every magnification does.
+        let useSelectedOutputScale = !usingDocDNGs && cropZoomForCapture <= 1.0001
         let algorithmScale: Float = useSelectedOutputScale
             ? outputResolutionMode.algorithmScale
             : 2.0
@@ -1671,10 +1757,6 @@ final class CameraModel: NSObject, ObservableObject {
         ]
 
         var preview: UIImage?
-        // Documents debug DNGs: no center-crop (match Python full-frame run).
-        let cropFactor = (usingDocDNGs || activeCameraSelection != .wide)
-            ? Int32(1)
-            : Int32(lensZoomMode.cropFactor)
         let inputURLs = capturedDNGs
         let rawInputPaths = rawFrames.compactMap { $0["path"] as? String }
         let progressBlock: (String, Float) -> Void = { [weak self] stage, frac in
@@ -1693,7 +1775,7 @@ final class CameraModel: NSObject, ObservableObject {
                 rawFrames,
                 toPath: outURL.path,
                 scale: algorithmScale,
-                cropFactor: cropFactor,
+                cropZoom: cropZoomForCapture,
                 tuningParams: tuningDict,
                 progress: progressBlock,
                 previewImage: &preview
@@ -1703,7 +1785,7 @@ final class CameraModel: NSObject, ObservableObject {
                 paths,
                 toPath: outURL.path,
                 scale: algorithmScale,
-                cropFactor: cropFactor,
+                cropZoom: cropZoomForCapture,
                 tuningParams: tuningDict,
                 progress: progressBlock,
                 previewImage: &preview

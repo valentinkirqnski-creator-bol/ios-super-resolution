@@ -6,6 +6,7 @@ struct CameraView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showViewer = false
     @State private var showSettings = false
+    @State private var pinchBaseZoom: CGFloat?
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
     /// True only while the user is actively dragging the shutter slider.
@@ -137,13 +138,39 @@ struct CameraView: View {
             VStack {
                 Spacer()
                 if cam.cameraSelection != .front {
-                    backLensPicker
-                        .padding(.bottom, 14)
+                    // One or the other, never both: the slider is the zoomed-in
+                    // form of the same control, as on the reference UI.
+                    if cam.zoomUIVisible {
+                        zoomSlider(width: width)
+                            .padding(.bottom, 14)
+                            .transition(.opacity)
+                    } else {
+                        backLensPicker
+                            .padding(.bottom, 14)
+                            .transition(.opacity)
+                    }
                 }
             }
             .frame(width: width, height: height)
         }
         .frame(width: width, height: height)
+        // simultaneousGesture, not gesture: the preview carries its own UIKit
+        // tap recogniser for focus, and claiming the gesture outright here
+        // would stop taps reaching it.
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { v in
+                    guard !cam.isBusy else { return }
+                    let base = pinchBaseZoom ?? cam.zoomFactor
+                    if pinchBaseZoom == nil { pinchBaseZoom = base }
+                    cam.setZoom(base * v)
+                    cam.showZoomUI()
+                }
+                .onEnded { _ in
+                    pinchBaseZoom = nil
+                    cam.showZoomUI()
+                }
+        )
         .background(Color.black)
     }
 
@@ -286,26 +313,122 @@ struct CameraView: View {
         .disabled(!enabled)
     }
 
+    // MARK: - Zoom slider (over viewfinder)
+
+    /// Magnifications that get a labelled, emphasised tick: each physical lens,
+    /// plus 2x, plus whatever the crop limit works out to.
+    private var zoomStops: [CGFloat] {
+        var out: [CGFloat] = []
+        if cam.availableCameras.contains(.ultraWide) { out.append(cam.ultraWideNativeZoom) }
+        out.append(1)
+        out.append(2)
+        if cam.availableCameras.contains(.telephoto) { out.append(cam.telephotoNativeZoom) }
+        out.append(cam.maxZoom)
+        var uniq: [CGFloat] = []
+        for z in out.sorted() where z >= cam.minZoom - 1e-4 && z <= cam.maxZoom + 1e-4 {
+            if uniq.last.map({ abs($0 - z) > 0.05 }) ?? true { uniq.append(z) }
+        }
+        return uniq
+    }
+
+    private static func zoomLabel(_ z: CGFloat) -> String {
+        z < 1 ? String(format: "%.1f×", Double(z))
+              : (abs(z - z.rounded()) < 0.05 ? "\(Int(z.rounded()))×"
+                                             : String(format: "%.1f×", Double(z)))
+    }
+
+    /// Log scale, so each doubling takes the same distance along the track.
+    /// A linear one would bunch every useful magnification into the first
+    /// tenth of the bar.
+    private func zoomPosition(_ z: CGFloat) -> CGFloat {
+        let lo = log(max(0.01, cam.minZoom))
+        let hi = log(max(cam.minZoom * 1.01, cam.maxZoom))
+        return min(1, max(0, (log(max(0.01, z)) - lo) / (hi - lo)))
+    }
+
+    private func zoomAt(_ t: CGFloat) -> CGFloat {
+        let lo = log(max(0.01, cam.minZoom))
+        let hi = log(max(cam.minZoom * 1.01, cam.maxZoom))
+        return exp(lo + min(1, max(0, t)) * (hi - lo))
+    }
+
+    private func zoomSlider(width: CGFloat) -> some View {
+        let trackW = max(120, width - 96)
+        let ticks = 29
+        let accent = Color(red: 0.62, green: 0.85, blue: 0.88)
+        return VStack(spacing: 6) {
+            Text(Self.zoomLabel(cam.zoomFactor))
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundColor(.black)
+                .frame(width: 52, height: 34)
+                .background(Circle().fill(accent))
+                .offset(x: (zoomPosition(cam.zoomFactor) - 0.5) * trackW)
+
+            ZStack {
+                Capsule().fill(Color.black.opacity(0.55))
+                HStack(spacing: 0) {
+                    ForEach(0..<ticks, id: \.self) { i in
+                        let t = CGFloat(i) / CGFloat(ticks - 1)
+                        let onStop = zoomStops.contains {
+                            abs(zoomPosition($0) - t) < 0.5 / CGFloat(ticks - 1)
+                        }
+                        let near = abs(zoomPosition(cam.zoomFactor) - t) < 0.5 / CGFloat(ticks - 1)
+                        Circle()
+                            .fill(near ? accent
+                                       : (onStop ? accent.opacity(0.85) : Color.white.opacity(0.45)))
+                            .frame(width: near ? 7 : (onStop ? 5 : 3),
+                                   height: near ? 7 : (onStop ? 5 : 3))
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
+            .frame(width: trackW, height: 34)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        guard !cam.isBusy else { return }
+                        cam.setZoom(zoomAt(v.location.x / trackW))
+                        cam.showZoomUI()
+                    }
+                    .onEnded { _ in cam.showZoomUI() }
+            )
+
+            ZStack(alignment: .topLeading) {
+                ForEach(zoomStops, id: \.self) { z in
+                    Text(Self.zoomLabel(z))
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundColor(.white.opacity(0.7))
+                        .position(x: zoomPosition(z) * trackW, y: 6)
+                }
+            }
+            .frame(width: trackW, height: 12)
+        }
+        .frame(width: width)
+    }
+
     // MARK: - Lens picker (over viewfinder)
 
     private var backLensPicker: some View {
         VStack(spacing: 8) {
             HStack(spacing: 6) {
                 if cam.availableCameras.contains(.ultraWide) {
-                    lensChip(title: "0.5×", selected: cam.lensZoomMode == .ultraWide) {
+                    lensChip(title: "0.5×", selected: cam.isAtZoom(cam.ultraWideNativeZoom)) {
                         cam.setLensZoom(.ultraWide)
                     }
                 }
                 if cam.availableCameras.contains(.wide) {
-                    lensChip(title: "1×", selected: cam.lensZoomMode == .wide1x) {
+                    lensChip(title: "1×", selected: cam.isAtZoom(1)) {
                         cam.setLensZoom(.wide1x)
                     }
-                    lensChip(title: "2×", selected: cam.lensZoomMode == .wide2x) {
+                    lensChip(title: "2×", selected: cam.isAtZoom(2)) {
                         cam.setLensZoom(.wide2x)
                     }
                 }
                 if cam.availableCameras.contains(.telephoto) {
-                    lensChip(title: cam.telephotoLensLabel, selected: cam.lensZoomMode == .telephoto) {
+                    lensChip(title: cam.telephotoLensLabel,
+                             selected: cam.isAtZoom(cam.telephotoNativeZoom)) {
                         cam.setLensZoom(.telephoto)
                     }
                 }
@@ -752,12 +875,12 @@ struct CameraView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .disabled(cam.lensZoomMode != .wide1x)
-                    Text(cam.lensZoomMode == .wide1x
+                    .disabled(cam.cropZoom > 1.0001)
+                    Text(cam.cropZoom <= 1.0001
                          ? (cam.outputResolutionMode == .super48mp
                             ? "Super-resolves to 4x the pixel count. Slower and uses more memory."
                             : "Merges at sensor resolution. Faster.")
-                         : "Only available on the 1x lens; other lenses always merge at sensor resolution.")
+                         : "Only applies when nothing is cropped away. Any zoom is captured as a crop that super-resolution doubles, so it already merges at 2x.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 

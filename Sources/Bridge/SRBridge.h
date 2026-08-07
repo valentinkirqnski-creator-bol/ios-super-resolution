@@ -13,7 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
              toPath:(NSString *)outPath
               scale:(float)scale
-         cropFactor:(int)cropFactor
+           cropZoom:(float)cropZoom
        tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
            progress:(nullable void (^)(NSString *stage, float fraction))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut;
@@ -24,7 +24,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)processRawFrames:(NSArray<NSDictionary<NSString *, id> *> *)frames
                   toPath:(NSString *)outPath
                    scale:(float)scale
-              cropFactor:(int)cropFactor
+                cropZoom:(float)cropZoom
             tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
                 progress:(nullable void (^)(NSString *stage, float fraction))progress
              previewImage:(UIImage * _Nullable * _Nullable)previewOut;

@@ -605,10 +605,14 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     }
     cfg.raw_prewhitened = true;
 
-    if (cfg.input_crop_factor > 1) {
-        const int factor = cfg.input_crop_factor;
-        int ch = (img.h / factor) & ~1;
-        int cw = (img.w / factor) & ~1;
+    if (cfg.input_crop_zoom > 1.f) {
+        const float z = cfg.input_crop_zoom;
+        // Every extent and offset is forced even. Not tidiness: an odd origin
+        // shifts the Bayer phase, so the CFA under the crop would no longer be
+        // the CFA the pipeline is told it has. The epsilon stops an exact ratio
+        // landing just under the integer and losing two rows.
+        int ch = (int)((float)img.h / z + 1e-4f) & ~1;
+        int cw = (int)((float)img.w / z + 1e-4f) & ~1;
         int y0 = ((img.h - ch) / 2) & ~1;
         int x0 = ((img.w - cw) / 2) & ~1;
         if (ch > 0 && cw > 0) {
@@ -637,7 +641,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
              toPath:(NSString *)outPath
               scale:(float)scale
-         cropFactor:(int)cropFactor
+           cropZoom:(float)cropZoom
        tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
            progress:(void (^)(NSString *, float))progress
         previewImage:(UIImage * _Nullable * _Nullable)previewOut {
@@ -653,7 +657,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     Config cfg;
     cfg.scale = scale;
-    cfg.input_crop_factor = std::max(1, cropFactor);
+    cfg.input_crop_zoom = std::max(1.f, cropZoom);
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;   // linear camera RGB in DNG; WB applied only for in-app preview / JPEG
     cfg.use_gpu = false;
@@ -694,7 +698,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 + (BOOL)processRawFrames:(NSArray<NSDictionary<NSString *, id> *> *)frames
                   toPath:(NSString *)outPath
                    scale:(float)scale
-              cropFactor:(int)cropFactor
+                cropZoom:(float)cropZoom
             tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning
                 progress:(void (^)(NSString *, float))progress
              previewImage:(UIImage * _Nullable * _Nullable)previewOut {
@@ -705,7 +709,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     Config cfg;
     cfg.scale = scale;
-    cfg.input_crop_factor = std::max(1, cropFactor);
+    cfg.input_crop_zoom = std::max(1.f, cropZoom);
     cfg.bayer_mode = true;
     cfg.bake_srgb = false;
     cfg.use_gpu = false;
