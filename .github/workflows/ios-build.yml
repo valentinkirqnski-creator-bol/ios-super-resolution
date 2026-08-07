@@ -51,8 +51,8 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild \
-            -project HandheldSRCamera.xcodeproj \
-            -scheme HandheldSRCamera \
+            -project FuzeFrame.xcodeproj \
+            -scheme FuzeFrame \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
@@ -63,16 +63,16 @@ jobs:
 
       - name: Package unsigned .ipa
         run: |
-          APP_PATH="build/Build/Products/Release-iphoneos/HandheldSRCamera.app"
+          APP_PATH="build/Build/Products/Release-iphoneos/FuzeFrame.app"
           if [ ! -d "$APP_PATH" ]; then echo "App not found at $APP_PATH"; exit 1; fi
           rm -rf Payload && mkdir Payload
           cp -R "$APP_PATH" Payload/
-          zip -qr HandheldSRCamera-unsigned.ipa Payload
-          echo "Built HandheldSRCamera-unsigned.ipa"
+          zip -qr FuzeFrame-unsigned.ipa Payload
+          echo "Built FuzeFrame-unsigned.ipa"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HandheldSRCamera-unsigned-ipa
-          path: HandheldSRCamera-unsigned.ipa
+          name: FuzeFrame-unsigned-ipa
+          path: FuzeFrame-unsigned.ipa
           if-no-files-found: error

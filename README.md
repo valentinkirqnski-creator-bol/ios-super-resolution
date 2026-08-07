@@ -1,4 +1,4 @@
-# Handheld SR — iOS camera app
+# FuzeFrame — iOS camera app
 
 A minimal camera app that captures an **8-frame RAW (DNG) burst**, runs the
 Handheld Multi-Frame Super-Resolution pipeline (the *same* C++ core as the
@@ -47,7 +47,7 @@ Commit and push to GitHub.
 
 ### 2. Run the build
 On GitHub: **Actions → “iOS unsigned build” → Run workflow**. When it finishes,
-download **`HandheldSRCamera-unsigned-ipa`** from the run's **Artifacts**.
+download **`FuzeFrame-unsigned-ipa`** from the run's **Artifacts**.
 
 > This uses free GitHub-hosted macOS minutes (free for public repos; private
 > repos get a monthly free allotment). Alternatives that also work: **Codemagic**
@@ -72,7 +72,7 @@ cd ios
 brew install xcodegen
 bash scripts/fetch_libraw.sh
 xcodegen generate
-open HandheldSRCamera.xcodeproj   # then Run on your device
+open FuzeFrame.xcodeproj   # then Run on your device
 ```
 
 ## Project layout

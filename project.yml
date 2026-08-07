@@ -1,6 +1,6 @@
-# XcodeGen spec — generates HandheldSRCamera.xcodeproj from these sources.
+# XcodeGen spec — generates FuzeFrame.xcodeproj from these sources.
 # Run `xcodegen generate` (CI does this) after `scripts/fetch_libraw.sh`.
-name: HandheldSRCamera
+name: FuzeFrame
 options:
   bundleIdPrefix: com.handheldsr
   deploymentTarget:
@@ -29,7 +29,7 @@ settings:
     OTHER_CPLUSPLUSFLAGS: "-w"
 
 targets:
-  HandheldSRCamera:
+  FuzeFrame:
     type: application
     platform: iOS
     sources:
@@ -67,7 +67,7 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
-        CFBundleDisplayName: Handheld SR
+        CFBundleDisplayName: FuzeFrame
         NSCameraUsageDescription: "The camera is used to capture a short RAW burst for multi-frame super-resolution."
         NSPhotoLibraryAddUsageDescription: "Used to save the final super-resolution DNG or JPG to your photo library."
         NSPhotoLibraryUsageDescription: "Used to show your captures in the in-app gallery."
