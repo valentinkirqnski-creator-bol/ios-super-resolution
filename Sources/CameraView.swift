@@ -9,8 +9,6 @@ struct CameraView: View {
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
     /// True only while the user is actively dragging the shutter slider.
-    @State private var shutterSliderDragging = false
-    @State private var shutterSliderDragStart: Double?
     @State private var didApplyLaunchShutter = false
     /// Manual capture controls (burst length, shutter) shown above the
     /// viewfinder. Collapsible so the preview can fill the screen.
@@ -104,6 +102,30 @@ struct CameraView: View {
                     .allowsHitTesting(false)
             }
 
+            thirdsGrid
+                .frame(width: width, height: height)
+                .allowsHitTesting(false)
+
+            // Exposure controls sit on the frame edges rather than in a bar
+            // above it, so the preview keeps the full height.
+            HStack {
+                edgeSlider(value: $cam.isoSlider,
+                           symbol: "circle.lefthalf.filled",
+                           active: !cam.isoIsAuto,
+                           height: height * 0.42,
+                           toggle: { cam.isoIsAuto.toggle() },
+                           goManual: { cam.isoIsAuto = false })
+                Spacer()
+                edgeSlider(value: $cam.shutterSlider,
+                           symbol: "sun.max",
+                           active: !cam.shutterIsAuto,
+                           height: height * 0.42,
+                           toggle: { cam.setShutterAuto(!cam.shutterIsAuto) },
+                           goManual: { cam.applyManualShutterFromSlider() })
+            }
+            .padding(.horizontal, 14)
+            .frame(width: width, height: height)
+
             VStack {
                 Spacer()
                 if cam.cameraSelection != .front {
@@ -115,6 +137,70 @@ struct CameraView: View {
         }
         .frame(width: width, height: height)
         .background(Color.black)
+    }
+
+    private var thirdsGrid: some View {
+        GeometryReader { g in
+            Path { p in
+                for i in 1...2 {
+                    let x = g.size.width * CGFloat(i) / 3
+                    p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: g.size.height))
+                    let y = g.size.height * CGFloat(i) / 3
+                    p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: g.size.width, y: y))
+                }
+            }
+            .stroke(Color.white.opacity(0.28), lineWidth: 0.5)
+        }
+    }
+
+    /// Vertical track with a round icon handle that rides it. Tapping the
+    /// handle toggles the control between auto and manual; dragging anywhere on
+    /// the track sets the value, so the handle is not a small hit target.
+    private func edgeSlider(value: Binding<Double>,
+                            symbol: String,
+                            active: Bool,
+                            height: CGFloat,
+                            toggle: @escaping () -> Void,
+                            goManual: @escaping () -> Void) -> some View {
+        GeometryReader { g in
+            let h = g.size.height
+            let knob: CGFloat = 34
+            let travel = max(1, h - knob)
+            // Top of the track is the high value, as on a physical fader.
+            let y = knob / 2 + travel * CGFloat(1 - value.wrappedValue)
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(Color.white.opacity(active ? 0.85 : 0.35))
+                    .frame(width: 2, height: h)
+                    .frame(maxWidth: .infinity)
+                Button(action: toggle) {
+                    ZStack {
+                        Circle().fill(Color.black.opacity(0.55)).frame(width: knob, height: knob)
+                        Circle().strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
+                            .frame(width: knob, height: knob)
+                        Image(systemName: symbol)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundColor(active ? .white : .white.opacity(0.55))
+                    }
+                }
+                .buttonStyle(.plain)
+                .position(x: g.size.width / 2, y: y)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 4)
+                    .onChanged { v in
+                        guard !cam.isBusy else { return }
+                        let t = 1 - (v.location.y - knob / 2) / travel
+                        value.wrappedValue = min(1, max(0, Double(t)))
+                        // Dragging leaves Auto, as the previous slider did --
+                        // otherwise the handle has to be tapped first and the
+                        // drag silently does nothing.
+                        if !active { goManual() }
+                    }
+            )
+        }
+        .frame(width: 44, height: height)
     }
 
     private func showFocusIndicator(at point: CGPoint) {
@@ -137,97 +223,19 @@ struct CameraView: View {
                 Spacer()
             }
 
-            isoRow
-
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
+                Text("ISO " + cam.isoLabel)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.6))
                 Text(cam.shutterLabel)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundColor(.white.opacity(0.85))
                     .frame(minWidth: 44, alignment: .trailing)
             }
-            shutterSliderRow
         }
         .padding(.horizontal, 20)
-    }
-
-    private var isoRow: some View {
-        HStack(spacing: 10) {
-            Button { cam.isoIsAuto.toggle() } label: {
-                Text("ISO")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(cam.isoIsAuto ? .black : .white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(cam.isoIsAuto ? Color.yellow : Color.white.opacity(0.15))
-                    .clipShape(Capsule())
-            }
-            .disabled(cam.isBusy)
-
-            Slider(value: $cam.isoSlider, in: 0...1)
-                .disabled(cam.isoIsAuto || cam.isBusy)
-                .opacity(cam.isoIsAuto ? 0.4 : 1)
-
-            Text(cam.isoLabel)
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundColor(.white.opacity(0.85))
-                .frame(minWidth: 44, alignment: .trailing)
-        }
-    }
-
-    private var shutterSliderRow: some View {
-        HStack(spacing: 10) {
-            Button {
-                cam.toggleShutterAuto()
-            } label: {
-                VStack(spacing: 1) {
-                    Text("A")
-                        .font(.system(size: 13, weight: .bold))
-                    Text("Auto")
-                        .font(.system(size: 8, weight: .medium))
-                }
-                .foregroundColor(cam.shutterIsAuto ? .black : .white)
-                .frame(width: 36, height: 36)
-                .background(cam.shutterIsAuto ? Color.yellow : Color.white.opacity(0.15))
-                .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .disabled(cam.isBusy)
-
-            Slider(
-                value: Binding(
-                    get: { cam.shutterSlider },
-                    set: { value in
-                        guard !cam.isBusy else { return }
-                        // Ignore programmatic AE sync updates while Auto is on.
-                        guard shutterSliderDragging || !cam.shutterIsAuto else { return }
-                        cam.shutterSlider = value
-                    }
-                ),
-                in: 0...1,
-                onEditingChanged: { editing in
-                    guard !cam.isBusy else { return }
-                    if editing {
-                        // Finger down — do not leave Auto until the value actually moves.
-                        shutterSliderDragging = true
-                        shutterSliderDragStart = cam.shutterSlider
-                    } else {
-                        let start = shutterSliderDragStart
-                        shutterSliderDragging = false
-                        shutterSliderDragStart = nil
-                        // Leave Auto only after a real user drag (not SwiftUI appear noise).
-                        if let start, abs(cam.shutterSlider - start) > 0.002 {
-                            cam.applyManualShutterFromSlider()
-                        }
-                    }
-                }
-            )
-            .tint(.yellow)
-            .opacity(cam.isBusy ? 0.4 : 1)
-            .allowsHitTesting(!cam.isBusy)
-        }
-        .contentShape(Rectangle())
     }
 
     private var frameCountControl: some View {
@@ -295,7 +303,9 @@ struct CameraView: View {
                 .foregroundColor(selected ? .black : .white.opacity(0.92))
                 .frame(width: 38, height: 38)
                 .background(
-                    Circle().fill(selected ? Color.white : Color.white.opacity(0.14))
+                    Circle().fill(selected
+                                  ? Color(red: 0.86, green: 0.78, blue: 0.60)
+                                  : Color.white.opacity(0.14))
                 )
         }
         .disabled(cam.isBusy)
