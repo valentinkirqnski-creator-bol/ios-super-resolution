@@ -35,7 +35,12 @@ bool mps_fft_enabled();
 //
 // Returns false if unavailable or if anything fails, in which case the caller
 // must fall back to the Stockham path. Never partially writes `out` on failure.
-bool mps_grey_lowpass(const float* in, float* out, int h, int w);
+// out_mtl_buffer, when non-null, is an id<MTLBuffer> of at least h*w floats
+// that the graph writes into directly. The caller usually needs the result in a
+// Metal buffer anyway (align reuses it as the pinned moving grey), so supplying
+// it here avoids a second full-frame staging buffer and one memcpy per frame.
+bool mps_grey_lowpass(const float* in, float* out, int h, int w,
+                      void* out_mtl_buffer = nullptr);
 
 // Build and cache the graph for these dimensions ahead of time.
 //

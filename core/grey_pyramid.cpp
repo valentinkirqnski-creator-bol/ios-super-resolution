@@ -268,6 +268,13 @@ Image compute_grey_fft(const Image& raw) {
 Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method) {
     if (!bayer_mode) return raw;
     if (method == GreyMethod::FFT) return compute_grey_fft(raw);
+#ifdef __APPLE__
+    // The decimate path is pure CPU and never pins a grey, so align_metal must
+    // not find a stale sticky_grey left by an earlier FFT burst. Dimensions
+    // would normally differ (half versus full resolution) and spare us, but
+    // that is a coincidence, not a guarantee.
+    metal_invalidate_sticky_grey();
+#endif
     return compute_grey_decimate(raw, true);
 }
 

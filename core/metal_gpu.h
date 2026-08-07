@@ -118,6 +118,9 @@ void metal_merge_begin_burst(bool trim_analyze_scratch = true);
 // Free grow-only L2 / Alg. 5 scratch (call before merge prefetch / new burst).
 void metal_trim_analyze_scratch();
 
+// Drop the pinned moving grey so align_metal re-uploads instead of reusing it.
+void metal_invalidate_sticky_grey();
+
 // When true, reuse one GPU num/den slot (wait each band). Cuts peak RAM ~2× so
 // full-res 1× can use larger bands without jetsam. Default false (2× double-buffer).
 void metal_merge_set_single_acc_slot(bool enabled);

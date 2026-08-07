@@ -892,13 +892,16 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
         grey.w = (int)w;
         grey.c = 1;
         grey.data.resize(n);
-        if (mps_grey_lowpass(raw.data.data(), grey.data.data(), (int)h, (int)w)) {
-            // align_metal reuses sticky_grey when the dimensions match, so it
-            // must be refreshed here. Leaving the previous frame's buffer pinned
-            // would silently align every frame against a stale grey.
-            id<MTLBuffer> pinned = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
+        // Hand the graph the buffer align_metal will pin, so the result lands
+        // there directly. Saves a second full-frame staging buffer inside
+        // mps_fft (~47MB held across the whole analysis) and one memcpy per
+        // frame. align_metal reuses sticky_grey when the dimensions match, so
+        // it has to be refreshed here either way -- leaving the previous
+        // frame's buffer pinned would align against a stale grey.
+        id<MTLBuffer> pinned = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
+        if (mps_grey_lowpass(raw.data.data(), grey.data.data(), (int)h, (int)w,
+                             (__bridge void*)pinned)) {
             if (pinned) {
-                memcpy([pinned contents], grey.data.data(), n * sizeof(float));
                 c.sticky_grey = pinned;
                 c.sticky_grey_h = (int)h;
                 c.sticky_grey_w = (int)w;
@@ -2813,6 +2816,13 @@ bool metal_merge_wait_inflight() {
 
 void metal_merge_set_single_acc_slot(bool enabled) {
     g_merge_single_slot = enabled;
+}
+
+void metal_invalidate_sticky_grey() {
+    if (!metal_gpu_init()) return;
+    auto& c = ctx();
+    c.sticky_grey = nil;
+    c.sticky_grey_h = c.sticky_grey_w = 0;
 }
 
 void metal_trim_analyze_scratch() {
