@@ -294,6 +294,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"alignment_grey_fft"])
         cfg.grey_method = tuning[@"alignment_grey_fft"].boolValue
                               ? GreyMethod::FFT : GreyMethod::Decimate;
+    if (tuning[@"hf_artifact_removal_enabled"])
+        cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
+    if (tuning[@"hf_variance_loss_threshold"])
+        cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
+    if (tuning[@"hf_flow_variance_threshold"])
+        cfg.hf_flow_variance_threshold = tuning[@"hf_flow_variance_threshold"].floatValue;
+    if (tuning[@"hf_min_texture_snr"])
+        cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])

@@ -1376,6 +1376,8 @@ struct RobMaskParams {
     uint curve_n;     // 1001
     uint bayer;
     float r_t;
+    uint hf_enabled;
+    float hf_variance_loss_threshold;
     uint motion_edge_enabled;
     float motion_edge_threshold;
     float motion_edge_residual_threshold;
@@ -1461,6 +1463,69 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     guide[o + 1u] = 0.5f * gsum;
 }
 
+// Parameters for the high-frequency variance-loss map.
+struct RobHfLossParams {
+    uint h, w, nch;
+    uint _pad0;
+    float alpha, beta;
+    float min_texture_snr;
+    float _pad1;
+};
+
+kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
+                                    device const float* guide [[buffer(1)]],
+                                    constant RobStatsParams& p [[buffer(2)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    int y = int(gid.y), x = int(gid.x);
+    int H = int(p.h), W = int(p.w);
+    float k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        float s = 0.f;
+        for (int i = -2; i <= 2; ++i) {
+            int yy = clamp_edge(y + i, H - 1);
+            float wy = k[i + 2];
+            for (int j = -2; j <= 2; ++j) {
+                int xx = clamp_edge(x + j, W - 1);
+                s += wy * k[j + 2] * guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
+            }
+        }
+        out[(gid.y * p.w + gid.x) * p.nch + ch] = s / 256.f;
+    }
+}
+
+kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
+                                 device const float* means [[buffer(1)]],
+                                 device const float* vars [[buffer(2)]],
+                                 device const float* lp_vars [[buffer(3)]],
+                                 constant RobHfLossParams& p [[buffer(4)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
+    constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
+    const float kMinTextureSnr = max(p.min_texture_snr, 0.f);
+    float var_sum = 0.f;
+    float lp_var_sum = 0.f;
+    float noise_var = 0.f;
+    float lp_noise_var = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+        var_sum += max(vars[o], 0.f);
+        lp_var_sum += max(lp_vars[o], 0.f);
+        float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
+        float nv = max(p.alpha * brightness + p.beta, 0.f);
+        if (p.nch == 3u && ch == 1u) nv *= 0.5f;
+        noise_var += kLocalVarianceNoiseScale * nv;
+        lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
+    }
+    float signal_var = max(var_sum - noise_var, 0.f);
+    float signal_lp_var = max(lp_var_sum - lp_noise_var, 0.f);
+    float min_signal_var = kMinTextureSnr * max(noise_var, 1.0e-20f);
+    loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
+        ? max((signal_var - signal_lp_var) / signal_var, 0.f)
+        : 0.f;
+}
+
 kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
                                 device float* vars [[buffer(1)]],
                                 device const float* guide [[buffer(2)]],
@@ -1543,6 +1608,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* S [[buffer(8)]],
                           device const uint* motion_irregular [[buffer(9)]],
                           device const float* flow [[buffer(10)]],
+                          device const float* comp_hf_loss [[buffer(2)]],
+                          device const float* ref_hf_loss [[buffer(5)]],
+                          device const uint* flow_unstable [[buffer(12)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
@@ -1600,6 +1668,29 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         ? d_sq_ / sig
         : (d_sq_ > 0.f ? INFINITY : 0.f);
     bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
+    // High Frequency Artifacts Removal, Wronski et al. Two conditions, both
+    // required: the patch is almost entirely high-frequency (most of its local
+    // variance is destroyed by low-pass filtering), and the flow field is
+    // locally unstable (neighbouring tiles disagree).
+    //
+    // Neither alone is sufficient. Hair and fur are high-frequency but track
+    // cleanly, so the flow test spares them. A flat noisy wall has unstable
+    // flow but no real high-frequency signal, and the texture floor inside
+    // rob_hf_loss_adaptive drives its loss to zero, so the variance test
+    // spares it.
+    //
+    // Deliberately NOT gated on the misalignment residual: the aperture
+    // problem is exactly the case where a repetitive pattern locks onto the
+    // wrong period and still matches itself well, so the residual stays low.
+    bool hf_reject = false;
+    if (p.hf_enabled != 0u && flow_unstable[pidx] != 0u) {
+        float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
+        if (inbound) {
+            hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
+        }
+        hf_reject = hf_loss > p.hf_variance_loss_threshold;
+    }
+
     bool edge_reject = false;
     if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
         if (residual_high) {
@@ -1626,7 +1717,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    R[gid.y * p.w + gid.x] = edge_reject
+    R[gid.y * p.w + gid.x] = (hf_reject || edge_reject)
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
 }

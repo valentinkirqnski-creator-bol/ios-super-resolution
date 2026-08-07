@@ -65,6 +65,7 @@ void clear_align_ref_ica_cache();
 struct RefStats {
     Image means;
     Image stds;
+    Image hf_loss;   // 1-channel high-frequency variance-loss map
 }; // guide resolution [h/2, w/2, ch] for Bayer
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 

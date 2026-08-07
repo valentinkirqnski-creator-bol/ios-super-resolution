@@ -151,6 +151,7 @@ static MetalCtx& ctx() {
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
+            "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_make_mask", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
@@ -1104,6 +1105,8 @@ static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
     float r_t;
+    uint32_t hf_enabled = 0;
+    float hf_variance_loss_threshold = 0.f;
     uint32_t motion_edge_enabled = 0;
     float motion_edge_threshold = 0.f;
     float motion_edge_residual_threshold = 0.f;
@@ -1113,6 +1116,112 @@ struct RobMaskParamsCPU {
     uint32_t motion_edge_neighborhood_radius = 0;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 72, "RobMaskParamsCPU");
+
+struct RobHfLossParamsCPU {
+    uint32_t h, w, nch;
+    uint32_t _pad0 = 0;
+    float alpha = 0.f, beta = 0.f;
+    float min_texture_snr = 0.f;
+    float _pad1 = 0.f;
+};
+static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
+
+static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
+                            id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
+                            int guide_h, int guide_w, int nch,
+                            const Config& cfg, id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
+    const size_t loss_b = (size_t)guide_h * (size_t)guide_w * sizeof(float);
+    id<MTLBuffer> b_lp_guide = buf(nullptr, guide_b);
+    id<MTLBuffer> b_lp_means = buf(nullptr, guide_b);
+    id<MTLBuffer> b_lp_vars = buf(nullptr, guide_b);
+    b_loss = buf(nullptr, loss_b);
+    if (!b_guide || !b_means || !b_vars || !b_lp_guide ||
+        !b_lp_means || !b_lp_vars || !b_loss)
+        return false;
+
+    RobStatsParamsCPU sp{};
+    sp.h = (uint32_t)guide_h;
+    sp.w = (uint32_t)guide_w;
+    sp.nch = (uint32_t)nch;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_lp_guide offset:0 atIndex:0];
+    [enc setBuffer:b_guide offset:0 atIndex:1];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+    dispatch2(enc, c.pipe("rob_lowpass_gaussian5x5"), sp.w, sp.h);
+    [enc endEncoding];
+
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_lp_means offset:0 atIndex:0];
+    [enc setBuffer:b_lp_vars offset:0 atIndex:1];
+    [enc setBuffer:b_lp_guide offset:0 atIndex:2];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+    dispatch2(enc, c.pipe("rob_local_stats_3x3"), sp.w, sp.h);
+    [enc endEncoding];
+
+    RobHfLossParamsCPU hp{};
+    hp.h = (uint32_t)guide_h;
+    hp.w = (uint32_t)guide_w;
+    hp.nch = (uint32_t)nch;
+    hp.alpha = cfg.alpha;
+    hp.min_texture_snr = cfg.hf_min_texture_snr;
+    hp.beta = cfg.beta;
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_loss offset:0 atIndex:0];
+    [enc setBuffer:b_means offset:0 atIndex:1];
+    [enc setBuffer:b_vars offset:0 atIndex:2];
+    [enc setBuffer:b_lp_vars offset:0 atIndex:3];
+    [enc setBytes:&hp length:sizeof(hp) atIndex:4];
+    dispatch2(enc, c.pipe("rob_hf_loss_adaptive"), hp.w, hp.h);
+    [enc endEncoding];
+    return true;
+}
+
+// Flow instability per tile: mean squared deviation of the flow vectors from
+// their own 3x3 neighbourhood mean, in pixels^2.
+//
+// Variance rather than the max-min spread used for the motion prior. Spread is
+// decided by a single extreme tile, so one bad vector condemns its neighbours;
+// a mean squared deviation weighs the whole neighbourhood. A smooth field like
+// (0.20, 0.21, 0.22) scores ~1e-4, while (0.2, 1.8, -0.6, 2.1) scores ~1.3.
+static std::vector<uint32_t> rob_flow_unstable(const FlowField& flow, f32 threshold) {
+    std::vector<uint32_t> out((size_t)flow.ny * (size_t)flow.nx, 0u);
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return out;
+    for (int ty = 0; ty < flow.ny; ++ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            f32 sx = 0.f, sy = 0.f;
+            int cnt = 0;
+            for (int i = -1; i <= 1; ++i) {
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    sx += flow.dx(yy, xx);
+                    sy += flow.dy(yy, xx);
+                    ++cnt;
+                }
+            }
+            if (cnt < 2) continue;
+            const f32 mx = sx / (f32)cnt, my = sy / (f32)cnt;
+            f32 acc = 0.f;
+            for (int i = -1; i <= 1; ++i) {
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    const f32 dx = flow.dx(yy, xx) - mx;
+                    const f32 dy = flow.dy(yy, xx) - my;
+                    acc += dx * dx + dy * dy;
+                }
+            }
+            out[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
+                (acc / (f32)cnt > threshold) ? 1u : 0u;
+        }
+    }
+    return out;
+}
 
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                       std::vector<uint32_t>* irregular_out = nullptr) {
@@ -1251,6 +1360,8 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
 } // namespace
 
 // Sticky ref means/vars for compute_robustness_metal (avoid re-upload + free host).
+static id<MTLBuffer> g_rob_ref_hf = nil;
+static size_t g_rob_ref_hf_bytes = 0;
 static id<MTLBuffer> g_rob_ref_m = nil;
 static id<MTLBuffer> g_rob_ref_v = nil;
 static int g_rob_ref_h = 0, g_rob_ref_w = 0, g_rob_ref_c = 0;
@@ -1262,6 +1373,8 @@ static float g_rob_curve_alpha = std::numeric_limits<float>::quiet_NaN();
 static float g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 
 static void clear_rob_ref_gpu() {
+    g_rob_ref_hf = nil;
+    g_rob_ref_hf_bytes = 0;
     g_rob_ref_m = nil;
     g_rob_ref_v = nil;
     g_rob_ref_h = g_rob_ref_w = g_rob_ref_c = 0;
@@ -1304,6 +1417,13 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     st.means.h = gh;
     st.means.w = gw;
     st.means.c = nch;
+    if (cfg.hf_artifact_removal_enabled) {
+        id<MTLBuffer> b_hf = nil;
+        if (!rob_run_hf_loss(b_guide, b_means, b_vars, b_hf, gh, gw, nch, cfg, cmd))
+            return RefStats();
+        g_rob_ref_hf = b_hf;
+        g_rob_ref_hf_bytes = (size_t)gh * (size_t)gw * sizeof(float);
+    }
     st.stds.h = gh;
     st.stds.w = gw;
     st.stds.c = nch;
@@ -1332,8 +1452,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                       (cfg.motion_edge_rejection_enabled ||
-)
+                                       cfg.motion_edge_rejection_enabled
                                            ? &motion_irregular
                                            : nullptr);
     if (!cfg.motion_edge_rejection_enabled)
@@ -1380,7 +1499,26 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
+    // Flow instability drives only the high-frequency test; the motion prior
+    // keeps its own max-spread measure so Eq. 5 is unchanged.
+    std::vector<uint32_t> flow_unstable =
+        cfg.hf_artifact_removal_enabled
+            ? rob_flow_unstable(flow, cfg.hf_flow_variance_threshold)
+            : std::vector<uint32_t>(S.size(), 0u);
+
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
+    id<MTLBuffer> b_unstable = buf(flow_unstable.data(), flow_unstable.size() * sizeof(uint32_t));
+
+    const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
+    id<MTLBuffer> b_comp_hf = b_gvars;
+    if (cfg.hf_artifact_removal_enabled &&
+        !rob_run_hf_loss(b_guide, b_gmeans, b_gvars, b_comp_hf, gh, gw, nch, cfg, cmd))
+        return Image();
+    id<MTLBuffer> b_ref_hf = b_ref_v;
+    if (cfg.hf_artifact_removal_enabled) {
+        if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
+        b_ref_hf = g_rob_ref_hf;
+    }
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
@@ -1398,6 +1536,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
     mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
     mp.motion_edge_threshold = cfg.motion_edge_threshold;
     mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
@@ -1417,7 +1557,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_diff offset:0 atIndex:7];
     [enc setBuffer:b_S offset:0 atIndex:8];
     [enc setBuffer:b_motion offset:0 atIndex:9];
+    [enc setBuffer:b_comp_hf offset:0 atIndex:2];
+    [enc setBuffer:b_ref_hf offset:0 atIndex:5];
     [enc setBuffer:b_flow offset:0 atIndex:10];
+    [enc setBuffer:b_unstable offset:0 atIndex:12];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];

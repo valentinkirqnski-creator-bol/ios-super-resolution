@@ -118,6 +118,36 @@ struct Config {
     // Minimum texture SNR: signal variance must exceed this multiple of the
     // noise floor before a pixel is treated as real high-frequency detail.
     // loss landed, then a hardcoded kMinTextureSnr = 4; configurable again.
+    // High-frequency artifact rejection (Wronski et al., "High Frequency
+    // Artifacts Removal"). Block matching cannot resolve repetitive fine
+    // texture -- the aperture problem -- so it locks onto the wrong period and
+    // produces blocky artifacts. Rejected only where BOTH hold:
+    //
+    //   1. the patch is almost entirely high-frequency: most of its local
+    //      variance disappears under a low-pass filter, and
+    //   2. the flow field is locally unstable: neighbouring tiles disagree.
+    //
+    // Both are needed. Hair and fur are high-frequency but track cleanly, so
+    // condition 2 spares them. A flat noisy wall has unstable flow but no real
+    // high-frequency signal, so condition 1 spares it.
+    //
+    // Off by default: it changes which pixels merge, so enable it deliberately.
+    bool  hf_artifact_removal_enabled = false;
+    // loss = 1 - variance_lowpass / variance_original, both noise-corrected.
+    // Above this the patch counts as high-frequency. Reference points measured
+    // on typical content: flat wall ~0.04, face ~0.19, brick ~0.83,
+    // checkerboard ~0.92.
+    float hf_variance_loss_threshold = 0.75f;
+    // Mean squared deviation of the flow vectors from their neighbourhood mean,
+    // in pixels^2, over a 3x3 tile window. Variance rather than max-min spread:
+    // one outlying tile should not condemn its neighbours. 0.25 is an RMS
+    // deviation of 0.5px.
+    float hf_flow_variance_threshold = 0.25f;
+    // The patch is skipped unless its signal variance exceeds this multiple of
+    // the estimated sensor noise variance. This is what stops ISO 6400 noise
+    // reading as high-frequency detail, and it scales with brightness through
+    // the noise model rather than being a fixed number.
+    float hf_min_texture_snr = 4.0f;
     bool  motion_edge_rejection_enabled = true;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
