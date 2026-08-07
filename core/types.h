@@ -111,18 +111,13 @@ struct Config {
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
     float r_Mt = 0.8f;
-    bool  hf_artifact_removal_enabled = true;
-    float hf_variance_loss_threshold = 0.90f;
     // Scales the estimated sensor noise variance subtracted before the HF
     // loss ratio. >1 assumes more noise, so less of the local variance counts
     // as signal and fewer areas are flagged as high-frequency detail; <1 is
     // more aggressive. 1.0 leaves the estimate as measured.
-    float hf_variance_noise_multiplier = 1.0f;
     // Minimum texture SNR: signal variance must exceed this multiple of the
     // noise floor before a pixel is treated as real high-frequency detail.
-    // Was hf_noise_floor_multiplier (default 6) before the noise-corrected
     // loss landed, then a hardcoded kMinTextureSnr = 4; configurable again.
-    float hf_noise_floor_multiplier = 4.0f;
     bool  motion_edge_rejection_enabled = true;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;

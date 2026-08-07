@@ -93,10 +93,6 @@ struct TuningParams: Equatable, Codable {
     var r_Mt: Float = 0.8
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
-    var hf_artifact_removal_enabled: Bool = true
-    var hf_variance_loss_threshold: Float = 0.90
-    var hf_variance_noise_multiplier: Float = 1.0
-    var hf_noise_floor_multiplier: Float = 4.0
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -128,8 +124,6 @@ struct TuningParams: Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
         case alignment_grey_fft
-        case hf_artifact_removal_enabled, hf_variance_loss_threshold
-        case hf_variance_noise_multiplier, hf_noise_floor_multiplier
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -151,10 +145,6 @@ struct TuningParams: Equatable, Codable {
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
-        hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
-        hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
-        hf_variance_noise_multiplier = try c.decodeIfPresent(Float.self, forKey: .hf_variance_noise_multiplier) ?? hf_variance_noise_multiplier
-        hf_noise_floor_multiplier = try c.decodeIfPresent(Float.self, forKey: .hf_noise_floor_multiplier) ?? hf_noise_floor_multiplier
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1351,10 +1341,6 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
-            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
-            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
-            "hf_variance_noise_multiplier": NSNumber(value: tuningParams.hf_variance_noise_multiplier),
-            "hf_noise_floor_multiplier": NSNumber(value: tuningParams.hf_noise_floor_multiplier),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),

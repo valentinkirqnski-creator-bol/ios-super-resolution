@@ -65,8 +65,7 @@ void clear_align_ref_ica_cache();
 struct RefStats {
     Image means;
     Image stds;
-    Image hf_loss;
-}; // guide resolution [h/2, w/2, ch] for Bayer; hf_loss is 1-channel
+}; // guide resolution [h/2, w/2, ch] for Bayer
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).

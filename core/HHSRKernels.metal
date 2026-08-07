@@ -1359,14 +1359,6 @@ struct RobStatsParams {
     uint _pad0;
 };
 
-struct RobHfLossParams {
-    uint h, w, nch;
-    uint _pad0;
-    float alpha, beta;
-    float noise_mult;
-    float min_texture_snr;
-};
-
 struct RobDogsonParams {
     uint in_h, in_w, out_h, out_w, nch;
     uint is_ref;      // 1 = no flow
@@ -1385,10 +1377,8 @@ struct RobMaskParams {
     uint bayer;
     float r_t;
     uint motion_edge_enabled;
-    uint hf_enabled;
     float motion_edge_threshold;
     float motion_edge_residual_threshold;
-    float hf_variance_loss_threshold;
     float alpha, beta;
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
@@ -1497,60 +1487,6 @@ kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
     }
 }
 
-kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
-                                    device const float* guide [[buffer(1)]],
-                                    constant RobStatsParams& p [[buffer(2)]],
-                                    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    int y = int(gid.y), x = int(gid.x);
-    int H = int(p.h), W = int(p.w);
-    float k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        float s = 0.f;
-        for (int i = -2; i <= 2; ++i) {
-            int yy = clamp_edge(y + i, H - 1);
-            float wy = k[i + 2];
-            for (int j = -2; j <= 2; ++j) {
-                int xx = clamp_edge(x + j, W - 1);
-                s += wy * k[j + 2] * guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
-            }
-        }
-        out[(gid.y * p.w + gid.x) * p.nch + ch] = s / 256.f;
-    }
-}
-
-kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
-                                 device const float* means [[buffer(1)]],
-                                 device const float* vars [[buffer(2)]],
-                                 device const float* lp_vars [[buffer(3)]],
-                                 constant RobHfLossParams& p [[buffer(4)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
-    constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    const float kMinTextureSnr = max(p.min_texture_snr, 0.f);
-    float var_sum = 0.f;
-    float lp_var_sum = 0.f;
-    float noise_var = 0.f;
-    float lp_noise_var = 0.f;
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-        var_sum += max(vars[o], 0.f);
-        lp_var_sum += max(lp_vars[o], 0.f);
-        float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
-        float nv = max((p.alpha * brightness + p.beta) * p.noise_mult, 0.f);
-        if (p.nch == 3u && ch == 1u) nv *= 0.5f;
-        noise_var += kLocalVarianceNoiseScale * nv;
-        lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
-    }
-    float signal_var = max(var_sum - noise_var, 0.f);
-    float signal_lp_var = max(lp_var_sum - lp_noise_var, 0.f);
-    float min_signal_var = kMinTextureSnr * max(noise_var, 1.0e-20f);
-    loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
-        ? max((signal_var - signal_lp_var) / signal_var, 0.f)
-        : 0.f;
-}
-
 kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
                                device const float* stats [[buffer(1)]],
                                device const float* flow [[buffer(2)]],
@@ -1600,10 +1536,8 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
-                          device const float* comp_hf_loss [[buffer(2)]],
                           device const float* ref_means [[buffer(3)]],
                           device const float* ref_vars [[buffer(4)]],
-                          device const float* ref_hf_loss [[buffer(5)]],
                           device const float* std_curve [[buffer(6)]],
                           device const float* diff_curve [[buffer(7)]],
                           device const float* S [[buffer(8)]],
@@ -1666,26 +1600,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         ? d_sq_ / sig
         : (d_sq_ > 0.f ? INFINITY : 0.f);
     bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
-    bool hf_reject = false;
-    // Wronski et al., High Frequency Artifacts Removal: reject where there is
-    // variance loss under low-pass filtering AND large local variation in the
-    // alignment vector field. Two conditions, not three.
-    //
-    // This previously also required residual_high (d^2/sigma^2 above the motion
-    // residual threshold), which defeats the purpose. The aperture problem is
-    // precisely the case where a repetitive pattern locks onto the wrong period
-    // and still matches itself well, so the residual stays LOW. Demanding a high
-    // residual meant the test could only fire where alignment was both wrong and
-    // looked wrong -- which ordinary robustness already rejects. residual_high
-    // stays on the motion-edge branch below, where a genuine moving edge does
-    // produce a large residual and the test belongs.
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
-        float hf_loss = ref_hf_loss[gid.y * p.w + gid.x];
-        if (inbound) {
-            hf_loss = max(hf_loss, comp_hf_loss[uint(new_idy) * p.w + uint(new_idx)]);
-        }
-        hf_reject = hf_loss > p.hf_variance_loss_threshold;
-    }
     bool edge_reject = false;
     if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
         if (residual_high) {
@@ -1712,7 +1626,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    R[gid.y * p.w + gid.x] = (hf_reject || edge_reject)
+    R[gid.y * p.w + gid.x] = edge_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
 }

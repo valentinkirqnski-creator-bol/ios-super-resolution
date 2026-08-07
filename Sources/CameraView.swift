@@ -466,37 +466,6 @@ struct CameraView: View {
                          ? "Full-res FFT low-pass. Slower."
                          : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
                         .font(.caption2).foregroundColor(.secondary)
-                    Toggle("High-Frequency Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
-
-                    if cam.tuningParams.hf_artifact_removal_enabled {
-                        HStack {
-                            Text("Variance Loss")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_loss_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.hf_variance_loss_threshold,
-                               in: 0.50...0.99,
-                               step: 0.01)
-
-                        HStack {
-                            Text("Variance Noise Mult")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_noise_multiplier))
-                        }
-                        Slider(value: $cam.tuningParams.hf_variance_noise_multiplier,
-                               in: 0.25...4.00,
-                               step: 0.05)
-
-                        HStack {
-                            Text("Noise Floor Mult")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.hf_noise_floor_multiplier))
-                        }
-                        Slider(value: $cam.tuningParams.hf_noise_floor_multiplier,
-                               in: 0.0...12.0,
-                               step: 0.5)
-                    }
-
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
                     if cam.tuningParams.motion_edge_rejection_enabled {
