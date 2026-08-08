@@ -944,10 +944,10 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
-                        Toggle("Match Tile To Scene", isOn: $cam.tuningParams.align_tile_match_scene)
-                        Text("Halves alignment tiles on the 2x2 decimate grey so one tile "
-                             + "covers the same scene area as on the full-res FFT grey. "
-                             + "No effect in FFT mode. Changes alignment output.")
+                        Toggle("ICA Every Pyramid Level", isOn: $cam.tuningParams.align_ica_per_level)
+                        Text("Refines sub-pixel alignment after block matching at every "
+                             + "pyramid level, as the reference does, instead of only the "
+                             + "finest. 2x2 decimate grey only; no effect in FFT mode.")
                             .font(.caption2).foregroundColor(.secondary)
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)

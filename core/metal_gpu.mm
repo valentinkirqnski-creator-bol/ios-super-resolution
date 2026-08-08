@@ -86,13 +86,23 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
-    const void* ica_ref_key = nullptr;
-    id<MTLBuffer> ica_ref = nil;
-    id<MTLBuffer> ica_gx = nil;
-    id<MTLBuffer> ica_gy = nil;
-    id<MTLBuffer> ica_hess = nil;
-    int ica_ref_h = 0, ica_ref_w = 0, ica_ref_ts = 0;
-    int ica_ny = 0, ica_nx = 0;
+    // Reference Sobel gradients and ICA Hessian, cached per pyramid level.
+    // One slot was enough while ICA ran only on the finest level; per-level ICA
+    // asks for a different level on every call, so a single slot would miss
+    // every time and recompute the gradients once per comparison frame instead
+    // of once per burst. The reference does not change within a burst, so all
+    // levels stay valid together.
+    struct IcaRefSlot {
+        const void* key = nullptr;
+        id<MTLBuffer> ref = nil;
+        id<MTLBuffer> gx = nil;
+        id<MTLBuffer> gy = nil;
+        id<MTLBuffer> hess = nil;
+        int h = 0, w = 0, ts = 0, ny = 0, nx = 0;
+    };
+    static constexpr int kIcaSlots = 8;   // pyramids here are 4 levels
+    IcaRefSlot ica[kIcaSlots];
+    int ica_next = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -2005,15 +2015,22 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     nx = (r.w + ts - 1) / ts;
     if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) return false;
     const void* key = r.data.empty() ? nullptr : (const void*)r.data.data();
-    if (key && c.ica_ref && c.ica_gx && c.ica_gy && c.ica_hess &&
-        c.ica_ref_key == key &&
-        c.ica_ref_h == r.h && c.ica_ref_w == r.w &&
-        c.ica_ref_ts == ts && c.ica_ny == ny && c.ica_nx == nx) {
-        b_ref = c.ica_ref;
-        b_gx = c.ica_gx;
-        b_gy = c.ica_gy;
-        b_hess = c.ica_hess;
-        return true;
+    // Slots are few, so a linear scan is cheaper than any indexing scheme, and
+    // it keeps this function's signature free of a level number it would
+    // otherwise only use as a cache key.
+    if (key) {
+        for (int i = 0; i < MetalCtx::kIcaSlots; ++i) {
+            const auto& sl = c.ica[i];
+            if (sl.key == key && sl.ref && sl.gx && sl.gy && sl.hess &&
+                sl.h == r.h && sl.w == r.w && sl.ts == ts &&
+                sl.ny == ny && sl.nx == nx) {
+                b_ref = sl.ref;
+                b_gx = sl.gx;
+                b_gy = sl.gy;
+                b_hess = sl.hess;
+                return true;
+            }
+        }
     }
     b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
     const size_t pix_b = (size_t)r.h * (size_t)r.w * sizeof(float);
@@ -2065,16 +2082,27 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
     align_commit(cmd);
     const bool ok = true;
     if (ok && key) {
-        c.ica_ref_key = key;
-        c.ica_ref = b_ref;
-        c.ica_gx = b_gx;
-        c.ica_gy = b_gy;
-        c.ica_hess = b_hess;
-        c.ica_ref_h = r.h;
-        c.ica_ref_w = r.w;
-        c.ica_ref_ts = ts;
-        c.ica_ny = ny;
-        c.ica_nx = nx;
+        // Reuse the slot already holding this level, else take the next one.
+        int slot = -1;
+        for (int i = 0; i < MetalCtx::kIcaSlots && slot < 0; ++i)
+            if (c.ica[i].key == key && c.ica[i].h == r.h &&
+                c.ica[i].w == r.w && c.ica[i].ts == ts)
+                slot = i;
+        if (slot < 0) {
+            slot = c.ica_next;
+            c.ica_next = (c.ica_next + 1) % MetalCtx::kIcaSlots;
+        }
+        auto& sl = c.ica[slot];
+        sl.key = key;
+        sl.ref = b_ref;
+        sl.gx = b_gx;
+        sl.gy = b_gy;
+        sl.hess = b_hess;
+        sl.h = r.h;
+        sl.w = r.w;
+        sl.ts = ts;
+        sl.ny = ny;
+        sl.nx = nx;
     }
     return ok;
 }
@@ -2147,9 +2175,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         moving_grey.h <= 0 || moving_grey.w <= 0) return false;
     // Fine-first levels[]: params arrays are fine→coarse, so index with lvl.
     for (int lvl = 0; lvl < nlev; ++lvl) {
-        int ts = align_tile_scaled(
-            (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size,
-            cfg.align_tile_match_scene, cfg.grey_method);
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
@@ -2196,13 +2222,12 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
     id<MTLBuffer> b_flow = nil;
     int flow_ny = 0, flow_nx = 0;
+    const bool ica_all = cfg.ica_every_level();
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[(size_t)lvl];
         const Lev& m = mov_pyr[(size_t)lvl];
-        int ts = align_tile_scaled(
-            (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size,
-            cfg.align_tile_match_scene, cfg.grey_method);
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
         id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
@@ -2226,10 +2251,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
-            int prev_ts = align_tile_scaled(
-                ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
-                    ? cfg.bm_tile_sizes[lvl + 1] : ts,
-                cfg.align_tile_match_scene, cfg.grey_method);
+            int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                          ? cfg.bm_tile_sizes[lvl + 1] : ts;
             id<MTLBuffer> b_up = nil;
             if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
                                        b_up, ny, nx, upsample_factor, ts, prev_ts,
@@ -2251,15 +2274,32 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
-        // Block matching only; ICA runs once below on the finest level.
+        // alignment.py align_lvl: block matching, then ICA, on this level --
+        // before upscale_flow multiplies whatever error is left by the
+        // upsampling factor on the way to the next one.
+        if (ica_all) {
+            id<MTLBuffer> l_ref = nil, l_gx = nil, l_gy = nil, l_hess = nil;
+            int l_ny = 0, l_nx = 0;
+            if (!prep_level_ica_gpu(r, ts, l_ref, l_gx, l_gy, l_hess, l_ny, l_nx))
+                return false;
+            // prep tiles with ceil, block matching with floor; they agree for
+            // every shipped pyramid, but skip rather than dispatch a mismatched
+            // grid if a future tile size makes them differ.
+            if (l_ny == ny && l_nx == nx &&
+                !ica_bufs(l_ref, l_gx, l_gy, l_hess, m.img, b_flow,
+                          r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))
+                return false;
+        }
     }
 
     // No drain here: nothing below reads GPU memory on the CPU until the flow
     // readback, and the ICA stages are ordered behind the pyramid work by the
     // queue. Draining here would stall out most of the async benefit.
-    // ICA once on the finest level, matching 63e6919 and align.cpp, rather than
-    // once per pyramid level as ac0ff06 did.
+    // Full-res FFT grey keeps the single finest-level refinement, unchanged.
+    // With per-level ICA the loop already refined level 0 and repeating it here
+    // would run ICA twice on the finest scale.
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
+    if (!ica_all) {
     id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
     int ica_ny = 0, ica_nx = 0;
     if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
@@ -2284,6 +2324,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
                   flow_ny, flow_nx, tile_size, cfg.ica_n_iter))
         return false;
+    }
 
     // Single sync point for the whole align before the CPU reads the flow.
     if (!align_drain()) return false;
@@ -2295,13 +2336,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
 void metal_clear_ref_ica_cache() {
     auto& c = ctx();
-    c.ica_ref_key = nullptr;
-    c.ica_ref = nil;
-    c.ica_gx = nil;
-    c.ica_gy = nil;
-    c.ica_hess = nil;
-    c.ica_ref_h = c.ica_ref_w = c.ica_ref_ts = 0;
-    c.ica_ny = c.ica_nx = 0;
+    for (int i = 0; i < MetalCtx::kIcaSlots; ++i) c.ica[i] = {};
+    c.ica_next = 0;
     g_dumped_ref_grads = false;
 }
 
@@ -2969,13 +3005,8 @@ void metal_trim_analyze_scratch() {
     c.scratch_cols_bytes = 0;
     c.sticky_grey = nil;
     c.sticky_grey_h = c.sticky_grey_w = 0;
-    c.ica_ref_key = nullptr;
-    c.ica_ref = nil;
-    c.ica_gx = nil;
-    c.ica_gy = nil;
-    c.ica_hess = nil;
-    c.ica_ref_h = c.ica_ref_w = c.ica_ref_ts = 0;
-    c.ica_ny = c.ica_nx = 0;
+    for (int i = 0; i < MetalCtx::kIcaSlots; ++i) c.ica[i] = {};
+    c.ica_next = 0;
     clear_rob_ref_gpu();
 }
 

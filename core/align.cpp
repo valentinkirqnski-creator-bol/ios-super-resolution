@@ -769,16 +769,19 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // returns coarse-first (pyramid[::-1]); its list_id = n-1-l then maps
     // coarse→params[n-1], fine→params[0]. With fine-first storage that is simply
     // params[lvl] (arrays are fine→coarse in default.yaml).
-    if (false && (g_ref_ica_cache.key != (const void*)&ref_pyr ||
-        (int)g_ref_ica_cache.levels.size() != nlev)) {
+    // Sobel gradients and the ICA Hessian depend only on the reference, so they
+    // are built once per burst and reused by every comparison frame. Keyed on
+    // the pyramid's address and level count; clear_align_ref_ica_cache() drops
+    // it between bursts.
+    const bool ica_all = cfg.ica_every_level();
+    if (ica_all && (g_ref_ica_cache.key != (const void*)&ref_pyr ||
+                    (int)g_ref_ica_cache.levels.size() != nlev)) {
         g_ref_ica_cache.key = (const void*)&ref_pyr;
         g_ref_ica_cache.levels.assign((size_t)nlev, RefIcaLevel{});
         for (int lvl = 0; lvl < nlev; ++lvl) {
             const Image& r = ref_pyr.levels[lvl];
-            int ts = align_tile_scaled(
-                (lvl < (int)cfg.bm_tile_sizes.size())
-                    ? cfg.bm_tile_sizes[lvl] : tile_size,
-                cfg.align_tile_match_scene, cfg.grey_method);
+            int ts = (lvl < (int)cfg.bm_tile_sizes.size())
+                         ? cfg.bm_tile_sizes[lvl] : tile_size;
             RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             L.gx = compute_sobel_gradx(r);
             L.gy = compute_sobel_grady(r);
@@ -802,10 +805,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         const Image& r = ref_pyr.levels[lvl];
         const Image& m = mov_pyr.levels[lvl];
 
-        int ts = align_tile_scaled(
-            (lvl < (int)cfg.bm_tile_sizes.size())
-                ? cfg.bm_tile_sizes[lvl] : tile_size,
-            cfg.align_tile_match_scene, cfg.grey_method);
+        int ts = (lvl < (int)cfg.bm_tile_sizes.size())
+                     ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size())
                      ? cfg.bm_search_radii[lvl] : 2;
 
@@ -823,10 +824,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
-            int prev_ts = align_tile_scaled(
-                ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
-                    ? cfg.bm_tile_sizes[lvl + 1] : ts,
-                cfg.align_tile_match_scene, cfg.grey_method);
+            int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                          ? cfg.bm_tile_sizes[lvl + 1]
+                          : ts;
             flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
         }
 
@@ -839,17 +839,28 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg.num_threads);
 
+        // alignment.py align_lvl: block matching, then ICA, at this level --
+        // before the flow is upscaled and its error multiplied.
+        if (ica_all && lvl < (int)g_ref_ica_cache.levels.size()) {
+            const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
+            if (L.hess.ny == flow.ny && L.hess.nx == flow.nx)
+                ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts,
+                                 cfg.ica_n_iter, cfg.num_threads);
+        }
     }
 
-    // ICA runs once on the finest level, not per pyramid level. Per-level
-    // refinement was tried and reverted: this restores the d5215ec behaviour.
-    Image gx = compute_sobel_gradx(ref_grey);
-    Image gy = compute_sobel_grady(ref_grey);
-    HessianField hess = compute_hessian(gx, gy, tile_size);
-    debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
-    debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
-    ica_refine_level(ref_grey, gx, gy, moving_grey, hess, flow, tile_size,
-                     cfg.ica_n_iter, cfg.num_threads);
+    // Full-res FFT grey keeps the single finest-level refinement, unchanged.
+    // With per-level ICA the loop above already refined level 0, and repeating
+    // it here would run ICA twice on the finest scale.
+    if (!ica_all) {
+        Image gx = compute_sobel_gradx(ref_grey);
+        Image gy = compute_sobel_grady(ref_grey);
+        HessianField hess = compute_hessian(gx, gy, tile_size);
+        debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
+        debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
+        ica_refine_level(ref_grey, gx, gy, moving_grey, hess, flow, tile_size,
+                         cfg.ica_n_iter, cfg.num_threads);
+    }
     return flow;
 }
 

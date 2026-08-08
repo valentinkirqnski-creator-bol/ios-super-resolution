@@ -68,29 +68,6 @@ enum class GreyMethod { FFT, Decimate };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };
 
-// Block-matching tile sizes are expressed in GREY pixels, and the two grey
-// methods do not share a resolution: the FFT grey is full raw size, the 2x2
-// decimate grey is half. So tile 16 spans 16 raw pixels on the FFT path and 32
-// on the decimate path -- four times the scene area, averaging away that much
-// more of any motion that varies inside one tile (parallax, depth steps, a
-// moving subject). A robustness mask computed at half resolution cannot see the
-// resulting sub-pixel error, but the merge can, because sample placement is
-// exactly what super-resolution depends on.
-//
-// Halving the tile on the decimate path makes both cover the same scene
-// footprint. Applied ONLY to alignment: the merge's tile size comes from
-// bm_tile_sizes[0] read in pipeline.cpp / pipeline_paths.cpp and is deliberately
-// left alone. The FFT path is untouched because its divisor is 1 by definition.
-//
-// Floored at 8: align_metal accepts only 8/16/32/64 and returns false for
-// anything else, which would silently drop the whole burst onto the CPU
-// aligner. The coarsest level is already 8, so it stays 8.
-inline int align_tile_scaled(int ts, bool match_scene, GreyMethod gm) {
-    if (!match_scene || gm != GreyMethod::Decimate) return ts;
-    const int t = ts / 2;
-    return t < 8 ? 8 : t;
-}
-
 // 2x2 Bayer CFA pattern (indices into {R=0,G=1,B=2}).
 struct CFA {
     uint8_t p[2][2] = {{0, 1}, {1, 2}}; // default RGGB
@@ -116,14 +93,44 @@ struct Config {
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
-    // Halve alignment tiles on the half-resolution decimate grey so they cover
-    // the same scene area as on the FFT grey. See align_tile_scaled above.
-    // Changes alignment output, so it ships off.
-    bool  align_tile_match_scene = false;
     std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
+    // Run ICA after block matching on EVERY pyramid level, not only the finest.
+    //
+    // The reference implementation (alignment.py, align_lvl) does block matching
+    // then align_lvl_ica at each level. This port refined only once, at the
+    // finest, so every coarse level emits integer-only flow with up to half a
+    // pixel of residual, which upscale_flow then multiplies by the upsampling
+    // factor.
+    //
+    // That amplification is not unchecked -- each level re-searches, so it only
+    // matters if the arriving error exceeds that level's search radius. With
+    // factors {1,2,4,4} and radii {1,4,4,4} the arriving error is 0.5*factor:
+    // 2px into levels 2 and 1 against a radius of 4, comfortable; but 1px into
+    // level 0 against a radius of 1. The finest level runs with exactly zero
+    // slack, so anything else that adds error -- aliasing from the box-filter
+    // decimation, motion varying inside a tile, the multi-hypothesis step
+    // taking a neighbour's vector -- lands outside what it can recover.
+    //
+    // Refining per level makes what arrives sub-pixel and restores that margin.
+    // It also hands the finest-level ICA a far better starting point, which
+    // matters because ICA is a local gradient method with a finite basin of
+    // attraction. It does NOT improve final sub-pixel precision in raw terms:
+    // the last refinement still happens on a half-resolution grey.
+    //
+    // Restricted to the decimate grey. It is half raw resolution, so both the
+    // accumulated error and that +/-1 budget are twice as coarse in scene terms
+    // as on the full-res FFT grey -- and keeping FFT on the single finest-level
+    // refinement leaves its output bit-identical to before.
+    bool align_ica_per_level = true;
+
+    // True when ICA should run on every pyramid level rather than only the
+    // finest. Half-res grey only, so the FFT path is untouched.
+    bool ica_every_level() const {
+        return align_ica_per_level && grey_method == GreyMethod::Decimate;
+    }
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
     // With this false the plan stays empty, so every frame enters align() with a
