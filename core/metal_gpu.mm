@@ -2147,7 +2147,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         moving_grey.h <= 0 || moving_grey.w <= 0) return false;
     // Fine-first levels[]: params arrays are fine→coarse, so index with lvl.
     for (int lvl = 0; lvl < nlev; ++lvl) {
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
+        int ts = align_tile_scaled(
+            (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size,
+            cfg.align_tile_match_scene, cfg.grey_method);
         if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
@@ -2198,7 +2200,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[(size_t)lvl];
         const Lev& m = mov_pyr[(size_t)lvl];
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
+        int ts = align_tile_scaled(
+            (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size,
+            cfg.align_tile_match_scene, cfg.grey_method);
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
         id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
@@ -2222,8 +2226,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
-            int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
-                          ? cfg.bm_tile_sizes[lvl + 1] : ts;
+            int prev_ts = align_tile_scaled(
+                ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                    ? cfg.bm_tile_sizes[lvl + 1] : ts,
+                cfg.align_tile_match_scene, cfg.grey_method);
             id<MTLBuffer> b_up = nil;
             if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
                                        b_up, ny, nx, upsample_factor, ts, prev_ts,
@@ -2872,7 +2878,32 @@ void metal_merge_begin_online(int out_h, int out_w, int nch) {
     g_merge_need_zero = false;
 }
 
+// Accumulator slots are grow-only and shared with the banded path, so they are
+// dropped rather than resized. Assigning {} nils the strong buffer refs, which
+// under ARC releases them.
+static void merge_release_acc_slots() {
+    g_merge_acc[0] = {};
+    g_merge_acc[1] = {};
+}
+
 void metal_merge_end_online() {
+    // Release the accumulator with the burst instead of leaving it for the next
+    // begin_burst to clear. Online sizes it to the whole output -- 22MB per
+    // output megapixel, ~1.1GB at 48MP -- so holding it until the following
+    // capture meant the app idled at over a gigabyte, and every shot after the
+    // first began with that much of the jetsam budget already spent. Measured:
+    // burst:begin 1247.7MB against a ~150MB app, and the matching -1150MB drop
+    // did not appear until begin_burst, one whole burst later.
+    //
+    // Safe at this point: flush_online commits and waits, so nothing is queued
+    // against these buffers, and every caller has finished reading the mapping
+    // from metal_merge_map_online -- the output path calls this only after the
+    // encode loop, the rest are error exits that return immediately. The wait
+    // and reset mirror begin_burst, which frees the same slots, and cover the
+    // error paths that arrive with a band command buffer still open.
+    (void)metal_merge_wait_inflight_impl();
+    merge_band_cmd_reset();
+    merge_release_acc_slots();
     g_merge_online = false;
     g_merge_online_zeroed = false;
     g_online_h = g_online_w = g_online_nch = 0;
@@ -2964,8 +2995,10 @@ void metal_merge_begin_burst(bool trim_analyze_scratch) {
     g_merge_need_zero = false;
     // Drop previous burst's grow-only acc slots (1× bands can be hundreds of MB;
     // keeping them across shots causes jetsam on the next full-res merge).
-    g_merge_acc[0] = {};
-    g_merge_acc[1] = {};
+    // end_online now frees them as soon as the online output is encoded, so for
+    // that path this is only a backstop; the banded path still has no end hook
+    // and relies on this, one burst late.
+    merge_release_acc_slots();
     // Drop analyze scratch so merge prefetch is not fighting L2/Alg. 5 temps.
     // Skipped when the caller opens the frame table before analysis: this also
     // clears the reference robustness statistics, whose host copy has already

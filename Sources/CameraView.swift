@@ -730,7 +730,7 @@ struct CameraView: View {
                             Spacer()
                             Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))
                         }
-                        Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...16.0, step: 0.5)
+                        Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
                     }
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
@@ -944,6 +944,12 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
+                        Toggle("Match Tile To Scene", isOn: $cam.tuningParams.align_tile_match_scene)
+                        Text("Halves alignment tiles on the 2x2 decimate grey so one tile "
+                             + "covers the same scene area as on the full-res FFT grey. "
+                             + "No effect in FFT mode. Changes alignment output.")
+                            .font(.caption2).foregroundColor(.secondary)
+
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
                         Text(cam.tuningParams.acc_rob_adaptive
                              ? "Enlargement is derived from how many frames actually merged at each pixel, relative to the burst length. Nothing to set; Max Multiplier only caps it."

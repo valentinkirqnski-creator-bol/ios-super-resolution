@@ -365,6 +365,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
     if (tuning[@"acc_rob_adaptive"])
         cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
+    if (tuning[@"align_tile_match_scene"])
+        cfg.align_tile_match_scene = tuning[@"align_tile_match_scene"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

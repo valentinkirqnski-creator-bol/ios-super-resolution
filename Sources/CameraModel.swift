@@ -117,6 +117,9 @@ struct TuningParams: Equatable, Codable {
     var merge_arch: Int32 = 0
     /// Adapt the enlargement to the merged frame count instead of the
     /// reference implementation's step. Off reproduces the reference exactly.
+    /// Halve alignment tiles on the half-res 2x2 decimate grey so a tile covers
+    /// the same scene area it does on the full-res FFT grey. No effect on FFT.
+    var align_tile_match_scene: Bool = false
     var acc_rob_adaptive: Bool = true
     /// Only used when acc_rob_adaptive is off.
     var acc_rob_max_frame_count: Float = 2.0
@@ -144,7 +147,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_save_mask
         case accumulated_robustness_denoiser_enabled
         case merge_arch
-        case acc_rob_adaptive, acc_rob_max_frame_count
+        case acc_rob_adaptive, acc_rob_max_frame_count, align_tile_match_scene
         case acc_rob_rad_max, acc_rob_max_multiplier
     }
 
@@ -180,6 +183,7 @@ struct TuningParams: Equatable, Codable {
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
+        align_tile_match_scene = try c.decodeIfPresent(Bool.self, forKey: .align_tile_match_scene) ?? align_tile_match_scene
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1766,6 +1770,7 @@ final class CameraModel: NSObject, ObservableObject {
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
+            "align_tile_match_scene": NSNumber(value: tuningParams.align_tile_match_scene),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)

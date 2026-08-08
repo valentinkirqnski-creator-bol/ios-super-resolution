@@ -775,8 +775,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         g_ref_ica_cache.levels.assign((size_t)nlev, RefIcaLevel{});
         for (int lvl = 0; lvl < nlev; ++lvl) {
             const Image& r = ref_pyr.levels[lvl];
-            int ts = (lvl < (int)cfg.bm_tile_sizes.size())
-                         ? cfg.bm_tile_sizes[lvl] : tile_size;
+            int ts = align_tile_scaled(
+                (lvl < (int)cfg.bm_tile_sizes.size())
+                    ? cfg.bm_tile_sizes[lvl] : tile_size,
+                cfg.align_tile_match_scene, cfg.grey_method);
             RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             L.gx = compute_sobel_gradx(r);
             L.gy = compute_sobel_grady(r);
@@ -800,8 +802,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         const Image& r = ref_pyr.levels[lvl];
         const Image& m = mov_pyr.levels[lvl];
 
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size())
-                     ? cfg.bm_tile_sizes[lvl] : tile_size;
+        int ts = align_tile_scaled(
+            (lvl < (int)cfg.bm_tile_sizes.size())
+                ? cfg.bm_tile_sizes[lvl] : tile_size,
+            cfg.align_tile_match_scene, cfg.grey_method);
         int radius = (lvl < (int)cfg.bm_search_radii.size())
                      ? cfg.bm_search_radii[lvl] : 2;
 
@@ -819,9 +823,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
-            int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
-                          ? cfg.bm_tile_sizes[lvl + 1]
-                          : ts;
+            int prev_ts = align_tile_scaled(
+                ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
+                    ? cfg.bm_tile_sizes[lvl + 1] : ts,
+                cfg.align_tile_match_scene, cfg.grey_method);
             flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
         }
 
