@@ -2787,7 +2787,14 @@ static bool ensure_acc_buffers(size_t nelem, bool start_band) {
                 if (!metal_merge_wait_inflight_impl()) return false;
             }
         }
-        g_merge_need_zero = true;
+        // Banded opens a command buffer per band and accumulates every frame
+        // into it, so "new command buffer" and "zero the accumulator" mean the
+        // same thing there. Online commits after each frame -- it has to, or the
+        // frame's GPU buffers cannot be freed -- so start_band is true on every
+        // single frame, and zeroing here wiped everything merged so far. Each
+        // frame erased its predecessors and only the reference, merged last,
+        // survived into the output. The online branch above zeroes once.
+        if (!g_merge_online) g_merge_need_zero = true;
     }
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!slot.num || !slot.den || slot.capacity < bytes) {

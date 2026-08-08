@@ -765,21 +765,6 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     if (mode == 1) return false;              // forced banded
     if (mode == 2) return true;               // forced online
 
-    // Auto does not select online.
-    //
-    // On device it has never been observed to merge a comparison frame: with
-    // both the FFT and the 2x2 decimate grey the output is the reference alone,
-    // at every burst length. The accumulator is clearly being allocated -- the
-    // footprint shows it -- so the frames reach ensure_acc_buffers and are lost
-    // after that, but I have not found where by reading, and a silently
-    // single-frame result is the worst failure this pipeline can produce.
-    //
-    // So correctness first: Auto stays on the banded path, which works for both
-    // grey methods. Merge Architecture -> Online still forces it, which is how
-    // the skip counters added alongside this get exercised. Restore the
-    // comparison below once a forced run reports where the frames go.
-    return false;
-
     if (n < kOnlineMinFrames) return false;
 
     const size_t f = sizeof(f32);
