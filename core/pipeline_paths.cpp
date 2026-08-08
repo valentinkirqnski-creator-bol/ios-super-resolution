@@ -834,6 +834,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (frame_count < 2 || !loader) return Image();
 
     prof_reset();
+    prof_mark_memory("burst:begin");
     const double t_burst = prof_now_ms();
 
     Config work = cfg;
@@ -1097,6 +1098,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // After begin_burst, which clears online state along with the rest of the
     // merge globals.
     if (use_online) metal_merge_begin_online(out_h, out_w, out_nch);
+    prof_mark_memory(use_online ? "merge:online-armed" : "merge:banded-armed");
 #endif
 
     auto drain_spill = [&]() {
@@ -1290,6 +1292,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // looked fully analysed, and the output -- the reference alone --
             // came out with no error at all.
             if (contributed) n_comp_ok++;
+            prof_mark_memory("merge:online-frame");
 #endif
         } else if (stream_comp_raw) {
             // Keep flow/R/cov in RAM. For DNG-file input, spill normalized Bayer

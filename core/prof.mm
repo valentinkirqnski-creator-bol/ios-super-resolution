@@ -24,10 +24,24 @@ struct Bucket {
     uint64_t calls = 0;
 };
 
+// One row per prof_mark_memory label. The peak alone says how bad it got but
+// not what put it there; the change since the preceding mark attributes memory
+// to the stage that actually allocated it.
+struct MemMark {
+    std::string name;
+    uint64_t last = 0;      // footprint the last time this mark was reached
+    uint64_t peak = 0;      // highest it has been at this mark
+    int64_t  net = 0;       // summed change since the preceding mark, all hits
+    uint64_t hits = 0;
+};
+
 struct ProfState {
     std::mutex m;
     std::vector<Bucket> cpu;
     std::vector<Bucket> gpu;
+    std::vector<MemMark> marks;
+    uint64_t last_fp = 0;
+    bool have_last_fp = false;
     uint64_t peak_footprint = 0;
     std::string peak_label;
     uint64_t min_available = UINT64_MAX;
@@ -196,6 +210,25 @@ void prof_mark_memory(const char* label) {
     const uint64_t avail = prof_available_bytes();
     ProfState& s = state();
     std::lock_guard<std::mutex> lk(s.m);
+
+    const std::string name = label ? label : "";
+    MemMark* m = nullptr;
+    for (MemMark& e : s.marks) {
+        if (e.name == name) { m = &e; break; }
+    }
+    if (!m) {
+        MemMark e;
+        e.name = name;
+        s.marks.push_back(std::move(e));
+        m = &s.marks.back();
+    }
+    m->last = fp;
+    if (fp > m->peak) m->peak = fp;
+    if (s.have_last_fp) m->net += (int64_t)fp - (int64_t)s.last_fp;
+    m->hits++;
+    s.last_fp = fp;
+    s.have_last_fp = true;
+
     if (fp > s.peak_footprint) {
         s.peak_footprint = fp;
         s.peak_label = label ? label : "";
@@ -229,6 +262,21 @@ std::string prof_report() {
     append_table(ss, "CPU stage", "calls", s.cpu);
     append_table(ss, "GPU kernel", "dispatch", s.gpu);
 
+    if (!s.marks.empty()) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "%-28s %10s %10s %10s %6s\n",
+                      "Memory by stage", "footprint", "peak", "net +/-", "hits");
+        ss << line;
+        for (const MemMark& m : s.marks) {
+            std::snprintf(line, sizeof(line), "  %-26s %10s %10s %+9.1f %6llu\n",
+                          m.name.c_str(), fmt_mb(m.last).c_str(), fmt_mb(m.peak).c_str(),
+                          (double)m.net / (1024.0 * 1024.0),
+                          (unsigned long long)m.hits);
+            ss << line;
+        }
+        ss << "\n";
+    }
+
     if (s.peak_footprint > 0) {
         ss << "Memory\n"
            << "  peak footprint             " << fmt_mb(s.peak_footprint)
@@ -247,6 +295,9 @@ void prof_reset() {
     std::lock_guard<std::mutex> lk(s.m);
     s.cpu.clear();
     s.gpu.clear();
+    s.marks.clear();
+    s.last_fp = 0;
+    s.have_last_fp = false;
     s.peak_footprint = 0;
     s.peak_label.clear();
     s.min_available = UINT64_MAX;
