@@ -148,15 +148,7 @@ inline f32 s_curve(f32 v, f32 amount) {
     const f32 t = clampf(v, 0.f, 1.f);
     // smoothstep is the S; blending toward it keeps the strength controllable.
     const f32 s = t * t * (3.f - 2.f * t);
-    // Faded out as the tone approaches white. smoothstep has zero slope at 1, so
-    // at full strength it squeezes the top of the range into two thirds of its
-    // width -- the shoulder the tone curve just built gets flattened a second
-    // time, and highlights read as blown even where nothing clips. Measured, the
-    // top 0.15 kept 0.67x of its separation; with the fade it keeps 0.90x, and
-    // midtones are unchanged to three decimals.
-    const f32 u = clampf((t - 0.60f) / 0.40f, 0.f, 1.f);
-    const f32 w = 1.f - u * u * (3.f - 2.f * u);
-    return t + (s - t) * amount * w;
+    return t + (s - t) * amount;
 }
 
 // Weight peaking on skin hues (orange-red). Cheap stand-in for the segmentation
@@ -460,14 +452,7 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     if (st.p.contrast > 0.f) {
         const f32 yl = luma_of(sr, sg, sb);
         if (yl > kEps) {
-            f32 k = s_curve(yl, st.p.contrast) / yl;
-            // Cap the gain so the brightest channel lands at white rather than
-            // past it. Clamping each channel separately instead clips only the
-            // largest, which shifts hue -- the exact fault the luminance tone
-            // curve exists to avoid, reintroduced two steps later. A warm
-            // highlight at (0.99, 0.70, 0.55) took k = 1.069 and lost its red.
-            const f32 mx = std::max(sr, std::max(sg, sb));
-            if (mx * k > 1.f) k = 1.f / std::max(mx, kEps);
+            const f32 k = s_curve(yl, st.p.contrast) / yl;
             sr = clampf(sr * k, 0.f, 1.f);
             sg = clampf(sg * k, 0.f, 1.f);
             sb = clampf(sb * k, 0.f, 1.f);
