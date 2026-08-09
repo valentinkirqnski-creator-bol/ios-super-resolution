@@ -120,6 +120,10 @@ struct TuningParams: Equatable, Codable {
     /// Run ICA after block matching on every pyramid level, as the reference
     /// implementation does, instead of only on the finest. Half-res 2x2 grey
     /// only -- the full-res FFT path is unaffected either way.
+    /// Emit the FFT grey at half resolution. Lossless -- the low-pass leaves
+    /// nothing above half Nyquist -- and takes alignment to a quarter of the
+    /// pixels. No effect in 2x2 decimate mode.
+    var fft_grey_half_res: Bool = false
     var align_ica_per_level: Bool = true
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -170,7 +174,7 @@ struct TuningParams: Equatable, Codable {
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
-        case isp_colour_strength, isp_highlight_knee
+        case isp_colour_strength, isp_highlight_knee, fft_grey_half_res
         case acc_rob_rad_max, acc_rob_max_multiplier
     }
 
@@ -221,6 +225,7 @@ struct TuningParams: Equatable, Codable {
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
+        fft_grey_half_res = try c.decodeIfPresent(Bool.self, forKey: .fft_grey_half_res) ?? fft_grey_half_res
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1822,6 +1827,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
+            "fft_grey_half_res": NSNumber(value: tuningParams.fft_grey_half_res),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)

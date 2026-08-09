@@ -992,6 +992,12 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
+                    Toggle("FFT Grey At Half Res", isOn: $cam.tuningParams.fft_grey_half_res)
+                    Text("The FFT low-pass leaves nothing above half Nyquist, so every "
+                         + "second sample describes it exactly. Aligns on a quarter of "
+                         + "the pixels with the same clean filtering. No effect in 2x2 mode.")
+                        .font(.caption2).foregroundColor(.secondary)
+
                         Toggle("ICA Every Pyramid Level", isOn: $cam.tuningParams.align_ica_per_level)
                         Text("Refines sub-pixel alignment after block matching at every "
                              + "pyramid level, as the reference does, instead of only the "

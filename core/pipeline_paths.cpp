@@ -929,7 +929,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_mark_memory("ref:start");
     const double t_ref_grey = prof_now_ms();
     // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method, work.fft_grey_half_res);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
 
     prof_add_cpu("ref:grey(gpu)", prof_now_ms() - t_ref_grey);
@@ -1164,7 +1164,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
 
         const double t_comp_grey = prof_now_ms();
-        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method, work.fft_grey_half_res);
         prof_add_cpu("comp:grey", prof_now_ms() - t_comp_grey);
         debug_dump_bin("cpp_mov_grey_" + std::to_string(pos),
                        comp_grey.data.data(), comp_grey.data.size());

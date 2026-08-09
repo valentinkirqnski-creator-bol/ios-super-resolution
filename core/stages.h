@@ -26,7 +26,8 @@ void fftshift2d_real(std::vector<f32>& data, int h, int w);
 // ---- grey_pyramid.cpp ---------------------------------------------------
 Image compute_grey_decimate(const Image& raw, bool bayer_mode);
 Image compute_grey_fft(const Image& raw);
-Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
+Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method,
+                   bool fft_half_res = false);
 
 // Re-express a flow field estimated on the grey onto a raw-resolution tile
 // grid, scaling displacements by the resolution ratio.
