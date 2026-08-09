@@ -795,7 +795,12 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 cfg.hf_artifact_removal_enabled &&
                 pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
                 !ref_stats.hf_loss.data.empty() &&
-                ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold;
+                ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold &&
+                // Optional third condition: the aligned patch must actually
+                // differ from the reference. See hf_min_residual in types.h for
+                // why this is off by default rather than always on.
+                (cfg.hf_min_residual <= 0.f ||
+                 (std::isfinite(ratio) && ratio > cfg.hf_min_residual));
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);

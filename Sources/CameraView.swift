@@ -748,6 +748,21 @@ struct CameraView: View {
                             Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))
                         }
                         Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
+
+                        HStack {
+                            Text("Require Mismatch")
+                            Spacer()
+                            Text(cam.tuningParams.hf_min_residual <= 0
+                                 ? "off"
+                                 : String(format: "%.1f", cam.tuningParams.hf_min_residual))
+                                .foregroundColor(.secondary)
+                        }
+                        Slider(value: $cam.tuningParams.hf_min_residual, in: 0.0...8.0, step: 0.5)
+                        Text("Also require the aligned patch to differ from the reference by "
+                             + "this multiple of the noise. Off by default: a repetitive pattern "
+                             + "locked onto the wrong period still matches itself, so this can "
+                             + "mute rejection where it is most needed.")
+                            .font(.caption2).foregroundColor(.secondary)
                     }
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)

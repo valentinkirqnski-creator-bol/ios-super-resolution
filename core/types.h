@@ -262,6 +262,19 @@ struct Config {
     bool  motion_edge_rejection_enabled = true;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
+    // Third condition on high-frequency rejection: the aligned patch must also
+    // disagree with the reference by this multiple of the noise before it is
+    // thrown away. 0 disables the test, which is the behaviour up to now.
+    //
+    // Deliberately off by default. The failure this rejection targets is one
+    // where the residual stays LOW: a repetitive pattern locks onto the wrong
+    // period and still matches itself, and d_sq compares local means, which
+    // barely move when a periodic texture shifts by a period. So requiring
+    // disagreement mutes the rejection exactly where it was meant to fire.
+    // It is here because the opposite failure is real too -- rejection firing on
+    // regions that aligned perfectly well -- and only a measurement on real
+    // bursts can say which costs more.
+    float hf_min_residual = 0.f;
     float motion_edge_noise_floor_multiplier = 1.0f;
     int   motion_edge_neighborhood_radius = 1;
 

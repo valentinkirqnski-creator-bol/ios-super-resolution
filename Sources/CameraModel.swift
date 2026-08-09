@@ -91,6 +91,7 @@ struct TuningParams: Equatable, Codable {
     var alignment_grey_fft: Bool = true
     var hf_artifact_removal_enabled: Bool = false
     var hf_variance_loss_threshold: Float = 0.75
+    var hf_min_residual: Float = 0.0
     var hf_min_texture_snr: Float = 4.0
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
@@ -159,7 +160,7 @@ struct TuningParams: Equatable, Codable {
         case r_t, r_s1, r_s2, r_Mt
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
-        case hf_min_texture_snr
+        case hf_min_texture_snr, hf_min_residual
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -190,6 +191,7 @@ struct TuningParams: Equatable, Codable {
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
+        hf_min_residual = try c.decodeIfPresent(Float.self, forKey: .hf_min_residual) ?? hf_min_residual
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1792,6 +1794,7 @@ final class CameraModel: NSObject, ObservableObject {
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
+            "hf_min_residual": NSNumber(value: tuningParams.hf_min_residual),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),

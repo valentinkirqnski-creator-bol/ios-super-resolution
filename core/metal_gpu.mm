@@ -1124,8 +1124,9 @@ struct RobMaskParamsCPU {
     float beta = 0.f;
     float motion_edge_noise_floor_multiplier = 1.f;
     uint32_t motion_edge_neighborhood_radius = 0;
+    float hf_min_residual = 0.f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 72, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 76, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1502,6 +1503,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.r_t = cfg.r_t;
     mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
     mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.hf_min_residual = cfg.hf_min_residual;
     mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
     mp.motion_edge_threshold = cfg.motion_edge_threshold;
     mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
