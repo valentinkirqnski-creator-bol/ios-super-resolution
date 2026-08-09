@@ -1,0 +1,50 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - 'core/**'
+      - '.github/workflows/android.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # LibRaw is fetched, not committed -- same script the iOS build uses.
+      # Not tolerant of failure: without it CMake globs an empty source list and
+      # the failure surfaces later as a wall of undefined LibRaw symbols.
+      - name: Fetch LibRaw
+        run: |
+          chmod +x scripts/fetch_libraw.sh
+          ./scripts/fetch_libraw.sh
+          test -d vendor/LibRaw/src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1"
+
+      # gradle-version installs Gradle directly, so no wrapper needs committing
+      # or bootstrapping.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FuzeFrame-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
