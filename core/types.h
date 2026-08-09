@@ -94,12 +94,12 @@ struct IspParams {
     // the reference render was 0.414 vs 0.320 in sky and 0.260 vs 0.171 in
     // gravel; 0.6 brings both close while keeping more colour than the
     // reference has.
-    float colour_strength = 0.60f;
+    float colour_strength = 0.75f;
     // S-curve in display space, applied to luminance so hue is preserved.
     float contrast = 0.55f;
     // Saturation-dependent boost: muted colours gain, already-saturated ones
     // barely move. This is what separates vibrance from RGB *= k.
-    float vibrance = 0.40f;
+    float vibrance = 0.35f;
     // Flat multiplier applied after vibrance.
     float saturation = 1.0f;
     // Re-adds the detail layer above unity for local micro-contrast. Distinct

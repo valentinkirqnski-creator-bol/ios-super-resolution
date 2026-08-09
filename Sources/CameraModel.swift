@@ -131,9 +131,9 @@ struct TuningParams: Equatable, Codable {
     var isp_shadow: Float = 0.28
     var isp_black_point: Float = 0.065
     var isp_warmth: Float = 0.03
-    var isp_colour_strength: Float = 0.60
+    var isp_colour_strength: Float = 0.75
     var isp_contrast: Float = 0.55
-    var isp_vibrance: Float = 0.40
+    var isp_vibrance: Float = 0.35
     var isp_saturation: Float = 1.0
     var isp_local_contrast: Float = 0.20
     var isp_skin_protect: Bool = true

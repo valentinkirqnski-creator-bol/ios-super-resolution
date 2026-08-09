@@ -350,11 +350,41 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     lg = std::max(lg, 0.f);
     lb = std::max(lb, 0.f);
 
-    // Output curve on each channel, then gamma. The curve is monotone and shared
-    // across channels, so neutrals stay neutral.
-    lr = tone_curve(lr, st.white);
-    lg = tone_curve(lg, st.white);
-    lb = tone_curve(lb, st.white);
+    // Output curve on LUMINANCE, with RGB scaled by the resulting ratio.
+    //
+    // Running it on each channel independently -- which is what this did first,
+    // and what most naive tone mappers do -- compresses whichever channel is
+    // largest the hardest. That drains saturation and rotates hue: measured, a
+    // red at value 0.750 came out at 0.562, and a sky blue rotated from hue 214
+    // to 210. Dark and slightly desaturated red reads as brown; blue rotated
+    // toward cyan reads as teal. Neither can be tuned out downstream with the
+    // matrix or vibrance, because the curve itself is doing the damage.
+    const f32 y_lin = luma_of(lr, lg, lb);
+    f32 y_out = 0.f;
+    if (y_lin > kEps) {
+        y_out = tone_curve(y_lin, st.white);
+        const f32 k = y_out / y_lin;
+        lr *= k;
+        lg *= k;
+        lb *= k;
+    } else {
+        lr = lg = lb = 0.f;
+    }
+
+    // Holding luminance lets a saturated channel land above 1. Roll it back
+    // toward the neutral of that same luminance rather than clipping: a bright
+    // saturated colour then desaturates toward white the way it does optically,
+    // and clipping per channel here would reintroduce exactly the hue shift the
+    // luminance curve just removed.
+    {
+        const f32 mx = std::max(lr, std::max(lg, lb));
+        if (mx > 1.f) {
+            const f32 t = clampf((mx - 1.f) / std::max(mx - y_out, kEps), 0.f, 1.f);
+            lr += (y_out - lr) * t;
+            lg += (y_out - lg) * t;
+            lb += (y_out - lb) * t;
+        }
+    }
 
     const f32 osc = (f32)(kOetfN - 1);
     sr = lut_sample(st.oetf, clampf(lr, 0.f, 1.f), osc);
