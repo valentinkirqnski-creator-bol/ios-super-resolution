@@ -231,9 +231,18 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
     // One task per OUTPUT row, so no two tasks touch the same accumulator and
     // the reduction needs no locking. Iterating input rows instead would have
     // several tasks writing the same gy.
+    // Two grids. The mean drives exposure and the base layer; the MAX exists
+    // only to find the white point. Taking the white point from the mean grid
+    // was hiding highlights: box-averaging an 8x8 block buries any bright
+    // feature smaller than the block, so a specular or a bright window read far
+    // dimmer than it is, the shoulder was set below it, and it clipped. Measured
+    // on a mild scene the mean grid lost 14% of the true peak; on one with small
+    // highlights it loses far more.
     std::vector<f32> Y((size_t)gw * gh, 0.f);
+    std::vector<f32> Ymax((size_t)gw * gh, 0.f);
     parallel_rows(gh, 0, [&](int gy) {
         f32* out = &Y[(size_t)gy * gw];
+        f32* omax = &Ymax[(size_t)gy * gw];
         std::vector<f32> cnt((size_t)gw, 0.f);
         const int y0 = gy * f;
         const int y1 = (gy == gh - 1) ? H : std::min(H, y0 + f);
@@ -248,7 +257,9 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
                 // a blown magenta highlight as ~30% darker than it renders and
                 // under-compress it.
                 recover_highlight(rr, gg, bb, p.highlight_knee);
-                out[gx] += luma_of(rr, gg, bb);
+                const f32 l = luma_of(rr, gg, bb);
+                out[gx] += l;
+                if (l > omax[gx]) omax[gx] = l;
                 cnt[gx] += 1.f;
             }
         }
@@ -268,13 +279,23 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 
     // Everything from here on is in exposed linear.
     for (f32& v : Y) v *= exposure;
+    for (f32& v : Ymax) v *= exposure;
 
-    // White point for the output curve: the brightest content present, so the
-    // shoulder rolls off to exactly that instead of clipping it or wasting range.
-    std::vector<f32> sorted(Y);
+    // White point: where the shoulder reaches display white. Taken from the MAX
+    // grid, high up, so real highlights land just under it instead of past it.
+    // On the reference frame this drops the share of pixels driven past white
+    // from 0.125% to 0.001%.
+    //
+    // The ceiling used to be 24, which is not high enough to be inert: a dark
+    // room with a bright window pushes automatic exposure to ~166 and the peak
+    // to ~46, so the clamp itself was clipping the window. Raising it costs
+    // nothing -- white only positions the shoulder, and moving it from 24 to 46
+    // shifts middle grey by under 0.01% -- so it is now high enough never to be
+    // the binding constraint.
+    std::vector<f32> sorted(Ymax);
     std::sort(sorted.begin(), sorted.end());
-    const f32 p999 = sorted[(size_t)((sorted.size() - 1) * 0.999)];
-    st.white = clampf(p999, 1.2f, 24.f);
+    const f32 hi = sorted[(size_t)((sorted.size() - 1) * 0.9999)];
+    st.white = clampf(hi, 1.2f, 512.f);
 
     // Base layer in log2: tone mapping is a ratio operation, and doing it in log
     // makes the compression uniform across stops instead of biased toward the
