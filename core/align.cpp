@@ -503,9 +503,33 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
 
             const f32* h = hessian.at(ty, tx);
             f32 h00 = h[0], h01 = h[1], h10 = h[2], h11 = h[3];
-            f32 det = h00 * h11 - h01 * h10;
-            if (std::fabs(det) < 1e-5f) continue;
-            f32 det_inv = 1.f / det;
+            // Damped, scale-relative inverse instead of an absolute reject.
+            //
+            // The guard here was |det| < 1e-5, but det scales with contrast to
+            // the fourth power and with tile area, so it is not a conditioning
+            // test at all -- it rejects dim tiles. Measured on a real frame with
+            // this gradient operator and tile size it skipped 46.7% of tiles,
+            // while only 1.0% were genuinely aperture-limited (second eigenvalue
+            // under 1% of the first) and the median tile was near isotropic at
+            // 0.64. Every skipped tile then merged on integer-precision flow,
+            // which places samples at the wrong sub-pixel position: averaging,
+            // not super-resolution.
+            //
+            // Levenberg damping needs no threshold. Adding lambda to the
+            // diagonal makes H invertible whatever its conditioning: a
+            // well-conditioned tile is refined as before (lambda measures ~0.08%
+            // of its large eigenvalue) and a tile that is genuinely
+            // aperture-limited refines across the edge while the unobservable
+            // direction along it is pulled toward no change rather than the
+            // whole tile being abandoned.
+            const f32 trace = h00 + h11;
+            if (!(trace > 0.f)) continue;   // no gradient anywhere in the tile
+            const f32 lambda = 5e-4f * trace;
+            h00 += lambda;
+            h11 += lambda;
+            const f32 det = h00 * h11 - h01 * h10;
+            if (!(det > 0.f)) continue;
+            const f32 det_inv = 1.f / det;
 
             f32 fx = flow.dx(ty, tx);
             f32 fy = flow.dy(ty, tx);

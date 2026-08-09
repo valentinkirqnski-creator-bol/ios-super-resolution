@@ -2092,8 +2092,17 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     uint ho = tid * 4u;
     float h00 = hess[ho + 0u], h01 = hess[ho + 1u];
     float h10 = hess[ho + 2u], h11 = hess[ho + 3u];
+    // Matches align.cpp: damped scale-relative inverse, not an absolute reject.
+    // |det| < 1e-5 rejected dim tiles rather than ill-conditioned ones -- 46.7%
+    // of a measured frame against 1.0% actually aperture-limited -- and each one
+    // then merged on integer-precision flow.
+    float trace = h00 + h11;
+    if (!(trace > 0.f)) return;     // no gradient anywhere in the tile
+    float lambda = 5e-4f * trace;
+    h00 += lambda;
+    h11 += lambda;
     float det = h00 * h11 - h01 * h10;
-    if (fabs(det) < 1e-5f) return; // leave flow unchanged (460-main Python early exit)
+    if (!(det > 0.f)) return;
     float det_inv = 1.f / det;
 
     float fx = flow[tid * 2u + 0u];
