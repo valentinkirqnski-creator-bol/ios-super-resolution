@@ -160,7 +160,15 @@ static bool invert_3x3(const float* m, float* inv) {
     return true;
 }
 
-static bool derive_cam_to_srgb_from_color_matrix(const float* color_matrix, float* out) {
+// Scale every row to sum to this. The matrix is applied AFTER automatic
+// exposure, so its overall gain feeds straight into the tone curve -- which was
+// tuned against a matrix whose rows summed to about 0.612. Equal sums also mean
+// a neutral camera value renders neutral, which unequal ones quietly do not.
+static constexpr float kNeutralRowSum = 0.6124f;
+
+static bool derive_cam_to_srgb_from_color_matrix(const float* color_matrix,
+                                                 const float* analog_balance,
+                                                 float* out) {
     // DNG ColorMatrix is XYZ -> camera. Invert to camera -> XYZ, then convert XYZ to sRGB.
     float cam_to_xyz[9];
     if (!color_matrix || !invert_3x3(color_matrix, cam_to_xyz)) return false;
@@ -177,6 +185,31 @@ static bool derive_cam_to_srgb_from_color_matrix(const float* color_matrix, floa
                 xyz_to_srgb[r * 3 + 2] * cam_to_xyz[2 * 3 + col];
         }
     }
+    // The stored pixels are pre-white-balanced, so what sits in the file is
+    // AnalogBalance . ColorMatrix . XYZ, not ColorMatrix . XYZ. Undoing only the
+    // colour matrix therefore leaves the WB gains baked into the transform.
+    // Dividing column c by AnalogBalance[c] is the missing inverse, and it is
+    // what put red 17% low in blues (rendered hue 206 against a reference 217,
+    // read as teal) and 25% high in warm areas (hue 22 against 31).
+    //
+    // It also means the correct matrix differs per shot, because AnalogBalance
+    // is that shot's white balance -- one hardcoded matrix cannot be right for
+    // every capture.
+    if (analog_balance) {
+        for (int c = 0; c < 3; ++c) {
+            const float ab = analog_balance[c];
+            if (!(std::fabs(ab) > 1e-6f) || !std::isfinite(ab)) return false;
+            for (int r = 0; r < 3; ++r) out[r * 3 + c] /= ab;
+        }
+    }
+
+    for (int r = 0; r < 3; ++r) {
+        const float sum = out[r * 3 + 0] + out[r * 3 + 1] + out[r * 3 + 2];
+        if (!(std::fabs(sum) > 1e-6f) || !std::isfinite(sum)) return false;
+        const float k = kNeutralRowSum / sum;
+        for (int c = 0; c < 3; ++c) out[r * 3 + c] *= k;
+    }
+
     for (int k = 0; k < 9; ++k)
         if (!std::isfinite(out[k])) return false;
     return true;
@@ -217,8 +250,13 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              uint32_t& strip_byte_counts_offset_out) {
     float derived_cam_to_srgb[9];
     const float* jpeg_cam_to_srgb = cam_to_srgb;
+    // When the pixels are pre-white-balanced the gains go out as AnalogBalance
+    // below, so the derivation has to undo them here too -- otherwise the matrix
+    // cached in the private tag disagrees with the one the loader reconstructs
+    // from the file, and the two render paths drift apart.
+    const float* ab = (pixels_prewhitened && wb) ? wb : nullptr;
     if (!jpeg_cam_to_srgb && cm &&
-        derive_cam_to_srgb_from_color_matrix(cm, derived_cam_to_srgb)) {
+        derive_cam_to_srgb_from_color_matrix(cm, ab, derived_cam_to_srgb)) {
         jpeg_cam_to_srgb = derived_cam_to_srgb;
     }
 
@@ -792,6 +830,8 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
     bool private_color = false;
     bool has_color_matrix = false;
     float color_matrix[9] = {0};
+    bool has_analog_balance = false;
+    float analog_balance[3] = {1.f, 1.f, 1.f};
     for (uint16_t i = 0; i < nent; ++i) {
         const uint8_t* e = file.data() + ifd + 2 + i * 12;
         uint16_t tag = r16(e), type = r16(e + 2);
@@ -829,10 +869,29 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                 has_color_matrix = ok;
             }
         }
+        if (tag == 50727 && (type == T_RATIONAL || type == T_SRATIONAL) && count >= 3) {
+            const uint32_t bytes = count * type_size(type);
+            uint32_t off = (bytes <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 3u * 8u <= file.size()) {
+                bool ok = true;
+                for (int k = 0; k < 3; ++k) {
+                    const uint8_t* p = file.data() + off + (uint32_t)k * 8u;
+                    const int32_t num = (type == T_SRATIONAL)
+                        ? (int32_t)r32(p) : (int32_t)(uint32_t)r32(p);
+                    const int32_t den = (int32_t)r32(p + 4);
+                    if (den == 0) { ok = false; break; }
+                    analog_balance[k] = (float)num / (float)den;
+                    ok = ok && std::isfinite(analog_balance[k]) &&
+                         std::fabs(analog_balance[k]) > 1e-6f;
+                }
+                has_analog_balance = ok;
+            }
+        }
     }
     if ((!private_color || is_identity_3x3(cam_to_srgb)) && has_color_matrix) {
         float derived[9];
-        if (derive_cam_to_srgb_from_color_matrix(color_matrix, derived)) {
+        if (derive_cam_to_srgb_from_color_matrix(
+                color_matrix, has_analog_balance ? analog_balance : nullptr, derived)) {
             for (int k = 0; k < 9; ++k) cam_to_srgb[k] = derived[k];
             has_color = true;
         }

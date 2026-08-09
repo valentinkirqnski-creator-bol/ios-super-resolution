@@ -793,7 +793,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // ISP needs a global view for automatic exposure and the local gain map.
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
-                         hhsr::isp_analyse(rgb.data(), W, H, nullptr, g_isp, isp);
+                         hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
     // Row-parallel: 48MP through a scalar loop on one core was the difference
     // between a JPEG appearing at once and taking seconds. Rows are independent
@@ -875,7 +875,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // cannot disagree about how the shot looks.
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
-                         hhsr::isp_analyse(rgb.data(), W, H, nullptr, g_isp, isp);
+                         hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
     std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
     auto sample_tonemap = [&](int sx, int sy, float& sr, float& sg, float& sb) {
