@@ -941,6 +941,7 @@ struct CameraView: View {
 
                 if cam.tuningParams.isp_enabled {
                     Section(header: Text("Rendering \u{2014} Colour")) {
+                        ispRow("Colour Strength", $cam.tuningParams.isp_colour_strength, 0.0...1.0)
                         ispRow("Contrast", $cam.tuningParams.isp_contrast, 0.0...1.0)
                         ispRow("Vibrance", $cam.tuningParams.isp_vibrance, 0.0...1.5)
                         ispRow("Saturation", $cam.tuningParams.isp_saturation, 0.5...1.5)

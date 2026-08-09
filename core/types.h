@@ -86,12 +86,20 @@ struct IspParams {
     // about 6% short on red against the reference renders, which reads as a
     // cool, flat image. Red only: also cutting blue overshot and left B at 92
     // against a reference 98.
-    float warmth = 0.05f;
+    float warmth = 0.03f;
+    // How much of the measured camera->sRGB matrix to apply, blended toward
+    // identity with the neutral response held constant. At full strength that
+    // matrix crushes a sky blue's red channel from 0.40 to 0.053, which reads as
+    // teal, and pushes warm midtones orange-brown. Measured saturation against
+    // the reference render was 0.414 vs 0.320 in sky and 0.260 vs 0.171 in
+    // gravel; 0.6 brings both close while keeping more colour than the
+    // reference has.
+    float colour_strength = 0.60f;
     // S-curve in display space, applied to luminance so hue is preserved.
     float contrast = 0.55f;
     // Saturation-dependent boost: muted colours gain, already-saturated ones
     // barely move. This is what separates vibrance from RGB *= k.
-    float vibrance = 0.50f;
+    float vibrance = 0.40f;
     // Flat multiplier applied after vibrance.
     float saturation = 1.0f;
     // Re-adds the detail layer above unity for local micro-contrast. Distinct

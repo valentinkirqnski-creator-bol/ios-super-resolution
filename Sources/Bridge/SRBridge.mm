@@ -378,6 +378,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"isp_shadow"])         cfg.isp.shadow_lift = tuning[@"isp_shadow"].floatValue;
     if (tuning[@"isp_black_point"])    cfg.isp.black_point = tuning[@"isp_black_point"].floatValue;
     if (tuning[@"isp_warmth"])         cfg.isp.warmth = tuning[@"isp_warmth"].floatValue;
+    if (tuning[@"isp_colour_strength"]) cfg.isp.colour_strength = tuning[@"isp_colour_strength"].floatValue;
     if (tuning[@"isp_contrast"])       cfg.isp.contrast = tuning[@"isp_contrast"].floatValue;
     if (tuning[@"isp_vibrance"])       cfg.isp.vibrance = tuning[@"isp_vibrance"].floatValue;
     if (tuning[@"isp_saturation"])     cfg.isp.saturation = tuning[@"isp_saturation"].floatValue;
@@ -793,23 +794,28 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, nullptr, g_isp, isp);
 
+    // Row-parallel: 48MP through a scalar loop on one core was the difference
+    // between a JPEG appearing at once and taking seconds. Rows are independent
+    // -- the gain map is read-only by now -- so this needs no synchronisation.
     std::vector<uint8_t> srgb((size_t)W * (size_t)H * 4);
-    const size_t n = (size_t)W * (size_t)H;
-    for (size_t i = 0; i < n; ++i) {
-        float r = rgb[i * 3 + 0] * (1.f / 65535.f);
-        float g = rgb[i * 3 + 1] * (1.f / 65535.f);
-        float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        float sr, sg, sb;
-        if (use_isp)
-            hhsr::isp_render(isp, r, g, b, (int)(i % (size_t)W), (int)(i / (size_t)W),
-                             sr, sg, sb);
-        else
-            render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-        srgb[i * 4 + 0] = (uint8_t)std::lround(sr * 255.f);
-        srgb[i * 4 + 1] = (uint8_t)std::lround(sg * 255.f);
-        srgb[i * 4 + 2] = (uint8_t)std::lround(sb * 255.f);
-        srgb[i * 4 + 3] = 255;
-    }
+    hhsr::parallel_rows(H, 0, [&](int y) {
+        const size_t row = (size_t)y * (size_t)W;
+        for (int x = 0; x < W; ++x) {
+            const size_t i = row + (size_t)x;
+            float r = rgb[i * 3 + 0] * (1.f / 65535.f);
+            float g = rgb[i * 3 + 1] * (1.f / 65535.f);
+            float b = rgb[i * 3 + 2] * (1.f / 65535.f);
+            float sr, sg, sb;
+            if (use_isp)
+                hhsr::isp_render(isp, r, g, b, x, y, sr, sg, sb);
+            else
+                render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+            srgb[i * 4 + 0] = (uint8_t)std::lround(sr * 255.f);
+            srgb[i * 4 + 1] = (uint8_t)std::lround(sg * 255.f);
+            srgb[i * 4 + 2] = (uint8_t)std::lround(sb * 255.f);
+            srgb[i * 4 + 3] = 255;
+        }
+    });
     rgb.clear();
     rgb.shrink_to_fit();
 
@@ -882,7 +888,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         else         render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
     };
 
-    for (int y = 0; y < oh; ++y) {
+    hhsr::parallel_rows(oh, 0, [&](int y) {
         int sy = (scale < 1.f) ? (int)((y + 0.5f) / scale) : y;
         for (int x = 0; x < ow; ++x) {
             int sx = (scale < 1.f) ? (int)((x + 0.5f) / scale) : x;
@@ -894,7 +900,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
             srgb[o + 2] = (uint8_t)std::lround(sb * 255.f);
             srgb[o + 3] = 255;
         }
-    }
+    });
     rgb.clear();
     rgb.shrink_to_fit();
 

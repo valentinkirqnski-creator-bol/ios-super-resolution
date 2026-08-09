@@ -44,7 +44,13 @@ struct IspState {
     std::vector<f32> base;           // exposed linear luminance, blurred
     f32 exposure = 1.f;              // linear multiplier applied before anything
     f32 white = 4.f;                 // output curve maps this to display 1.0
-    f32 m[9] = {1,0,0, 0,1,0, 0,0,1};// camera linear -> sRGB linear
+    f32 m[9] = {1,0,0, 0,1,0, 0,0,1};// camera linear -> sRGB linear, already
+                                     // blended by colour_strength
+    // std::pow dominated the render: srgb_oetf called it three times per pixel
+    // and the local-contrast term once more, about 190M calls at 48MP on one
+    // thread. Both are fixed-shape curves, so they are tabulated once here.
+    std::vector<f32> oetf;           // [0,1] -> display, kOetfN entries
+    std::vector<f32> lcurve;         // detail ratio ^ local_contrast, kLcN entries
     IspParams p;
     bool valid = false;
 };

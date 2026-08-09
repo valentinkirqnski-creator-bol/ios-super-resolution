@@ -4,6 +4,8 @@
 #include <cmath>
 #include <vector>
 
+#include "parallel.h"
+
 namespace hhsr {
 namespace {
 
@@ -104,9 +106,25 @@ inline f32 tone_curve(f32 x, f32 white) {
     return x * (1.f + x / w2) / (1.f + x);
 }
 
-inline f32 srgb_oetf(f32 v) {
+inline f32 srgb_oetf_exact(f32 v) {
     v = clampf(v, 0.f, 1.f);
     return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+}
+
+// Table sizes chosen so linear interpolation stays well under a quantisation
+// step: the OETF's worst curvature is near v=0.003, where the interpolation
+// error works out around 0.02 of a 255-level step.
+constexpr int kOetfN = 2048;
+constexpr int kLcN = 2048;
+constexpr f32 kLcMax = 20.f;     // matches the clamp on the detail ratio
+
+inline f32 lut_sample(const std::vector<f32>& t, f32 x, f32 scale) {
+    const f32 p = x * scale;
+    const int i = (int)p;
+    if (i < 0) return t.front();
+    if (i >= (int)t.size() - 1) return t.back();
+    const f32 f = p - (f32)i;
+    return t[i] + (t[i + 1] - t[i]) * f;
 }
 
 // Contrast as an S-curve about mid display grey. Applied to luminance and then
@@ -153,6 +171,36 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
     for (int i = 0; i < 9; ++i)
         st.m[i] = cam_to_srgb ? cam_to_srgb[i] : kDefaultCamToSrgb[i];
 
+    // Blend toward identity, then rescale each row back to its original sum so
+    // the neutral response -- and therefore the exposure -- does not move.
+    // Baked in here so it costs nothing per pixel.
+    const f32 cs = clampf(p.colour_strength, 0.f, 1.f);
+    if (cs < 1.f) {
+        for (int r = 0; r < 3; ++r) {
+            const f32 want = st.m[r * 3 + 0] + st.m[r * 3 + 1] + st.m[r * 3 + 2];
+            f32 got = 0.f;
+            for (int c = 0; c < 3; ++c) {
+                const f32 ident = (r == c) ? 1.f : 0.f;
+                st.m[r * 3 + c] = ident * (1.f - cs) + st.m[r * 3 + c] * cs;
+                got += st.m[r * 3 + c];
+            }
+            if (std::fabs(got) > 1e-6f) {
+                const f32 k = want / got;
+                for (int c = 0; c < 3; ++c) st.m[r * 3 + c] *= k;
+            }
+        }
+    }
+
+    st.oetf.resize(kOetfN);
+    for (int i = 0; i < kOetfN; ++i)
+        st.oetf[i] = srgb_oetf_exact((f32)i / (f32)(kOetfN - 1));
+    st.lcurve.resize(kLcN);
+    const f32 lc = std::max(p.local_contrast, 0.f);
+    for (int i = 0; i < kLcN; ++i) {
+        const f32 ratio = (f32)i / (f32)(kLcN - 1) * kLcMax;
+        st.lcurve[i] = (lc > 0.f) ? std::pow(std::max(ratio, 1e-4f), lc) : 1.f;
+    }
+
     // Downsample so the short side keeps ~128 samples: enough for the base layer
     // to follow real scene structure, small enough that the whole analysis is a
     // few MB and a few milliseconds at 48MP.
@@ -167,21 +215,27 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 
     // Box-average luminance into the low-res grid. Averaging rather than
     // point-sampling keeps the base layer free of the input's own noise.
+    // One task per OUTPUT row, so no two tasks touch the same accumulator and
+    // the reduction needs no locking. Iterating input rows instead would have
+    // several tasks writing the same gy.
     std::vector<f32> Y((size_t)gw * gh, 0.f);
-    std::vector<f32> cnt((size_t)gw * gh, 0.f);
-    for (int y = 0; y < H; ++y) {
-        const int gy = std::min(gh - 1, y / f);
-        const uint16_t* row = rgb16 + (size_t)y * W * 3;
-        for (int x = 0; x < W; ++x) {
-            const int gx = std::min(gw - 1, x / f);
-            const f32 l = luma_of(row[x * 3 + 0] * (1.f / 65535.f),
-                                  row[x * 3 + 1] * (1.f / 65535.f),
-                                  row[x * 3 + 2] * (1.f / 65535.f));
-            Y[(size_t)gy * gw + gx] += l;
-            cnt[(size_t)gy * gw + gx] += 1.f;
+    parallel_rows(gh, 0, [&](int gy) {
+        f32* out = &Y[(size_t)gy * gw];
+        std::vector<f32> cnt((size_t)gw, 0.f);
+        const int y0 = gy * f;
+        const int y1 = (gy == gh - 1) ? H : std::min(H, y0 + f);
+        for (int y = y0; y < y1; ++y) {
+            const uint16_t* row = rgb16 + (size_t)y * W * 3;
+            for (int x = 0; x < W; ++x) {
+                const int gx = std::min(gw - 1, x / f);
+                out[gx] += luma_of(row[x * 3 + 0] * (1.f / 65535.f),
+                                   row[x * 3 + 1] * (1.f / 65535.f),
+                                   row[x * 3 + 2] * (1.f / 65535.f));
+                cnt[gx] += 1.f;
+            }
         }
-    }
-    for (size_t i = 0; i < Y.size(); ++i) Y[i] /= std::max(cnt[i], 1.f);
+        for (int gx = 0; gx < gw; ++gx) out[gx] /= std::max(cnt[gx], 1.f);
+    });
 
     // Automatic exposure from the log-average, which tracks what the scene
     // actually contains rather than its extremes: a small bright window does not
@@ -274,7 +328,8 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
             // micro-contrast: no high-pass, so no halo and no noise gained.
             const f32 base = sample_map(st.base, st.gw, st.gh, x, y, st.shift);
             const f32 ratio = luma_of(r, g, b) / std::max(base, kEps);
-            gain *= std::pow(clampf(ratio, 0.05f, 20.f), st.p.local_contrast);
+            gain *= lut_sample(st.lcurve, clampf(ratio, 0.05f, kLcMax),
+                               (f32)(kLcN - 1) / kLcMax);
         }
         // One factor for all three channels: hue survives.
         r *= gain;
@@ -301,9 +356,10 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     lg = tone_curve(lg, st.white);
     lb = tone_curve(lb, st.white);
 
-    sr = srgb_oetf(lr);
-    sg = srgb_oetf(lg);
-    sb = srgb_oetf(lb);
+    const f32 osc = (f32)(kOetfN - 1);
+    sr = lut_sample(st.oetf, clampf(lr, 0.f, 1.f), osc);
+    sg = lut_sample(st.oetf, clampf(lg, 0.f, 1.f), osc);
+    sb = lut_sample(st.oetf, clampf(lb, 0.f, 1.f), osc);
 
     // Black point. Without it the shadow lift leaves the darkest pixels grey,
     // and the image reads flat however much contrast is applied afterwards.
