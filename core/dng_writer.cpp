@@ -274,6 +274,12 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     else
         ifd.shortv(262, 34892);        // LinearRaw
     ifd.longv(273, 0);                 // StripOffsets (patched)
+    // SubIFDs, reserved empty. Adding this tag later would grow IFD0 by 12
+    // bytes and push the image strip along with it, which is why embedding a
+    // preview used to rebuild the entire file -- a 292MB read plus a 292MB
+    // write plus both buffers resident, just to attach a thumbnail. Reserved
+    // here, embedding becomes an append and a four-byte patch.
+    ifd.longv(330, 0);                 // SubIFDs (patched by embed_dng_jpeg_preview)
     if (orientation >= 1 && orientation <= 8)
         ifd.shortv(274, (uint16_t)orientation);
     ifd.shortv(277, 3);                // SamplesPerPixel
@@ -560,12 +566,111 @@ DngStreamWriter::~DngStreamWriter() {
     if (f_) fclose(f_);
 }
 
+// Build the preview SubIFD. Every value fits inline, so it needs no heap.
+static std::vector<uint8_t> build_preview_ifd(uint32_t jpeg_off, size_t jpeg_len,
+                                              int jpeg_w, int jpeg_h) {
+    IFD prev;
+    prev.longv(254, 1);               // NewSubfileType = reduced resolution
+    prev.longv(256, (uint32_t)jpeg_w);
+    prev.longv(257, (uint32_t)jpeg_h);
+    prev.shorts(258, {8, 8, 8});
+    prev.shortv(259, 7);              // JPEG
+    prev.shortv(262, 6);              // YCbCr
+    prev.longv(273, jpeg_off);        // StripOffsets
+    prev.shortv(277, 3);
+    prev.longv(278, (uint32_t)jpeg_h);
+    prev.longv(279, (uint32_t)jpeg_len);
+    prev.shortv(284, 1);
+    prev.shorts(530, {2, 2});
+    prev.shortv(531, 1);
+    std::sort(prev.e.begin(), prev.e.end(),
+              [](const Entry& a, const Entry& b) { return a.tag < b.tag; });
+    std::vector<uint8_t> out;
+    w16(out, (uint16_t)prev.e.size());
+    for (const auto& e : prev.e) {
+        w16(out, e.tag);
+        w16(out, e.type);
+        w32(out, e.count);
+        w32(out, e.inlineval);
+    }
+    w32(out, 0);                      // next IFD
+    return out;
+}
+
+// Append the preview and point the reserved SubIFDs tag at it. Returns false if
+// the tag is absent, so the caller can fall back to rebuilding the file.
+static bool embed_preview_append(const std::string& path,
+                                 const uint8_t* jpeg, size_t jpeg_len,
+                                 int jpeg_w, int jpeg_h) {
+    FILE* f = fopen(path.c_str(), "r+b");
+    if (!f) return false;
+    uint8_t hdr[8];
+    if (fread(hdr, 1, 8, f) != 8 || hdr[0] != 'I' || hdr[1] != 'I' || r16(hdr + 2) != 42) {
+        fclose(f);
+        return false;
+    }
+    const uint32_t ifd0 = r32(hdr + 4);
+    if (fseek(f, (long)ifd0, SEEK_SET) != 0) { fclose(f); return false; }
+    uint8_t cnt[2];
+    if (fread(cnt, 1, 2, f) != 2) { fclose(f); return false; }
+    const uint16_t nent = r16(cnt);
+    if (nent == 0 || nent > 512) { fclose(f); return false; }
+    std::vector<uint8_t> entries((size_t)nent * 12u);
+    if (fread(entries.data(), 1, entries.size(), f) != entries.size()) {
+        fclose(f);
+        return false;
+    }
+
+    long subifd_value_off = -1;
+    uint32_t existing = 0;
+    for (uint16_t i = 0; i < nent; ++i) {
+        const uint8_t* e = entries.data() + (size_t)i * 12u;
+        if (r16(e) == 330) {
+            subifd_value_off = (long)ifd0 + 2 + (long)i * 12 + 8;
+            existing = r32(e + 8);
+            break;
+        }
+    }
+    if (subifd_value_off < 0) { fclose(f); return false; }   // old file, rebuild
+    if (existing != 0) { fclose(f); return true; }            // already embedded
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long end = ftell(f);
+    if (end < 16) { fclose(f); return false; }
+    if (end & 1) { const uint8_t pad = 0; fwrite(&pad, 1, 1, f); ++end; }
+    const uint32_t jpeg_off = (uint32_t)end;
+    if (fwrite(jpeg, 1, jpeg_len, f) != jpeg_len) { fclose(f); return false; }
+
+    long after = jpeg_off + (long)jpeg_len;
+    if (after & 1) { const uint8_t pad = 0; fwrite(&pad, 1, 1, f); ++after; }
+    const uint32_t ifd1_off = (uint32_t)after;
+    const std::vector<uint8_t> ifd1 =
+        build_preview_ifd(jpeg_off, jpeg_len, jpeg_w, jpeg_h);
+    if (fwrite(ifd1.data(), 1, ifd1.size(), f) != ifd1.size()) { fclose(f); return false; }
+
+    // Patch last: until this lands the appended bytes are unreferenced, so a
+    // failure part-way leaves a DNG that still reads correctly, just without a
+    // preview.
+    if (fseek(f, subifd_value_off, SEEK_SET) != 0) { fclose(f); return false; }
+    uint8_t v[4] = {(uint8_t)(ifd1_off & 0xFF), (uint8_t)((ifd1_off >> 8) & 0xFF),
+                    (uint8_t)((ifd1_off >> 16) & 0xFF), (uint8_t)((ifd1_off >> 24) & 0xFF)};
+    const bool ok = fwrite(v, 1, 4, f) == 4;
+    fclose(f);
+    return ok;
+}
+
 bool embed_dng_jpeg_preview(const std::string& path,
                             const uint8_t* jpeg, size_t jpeg_len,
                             int jpeg_w, int jpeg_h) {
     if (!jpeg || jpeg_len < 4 || jpeg_w <= 0 || jpeg_h <= 0) return false;
     // SOI marker
     if (jpeg[0] != 0xFF || jpeg[1] != 0xD8) return false;
+
+    // Fast path: the writer reserves an empty SubIFDs tag, so the preview can be
+    // appended and the tag patched in place. Touches a few kilobytes instead of
+    // reading and rewriting the whole file. Falls back to the rebuild below for
+    // DNGs written before the slot existed.
+    if (embed_preview_append(path, jpeg, jpeg_len, jpeg_w, jpeg_h)) return true;
 
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -583,10 +688,13 @@ bool embed_dng_jpeg_preview(const std::string& path,
     uint16_t nent = r16(file.data() + ifd0);
     if (ifd0 + 2u + (uint32_t)nent * 12u + 4u > file.size()) return false;
 
-    // Already has SubIFDs — leave alone (idempotent).
+    // Already has a preview — leave alone (idempotent). The value must be
+    // checked, not just the tag: the writer now reserves an EMPTY SubIFDs entry
+    // so the fast path above can patch it, and testing the tag alone would treat
+    // every freshly written DNG as already done and silently embed nothing.
     for (uint16_t i = 0; i < nent; ++i) {
         const uint8_t* e = file.data() + ifd0 + 2 + i * 12;
-        if (r16(e) == 330) return true;
+        if (r16(e) == 330 && r32(e + 8) != 0) return true;
     }
 
     uint32_t strip_off = 0, strip_bc = 0;
