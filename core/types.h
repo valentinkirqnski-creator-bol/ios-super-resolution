@@ -187,11 +187,41 @@ struct Config {
     // refinement leaves its output bit-identical to before.
     bool align_ica_per_level = true;
 
+    // Extend per-level ICA to the full-res FFT grey as well.
+    //
+    // The restriction above was for bit-compatibility, not for any technical
+    // reason, and it leaves the FFT path in the worse of the two positions:
+    // levels 3..1 emit integer-only flow, level 1 runs at half scale so its
+    // residual is up to 0.5px there, upscale_flow multiplies that by 2, and
+    // exactly 1.0px arrives at a finest level whose search radius is 1. The
+    // budget is spent before level 0 begins, so anything else that adds error
+    // -- upscale_flow_460 taking a neighbour's vector, aliasing from the
+    // decimation, motion varying inside a tile -- lands outside +/-1 and is
+    // never corrected. That is what a tile-shaped displacement in the output
+    // looks like.
+    //
+    // Costs memory rather than time: the reference gradient/Hessian cache goes
+    // resident for the burst, and the FFT grey has 4x the pixels of the
+    // decimate grey, so roughly +120MB at 12MP. It saves compute, since those
+    // gradients are currently rebuilt per frame.
+    bool align_ica_per_level_fft = false;
+
     // True when ICA should run on every pyramid level rather than only the
-    // finest. Half-res grey only, so the FFT path is untouched.
+    // finest.
     bool ica_every_level() const {
-        return align_ica_per_level && grey_method == GreyMethod::Decimate;
+        return align_ica_per_level &&
+               (grey_method == GreyMethod::Decimate || align_ica_per_level_fft);
     }
+
+    // Override the finest level's block-match search radius. 0 keeps
+    // bm_search_radii[0].
+    //
+    // The default of 1 assumes the flow arriving from level 1 is already
+    // sub-pixel, which is only true when ICA has run there. Raising it buys
+    // margin directly, at (2r+1)^2 / 9 times the finest level's search cost:
+    // 2.8x at radius 2, 5.4x at radius 3. The finest level is the most
+    // expensive one, so this is not free.
+    int align_fine_search_radius = 0;
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
     // With this false the plan stays empty, so every frame enters align() with a

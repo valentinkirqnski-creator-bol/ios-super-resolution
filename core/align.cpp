@@ -809,6 +809,11 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                      ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size())
                      ? cfg.bm_search_radii[lvl] : 2;
+        // Finest level only: the default 1 leaves no margin once anything
+        // upstream contributes error. The Metal search derives its candidate
+        // span from this same radius, so both paths widen together.
+        if (lvl == 0 && cfg.align_fine_search_radius > 0)
+            radius = cfg.align_fine_search_radius;
 
         // Tile grid from padded ref level (Python: h // tile_size)
         int ny = r.h / ts;

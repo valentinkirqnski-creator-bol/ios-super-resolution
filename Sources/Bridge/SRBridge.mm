@@ -388,6 +388,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     g_isp = cfg.isp;
     if (tuning[@"align_ica_per_level"])
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
+    if (tuning[@"align_ica_per_level_fft"])
+        cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
+    if (tuning[@"align_fine_search_radius"]) {
+        const int r = tuning[@"align_fine_search_radius"].intValue;
+        cfg.align_fine_search_radius = (r >= 1 && r <= 4) ? r : 0;
+    }
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

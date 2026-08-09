@@ -995,7 +995,34 @@ struct CameraView: View {
                         Toggle("ICA Every Pyramid Level", isOn: $cam.tuningParams.align_ica_per_level)
                         Text("Refines sub-pixel alignment after block matching at every "
                              + "pyramid level, as the reference does, instead of only the "
-                             + "finest. 2x2 decimate grey only; no effect in FFT mode.")
+                             + "finest. 2x2 decimate grey only unless the switch below is on.")
+                            .font(.caption2).foregroundColor(.secondary)
+
+                        Toggle("ICA Per Level In FFT Mode",
+                               isOn: $cam.tuningParams.align_ica_per_level_fft)
+                        Text("Extends the above to the full-res FFT grey. Without it that "
+                             + "path feeds integer-only flow into a finest level that can "
+                             + "only search +/-1 pixel, so the correction budget is spent "
+                             + "before it starts and tile-shaped displacements survive. "
+                             + "Costs about 120MB at 12MP.")
+                            .font(.caption2).foregroundColor(.secondary)
+
+                        HStack {
+                            Text("Finest Search Radius")
+                            Spacer()
+                            Text(cam.tuningParams.align_fine_search_radius == 0
+                                 ? "default (1)"
+                                 : "\(cam.tuningParams.align_fine_search_radius)")
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { Double(cam.tuningParams.align_fine_search_radius) },
+                                set: { cam.tuningParams.align_fine_search_radius = Int($0.rounded()) }),
+                            in: 0...4, step: 1)
+                        Text("How far the finest pyramid level may correct the flow it "
+                             + "inherits. Raising it buys margin when something upstream "
+                             + "adds error, at (2r+1)^2/9 times that level's search cost: "
+                             + "2.8x at 2, 5.4x at 3. This is the most expensive level.")
                             .font(.caption2).foregroundColor(.secondary)
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
