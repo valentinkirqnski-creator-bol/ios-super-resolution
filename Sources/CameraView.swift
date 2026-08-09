@@ -693,9 +693,80 @@ struct CameraView: View {
         }
     }
 
-    private var tuningSettingsView: some View {
-        NavigationView {
-            Form {
+    // Extracted, not inlined into tuningSettingsView. That body is one
+    // expression and the Swift type checker gives up on it past a certain size
+    // -- "unable to type-check this expression in reasonable time". A computed
+    // property is type-checked on its own, and it also counts as one child
+    // against the 10-child ViewBuilder limit instead of six.
+    //
+    // Long help text lives in one literal each: `+` between string literals is
+    // an operator overload the checker has to resolve, and there were enough of
+    // them here to matter.
+    @ViewBuilder
+    private var structureGuardSection: some View {
+        Toggle("Structure Mismatch Guard", isOn: $cam.tuningParams.struct_reject_enabled)
+        Text("""
+             Rejects a patch whose structure does not match the reference even though its \
+             local brightness does. The standard test compares 3x3 means, which cannot see \
+             a stripe pattern locked one period out or skin displaced within skin -- the \
+             misalignments that survive as tile-shaped blocks on a moving subject.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+
+        if cam.tuningParams.struct_reject_enabled {
+            HStack {
+                Text("Residual Tolerance")
+                Spacer()
+                Text(String(format: "%.1f", cam.tuningParams.struct_reject_threshold))
+                    .monospacedDigit()
+            }
+            Slider(value: $cam.tuningParams.struct_reject_threshold, in: 1.0...20.0)
+            Text("""
+                 Multiple of the sensor-noise floor the residual may reach before the pixel \
+                 is dropped. Lower rejects more. A rejected region falls back to the \
+                 reference frame: softer there, but without a seam, so tune down until the \
+                 artifacts go rather than up until detail returns.
+                 """)
+                .font(.caption2).foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var fineAlignmentSection: some View {
+        Toggle("ICA Per Level In FFT Mode", isOn: $cam.tuningParams.align_ica_per_level_fft)
+        Text("""
+             Extends the above to the full-res FFT grey. Without it that path feeds \
+             integer-only flow into a finest level that can only search +/-1 pixel, so the \
+             correction budget is spent before it starts and tile-shaped displacements \
+             survive. Costs about 120MB at 12MP.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+
+        Stepper(value: $cam.tuningParams.align_fine_search_radius, in: 0...4) {
+            HStack {
+                Text("Finest Search Radius")
+                Spacer()
+                Text(cam.tuningParams.align_fine_search_radius == 0
+                     ? "default (1)"
+                     : String(cam.tuningParams.align_fine_search_radius))
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        Text("""
+             How far the finest pyramid level may correct the flow it inherits. Raising it \
+             buys margin when something upstream adds error, at (2r+1)^2/9 times that \
+             level's search cost: 2.8x at 2, 5.4x at 3. This is the most expensive level.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+    }
+
+    // Two of the eight Sections live here rather than inline. The Form body
+    // was one 343-line expression and the Swift type checker gave up on it
+    // ("unable to type-check this expression in reasonable time"); these are
+    // the two largest, and moving them lets each be checked on its own.
+    @ViewBuilder
+    private var robustnessSection: some View {
                 Section(header: Text("Robustness (Motion Rejection)")) {
                     HStack {
                         Text("Threshold (r_t)")
@@ -750,30 +821,7 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
                     }
 
-                    Toggle("Structure Mismatch Guard",
-                           isOn: $cam.tuningParams.struct_reject_enabled)
-                    Text("Rejects a patch whose structure does not match the reference "
-                         + "even though its local brightness does. The standard test "
-                         + "compares 3x3 means, which cannot see a stripe pattern locked "
-                         + "one period out or skin displaced within skin -- the "
-                         + "misalignments that survive as tile-shaped blocks on a moving "
-                         + "subject.")
-                        .font(.caption2).foregroundColor(.secondary)
-
-                    if cam.tuningParams.struct_reject_enabled {
-                        HStack {
-                            Text("Residual Tolerance")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.struct_reject_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.struct_reject_threshold, in: 1.0...20.0)
-                        Text("Multiple of the sensor-noise floor the residual may reach "
-                             + "before the pixel is dropped. Lower rejects more. A "
-                             + "rejected region falls back to the reference frame: "
-                             + "softer there, but without a seam, so tune down until "
-                             + "the artifacts go rather than up until detail returns.")
-                            .font(.caption2).foregroundColor(.secondary)
-                    }
+                    structureGuardSection
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
@@ -815,7 +863,10 @@ struct CameraView: View {
                         }
                     }
                 }
-                
+    }
+
+    @ViewBuilder
+    private var kernelsSection: some View {
                 Section(header: Text("Steerable Kernels (Merging)")) {
                     Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
 
@@ -896,6 +947,14 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
+    }
+
+    private var tuningSettingsView: some View {
+        NavigationView {
+            Form {
+                robustnessSection
+                
+                kernelsSection
                 
                 Section(header: Text("Capture")) {
                     if cam.frameCount > 10 {
@@ -1023,32 +1082,7 @@ struct CameraView: View {
                              + "finest. 2x2 decimate grey only unless the switch below is on.")
                             .font(.caption2).foregroundColor(.secondary)
 
-                        Toggle("ICA Per Level In FFT Mode",
-                               isOn: $cam.tuningParams.align_ica_per_level_fft)
-                        Text("Extends the above to the full-res FFT grey. Without it that "
-                             + "path feeds integer-only flow into a finest level that can "
-                             + "only search +/-1 pixel, so the correction budget is spent "
-                             + "before it starts and tile-shaped displacements survive. "
-                             + "Costs about 120MB at 12MP.")
-                            .font(.caption2).foregroundColor(.secondary)
-
-                        HStack {
-                            Text("Finest Search Radius")
-                            Spacer()
-                            Text(cam.tuningParams.align_fine_search_radius == 0
-                                 ? "default (1)"
-                                 : "\(cam.tuningParams.align_fine_search_radius)")
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { Double(cam.tuningParams.align_fine_search_radius) },
-                                set: { cam.tuningParams.align_fine_search_radius = Int($0.rounded()) }),
-                            in: 0...4, step: 1)
-                        Text("How far the finest pyramid level may correct the flow it "
-                             + "inherits. Raising it buys margin when something upstream "
-                             + "adds error, at (2r+1)^2/9 times that level's search cost: "
-                             + "2.8x at 2, 5.4x at 3. This is the most expensive level.")
-                            .font(.caption2).foregroundColor(.secondary)
+                        fineAlignmentSection
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
                         Text(cam.tuningParams.acc_rob_adaptive
