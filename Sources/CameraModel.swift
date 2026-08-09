@@ -2003,7 +2003,11 @@ final class CameraModel: NSObject, ObservableObject {
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 let opts = PHAssetResourceCreationOptions()
-                opts.shouldMoveFile = false
+                // Move rather than copy. These sources are our own temporary
+                // files -- the burst directory is deleted immediately after --
+                // so copying meant writing the whole export a second time,
+                // which at ~290MB for a DNG is most of the wait at the end.
+                opts.shouldMoveFile = true
                 if format == .dng {
                     opts.uniformTypeIdentifier = "com.adobe.raw-image"
                 }
