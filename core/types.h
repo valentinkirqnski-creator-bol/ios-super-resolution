@@ -68,6 +68,42 @@ enum class GreyMethod { FFT, Decimate };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };
 
+struct IspParams {
+    // Manual trim on top of the automatic exposure, in stops.
+    float exposure_ev = 0.0f;
+    // How much of the local (as opposed to global) tone mapping to apply.
+    // 0 disables it and leaves a purely global render.
+    float local_strength = 0.75f;
+    // Highlight compression and shadow lift, applied to the blurred base only.
+    float highlight_rolloff = 0.65f;
+    float shadow_lift = 0.28f;
+    // Display-space black point, applied after the output curve. The log-space
+    // shadow lift raises the whole lower range uniformly, which leaves no true
+    // black -- measured p1 sat at 22/255 against a reference of 15 until this
+    // was added. Renormalised so display white stays at 1.
+    float black_point = 0.065f;
+    // Red trim on the camera RGB before the matrix. The measured matrix runs
+    // about 6% short on red against the reference renders, which reads as a
+    // cool, flat image. Red only: also cutting blue overshot and left B at 92
+    // against a reference 98.
+    float warmth = 0.05f;
+    // S-curve in display space, applied to luminance so hue is preserved.
+    float contrast = 0.55f;
+    // Saturation-dependent boost: muted colours gain, already-saturated ones
+    // barely move. This is what separates vibrance from RGB *= k.
+    float vibrance = 0.50f;
+    // Flat multiplier applied after vibrance.
+    float saturation = 1.0f;
+    // Re-adds the detail layer above unity for local micro-contrast. Distinct
+    // from sharpening: no high-pass, no halos, no noise amplification.
+    float local_contrast = 0.20f;
+    // Hold saturation and hue in the skin band. Without a face detector this is
+    // the cheap substitute, and it is what stops strong tone mapping plus
+    // vibrance turning skin orange.
+    bool skin_protect = true;
+    bool enabled = true;
+};
+
 // 2x2 Bayer CFA pattern (indices into {R=0,G=1,B=2}).
 struct CFA {
     uint8_t p[2][2] = {{0, 1}, {1, 2}}; // default RGGB
@@ -228,6 +264,10 @@ struct Config {
     float k_shrink  = 2.0f;
 
     CFA cfa;
+
+    // JPEG / preview rendering. Never affects the linear DNG, which is always
+    // written from the unmodified merge.
+    IspParams isp;
     // Raw AsShot-style gains (cam_mul), same as Python camera_whitebalance.
     // Load applies k = wb[c]/wb[G]; robustness guide undoes with wb[c] (raw).
     float white_balance[3] = {1.f, 1.f, 1.f};

@@ -14,6 +14,7 @@
 #include "core/metal_gpu.h"
 #include "core/mps_fft.h"
 #include "core/preset_lut.h"
+#include "core/render_isp.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -219,6 +220,11 @@ static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
 #endif
 }
 
+// Render settings for exportJPEGFromLinearDNG / embedJPEGPreviewInDNG. Those
+// take only a path -- there is no Config to thread through -- so the values are
+// parked here when the tuning dictionary is parsed.
+static hhsr::IspParams g_isp;
+
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
            std::fabs(wb[1] - 1.f) < 1e-4f &&
@@ -365,6 +371,19 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
     if (tuning[@"acc_rob_adaptive"])
         cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
+    if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
+    if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
+    if (tuning[@"isp_local_strength"]) cfg.isp.local_strength = tuning[@"isp_local_strength"].floatValue;
+    if (tuning[@"isp_highlight"])      cfg.isp.highlight_rolloff = tuning[@"isp_highlight"].floatValue;
+    if (tuning[@"isp_shadow"])         cfg.isp.shadow_lift = tuning[@"isp_shadow"].floatValue;
+    if (tuning[@"isp_black_point"])    cfg.isp.black_point = tuning[@"isp_black_point"].floatValue;
+    if (tuning[@"isp_warmth"])         cfg.isp.warmth = tuning[@"isp_warmth"].floatValue;
+    if (tuning[@"isp_contrast"])       cfg.isp.contrast = tuning[@"isp_contrast"].floatValue;
+    if (tuning[@"isp_vibrance"])       cfg.isp.vibrance = tuning[@"isp_vibrance"].floatValue;
+    if (tuning[@"isp_saturation"])     cfg.isp.saturation = tuning[@"isp_saturation"].floatValue;
+    if (tuning[@"isp_local_contrast"]) cfg.isp.local_contrast = tuning[@"isp_local_contrast"].floatValue;
+    if (tuning[@"isp_skin_protect"])   cfg.isp.skin_protect = tuning[@"isp_skin_protect"].boolValue;
+    g_isp = cfg.isp;
     if (tuning[@"align_ica_per_level"])
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
@@ -768,7 +787,12 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         W <= 0 || H <= 0)
         return NO;
 
-    // Linear camera RGB → WB → cam→sRGB → Highlights −70 → contrast → vibrance.
+    // One analysis pass over the whole image before any pixel is rendered: the
+    // ISP needs a global view for automatic exposure and the local gain map.
+    hhsr::IspState isp;
+    const bool use_isp = g_isp.enabled &&
+                         hhsr::isp_analyse(rgb.data(), W, H, nullptr, g_isp, isp);
+
     std::vector<uint8_t> srgb((size_t)W * (size_t)H * 4);
     const size_t n = (size_t)W * (size_t)H;
     for (size_t i = 0; i < n; ++i) {
@@ -776,7 +800,11 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);
         float sr, sg, sb;
-        render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+        if (use_isp)
+            hhsr::isp_render(isp, r, g, b, (int)(i % (size_t)W), (int)(i / (size_t)W),
+                             sr, sg, sb);
+        else
+            render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
         srgb[i * 4 + 0] = (uint8_t)std::lround(sr * 255.f);
         srgb[i * 4 + 1] = (uint8_t)std::lround(sg * 255.f);
         srgb[i * 4 + 2] = (uint8_t)std::lround(sb * 255.f);
@@ -835,6 +863,13 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     const int ow = std::max(1, (int)std::lround(W * scale));
     const int oh = std::max(1, (int)std::lround(H * scale));
 
+    // Analysed at full resolution even though the preview is downscaled, so the
+    // thumbnail and the exported JPEG get the same exposure and gain map and
+    // cannot disagree about how the shot looks.
+    hhsr::IspState isp;
+    const bool use_isp = g_isp.enabled &&
+                         hhsr::isp_analyse(rgb.data(), W, H, nullptr, g_isp, isp);
+
     std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
     auto sample_tonemap = [&](int sx, int sy, float& sr, float& sg, float& sb) {
         sx = std::max(0, std::min(W - 1, sx));
@@ -843,7 +878,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+        if (use_isp) hhsr::isp_render(isp, r, g, b, sx, sy, sr, sg, sb);
+        else         render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
     };
 
     for (int y = 0; y < oh; ++y) {
