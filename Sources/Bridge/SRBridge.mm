@@ -798,7 +798,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // Row-parallel: 48MP through a scalar loop on one core was the difference
     // between a JPEG appearing at once and taking seconds. Rows are independent
     // -- the gain map is read-only by now -- so this needs no synchronisation.
-    std::vector<uint8_t> srgb((size_t)W * (size_t)H * 4);
+    // RGB, not RGBA. The alpha byte was 255 everywhere and JPEG has no use for
+    // it, so at 48MP it cost 48MB of allocation and a quarter of the store
+    // traffic for nothing.
+    std::vector<uint8_t> srgb((size_t)W * (size_t)H * 3);
     hhsr::parallel_rows(H, 0, [&](int y) {
         const size_t row = (size_t)y * (size_t)W;
         for (int x = 0; x < W; ++x) {
@@ -811,10 +814,9 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 hhsr::isp_render(isp, r, g, b, x, y, sr, sg, sb);
             else
                 render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-            srgb[i * 4 + 0] = (uint8_t)std::lround(sr * 255.f);
-            srgb[i * 4 + 1] = (uint8_t)std::lround(sg * 255.f);
-            srgb[i * 4 + 2] = (uint8_t)std::lround(sb * 255.f);
-            srgb[i * 4 + 3] = 255;
+            srgb[i * 3 + 0] = (uint8_t)std::lround(sr * 255.f);
+            srgb[i * 3 + 1] = (uint8_t)std::lround(sg * 255.f);
+            srgb[i * 3 + 2] = (uint8_t)std::lround(sb * 255.f);
         }
     });
     rgb.clear();
@@ -829,8 +831,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
     CGImageRef cgOut = CGImageCreate(
-        W, H, 8, 32, W * 4, cs,
-        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast,
+        W, H, 8, 24, W * 3, cs,
+        kCGBitmapByteOrderDefault | kCGImageAlphaNone,
         provider, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(cs);
