@@ -265,33 +265,9 @@ Image compute_grey_fft(const Image& raw) {
 #endif
 }
 
-// Keep every second sample. The FFT low-pass leaves nothing above half Nyquist,
-// so this is exact rather than approximate -- no averaging, because averaging
-// would apply a second, cruder filter to a signal that is already band limited.
-static Image decimate_bandlimited_2x(const Image& g) {
-    const int h = g.h / 2, w = g.w / 2;
-    if (h <= 0 || w <= 0) return g;
-    Image out(h, w, 1);
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x)
-            out.at(y, x) = g.at(y * 2, x * 2);
-    return out;
-}
-
-Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method,
-                   bool fft_half_res) {
+Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method) {
     if (!bayer_mode) return raw;
-    if (method == GreyMethod::FFT) {
-        Image g = compute_grey_fft(raw);
-        if (!fft_half_res || g.h <= 0 || g.w <= 0) return g;
-#ifdef __APPLE__
-        // The full-resolution result is pinned as sticky_grey for align_metal to
-        // reuse. It no longer matches what alignment will be handed, and leaving
-        // it pinned holds a full-frame buffer for nothing.
-        metal_invalidate_sticky_grey();
-#endif
-        return decimate_bandlimited_2x(g);
-    }
+    if (method == GreyMethod::FFT) return compute_grey_fft(raw);
 #ifdef __APPLE__
     // The decimate path is pure CPU and never pins a grey, so align_metal must
     // not find a stale sticky_grey left by an earlier FFT burst. Dimensions

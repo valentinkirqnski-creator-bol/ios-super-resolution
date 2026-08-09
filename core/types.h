@@ -144,22 +144,6 @@ struct Config {
     float input_crop_zoom = 1.f;
     bool  bayer_mode = true;
     GreyMethod grey_method = GreyMethod::FFT;
-    // Emit the FFT grey at half resolution.
-    //
-    // The FFT grey is a low-pass: it keeps only the central half of the spectrum
-    // in each axis, so the result is bandlimited to half Nyquist. By the
-    // sampling theorem every second sample then describes it exactly -- the
-    // full-resolution image carries half-resolution information, while the
-    // pyramid, block matching, ICA and the Hessians all run over four times the
-    // pixels.
-    //
-    // With this on, the FFT path keeps its clean anti-aliasing -- which is its
-    // real advantage over the 2x2 quad average, whose box filter leaks aliasing
-    // that moves between frames -- but at the decimate path's cost. What it
-    // gives up is interpolation accuracy: refinement interpolates bilinearly
-    // between samples, and shorter gaps are more accurate, so this is a genuine
-    // trade rather than a free win. Off by default; A/B it.
-    bool  fft_grey_half_res = false;
 
     // Noise model: sigma^2 = alpha * I + beta   (already scaled for ISO).
     // Defaults are Pixel-ish fallbacks; overwritten from DNG NoiseProfile (0xC761).
@@ -262,19 +246,6 @@ struct Config {
     bool  motion_edge_rejection_enabled = true;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
-    // Third condition on high-frequency rejection: the aligned patch must also
-    // disagree with the reference by this multiple of the noise before it is
-    // thrown away. 0 disables the test, which is the behaviour up to now.
-    //
-    // Deliberately off by default. The failure this rejection targets is one
-    // where the residual stays LOW: a repetitive pattern locks onto the wrong
-    // period and still matches itself, and d_sq compares local means, which
-    // barely move when a periodic texture shifts by a period. So requiring
-    // disagreement mutes the rejection exactly where it was meant to fire.
-    // It is here because the opposite failure is real too -- rejection firing on
-    // regions that aligned perfectly well -- and only a measurement on real
-    // bursts can say which costs more.
-    float hf_min_residual = 0.f;
     float motion_edge_noise_floor_multiplier = 1.0f;
     int   motion_edge_neighborhood_radius = 1;
 

@@ -1410,7 +1410,6 @@ struct RobMaskParams {
     float alpha, beta;
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
-    float hf_min_residual;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1709,17 +1708,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // comparison of local variance before and after low-pass filtering, marking
     // regions of the scene; the reference is the frame the merge is anchored on.
     //
-    // The misalignment-residual gate is optional and off unless hf_min_residual
-    // is set, because it works against the purpose: the aperture problem is
-    // exactly the case where a repetitive pattern locks onto the wrong period
-    // and still matches itself well, so the residual stays low. Available
-    // because the opposite failure -- rejecting regions that aligned fine -- is
-    // real too, and only a measurement decides which costs more.
+    // No misalignment-residual gate. That is not in the paper, and it would
+    // defeat the purpose: the aperture problem is exactly the case where a
+    // repetitive pattern locks onto the wrong period and still matches itself
+    // well, so the residual stays low.
     bool hf_reject = false;
     if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
         hf_reject = ref_hf_loss[gid.y * p.w + gid.x] > p.hf_variance_loss_threshold;
-        if (hf_reject && p.hf_min_residual > 0.f)
-            hf_reject = isfinite(ratio) && ratio > p.hf_min_residual;
     }
 
     bool edge_reject = false;
