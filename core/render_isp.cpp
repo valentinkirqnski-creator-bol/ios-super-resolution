@@ -294,8 +294,10 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
     // the binding constraint.
     std::vector<f32> sorted(Ymax);
     std::sort(sorted.begin(), sorted.end());
-    const f32 hi = sorted[(size_t)((sorted.size() - 1) * 0.9999)];
-    st.white = clampf(hi, 1.2f, 512.f);
+    // Named peak, not hi: `hi` is already the highlight-compression factor
+    // further down this same function.
+    const f32 peak = sorted[(size_t)((sorted.size() - 1) * 0.9999)];
+    st.white = clampf(peak, 1.2f, 512.f);
 
     // Base layer in log2: tone mapping is a ratio operation, and doing it in log
     // makes the compression uniform across stops instead of biased toward the
