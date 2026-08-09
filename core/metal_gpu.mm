@@ -2299,11 +2299,15 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // alignment.py align_lvl: block matching, then ICA, on this level --
         // before upscale_flow multiplies whatever error is left by the
         // upsampling factor on the way to the next one.
-        if (ica_all) {
+        if (ica_all && !(lvl == 0 && cfg.ica_per_level_coarse_only())) {
             id<MTLBuffer> l_ref = nil, l_gx = nil, l_gy = nil, l_hess = nil;
             int l_ny = 0, l_nx = 0;
+            // Not fatal. A refinement that cannot be prepared costs this level
+            // its sub-pixel correction; failing the whole call loses the frame,
+            // because pipeline_paths treats a false return as "Metal alignment
+            // failed" and skips it. Losing precision beats losing the frame.
             if (!prep_level_ica_gpu(r, ts, l_ref, l_gx, l_gy, l_hess, l_ny, l_nx))
-                return false;
+                continue;
             // prep tiles with ceil, block matching with floor; they agree for
             // every shipped pyramid, but skip rather than dispatch a mismatched
             // grid if a future tile size makes them differ.
@@ -2321,7 +2325,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     // With per-level ICA the loop already refined level 0 and repeating it here
     // would run ICA twice on the finest scale.
     if (!b_flow || flow_ny <= 0 || flow_nx <= 0) return false;
-    if (!ica_all) {
+    // Coarse-only leaves the finest level to this pass, so it must still run.
+    if (!ica_all || cfg.ica_per_level_coarse_only()) {
     id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
     int ica_ny = 0, ica_nx = 0;
     if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,

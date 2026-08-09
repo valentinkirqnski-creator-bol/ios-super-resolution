@@ -213,6 +213,25 @@ struct Config {
                (grey_method == GreyMethod::Decimate || align_ica_per_level_fft);
     }
 
+    // On the FFT grey, run per-level ICA on the COARSE levels only and leave
+    // the finest to the single pass that already exists.
+    //
+    // The per-level cache holds ref + gradx + grady as full-resolution float
+    // buffers for each level. On the decimate grey that is about 180MB across
+    // four levels at 48MP; on the FFT grey, which has four times the pixels,
+    // level 0 alone is about 576MB and the set is about 730MB. Allocation then
+    // fails, prep_level_ica_gpu returns false, align_metal returns false, and
+    // pipeline_paths skips the frame -- every frame, so nothing merges at all.
+    //
+    // Skipping level 0 in the loop costs nothing, because the finest level is
+    // refined either way: the existing single pass allocates those same
+    // buffers. Levels 1..3 add only about a quarter of full resolution, and
+    // they are where the benefit is -- integer-only flow originates on the
+    // coarse levels, and that is what arrives at level 0 with its budget spent.
+    bool ica_per_level_coarse_only() const {
+        return align_ica_per_level_fft && grey_method == GreyMethod::FFT;
+    }
+
     // Override the finest level's block-match search radius. 0 keeps
     // bm_search_radii[0].
     //

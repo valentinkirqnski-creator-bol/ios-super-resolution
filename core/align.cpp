@@ -779,6 +779,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         g_ref_ica_cache.key = (const void*)&ref_pyr;
         g_ref_ica_cache.levels.assign((size_t)nlev, RefIcaLevel{});
         for (int lvl = 0; lvl < nlev; ++lvl) {
+            // Level 0 on the FFT grey is refined by the single finest pass
+            // below, which builds its own gradients; caching a second
+            // full-resolution set here is the allocation that fails.
+            if (lvl == 0 && cfg.ica_per_level_coarse_only()) continue;
             const Image& r = ref_pyr.levels[lvl];
             int ts = (lvl < (int)cfg.bm_tile_sizes.size())
                          ? cfg.bm_tile_sizes[lvl] : tile_size;
@@ -846,7 +850,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 
         // alignment.py align_lvl: block matching, then ICA, at this level --
         // before the flow is upscaled and its error multiplied.
-        if (ica_all && lvl < (int)g_ref_ica_cache.levels.size()) {
+        if (ica_all && lvl < (int)g_ref_ica_cache.levels.size() &&
+            !(lvl == 0 && cfg.ica_per_level_coarse_only())) {
             const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             if (L.hess.ny == flow.ny && L.hess.nx == flow.nx)
                 ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts,
@@ -857,7 +862,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // Full-res FFT grey keeps the single finest-level refinement, unchanged.
     // With per-level ICA the loop above already refined level 0, and repeating
     // it here would run ICA twice on the finest scale.
-    if (!ica_all) {
+    // Coarse-only leaves the finest level to this pass, so it must still run.
+    if (!ica_all || cfg.ica_per_level_coarse_only()) {
         Image gx = compute_sobel_gradx(ref_grey);
         Image gy = compute_sobel_grady(ref_grey);
         HessianField hess = compute_hessian(gx, gy, tile_size);

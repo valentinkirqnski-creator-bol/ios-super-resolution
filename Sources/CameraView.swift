@@ -738,7 +738,8 @@ struct CameraView: View {
              Extends the above to the full-res FFT grey. Without it that path feeds \
              integer-only flow into a finest level that can only search +/-1 pixel, so the \
              correction budget is spent before it starts and tile-shaped displacements \
-             survive. Costs about 120MB at 12MP.
+             survive. Coarse levels only -- the finest is refined either way -- which keeps \
+             the extra reference gradients to about a quarter of a frame.
              """)
             .font(.caption2).foregroundColor(.secondary)
 
