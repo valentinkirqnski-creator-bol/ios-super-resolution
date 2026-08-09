@@ -676,6 +676,23 @@ struct CameraView: View {
         }
     }
 
+    /// Label, live value and slider as ONE view. Twelve parameters at two
+    /// children each would blow SwiftUI's 10-child ViewBuilder limit whatever
+    /// way the sections were split.
+    private func ispRow(_ title: String, _ value: Binding<Float>,
+                        _ range: ClosedRange<Float>, _ fmt: String = "%.2f") -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(String(format: fmt, value.wrappedValue))
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+            Slider(value: value, in: range)
+        }
+    }
+
     private var tuningSettingsView: some View {
         NavigationView {
             Form {
@@ -900,9 +917,38 @@ struct CameraView: View {
                     .pickerStyle(.segmented)
                     Text(cam.exportFormat == .dng
                          ? "LinearRaw DNG with embedded tone-mapped JPEG preview (Photos thumbnail; Lightroom reads the raw)."
-                         : "Tone-mapped JPEG: WB + matrix + Highlights −70 + contrast + vibrance (no sharpen).")
+                         : "JPEG rendered by the ISP: auto exposure, local tone mapping, contrast and vibrance. No sharpening.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                }
+
+                Section(header: Text("Rendering \u{2014} Tone")) {
+                    Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
+                    Text(cam.tuningParams.isp_enabled
+                         ? "Local tone mapping, contrast and vibrance, applied to the JPEG and the DNG preview only. The DNG itself always stays the unmodified linear merge."
+                         : "Off: the legacy fixed-grade render is used instead.")
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    if cam.tuningParams.isp_enabled {
+                        ispRow("Exposure (EV)", $cam.tuningParams.isp_exposure_ev, -2.0...2.0, "%+.2f")
+                        ispRow("Local Strength", $cam.tuningParams.isp_local_strength, 0.0...1.0)
+                        ispRow("Highlight Rolloff", $cam.tuningParams.isp_highlight, 0.0...1.0)
+                        ispRow("Shadow Lift", $cam.tuningParams.isp_shadow, 0.0...1.0)
+                        ispRow("Black Point", $cam.tuningParams.isp_black_point, 0.0...0.20, "%.3f")
+                        ispRow("Local Contrast", $cam.tuningParams.isp_local_contrast, 0.0...0.60)
+                    }
+                }
+
+                if cam.tuningParams.isp_enabled {
+                    Section(header: Text("Rendering \u{2014} Colour")) {
+                        ispRow("Contrast", $cam.tuningParams.isp_contrast, 0.0...1.0)
+                        ispRow("Vibrance", $cam.tuningParams.isp_vibrance, 0.0...1.5)
+                        ispRow("Saturation", $cam.tuningParams.isp_saturation, 0.5...1.5)
+                        ispRow("Warmth", $cam.tuningParams.isp_warmth, -0.15...0.15, "%+.3f")
+                        Toggle("Protect Skin Tones", isOn: $cam.tuningParams.isp_skin_protect)
+                        Text("Holds back saturation in the skin hue band. There is no face detector, so this is what stops strong tone mapping turning skin orange.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("Merge Architecture")) {

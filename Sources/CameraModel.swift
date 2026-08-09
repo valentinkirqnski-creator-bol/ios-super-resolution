@@ -121,6 +121,22 @@ struct TuningParams: Equatable, Codable {
     /// implementation does, instead of only on the finest. Half-res 2x2 grey
     /// only -- the full-res FFT path is unaffected either way.
     var align_ica_per_level: Bool = true
+    // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
+    // exactly; they were tuned against real DNG/reference pairs, so changing one
+    // here without changing the other silently splits the two.
+    var isp_enabled: Bool = true
+    var isp_exposure_ev: Float = 0.0
+    var isp_local_strength: Float = 0.75
+    var isp_highlight: Float = 0.65
+    var isp_shadow: Float = 0.28
+    var isp_black_point: Float = 0.065
+    var isp_warmth: Float = 0.05
+    var isp_contrast: Float = 0.55
+    var isp_vibrance: Float = 0.50
+    var isp_saturation: Float = 1.0
+    var isp_local_contrast: Float = 0.20
+    var isp_skin_protect: Bool = true
+
     var acc_rob_adaptive: Bool = true
     /// Only used when acc_rob_adaptive is off.
     var acc_rob_max_frame_count: Float = 2.0
@@ -149,6 +165,9 @@ struct TuningParams: Equatable, Codable {
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
+        case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
+        case isp_shadow, isp_black_point, isp_warmth, isp_contrast
+        case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
         case acc_rob_rad_max, acc_rob_max_multiplier
     }
 
@@ -184,6 +203,18 @@ struct TuningParams: Equatable, Codable {
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
+        isp_enabled = try c.decodeIfPresent(Bool.self, forKey: .isp_enabled) ?? isp_enabled
+        isp_exposure_ev = try c.decodeIfPresent(Float.self, forKey: .isp_exposure_ev) ?? isp_exposure_ev
+        isp_local_strength = try c.decodeIfPresent(Float.self, forKey: .isp_local_strength) ?? isp_local_strength
+        isp_highlight = try c.decodeIfPresent(Float.self, forKey: .isp_highlight) ?? isp_highlight
+        isp_shadow = try c.decodeIfPresent(Float.self, forKey: .isp_shadow) ?? isp_shadow
+        isp_black_point = try c.decodeIfPresent(Float.self, forKey: .isp_black_point) ?? isp_black_point
+        isp_warmth = try c.decodeIfPresent(Float.self, forKey: .isp_warmth) ?? isp_warmth
+        isp_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_contrast) ?? isp_contrast
+        isp_vibrance = try c.decodeIfPresent(Float.self, forKey: .isp_vibrance) ?? isp_vibrance
+        isp_saturation = try c.decodeIfPresent(Float.self, forKey: .isp_saturation) ?? isp_saturation
+        isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
+        isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -1771,6 +1802,18 @@ final class CameraModel: NSObject, ObservableObject {
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
+            "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
+            "isp_exposure_ev": NSNumber(value: tuningParams.isp_exposure_ev),
+            "isp_local_strength": NSNumber(value: tuningParams.isp_local_strength),
+            "isp_highlight": NSNumber(value: tuningParams.isp_highlight),
+            "isp_shadow": NSNumber(value: tuningParams.isp_shadow),
+            "isp_black_point": NSNumber(value: tuningParams.isp_black_point),
+            "isp_warmth": NSNumber(value: tuningParams.isp_warmth),
+            "isp_contrast": NSNumber(value: tuningParams.isp_contrast),
+            "isp_vibrance": NSNumber(value: tuningParams.isp_vibrance),
+            "isp_saturation": NSNumber(value: tuningParams.isp_saturation),
+            "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
+            "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),

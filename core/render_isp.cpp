@@ -18,7 +18,10 @@ constexpr f32 kMidGrey = 0.18f;
 // scenes, which is what the log-average alone does not achieve.
 constexpr f32 kAutoKey = 0.2824f;
 
-inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
+// clampf comes from types.h. Defining an identical one here made every call
+// site ambiguous rather than shadowing it: the helpers live in an anonymous
+// namespace, but isp_analyse and isp_render sit in hhsr proper, where both the
+// anonymous-namespace copy and hhsr::clampf are equally visible.
 
 inline f32 luma_of(f32 r, f32 g, f32 b) {
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
