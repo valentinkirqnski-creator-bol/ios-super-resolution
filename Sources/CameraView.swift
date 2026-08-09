@@ -931,6 +931,7 @@ struct CameraView: View {
 
                     if cam.tuningParams.isp_enabled {
                         ispRow("Exposure (EV)", $cam.tuningParams.isp_exposure_ev, -2.0...2.0, "%+.2f")
+                        ispRow("Highlight Recovery", $cam.tuningParams.isp_highlight_knee, 0.60...1.0, "%.2f")
                         ispRow("Local Strength", $cam.tuningParams.isp_local_strength, 0.0...1.0)
                         ispRow("Highlight Rolloff", $cam.tuningParams.isp_highlight, 0.0...1.0)
                         ispRow("Shadow Lift", $cam.tuningParams.isp_shadow, 0.0...1.0)

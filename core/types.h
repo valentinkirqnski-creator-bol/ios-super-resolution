@@ -71,6 +71,20 @@ enum class SelectionLaw { HardThreshold, Linear };
 struct IspParams {
     // Manual trim on top of the automatic exposure, in stops.
     float exposure_ev = 0.0f;
+    // Where highlight recovery starts, as a fraction of full scale. 1.0 off.
+    //
+    // The merge writes the DNG pre-white-balanced, so the WB gains are applied
+    // BEFORE the 16-bit ceiling. On this sensor those are R x2.06, G x1.0,
+    // B x1.84, so a highlight that clipped evenly in raw arrives with R and B
+    // pinned at 1.0 and G far below -- hue 300-312, magenta -- and where only
+    // green clipped, the complementary green patches. Measured on a raw clip of
+    // 0.55: stored (1.000, 0.550, 1.000), saturation 0.45.
+    //
+    // Anything above the knee is pulled toward neutral at its own peak, so a
+    // blown highlight renders white. The per-channel output curve used to hide
+    // this by compressing the largest channel hardest; moving the curve onto
+    // luminance was correct but removed that accidental cover.
+    float highlight_knee = 0.88f;
     // How much of the local (as opposed to global) tone mapping to apply.
     // 0 disables it and leaves a purely global render.
     float local_strength = 0.75f;

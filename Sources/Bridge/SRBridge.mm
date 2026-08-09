@@ -373,6 +373,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
     if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
     if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
+    if (tuning[@"isp_highlight_knee"]) cfg.isp.highlight_knee = tuning[@"isp_highlight_knee"].floatValue;
     if (tuning[@"isp_local_strength"]) cfg.isp.local_strength = tuning[@"isp_local_strength"].floatValue;
     if (tuning[@"isp_highlight"])      cfg.isp.highlight_rolloff = tuning[@"isp_highlight"].floatValue;
     if (tuning[@"isp_shadow"])         cfg.isp.shadow_lift = tuning[@"isp_shadow"].floatValue;

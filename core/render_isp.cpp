@@ -29,6 +29,19 @@ inline f32 luma_of(f32 r, f32 g, f32 b) {
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
+// Pull a near-clipped pixel toward neutral at its own peak. Smoothstep rather
+// than a linear ramp so there is no visible edge where recovery begins.
+inline void recover_highlight(f32& r, f32& g, f32& b, f32 knee) {
+    if (knee >= 1.f) return;
+    const f32 mx = std::max(r, std::max(g, b));
+    if (mx <= knee) return;
+    const f32 t = clampf((mx - knee) / std::max(1.f - knee, kEps), 0.f, 1.f);
+    const f32 w = t * t * (3.f - 2.f * t);
+    r += (mx - r) * w;
+    g += (mx - g) * w;
+    b += (mx - b) * w;
+}
+
 // Camera linear -> sRGB linear, measured from a HandheldSR linear DNG and its
 // reference render. The merge output is already white balanced, so applying the
 // DNG's own ColorMatrix here would push colour twice and cast the highlights.
@@ -228,9 +241,14 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
             const uint16_t* row = rgb16 + (size_t)y * W * 3;
             for (int x = 0; x < W; ++x) {
                 const int gx = std::min(gw - 1, x / f);
-                out[gx] += luma_of(row[x * 3 + 0] * (1.f / 65535.f),
-                                   row[x * 3 + 1] * (1.f / 65535.f),
-                                   row[x * 3 + 2] * (1.f / 65535.f));
+                f32 rr = row[x * 3 + 0] * (1.f / 65535.f);
+                f32 gg = row[x * 3 + 1] * (1.f / 65535.f);
+                f32 bb = row[x * 3 + 2] * (1.f / 65535.f);
+                // Same recovery the render applies, or the base layer would read
+                // a blown magenta highlight as ~30% darker than it renders and
+                // under-compress it.
+                recover_highlight(rr, gg, bb, p.highlight_knee);
+                out[gx] += luma_of(rr, gg, bb);
                 cnt[gx] += 1.f;
             }
         }
@@ -317,9 +335,15 @@ inline f32 sample_map(const std::vector<f32>& map, int gw, int gh,
 
 void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
                 f32& sr, f32& sg, f32& sb) {
-    r = std::max(r, 0.f) * st.exposure;
-    g = std::max(g, 0.f) * st.exposure;
-    b = std::max(b, 0.f) * st.exposure;
+    r = std::max(r, 0.f);
+    g = std::max(g, 0.f);
+    b = std::max(b, 0.f);
+    // Before exposure: the knee is a property of where the stored value sits
+    // against full scale, not of how bright it is rendered.
+    recover_highlight(r, g, b, st.p.highlight_knee);
+    r *= st.exposure;
+    g *= st.exposure;
+    b *= st.exposure;
 
     if (st.valid && st.p.local_strength > 0.f) {
         f32 gain = sample_map(st.gain, st.gw, st.gh, x, y, st.shift);

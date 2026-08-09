@@ -126,6 +126,7 @@ struct TuningParams: Equatable, Codable {
     // here without changing the other silently splits the two.
     var isp_enabled: Bool = true
     var isp_exposure_ev: Float = 0.0
+    var isp_highlight_knee: Float = 0.88
     var isp_local_strength: Float = 0.75
     var isp_highlight: Float = 0.65
     var isp_shadow: Float = 0.28
@@ -169,7 +170,7 @@ struct TuningParams: Equatable, Codable {
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
-        case isp_colour_strength
+        case isp_colour_strength, isp_highlight_knee
         case acc_rob_rad_max, acc_rob_max_multiplier
     }
 
@@ -207,6 +208,7 @@ struct TuningParams: Equatable, Codable {
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
         isp_enabled = try c.decodeIfPresent(Bool.self, forKey: .isp_enabled) ?? isp_enabled
         isp_exposure_ev = try c.decodeIfPresent(Float.self, forKey: .isp_exposure_ev) ?? isp_exposure_ev
+        isp_highlight_knee = try c.decodeIfPresent(Float.self, forKey: .isp_highlight_knee) ?? isp_highlight_knee
         isp_local_strength = try c.decodeIfPresent(Float.self, forKey: .isp_local_strength) ?? isp_local_strength
         isp_highlight = try c.decodeIfPresent(Float.self, forKey: .isp_highlight) ?? isp_highlight
         isp_shadow = try c.decodeIfPresent(Float.self, forKey: .isp_shadow) ?? isp_shadow
@@ -1807,6 +1809,7 @@ final class CameraModel: NSObject, ObservableObject {
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
             "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
             "isp_exposure_ev": NSNumber(value: tuningParams.isp_exposure_ev),
+            "isp_highlight_knee": NSNumber(value: tuningParams.isp_highlight_knee),
             "isp_local_strength": NSNumber(value: tuningParams.isp_local_strength),
             "isp_highlight": NSNumber(value: tuningParams.isp_highlight),
             "isp_shadow": NSNumber(value: tuningParams.isp_shadow),
