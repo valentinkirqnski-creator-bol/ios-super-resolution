@@ -675,6 +675,8 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
     st.stds  = std::move(vars);
+    // The structure test needs the pixels, not the statistics.
+    if (cfg.struct_reject_enabled) st.guide = guide;
     if (cfg.hf_artifact_removal_enabled) {
         Image lp_guide = local_lowpass_gaussian5x5(guide);
         Image lp_means, lp_vars;
@@ -799,7 +801,46 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            R.at(y, x) = (hf_reject || edge_reject)
+            // Structure residual: what the 3x3 mean comparison above cannot see.
+            bool struct_reject = false;
+            const bool inbound =
+                (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h);
+            if (cfg.struct_reject_enabled && inbound &&
+                !ref_stats.guide.data.empty() && !guide.data.empty()) {
+                f32 acc = 0.f, dc = 0.f, noise = 0.f;
+                for (int i = -1; i <= 1; ++i) {
+                    const int ry = std::min(std::max(y + i, 0), h - 1);
+                    const int cy = std::min(std::max(new_y + i, 0), h - 1);
+                    for (int j = -1; j <= 1; ++j) {
+                        const int rx = std::min(std::max(x + j, 0), w - 1);
+                        const int cx = std::min(std::max(new_x + j, 0), w - 1);
+                        for (int ch = 0; ch < ref_stats.means.c; ++ch) {
+                            const f32 d = ref_stats.guide.at(ry, rx, ch) -
+                                          guide.at(cy, cx, ch);
+                            acc += d * d;
+                        }
+                    }
+                }
+                for (int ch = 0; ch < ref_stats.means.c; ++ch) {
+                    const f32 m = ref_stats.means.at(y, x, ch) -
+                                  comp_means.at(new_y, new_x, ch);
+                    dc += m * m;
+                    // Same MC curve the noise model uses, so the floor tracks
+                    // brightness instead of being a fixed number.
+                    const f32 b = ref_stats.means.at(y, x, ch);
+                    int idn = (int)std::lround(1000.f * b);
+                    if (!std::isfinite(b) || idn < 0) idn = 0;
+                    else if (idn >= (int)nc.std_curve.size())
+                        idn = (int)nc.std_curve.size() - 1;
+                    const f32 st_ = nc.std_curve[(size_t)idn];
+                    // Difference of two independent noisy samples.
+                    noise += 2.f * st_ * st_;
+                }
+                const f32 resid = std::max(0.f, acc / 9.f - dc);
+                struct_reject = resid > cfg.struct_reject_threshold *
+                                            std::max(noise, 1e-12f);
+            }
+            R.at(y, x) = (hf_reject || edge_reject || struct_reject)
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
         }

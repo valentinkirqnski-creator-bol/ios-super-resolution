@@ -236,6 +236,40 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
+
+    // Structure-residual rejection: zero R where the aligned patch does not
+    // actually look like the reference patch here.
+    //
+    // Eq. 5 measures |ref_mean - comp_mean| on 3x3 local means, which is a
+    // deliberate low-pass -- it is meant to see motion and occlusion rather
+    // than alignment residual. The side effect is that it cannot see structure
+    // at all. A stripe pattern locked one period out has the same local mean as
+    // an aligned one; so does a patch of skin displaced within uniform skin.
+    // Both keep a high R and merge, which is what a tile-shaped displacement in
+    // the output is made of.
+    //
+    // This measures what is left after the brightness offset is removed:
+    //
+    //   resid = mean_3x3[(ref - comp_aligned)^2] - (ref_mean - comp_mean)^2
+    //
+    // i.e. the variance of the alignment residual, which is exactly the AC part
+    // Eq. 5 discards. Rejected when resid exceeds struct_reject_threshold times
+    // what sensor noise alone explains (2*sigma^2 from the same MC curves), so
+    // the test scales with brightness rather than being a fixed number.
+    //
+    // Not circular with the matcher: block matching minimised a sum over a
+    // 16x16 tile of the grey, while this is a per-pixel 3x3 statistic on the
+    // Bayer guide. A tile can minimise its total while individual
+    // neighbourhoods inside it are badly wrong -- that is precisely the
+    // compromise a single translation makes on a rotating subject, and this is
+    // where it becomes visible.
+    //
+    // Off by default: it changes which pixels merge. Rejection is the safe
+    // direction (a rejected region falls back to reference-only: softer, but
+    // without a seam), so tune the threshold down until artifacts go rather
+    // than up until detail returns.
+    bool  struct_reject_enabled = false;
+    float struct_reject_threshold = 4.0f;
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;

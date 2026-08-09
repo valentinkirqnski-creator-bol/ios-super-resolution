@@ -1124,8 +1124,12 @@ struct RobMaskParamsCPU {
     float beta = 0.f;
     float motion_edge_noise_floor_multiplier = 1.f;
     uint32_t motion_edge_neighborhood_radius = 0;
+    // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
+    // same order. A mismatch here is silent on the shader side.
+    uint32_t struct_enabled = 0;
+    float struct_threshold = 0.f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 72, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1332,6 +1336,9 @@ static id<MTLBuffer> g_rob_ref_hf = nil;
 static size_t g_rob_ref_hf_bytes = 0;
 static id<MTLBuffer> g_rob_ref_m = nil;
 static id<MTLBuffer> g_rob_ref_v = nil;
+// The reference guide itself, pinned only when the structure test is on: it is
+// another full guide-grid buffer resident for the whole burst.
+static id<MTLBuffer> g_rob_ref_guide = nil;
 static int g_rob_ref_h = 0, g_rob_ref_w = 0, g_rob_ref_c = 0;
 static size_t g_rob_ref_bytes = 0;
 static id<MTLBuffer> g_rob_std_curve = nil;
@@ -1343,6 +1350,7 @@ static float g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
 static void clear_rob_ref_gpu() {
     g_rob_ref_hf = nil;
     g_rob_ref_hf_bytes = 0;
+    g_rob_ref_guide = nil;
     g_rob_ref_m = nil;
     g_rob_ref_v = nil;
     g_rob_ref_h = g_rob_ref_w = g_rob_ref_c = 0;
@@ -1387,6 +1395,9 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // Pin guide-grid local stats for all comparison frames (460-main robustness).
     g_rob_ref_m = b_means;
     g_rob_ref_v = b_vars;
+    // Only when the structure test needs it; otherwise this buffer is dropped
+    // here as before and never charged against peak footprint.
+    g_rob_ref_guide = cfg.struct_reject_enabled ? b_guide : nil;
     g_rob_ref_h = gh;
     g_rob_ref_w = gw;
     g_rob_ref_c = nch;
@@ -1510,11 +1521,22 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
+    // Needs the pinned reference guide from init_robustness_metal. If that is
+    // absent the burst began with the switch off, so run without the test
+    // rather than binding a null buffer.
+    const bool struct_on = cfg.struct_reject_enabled && g_rob_ref_guide != nil;
+    mp.struct_enabled = struct_on ? 1u : 0u;
+    mp.struct_threshold = cfg.struct_reject_threshold;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_gmeans offset:0 atIndex:1];
+    // Buffers 2 and 12 are read only when struct_enabled, but Metal requires
+    // every declared binding to be set, so point them at the comp guide when
+    // the test is off.
+    [enc setBuffer:(struct_on ? g_rob_ref_guide : b_guide) offset:0 atIndex:2];
+    [enc setBuffer:b_guide offset:0 atIndex:12];
     [enc setBuffer:b_ref_m offset:0 atIndex:3];
     [enc setBuffer:b_ref_v offset:0 atIndex:4];
     [enc setBuffer:b_std offset:0 atIndex:6];

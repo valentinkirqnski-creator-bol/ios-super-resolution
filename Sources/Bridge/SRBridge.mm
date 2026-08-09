@@ -324,6 +324,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
     if (tuning[@"hf_min_texture_snr"])
         cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
+    if (tuning[@"struct_reject_enabled"])
+        cfg.struct_reject_enabled = tuning[@"struct_reject_enabled"].boolValue;
+    if (tuning[@"struct_reject_threshold"])
+        cfg.struct_reject_threshold = tuning[@"struct_reject_threshold"].floatValue;
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])

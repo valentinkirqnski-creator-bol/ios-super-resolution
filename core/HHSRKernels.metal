@@ -1410,6 +1410,10 @@ struct RobMaskParams {
     float alpha, beta;
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
+    // Field order and size must stay in lockstep with RobMaskParamsCPU in
+    // metal_gpu.mm, which static_asserts the size.
+    uint struct_enabled;
+    float struct_threshold;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1627,6 +1631,8 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
+                          device const float* ref_guide [[buffer(2)]],
+                          device const float* comp_guide [[buffer(12)]],
                           device const float* ref_means [[buffer(3)]],
                           device const float* ref_vars [[buffer(4)]],
                           device const float* std_curve [[buffer(6)]],
@@ -1639,6 +1645,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
+    // Accumulated alongside the loop below so the structure test costs no extra
+    // curve lookups: dc_sq_ is the part of the residual a brightness offset
+    // explains, noise_sq_ what sensor noise alone would produce.
+    float dc_sq_ = 0.f, noise_sq_ = 0.f;
     int patch_idy;
     int patch_idx;
     float flow_x;
@@ -1684,6 +1694,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_p_sq = d_p_ * d_p_;
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
         d_sq_ += d_p_sq * shrink * shrink;
+        // Unshrunk, for the structure test: it needs the raw DC difference to
+        // subtract, not the noise-suppressed one Eq. 5 uses.
+        if (inbound) dc_sq_ += d_p_sq;
+        noise_sq_ += 2.f * sigma_t * sigma_t;
     }
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
@@ -1743,7 +1757,30 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    R[gid.y * p.w + gid.x] = (hf_reject || edge_reject)
+    // Structure residual -- the AC part of the mismatch, which the mean
+    // comparison above is blind to by construction. Matches the CPU path in
+    // robustness.cpp; see struct_reject_enabled in types.h for why.
+    bool struct_reject = false;
+    if (p.struct_enabled != 0u && inbound) {
+        float acc = 0.f;
+        for (int i = -1; i <= 1; ++i) {
+            int ry = clamp_edge(int(gid.y) + i, int(p.h) - 1);
+            int cy = clamp_edge(new_idy + i, int(p.h) - 1);
+            for (int j = -1; j <= 1; ++j) {
+                int rx = clamp_edge(int(gid.x) + j, int(p.w) - 1);
+                int cx = clamp_edge(new_idx + j, int(p.w) - 1);
+                for (uint ch = 0u; ch < p.nch; ++ch) {
+                    float d = ref_guide[(uint(ry) * p.w + uint(rx)) * p.nch + ch] -
+                              comp_guide[(uint(cy) * p.w + uint(cx)) * p.nch + ch];
+                    acc += d * d;
+                }
+            }
+        }
+        float resid = max(0.f, acc / 9.f - dc_sq_);
+        struct_reject = resid > p.struct_threshold * max(noise_sq_, 1e-12f);
+    }
+
+    R[gid.y * p.w + gid.x] = (hf_reject || edge_reject || struct_reject)
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
 }

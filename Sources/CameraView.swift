@@ -750,6 +750,31 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
                     }
 
+                    Toggle("Structure Mismatch Guard",
+                           isOn: $cam.tuningParams.struct_reject_enabled)
+                    Text("Rejects a patch whose structure does not match the reference "
+                         + "even though its local brightness does. The standard test "
+                         + "compares 3x3 means, which cannot see a stripe pattern locked "
+                         + "one period out or skin displaced within skin -- the "
+                         + "misalignments that survive as tile-shaped blocks on a moving "
+                         + "subject.")
+                        .font(.caption2).foregroundColor(.secondary)
+
+                    if cam.tuningParams.struct_reject_enabled {
+                        HStack {
+                            Text("Residual Tolerance")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.struct_reject_threshold))
+                        }
+                        Slider(value: $cam.tuningParams.struct_reject_threshold, in: 1.0...20.0)
+                        Text("Multiple of the sensor-noise floor the residual may reach "
+                             + "before the pixel is dropped. Lower rejects more. A "
+                             + "rejected region falls back to the reference frame: "
+                             + "softer there, but without a seam, so tune down until "
+                             + "the artifacts go rather than up until detail returns.")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
                     if cam.tuningParams.motion_edge_rejection_enabled {

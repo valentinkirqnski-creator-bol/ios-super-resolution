@@ -92,6 +92,14 @@ struct TuningParams: Equatable, Codable {
     var hf_artifact_removal_enabled: Bool = false
     var hf_variance_loss_threshold: Float = 0.75
     var hf_min_texture_snr: Float = 4.0
+    /// Zero R where the aligned patch does not structurally match the reference.
+    /// Eq. 5 compares 3x3 local means, which cannot see a stripe pattern locked
+    /// one period out or skin displaced within skin; this compares what is left
+    /// after the brightness offset is removed.
+    var struct_reject_enabled: Bool = false
+    /// Multiple of the sensor-noise floor the structure residual may reach
+    /// before the pixel is rejected. Lower rejects more.
+    var struct_reject_threshold: Float = 4.0
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -163,6 +171,7 @@ struct TuningParams: Equatable, Codable {
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
+        case struct_reject_enabled, struct_reject_threshold
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -194,6 +203,8 @@ struct TuningParams: Equatable, Codable {
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
+        struct_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .struct_reject_enabled) ?? struct_reject_enabled
+        struct_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .struct_reject_threshold) ?? struct_reject_threshold
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1797,6 +1808,8 @@ final class CameraModel: NSObject, ObservableObject {
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
+            "struct_reject_enabled": NSNumber(value: tuningParams.struct_reject_enabled),
+            "struct_reject_threshold": NSNumber(value: tuningParams.struct_reject_threshold),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
