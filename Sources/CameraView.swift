@@ -733,14 +733,15 @@ struct CameraView: View {
 
     @ViewBuilder
     private var flowRegularizeSection: some View {
-        Toggle("Flow Median Filter", isOn: $cam.tuningParams.flow_regularize_enabled)
+        Toggle("Aperture Flow Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
         Text("""
-             Replaces a tile's motion component with the median of its neighbours when it \
-             disagrees with them. A tile holding one long edge -- a grille slat, a chrome \
-             strip -- cannot see how far it moved ALONG that edge, so it picks at random \
-             and the merged edge wobbles from tile to tile. The neighbours know. \
-             For static scenes: across a real motion boundary the median belongs to \
-             neither side.
+             A tile holding one long edge -- a grille slat, a chrome strip -- cannot see how \
+             far it moved ALONG that edge, so it picks at random and the merged edge wobbles \
+             from tile to tile. This finds that direction from the tile's own gradients and \
+             takes only that component from the neighbours, keeping the direction it could \
+             measure exactly as measured. Tiles with structure in both directions are left \
+             alone entirely. For static scenes: across a real motion boundary the \
+             neighbours' motion belongs to neither side.
              """)
             .font(.caption2).foregroundColor(.secondary)
 
@@ -753,9 +754,10 @@ struct CameraView: View {
             }
             Slider(value: $cam.tuningParams.flow_regularize_threshold, in: 0.25...4.0)
             Text("""
-                 How far a tile may differ from its neighbours before it is replaced. Lower \
-                 corrects more and smooths more. Each component is tested on its own, so on \
-                 a horizontal edge only the horizontal motion is repaired.
+                 How far the ambiguous component may differ from the neighbours' before it \
+                 is replaced. Lower corrects more. Only tiles that are genuinely \
+                 one-dimensional are considered, so raising this narrows the repair rather \
+                 than protecting real structure -- that is already protected.
                  """)
                 .font(.caption2).foregroundColor(.secondary)
         }

@@ -2361,6 +2361,33 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     return true;
 }
 
+// Copy a cached reference Hessian back to the host so flow regularisation can
+// tell which direction each tile could actually observe.
+//
+// Matched on grid size rather than on the slot key: the finest level is
+// prepared from ref_grey by the single ICA pass and from ref_pyr.levels[0] by
+// the per-level one, which are equal in content but different allocations, so
+// the key would depend on which path ran. The grid is what the flow field is
+// indexed by, and align_metal already refuses to proceed unless it matches.
+//
+// ny*nx*4 floats -- about 3MB for 16px tiles on a 48MP frame -- and the
+// reference does not change within a burst, so this is one small readback per
+// burst rather than per frame.
+bool metal_fetch_ref_hessian(int ny, int nx, std::vector<float>& out) {
+    if (ny <= 0 || nx <= 0) return false;
+    auto& c = ctx();
+    const size_t need = (size_t)ny * (size_t)nx * 4u;
+    for (int i = 0; i < MetalCtx::kIcaSlots; ++i) {
+        const auto& sl = c.ica[i];
+        if (!sl.hess || sl.ny != ny || sl.nx != nx) continue;
+        if ([sl.hess length] < need * sizeof(float)) continue;
+        out.resize(need);
+        memcpy(out.data(), [sl.hess contents], need * sizeof(float));
+        return true;
+    }
+    return false;
+}
+
 void metal_clear_ref_ica_cache() {
     auto& c = ctx();
     for (int i = 0; i < MetalCtx::kIcaSlots; ++i) c.ica[i] = {};

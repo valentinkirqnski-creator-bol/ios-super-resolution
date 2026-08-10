@@ -760,20 +760,42 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
 // neighbours, and one tile over there is usually a corner, a gap or an end that
 // fixes it. Taking the median supplies what the tile could not see.
 //
-// Per component, not per vector, and that matters: on a horizontal edge only dx
-// is the outlier, so replacing components independently repairs it while
-// leaving the well-determined dy untouched. A vector median would move both.
+// Which direction is unobservable is decided by the Hessian, not by the axes.
+// H is symmetric, so its eigenvectors are the directions of most and least
+// gradient energy: the large one points across the edge (well determined), the
+// small one along it (ambiguous). The flow is projected onto that pair, the
+// reliable component is kept exactly as measured, and only the ambiguous one
+// takes the neighbours' value.
 //
-// Only tiles that actually disagree are touched, so a well-determined tile that
-// already matches its neighbours is returned unchanged.
+// Doing it per axis instead is only correct when the edge happens to be
+// horizontal or vertical. On a diagonal edge neither dx nor dy is the outlier
+// -- both are part right and part wrong -- so an axis-aligned rule either
+// over-corrects the reliable direction or misses the ambiguous one entirely.
+//
+// Two gates, and a tile must fail both to be touched: it has to be genuinely
+// aperture-limited (l2/l1 below kApertureRatio) and its ambiguous component has
+// to disagree with the neighbours by more than the threshold. A well-determined
+// tile is returned untouched no matter what its neighbours say, which is what
+// keeps this from smoothing real structure away.
+//
+// Without a Hessian -- no cached reference gradients for this grid -- it falls
+// back to the per-axis form, which is the axis-aligned special case.
 //
 // Not safe on a moving subject: across a genuine motion boundary the
 // neighbours' median is a motion that belongs to neither side. Off by default.
-static void regularize_flow_aperture(FlowField& flow, const Config& cfg) {
+static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
+                                     const Config& cfg) {
     if (!cfg.flow_regularize_enabled) return;
     if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
     const f32 thr = std::max(0.f, cfg.flow_regularize_threshold);
     const int ny = flow.ny, nx = flow.nx;
+    // Second eigenvalue below this fraction of the first counts as
+    // aperture-limited. Measured on a real frame at 16px tiles the median tile
+    // sits at 0.64 and is nowhere near this, while a strong edge is under 0.05;
+    // 0.15 takes the genuinely one-dimensional tiles and leaves the rest.
+    constexpr f32 kApertureRatio = 0.15f;
+    const bool use_h = hess && hess->ny == ny && hess->nx == nx &&
+                       hess->data.size() >= (size_t)ny * (size_t)nx * 4u;
 
     // Read from a copy: filtering in place would feed already-corrected tiles
     // back into their neighbours' medians and let one repair cascade across the
@@ -800,8 +822,46 @@ static void regularize_flow_aperture(FlowField& flow, const Config& cfg) {
             const f32 mx = bx[n / 2], my = by[n / 2];
             f32& dx = flow.dx(ty, tx);
             f32& dy = flow.dy(ty, tx);
-            if (std::fabs(dx - mx) > thr) dx = mx;
-            if (std::fabs(dy - my) > thr) dy = my;
+
+            if (!use_h) {
+                if (std::fabs(dx - mx) > thr) dx = mx;
+                if (std::fabs(dy - my) > thr) dy = my;
+                continue;
+            }
+
+            const f32* h = hess->at(ty, tx);
+            const f32 h00 = h[0], h01 = h[1], h11 = h[3];
+            const f32 tr = h00 + h11;
+            const f32 det = h00 * h11 - h01 * h[2];
+            if (!(tr > 0.f)) {
+                // No gradient at all: nothing here was ever observable.
+                if (std::fabs(dx - mx) > thr) dx = mx;
+                if (std::fabs(dy - my) > thr) dy = my;
+                continue;
+            }
+            const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
+            const f32 l1 = tr * 0.5f + disc;          // across the edge
+            const f32 l2 = tr * 0.5f - disc;          // along it
+            if (!(l1 > 0.f) || l2 >= kApertureRatio * l1) continue;  // well determined
+
+            // Principal direction as a Jacobi rotation angle, not from the
+            // closed form (l1 - d, b). On the case this exists to handle -- a
+            // horizontal edge, where h00 and h01 are both near zero -- l1
+            // equals h11 to within rounding, so (l1 - h11) is pure cancellation
+            // noise that can dwarf h01 and hand back the wrong axis. atan2
+            // subtracts nothing nearly equal and is exact at every degenerate
+            // orientation.
+            const f32 theta = 0.5f * std::atan2(2.f * h01, h00 - h11);
+            const f32 ux = std::cos(theta), uy = std::sin(theta);  // across the edge
+            const f32 vx = -uy, vy = ux;                           // along it
+
+            const f32 f_v = dx * vx + dy * vy;        // measured, unreliable
+            const f32 m_v = mx * vx + my * vy;        // neighbours' value
+            if (std::fabs(f_v - m_v) <= thr) continue;
+            // Keep the reliable component exactly as measured; move only along v.
+            const f32 corr = m_v - f_v;
+            dx += corr * vx;
+            dy += corr * vy;
         }
     });
 }
@@ -824,7 +884,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             // On the host, after the readback: the field is one vector per tile,
             // a few hundred KB, so filtering it here costs nothing measurable
             // and keeps a single implementation for both backends.
-            regularize_flow_aperture(flow_gpu, cfg);
+            HessianField gh;
+            if (cfg.flow_regularize_enabled &&
+                metal_fetch_ref_hessian(flow_gpu.ny, flow_gpu.nx, gh.data)) {
+                gh.ny = flow_gpu.ny;
+                gh.nx = flow_gpu.nx;
+            }
+            regularize_flow_aperture(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg);
             return flow_gpu;
         }
     }
@@ -929,16 +995,26 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // With per-level ICA the loop above already refined level 0, and repeating
     // it here would run ICA twice on the finest scale.
     // Coarse-only leaves the finest level to this pass, so it must still run.
+    // Kept past the block so regularisation can read it; the per-level cache
+    // holds the equivalent when the loop above refined the finest level.
+    HessianField finest_hess;
     if (!ica_all || cfg.ica_per_level_coarse_only()) {
         Image gx = compute_sobel_gradx(ref_grey);
         Image gy = compute_sobel_grady(ref_grey);
-        HessianField hess = compute_hessian(gx, gy, tile_size);
+        finest_hess = compute_hessian(gx, gy, tile_size);
         debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
         debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
-        ica_refine_level(ref_grey, gx, gy, moving_grey, hess, flow, tile_size,
+        ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow, tile_size,
                          cfg.ica_n_iter, cfg.num_threads);
     }
-    regularize_flow_aperture(flow, cfg);
+    const HessianField* reg_hess = nullptr;
+    if (finest_hess.ny == flow.ny && finest_hess.nx == flow.nx)
+        reg_hess = &finest_hess;
+    else if (!g_ref_ica_cache.levels.empty() &&
+             g_ref_ica_cache.levels[0].hess.ny == flow.ny &&
+             g_ref_ica_cache.levels[0].hess.nx == flow.nx)
+        reg_hess = &g_ref_ica_cache.levels[0].hess;
+    regularize_flow_aperture(flow, reg_hess, cfg);
     return flow;
 }
 

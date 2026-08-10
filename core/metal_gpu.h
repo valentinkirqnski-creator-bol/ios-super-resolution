@@ -65,6 +65,11 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
 
+// Cached reference ICA Hessian for the tile grid [ny, nx], packed ny*nx*4
+// (h00,h01,h10,h11). Used by flow regularisation to find each tile's
+// unobservable direction. False when no cached level matches that grid.
+bool metal_fetch_ref_hessian(int ny, int nx, std::vector<float>& out);
+
 // num/den → packed RGB16 (same math as encode_band_rows DNG path). Preview
 // sampling stays on the host. Returns false → caller uses CPU encode.
 // Pointer form, for the online merge: it holds one accumulator for the whole
