@@ -1414,6 +1414,10 @@ struct RobMaskParams {
     // metal_gpu.mm, which static_asserts the size.
     uint struct_enabled;
     float struct_threshold;
+    uint night_mismatch_enabled;
+    float night_mismatch_keep;
+    float night_mismatch_reject;
+    uint _pad2;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1502,6 +1506,19 @@ struct RobHfLossParams {
     float _pad1;
 };
 
+struct RobMismatchParams {
+    uint h, w, nch;
+    uint tile_size;
+    uint flow_ny;
+    uint flow_nx;
+    uint bayer;
+    uint _pad0;
+    float alpha;
+    float beta;
+    float s;
+    float _pad1;
+};
+
 kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
                                     device const float* guide [[buffer(1)]],
                                     constant RobStatsParams& p [[buffer(2)]],
@@ -1554,6 +1571,82 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
     loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
         ? max((signal_var - signal_lp_var) / signal_var, 0.f)
         : 0.f;
+}
+
+inline float rob_guide_noise_var(float alpha, float beta, uint nch, uint ch,
+                                 float brightness) {
+    brightness = clamp(isfinite(brightness) ? brightness : 0.f, 0.f, 1.f);
+    float v = max(alpha * brightness + beta, 0.f);
+    if (nch == 3u && ch == 1u) v *= 0.5f;
+    return v;
+}
+
+inline float rob_sample_guide_bilinear(device const float* guide,
+                                       uint h, uint w, uint nch,
+                                       float y, float x, uint ch) {
+    if (!(x >= 0.f && y >= 0.f && x <= float(w - 1u) && y <= float(h - 1u)))
+        return INFINITY;
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = min(x0 + 1, int(w) - 1);
+    int y1 = min(y0 + 1, int(h) - 1);
+    float fx = x - float(x0);
+    float fy = y - float(y0);
+    float a = guide[(uint(y0) * w + uint(x0)) * nch + ch] +
+              fx * (guide[(uint(y0) * w + uint(x1)) * nch + ch] -
+                    guide[(uint(y0) * w + uint(x0)) * nch + ch]);
+    float b = guide[(uint(y1) * w + uint(x0)) * nch + ch] +
+              fx * (guide[(uint(y1) * w + uint(x1)) * nch + ch] -
+                    guide[(uint(y1) * w + uint(x0)) * nch + ch]);
+    return a + fy * (b - a);
+}
+
+kernel void rob_night_mismatch_tiles(device float* mismatch [[buffer(0)]],
+                                     device const float* ref_guide [[buffer(1)]],
+                                     device const float* comp_guide [[buffer(2)]],
+                                     device const float* flow [[buffer(3)]],
+                                     constant RobMismatchParams& p [[buffer(4)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.flow_nx || gid.y >= p.flow_ny) return;
+    bool bayer = (p.bayer != 0u && p.nch == 3u);
+    float coord_scale = bayer ? 0.5f : 1.f;
+    int guide_tile = max(1, int(floor(float(p.tile_size) * coord_scale + 0.5f)));
+    uint fi = (gid.y * p.flow_nx + gid.x) * 2u;
+    float fx = flow[fi + 0u] * coord_scale;
+    float fy = flow[fi + 1u] * coord_scale;
+    int y0 = int(gid.y) * guide_tile;
+    int x0 = int(gid.x) * guide_tile;
+    int y1 = min(y0 + guide_tile, int(p.h));
+    int x1 = min(x0 + guide_tile, int(p.w));
+    float d_sum = 0.f;
+    float noise_sum = 0.f;
+    uint n = 0u;
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            float cy = float(y) + fy;
+            float cx = float(x) + fx;
+            if (!(cx >= 0.f && cy >= 0.f &&
+                  cx <= float(p.w - 1u) && cy <= float(p.h - 1u)))
+                continue;
+            for (uint ch = 0u; ch < p.nch; ++ch) {
+                float c = rob_sample_guide_bilinear(comp_guide, p.h, p.w, p.nch,
+                                                    cy, cx, ch);
+                if (!isfinite(c)) continue;
+                float r = ref_guide[(uint(y) * p.w + uint(x)) * p.nch + ch];
+                d_sum += fabs(r - c);
+                noise_sum += 2.f * rob_guide_noise_var(p.alpha, p.beta, p.nch, ch, r);
+                ++n;
+            }
+        }
+    }
+    float m = 1.f;
+    if (n > 0u) {
+        float d = d_sum / float(n);
+        float sigma2 = max(noise_sum / float(n), 1.0e-20f);
+        float ss = max(p.s, 1.0e-6f);
+        m = (d * d) / (d * d + ss * sigma2);
+    }
+    mismatch[gid.y * p.flow_nx + gid.x] = clamp(isfinite(m) ? m : 1.f, 0.f, 1.f);
 }
 
 kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
@@ -1633,6 +1726,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_guide [[buffer(2)]],
                           device const float* comp_guide [[buffer(12)]],
+                          device const float* night_mismatch [[buffer(13)]],
                           device const float* ref_means [[buffer(3)]],
                           device const float* ref_vars [[buffer(4)]],
                           device const float* std_curve [[buffer(6)]],
@@ -1780,9 +1874,19 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         struct_reject = resid > p.struct_threshold * max(noise_sq_, 1e-12f);
     }
 
-    R[gid.y * p.w + gid.x] = (hf_reject || edge_reject || struct_reject)
+    float r_val = (hf_reject || edge_reject || struct_reject)
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    if (p.night_mismatch_enabled != 0u) {
+        float m = night_mismatch[pidx];
+        float keep = clamp(p.night_mismatch_keep, 0.f, 1.f);
+        float reject = clamp(p.night_mismatch_reject, 0.f, 1.f);
+        float safe = (reject <= keep)
+            ? ((isfinite(m) && m <= keep) ? 1.f : 0.f)
+            : clamp((reject - (isfinite(m) ? m : 1.f)) / (reject - keep), 0.f, 1.f);
+        r_val = min(r_val, safe);
+    }
+    R[gid.y * p.w + gid.x] = r_val;
 }
 
 kernel void rob_local_min_5x5(device float* out [[buffer(0)]],

@@ -732,6 +732,50 @@ struct CameraView: View {
     }
 
     @ViewBuilder
+    private var nightMismatchSection: some View {
+        Toggle("Night Sight Mismatch", isOn: $cam.tuningParams.night_mismatch_enabled)
+        Text("""
+             Computes the Night Sight per-frame mismatch map after alignment: \
+             m = d^2 / (d^2 + s * sigma^2), where d is the aligned tile L1 \
+             difference from the reference. High mismatch reduces that frame's \
+             merge confidence for the tile.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+
+        if cam.tuningParams.night_mismatch_enabled {
+            HStack {
+                Text("Mismatch s")
+                Spacer()
+                Text(String(format: "%.2f", cam.tuningParams.night_mismatch_s))
+                    .monospacedDigit()
+            }
+            Slider(value: $cam.tuningParams.night_mismatch_s,
+                   in: 0.10...2.00,
+                   step: 0.05)
+
+            HStack {
+                Text("Keep Below")
+                Spacer()
+                Text(String(format: "%.2f", cam.tuningParams.night_mismatch_keep))
+                    .monospacedDigit()
+            }
+            Slider(value: $cam.tuningParams.night_mismatch_keep,
+                   in: 0.00...0.80,
+                   step: 0.01)
+
+            HStack {
+                Text("Reject Above")
+                Spacer()
+                Text(String(format: "%.2f", cam.tuningParams.night_mismatch_reject))
+                    .monospacedDigit()
+            }
+            Slider(value: $cam.tuningParams.night_mismatch_reject,
+                   in: 0.05...1.00,
+                   step: 0.01)
+        }
+    }
+
+    @ViewBuilder
     private var flowRegularizeSection: some View {
         Toggle("Aperture Flow Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
         Text("""
@@ -871,6 +915,7 @@ struct CameraView: View {
                     }
 
                     structureGuardSection
+                    nightMismatchSection
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 

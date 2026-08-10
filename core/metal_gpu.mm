@@ -162,7 +162,7 @@ static MetalCtx& ctx() {
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
-            "rob_make_mask", "rob_local_min_5x5",
+            "rob_night_mismatch_tiles", "rob_make_mask", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
@@ -1128,8 +1128,12 @@ struct RobMaskParamsCPU {
     // same order. A mismatch here is silent on the shader side.
     uint32_t struct_enabled = 0;
     float struct_threshold = 0.f;
+    uint32_t night_mismatch_enabled = 0;
+    float night_mismatch_keep = 0.f;
+    float night_mismatch_reject = 0.f;
+    uint32_t _pad2 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1139,6 +1143,20 @@ struct RobHfLossParamsCPU {
     float _pad1 = 0.f;
 };
 static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
+
+struct RobMismatchParamsCPU {
+    uint32_t h, w, nch;
+    uint32_t tile_size;
+    uint32_t flow_ny;
+    uint32_t flow_nx;
+    uint32_t bayer;
+    uint32_t _pad0 = 0;
+    float alpha = 0.f;
+    float beta = 0.f;
+    float s = 0.5f;
+    float _pad1 = 0.f;
+};
+static_assert(sizeof(RobMismatchParamsCPU) == 48, "RobMismatchParamsCPU");
 
 static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
                             id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
@@ -1191,6 +1209,45 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     [enc setBuffer:b_lp_vars offset:0 atIndex:3];
     [enc setBytes:&hp length:sizeof(hp) atIndex:4];
     dispatch2(enc, c.pipe("rob_hf_loss_adaptive"), hp.w, hp.h);
+    [enc endEncoding];
+    return true;
+}
+
+static bool rob_run_night_mismatch(id<MTLBuffer> b_ref_guide,
+                                   id<MTLBuffer> b_comp_guide,
+                                   id<MTLBuffer> b_flow,
+                                   __strong id<MTLBuffer>& b_mismatch,
+                                   int guide_h, int guide_w, int nch,
+                                   const FlowField& flow, int tile_size,
+                                   const Config& cfg, id<MTLCommandBuffer> cmd) {
+    if (!b_ref_guide || !b_comp_guide || !b_flow ||
+        flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0)
+        return false;
+    auto& c = ctx();
+    const size_t mismatch_b = (size_t)flow.ny * (size_t)flow.nx * sizeof(float);
+    b_mismatch = buf(nullptr, mismatch_b);
+    if (!b_mismatch) return false;
+
+    RobMismatchParamsCPU mp{};
+    mp.h = (uint32_t)guide_h;
+    mp.w = (uint32_t)guide_w;
+    mp.nch = (uint32_t)nch;
+    mp.tile_size = (uint32_t)tile_size;
+    mp.flow_ny = (uint32_t)flow.ny;
+    mp.flow_nx = (uint32_t)flow.nx;
+    mp.bayer = cfg.bayer_mode ? 1u : 0u;
+    mp.alpha = cfg.alpha;
+    mp.beta = cfg.beta;
+    mp.s = std::max(cfg.night_mismatch_s, 1.0e-6f);
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_mismatch offset:0 atIndex:0];
+    [enc setBuffer:b_ref_guide offset:0 atIndex:1];
+    [enc setBuffer:b_comp_guide offset:0 atIndex:2];
+    [enc setBuffer:b_flow offset:0 atIndex:3];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:4];
+    dispatch2(enc, c.pipe("rob_night_mismatch_tiles"), mp.flow_nx, mp.flow_ny);
     [enc endEncoding];
     return true;
 }
@@ -1395,9 +1452,10 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // Pin guide-grid local stats for all comparison frames (460-main robustness).
     g_rob_ref_m = b_means;
     g_rob_ref_v = b_vars;
-    // Only when the structure test needs it; otherwise this buffer is dropped
-    // here as before and never charged against peak footprint.
-    g_rob_ref_guide = cfg.struct_reject_enabled ? b_guide : nil;
+    // Only when a residual test needs it; otherwise this buffer is dropped here
+    // as before and never charged against peak footprint.
+    g_rob_ref_guide =
+        (cfg.struct_reject_enabled || cfg.night_mismatch_enabled) ? b_guide : nil;
     g_rob_ref_h = gh;
     g_rob_ref_w = gw;
     g_rob_ref_c = nch;
@@ -1495,10 +1553,16 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         b_ref_hf = g_rob_ref_hf;
     }
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    id<MTLBuffer> b_mismatch = b_ref_v;
+    const bool night_on = cfg.night_mismatch_enabled && g_rob_ref_guide != nil;
+    if (night_on &&
+        !rob_run_night_mismatch(g_rob_ref_guide, b_guide, b_flow, b_mismatch,
+                                gh, gw, nch, flow, tile_size, cfg, cmd))
+        return Image();
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_motion || !b_flow || !b_R || !b_out)
+        !b_S || !b_motion || !b_flow || !b_mismatch || !b_R || !b_out)
         return Image();
 
     RobMaskParamsCPU mp{};
@@ -1527,6 +1591,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const bool struct_on = cfg.struct_reject_enabled && g_rob_ref_guide != nil;
     mp.struct_enabled = struct_on ? 1u : 0u;
     mp.struct_threshold = cfg.struct_reject_threshold;
+    mp.night_mismatch_enabled = night_on ? 1u : 0u;
+    mp.night_mismatch_keep = cfg.night_mismatch_keep;
+    mp.night_mismatch_reject = cfg.night_mismatch_reject;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1537,6 +1604,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // the test is off.
     [enc setBuffer:(struct_on ? g_rob_ref_guide : b_guide) offset:0 atIndex:2];
     [enc setBuffer:b_guide offset:0 atIndex:12];
+    [enc setBuffer:b_mismatch offset:0 atIndex:13];
     [enc setBuffer:b_ref_m offset:0 atIndex:3];
     [enc setBuffer:b_ref_v offset:0 atIndex:4];
     [enc setBuffer:b_std offset:0 atIndex:6];

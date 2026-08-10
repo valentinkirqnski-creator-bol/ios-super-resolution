@@ -335,6 +335,16 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.struct_reject_enabled = tuning[@"struct_reject_enabled"].boolValue;
     if (tuning[@"struct_reject_threshold"])
         cfg.struct_reject_threshold = tuning[@"struct_reject_threshold"].floatValue;
+    if (tuning[@"night_mismatch_enabled"])
+        cfg.night_mismatch_enabled = tuning[@"night_mismatch_enabled"].boolValue;
+    if (tuning[@"night_mismatch_s"])
+        cfg.night_mismatch_s = std::max(1.0e-6f, tuning[@"night_mismatch_s"].floatValue);
+    if (tuning[@"night_mismatch_keep"])
+        cfg.night_mismatch_keep =
+            std::max(0.0f, std::min(1.0f, tuning[@"night_mismatch_keep"].floatValue));
+    if (tuning[@"night_mismatch_reject"])
+        cfg.night_mismatch_reject =
+            std::max(0.0f, std::min(1.0f, tuning[@"night_mismatch_reject"].floatValue));
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])
