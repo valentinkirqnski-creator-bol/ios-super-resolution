@@ -794,9 +794,14 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
     const int ny = flow.ny, nx = flow.nx;
     // Second eigenvalue below this fraction of the first counts as
     // aperture-limited. Measured on a real frame at 16px tiles the median tile
-    // sits at 0.64 and is nowhere near this, while a strong edge is under 0.05;
-    // 0.15 takes the genuinely one-dimensional tiles and leaves the rest.
-    constexpr f32 kApertureRatio = 0.15f;
+    // sits at 0.64 and is nowhere near the default, while a strong edge is
+    // under 0.05; 0.15 takes the genuinely one-dimensional tiles and leaves the
+    // rest. Exposed as a setting because some static edge failures are less
+    // perfectly one-dimensional once noise, letters, reflections and Bayer
+    // texture enter the tile.
+    f32 aperture_ratio = cfg.flow_regularize_aperture_ratio;
+    if (!std::isfinite(aperture_ratio)) aperture_ratio = 0.15f;
+    aperture_ratio = std::min(std::max(aperture_ratio, 0.f), 1.f);
     const bool use_h = hess && hess->ny == ny && hess->nx == nx &&
                        hess->data.size() >= (size_t)ny * (size_t)nx * 4u;
 
@@ -854,7 +859,7 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
             const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
             const f32 l1 = tr * 0.5f + disc;          // across the edge
             const f32 l2 = tr * 0.5f - disc;          // along it
-            if (!(l1 > 0.f) || l2 >= kApertureRatio * l1) continue;  // well determined
+            if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;  // well determined
             n_aperture.fetch_add(1, std::memory_order_relaxed);
 
             // Principal direction as a Jacobi rotation angle, not from the
@@ -889,6 +894,7 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
         const long long fx = n_fixed.load();
         prof_add_cpu("flowreg#tiles", (double)tiles);
         prof_add_cpu("flowreg#hessian-ok", use_h ? 1.0 : 0.0);
+        prof_add_cpu("flowreg#aperture-ratio", (double)aperture_ratio);
         prof_add_cpu("flowreg#aperture-limited", (double)ap);
         prof_add_cpu("flowreg#corrected", (double)fx);
         prof_add_cpu("flowreg#px-moved-total", sum_corr);

@@ -328,6 +328,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_regularize_enabled = tuning[@"flow_regularize_enabled"].boolValue;
     if (tuning[@"flow_regularize_threshold"])
         cfg.flow_regularize_threshold = tuning[@"flow_regularize_threshold"].floatValue;
+    if (tuning[@"flow_regularize_aperture_ratio"])
+        cfg.flow_regularize_aperture_ratio =
+            std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
     if (tuning[@"struct_reject_enabled"])
         cfg.struct_reject_enabled = tuning[@"struct_reject_enabled"].boolValue;
     if (tuning[@"struct_reject_threshold"])

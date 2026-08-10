@@ -760,6 +760,22 @@ struct CameraView: View {
                  than protecting real structure -- that is already protected.
                  """)
                 .font(.caption2).foregroundColor(.secondary)
+
+            HStack {
+                Text("Aperture Ratio")
+                Spacer()
+                Text(String(format: "%.2f", cam.tuningParams.flow_regularize_aperture_ratio))
+                    .monospacedDigit()
+            }
+            Slider(value: $cam.tuningParams.flow_regularize_aperture_ratio,
+                   in: 0.05...0.75,
+                   step: 0.05)
+            Text("""
+                 Maximum lambda2/lambda1 for a tile to be repaired. Higher catches more \
+                 edge-like tiles; lower keeps the repair limited to very one-dimensional \
+                 edges. Default is 0.15.
+                 """)
+                .font(.caption2).foregroundColor(.secondary)
         }
     }
 

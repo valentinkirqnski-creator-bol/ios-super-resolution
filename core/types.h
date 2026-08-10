@@ -256,6 +256,10 @@ struct Config {
     // subject moves.
     bool  flow_regularize_enabled = false;
     float flow_regularize_threshold = 1.0f;
+    // A tile is considered aperture-limited when lambda2/lambda1 is below this
+    // ratio. Higher catches more edge-like tiles; lower limits repair to very
+    // one-dimensional tiles.
+    float flow_regularize_aperture_ratio = 0.15f;
 
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
