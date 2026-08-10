@@ -1,7 +1,10 @@
 #include "stages.h"
 #include "parallel.h"
 #include "debug_utils.h"
+#include "prof.h"
+#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <complex>
 #include <cstdlib>
 #include <limits>
@@ -797,6 +800,15 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
     const bool use_h = hess && hess->ny == ny && hess->nx == nx &&
                        hess->data.size() >= (size_t)ny * (size_t)nx * 4u;
 
+    // Counters, not timings. Setting the threshold to 0.1px and seeing no
+    // change has three possible causes that look identical from the outside --
+    // the Hessian never arrived, no tile passed the anisotropy gate, or tiles
+    // were corrected and the artifact is something else entirely. These
+    // separate them in the profile without a debugger.
+    std::atomic<long long> n_aperture{0}, n_fixed{0};
+    double sum_corr = 0.0;
+    std::mutex corr_mu;
+
     // Read from a copy: filtering in place would feed already-corrected tiles
     // back into their neighbours' medians and let one repair cascade across the
     // field, which is smoothing rather than outlier replacement.
@@ -843,6 +855,7 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
             const f32 l1 = tr * 0.5f + disc;          // across the edge
             const f32 l2 = tr * 0.5f - disc;          // along it
             if (!(l1 > 0.f) || l2 >= kApertureRatio * l1) continue;  // well determined
+            n_aperture.fetch_add(1, std::memory_order_relaxed);
 
             // Principal direction as a Jacobi rotation angle, not from the
             // closed form (l1 - d, b). On the case this exists to handle -- a
@@ -862,8 +875,24 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
             const f32 corr = m_v - f_v;
             dx += corr * vx;
             dy += corr * vy;
+            n_fixed.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(corr_mu);
+                sum_corr += std::fabs((double)corr);
+            }
         }
     });
+
+    if (prof_enabled()) {
+        const long long tiles = (long long)ny * nx;
+        const long long ap = n_aperture.load();
+        const long long fx = n_fixed.load();
+        prof_add_cpu("flowreg#tiles", (double)tiles);
+        prof_add_cpu("flowreg#hessian-ok", use_h ? 1.0 : 0.0);
+        prof_add_cpu("flowreg#aperture-limited", (double)ap);
+        prof_add_cpu("flowreg#corrected", (double)fx);
+        prof_add_cpu("flowreg#px-moved-total", sum_corr);
+    }
 }
 
 // ============================================================================
