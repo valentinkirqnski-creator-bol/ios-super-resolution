@@ -241,6 +241,22 @@ struct Config {
     // 2.8x at radius 2, 5.4x at radius 3. The finest level is the most
     // expensive one, so this is not free.
     int align_fine_search_radius = 0;
+    // Median-filter a tile's displacement component when it disagrees with its
+    // neighbours by more than flow_regularize_threshold pixels.
+    //
+    // The aperture problem is local, not global: a tile holding one long edge
+    // cannot see its along-edge motion, but that motion is shared with the
+    // neighbours and one tile over there is usually a corner or an end that
+    // determines it. Applied per component, so on a horizontal edge the
+    // unobservable dx is repaired and the well-determined dy is left alone.
+    //
+    // Aimed at static scenes, where the true field is one rigid transform and
+    // any tile-to-tile disagreement is error. Across a genuine motion boundary
+    // the neighbours' median belongs to neither side, so leave it off when the
+    // subject moves.
+    bool  flow_regularize_enabled = false;
+    float flow_regularize_threshold = 1.0f;
+
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
     // With this false the plan stays empty, so every frame enters align() with a

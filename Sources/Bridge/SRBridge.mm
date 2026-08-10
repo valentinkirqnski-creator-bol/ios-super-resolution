@@ -324,6 +324,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
     if (tuning[@"hf_min_texture_snr"])
         cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
+    if (tuning[@"flow_regularize_enabled"])
+        cfg.flow_regularize_enabled = tuning[@"flow_regularize_enabled"].boolValue;
+    if (tuning[@"flow_regularize_threshold"])
+        cfg.flow_regularize_threshold = tuning[@"flow_regularize_threshold"].floatValue;
     if (tuning[@"struct_reject_enabled"])
         cfg.struct_reject_enabled = tuning[@"struct_reject_enabled"].boolValue;
     if (tuning[@"struct_reject_threshold"])

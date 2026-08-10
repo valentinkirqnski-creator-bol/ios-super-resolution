@@ -92,6 +92,12 @@ struct TuningParams: Equatable, Codable {
     var hf_artifact_removal_enabled: Bool = false
     var hf_variance_loss_threshold: Float = 0.75
     var hf_min_texture_snr: Float = 4.0
+    /// Median-filter a tile's flow component when it disagrees with its
+    /// neighbours. Repairs the aperture problem on long edges, where the
+    /// along-edge component is unobservable inside one tile but determined by
+    /// the neighbours. Static scenes only.
+    var flow_regularize_enabled: Bool = false
+    var flow_regularize_threshold: Float = 1.0
     /// Zero R where the aligned patch does not structurally match the reference.
     /// Eq. 5 compares 3x3 local means, which cannot see a stripe pattern locked
     /// one period out or skin displaced within skin; this compares what is left
@@ -171,6 +177,7 @@ struct TuningParams: Equatable, Codable {
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
+        case flow_regularize_enabled, flow_regularize_threshold
         case struct_reject_enabled, struct_reject_threshold
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
@@ -203,6 +210,8 @@ struct TuningParams: Equatable, Codable {
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
+        flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
+        flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
         struct_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .struct_reject_enabled) ?? struct_reject_enabled
         struct_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .struct_reject_threshold) ?? struct_reject_threshold
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
@@ -1808,6 +1817,8 @@ final class CameraModel: NSObject, ObservableObject {
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
+            "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
+            "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
             "struct_reject_enabled": NSNumber(value: tuningParams.struct_reject_enabled),
             "struct_reject_threshold": NSNumber(value: tuningParams.struct_reject_threshold),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),

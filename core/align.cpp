@@ -745,6 +745,67 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
     return flow;
 }
 
+// Replace a tile's displacement component with the local median when it
+// disagrees with its neighbours.
+//
+// Every tile is solved independently and nothing downstream ties one to the
+// next, so a tile whose evidence does not determine its motion is free to
+// return anything. The classic case is a tile holding one long edge and
+// nothing else: the component across the edge is well determined, the one
+// ALONG it is unobservable, and the block match picks whichever of a set of
+// near-identical candidates wins on noise. Neighbouring tiles on the same edge
+// each pick independently, and the merged edge acquires a tile-period wobble.
+//
+// That ambiguity is local, not global. The along-edge motion is shared with the
+// neighbours, and one tile over there is usually a corner, a gap or an end that
+// fixes it. Taking the median supplies what the tile could not see.
+//
+// Per component, not per vector, and that matters: on a horizontal edge only dx
+// is the outlier, so replacing components independently repairs it while
+// leaving the well-determined dy untouched. A vector median would move both.
+//
+// Only tiles that actually disagree are touched, so a well-determined tile that
+// already matches its neighbours is returned unchanged.
+//
+// Not safe on a moving subject: across a genuine motion boundary the
+// neighbours' median is a motion that belongs to neither side. Off by default.
+static void regularize_flow_aperture(FlowField& flow, const Config& cfg) {
+    if (!cfg.flow_regularize_enabled) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
+    const f32 thr = std::max(0.f, cfg.flow_regularize_threshold);
+    const int ny = flow.ny, nx = flow.nx;
+
+    // Read from a copy: filtering in place would feed already-corrected tiles
+    // back into their neighbours' medians and let one repair cascade across the
+    // field, which is smoothing rather than outlier replacement.
+    const std::vector<f32> src = flow.flow;
+    auto sdx = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 0u]; };
+    auto sdy = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 1u]; };
+
+    parallel_rows(ny, cfg.num_threads, [&](int ty) {
+        f32 bx[9], by[9];
+        for (int tx = 0; tx < nx; ++tx) {
+            int n = 0;
+            for (int i = -1; i <= 1; ++i) {
+                const int yy = std::min(std::max(ty + i, 0), ny - 1);
+                for (int j = -1; j <= 1; ++j) {
+                    const int xx = std::min(std::max(tx + j, 0), nx - 1);
+                    bx[n] = sdx(yy, xx);
+                    by[n] = sdy(yy, xx);
+                    ++n;
+                }
+            }
+            std::nth_element(bx, bx + n / 2, bx + n);
+            std::nth_element(by, by + n / 2, by + n);
+            const f32 mx = bx[n / 2], my = by[n / 2];
+            f32& dx = flow.dx(ty, tx);
+            f32& dy = flow.dy(ty, tx);
+            if (std::fabs(dx - mx) > thr) dx = mx;
+            if (std::fabs(dy - my) > thr) dy = my;
+        }
+    });
+}
+
 // ============================================================================
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
@@ -759,8 +820,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
-                        initial_dx, initial_dy, initial_rotation_rad))
+                        initial_dx, initial_dy, initial_rotation_rad)) {
+            // On the host, after the readback: the field is one vector per tile,
+            // a few hundred KB, so filtering it here costs nothing measurable
+            // and keeps a single implementation for both backends.
+            regularize_flow_aperture(flow_gpu, cfg);
             return flow_gpu;
+        }
     }
 #endif
 
@@ -872,6 +938,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         ica_refine_level(ref_grey, gx, gy, moving_grey, hess, flow, tile_size,
                          cfg.ica_n_iter, cfg.num_threads);
     }
+    regularize_flow_aperture(flow, cfg);
     return flow;
 }
 

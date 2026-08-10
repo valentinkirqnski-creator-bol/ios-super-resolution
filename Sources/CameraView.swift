@@ -732,6 +732,36 @@ struct CameraView: View {
     }
 
     @ViewBuilder
+    private var flowRegularizeSection: some View {
+        Toggle("Flow Median Filter", isOn: $cam.tuningParams.flow_regularize_enabled)
+        Text("""
+             Replaces a tile's motion component with the median of its neighbours when it \
+             disagrees with them. A tile holding one long edge -- a grille slat, a chrome \
+             strip -- cannot see how far it moved ALONG that edge, so it picks at random \
+             and the merged edge wobbles from tile to tile. The neighbours know. \
+             For static scenes: across a real motion boundary the median belongs to \
+             neither side.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+
+        if cam.tuningParams.flow_regularize_enabled {
+            HStack {
+                Text("Disagreement")
+                Spacer()
+                Text(String(format: "%.1f px", cam.tuningParams.flow_regularize_threshold))
+                    .monospacedDigit()
+            }
+            Slider(value: $cam.tuningParams.flow_regularize_threshold, in: 0.25...4.0)
+            Text("""
+                 How far a tile may differ from its neighbours before it is replaced. Lower \
+                 corrects more and smooths more. Each component is tested on its own, so on \
+                 a horizontal edge only the horizontal motion is repaired.
+                 """)
+                .font(.caption2).foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
     private var fineAlignmentSection: some View {
         Toggle("ICA Per Level In FFT Mode", isOn: $cam.tuningParams.align_ica_per_level_fft)
         Text("""
@@ -1084,6 +1114,8 @@ struct CameraView: View {
                             .font(.caption2).foregroundColor(.secondary)
 
                         fineAlignmentSection
+
+                        flowRegularizeSection
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
                         Text(cam.tuningParams.acc_rob_adaptive
