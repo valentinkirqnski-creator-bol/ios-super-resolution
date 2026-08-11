@@ -96,6 +96,16 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
 
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        // Alignment ran on the grey. With the Bayer quad average that is half
+        // resolution, so the field is on a grey tile grid carrying grey-pixel
+        // displacements, while compute_robustness and merge_comp both index it
+        // by raw_coordinate / tile_size and add raw pixels. pipeline_paths.cpp
+        // has converted here since the decimate grey landed; this path never
+        // did, which read the wrong tile everywhere and walked past the field
+        // at the right and bottom edges (caught by a hardened-STL bounds
+        // assert). No-op for the full-resolution FFT grey.
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
+                                     comp_grey.h, comp_grey.w, tile_size);
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
