@@ -929,11 +929,19 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 struct_reject = resid > cfg.struct_reject_threshold *
                                             std::max(noise, 1e-12f);
             }
-            f32 r_val = (hf_reject || edge_reject || struct_reject)
+            const bool hard_reject = hf_reject || edge_reject || struct_reject;
+            f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
-            if (cfg.night_mismatch_enabled && pidx < night_mismatch.size())
-                r_val = std::min(r_val, night_mismatch_weight(night_mismatch[pidx], cfg));
+            if (cfg.night_mismatch_enabled && pidx < night_mismatch.size()) {
+                // Night Sight's map is its own per-frame mismatch confidence,
+                // not the Wronski Eq. 5 confidence. When enabled, make the
+                // saved/merge mask visibly be that mismatch map, with the
+                // optional hard artifact guards still allowed to zero it.
+                r_val = hard_reject
+                    ? 0.f
+                    : night_mismatch_weight(night_mismatch[pidx], cfg);
+            }
             R.at(y, x) = r_val;
         }
     }

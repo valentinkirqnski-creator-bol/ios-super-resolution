@@ -1874,7 +1874,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         struct_reject = resid > p.struct_threshold * max(noise_sq_, 1e-12f);
     }
 
-    float r_val = (hf_reject || edge_reject || struct_reject)
+    bool hard_reject = hf_reject || edge_reject || struct_reject;
+    float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
     if (p.night_mismatch_enabled != 0u) {
@@ -1884,7 +1885,11 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float safe = (reject <= keep)
             ? ((isfinite(m) && m <= keep) ? 1.f : 0.f)
             : clamp((reject - (isfinite(m) ? m : 1.f)) / (reject - keep), 0.f, 1.f);
-        r_val = min(r_val, safe);
+        // Night Sight's map is its own per-frame mismatch confidence, not the
+        // Wronski Eq. 5 confidence. When enabled, make the saved/merge mask
+        // visibly be that mismatch map, with optional hard artifact guards
+        // still allowed to zero it.
+        r_val = hard_reject ? 0.f : safe;
     }
     R[gid.y * p.w + gid.x] = r_val;
 }

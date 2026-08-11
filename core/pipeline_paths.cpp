@@ -117,32 +117,15 @@ static bool robustness_row_activity(const Image& rob, std::vector<uint8_t>& rows
     return any;
 }
 
-static Image compute_robustness_with_mismatch_fallback(const Image& comp,
-                                                       const RefStats& ref_stats,
-                                                       const FlowField& flow,
-                                                       int tile_size,
-                                                       const Config& work,
-                                                       std::vector<uint8_t>& rows,
-                                                       bool& has_nonzero) {
+static Image compute_robustness_and_activity(const Image& comp,
+                                             const RefStats& ref_stats,
+                                             const FlowField& flow,
+                                             int tile_size,
+                                             const Config& work,
+                                             std::vector<uint8_t>& rows,
+                                             bool& has_nonzero) {
     Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
     has_nonzero = robustness_row_activity(rob, rows);
-    if (has_nonzero || !work.night_mismatch_enabled)
-        return rob;
-
-    // Night Sight's mismatch map reduces temporal strength; it does not mean a
-    // whole usable comparison frame should disappear. In this Wronski-style
-    // merge adaptation, if the mismatch cap wipes a frame out entirely, keep
-    // the base robustness result for that frame instead of aborting the burst.
-    Config base = work;
-    base.night_mismatch_enabled = false;
-    std::vector<uint8_t> base_rows;
-    Image base_rob = compute_robustness(comp, ref_stats, flow, tile_size, base);
-    const bool base_has_nonzero = robustness_row_activity(base_rob, base_rows);
-    if (base_has_nonzero) {
-        rows = std::move(base_rows);
-        has_nonzero = true;
-        return base_rob;
-    }
     return rob;
 }
 
@@ -1115,6 +1098,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
+    int rejected_by_mask = 0;
+    bool ref_only_due_mismatch = false;
 #if defined(__APPLE__)
     // Opened here, not at merge time, so each comparison frame can be uploaded
     // as soon as it is analyzed. set_single_acc_slot must precede begin_burst,
@@ -1235,10 +1220,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
-            rob = compute_robustness_with_mismatch_fallback(comp, ref_stats, flow,
-                                                            tile_size, work,
-                                                            rob_rows_nonzero,
-                                                            rob_has_nonzero);
+            rob = compute_robustness_and_activity(comp, ref_stats, flow,
+                                                  tile_size, work,
+                                                  rob_rows_nonzero,
+                                                  rob_has_nonzero);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1262,10 +1247,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
-            rob = compute_robustness_with_mismatch_fallback(comp, ref_stats, flow,
-                                                            tile_size, work,
-                                                            rob_rows_nonzero,
-                                                            rob_has_nonzero);
+            rob = compute_robustness_and_activity(comp, ref_stats, flow,
+                                                  tile_size, work,
+                                                  rob_rows_nonzero,
+                                                  rob_has_nonzero);
             covs = cov_fut.get();
         }
         debug_dump_bin("cpp_mask_" + std::to_string(pos),
@@ -1276,6 +1261,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, mask_name.c_str(), rob);
             append_cov_summary(debug_summary, cov_name.c_str(), covs);
         }
+        if (!rob_has_nonzero)
+            rejected_by_mask++;
         const double t_stash = prof_now_ms();
         if (use_online) {
 #if defined(__APPLE__)
@@ -1418,16 +1405,22 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
     if (n_comp_ok < 1) {
-        if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
-        char why[160];
-        std::snprintf(why, sizeof(why),
-                      "Error: no comparison frame merged (rejected %d, no data %d, gpu %d)",
-                      online_skip_rejected, online_skip_nodata, online_skip_gpu);
-        report(why, 1.f);
+        if (work.night_mismatch_enabled && rejected_by_mask > 0) {
+            ref_only_due_mismatch = true;
+            report("Night Sight mismatch rejected all comparison frames; using reference only",
+                   0.47f);
+        } else {
+            if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+            char why[160];
+            std::snprintf(why, sizeof(why),
+                          "Error: no comparison frame merged (rejected %d, no data %d, gpu %d)",
+                          online_skip_rejected, online_skip_nodata, online_skip_gpu);
+            report(why, 1.f);
 #if defined(__APPLE__)
-        metal_merge_end_online();
+            metal_merge_end_online();
 #endif
-        return Image();
+            return Image();
+        }
     }
 
     // Release reference-side helpers not needed during merge.
@@ -1460,7 +1453,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (!stream_comp_raw)
         build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
     prof_add_cpu("merge:acc-rob-sum", prof_now_ms() - t_accrob);
-    const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
+    const Image* acc_rob_ptr =
+        (accumulate_r && have_acc_rob && !ref_only_due_mismatch) ? &acc_rob : nullptr;
     if (have_acc_rob) {
         debug_dump_bin("cpp_acc_rob", acc_rob.data.data(), acc_rob.data.size());
         if (debug) append_image_summary(debug_summary, "acc_rob", acc_rob);

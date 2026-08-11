@@ -737,8 +737,8 @@ struct CameraView: View {
         Text("""
              Computes the Night Sight per-frame mismatch map after alignment: \
              m = d^2 / (d^2 + s * sigma^2), where d is the aligned tile L1 \
-             difference from the reference. High mismatch reduces that frame's \
-             merge confidence for the tile.
+             difference from the reference. When enabled, this mismatch weight \
+             drives the merge mask instead of the Wronski statistical mask.
              """)
             .font(.caption2).foregroundColor(.secondary)
 
