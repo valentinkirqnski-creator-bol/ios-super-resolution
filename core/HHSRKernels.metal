@@ -470,19 +470,15 @@ struct AlignLocalSearch460Params {
 // which reproduces the original sdy-outer / sdx-inner first-minimum-wins scan.
 //
 // Threadgroup memory is supplied by the host: [0] = ts*ts floats for the tile,
-// [1]/[2] = best float/int per lane, [3]/[4] = second-best float/int per lane.
-// `lanes` must be a power of two (the host enforces this) for the tree
-// reduction to cover every element.
+// [1]/[2] = one float/int per lane for the reduction. `lanes` must be a power of
+// two (the host enforces this) for the tree reduction to cover every element.
 kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    device const float* mov [[buffer(1)]],
                                    device float* flow [[buffer(2)]],
                                    constant AlignLocalSearch460Params& p [[buffer(3)]],
-                                   device float* match_margin [[buffer(4)]],
                                    threadgroup float* ref_tile [[threadgroup(0)]],
                                    threadgroup float* red_dist [[threadgroup(1)]],
                                    threadgroup int* red_cand [[threadgroup(2)]],
-                                   threadgroup float* red_second_dist [[threadgroup(3)]],
-                                   threadgroup int* red_second_cand [[threadgroup(4)]],
                                    uint tile_id [[threadgroup_position_in_grid]],
                                    uint lane [[thread_position_in_threadgroup]],
                                    uint lanes [[threads_per_threadgroup]]) {
@@ -520,8 +516,6 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
 
     float best_dist = INFINITY;
     int best_cand = kNone;
-    float second_dist = INFINITY;
-    int second_cand = kNone;
 
     if (ref_in) {
         const int ifx = int(local_fx);
@@ -548,60 +542,25 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                 }
             }
             if (dist < best_dist) {
-                second_dist = best_dist;
-                second_cand = best_cand;
                 best_dist = dist;
                 best_cand = c;
-            } else if (dist < second_dist) {
-                second_dist = dist;
-                second_cand = c;
             }
         }
     }
 
     red_dist[lane] = best_dist;
     red_cand[lane] = best_cand;
-    red_second_dist[lane] = second_dist;
-    red_second_cand[lane] = second_cand;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint s = lanes >> 1u; s > 0u; s >>= 1u) {
         if (lane < s) {
             const float od = red_dist[lane + s];
             const int oc = red_cand[lane + s];
-            const float osd = red_second_dist[lane + s];
-            const int osc = red_second_cand[lane + s];
             if (oc != kNone &&
                 (od < red_dist[lane] ||
                  (od == red_dist[lane] && oc < red_cand[lane]))) {
-                if (oc != red_cand[lane]) {
-                    red_second_dist[lane] = red_dist[lane];
-                    red_second_cand[lane] = red_cand[lane];
-                }
                 red_dist[lane] = od;
                 red_cand[lane] = oc;
-            } else if (oc != kNone && oc != red_cand[lane] &&
-                       (od < red_second_dist[lane] ||
-                        (od == red_second_dist[lane] &&
-                         oc < red_second_cand[lane]))) {
-                red_second_dist[lane] = od;
-                red_second_cand[lane] = oc;
-            }
-            if (osc != kNone &&
-                (osd < red_dist[lane] ||
-                 (osd == red_dist[lane] && osc < red_cand[lane]))) {
-                if (osc != red_cand[lane]) {
-                    red_second_dist[lane] = red_dist[lane];
-                    red_second_cand[lane] = red_cand[lane];
-                }
-                red_dist[lane] = osd;
-                red_cand[lane] = osc;
-            } else if (osc != kNone && osc != red_cand[lane] &&
-                       (osd < red_second_dist[lane] ||
-                        (osd == red_second_dist[lane] &&
-                         osc < red_second_cand[lane]))) {
-                red_second_dist[lane] = osd;
-                red_second_cand[lane] = osc;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -617,14 +576,6 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
         }
         flow[tile_id * 2u + 0u] = local_fx + float(sdx);
         flow[tile_id * 2u + 1u] = local_fy + float(sdy);
-        float margin = 0.f;
-        if (isfinite(red_dist[0])) {
-            margin = isfinite(red_second_dist[0])
-                ? max((red_second_dist[0] - red_dist[0]) /
-                      max(fabs(red_dist[0]), 1.0e-12f), 0.f)
-                : INFINITY;
-        }
-        match_margin[tile_id] = margin;
     }
 }
 
@@ -1462,9 +1413,7 @@ struct RobMaskParams {
     uint motion_edge_neighborhood_radius;
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
-    uint match_ambiguity_enabled;
-    float match_ambiguity_min_margin;
-    uint _pad2, _pad3, _pad4, _pad5;
+    uint _pad0, _pad1;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1682,7 +1631,6 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
-                          device const float* match_margin [[buffer(14)]],
                           device const float* ref_means [[buffer(3)]],
                           device const float* ref_vars [[buffer(4)]],
                           device const float* std_curve [[buffer(6)]],
@@ -1799,13 +1747,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    bool ambiguity_reject = false;
-    if (p.match_ambiguity_enabled != 0u) {
-        float margin = match_margin[pidx];
-        ambiguity_reject = isnan(margin) ||
-            margin <= max(p.match_ambiguity_min_margin, 0.f);
-    }
-    bool hard_reject = hf_reject || edge_reject || ambiguity_reject;
+    bool hard_reject = hf_reject || edge_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);

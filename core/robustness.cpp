@@ -799,16 +799,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            bool ambiguity_reject = false;
-            if (cfg.match_ambiguity_reject_enabled &&
-                flow.match_margin.size() == (size_t)flow.ny * (size_t)flow.nx &&
-                pidx < flow.match_margin.size()) {
-                const f32 margin = flow.match_margin[pidx];
-                ambiguity_reject = std::isnan(margin) ||
-                    margin <= std::max(cfg.match_ambiguity_min_margin, 0.f);
-            }
-            const bool hard_reject =
-                hf_reject || edge_reject || ambiguity_reject;
+            const bool hard_reject = hf_reject || edge_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);

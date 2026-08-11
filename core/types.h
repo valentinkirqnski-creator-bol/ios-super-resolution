@@ -14,7 +14,6 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
-#include <limits>
 
 namespace hhsr {
 
@@ -42,24 +41,14 @@ struct FlowField {
     int ny = 0;
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
-    // Per-tile block-match uniqueness:
-    //   (second_best_cost - best_cost) / max(abs(best_cost), eps)
-    // Larger means the winning match was clearly unique. Near zero means an
-    // equally plausible second match existed, which is exactly the repeated
-    // texture / long-edge failure that can produce smooth wrong flow.
-    std::vector<f32> match_margin; // ny*nx
 
     FlowField() = default;
-    FlowField(int ny_, int nx_)
-        : ny(ny_), nx(nx_), flow((size_t)ny_ * nx_ * 2, 0.f),
-          match_margin((size_t)ny_ * nx_, std::numeric_limits<f32>::infinity()) {}
+    FlowField(int ny_, int nx_) : ny(ny_), nx(nx_), flow((size_t)ny_ * nx_ * 2, 0.f) {}
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
     inline f32 dx(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
-    inline f32& margin(int ty, int tx) { return match_margin[(size_t)ty * nx + tx]; }
-    inline f32 margin(int ty, int tx) const { return match_margin[(size_t)ty * nx + tx]; }
 };
 
 // Per-grey-pixel 2x2 covariance field (steerable kernels): [h, w, 4] = xx,xy,yx,yy.
@@ -287,12 +276,6 @@ struct Config {
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
 
-    // Block-match ambiguity rejection: after the local search, compare the
-    // best and second-best candidate costs for that frame/tile. If the winner
-    // is not better by this fractional margin, the match is not unique enough
-    // to trust for SR and robustness is forced to zero for that tile.
-    bool  match_ambiguity_reject_enabled = false;
-    float match_ambiguity_min_margin = 0.08f;
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;

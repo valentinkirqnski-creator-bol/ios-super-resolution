@@ -1126,11 +1126,9 @@ struct RobMaskParamsCPU {
     uint32_t motion_edge_neighborhood_radius = 0;
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
-    uint32_t match_ambiguity_enabled = 0;
-    float match_ambiguity_min_margin = 0.f;
-    uint32_t _pad2 = 0, _pad3 = 0, _pad4 = 0, _pad5 = 0;
+    uint32_t _pad0 = 0, _pad1 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1489,16 +1487,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         b_ref_hf = g_rob_ref_hf;
     }
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    const bool ambiguity_on =
-        cfg.match_ambiguity_reject_enabled &&
-        flow.match_margin.size() == (size_t)flow.ny * (size_t)flow.nx;
-    id<MTLBuffer> b_match_margin = ambiguity_on
-        ? buf(flow.match_margin.data(), flow.match_margin.size() * sizeof(float))
-        : b_ref_v;
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_motion || !b_flow || !b_match_margin ||
+        !b_S || !b_motion || !b_flow ||
         !b_R || !b_out)
         return Image();
 
@@ -1522,15 +1514,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
-    mp.match_ambiguity_enabled = ambiguity_on ? 1u : 0u;
-    mp.match_ambiguity_min_margin =
-        std::max(0.0f, cfg.match_ambiguity_min_margin);
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_gmeans offset:0 atIndex:1];
-    [enc setBuffer:b_match_margin offset:0 atIndex:14];
     [enc setBuffer:b_ref_m offset:0 atIndex:3];
     [enc setBuffer:b_ref_v offset:0 atIndex:4];
     [enc setBuffer:b_std offset:0 atIndex:6];
@@ -1725,13 +1713,11 @@ static bool l2_bufs(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer> 
 
 static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
                                   id<MTLBuffer> b_flow,
-                                  id<MTLBuffer> b_margin,
                                   int ref_h, int ref_w, int mov_h, int mov_w,
                                   int tile_size, int search_radius,
                                   int ny, int nx, bool l1) {
     if (search_radius < 0 || tile_size <= 0) return false;
     if (ny <= 0 || nx <= 0) return true;
-    if (!b_margin) return false;
     auto& c = ctx();
     struct AlignLocalSearch460ParamsCPU {
         uint32_t ny, nx;
@@ -1762,7 +1748,6 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
-    [enc setBuffer:b_margin offset:0 atIndex:4];
 
     // One threadgroup per tile: lanes split the candidate shifts and the kernel
     // stages the reference tile on-chip. `lanes` must be a power of two for the
@@ -1776,7 +1761,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     NSUInteger lanes = 64;
     while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
     auto red_bytes = [&](NSUInteger n) -> NSUInteger {
-        return 2u * align16(n * sizeof(float)) + 2u * align16(n * sizeof(int));
+        return align16(n * sizeof(float)) + align16(n * sizeof(int));
     };
     while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
     if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
@@ -1785,8 +1770,6 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:1];
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
-    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:3];
-    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:4];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
@@ -1918,9 +1901,8 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     id<MTLBuffer> ref_img = buf(ref.data.data(), ref.data.size() * sizeof(float));
     id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    id<MTLBuffer> margin_b = buf(nullptr, (size_t)ny * (size_t)nx * sizeof(float));
-    if (!ref_img || !mov_img || !flow_b || !margin_b) return false;
-    if (!local_search_460_bufs(ref_img, mov_img, flow_b, margin_b, ref.h, ref.w,
+    if (!ref_img || !mov_img || !flow_b) return false;
+    if (!local_search_460_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, false))
         return false;
@@ -1928,9 +1910,6 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     // so drain before reading the result back to the host.
     if (!align_drain()) return false;
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
-    if (flow.match_margin.size() == (size_t)ny * (size_t)nx)
-        memcpy(flow.match_margin.data(), [margin_b contents],
-               flow.match_margin.size() * sizeof(float));
     return true;
 }
 
@@ -1943,9 +1922,8 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
     id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
     id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    id<MTLBuffer> b_margin = buf(nullptr, (size_t)ny * (size_t)nx * sizeof(float));
-    if (!b_ref || !b_mov || !b_flow || !b_margin) return false;
-    if (!local_search_460_bufs(b_ref, b_mov, b_flow, b_margin, ref.h, ref.w,
+    if (!b_ref || !b_mov || !b_flow) return false;
+    if (!local_search_460_bufs(b_ref, b_mov, b_flow, ref.h, ref.w,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, true))
         return false;
@@ -1953,9 +1931,6 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
     // so drain before reading the result back to the host.
     if (!align_drain()) return false;
     memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
-    if (flow.match_margin.size() == (size_t)ny * (size_t)nx)
-        memcpy(flow.match_margin.data(), [b_margin contents],
-               flow.match_margin.size() * sizeof(float));
     return true;
 }
 
@@ -2250,7 +2225,6 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     }
 
     id<MTLBuffer> b_flow = nil;
-    id<MTLBuffer> b_margin = nil;
     int flow_ny = 0, flow_nx = 0;
     const bool ica_all = cfg.ica_every_level();
 
@@ -2295,14 +2269,12 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
 
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
-        b_margin = buf(nullptr, (size_t)ny * (size_t)nx * sizeof(float));
-        if (!b_margin) return false;
         bool bm_ok = false;
         if (metric == "L1")
-            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, b_margin, r.h, r.w,
+            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, true);
         else
-            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, b_margin, r.h, r.w,
+            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
@@ -2368,9 +2340,6 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
-    if (b_margin && flow_out.match_margin.size() == (size_t)flow_ny * (size_t)flow_nx)
-        memcpy(flow_out.match_margin.data(), [b_margin contents],
-               flow_out.match_margin.size() * sizeof(float));
     return true;
 }
 

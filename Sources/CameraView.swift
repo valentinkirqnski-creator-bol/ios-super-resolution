@@ -703,41 +703,13 @@ struct CameraView: View {
     // an operator overload the checker has to resolve, and there were enough of
     // them here to matter.
     @ViewBuilder
-    private var matchAmbiguitySection: some View {
-        Toggle("Match Ambiguity Guard",
-               isOn: $cam.tuningParams.match_ambiguity_reject_enabled)
-        Text("""
-             Rejects a comparison frame's tile when block matching finds another candidate \
-             with almost the same cost as the winner. This targets repeated edges and \
-             textures where the selected flow can be smooth but still wrong.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-
-        if cam.tuningParams.match_ambiguity_reject_enabled {
-            HStack {
-                Text("Min Margin")
-                Spacer()
-                Text(String(format: "%.2f", cam.tuningParams.match_ambiguity_min_margin))
-                    .monospacedDigit()
-            }
-            Slider(value: $cam.tuningParams.match_ambiguity_min_margin,
-                   in: 0.00...0.50,
-                   step: 0.01)
-            Text("""
-                 0.08 means the second-best match must be at least 8% worse than the \
-                 best match. Higher rejects more ambiguous tiles; lower keeps more detail.
-                 """)
-                .font(.caption2).foregroundColor(.secondary)
-        }
-    }
-
-    @ViewBuilder
     private var flowRegularizeSection: some View {
-        Toggle("Aperture Flow Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
+        Toggle("Hessian Aperture Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
         Text("""
              A tile holding one long edge -- a grille slat, a chrome strip -- cannot see how \
              far it moved ALONG that edge, so it picks at random and the merged edge wobbles \
-             from tile to tile. This finds that direction from the tile's own gradients and \
+             from tile to tile. This uses the tile Hessian eigenvalues to find that weak \
+             direction from the tile's own gradients and \
              takes only that component from the neighbours, keeping the direction it could \
              measure exactly as measured. Tiles with structure in both directions are left \
              alone entirely. For static scenes: across a real motion boundary the \
@@ -869,8 +841,6 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
                     }
-
-                    matchAmbiguitySection
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 

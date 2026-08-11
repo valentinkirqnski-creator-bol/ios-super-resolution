@@ -99,11 +99,6 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_enabled: Bool = false
     var flow_regularize_threshold: Float = 1.0
     var flow_regularize_aperture_ratio: Float = 0.15
-    /// Reject a frame/tile when block matching did not have a clearly unique
-    /// winner. This targets repeated edges/textures where multiple candidate
-    /// shifts look almost equally good.
-    var match_ambiguity_reject_enabled: Bool = false
-    var match_ambiguity_min_margin: Float = 0.08
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -176,7 +171,6 @@ struct TuningParams: Equatable, Codable {
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
         case flow_regularize_enabled, flow_regularize_threshold, flow_regularize_aperture_ratio
-        case match_ambiguity_reject_enabled, match_ambiguity_min_margin
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -211,8 +205,6 @@ struct TuningParams: Equatable, Codable {
         flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
         flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
-        match_ambiguity_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .match_ambiguity_reject_enabled) ?? match_ambiguity_reject_enabled
-        match_ambiguity_min_margin = try c.decodeIfPresent(Float.self, forKey: .match_ambiguity_min_margin) ?? match_ambiguity_min_margin
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1819,8 +1811,6 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
             "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
-            "match_ambiguity_reject_enabled": NSNumber(value: tuningParams.match_ambiguity_reject_enabled),
-            "match_ambiguity_min_margin": NSNumber(value: tuningParams.match_ambiguity_min_margin),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
