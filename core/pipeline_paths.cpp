@@ -117,6 +117,35 @@ static bool robustness_row_activity(const Image& rob, std::vector<uint8_t>& rows
     return any;
 }
 
+static Image compute_robustness_with_mismatch_fallback(const Image& comp,
+                                                       const RefStats& ref_stats,
+                                                       const FlowField& flow,
+                                                       int tile_size,
+                                                       const Config& work,
+                                                       std::vector<uint8_t>& rows,
+                                                       bool& has_nonzero) {
+    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+    has_nonzero = robustness_row_activity(rob, rows);
+    if (has_nonzero || !work.night_mismatch_enabled)
+        return rob;
+
+    // Night Sight's mismatch map reduces temporal strength; it does not mean a
+    // whole usable comparison frame should disappear. In this Wronski-style
+    // merge adaptation, if the mismatch cap wipes a frame out entirely, keep
+    // the base robustness result for that frame instead of aborting the burst.
+    Config base = work;
+    base.night_mismatch_enabled = false;
+    std::vector<uint8_t> base_rows;
+    Image base_rob = compute_robustness(comp, ref_stats, flow, tile_size, base);
+    const bool base_has_nonzero = robustness_row_activity(base_rob, base_rows);
+    if (base_has_nonzero) {
+        rows = std::move(base_rows);
+        has_nonzero = true;
+        return base_rob;
+    }
+    return rob;
+}
+
 static inline int round_away_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -1206,7 +1235,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
-            rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+            rob = compute_robustness_with_mismatch_fallback(comp, ref_stats, flow,
+                                                            tile_size, work,
+                                                            rob_rows_nonzero,
+                                                            rob_has_nonzero);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1224,16 +1256,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             const double t_kern = prof_now_ms();
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
-            rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
             covs = cov_fut.get();
             prof_add_cpu("comp:kernels", prof_now_ms() - t_kern);
         } else {
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
-            rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+            rob = compute_robustness_with_mismatch_fallback(comp, ref_stats, flow,
+                                                            tile_size, work,
+                                                            rob_rows_nonzero,
+                                                            rob_has_nonzero);
             covs = cov_fut.get();
-            rob_has_nonzero = robustness_row_activity(rob, rob_rows_nonzero);
         }
         debug_dump_bin("cpp_mask_" + std::to_string(pos),
                        rob.data.data(), rob.data.size());
