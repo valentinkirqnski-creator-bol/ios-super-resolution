@@ -66,10 +66,6 @@ struct RefStats {
     Image means;
     Image stds;
     Image hf_loss;   // 1-channel high-frequency variance-loss map
-    // The guide itself, not just its statistics. Retained only when a robustness
-    // test needs pixels (structure residual or Night Sight mismatch). Empty on
-    // Apple -- the Metal path pins it in a GPU buffer instead.
-    Image guide;
 }; // guide resolution [h/2, w/2, ch] for Bayer
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 

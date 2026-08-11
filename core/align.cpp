@@ -201,6 +201,15 @@ static bool env_flag_on(const char* name) {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+static f32 match_margin_from_costs(f32 best, f32 second) {
+    if (!std::isfinite(best))
+        return 0.f;
+    if (!std::isfinite(second))
+        return std::numeric_limits<f32>::infinity();
+    const f32 denom = std::max(std::fabs(best), 1.0e-12f);
+    return std::max((second - best) / denom, 0.f);
+}
+
 static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
                                      int tile_size, int search_radius,
                                      FlowField& flow, int num_threads) {
@@ -290,20 +299,26 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
             }
 
             f32 best_err = 1e30f;
+            f32 second_err = 1e30f;
             int best_dy = 0, best_dx = 0;
             for (int i = 0; i < corr_size; ++i) {
                 for (int j = 0; j < corr_size; ++j) {
                     f32 err = b.L2_search[(size_t)i * corr_size + j]
                             - 2.f * b.corrs[(size_t)i * corr_size + j];
                     if (err < best_err) {
+                        second_err = best_err;
                         best_err = err;
                         best_dy = i - corr_size / 2;
                         best_dx = j - corr_size / 2;
+                    } else if (err < second_err) {
+                        second_err = err;
                     }
                 }
             }
             flow.dx(ty, tx) += (f32)best_dx;
             flow.dy(ty, tx) += (f32)best_dy;
+            if (flow.match_margin.size() == (size_t)ny * (size_t)nx)
+                flow.margin(ty, tx) = match_margin_from_costs(best_err, second_err);
         }
     });
 }
@@ -321,6 +336,7 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
             const f32 local_fx = flow.dx(ty, tx);
             const f32 local_fy = flow.dy(ty, tx);
             f32 min_dist = std::numeric_limits<f32>::infinity();
+            f32 second_dist = std::numeric_limits<f32>::infinity();
             int min_shift_x = 0, min_shift_y = 0;
             for (int sdy = -R; sdy <= R; ++sdy) {
                 for (int sdx = -R; sdx <= R; ++sdx) {
@@ -343,14 +359,19 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                     }
                     if (!valid) dist = std::numeric_limits<f32>::infinity();
                     if (dist < min_dist) {
+                        second_dist = min_dist;
                         min_dist = dist;
                         min_shift_y = sdy;
                         min_shift_x = sdx;
+                    } else if (dist < second_dist) {
+                        second_dist = dist;
                     }
                 }
             }
             flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
             flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+            if (flow.match_margin.size() == (size_t)ny * (size_t)nx)
+                flow.margin(ty, tx) = match_margin_from_costs(min_dist, second_dist);
         }
     });
 }
@@ -616,6 +637,9 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             int sx = std::min(in.nx - 1, tx / repeat_factor);
             upsampled.dx(ty, tx) = in.dx(sy, sx) * (f32)upsample_factor;
             upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
+            if (upsampled.match_margin.size() == (size_t)upsampled.ny * (size_t)upsampled.nx &&
+                in.match_margin.size() == (size_t)in.ny * (size_t)in.nx)
+                upsampled.margin(ty, tx) = in.margin(sy, sx);
         }
     }
 
@@ -625,6 +649,10 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             if (ty < up_ny && tx < up_nx) {
                 out.dx(ty, tx) = upsampled.dx(ty, tx);
                 out.dy(ty, tx) = upsampled.dy(ty, tx);
+                if (out.match_margin.size() == (size_t)out.ny * (size_t)out.nx &&
+                    upsampled.match_margin.size() ==
+                        (size_t)upsampled.ny * (size_t)upsampled.nx)
+                    out.margin(ty, tx) = upsampled.margin(ty, tx);
             }
         }
     }
@@ -645,6 +673,8 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             if (tx >= repeat_factor * in.nx || ty >= repeat_factor * in.ny) {
                 out.dx(ty, tx) = 0.f;
                 out.dy(ty, tx) = 0.f;
+                if (out.match_margin.size() == (size_t)out.ny * (size_t)out.nx)
+                    out.margin(ty, tx) = 0.f;
                 continue;
             }
 
@@ -694,6 +724,18 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             }
             out.dx(ty, tx) = cand[best_i][0];
             out.dy(ty, tx) = cand[best_i][1];
+            if (out.match_margin.size() == (size_t)out.ny * (size_t)out.nx &&
+                in.match_margin.size() == (size_t)in.ny * (size_t)in.nx) {
+                int src_y = prev_y, src_x = prev_x;
+                if (best_i == 1) {
+                    src_y = cand_y;
+                    src_x = prev_x;
+                } else if (best_i == 2) {
+                    src_y = prev_y;
+                    src_x = cand_x;
+                }
+                out.margin(ty, tx) = in.margin(src_y, src_x);
+            }
         }
     }
     return out;
@@ -1094,6 +1136,9 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 (int)std::floor((raw_cx / sx) / (f32)tile_size)));
             out.dx(ty, tx) = flow.dx(gy, gx) * sx;
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
+            if (out.match_margin.size() == (size_t)out.ny * (size_t)out.nx &&
+                flow.match_margin.size() == (size_t)flow.ny * (size_t)flow.nx)
+                out.margin(ty, tx) = flow.margin(gy, gx);
         }
     }
     return out;

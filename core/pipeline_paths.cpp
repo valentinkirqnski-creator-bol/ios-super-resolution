@@ -1098,8 +1098,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
-    int rejected_by_mask = 0;
-    bool ref_only_due_mismatch = false;
 #if defined(__APPLE__)
     // Opened here, not at merge time, so each comparison frame can be uploaded
     // as soon as it is analyzed. set_single_acc_slot must precede begin_burst,
@@ -1261,8 +1259,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, mask_name.c_str(), rob);
             append_cov_summary(debug_summary, cov_name.c_str(), covs);
         }
-        if (!rob_has_nonzero)
-            rejected_by_mask++;
         const double t_stash = prof_now_ms();
         if (use_online) {
 #if defined(__APPLE__)
@@ -1405,22 +1401,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
 
     if (n_comp_ok < 1) {
-        if (work.night_mismatch_enabled && rejected_by_mask > 0) {
-            ref_only_due_mismatch = true;
-            report("Night Sight mismatch rejected all comparison frames; using reference only",
-                   0.47f);
-        } else {
-            if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
-            char why[160];
-            std::snprintf(why, sizeof(why),
-                          "Error: no comparison frame merged (rejected %d, no data %d, gpu %d)",
-                          online_skip_rejected, online_skip_nodata, online_skip_gpu);
-            report(why, 1.f);
+        if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+        char why[160];
+        std::snprintf(why, sizeof(why),
+                      "Error: no comparison frame merged (rejected %d, no data %d, gpu %d)",
+                      online_skip_rejected, online_skip_nodata, online_skip_gpu);
+        report(why, 1.f);
 #if defined(__APPLE__)
-            metal_merge_end_online();
+        metal_merge_end_online();
 #endif
-            return Image();
-        }
+        return Image();
     }
 
     // Release reference-side helpers not needed during merge.
@@ -1453,8 +1443,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (!stream_comp_raw)
         build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
     prof_add_cpu("merge:acc-rob-sum", prof_now_ms() - t_accrob);
-    const Image* acc_rob_ptr =
-        (accumulate_r && have_acc_rob && !ref_only_due_mismatch) ? &acc_rob : nullptr;
+    const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
     if (have_acc_rob) {
         debug_dump_bin("cpp_acc_rob", acc_rob.data.data(), acc_rob.data.size());
         if (debug) append_image_summary(debug_summary, "acc_rob", acc_rob);

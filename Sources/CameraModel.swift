@@ -99,20 +99,11 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_enabled: Bool = false
     var flow_regularize_threshold: Float = 1.0
     var flow_regularize_aperture_ratio: Float = 0.15
-    /// Zero R where the aligned patch does not structurally match the reference.
-    /// Eq. 5 compares 3x3 local means, which cannot see a stripe pattern locked
-    /// one period out or skin displaced within skin; this compares what is left
-    /// after the brightness offset is removed.
-    var struct_reject_enabled: Bool = false
-    /// Multiple of the sensor-noise floor the structure residual may reach
-    /// before the pixel is rejected. Lower rejects more.
-    var struct_reject_threshold: Float = 4.0
-    /// Night Sight-style per-frame mismatch gate:
-    /// m = d^2 / (d^2 + s * sigma^2), where d is aligned tile L1 difference.
-    var night_mismatch_enabled: Bool = false
-    var night_mismatch_s: Float = 0.5
-    var night_mismatch_keep: Float = 0.20
-    var night_mismatch_reject: Float = 0.60
+    /// Reject a frame/tile when block matching did not have a clearly unique
+    /// winner. This targets repeated edges/textures where multiple candidate
+    /// shifts look almost equally good.
+    var match_ambiguity_reject_enabled: Bool = false
+    var match_ambiguity_min_margin: Float = 0.08
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -185,9 +176,7 @@ struct TuningParams: Equatable, Codable {
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
         case flow_regularize_enabled, flow_regularize_threshold, flow_regularize_aperture_ratio
-        case struct_reject_enabled, struct_reject_threshold
-        case night_mismatch_enabled, night_mismatch_s
-        case night_mismatch_keep, night_mismatch_reject
+        case match_ambiguity_reject_enabled, match_ambiguity_min_margin
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -222,12 +211,8 @@ struct TuningParams: Equatable, Codable {
         flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
         flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
-        struct_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .struct_reject_enabled) ?? struct_reject_enabled
-        struct_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .struct_reject_threshold) ?? struct_reject_threshold
-        night_mismatch_enabled = try c.decodeIfPresent(Bool.self, forKey: .night_mismatch_enabled) ?? night_mismatch_enabled
-        night_mismatch_s = try c.decodeIfPresent(Float.self, forKey: .night_mismatch_s) ?? night_mismatch_s
-        night_mismatch_keep = try c.decodeIfPresent(Float.self, forKey: .night_mismatch_keep) ?? night_mismatch_keep
-        night_mismatch_reject = try c.decodeIfPresent(Float.self, forKey: .night_mismatch_reject) ?? night_mismatch_reject
+        match_ambiguity_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .match_ambiguity_reject_enabled) ?? match_ambiguity_reject_enabled
+        match_ambiguity_min_margin = try c.decodeIfPresent(Float.self, forKey: .match_ambiguity_min_margin) ?? match_ambiguity_min_margin
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1834,12 +1819,8 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
             "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
-            "struct_reject_enabled": NSNumber(value: tuningParams.struct_reject_enabled),
-            "struct_reject_threshold": NSNumber(value: tuningParams.struct_reject_threshold),
-            "night_mismatch_enabled": NSNumber(value: tuningParams.night_mismatch_enabled),
-            "night_mismatch_s": NSNumber(value: tuningParams.night_mismatch_s),
-            "night_mismatch_keep": NSNumber(value: tuningParams.night_mismatch_keep),
-            "night_mismatch_reject": NSNumber(value: tuningParams.night_mismatch_reject),
+            "match_ambiguity_reject_enabled": NSNumber(value: tuningParams.match_ambiguity_reject_enabled),
+            "match_ambiguity_min_margin": NSNumber(value: tuningParams.match_ambiguity_min_margin),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),

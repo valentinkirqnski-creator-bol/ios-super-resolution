@@ -703,75 +703,31 @@ struct CameraView: View {
     // an operator overload the checker has to resolve, and there were enough of
     // them here to matter.
     @ViewBuilder
-    private var structureGuardSection: some View {
-        Toggle("Structure Mismatch Guard", isOn: $cam.tuningParams.struct_reject_enabled)
+    private var matchAmbiguitySection: some View {
+        Toggle("Match Ambiguity Guard",
+               isOn: $cam.tuningParams.match_ambiguity_reject_enabled)
         Text("""
-             Rejects a patch whose structure does not match the reference even though its \
-             local brightness does. The standard test compares 3x3 means, which cannot see \
-             a stripe pattern locked one period out or skin displaced within skin -- the \
-             misalignments that survive as tile-shaped blocks on a moving subject.
+             Rejects a comparison frame's tile when block matching finds another candidate \
+             with almost the same cost as the winner. This targets repeated edges and \
+             textures where the selected flow can be smooth but still wrong.
              """)
             .font(.caption2).foregroundColor(.secondary)
 
-        if cam.tuningParams.struct_reject_enabled {
+        if cam.tuningParams.match_ambiguity_reject_enabled {
             HStack {
-                Text("Residual Tolerance")
+                Text("Min Margin")
                 Spacer()
-                Text(String(format: "%.1f", cam.tuningParams.struct_reject_threshold))
+                Text(String(format: "%.2f", cam.tuningParams.match_ambiguity_min_margin))
                     .monospacedDigit()
             }
-            Slider(value: $cam.tuningParams.struct_reject_threshold, in: 1.0...20.0)
+            Slider(value: $cam.tuningParams.match_ambiguity_min_margin,
+                   in: 0.00...0.50,
+                   step: 0.01)
             Text("""
-                 Multiple of the sensor-noise floor the residual may reach before the pixel \
-                 is dropped. Lower rejects more. A rejected region falls back to the \
-                 reference frame: softer there, but without a seam, so tune down until the \
-                 artifacts go rather than up until detail returns.
+                 0.08 means the second-best match must be at least 8% worse than the \
+                 best match. Higher rejects more ambiguous tiles; lower keeps more detail.
                  """)
                 .font(.caption2).foregroundColor(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var nightMismatchSection: some View {
-        Toggle("Night Sight Mismatch", isOn: $cam.tuningParams.night_mismatch_enabled)
-        Text("""
-             Computes the Night Sight per-frame mismatch map after alignment: \
-             m = d^2 / (d^2 + s * sigma^2), where d is the aligned tile L1 \
-             difference from the reference. When enabled, this mismatch weight \
-             drives the merge mask instead of the Wronski statistical mask.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-
-        if cam.tuningParams.night_mismatch_enabled {
-            HStack {
-                Text("Mismatch s")
-                Spacer()
-                Text(String(format: "%.2f", cam.tuningParams.night_mismatch_s))
-                    .monospacedDigit()
-            }
-            Slider(value: $cam.tuningParams.night_mismatch_s,
-                   in: 0.10...2.00,
-                   step: 0.05)
-
-            HStack {
-                Text("Keep Below")
-                Spacer()
-                Text(String(format: "%.2f", cam.tuningParams.night_mismatch_keep))
-                    .monospacedDigit()
-            }
-            Slider(value: $cam.tuningParams.night_mismatch_keep,
-                   in: 0.00...0.80,
-                   step: 0.01)
-
-            HStack {
-                Text("Reject Above")
-                Spacer()
-                Text(String(format: "%.2f", cam.tuningParams.night_mismatch_reject))
-                    .monospacedDigit()
-            }
-            Slider(value: $cam.tuningParams.night_mismatch_reject,
-                   in: 0.05...1.00,
-                   step: 0.01)
         }
     }
 
@@ -914,8 +870,7 @@ struct CameraView: View {
                         Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
                     }
 
-                    structureGuardSection
-                    nightMismatchSection
+                    matchAmbiguitySection
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 

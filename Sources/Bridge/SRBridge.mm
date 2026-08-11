@@ -331,20 +331,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"flow_regularize_aperture_ratio"])
         cfg.flow_regularize_aperture_ratio =
             std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
-    if (tuning[@"struct_reject_enabled"])
-        cfg.struct_reject_enabled = tuning[@"struct_reject_enabled"].boolValue;
-    if (tuning[@"struct_reject_threshold"])
-        cfg.struct_reject_threshold = tuning[@"struct_reject_threshold"].floatValue;
-    if (tuning[@"night_mismatch_enabled"])
-        cfg.night_mismatch_enabled = tuning[@"night_mismatch_enabled"].boolValue;
-    if (tuning[@"night_mismatch_s"])
-        cfg.night_mismatch_s = std::max(1.0e-6f, tuning[@"night_mismatch_s"].floatValue);
-    if (tuning[@"night_mismatch_keep"])
-        cfg.night_mismatch_keep =
-            std::max(0.0f, std::min(1.0f, tuning[@"night_mismatch_keep"].floatValue));
-    if (tuning[@"night_mismatch_reject"])
-        cfg.night_mismatch_reject =
-            std::max(0.0f, std::min(1.0f, tuning[@"night_mismatch_reject"].floatValue));
+    if (tuning[@"match_ambiguity_reject_enabled"])
+        cfg.match_ambiguity_reject_enabled =
+            tuning[@"match_ambiguity_reject_enabled"].boolValue;
+    if (tuning[@"match_ambiguity_min_margin"])
+        cfg.match_ambiguity_min_margin =
+            std::max(0.0f, tuning[@"match_ambiguity_min_margin"].floatValue);
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])

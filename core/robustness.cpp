@@ -448,99 +448,6 @@ static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     return v;
 }
 
-static f32 sample_guide_bilinear(const Image& guide, f32 y, f32 x, int ch) {
-    if (!(x >= 0.f && y >= 0.f && x <= (f32)(guide.w - 1) && y <= (f32)(guide.h - 1)))
-        return std::numeric_limits<f32>::quiet_NaN();
-    const int x0 = (int)std::floor(x);
-    const int y0 = (int)std::floor(y);
-    const int x1 = std::min(x0 + 1, guide.w - 1);
-    const int y1 = std::min(y0 + 1, guide.h - 1);
-    const f32 fx = x - (f32)x0;
-    const f32 fy = y - (f32)y0;
-    const f32 a = guide.at(y0, x0, ch) + fx * (guide.at(y0, x1, ch) - guide.at(y0, x0, ch));
-    const f32 b = guide.at(y1, x0, ch) + fx * (guide.at(y1, x1, ch) - guide.at(y1, x0, ch));
-    return a + fy * (b - a);
-}
-
-static std::vector<f32> compute_night_mismatch_tiles(const Image& ref_guide,
-                                                     const Image& comp_guide,
-                                                     const FlowField& flow,
-                                                     int tile_size,
-                                                     const Config& cfg) {
-    std::vector<f32> mismatch((size_t)flow.ny * (size_t)flow.nx, 1.f);
-    if (!cfg.night_mismatch_enabled || ref_guide.data.empty() ||
-        comp_guide.data.empty() || ref_guide.h != comp_guide.h ||
-        ref_guide.w != comp_guide.w || ref_guide.c != comp_guide.c ||
-        flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0)
-        return mismatch;
-
-    const bool bayer = (ref_guide.c == 3 && cfg.bayer_mode);
-    const f32 coord_scale = bayer ? 0.5f : 1.f;
-    const int guide_tile = std::max(1, (int)std::lround((f32)tile_size * coord_scale));
-    const f32 s = std::max(cfg.night_mismatch_s, 1.0e-6f);
-    constexpr double kExpectedAbsGaussian = 0.7978845608028654; // sqrt(2 / pi)
-
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            const f32 fx = flow.dx(ty, tx) * coord_scale;
-            const f32 fy = flow.dy(ty, tx) * coord_scale;
-            const int y0 = ty * guide_tile;
-            const int x0 = tx * guide_tile;
-            const int y1 = std::min(y0 + guide_tile, ref_guide.h);
-            const int x1 = std::min(x0 + guide_tile, ref_guide.w);
-
-            double abs_sum = 0.0;
-            double noise_abs_sum = 0.0;
-            double noise_var_sum = 0.0;
-            int n = 0;
-            for (int y = y0; y < y1; ++y) {
-                for (int x = x0; x < x1; ++x) {
-                    const f32 cy = (f32)y + fy;
-                    const f32 cx = (f32)x + fx;
-                    if (!(cx >= 0.f && cy >= 0.f &&
-                          cx <= (f32)(comp_guide.w - 1) &&
-                          cy <= (f32)(comp_guide.h - 1)))
-                        continue;
-                    for (int ch = 0; ch < ref_guide.c; ++ch) {
-                        const f32 c = sample_guide_bilinear(comp_guide, cy, cx, ch);
-                        if (!std::isfinite(c)) continue;
-                        const f32 r = ref_guide.at(y, x, ch);
-                        const double noise_var =
-                            2.0 * (double)guide_noise_var(cfg, ref_guide.c, ch, r);
-                        abs_sum += std::fabs((double)r - (double)c);
-                        noise_abs_sum += std::sqrt(std::max(noise_var, 0.0)) *
-                                         kExpectedAbsGaussian;
-                        noise_var_sum += noise_var;
-                        ++n;
-                    }
-                }
-            }
-
-            f32 m = 1.f;
-            if (n > 0) {
-                const double mean_abs = abs_sum / (double)n;
-                const double mean_noise_abs = noise_abs_sum / (double)n;
-                const double d = std::max(mean_abs - mean_noise_abs, 0.0);
-                const double sigma2 = std::max(noise_var_sum / (double)n, 1.0e-20);
-                m = (f32)((d * d) / (d * d + (double)s * sigma2));
-            }
-            mismatch[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
-                clampf(std::isfinite(m) ? m : 1.f, 0.f, 1.f);
-        }
-    });
-    return mismatch;
-}
-
-static f32 night_mismatch_weight(f32 mismatch, const Config& cfg) {
-    if (!cfg.night_mismatch_enabled) return 1.f;
-    if (!std::isfinite(mismatch)) return 0.f;
-    f32 keep = clampf(cfg.night_mismatch_keep, 0.f, 1.f);
-    f32 reject = clampf(cfg.night_mismatch_reject, 0.f, 1.f);
-    if (reject <= keep)
-        return mismatch <= keep ? 1.f : 0.f;
-    return clampf((reject - mismatch) / (reject - keep), 0.f, 1.f);
-}
-
 static f32 guide_edge_strength_sq(const Image& means, int y, int x) {
     if (means.h <= 0 || means.w <= 0 || means.c <= 0) return 0.f;
     const int xm = (int)clampf((f32)(x - 1), 0.f, (f32)(means.w - 1));
@@ -768,8 +675,6 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
     st.stds  = std::move(vars);
-    // These tests need the guide pixels, not just the statistics.
-    if (cfg.struct_reject_enabled || cfg.night_mismatch_enabled) st.guide = guide;
     if (cfg.hf_artifact_removal_enabled) {
         Image lp_guide = local_lowpass_gaussian5x5(guide);
         Image lp_means, lp_vars;
@@ -810,10 +715,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-    std::vector<f32> night_mismatch;
-    if (cfg.night_mismatch_enabled)
-        night_mismatch = compute_night_mismatch_tiles(ref_stats.guide, guide, flow,
-                                                      tile_size, cfg);
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
@@ -898,58 +799,19 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            // Structure residual: what the 3x3 mean comparison above cannot see.
-            bool struct_reject = false;
-            const bool inbound =
-                (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h);
-            if (cfg.struct_reject_enabled && inbound &&
-                !ref_stats.guide.data.empty() && !guide.data.empty()) {
-                f32 acc = 0.f, dc = 0.f, noise = 0.f;
-                for (int i = -1; i <= 1; ++i) {
-                    const int ry = std::min(std::max(y + i, 0), h - 1);
-                    const int cy = std::min(std::max(new_y + i, 0), h - 1);
-                    for (int j = -1; j <= 1; ++j) {
-                        const int rx = std::min(std::max(x + j, 0), w - 1);
-                        const int cx = std::min(std::max(new_x + j, 0), w - 1);
-                        for (int ch = 0; ch < ref_stats.means.c; ++ch) {
-                            const f32 d = ref_stats.guide.at(ry, rx, ch) -
-                                          guide.at(cy, cx, ch);
-                            acc += d * d;
-                        }
-                    }
-                }
-                for (int ch = 0; ch < ref_stats.means.c; ++ch) {
-                    const f32 m = ref_stats.means.at(y, x, ch) -
-                                  comp_means.at(new_y, new_x, ch);
-                    dc += m * m;
-                    // Same MC curve the noise model uses, so the floor tracks
-                    // brightness instead of being a fixed number.
-                    const f32 b = ref_stats.means.at(y, x, ch);
-                    int idn = (int)std::lround(1000.f * b);
-                    if (!std::isfinite(b) || idn < 0) idn = 0;
-                    else if (idn >= (int)nc.std_curve.size())
-                        idn = (int)nc.std_curve.size() - 1;
-                    const f32 st_ = nc.std_curve[(size_t)idn];
-                    // Difference of two independent noisy samples.
-                    noise += 2.f * st_ * st_;
-                }
-                const f32 resid = std::max(0.f, acc / 9.f - dc);
-                struct_reject = resid > cfg.struct_reject_threshold *
-                                            std::max(noise, 1e-12f);
+            bool ambiguity_reject = false;
+            if (cfg.match_ambiguity_reject_enabled &&
+                flow.match_margin.size() == (size_t)flow.ny * (size_t)flow.nx &&
+                pidx < flow.match_margin.size()) {
+                const f32 margin = flow.match_margin[pidx];
+                ambiguity_reject = std::isnan(margin) ||
+                    margin <= std::max(cfg.match_ambiguity_min_margin, 0.f);
             }
-            const bool hard_reject = hf_reject || edge_reject || struct_reject;
+            const bool hard_reject =
+                hf_reject || edge_reject || ambiguity_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
-            if (cfg.night_mismatch_enabled && pidx < night_mismatch.size()) {
-                // Night Sight's map is its own per-frame mismatch confidence,
-                // not the Wronski Eq. 5 confidence. When enabled, make the
-                // saved/merge mask visibly be that mismatch map, with the
-                // optional hard artifact guards still allowed to zero it.
-                r_val = hard_reject
-                    ? 0.f
-                    : night_mismatch_weight(night_mismatch[pidx], cfg);
-            }
             R.at(y, x) = r_val;
         }
     }

@@ -14,6 +14,7 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 namespace hhsr {
 
@@ -41,14 +42,24 @@ struct FlowField {
     int ny = 0;
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
+    // Per-tile block-match uniqueness:
+    //   (second_best_cost - best_cost) / max(abs(best_cost), eps)
+    // Larger means the winning match was clearly unique. Near zero means an
+    // equally plausible second match existed, which is exactly the repeated
+    // texture / long-edge failure that can produce smooth wrong flow.
+    std::vector<f32> match_margin; // ny*nx
 
     FlowField() = default;
-    FlowField(int ny_, int nx_) : ny(ny_), nx(nx_), flow((size_t)ny_ * nx_ * 2, 0.f) {}
+    FlowField(int ny_, int nx_)
+        : ny(ny_), nx(nx_), flow((size_t)ny_ * nx_ * 2, 0.f),
+          match_margin((size_t)ny_ * nx_, std::numeric_limits<f32>::infinity()) {}
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
     inline f32 dx(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
+    inline f32& margin(int ty, int tx) { return match_margin[(size_t)ty * nx + tx]; }
+    inline f32 margin(int ty, int tx) const { return match_margin[(size_t)ty * nx + tx]; }
 };
 
 // Per-grey-pixel 2x2 covariance field (steerable kernels): [h, w, 4] = xx,xy,yx,yy.
@@ -276,54 +287,12 @@ struct Config {
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
 
-    // Structure-residual rejection: zero R where the aligned patch does not
-    // actually look like the reference patch here.
-    //
-    // Eq. 5 measures |ref_mean - comp_mean| on 3x3 local means, which is a
-    // deliberate low-pass -- it is meant to see motion and occlusion rather
-    // than alignment residual. The side effect is that it cannot see structure
-    // at all. A stripe pattern locked one period out has the same local mean as
-    // an aligned one; so does a patch of skin displaced within uniform skin.
-    // Both keep a high R and merge, which is what a tile-shaped displacement in
-    // the output is made of.
-    //
-    // This measures what is left after the brightness offset is removed:
-    //
-    //   resid = mean_3x3[(ref - comp_aligned)^2] - (ref_mean - comp_mean)^2
-    //
-    // i.e. the variance of the alignment residual, which is exactly the AC part
-    // Eq. 5 discards. Rejected when resid exceeds struct_reject_threshold times
-    // what sensor noise alone explains (2*sigma^2 from the same MC curves), so
-    // the test scales with brightness rather than being a fixed number.
-    //
-    // Not circular with the matcher: block matching minimised a sum over a
-    // 16x16 tile of the grey, while this is a per-pixel 3x3 statistic on the
-    // Bayer guide. A tile can minimise its total while individual
-    // neighbourhoods inside it are badly wrong -- that is precisely the
-    // compromise a single translation makes on a rotating subject, and this is
-    // where it becomes visible.
-    //
-    // Off by default: it changes which pixels merge. Rejection is the safe
-    // direction (a rejected region falls back to reference-only: softer, but
-    // without a seam), so tune the threshold down until artifacts go rather
-    // than up until detail returns.
-    bool  struct_reject_enabled = false;
-    float struct_reject_threshold = 4.0f;
-    // Night Sight-style per-frame mismatch map. For every aligned comparison
-    // frame, compute a tile L1 residual against the reference in guide space:
-    //
-    //   m = d^2 / (d^2 + s * sigma^2)
-    //
-    // where d is the noise-corrected aligned tile L1 difference and sigma^2
-    // is the expected sensor-noise variance at that brightness. The paper
-    // then maps m to a temporal strength factor. This merge has direct
-    // per-pixel confidence rather than Hasinoff Fourier temporal strength,
-    // so the mismatch map is used as an extra safety cap on R: low mismatch
-    // leaves R alone, high mismatch forces it toward zero for that frame/tile.
-    bool  night_mismatch_enabled = false;
-    float night_mismatch_s = 0.5f;
-    float night_mismatch_keep = 0.20f;
-    float night_mismatch_reject = 0.60f;
+    // Block-match ambiguity rejection: after the local search, compare the
+    // best and second-best candidate costs for that frame/tile. If the winner
+    // is not better by this fractional margin, the match is not unique enough
+    // to trust for SR and robustness is forced to zero for that tile.
+    bool  match_ambiguity_reject_enabled = false;
+    float match_ambiguity_min_margin = 0.08f;
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;

@@ -470,15 +470,19 @@ struct AlignLocalSearch460Params {
 // which reproduces the original sdy-outer / sdx-inner first-minimum-wins scan.
 //
 // Threadgroup memory is supplied by the host: [0] = ts*ts floats for the tile,
-// [1]/[2] = one float/int per lane for the reduction. `lanes` must be a power of
-// two (the host enforces this) for the tree reduction to cover every element.
+// [1]/[2] = best float/int per lane, [3]/[4] = second-best float/int per lane.
+// `lanes` must be a power of two (the host enforces this) for the tree
+// reduction to cover every element.
 kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    device const float* mov [[buffer(1)]],
                                    device float* flow [[buffer(2)]],
                                    constant AlignLocalSearch460Params& p [[buffer(3)]],
+                                   device float* match_margin [[buffer(4)]],
                                    threadgroup float* ref_tile [[threadgroup(0)]],
                                    threadgroup float* red_dist [[threadgroup(1)]],
                                    threadgroup int* red_cand [[threadgroup(2)]],
+                                   threadgroup float* red_second_dist [[threadgroup(3)]],
+                                   threadgroup int* red_second_cand [[threadgroup(4)]],
                                    uint tile_id [[threadgroup_position_in_grid]],
                                    uint lane [[thread_position_in_threadgroup]],
                                    uint lanes [[threads_per_threadgroup]]) {
@@ -516,6 +520,8 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
 
     float best_dist = INFINITY;
     int best_cand = kNone;
+    float second_dist = INFINITY;
+    int second_cand = kNone;
 
     if (ref_in) {
         const int ifx = int(local_fx);
@@ -542,24 +548,60 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                 }
             }
             if (dist < best_dist) {
+                second_dist = best_dist;
+                second_cand = best_cand;
                 best_dist = dist;
                 best_cand = c;
+            } else if (dist < second_dist) {
+                second_dist = dist;
+                second_cand = c;
             }
         }
     }
 
     red_dist[lane] = best_dist;
     red_cand[lane] = best_cand;
+    red_second_dist[lane] = second_dist;
+    red_second_cand[lane] = second_cand;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint s = lanes >> 1u; s > 0u; s >>= 1u) {
         if (lane < s) {
             const float od = red_dist[lane + s];
             const int oc = red_cand[lane + s];
-            if (od < red_dist[lane] ||
-                (od == red_dist[lane] && oc < red_cand[lane])) {
+            const float osd = red_second_dist[lane + s];
+            const int osc = red_second_cand[lane + s];
+            if (oc != kNone &&
+                (od < red_dist[lane] ||
+                 (od == red_dist[lane] && oc < red_cand[lane]))) {
+                if (oc != red_cand[lane]) {
+                    red_second_dist[lane] = red_dist[lane];
+                    red_second_cand[lane] = red_cand[lane];
+                }
                 red_dist[lane] = od;
                 red_cand[lane] = oc;
+            } else if (oc != kNone && oc != red_cand[lane] &&
+                       (od < red_second_dist[lane] ||
+                        (od == red_second_dist[lane] &&
+                         oc < red_second_cand[lane]))) {
+                red_second_dist[lane] = od;
+                red_second_cand[lane] = oc;
+            }
+            if (osc != kNone &&
+                (osd < red_dist[lane] ||
+                 (osd == red_dist[lane] && osc < red_cand[lane]))) {
+                if (osc != red_cand[lane]) {
+                    red_second_dist[lane] = red_dist[lane];
+                    red_second_cand[lane] = red_cand[lane];
+                }
+                red_dist[lane] = osd;
+                red_cand[lane] = osc;
+            } else if (osc != kNone && osc != red_cand[lane] &&
+                       (osd < red_second_dist[lane] ||
+                        (osd == red_second_dist[lane] &&
+                         osc < red_second_cand[lane]))) {
+                red_second_dist[lane] = osd;
+                red_second_cand[lane] = osc;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -575,6 +617,14 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
         }
         flow[tile_id * 2u + 0u] = local_fx + float(sdx);
         flow[tile_id * 2u + 1u] = local_fy + float(sdy);
+        float margin = 0.f;
+        if (isfinite(red_dist[0])) {
+            margin = isfinite(red_second_dist[0])
+                ? max((red_second_dist[0] - red_dist[0]) /
+                      max(fabs(red_dist[0]), 1.0e-12f), 0.f)
+                : INFINITY;
+        }
+        match_margin[tile_id] = margin;
     }
 }
 
@@ -1412,12 +1462,9 @@ struct RobMaskParams {
     uint motion_edge_neighborhood_radius;
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
-    uint struct_enabled;
-    float struct_threshold;
-    uint night_mismatch_enabled;
-    float night_mismatch_keep;
-    float night_mismatch_reject;
-    uint _pad2;
+    uint match_ambiguity_enabled;
+    float match_ambiguity_min_margin;
+    uint _pad2, _pad3, _pad4, _pad5;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1506,19 +1553,6 @@ struct RobHfLossParams {
     float _pad1;
 };
 
-struct RobMismatchParams {
-    uint h, w, nch;
-    uint tile_size;
-    uint flow_ny;
-    uint flow_nx;
-    uint bayer;
-    uint _pad0;
-    float alpha;
-    float beta;
-    float s;
-    float _pad1;
-};
-
 kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
                                     device const float* guide [[buffer(1)]],
                                     constant RobStatsParams& p [[buffer(2)]],
@@ -1571,89 +1605,6 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
     loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
         ? max((signal_var - signal_lp_var) / signal_var, 0.f)
         : 0.f;
-}
-
-inline float rob_guide_noise_var(float alpha, float beta, uint nch, uint ch,
-                                 float brightness) {
-    brightness = clamp(isfinite(brightness) ? brightness : 0.f, 0.f, 1.f);
-    float v = max(alpha * brightness + beta, 0.f);
-    if (nch == 3u && ch == 1u) v *= 0.5f;
-    return v;
-}
-
-inline float rob_sample_guide_bilinear(device const float* guide,
-                                       uint h, uint w, uint nch,
-                                       float y, float x, uint ch) {
-    if (!(x >= 0.f && y >= 0.f && x <= float(w - 1u) && y <= float(h - 1u)))
-        return INFINITY;
-    int x0 = int(floor(x));
-    int y0 = int(floor(y));
-    int x1 = min(x0 + 1, int(w) - 1);
-    int y1 = min(y0 + 1, int(h) - 1);
-    float fx = x - float(x0);
-    float fy = y - float(y0);
-    float a = guide[(uint(y0) * w + uint(x0)) * nch + ch] +
-              fx * (guide[(uint(y0) * w + uint(x1)) * nch + ch] -
-                    guide[(uint(y0) * w + uint(x0)) * nch + ch]);
-    float b = guide[(uint(y1) * w + uint(x0)) * nch + ch] +
-              fx * (guide[(uint(y1) * w + uint(x1)) * nch + ch] -
-                    guide[(uint(y1) * w + uint(x0)) * nch + ch]);
-    return a + fy * (b - a);
-}
-
-kernel void rob_night_mismatch_tiles(device float* mismatch [[buffer(0)]],
-                                     device const float* ref_guide [[buffer(1)]],
-                                     device const float* comp_guide [[buffer(2)]],
-                                     device const float* flow [[buffer(3)]],
-                                     constant RobMismatchParams& p [[buffer(4)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.flow_nx || gid.y >= p.flow_ny) return;
-    bool bayer = (p.bayer != 0u && p.nch == 3u);
-    float coord_scale = bayer ? 0.5f : 1.f;
-    int guide_tile = max(1, int(floor(float(p.tile_size) * coord_scale + 0.5f)));
-    uint fi = (gid.y * p.flow_nx + gid.x) * 2u;
-    float fx = flow[fi + 0u] * coord_scale;
-    float fy = flow[fi + 1u] * coord_scale;
-    int y0 = int(gid.y) * guide_tile;
-    int x0 = int(gid.x) * guide_tile;
-    int y1 = min(y0 + guide_tile, int(p.h));
-    int x1 = min(x0 + guide_tile, int(p.w));
-    const float kExpectedAbsGaussian = 0.7978845608f; // sqrt(2 / pi)
-    float abs_sum = 0.f;
-    float noise_abs_sum = 0.f;
-    float noise_var_sum = 0.f;
-    uint n = 0u;
-    for (int y = y0; y < y1; ++y) {
-        for (int x = x0; x < x1; ++x) {
-            float cy = float(y) + fy;
-            float cx = float(x) + fx;
-            if (!(cx >= 0.f && cy >= 0.f &&
-                  cx <= float(p.w - 1u) && cy <= float(p.h - 1u)))
-                continue;
-            for (uint ch = 0u; ch < p.nch; ++ch) {
-                float c = rob_sample_guide_bilinear(comp_guide, p.h, p.w, p.nch,
-                                                    cy, cx, ch);
-                if (!isfinite(c)) continue;
-                float r = ref_guide[(uint(y) * p.w + uint(x)) * p.nch + ch];
-                float noise_var =
-                    2.f * rob_guide_noise_var(p.alpha, p.beta, p.nch, ch, r);
-                abs_sum += fabs(r - c);
-                noise_abs_sum += sqrt(max(noise_var, 0.f)) * kExpectedAbsGaussian;
-                noise_var_sum += noise_var;
-                ++n;
-            }
-        }
-    }
-    float m = 1.f;
-    if (n > 0u) {
-        float mean_abs = abs_sum / float(n);
-        float mean_noise_abs = noise_abs_sum / float(n);
-        float d = max(mean_abs - mean_noise_abs, 0.f);
-        float sigma2 = max(noise_var_sum / float(n), 1.0e-20f);
-        float ss = max(p.s, 1.0e-6f);
-        m = (d * d) / (d * d + ss * sigma2);
-    }
-    mismatch[gid.y * p.flow_nx + gid.x] = clamp(isfinite(m) ? m : 1.f, 0.f, 1.f);
 }
 
 kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
@@ -1731,9 +1682,7 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
 
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
-                          device const float* ref_guide [[buffer(2)]],
-                          device const float* comp_guide [[buffer(12)]],
-                          device const float* night_mismatch [[buffer(13)]],
+                          device const float* match_margin [[buffer(14)]],
                           device const float* ref_means [[buffer(3)]],
                           device const float* ref_vars [[buffer(4)]],
                           device const float* std_curve [[buffer(6)]],
@@ -1746,10 +1695,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
-    // Accumulated alongside the loop below so the structure test costs no extra
-    // curve lookups: dc_sq_ is the part of the residual a brightness offset
-    // explains, noise_sq_ what sensor noise alone would produce.
-    float dc_sq_ = 0.f, noise_sq_ = 0.f;
     int patch_idy;
     int patch_idx;
     float flow_x;
@@ -1795,10 +1740,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_p_sq = d_p_ * d_p_;
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
         d_sq_ += d_p_sq * shrink * shrink;
-        // Unshrunk, for the structure test: it needs the raw DC difference to
-        // subtract, not the noise-suppressed one Eq. 5 uses.
-        if (inbound) dc_sq_ += d_p_sq;
-        noise_sq_ += 2.f * sigma_t * sigma_t;
     }
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
@@ -1858,46 +1799,16 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    // Structure residual -- the AC part of the mismatch, which the mean
-    // comparison above is blind to by construction. Matches the CPU path in
-    // robustness.cpp; see struct_reject_enabled in types.h for why.
-    bool struct_reject = false;
-    if (p.struct_enabled != 0u && inbound) {
-        float acc = 0.f;
-        for (int i = -1; i <= 1; ++i) {
-            int ry = clamp_edge(int(gid.y) + i, int(p.h) - 1);
-            int cy = clamp_edge(new_idy + i, int(p.h) - 1);
-            for (int j = -1; j <= 1; ++j) {
-                int rx = clamp_edge(int(gid.x) + j, int(p.w) - 1);
-                int cx = clamp_edge(new_idx + j, int(p.w) - 1);
-                for (uint ch = 0u; ch < p.nch; ++ch) {
-                    float d = ref_guide[(uint(ry) * p.w + uint(rx)) * p.nch + ch] -
-                              comp_guide[(uint(cy) * p.w + uint(cx)) * p.nch + ch];
-                    acc += d * d;
-                }
-            }
-        }
-        float resid = max(0.f, acc / 9.f - dc_sq_);
-        struct_reject = resid > p.struct_threshold * max(noise_sq_, 1e-12f);
+    bool ambiguity_reject = false;
+    if (p.match_ambiguity_enabled != 0u) {
+        float margin = match_margin[pidx];
+        ambiguity_reject = isnan(margin) ||
+            margin <= max(p.match_ambiguity_min_margin, 0.f);
     }
-
-    bool hard_reject = hf_reject || edge_reject || struct_reject;
+    bool hard_reject = hf_reject || edge_reject || ambiguity_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
-    if (p.night_mismatch_enabled != 0u) {
-        float m = night_mismatch[pidx];
-        float keep = clamp(p.night_mismatch_keep, 0.f, 1.f);
-        float reject = clamp(p.night_mismatch_reject, 0.f, 1.f);
-        float safe = (reject <= keep)
-            ? ((isfinite(m) && m <= keep) ? 1.f : 0.f)
-            : clamp((reject - (isfinite(m) ? m : 1.f)) / (reject - keep), 0.f, 1.f);
-        // Night Sight's map is its own per-frame mismatch confidence, not the
-        // Wronski Eq. 5 confidence. When enabled, make the saved/merge mask
-        // visibly be that mismatch map, with optional hard artifact guards
-        // still allowed to zero it.
-        r_val = hard_reject ? 0.f : safe;
-    }
     R[gid.y * p.w + gid.x] = r_val;
 }
 
