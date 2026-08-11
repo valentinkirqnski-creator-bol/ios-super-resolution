@@ -314,12 +314,12 @@ struct Config {
     //
     //   m = d^2 / (d^2 + s * sigma^2)
     //
-    // where d is the aligned tile L1 difference and sigma^2 is the expected
-    // sensor-noise variance at that brightness. The paper then maps m to a
-    // temporal strength factor. This merge has direct per-pixel confidence
-    // rather than Hasinoff Fourier temporal strength, so the mismatch map is
-    // used as an extra safety cap on R: low mismatch leaves R alone, high
-    // mismatch forces it toward zero for that frame/tile.
+    // where d is the noise-corrected aligned tile L1 difference and sigma^2
+    // is the expected sensor-noise variance at that brightness. The paper
+    // then maps m to a temporal strength factor. This merge has direct
+    // per-pixel confidence rather than Hasinoff Fourier temporal strength,
+    // so the mismatch map is used as an extra safety cap on R: low mismatch
+    // leaves R alone, high mismatch forces it toward zero for that frame/tile.
     bool  night_mismatch_enabled = false;
     float night_mismatch_s = 0.5f;
     float night_mismatch_keep = 0.20f;

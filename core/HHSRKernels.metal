@@ -1618,8 +1618,10 @@ kernel void rob_night_mismatch_tiles(device float* mismatch [[buffer(0)]],
     int x0 = int(gid.x) * guide_tile;
     int y1 = min(y0 + guide_tile, int(p.h));
     int x1 = min(x0 + guide_tile, int(p.w));
-    float d_sum = 0.f;
-    float noise_sum = 0.f;
+    const float kExpectedAbsGaussian = 0.7978845608f; // sqrt(2 / pi)
+    float abs_sum = 0.f;
+    float noise_abs_sum = 0.f;
+    float noise_var_sum = 0.f;
     uint n = 0u;
     for (int y = y0; y < y1; ++y) {
         for (int x = x0; x < x1; ++x) {
@@ -1633,16 +1635,21 @@ kernel void rob_night_mismatch_tiles(device float* mismatch [[buffer(0)]],
                                                     cy, cx, ch);
                 if (!isfinite(c)) continue;
                 float r = ref_guide[(uint(y) * p.w + uint(x)) * p.nch + ch];
-                d_sum += fabs(r - c);
-                noise_sum += 2.f * rob_guide_noise_var(p.alpha, p.beta, p.nch, ch, r);
+                float noise_var =
+                    2.f * rob_guide_noise_var(p.alpha, p.beta, p.nch, ch, r);
+                abs_sum += fabs(r - c);
+                noise_abs_sum += sqrt(max(noise_var, 0.f)) * kExpectedAbsGaussian;
+                noise_var_sum += noise_var;
                 ++n;
             }
         }
     }
     float m = 1.f;
     if (n > 0u) {
-        float d = d_sum / float(n);
-        float sigma2 = max(noise_sum / float(n), 1.0e-20f);
+        float mean_abs = abs_sum / float(n);
+        float mean_noise_abs = noise_abs_sum / float(n);
+        float d = max(mean_abs - mean_noise_abs, 0.f);
+        float sigma2 = max(noise_var_sum / float(n), 1.0e-20f);
         float ss = max(p.s, 1.0e-6f);
         m = (d * d) / (d * d + ss * sigma2);
     }

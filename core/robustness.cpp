@@ -478,6 +478,7 @@ static std::vector<f32> compute_night_mismatch_tiles(const Image& ref_guide,
     const f32 coord_scale = bayer ? 0.5f : 1.f;
     const int guide_tile = std::max(1, (int)std::lround((f32)tile_size * coord_scale));
     const f32 s = std::max(cfg.night_mismatch_s, 1.0e-6f);
+    constexpr double kExpectedAbsGaussian = 0.7978845608028654; // sqrt(2 / pi)
 
     parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
@@ -488,8 +489,9 @@ static std::vector<f32> compute_night_mismatch_tiles(const Image& ref_guide,
             const int y1 = std::min(y0 + guide_tile, ref_guide.h);
             const int x1 = std::min(x0 + guide_tile, ref_guide.w);
 
-            double d_sum = 0.0;
-            double noise_sum = 0.0;
+            double abs_sum = 0.0;
+            double noise_abs_sum = 0.0;
+            double noise_var_sum = 0.0;
             int n = 0;
             for (int y = y0; y < y1; ++y) {
                 for (int x = x0; x < x1; ++x) {
@@ -503,8 +505,12 @@ static std::vector<f32> compute_night_mismatch_tiles(const Image& ref_guide,
                         const f32 c = sample_guide_bilinear(comp_guide, cy, cx, ch);
                         if (!std::isfinite(c)) continue;
                         const f32 r = ref_guide.at(y, x, ch);
-                        d_sum += std::fabs((double)r - (double)c);
-                        noise_sum += 2.0 * (double)guide_noise_var(cfg, ref_guide.c, ch, r);
+                        const double noise_var =
+                            2.0 * (double)guide_noise_var(cfg, ref_guide.c, ch, r);
+                        abs_sum += std::fabs((double)r - (double)c);
+                        noise_abs_sum += std::sqrt(std::max(noise_var, 0.0)) *
+                                         kExpectedAbsGaussian;
+                        noise_var_sum += noise_var;
                         ++n;
                     }
                 }
@@ -512,8 +518,10 @@ static std::vector<f32> compute_night_mismatch_tiles(const Image& ref_guide,
 
             f32 m = 1.f;
             if (n > 0) {
-                const double d = d_sum / (double)n;
-                const double sigma2 = std::max(noise_sum / (double)n, 1.0e-20);
+                const double mean_abs = abs_sum / (double)n;
+                const double mean_noise_abs = noise_abs_sum / (double)n;
+                const double d = std::max(mean_abs - mean_noise_abs, 0.0);
+                const double sigma2 = std::max(noise_var_sum / (double)n, 1.0e-20);
                 m = (f32)((d * d) / (d * d + (double)s * sigma2));
             }
             mismatch[(size_t)ty * (size_t)flow.nx + (size_t)tx] =
