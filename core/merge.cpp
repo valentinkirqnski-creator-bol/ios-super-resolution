@@ -89,6 +89,23 @@ static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
 
+static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32 x) {
+    if (robustness.h <= 0 || robustness.w <= 0) return 0.f;
+    y = std::min(std::max(y, 0.f), (f32)(robustness.h - 1));
+    x = std::min(std::max(x, 0.f), (f32)(robustness.w - 1));
+    const int y0 = (int)std::floor(y);
+    const int x0 = (int)std::floor(x);
+    const int y1 = std::min(y0 + 1, robustness.h - 1);
+    const int x1 = std::min(x0 + 1, robustness.w - 1);
+    const f32 fy = y - (f32)y0;
+    const f32 fx = x - (f32)x0;
+    const f32 top = robustness.at(y0, x0) +
+                    (robustness.at(y0, x1) - robustness.at(y0, x0)) * fx;
+    const f32 bot = robustness.at(y1, x0) +
+                    (robustness.at(y1, x1) - robustness.at(y1, x0)) * fx;
+    return top + (bot - top) * fy;
+}
+
 // Bilinear cov sample + invert.
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
@@ -162,17 +179,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 flowx = flow.dx(py, px);
             const f32 flowy = flow.dy(py, px);
 
-            int i_r, j_r;
-            if (cfg.bayer_mode) {
-                i_r = std::min(std::max(cuda_round_to_int((lr_y - 0.5f) / 2.f), 0),
-                               robustness.h - 1);
-                j_r = std::min(std::max(cuda_round_to_int((lr_x - 0.5f) / 2.f), 0),
-                               robustness.w - 1);
-            } else {
-                i_r = std::min(std::max(cuda_round_to_int(lr_y), 0), robustness.h - 1);
-                j_r = std::min(std::max(cuda_round_to_int(lr_x), 0), robustness.w - 1);
-            }
-            const f32 local_r = robustness.at(i_r, j_r);
+            const f32 rob_y = cfg.bayer_mode ? (lr_y - 0.5f) / 2.f : lr_y;
+            const f32 rob_x = cfg.bayer_mode ? (lr_x - 0.5f) / 2.f : lr_x;
+            const f32 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
 
             const f32 lr_mov_x = lr_x + flowx;
             const f32 lr_mov_y = lr_y + flowy;

@@ -926,6 +926,27 @@ inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
     return int(p.cfa11);
 }
 
+inline float sample_robustness_bilinear(device const float* robustness,
+                                        uint h, uint w,
+                                        float y, float x) {
+    if (h == 0u || w == 0u) return 0.f;
+    y = clamp(y, 0.f, float(h - 1u));
+    x = clamp(x, 0.f, float(w - 1u));
+    int y0 = int(floor(y));
+    int x0 = int(floor(x));
+    int y1 = min(y0 + 1, int(h) - 1);
+    int x1 = min(x0 + 1, int(w) - 1);
+    float fy = y - float(y0);
+    float fx = x - float(x0);
+    float top = robustness[uint(y0) * w + uint(x0)] +
+                (robustness[uint(y0) * w + uint(x1)] -
+                 robustness[uint(y0) * w + uint(x0)]) * fx;
+    float bot = robustness[uint(y1) * w + uint(x0)] +
+                (robustness[uint(y1) * w + uint(x1)] -
+                 robustness[uint(y1) * w + uint(x0)]) * fx;
+    return top + (bot - top) * fy;
+}
+
 // Alg. 4 — merge.cpp accumulate_comp
 // One comparison frame's contribution at one output pixel.
 //
@@ -954,15 +975,10 @@ static inline void merge_comp_contrib(device const float* img,
     float flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
     float flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
 
-    int i_r, j_r;
-    if (p.bayer) {
-        i_r = min(max(lround_away((lr_y - 0.5f) / 2.f), 0), int(p.rob_h) - 1);
-        j_r = min(max(lround_away((lr_x - 0.5f) / 2.f), 0), int(p.rob_w) - 1);
-    } else {
-        i_r = min(max(lround_away(lr_y), 0), int(p.rob_h) - 1);
-        j_r = min(max(lround_away(lr_x), 0), int(p.rob_w) - 1);
-    }
-    float local_r = robustness[uint(i_r) * p.rob_w + uint(j_r)];
+    float rob_y = p.bayer ? (lr_y - 0.5f) / 2.f : lr_y;
+    float rob_x = p.bayer ? (lr_x - 0.5f) / 2.f : lr_x;
+    float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
+                                               rob_y, rob_x);
     // Nothing to accumulate where the frame is fully rejected. Every
     // contribution is w * local_r * c or w * local_r, so all nine taps produce
     // exactly zero and the caller's running totals are unchanged.
@@ -1472,6 +1488,25 @@ inline float rob_brightness(device const float* means,
     return clamp(sum / float(nch), 0.f, 1.f);
 }
 
+inline float rob_sample_bilinear_or_inf(device const float* img,
+                                        uint h, uint w, uint nch,
+                                        float y, float x, uint ch) {
+    if (!(y >= 0.f && y < float(h) && x >= 0.f && x < float(w))) return INFINITY;
+    int y0 = int(floor(y));
+    int x0 = int(floor(x));
+    int y1 = min(y0 + 1, int(h) - 1);
+    int x1 = min(x0 + 1, int(w) - 1);
+    float fy = y - float(y0);
+    float fx = x - float(x0);
+    uint o00 = (uint(y0) * w + uint(x0)) * nch + ch;
+    uint o01 = (uint(y0) * w + uint(x1)) * nch + ch;
+    uint o10 = (uint(y1) * w + uint(x0)) * nch + ch;
+    uint o11 = (uint(y1) * w + uint(x1)) * nch + ch;
+    float top = img[o00] + (img[o01] - img[o00]) * fx;
+    float bot = img[o10] + (img[o11] - img[o10]) * fx;
+    return top + (bot - top) * fy;
+}
+
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
                             device const float* raw [[buffer(1)]],
                             constant RobGuideParams& p [[buffer(2)]],
@@ -1662,8 +1697,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         flow_x = 0.5f * flow[fi + 0u];
         flow_y = 0.5f * flow[fi + 1u];
     }
-    int new_idx = lround_away(float(gid.x) + flow_x);
-    int new_idy = lround_away(float(gid.y) + flow_y);
+    float sample_x = float(gid.x) + flow_x;
+    float sample_y = float(gid.y) + flow_y;
+    int new_idx = lround_away(sample_x);
+    int new_idy = lround_away(sample_y);
     bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
                     0 <= new_idy && new_idy < int(p.h));
     for (uint ch = 0u; ch < p.nch; ++ch) {
@@ -1684,9 +1721,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_t = diff_curve[id];
         float sigma_p_sq = ref_vars[o];
         sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-        float d_p_ = inbound
-            ? fabs(ref_means[o] - comp_means[(uint(new_idy) * p.w + uint(new_idx)) * p.nch + ch])
-            : INFINITY;
+        float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
+                                                sample_y, sample_x, ch);
+        float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
         d_sq_ += d_p_sq * shrink * shrink;

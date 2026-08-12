@@ -486,6 +486,22 @@ static f32 guide_brightness(const Image& means, int y, int x) {
     return clampf(sum / (f32)means.c, 0.f, 1.f);
 }
 
+static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
+    if (!(y >= 0.f && y < (f32)img.h && x >= 0.f && x < (f32)img.w))
+        return std::numeric_limits<f32>::infinity();
+    const int y0 = (int)std::floor(y);
+    const int x0 = (int)std::floor(x);
+    const int y1 = std::min(y0 + 1, img.h - 1);
+    const int x1 = std::min(x0 + 1, img.w - 1);
+    const f32 fy = y - (f32)y0;
+    const f32 fx = x - (f32)x0;
+    const f32 top = img.at(y0, x0, ch) +
+                    (img.at(y0, x1, ch) - img.at(y0, x0, ch)) * fx;
+    const f32 bot = img.at(y1, x0, ch) +
+                    (img.at(y1, x1, ch) - img.at(y1, x0, ch)) * fx;
+    return top + (bot - top) * fy;
+}
+
 static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
                                const std::vector<uint32_t>& motion_irregular,
                                size_t pidx, int y, int x, int new_y, int new_x,
@@ -734,12 +750,12 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
             }
 
-            const int new_x = (int)std::lround((f32)x + flow_x);
-            const int new_y = (int)std::lround((f32)y + flow_y);
-            const bool inbound = (new_x >= 0 && new_x < w && new_y >= 0 && new_y < h);
+            const f32 sample_x = (f32)x + flow_x;
+            const f32 sample_y = (f32)y + flow_y;
             for (int ch = 0; ch < d_p.c; ++ch) {
-                d_p.at(y, x, ch) = inbound
-                    ? std::fabs(ref_stats.means.at(y, x, ch) - comp_means.at(new_y, new_x, ch))
+                const f32 comp = sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
+                d_p.at(y, x, ch) = std::isfinite(comp)
+                    ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();
             }
         }
