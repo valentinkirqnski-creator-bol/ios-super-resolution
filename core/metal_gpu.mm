@@ -1126,7 +1126,8 @@ struct RobMaskParamsCPU {
     uint32_t motion_edge_neighborhood_radius = 0;
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
-    uint32_t _pad0 = 0, _pad1 = 0;
+    uint32_t aperture_reject_enabled = 0;
+    uint32_t _pad0 = 0;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
 
@@ -1479,6 +1480,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
+    const bool aperture_reject_on =
+        cfg.flow_reject_1d_enabled &&
+        flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx;
+    id<MTLBuffer> b_aperture = aperture_reject_on
+        ? buf(flow.aperture_limited.data(),
+              flow.aperture_limited.size() * sizeof(uint32_t))
+        : b_motion;
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_ref_hf = b_ref_v;
@@ -1490,7 +1498,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_motion || !b_flow ||
+        !b_S || !b_motion || !b_aperture || !b_flow ||
         !b_R || !b_out)
         return Image();
 
@@ -1514,6 +1522,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
+    mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1528,6 +1537,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_ref_hf offset:0 atIndex:5];
     [enc setBuffer:b_flow offset:0 atIndex:10];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
+    [enc setBuffer:b_aperture offset:0 atIndex:12];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

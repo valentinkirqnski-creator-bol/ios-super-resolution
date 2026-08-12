@@ -99,6 +99,9 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_enabled: Bool = false
     var flow_regularize_threshold: Float = 1.0
     var flow_regularize_aperture_ratio: Float = 0.15
+    /// Test switch: reject every tile whose Hessian says it is one-dimensional
+    /// instead of repairing only the uncertain flow component.
+    var flow_reject_1d_enabled: Bool = false
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -171,6 +174,7 @@ struct TuningParams: Equatable, Codable {
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
         case flow_regularize_enabled, flow_regularize_threshold, flow_regularize_aperture_ratio
+        case flow_reject_1d_enabled
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -205,6 +209,7 @@ struct TuningParams: Equatable, Codable {
         flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
         flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
+        flow_reject_1d_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_reject_1d_enabled) ?? flow_reject_1d_enabled
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1811,6 +1816,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
             "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
+            "flow_reject_1d_enabled": NSNumber(value: tuningParams.flow_reject_1d_enabled),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),

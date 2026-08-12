@@ -131,6 +131,25 @@ static HessianField compute_hessian(const Image& gradx, const Image& grady, int 
     return H;
 }
 
+static f32 clamped_aperture_ratio(const Config& cfg) {
+    f32 aperture_ratio = cfg.flow_regularize_aperture_ratio;
+    if (!std::isfinite(aperture_ratio)) aperture_ratio = 0.15f;
+    return std::min(std::max(aperture_ratio, 0.f), 1.f);
+}
+
+static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
+                               f32 aperture_ratio) {
+    const f32* h = hess.at(ty, tx);
+    const f32 h00 = h[0], h01 = h[1], h11 = h[3];
+    const f32 tr = h00 + h11;
+    const f32 det = h00 * h11 - h01 * h[2];
+    if (!(tr > 0.f)) return false; // flat: weak in both directions, not a 1D edge.
+    const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
+    const f32 l1 = tr * 0.5f + disc;
+    const f32 l2 = tr * 0.5f - disc;
+    return (l1 > 0.f) && (l2 < aperture_ratio * l1);
+}
+
 } // namespace
 
 // ============================================================================
@@ -616,6 +635,8 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             int sx = std::min(in.nx - 1, tx / repeat_factor);
             upsampled.dx(ty, tx) = in.dx(sy, sx) * (f32)upsample_factor;
             upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
+            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
+                upsampled.aperture(ty, tx) = in.aperture(sy, sx);
         }
     }
 
@@ -625,6 +646,8 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             if (ty < up_ny && tx < up_nx) {
                 out.dx(ty, tx) = upsampled.dx(ty, tx);
                 out.dy(ty, tx) = upsampled.dy(ty, tx);
+                if (upsampled.aperture_limited.size() == (size_t)up_ny * (size_t)up_nx)
+                    out.aperture(ty, tx) = upsampled.aperture(ty, tx);
             }
         }
     }
@@ -650,6 +673,8 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
 
             const int prev_x = tx / repeat_factor;
             const int prev_y = ty / repeat_factor;
+            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
+                out.aperture(ty, tx) = in.aperture(prev_y, prev_x);
             const int ups_x = tx % repeat_factor;
             const int ups_y = ty % repeat_factor;
             const int x_shift = (2 * ups_x + 1 > repeat_factor) ? 1 : -1;
@@ -786,6 +811,33 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
 //
 // Not safe on a moving subject: across a genuine motion boundary the
 // neighbours' median is a motion that belongs to neither side. Off by default.
+static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
+                                        const Config& cfg) {
+    const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
+    flow.aperture_limited.assign(n, 0u);
+    if (!cfg.flow_reject_1d_enabled) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
+    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx ||
+        hess->data.size() < n * 4u)
+        return;
+
+    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
+    std::atomic<long long> n_marked{0};
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            if (hessian_tile_is_1d(*hess, ty, tx, aperture_ratio)) {
+                flow.aperture(ty, tx) = 1u;
+                n_marked.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    if (prof_enabled()) {
+        prof_add_cpu("flow1d#enabled", 1.0);
+        prof_add_cpu("flow1d#aperture-ratio", (double)aperture_ratio);
+        prof_add_cpu("flow1d#rejected-tiles", (double)n_marked.load());
+    }
+}
+
 static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
                                      const Config& cfg) {
     if (!cfg.flow_regularize_enabled) return;
@@ -799,9 +851,7 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
     // rest. Exposed as a setting because some static edge failures are less
     // perfectly one-dimensional once noise, letters, reflections and Bayer
     // texture enter the tile.
-    f32 aperture_ratio = cfg.flow_regularize_aperture_ratio;
-    if (!std::isfinite(aperture_ratio)) aperture_ratio = 0.15f;
-    aperture_ratio = std::min(std::max(aperture_ratio, 0.f), 1.f);
+    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
     const bool use_h = hess && hess->ny == ny && hess->nx == nx &&
                        hess->data.size() >= (size_t)ny * (size_t)nx * 4u;
 
@@ -920,11 +970,12 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             // a few hundred KB, so filtering it here costs nothing measurable
             // and keeps a single implementation for both backends.
             HessianField gh;
-            if (cfg.flow_regularize_enabled &&
+            if ((cfg.flow_regularize_enabled || cfg.flow_reject_1d_enabled) &&
                 metal_fetch_ref_hessian(flow_gpu.ny, flow_gpu.nx, gh.data)) {
                 gh.ny = flow_gpu.ny;
                 gh.nx = flow_gpu.nx;
             }
+            mark_aperture_limited_tiles(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg);
             regularize_flow_aperture(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg);
             return flow_gpu;
         }
@@ -1049,6 +1100,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
              g_ref_ica_cache.levels[0].hess.ny == flow.ny &&
              g_ref_ica_cache.levels[0].hess.nx == flow.nx)
         reg_hess = &g_ref_ica_cache.levels[0].hess;
+    mark_aperture_limited_tiles(flow, reg_hess, cfg);
     regularize_flow_aperture(flow, reg_hess, cfg);
     return flow;
 }
@@ -1094,6 +1146,8 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 (int)std::floor((raw_cx / sx) / (f32)tile_size)));
             out.dx(ty, tx) = flow.dx(gy, gx) * sx;
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
+            if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx)
+                out.aperture(ty, tx) = flow.aperture(gy, gx);
         }
     }
     return out;

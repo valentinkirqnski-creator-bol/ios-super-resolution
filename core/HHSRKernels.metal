@@ -1413,7 +1413,8 @@ struct RobMaskParams {
     uint motion_edge_neighborhood_radius;
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
-    uint _pad0, _pad1;
+    uint aperture_reject_enabled;
+    uint _pad0;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1640,6 +1641,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* flow [[buffer(10)]],
                           device const float* ref_hf_loss [[buffer(5)]],
                           constant RobMaskParams& p [[buffer(11)]],
+                          device const uint* aperture_limited [[buffer(12)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1747,7 +1749,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    bool hard_reject = hf_reject || edge_reject;
+    bool aperture_reject =
+        p.aperture_reject_enabled != 0u && aperture_limited[pidx] != 0u;
+    bool hard_reject = hf_reject || edge_reject || aperture_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);

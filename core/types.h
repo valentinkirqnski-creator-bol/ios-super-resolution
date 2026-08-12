@@ -41,14 +41,19 @@ struct FlowField {
     int ny = 0;
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
+    std::vector<uint32_t> aperture_limited; // ny*nx, 1 = Hessian says 1D/aperture-limited
 
     FlowField() = default;
-    FlowField(int ny_, int nx_) : ny(ny_), nx(nx_), flow((size_t)ny_ * nx_ * 2, 0.f) {}
+    FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
+        flow((size_t)ny_ * nx_ * 2, 0.f),
+        aperture_limited((size_t)ny_ * nx_, 0u) {}
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
     inline f32 dx(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
+    inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
+    inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
 };
 
 // Per-grey-pixel 2x2 covariance field (steerable kernels): [h, w, 4] = xx,xy,yx,yy.
@@ -260,6 +265,9 @@ struct Config {
     // ratio. Higher catches more edge-like tiles; lower limits repair to very
     // one-dimensional tiles.
     float flow_regularize_aperture_ratio = 0.15f;
+    // Test switch: force merge robustness to zero for every tile that passes
+    // the same Hessian aperture-limited test, instead of repairing the flow.
+    bool  flow_reject_1d_enabled = false;
 
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.

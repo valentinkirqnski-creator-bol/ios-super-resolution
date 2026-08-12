@@ -717,6 +717,14 @@ struct CameraView: View {
              """)
             .font(.caption2).foregroundColor(.secondary)
 
+        Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
+        Text("""
+             Test mode: instead of repairing these aperture-limited tiles, force their merge \
+             robustness to zero. This should show as black blocks in the saved robustness \
+             mask anywhere the Hessian says the tile is one-dimensional.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+
         if cam.tuningParams.flow_regularize_enabled {
             HStack {
                 Text("Disagreement")
@@ -732,7 +740,9 @@ struct CameraView: View {
                  than protecting real structure -- that is already protected.
                  """)
                 .font(.caption2).foregroundColor(.secondary)
+        }
 
+        if cam.tuningParams.flow_regularize_enabled || cam.tuningParams.flow_reject_1d_enabled {
             HStack {
                 Text("Aperture Ratio")
                 Spacer()
@@ -744,8 +754,8 @@ struct CameraView: View {
                    step: 0.05)
             Text("""
                  Maximum lambda2/lambda1 for a tile to be repaired. Higher catches more \
-                 edge-like tiles; lower keeps the repair limited to very one-dimensional \
-                 edges. Default is 0.15.
+                 edge-like tiles; lower keeps the repair or rejection limited to very \
+                 one-dimensional edges. Default is 0.15.
                  """)
                 .font(.caption2).foregroundColor(.secondary)
         }

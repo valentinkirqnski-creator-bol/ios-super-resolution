@@ -331,6 +331,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"flow_regularize_aperture_ratio"])
         cfg.flow_regularize_aperture_ratio =
             std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
+    if (tuning[@"flow_reject_1d_enabled"])
+        cfg.flow_reject_1d_enabled = tuning[@"flow_reject_1d_enabled"].boolValue;
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])

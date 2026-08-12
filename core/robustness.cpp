@@ -799,7 +799,11 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            const bool hard_reject = hf_reject || edge_reject;
+            const bool aperture_reject =
+                cfg.flow_reject_1d_enabled &&
+                pidx < flow.aperture_limited.size() &&
+                flow.aperture_limited[pidx] != 0u;
+            const bool hard_reject = hf_reject || edge_reject || aperture_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
