@@ -27,7 +27,7 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                                  int& W, int& H, float wb[3], float cam_to_srgb[9],
                                  bool& has_color);
 
-// Streaming LinearRaw RGB DNG with fast lossless Deflate (ZIP), no predictor.
+// Streaming LinearRaw RGB DNG with lossless Deflate (ZIP) + TIFF predictor.
 // Same decoded pixels as before; write path optimized for merge latency.
 class DngStreamWriter {
 public:
@@ -59,6 +59,7 @@ private:
     uint32_t compressed_bytes_ = 0;
     void* z_stream_ = nullptr;             // z_stream*
     std::vector<uint8_t> z_out_;
+    std::vector<uint16_t> predictor_row_;
     bool deflate_ok_ = false;
 };
 

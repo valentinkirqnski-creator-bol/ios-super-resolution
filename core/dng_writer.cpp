@@ -226,14 +226,12 @@ static bool is_identity_3x3(const float* m) {
 
 } // namespace
 
-// Deflate of a 48MP LinearRaw strip measured ~8.6s of single-threaded zlib —
-// the single largest item in a burst, and unparallelizable because a zlib
-// stream is inherently serial. On 16-bit linear photographic data it only buys
-// ~1.2-1.5x, so storing uncompressed trades ~90MB of file size for those 8.6s.
-// Decoded pixels are identical either way, and load_linear_dng_rgb16 already
-// handles Compression=1. Flip to true to restore Deflate (the zlib path below
-// is kept intact); a multi-strip parallel Deflate is the eventual middle ground.
-static constexpr bool kDngCompress = false;
+// Lossless DNG compression. Adobe Deflate + TIFF horizontal differencing keeps
+// the exact RGB16 samples while making file size depend on image content instead
+// of always being W*H*3*2 bytes. A single streaming zlib state avoids an extra
+// full-image buffer; the only added RAM is one row for the predictor.
+static constexpr bool kDngCompress = true;
+static constexpr int kDngDeflateLevel = Z_BEST_SPEED;
 
 // Builds DNG header. StripByteCounts left as 0 — patched once the strip is done.
 // Private tag 65000: 12×f32 LE = wb[3] + cam_to_srgb[9] for JPEG export.
@@ -288,7 +286,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
     ifd.ascii(306, now_tiff_datetime()); // DateTime
-    ifd.shortv(317, 1);                // Predictor = none (faster write; same pixels)
+    ifd.shortv(317, kDngCompress ? 2 : 1); // horizontal differencing for ZIP
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
 
     ifd.longs(50719, {0, 0});
@@ -447,22 +445,16 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
         return false;
     }
 
-    if (!kDngCompress) {
-        // Uncompressed: rows go straight to disk, no zlib state at all.
-        deflate_ok_ = true;
-        return true;
-    }
-
     auto* zs = new z_stream();
     std::memset(zs, 0, sizeof(z_stream));
-    // Fastest lossless zlib level — same decoded RGB16, much less CPU than Z_BEST/default.
-    if (deflateInit(zs, Z_BEST_SPEED) != Z_OK) {
+    if (deflateInit(zs, kDngDeflateLevel) != Z_OK) {
         delete zs;
         fclose(f_); f_ = nullptr;
         return false;
     }
     z_stream_ = zs;
     z_out_.resize(1u << 20);
+    predictor_row_.resize((size_t)W_ * 3u);
     deflate_ok_ = true;
     return true;
 }
@@ -482,18 +474,15 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
 
     if (!z_stream_) return false;
     auto* zs = static_cast<z_stream*>(z_stream_);
-    // Bulk feed (no per-row copy / predictor) — same pixels, far less overhead.
-    const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
-    zs->next_in = reinterpret_cast<Bytef*>(const_cast<uint16_t*>(rgb16));
-    zs->avail_in = 0;
-    size_t remaining = nbytes;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(rgb16);
-    while (remaining > 0) {
-        const uInt chunk = (uInt)std::min(remaining, (size_t)0x80000000u);
-        zs->next_in = reinterpret_cast<Bytef*>(const_cast<uint8_t*>(src));
-        zs->avail_in = chunk;
-        src += chunk;
-        remaining -= chunk;
+    const size_t row_samples = (size_t)W_ * 3u;
+    const size_t row_bytes = row_samples * sizeof(uint16_t);
+    if (predictor_row_.size() < row_samples) predictor_row_.resize(row_samples);
+    for (int y = 0; y < nrows; ++y) {
+        const uint16_t* src_row = rgb16 + (size_t)y * row_samples;
+        std::memcpy(predictor_row_.data(), src_row, row_bytes);
+        apply_hdiff_rgb16(predictor_row_.data(), W_);
+        zs->next_in = reinterpret_cast<Bytef*>(predictor_row_.data());
+        zs->avail_in = (uInt)row_bytes;
         while (zs->avail_in > 0) {
             zs->next_out = z_out_.data();
             zs->avail_out = (uInt)z_out_.size();
