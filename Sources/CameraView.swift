@@ -705,21 +705,18 @@ struct CameraView: View {
     @ViewBuilder
     private var flowUpscaleSection: some View {
         Picker("Flow Upscaling", selection: $cam.tuningParams.flow_upscale_mode) {
-            Text("Candidate").tag(0)
-            Text("Nearest").tag(1)
-            Text("Bilinear").tag(2)
-            Text("Bicubic").tag(3)
+            Text("460").tag(0)
+            Text("Z Nearest").tag(1)
+            Text("Z Bilinear").tag(2)
+            Text("Z Bicubic").tag(3)
         }
         .pickerStyle(.segmented)
         Text("""
              How a tile's motion is carried to the next pyramid level. Candidate is the \
-             reference behaviour: the new tile takes its parent's vector or one of two \
-             neighbours', whichever matches best, so it is always a vector some search \
-             actually tested. Nearest, Bilinear and Bicubic are the interpolate modes from \
-             the Python variant; the blending ones can invent a displacement no search \
-             evaluated, which across a motion boundary belongs to neither side. Measured on \
-             a handheld burst these change the flow field a great deal and the output almost \
-             not at all.
+             old 460-style behaviour: the new tile takes its parent's vector or one of two \
+             neighbours, whichever matches best, so it is always a vector some search \
+             actually tested. Z Nearest, Z Bilinear, and Z Bicubic use the Python-z \
+             interpolate modes and coordinate rules; Z Nearest is Python-z's default.
              """)
             .font(.caption2).foregroundColor(.secondary)
     }

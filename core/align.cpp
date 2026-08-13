@@ -386,13 +386,14 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
 #ifdef __APPLE__
-    // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
+    // Python-z L2 block matching: rfft2/irfft2 correlation, then
+    // L2_search - 2*corr argmin. HHSR_L2_CPU=1 forces the CPU FFT path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
         if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow))
             return;
     }
 #endif
-    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow, false, num_threads);
+    block_match_level_L2_cpu(ref, moving, tile_size, search_radius, flow, num_threads);
 }
 
 // ============================================================================

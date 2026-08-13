@@ -97,9 +97,9 @@ struct TuningParams: Equatable, Codable {
     /// along-edge component is unobservable inside one tile but determined by
     /// the neighbours. Static scenes only.
     /// How the flow is carried between pyramid levels.
-    /// 0 = candidate selection (460-main, the shipped behaviour),
-    /// 1 = nearest, 2 = bilinear, 3 = bicubic (the python-z F.interpolate modes).
-    var flow_upscale_mode: Int = 0
+    /// 0 = candidate selection (460-main),
+    /// 1 = nearest (python-z default), 2 = bilinear, 3 = bicubic.
+    var flow_upscale_mode: Int = 1
     var flow_regularize_enabled: Bool = false
     var flow_regularize_threshold: Float = 1.0
     var flow_regularize_aperture_ratio: Float = 0.15
@@ -135,11 +135,9 @@ struct TuningParams: Equatable, Codable {
     /// implementation does, instead of only on the finest. Half-res 2x2 grey
     /// only -- the full-res FFT path is unaffected either way.
     var align_ica_per_level: Bool = true
-    /// Extend the above to the full-res FFT grey. Without it that path feeds
-    /// integer-only flow into a finest level whose search radius is 1, so the
-    /// correction budget is already spent when level 0 starts. Costs roughly
-    /// +120MB at 12MP, because the reference gradient cache goes resident.
-    var align_ica_per_level_fft: Bool = false
+    /// Extend the above to the full-res FFT grey, matching python-z's
+    /// block-match-then-ICA sequence at every pyramid level.
+    var align_ica_per_level_fft: Bool = true
     /// Finest-level block-match search radius. 0 keeps the built-in 1.
     var align_fine_search_radius: Int = 0
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
@@ -311,11 +309,19 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 12
+        let defaultsVersion = 13
         let verKey = "TuningParamsDefaultsVersion"
-        if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
+        let storedVersion = UserDefaults.standard.integer(forKey: verKey)
+        if storedVersion < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
-            let params = TuningParams.appDefaults
+            var params = TuningParams.appDefaults
+            if storedVersion > 0,
+               let data = UserDefaults.standard.data(forKey: "TuningParams"),
+               let saved = try? JSONDecoder().decode(TuningParams.self, from: data) {
+                params = saved
+                params.flow_upscale_mode = TuningParams.appDefaults.flow_upscale_mode
+                params.align_ica_per_level_fft = TuningParams.appDefaults.align_ica_per_level_fft
+            }
             if let data = try? JSONEncoder().encode(params) {
                 UserDefaults.standard.set(data, forKey: "TuningParams")
             }

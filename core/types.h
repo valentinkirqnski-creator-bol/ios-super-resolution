@@ -223,7 +223,7 @@ struct Config {
     // resident for the burst, and the FFT grey has 4x the pixels of the
     // decimate grey, so roughly +120MB at 12MP. It saves compute, since those
     // gradients are currently rebuilt per frame.
-    bool align_ica_per_level_fft = false;
+    bool align_ica_per_level_fft = true;
 
     // True when ICA should run on every pyramid level rather than only the
     // finest.
@@ -283,13 +283,10 @@ struct Config {
     // the same Hessian aperture-limited test, instead of repairing the flow.
     bool  flow_reject_1d_enabled = false;
 
-    // Candidate keeps the shipped behaviour exactly; the interpolating modes
-    // are opt-in. Measured on an 8-frame handheld burst, switching mode changes
-    // the FINAL flow field a great deal (RMS 12-18 px against Candidate, only
-    // 16% of tiles identical under Bilinear) because a coarse-level choice is
-    // amplified by every later upsample, yet the merged image was unchanged to
-    // two decimals in edge width. Treat it as an experiment, not a fix.
-    FlowUpscale flow_upscale = FlowUpscale::Candidate;
+    // Python-z default.yaml uses nearest flow upsampling between pyramid
+    // levels. Candidate remains selectable from the app, but it is the
+    // 460-main variant rather than the python-z default.
+    FlowUpscale flow_upscale = FlowUpscale::Nearest;
 
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.

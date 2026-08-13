@@ -1912,9 +1912,9 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     if (!ref_img || !mov_img || !flow_b) return false;
-    if (!local_search_460_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
-                               moving.h, moving.w, tile_size, search_radius,
-                               ny, nx, false))
+    if (!l2_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
+                 moving.h, moving.w, tile_size, search_radius,
+                 ny, nx))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -2305,8 +2305,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, true);
         else
-            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
-                                          m.h, m.w, ts, radius, ny, nx, false);
+            bm_ok = l2_bufs(b_ref, m.img, b_flow, r.h, r.w,
+                            m.h, m.w, ts, radius, ny, nx);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --
