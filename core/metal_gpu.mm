@@ -2027,8 +2027,13 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
                                __strong id<MTLBuffer>& b_hess,
                                int& ny, int& nx) {
     auto& c = ctx();
-    ny = (r.h + ts - 1) / ts;
-    nx = (r.w + ts - 1) / ts;
+    // Must be the grid block matching builds for this level (r.h / ts), not
+    // ceil. They agree only where the image is a whole number of tiles, which
+    // is the finest level alone; on every coarser level ceil overshot by a row
+    // or a column and the dispatch below was skipped, so the per-level
+    // refinement silently did nothing. Matches compute_hessian on the CPU.
+    ny = r.h / ts;
+    nx = r.w / ts;
     if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) return false;
     const void* key = r.data.empty() ? nullptr : (const void*)r.data.data();
     // Slots are few, so a linear scan is cheaper than any indexing scheme, and
@@ -2316,9 +2321,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             // failed" and skips it. Losing precision beats losing the frame.
             if (!prep_level_ica_gpu(r, ts, l_ref, l_gx, l_gy, l_hess, l_ny, l_nx))
                 continue;
-            // prep tiles with ceil, block matching with floor; they agree for
-            // every shipped pyramid, but skip rather than dispatch a mismatched
-            // grid if a future tile size makes them differ.
+            // Both grids are r.h / ts now, so this holds. Kept as a guard
+            // because the ICA indexes the Hessian by the flow's stride, so a
+            // mismatched grid would read the wrong tile rather than fail.
             if (l_ny == ny && l_nx == nx &&
                 !ica_bufs(l_ref, l_gx, l_gy, l_hess, m.img, b_flow,
                           r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))

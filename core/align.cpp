@@ -100,10 +100,18 @@ struct HessianField {
     const f32* at(int ty, int tx) const { return &data[((size_t)ty * nx + tx) * 4]; }
 };
 
-static HessianField compute_hessian(const Image& gradx, const Image& grady, int ts) {
-    // Python init_ICA: ny, nx = ceil(h / tile_size), ceil(w / tile_size).
-    int ny = (gradx.h + ts - 1) / ts;
-    int nx = (gradx.w + ts - 1) / ts;
+// grid_ny/grid_nx force the tile grid; 0 keeps the Python default.
+static HessianField compute_hessian(const Image& gradx, const Image& grady, int ts,
+                                    int grid_ny = 0, int grid_nx = 0) {
+    // Python init_ICA: ny, nx = ceil(h / tile_size), ceil(w / tile_size). That
+    // matches block matching (h // tile_size) only when the image is a whole
+    // number of tiles. The finest level is, because the grey is circular-padded
+    // to a tile multiple. Coarser pyramid levels are downsampled after that
+    // padding, so ceil overshoots the flow grid by a row or a column -- and
+    // since HessianField strides by nx, an overshooting grid cannot simply be
+    // indexed by the flow's. Callers refining a flow pass that flow's grid.
+    int ny = grid_ny > 0 ? grid_ny : (gradx.h + ts - 1) / ts;
+    int nx = grid_nx > 0 ? grid_nx : (gradx.w + ts - 1) / ts;
     HessianField H;
     H.ny = ny;
     H.nx = nx;
@@ -1065,7 +1073,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             L.gx = compute_sobel_gradx(r);
             L.gy = compute_sobel_grady(r);
-            L.hess = compute_hessian(L.gx, L.gy, ts);
+            // Same grid the block matching below builds for this level, so the
+            // per-level refinement actually runs instead of being skipped.
+            L.hess = compute_hessian(L.gx, L.gy, ts, r.h / ts, r.w / ts);
         }
         // Python dumps pyramid/grads at enum i==0 after reverse = coarsest.
         if (nlev > 0) {
