@@ -179,8 +179,12 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 flowx = flow.dx(py, px);
             const f32 flowy = flow.dy(py, px);
 
-            const f32 rob_y = cfg.bayer_mode ? (lr_y - 0.5f) / 2.f : lr_y;
-            const f32 rob_x = cfg.bayer_mode ? (lr_x - 0.5f) / 2.f : lr_x;
+            const bool raw_res_rob = cfg.bayer_mode &&
+                robustness.h == img.h && robustness.w == img.w;
+            const f32 rob_y = raw_res_rob ? lr_y :
+                (cfg.bayer_mode ? (lr_y - 0.5f) / 2.f : lr_y);
+            const f32 rob_x = raw_res_rob ? lr_x :
+                (cfg.bayer_mode ? (lr_x - 0.5f) / 2.f : lr_x);
             const f32 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
 
             const f32 lr_mov_x = lr_x + flowx;
@@ -250,6 +254,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     const f32 burst_frames = (f32)cfg.burst_frame_count;
     const bool adaptive = cfg.acc_rob_adaptive;
     const f32 max_frame_count = cfg.acc_rob_max_frame_count;
+    const bool raw_res_acc_rob =
+        cfg.bayer_mode && acc_rob && acc_rob->h == img.h && acc_rob->w == img.w;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -266,7 +272,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 // (high clamp only — no max(0,·))
                 f32 acc_y = coarse_y;
                 f32 acc_x = coarse_x;
-                if (cfg.bayer_mode) {
+                if (cfg.bayer_mode && !raw_res_acc_rob) {
                     acc_y = (coarse_y - 0.5f) / 2.f;
                     acc_x = (coarse_x - 0.5f) / 2.f;
                 }

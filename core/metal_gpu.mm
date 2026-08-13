@@ -1108,7 +1108,7 @@ struct RobDogsonParamsCPU {
     uint32_t in_h, in_w, out_h, out_w, nch;
     uint32_t is_ref, tile_size, flow_ny, flow_nx;
     float s;
-    uint32_t _pad0 = 0, _pad1 = 0;
+    uint32_t force_upscale = 0, _pad1 = 0;
 };
 static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 
@@ -1127,7 +1127,7 @@ struct RobMaskParamsCPU {
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
     uint32_t aperture_reject_enabled = 0;
-    uint32_t _pad0 = 0;
+    uint32_t raw_res_rob = 0;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
 
@@ -1140,19 +1140,16 @@ struct RobHfLossParamsCPU {
 };
 static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
 
-static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
-                            id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
-                            int guide_h, int guide_w, int nch,
-                            const Config& cfg, id<MTLCommandBuffer> cmd) {
+static bool rob_run_lowpass_vars(id<MTLBuffer> b_guide,
+                                 __strong id<MTLBuffer>& b_lp_vars,
+                                 int guide_h, int guide_w, int nch,
+                                 id<MTLCommandBuffer> cmd) {
     auto& c = ctx();
     const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
-    const size_t loss_b = (size_t)guide_h * (size_t)guide_w * sizeof(float);
     id<MTLBuffer> b_lp_guide = buf(nullptr, guide_b);
     id<MTLBuffer> b_lp_means = buf(nullptr, guide_b);
-    id<MTLBuffer> b_lp_vars = buf(nullptr, guide_b);
-    b_loss = buf(nullptr, loss_b);
-    if (!b_guide || !b_means || !b_vars || !b_lp_guide ||
-        !b_lp_means || !b_lp_vars || !b_loss)
+    b_lp_vars = buf(nullptr, guide_b);
+    if (!b_guide || !b_lp_guide || !b_lp_means || !b_lp_vars)
         return false;
 
     RobStatsParamsCPU sp{};
@@ -1175,15 +1172,28 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     [enc setBytes:&sp length:sizeof(sp) atIndex:3];
     dispatch2(enc, c.pipe("rob_local_stats_3x3"), sp.w, sp.h);
     [enc endEncoding];
+    return true;
+}
+
+static bool rob_run_hf_loss_from_stats(id<MTLBuffer> b_means, id<MTLBuffer> b_vars,
+                                       id<MTLBuffer> b_lp_vars,
+                                       __strong id<MTLBuffer>& b_loss,
+                                       int h, int w, int nch,
+                                       const Config& cfg,
+                                       id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    const size_t loss_b = (size_t)h * (size_t)w * sizeof(float);
+    b_loss = buf(nullptr, loss_b);
+    if (!b_means || !b_vars || !b_lp_vars || !b_loss) return false;
 
     RobHfLossParamsCPU hp{};
-    hp.h = (uint32_t)guide_h;
-    hp.w = (uint32_t)guide_w;
+    hp.h = (uint32_t)h;
+    hp.w = (uint32_t)w;
     hp.nch = (uint32_t)nch;
     hp.alpha = cfg.alpha;
     hp.min_texture_snr = cfg.hf_min_texture_snr;
     hp.beta = cfg.beta;
-    enc = [cmd computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
     [enc setBuffer:b_loss offset:0 atIndex:0];
     [enc setBuffer:b_means offset:0 atIndex:1];
@@ -1193,6 +1203,17 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     dispatch2(enc, c.pipe("rob_hf_loss_adaptive"), hp.w, hp.h);
     [enc endEncoding];
     return true;
+}
+
+static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
+                            id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
+                            int guide_h, int guide_w, int nch,
+                            const Config& cfg, id<MTLCommandBuffer> cmd) {
+    id<MTLBuffer> b_lp_vars = nil;
+    if (!rob_run_lowpass_vars(b_guide, b_lp_vars, guide_h, guide_w, nch, cmd))
+        return false;
+    return rob_run_hf_loss_from_stats(b_means, b_vars, b_lp_vars, b_loss,
+                                      guide_h, guide_w, nch, cfg, cmd);
 }
 
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
@@ -1288,10 +1309,11 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
 static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
-                       int& out_h, int& out_w, id<MTLCommandBuffer> cmd) {
+                       int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
+                       bool force_upscale = false) {
     auto& c = ctx();
-    out_h = (nch == 3) ? in_h * 2 : in_h;
-    out_w = (nch == 3) ? in_w * 2 : in_w;
+    out_h = (nch == 3 || force_upscale) ? in_h * 2 : in_h;
+    out_w = (nch == 3 || force_upscale) ? in_w * 2 : in_w;
     const size_t out_b = (size_t)out_h * (size_t)out_w * (size_t)nch * sizeof(float);
     b_out = buf(nullptr, out_b);
     if (!b_out) return false;
@@ -1307,6 +1329,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_ny = (!is_ref && flow) ? (uint32_t)flow->ny : 0u;
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
+    dp.force_upscale = force_upscale ? 1u : 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {
@@ -1369,14 +1392,48 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     int gh = 0, gw = 0, nch = 0;
     if (!rob_run_guide_stats(ref_raw, cfg, b_guide, b_means, b_vars, gh, gw, nch, cmd))
         return RefStats();
+    const bool full_res_rob =
+        cfg.robustness_full_res_fft && cfg.grey_method == GreyMethod::FFT &&
+        cfg.bayer_mode && nch == 3;
 
     // Must be encoded before the commit below: a committed MTLCommandBuffer
     // cannot accept further encoders, and doing so is a hard error rather than
     // a silent no-op. This block previously sat after the commit, which crashed
     // as soon as high-frequency rejection was switched on.
+    id<MTLBuffer> b_lp_vars = nil;
+    if (cfg.hf_artifact_removal_enabled &&
+        !rob_run_lowpass_vars(b_guide, b_lp_vars, gh, gw, nch, cmd))
+        return RefStats();
+
+    id<MTLBuffer> b_ref_m = b_means;
+    id<MTLBuffer> b_ref_v = b_vars;
+    id<MTLBuffer> b_ref_lp_v = b_lp_vars;
+    int ref_h = gh;
+    int ref_w = gw;
+    if (full_res_rob) {
+        id<MTLBuffer> b_up_m = nil, b_up_v = nil, b_up_lp_v = nil;
+        int mh = 0, mw = 0, vh = 0, vw = 0, lph = 0, lpw = 0;
+        if (!rob_dogson(b_means, b_up_m, gh, gw, nch, true, nullptr, 0, mh, mw, cmd))
+            return RefStats();
+        if (!rob_dogson(b_vars, b_up_v, gh, gw, nch, true, nullptr, 0, vh, vw, cmd))
+            return RefStats();
+        if (mh != vh || mw != vw) return RefStats();
+        if (cfg.hf_artifact_removal_enabled) {
+            if (!rob_dogson(b_lp_vars, b_up_lp_v, gh, gw, nch, true, nullptr,
+                            0, lph, lpw, cmd))
+                return RefStats();
+            if (mh != lph || mw != lpw) return RefStats();
+            b_ref_lp_v = b_up_lp_v;
+        }
+        b_ref_m = b_up_m;
+        b_ref_v = b_up_v;
+        ref_h = mh;
+        ref_w = mw;
+    }
     id<MTLBuffer> b_ref_hf_loss = nil;
     if (cfg.hf_artifact_removal_enabled &&
-        !rob_run_hf_loss(b_guide, b_means, b_vars, b_ref_hf_loss, gh, gw, nch, cfg, cmd))
+        !rob_run_hf_loss_from_stats(b_ref_m, b_ref_v, b_ref_lp_v, b_ref_hf_loss,
+                                    ref_h, ref_w, nch, cfg, cmd))
         return RefStats();
 
     // No CPU readback follows. Commit without waiting; subsequent work on the
@@ -1385,26 +1442,28 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
 
     g_rob_ref_hf = b_ref_hf_loss;
     g_rob_ref_hf_bytes = b_ref_hf_loss
-        ? (size_t)gh * (size_t)gw * sizeof(float)
+        ? (size_t)ref_h * (size_t)ref_w * sizeof(float)
         : 0;
 
-    // Pin guide-grid local stats for all comparison frames (460-main robustness).
-    g_rob_ref_m = b_means;
-    g_rob_ref_v = b_vars;
-    g_rob_ref_h = gh;
-    g_rob_ref_w = gw;
+    // Pin the reference local stats for all comparison frames. Default Bayer
+    // mode uses the Google/Wronski half-res guide grid; the optional FFT-only
+    // path stores the same stats upsampled back to raw resolution.
+    g_rob_ref_m = b_ref_m;
+    g_rob_ref_v = b_ref_v;
+    g_rob_ref_h = ref_h;
+    g_rob_ref_w = ref_w;
     g_rob_ref_c = nch;
-    g_rob_ref_bytes = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
+    g_rob_ref_bytes = (size_t)ref_h * (size_t)ref_w * (size_t)nch * sizeof(float);
 
     RefStats st;
     // Keep only dimensions on the CPU. The actual reference means/vars/HF loss
     // stay resident in pinned Metal buffers above; copying them back here is an
     // avoidable readback and peak-RAM spike on full-res bursts.
-    st.means.h = gh;
-    st.means.w = gw;
+    st.means.h = ref_h;
+    st.means.w = ref_w;
     st.means.c = nch;
-    st.stds.h = gh;
-    st.stds.w = gw;
+    st.stds.h = ref_h;
+    st.stds.w = ref_w;
     st.stds.c = nch;
     return st;
 }
@@ -1445,6 +1504,22 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     int gh = 0, gw = 0, nch = 0;
     if (!rob_run_guide_stats(comp_raw, cfg, b_guide, b_gmeans, b_gvars, gh, gw, nch, cmd))
         return Image();
+
+    const bool full_res_rob =
+        cfg.robustness_full_res_fft && cfg.grey_method == GreyMethod::FFT &&
+        cfg.bayer_mode && nch == 3 &&
+        ref_stats.means.h == comp_raw.h && ref_stats.means.w == comp_raw.w;
+    if (full_res_rob) {
+        id<MTLBuffer> b_up_m = nil;
+        int mh = 0, mw = 0;
+        if (!rob_dogson(b_gmeans, b_up_m, gh, gw, nch, false, &flow, tile_size,
+                        mh, mw, cmd))
+            return Image();
+        if (mh != ref_stats.means.h || mw != ref_stats.means.w) return Image();
+        b_gmeans = b_up_m;
+        gh = mh;
+        gw = mw;
+    }
 
     if (gh != ref_stats.means.h || gw != ref_stats.means.w || nch != ref_stats.means.c)
         return Image();
@@ -1523,6 +1598,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
+    mp.raw_res_rob = full_res_rob ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -2460,7 +2536,8 @@ struct MergeCompParamsCPU {
     uint32_t nch, bayer, iso, tile_size;
     float scale;
     uint32_t cfa00, cfa01, cfa10, cfa11;
-    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0, _pad3 = 0;
+    uint32_t raw_res_rob = 0;
+    uint32_t _pad1 = 0, _pad2 = 0, _pad3 = 0;
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -2474,7 +2551,7 @@ struct MergeRefParamsCPU {
     uint32_t cfa00, cfa01, cfa10, cfa11;
     uint32_t adaptive;
     float max_frame_count;
-    uint32_t _pad0 = 0;
+    uint32_t raw_res_acc_rob = 0;
 };
 static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
 
@@ -3135,6 +3212,9 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)comp_raw.w;
         p.rob_h = (uint32_t)robustness.h;
         p.rob_w = (uint32_t)robustness.w;
+        p.raw_res_rob = (cfg.bayer_mode &&
+                         robustness.h == comp_raw.h &&
+                         robustness.w == comp_raw.w) ? 1u : 0u;
         p.flow_ny = (uint32_t)flow.ny;
         p.flow_nx = (uint32_t)flow.nx;
         p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
@@ -3149,6 +3229,9 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)hit->lr_w;
         p.rob_h = (uint32_t)std::max(1, hit->rob_h);
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
+        p.raw_res_rob = (cfg.bayer_mode &&
+                         hit->rob_h == hit->lr_h &&
+                         hit->rob_w == hit->lr_w) ? 1u : 0u;
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
@@ -3214,6 +3297,9 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
+    p.raw_res_acc_rob = (denoise && cfg.bayer_mode &&
+                         acc_rob->h == ref_raw.h && acc_rob->w == ref_raw.w)
+                            ? 1u : 0u;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];

@@ -832,6 +832,13 @@ struct CameraView: View {
                          ? "Full-res FFT low-pass. Slower."
                          : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
                         .font(.caption2).foregroundColor(.secondary)
+
+                    Toggle("Full-res Robustness Mask", isOn: $cam.tuningParams.robustness_full_res_fft)
+                        .disabled(!cam.tuningParams.alignment_grey_fft)
+                    Text(cam.tuningParams.alignment_grey_fft
+                         ? "FFT only. Builds the robustness mask on the raw grid instead of the half-res guide grid."
+                         : "Only available with Alignment Grey: FFT.")
+                        .font(.caption2).foregroundColor(.secondary)
                     Toggle("HF Artifact Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
                     Text("Rejects repetitive fine texture that block matching cannot align (aperture problem). Needs high-frequency content AND unstable flow, so hair and noise are spared.")
                         .font(.caption2).foregroundColor(.secondary)

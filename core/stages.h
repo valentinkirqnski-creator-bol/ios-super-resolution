@@ -66,7 +66,7 @@ struct RefStats {
     Image means;
     Image stds;
     Image hf_loss;   // 1-channel high-frequency variance-loss map
-}; // guide resolution [h/2, w/2, ch] for Bayer
+}; // Bayer: guide resolution by default, raw resolution with robustness_full_res_fft
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
@@ -76,7 +76,8 @@ f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
 void fetch_noise_curves(f32 alpha, f32 beta,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 
-// Robustness mask r at raw resolution [h, w, 1].
+// Robustness mask. Bayer defaults to the half-res guide grid; FFT can opt into
+// a raw-grid mask with robustness_full_res_fft.
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg);
 

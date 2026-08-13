@@ -318,6 +318,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"alignment_grey_fft"])
         cfg.grey_method = tuning[@"alignment_grey_fft"].boolValue
                               ? GreyMethod::FFT : GreyMethod::Decimate;
+    if (tuning[@"robustness_full_res_fft"])
+        cfg.robustness_full_res_fft = tuning[@"robustness_full_res_fft"].boolValue;
     if (tuning[@"hf_artifact_removal_enabled"])
         cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
     if (tuning[@"hf_variance_loss_threshold"])
