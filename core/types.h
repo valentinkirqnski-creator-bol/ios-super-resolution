@@ -297,11 +297,49 @@ struct Config {
     // With this false the plan stays empty, so every frame enters align() with a
     // zero initial transform and frame 0 stays the reference.
     bool global_prealignment_enabled = false;
-    bool global_prealignment_choose_reference = true;
+    // Off by default: it is the only thing that forces the pre-alignment pass
+    // to decode every frame up front, and with it off the transform is computed
+    // in the analysis loop from the buffer already decoded there -- the stage
+    // goes from a separate decode pass to roughly the cost of one thumbnail per
+    // frame. See prealign_use_decoded_frames.
+    //
+    // What it gives up: the merge base is frame 0 rather than the frame nearest
+    // the midpoint of the burst's travel. The global transforms, the rotation,
+    // the flow initialisation and the aperture-problem benefit are all
+    // unaffected -- with frame 0 as reference from_reference[k] reduces to
+    // to_first[k] identically, so the prior is the same value, measured
+    // directly instead of composed.
+    bool global_prealignment_choose_reference = false;
     float global_prealignment_rotation_range_deg = 0.0f;
     float global_prealignment_rotation_step_deg = 0.25f;
     int   global_prealignment_max_shift = 24;       // thumbnail pixels
     int   global_prealignment_thumb_max_dim = 320;
+    // How many frames the pre-alignment pass decodes concurrently.
+    //
+    // That pass is a decode loop and nothing else: measured at 12MP the decode
+    // is 750ms per frame, the thumbnail 7ms, and the NCC search itself is below
+    // the timer's resolution. Overlapping the decodes is the only lever, and it
+    // cannot change the result -- the iterations share nothing and the estimate
+    // is deterministic.
+    //
+    // A decoded 12MP frame is 48MB, so 3 in flight is ~150MB. Raise it only if
+    // the device has headroom; 1 restores the serial loop exactly.
+    int   prealign_decode_concurrency = 3;
+    // Take the pre-alignment transform from the frame the analysis loop has
+    // already decoded, instead of running a separate pass that decodes every
+    // frame again purely to build a 320px thumbnail.
+    //
+    // Measured at 12MP: that pass is 750ms of decode per frame against 7ms of
+    // thumbnail and an NCC search below the timer's resolution, so it is a
+    // decode loop and nothing else. Integrated, an 8-frame burst spends ~52ms
+    // instead of ~3900ms and the stage stops existing as a separate step.
+    //
+    // Requires global_prealignment_choose_reference to be off, because picking
+    // the reference needs every frame's transform before the loop starts. With
+    // it off the reference is frame 0, and from_reference[k] reduces to
+    // to_first[k] exactly, so the inline result is identical to the pass it
+    // replaces -- same two thumbnails, same search, only computed later.
+    bool  prealign_use_decoded_frames = true;
 
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;

@@ -118,7 +118,9 @@ struct TuningParams: Equatable, Codable {
     var snr_auto_tune: Bool = true
     var alignment_tile_size: Int = 0
     var global_prealignment_enabled: Bool = true
-    var global_prealignment_choose_reference: Bool = true
+    /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
+    /// inside the analysis loop instead of as a separate decode pass.
+    var global_prealignment_choose_reference: Bool = false
     var global_prealignment_rotation_range_deg: Float = 0.0
     var global_prealignment_rotation_step_deg: Float = 0.25
     var global_prealignment_max_shift: Int = 24

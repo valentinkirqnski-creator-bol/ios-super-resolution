@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cmath>
 #include <future>
+#include <mutex>
 #include <memory>
 #include <limits>
 #include <sstream>
@@ -332,6 +333,13 @@ static PrealignPlan build_prealign_plan_from_first(
     if (!work.global_prealignment_enabled || frame_count < 2 ||
         !loader || first_ref.h <= 0 || first_ref.w <= 0)
         return plan;
+    // Integrated mode: the transform for a frame is computed in the analysis
+    // loop, from the buffer that loop has already decoded, so this pass has
+    // nothing to do and its decodes -- the entire cost of pre-alignment --
+    // disappear. Only reference selection needs every transform up front, so
+    // this is available exactly when that is off.
+    if (work.prealign_use_decoded_frames && !work.global_prealignment_choose_reference)
+        return plan;
 
     Image ref_thumb = make_prealign_thumbnail(first_ref, work);
     if (ref_thumb.h <= 0 || ref_thumb.w <= 0)
@@ -341,22 +349,56 @@ static PrealignPlan build_prealign_plan_from_first(
     plan.to_first[0].score = 1.f;
     const f32 thumb_to_raw_x = (f32)first_ref.w / (f32)ref_thumb.w;
     const f32 thumb_to_raw_y = (f32)first_ref.h / (f32)ref_thumb.h;
-    for (int k = 1; k < frame_count; ++k) {
-        if (progress) {
-            progress("Pre-aligning frame " + std::to_string(k + 1),
-                     0.025f + 0.035f * (float)(k - 1) / std::max(1, frame_count - 1));
-        }
+
+    // Measured on an 8-frame 12MP burst: the decode is 750ms per frame, the
+    // thumbnail 7ms, and the 625-evaluation NCC search below the timer's
+    // resolution. So this loop is entirely a decode loop, and the only thing
+    // worth doing to it is overlapping the decodes.
+    //
+    // Each iteration is independent -- it reads only ref_thumb and writes only
+    // its own slot -- and estimate_prealign_transform is deterministic, so the
+    // result does not depend on execution order. Bit-identical to the serial
+    // loop this replaces.
+    //
+    // Concurrency is bounded because a decoded 12MP frame is 48MB and this runs
+    // before the merge accumulators are allocated but not before everything
+    // else; 3 in flight is ~150MB, which is the most this can take without
+    // moving the peak. Frames are freed the moment their thumbnail exists.
+    const int conc = std::max(1, std::min(work.prealign_decode_concurrency,
+                                          frame_count - 1));
+    std::mutex progress_mu;
+    int done = 0;
+    auto do_frame = [&](int k) {
         Image comp = loader(k, work, false, first_ref.h, first_ref.w);
-        if (comp.h <= 0 || comp.w <= 0) continue;
+        if (comp.h <= 0 || comp.w <= 0) return;
         Image thumb = make_prealign_thumbnail(comp, work);
         comp = Image();
-        if (thumb.h != ref_thumb.h || thumb.w != ref_thumb.w) continue;
+        if (thumb.h != ref_thumb.h || thumb.w != ref_thumb.w) return;
         PrealignTransform t = estimate_prealign_transform(ref_thumb, thumb, work);
         if (t.valid) {
             t.dx *= thumb_to_raw_x;
             t.dy *= thumb_to_raw_y;
         }
         plan.to_first[(size_t)k] = t;
+        if (progress) {
+            std::lock_guard<std::mutex> lk(progress_mu);
+            ++done;
+            progress("Pre-aligning frame " + std::to_string(done + 1),
+                     0.025f + 0.035f * (float)done / std::max(1, frame_count - 1));
+        }
+    };
+    if (conc <= 1) {
+        for (int k = 1; k < frame_count; ++k) do_frame(k);
+    } else {
+        for (int k0 = 1; k0 < frame_count; k0 += conc) {
+            const int k1 = std::min(frame_count, k0 + conc);
+            std::vector<std::future<void>> batch;
+            batch.reserve((size_t)(k1 - k0 - 1));
+            for (int k = k0 + 1; k < k1; ++k)
+                batch.push_back(std::async(std::launch::async, do_frame, k));
+            do_frame(k0);                       // this thread takes one too
+            for (auto& f : batch) f.get();
+        }
     }
 
     if (work.global_prealignment_choose_reference) {
@@ -999,6 +1041,26 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     (void)t_snr;
 
     const int ref_h = ref.h, ref_w = ref.w;
+    // Integrated pre-alignment: one thumbnail of the reference, reused by every
+    // comparison frame. ~7ms, against the ~750ms per-frame decode the separate
+    // pass costs. With reference selection off the reference is frame 0, so
+    // from_reference[k] == to_first[k] identically (ref_t is the identity and
+    // the composition below reduces to rel = tk) -- this produces the same two
+    // thumbnails through the same search, so the result is unchanged.
+    const bool prealign_inline =
+        work.global_prealignment_enabled && work.prealign_use_decoded_frames &&
+        !work.global_prealignment_choose_reference;
+    Image prealign_ref_thumb;
+    f32 prealign_to_raw_x = 1.f, prealign_to_raw_y = 1.f;
+    if (prealign_inline) {
+        const double t_pt = prof_now_ms();
+        prealign_ref_thumb = make_prealign_thumbnail(ref, work);
+        if (prealign_ref_thumb.w > 0 && prealign_ref_thumb.h > 0) {
+            prealign_to_raw_x = (f32)ref_w / (f32)prealign_ref_thumb.w;
+            prealign_to_raw_y = (f32)ref_h / (f32)prealign_ref_thumb.h;
+        }
+        prof_add_cpu("setup:prealign-ref-thumb", prof_now_ms() - t_pt);
+    }
     const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
     // Output dimensions are known as soon as the reference is, and the online
@@ -1181,8 +1243,22 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         debug_dump_bin("cpp_mov_grey_" + std::to_string(pos),
                        comp_grey.data.data(), comp_grey.data.size());
         PrealignTransform init;
-        if (k >= 0 && k < (int)prealign.from_reference.size())
+        if (prealign_inline && prealign_ref_thumb.w > 0 && comp.h > 0 && comp.w > 0) {
+            // comp is already decoded and still resident -- this is the whole
+            // point. Thumbnail plus the NCC search, no decode.
+            const double t_pa = prof_now_ms();
+            Image thumb = make_prealign_thumbnail(comp, work);
+            if (thumb.h == prealign_ref_thumb.h && thumb.w == prealign_ref_thumb.w) {
+                init = estimate_prealign_transform(prealign_ref_thumb, thumb, work);
+                if (init.valid) {
+                    init.dx *= prealign_to_raw_x;
+                    init.dy *= prealign_to_raw_y;
+                }
+            }
+            prof_add_cpu("comp:prealign", prof_now_ms() - t_pa);
+        } else if (k >= 0 && k < (int)prealign.from_reference.size()) {
             init = prealign.from_reference[(size_t)k];
+        }
         const f32 grey_scale_x = ref_w > 0 ? (f32)ref_grey.w / (f32)ref_w : 1.f;
         const f32 grey_scale_y = ref_h > 0 ? (f32)ref_grey.h / (f32)ref_h : 1.f;
         const double t_align = prof_now_ms();

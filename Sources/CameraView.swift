@@ -796,6 +796,15 @@ struct CameraView: View {
     // was one 343-line expression and the Swift type checker gave up on it
     // ("unable to type-check this expression in reasonable time"); these are
     // the two largest, and moving them lets each be checked on its own.
+    // Out of the ViewBuilder deliberately: an inline ternary in a Text is the
+    // shape that has previously pushed this file past the type-checker limit.
+    private var chooseReferenceHelp: String {
+        if cam.tuningParams.global_prealignment_choose_reference {
+            return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
+        }
+        return "Frame 0 is the merge base, so pre-alignment runs inside the alignment pass at roughly the cost of one thumbnail per frame."
+    }
+
     @ViewBuilder
     private var robustnessSection: some View {
                 Section(header: Text("Robustness (Motion Rejection)")) {
@@ -936,6 +945,9 @@ struct CameraView: View {
 
                     if cam.tuningParams.global_prealignment_enabled {
                         Toggle("Choose Reference Frame", isOn: $cam.tuningParams.global_prealignment_choose_reference)
+                        Text(chooseReferenceHelp)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
 
                         HStack {
                             Text("Rotation Search")
