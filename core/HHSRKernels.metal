@@ -791,7 +791,7 @@ struct MergeCompParams {
     uint cfa01;
     uint cfa10;
     uint cfa11;
-    uint raw_res_rob;
+    uint _pad0;
     uint _pad1;
     uint _pad2;
     uint _pad3;
@@ -821,7 +821,7 @@ struct MergeRefParams {
     uint cfa11;
     uint adaptive;
     float max_frame_count;
-    uint raw_res_acc_rob;
+    uint _pad0;
 };
 
 // std::lround half-away-from-zero.
@@ -975,8 +975,8 @@ static inline void merge_comp_contrib(device const float* img,
     float flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
     float flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
 
-    float rob_y = p.raw_res_rob != 0u ? lr_y : (p.bayer ? (lr_y - 0.5f) / 2.f : lr_y);
-    float rob_x = p.raw_res_rob != 0u ? lr_x : (p.bayer ? (lr_x - 0.5f) / 2.f : lr_x);
+    float rob_y = p.bayer ? (lr_y - 0.5f) / 2.f : lr_y;
+    float rob_x = p.bayer ? (lr_x - 0.5f) / 2.f : lr_x;
     float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
                                                rob_y, rob_x);
     // Nothing to accumulate where the frame is fully rejected. Every
@@ -1145,8 +1145,8 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
     int rad = 1;
     if (p.robustness_denoise) {
         // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
-        float acc_y = (p.bayer && p.raw_res_acc_rob == 0u) ? (coarse_y - 0.5f) / 2.f : coarse_y;
-        float acc_x = (p.bayer && p.raw_res_acc_rob == 0u) ? (coarse_x - 0.5f) / 2.f : coarse_x;
+        float acc_y = p.bayer ? (coarse_y - 0.5f) / 2.f : coarse_y;
+        float acc_x = p.bayer ? (coarse_x - 0.5f) / 2.f : coarse_x;
         int ay = min(max(lround_away(acc_y), 0), int(p.acc_h) - 1);
         int ax = min(max(lround_away(acc_x), 0), int(p.acc_w) - 1);
         local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
@@ -1408,8 +1408,7 @@ struct RobDogsonParams {
     uint tile_size;
     uint flow_ny, flow_nx;
     float s;          // always 2.f (Python CUDA hardcode)
-    uint force_upscale;
-    uint _pad1;
+    uint _pad0, _pad1;
 };
 
 struct RobMaskParams {
@@ -1431,7 +1430,7 @@ struct RobMaskParams {
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
     uint aperture_reject_enabled;
-    uint raw_res_rob;
+    uint _pad0;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1685,12 +1684,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     int patch_idx;
     float flow_x;
     float flow_y;
-    if (p.raw_res_rob != 0u) {
-        patch_idy = int(gid.y) / int(p.tile_size);
-        patch_idx = int(gid.x) / int(p.tile_size);
-        flow_x = 0.f;
-        flow_y = 0.f;
-    } else if (p.nch == 1u) {
+    if (p.nch == 1u) {
         patch_idy = int(gid.y) / int(p.tile_size);
         patch_idx = int(gid.x) / int(p.tile_size);
         uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
@@ -1727,10 +1721,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_t = diff_curve[id];
         float sigma_p_sq = ref_vars[o];
         sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-        float comp = (p.raw_res_rob != 0u)
-            ? comp_means[o]
-            : rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
-                                         sample_y, sample_x, ch);
+        float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
+                                                sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);

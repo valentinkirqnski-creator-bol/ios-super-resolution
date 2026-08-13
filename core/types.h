@@ -283,11 +283,6 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    // Experimental: when the alignment grey is the full-resolution FFT image,
-    // warp/upscale the half-res guide statistics back to the raw grid and build
-    // the robustness mask at raw resolution. The 2x2 decimated grey path keeps
-    // the Google/Wronski half-res guide mask.
-    bool  robustness_full_res_fft = false;
 
     float r_t  = 0.12f;
     float r_s1 = 2.0f;

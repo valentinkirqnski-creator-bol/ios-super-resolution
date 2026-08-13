@@ -79,7 +79,6 @@ struct CachedCompFrame {
     CovField covs;
     Image comp;
     std::vector<uint8_t> rob_rows_nonzero;
-    bool rob_raw_res = false;
     bool rob_has_nonzero = true;
     int index = 0;
 };
@@ -89,7 +88,6 @@ struct CachedCompMeta {
     Image rob;
     CovField covs;
     std::vector<uint8_t> rob_rows_nonzero;
-    bool rob_raw_res = false;
     bool rob_has_nonzero = true;
     int index = 0;
 };
@@ -125,10 +123,8 @@ static Image compute_robustness_and_activity(const Image& comp,
                                              int tile_size,
                                              const Config& work,
                                              std::vector<uint8_t>& rows,
-                                             bool& has_nonzero,
-                                             bool& raw_res_rob) {
+                                             bool& has_nonzero) {
     Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
-    raw_res_rob = work.bayer_mode && rob.h == comp.h && rob.w == comp.w;
     has_nonzero = robustness_row_activity(rob, rows);
     return rob;
 }
@@ -139,15 +135,13 @@ static inline int round_away_to_int(f32 x) {
 
 static bool robustness_band_can_contribute(const std::vector<uint8_t>& rows,
                                            int y0, int bh, float scale,
-                                           bool bayer_mode, bool raw_res_rob) {
+                                           bool bayer_mode) {
     if (rows.empty()) return true;
     const int rh = (int)rows.size();
     for (int local_y = 0; local_y < bh; ++local_y) {
         const f32 lr_y = (f32)(y0 + local_y) / scale;
         int ry;
-        if (raw_res_rob)
-            ry = std::min(std::max(round_away_to_int(lr_y), 0), rh - 1);
-        else if (bayer_mode)
+        if (bayer_mode)
             ry = std::min(std::max(round_away_to_int((lr_y - 0.5f) / 2.f), 0), rh - 1);
         else
             ry = std::min(std::max(round_away_to_int(lr_y), 0), rh - 1);
@@ -1221,15 +1215,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         CovField covs;
         std::vector<uint8_t> rob_rows_nonzero;
         bool rob_has_nonzero = true;
-        bool rob_raw_res = false;
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
                                                   tile_size, work,
                                                   rob_rows_nonzero,
-                                                  rob_has_nonzero,
-                                                  rob_raw_res);
+                                                  rob_has_nonzero);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1256,8 +1248,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
                                                   tile_size, work,
                                                   rob_rows_nonzero,
-                                                  rob_has_nonzero,
-                                                  rob_raw_res);
+                                                  rob_has_nonzero);
             covs = cov_fut.get();
         }
         debug_dump_bin("cpp_mask_" + std::to_string(pos),
@@ -1386,7 +1377,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 meta.covs = rob_has_nonzero ? std::move(covs) : CovField();
             }
             meta.rob_rows_nonzero = std::move(rob_rows_nonzero);
-            meta.rob_raw_res = rob_raw_res;
             meta.rob_has_nonzero = rob_has_nonzero;
             cached_meta.push_back(std::move(meta));
             if (rob_has_nonzero) n_comp_ok++;
@@ -1398,7 +1388,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             fc.covs = rob_has_nonzero ? std::move(covs) : CovField();
             fc.comp = rob_has_nonzero ? std::move(comp) : Image();
             fc.rob_rows_nonzero = std::move(rob_rows_nonzero);
-            fc.rob_raw_res = rob_raw_res;
             fc.rob_has_nonzero = rob_has_nonzero;
             cached.push_back(std::move(fc));
             if (rob_has_nonzero) n_comp_ok++;
@@ -1658,8 +1647,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!meta.rob_has_nonzero ||
                     !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode,
-                                                    meta.rob_raw_res))
+                                                    work.scale, work.bayer_mode))
                     continue;
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
@@ -1675,8 +1663,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompFrame& fc : cached) {
                 if (!fc.rob_has_nonzero ||
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode,
-                                                    fc.rob_raw_res))
+                                                    work.scale, work.bayer_mode))
                     continue;
                 if (metal_merge_has_frame(fc.index)) {
                     Image empty;
@@ -1769,8 +1756,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!meta.rob_has_nonzero ||
                     !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode,
-                                                    meta.rob_raw_res))
+                                                    work.scale, work.bayer_mode))
                     continue;
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
@@ -1780,8 +1766,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompFrame& fc : cached) {
                 if (!fc.rob_has_nonzero ||
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode,
-                                                    fc.rob_raw_res))
+                                                    work.scale, work.bayer_mode))
                     continue;
                 merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
                                 num_band, den_band, y0, work, fc.index);

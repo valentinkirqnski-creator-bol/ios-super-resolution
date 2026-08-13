@@ -89,10 +89,6 @@ struct TuningParams: Equatable, Codable {
     var r_Mt: Float = 0.8
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
-    // Optional: when FFT grey is active, build the robustness mask at the raw
-    // grid resolution instead of the half-res Bayer guide grid. Decimated grey
-    // always keeps the half-res mask.
-    var robustness_full_res_fft: Bool = false
     var hf_artifact_removal_enabled: Bool = false
     var hf_variance_loss_threshold: Float = 0.75
     var hf_min_texture_snr: Float = 4.0
@@ -174,7 +170,7 @@ struct TuningParams: Equatable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
-        case alignment_grey_fft, robustness_full_res_fft
+        case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
         case flow_regularize_enabled, flow_regularize_threshold, flow_regularize_aperture_ratio
@@ -207,7 +203,6 @@ struct TuningParams: Equatable, Codable {
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
-        robustness_full_res_fft = try c.decodeIfPresent(Bool.self, forKey: .robustness_full_res_fft) ?? robustness_full_res_fft
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
@@ -1815,7 +1810,6 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
-            "robustness_full_res_fft": NSNumber(value: tuningParams.robustness_full_res_fft),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),

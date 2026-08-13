@@ -687,25 +687,14 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     Image guide = compute_guide(ref_raw, cfg);
     Image means, vars;
     local_stats_3x3(guide, means, vars);
-    const bool full_res_rob =
-        cfg.robustness_full_res_fft && cfg.grey_method == GreyMethod::FFT && cfg.bayer_mode;
-    if (full_res_rob) {
-        // Optional Python-z style path: keep the Google half-res RGB guide
-        // statistics, but resample them onto the raw grid before computing R.
-        st.means = upscale_warp_stats(means, true, nullptr, 0, cfg.num_threads);
-        st.stds  = upscale_warp_stats(vars,  true, nullptr, 0, cfg.num_threads);
-    } else {
-        // 460-main keeps robustness local statistics on the guide grid
-        // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
-        st.means = std::move(means);
-        st.stds  = std::move(vars);
-    }
+    // 460-main keeps robustness local statistics on the guide grid
+    // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
+    st.means = std::move(means);
+    st.stds  = std::move(vars);
     if (cfg.hf_artifact_removal_enabled) {
         Image lp_guide = local_lowpass_gaussian5x5(guide);
         Image lp_means, lp_vars;
         local_stats_3x3(lp_guide, lp_means, lp_vars);
-        if (full_res_rob)
-            lp_vars = upscale_warp_stats(lp_vars, true, nullptr, 0, cfg.num_threads);
         st.hf_loss = high_frequency_loss_map_adaptive(st.means, st.stds, lp_vars, cfg);
     }
     return st;
@@ -742,13 +731,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
-    const bool full_res_rob =
-        cfg.robustness_full_res_fft && cfg.grey_method == GreyMethod::FFT &&
-        cfg.bayer_mode && ref_stats.means.h == comp_raw.h &&
-        ref_stats.means.w == comp_raw.w && ref_stats.means.c == comp_means.c;
-    if (full_res_rob) {
-        comp_means = upscale_warp_stats(comp_means, false, &flow, tile_size, cfg.num_threads);
-    }
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
@@ -756,10 +738,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
             int patch_idy = 0, patch_idx = 0;
-            if (full_res_rob) {
-                patch_idy = y / tile_size;
-                patch_idx = x / tile_size;
-            } else if (d_p.c == 1) {
+            if (d_p.c == 1) {
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
                 flow_x = flow.dx(patch_idy, patch_idx);
@@ -774,9 +753,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const f32 sample_x = (f32)x + flow_x;
             const f32 sample_y = (f32)y + flow_y;
             for (int ch = 0; ch < d_p.c; ++ch) {
-                const f32 comp = full_res_rob
-                    ? comp_means.at(y, x, ch)
-                    : sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
+                const f32 comp = sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
                 d_p.at(y, x, ch) = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();
@@ -800,10 +777,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             int patch_idy, patch_idx;
-            if (full_res_rob) {
-                patch_idy = y / tile_size;
-                patch_idx = x / tile_size;
-            } else if (ref_stats.means.c == 3) {
+            if (ref_stats.means.c == 3) {
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
             } else {
@@ -811,10 +785,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idx = x / tile_size;
             }
             f32 flow_x = 0.f, flow_y = 0.f;
-            if (full_res_rob) {
-                flow_x = 0.f;
-                flow_y = 0.f;
-            } else if (ref_stats.means.c == 3) {
+            if (ref_stats.means.c == 3) {
                 flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
                 flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
             } else {
