@@ -1127,9 +1127,11 @@ struct RobMaskParamsCPU {
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
     uint32_t aperture_reject_enabled = 0;
+    uint32_t fb_enabled = 0;
     uint32_t _pad0 = 0;
+    uint32_t _pad1 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 88, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1487,6 +1489,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         ? buf(flow.aperture_limited.data(),
               flow.aperture_limited.size() * sizeof(uint32_t))
         : b_motion;
+    const bool fb_on =
+        cfg.fb_consistency_enabled &&
+        flow.fb_confidence.size() == (size_t)flow.ny * (size_t)flow.nx;
+    static const float kDummyFb = 1.f;
+    id<MTLBuffer> b_fb = fb_on
+        ? buf(flow.fb_confidence.data(), flow.fb_confidence.size() * sizeof(float))
+        : buf(&kDummyFb, sizeof(kDummyFb));
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_ref_hf = b_ref_v;
@@ -1498,7 +1507,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_motion || !b_aperture || !b_flow ||
+        !b_S || !b_motion || !b_aperture || !b_fb || !b_flow ||
         !b_R || !b_out)
         return Image();
 
@@ -1523,6 +1532,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
+    mp.fb_enabled = fb_on ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1538,6 +1548,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_flow offset:0 atIndex:10];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     [enc setBuffer:b_aperture offset:0 atIndex:12];
+    [enc setBuffer:b_fb offset:0 atIndex:13];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1912,9 +1923,9 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     if (!ref_img || !mov_img || !flow_b) return false;
-    if (!l2_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
-                 moving.h, moving.w, tile_size, search_radius,
-                 ny, nx))
+    if (!local_search_460_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
+                               moving.h, moving.w, tile_size, search_radius,
+                               ny, nx, false))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -2013,10 +2024,8 @@ struct AlignUpscaleParamsCPU {
     uint32_t upsample_factor, repeat_factor, up_ny, up_nx;
     int32_t ts;
     int32_t ref_h, ref_w, mov_h, mov_w;
-    // Keep in lockstep with AlignUpscaleParams in HHSRKernels.metal.
-    int32_t up_mode = 0;
 };
-static_assert(sizeof(AlignUpscaleParamsCPU) == 56, "AlignUpscaleParamsCPU");
+static_assert(sizeof(AlignUpscaleParamsCPU) == 52, "AlignUpscaleParamsCPU");
 
 // One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
 // retain all levels at once (full-res sticky cache jetsams on 1×).
@@ -2027,13 +2036,8 @@ static bool prep_level_ica_gpu(const Image& r, int ts,
                                __strong id<MTLBuffer>& b_hess,
                                int& ny, int& nx) {
     auto& c = ctx();
-    // Must be the grid block matching builds for this level (r.h / ts), not
-    // ceil. They agree only where the image is a whole number of tiles, which
-    // is the finest level alone; on every coarser level ceil overshot by a row
-    // or a column and the dispatch below was skipped, so the per-level
-    // refinement silently did nothing. Matches compute_hessian on the CPU.
-    ny = r.h / ts;
-    nx = r.w / ts;
+    ny = (r.h + ts - 1) / ts;
+    nx = (r.w + ts - 1) / ts;
     if (ny <= 0 || nx <= 0 || r.h <= 0 || r.w <= 0) return false;
     const void* key = r.data.empty() ? nullptr : (const void*)r.data.data();
     // Slots are few, so a linear scan is cheaper than any indexing scheme, and
@@ -2135,8 +2139,7 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
                                   int target_ny, int target_nx,
                                   int upsample_factor, int new_tile_size,
                                   int prev_tile_size,
-                                  int ref_h, int ref_w, int mov_h, int mov_w,
-                                  FlowUpscale up_mode) {
+                                  int ref_h, int ref_w, int mov_h, int mov_w) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -2161,31 +2164,18 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     p.ref_w = (int32_t)ref_w;
     p.mov_h = (int32_t)mov_h;
     p.mov_w = (int32_t)mov_w;
-    p.up_mode = (up_mode == FlowUpscale::Bilinear) ? 1
-              : (up_mode == FlowUpscale::Bicubic)  ? 2 : 0;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
-    // Candidate selection needs the two images to score patches against; the
-    // interpolating modes read only the incoming field, so they take the
-    // simpler kernel and leave buffers 1 and 2 unbound.
-    const bool candidate = (up_mode == FlowUpscale::Candidate);
-    id<MTLComputePipelineState> pipe =
-        c.pipe(candidate ? "align_upscale_flow_460" : "align_upscale_flow");
+    id<MTLComputePipelineState> pipe = c.pipe("align_upscale_flow_460");
     if (!pipe) return false;
-    if (candidate) {
-        [enc setBuffer:b_in offset:0 atIndex:0];
-        [enc setBuffer:b_ref offset:0 atIndex:1];
-        [enc setBuffer:b_mov offset:0 atIndex:2];
-        [enc setBuffer:b_out offset:0 atIndex:3];
-        [enc setBytes:&p length:sizeof(p) atIndex:4];
-    } else {
-        [enc setBuffer:b_in offset:0 atIndex:0];
-        [enc setBuffer:b_out offset:0 atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-    }
+    [enc setBuffer:b_in offset:0 atIndex:0];
+    [enc setBuffer:b_ref offset:0 atIndex:1];
+    [enc setBuffer:b_mov offset:0 atIndex:2];
+    [enc setBuffer:b_out offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:upscale-flow");
@@ -2291,7 +2281,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             id<MTLBuffer> b_up = nil;
             if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
                                        b_up, ny, nx, upsample_factor, ts, prev_ts,
-                                       r.h, r.w, m.h, m.w, cfg.flow_upscale) || !b_up)
+                                       r.h, r.w, m.h, m.w) || !b_up)
                 return false;
             b_flow = b_up;
             flow_ny = ny;
@@ -2305,8 +2295,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, true);
         else
-            bm_ok = l2_bufs(b_ref, m.img, b_flow, r.h, r.w,
-                            m.h, m.w, ts, radius, ny, nx);
+            bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
+                                          m.h, m.w, ts, radius, ny, nx, false);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --
@@ -2321,9 +2311,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             // failed" and skips it. Losing precision beats losing the frame.
             if (!prep_level_ica_gpu(r, ts, l_ref, l_gx, l_gy, l_hess, l_ny, l_nx))
                 continue;
-            // Both grids are r.h / ts now, so this holds. Kept as a guard
-            // because the ICA indexes the Hessian by the flow's stride, so a
-            // mismatched grid would read the wrong tile rather than fail.
+            // prep tiles with ceil, block matching with floor; they agree for
+            // every shipped pyramid, but skip rather than dispatch a mismatched
+            // grid if a future tile size makes them differ.
             if (l_ny == ny && l_nx == nx &&
                 !ica_bufs(l_ref, l_gx, l_gy, l_hess, m.img, b_flow,
                           r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter))

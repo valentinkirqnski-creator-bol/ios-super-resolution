@@ -703,25 +703,6 @@ struct CameraView: View {
     // an operator overload the checker has to resolve, and there were enough of
     // them here to matter.
     @ViewBuilder
-    private var flowUpscaleSection: some View {
-        Picker("Flow Upscaling", selection: $cam.tuningParams.flow_upscale_mode) {
-            Text("460").tag(0)
-            Text("Z Nearest").tag(1)
-            Text("Z Bilinear").tag(2)
-            Text("Z Bicubic").tag(3)
-        }
-        .pickerStyle(.segmented)
-        Text("""
-             How a tile's motion is carried to the next pyramid level. Candidate is the \
-             old 460-style behaviour: the new tile takes its parent's vector or one of two \
-             neighbours, whichever matches best, so it is always a vector some search \
-             actually tested. Z Nearest, Z Bilinear, and Z Bicubic use the Python-z \
-             interpolate modes and coordinate rules; Z Nearest is Python-z's default.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-    }
-
-    @ViewBuilder
     private var flowRegularizeSection: some View {
         Toggle("Hessian Aperture Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
         Text("""
@@ -845,6 +826,39 @@ struct CameraView: View {
                         Text(String(format: "%.2f", cam.tuningParams.r_Mt))
                     }
                     Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
+
+                    Toggle("Forward/Backward Gate", isOn: $cam.tuningParams.fb_consistency_enabled)
+                    Text("Extra geometry check: computes reverse flow and only darkens tiles whose forward/backward error is a local outlier.")
+                        .font(.caption2).foregroundColor(.secondary)
+
+                    if cam.tuningParams.fb_consistency_enabled {
+                        HStack {
+                            Text("FB Min Error")
+                            Spacer()
+                            Text(String(format: "%.2f px", cam.tuningParams.fb_consistency_min_error))
+                        }
+                        Slider(value: $cam.tuningParams.fb_consistency_min_error,
+                               in: 0.2...3.0,
+                               step: 0.05)
+
+                        HStack {
+                            Text("FB Sigma")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.fb_consistency_sigma))
+                        }
+                        Slider(value: $cam.tuningParams.fb_consistency_sigma,
+                               in: 1.0...6.0,
+                               step: 0.25)
+
+                        Stepper(value: $cam.tuningParams.fb_consistency_radius,
+                                in: 1...8) {
+                            HStack {
+                                Text("FB Neighborhood")
+                                Spacer()
+                                Text("\(cam.tuningParams.fb_consistency_radius)")
+                            }
+                        }
+                    }
 
                     Toggle("Alignment Grey: FFT", isOn: $cam.tuningParams.alignment_grey_fft)
                     Text(cam.tuningParams.alignment_grey_fft
@@ -1064,6 +1078,8 @@ struct CameraView: View {
                     if cam.tuningParams.isp_enabled {
                         ispRow("Exposure (EV)", $cam.tuningParams.isp_exposure_ev, -2.0...2.0, "%+.2f")
                         ispRow("Highlight Recovery", $cam.tuningParams.isp_highlight_knee, 0.60...1.0, "%.2f")
+                        ispRow("Colour Noise", $cam.tuningParams.isp_chroma_denoise, 0.0...1.0)
+                        ispRow("Colour Noise Radius", $cam.tuningParams.isp_chroma_radius, 2.0...48.0, "%.0f")
                         ispRow("Local Strength", $cam.tuningParams.isp_local_strength, 0.0...1.0)
                         ispRow("Highlight Rolloff", $cam.tuningParams.isp_highlight, 0.0...1.0)
                         ispRow("Shadow Lift", $cam.tuningParams.isp_shadow, 0.0...1.0)
@@ -1131,8 +1147,6 @@ struct CameraView: View {
                             .font(.caption2).foregroundColor(.secondary)
 
                         fineAlignmentSection
-
-                        flowUpscaleSection
 
                         flowRegularizeSection
 

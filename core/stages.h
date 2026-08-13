@@ -39,6 +39,11 @@ Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size);
 
+// Fill forward.fb_confidence from forward/backward consistency. Both fields
+// must be on the same tile grid and in the same pixel units.
+void apply_forward_backward_confidence(FlowField& forward, const FlowField& backward,
+                                       int tile_size, const Config& cfg);
+
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 

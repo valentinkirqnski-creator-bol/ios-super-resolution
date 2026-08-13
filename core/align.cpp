@@ -8,6 +8,7 @@
 #include <complex>
 #include <cstdlib>
 #include <limits>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -100,18 +101,10 @@ struct HessianField {
     const f32* at(int ty, int tx) const { return &data[((size_t)ty * nx + tx) * 4]; }
 };
 
-// grid_ny/grid_nx force the tile grid; 0 keeps the Python default.
-static HessianField compute_hessian(const Image& gradx, const Image& grady, int ts,
-                                    int grid_ny = 0, int grid_nx = 0) {
-    // Python init_ICA: ny, nx = ceil(h / tile_size), ceil(w / tile_size). That
-    // matches block matching (h // tile_size) only when the image is a whole
-    // number of tiles. The finest level is, because the grey is circular-padded
-    // to a tile multiple. Coarser pyramid levels are downsampled after that
-    // padding, so ceil overshoots the flow grid by a row or a column -- and
-    // since HessianField strides by nx, an overshooting grid cannot simply be
-    // indexed by the flow's. Callers refining a flow pass that flow's grid.
-    int ny = grid_ny > 0 ? grid_ny : (gradx.h + ts - 1) / ts;
-    int nx = grid_nx > 0 ? grid_nx : (gradx.w + ts - 1) / ts;
+static HessianField compute_hessian(const Image& gradx, const Image& grady, int ts) {
+    // Python init_ICA: ny, nx = ceil(h / tile_size), ceil(w / tile_size).
+    int ny = (gradx.h + ts - 1) / ts;
+    int nx = (gradx.w + ts - 1) / ts;
     HessianField H;
     H.ny = ny;
     H.nx = nx;
@@ -386,14 +379,13 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, int num_threads) {
 #ifdef __APPLE__
-    // Python-z L2 block matching: rfft2/irfft2 correlation, then
-    // L2_search - 2*corr argmin. HHSR_L2_CPU=1 forces the CPU FFT path.
+    // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
         if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow))
             return;
     }
 #endif
-    block_match_level_L2_cpu(ref, moving, tile_size, search_radius, flow, num_threads);
+    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow, false, num_threads);
 }
 
 // ============================================================================
@@ -627,22 +619,10 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
     });
 }
 
-// upscale_lvl — nearest (default.yaml flow_upscale_mode)
-// torch.nn.functional.interpolate cubic weights, A = -0.75 (PyTorch's value).
-// Two polynomials: |t| <= 1 for the inner pair, 1 < |t| < 2 for the outer.
-static inline void cubic_weights_torch(f32 t, f32 w[4]) {
-    constexpr f32 A = -0.75f;
-    const f32 t1 = t + 1.f, t2 = t, t3 = 1.f - t, t4 = 2.f - t;
-    w[0] = ((A * t1 - 5.f * A) * t1 + 8.f * A) * t1 - 4.f * A;
-    w[1] = ((A + 2.f) * t2 - (A + 3.f)) * t2 * t2 + 1.f;
-    w[2] = ((A + 2.f) * t3 - (A + 3.f)) * t3 * t3 + 1.f;
-    w[3] = ((A * t4 - 5.f * A) * t4 + 8.f * A) * t4 - 4.f * A;
-}
-
+// upscale_lvl — 460-main candidate upscaling.
 static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
                                int upsample_factor, int new_tile_size,
-                               int prev_tile_size,
-                               FlowUpscale mode = FlowUpscale::Nearest) {
+                               int prev_tile_size) {
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
     if (repeat_factor < 1) repeat_factor = 1;
@@ -650,60 +630,14 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
     int up_ny = in.ny * repeat_factor;
     int up_nx = in.nx * repeat_factor;
     FlowField upsampled(up_ny, up_nx);
-    // align_corners=False, the default F.interpolate uses with scale_factor:
-    // src = (dst + 0.5) / scale - 0.5.
-    const f32 inv_rep = 1.f / (f32)repeat_factor;
-    auto clampi = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
     for (int ty = 0; ty < up_ny; ++ty) {
         for (int tx = 0; tx < up_nx; ++tx) {
-            f32 vdx, vdy;
-            if (mode == FlowUpscale::Nearest) {
-                const int sy = std::min(in.ny - 1, ty / repeat_factor);
-                const int sx = std::min(in.nx - 1, tx / repeat_factor);
-                vdx = in.dx(sy, sx);
-                vdy = in.dy(sy, sx);
-            } else {
-                const f32 fy = ((f32)ty + 0.5f) * inv_rep - 0.5f;
-                const f32 fx = ((f32)tx + 0.5f) * inv_rep - 0.5f;
-                const int iy = (int)std::floor(fy), ix = (int)std::floor(fx);
-                const f32 ry = fy - (f32)iy, rx = fx - (f32)ix;
-                if (mode == FlowUpscale::Bilinear) {
-                    const int y0 = clampi(iy, in.ny - 1), y1 = clampi(iy + 1, in.ny - 1);
-                    const int x0 = clampi(ix, in.nx - 1), x1 = clampi(ix + 1, in.nx - 1);
-                    const f32 tdx = in.dx(y0, x0) + (in.dx(y0, x1) - in.dx(y0, x0)) * rx;
-                    const f32 bdx = in.dx(y1, x0) + (in.dx(y1, x1) - in.dx(y1, x0)) * rx;
-                    const f32 tdy = in.dy(y0, x0) + (in.dy(y0, x1) - in.dy(y0, x0)) * rx;
-                    const f32 bdy = in.dy(y1, x0) + (in.dy(y1, x1) - in.dy(y1, x0)) * rx;
-                    vdx = tdx + (bdx - tdx) * ry;
-                    vdy = tdy + (bdy - tdy) * ry;
-                } else {   // Bicubic
-                    f32 wy[4], wx[4];
-                    cubic_weights_torch(ry, wy);
-                    cubic_weights_torch(rx, wx);
-                    vdx = 0.f;
-                    vdy = 0.f;
-                    for (int j = 0; j < 4; ++j) {
-                        const int sy = clampi(iy - 1 + j, in.ny - 1);
-                        f32 rowx = 0.f, rowy = 0.f;
-                        for (int i = 0; i < 4; ++i) {
-                            const int sx = clampi(ix - 1 + i, in.nx - 1);
-                            rowx += wx[i] * in.dx(sy, sx);
-                            rowy += wx[i] * in.dy(sy, sx);
-                        }
-                        vdx += wy[j] * rowx;
-                        vdy += wy[j] * rowy;
-                    }
-                }
-            }
-            upsampled.dx(ty, tx) = vdx * (f32)upsample_factor;
-            upsampled.dy(ty, tx) = vdy * (f32)upsample_factor;
-            // The aperture flag is a per-tile property of the reference, not an
-            // interpolatable quantity, so it is always taken nearest.
-            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx) {
-                const int ay = std::min(in.ny - 1, ty / repeat_factor);
-                const int ax = std::min(in.nx - 1, tx / repeat_factor);
-                upsampled.aperture(ty, tx) = in.aperture(ay, ax);
-            }
+            int sy = std::min(in.ny - 1, ty / repeat_factor);
+            int sx = std::min(in.nx - 1, tx / repeat_factor);
+            upsampled.dx(ty, tx) = in.dx(sy, sx) * (f32)upsample_factor;
+            upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
+            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
+                upsampled.aperture(ty, tx) = in.aperture(sy, sx);
         }
     }
 
@@ -1074,9 +1008,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             L.gx = compute_sobel_gradx(r);
             L.gy = compute_sobel_grady(r);
-            // Same grid the block matching below builds for this level, so the
-            // per-level refinement actually runs instead of being skipped.
-            L.hess = compute_hessian(L.gx, L.gy, ts, r.h / ts, r.w / ts);
+            L.hess = compute_hessian(L.gx, L.gy, ts);
         }
         // Python dumps pyramid/grads at enum i==0 after reverse = coarsest.
         if (nlev > 0) {
@@ -1123,10 +1055,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1]
                           : ts;
-            flow = (cfg.flow_upscale == FlowUpscale::Candidate)
-                       ? upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts)
-                       : upscale_flow(flow, ny, nx, upsample_factor, ts, prev_ts,
-                                      cfg.flow_upscale);
+            flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
         }
 
         std::string metric = "L2";
@@ -1220,9 +1149,160 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
             if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.aperture(ty, tx) = flow.aperture(gy, gx);
+            if (flow.fb_confidence.size() == (size_t)flow.ny * (size_t)flow.nx)
+                out.fb(ty, tx) = flow.fb(gy, gx);
         }
     }
     return out;
+}
+
+namespace {
+
+static inline f32 sample_flow_bilinear(const FlowField& flow, f32 ty, f32 tx, int ch,
+                                       bool& ok) {
+    ok = false;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return 0.f;
+    if (!(ty >= 0.f && ty <= (f32)(flow.ny - 1) &&
+          tx >= 0.f && tx <= (f32)(flow.nx - 1)))
+        return 0.f;
+    int y0 = (int)std::floor(ty);
+    int x0 = (int)std::floor(tx);
+    int y1 = std::min(y0 + 1, flow.ny - 1);
+    int x1 = std::min(x0 + 1, flow.nx - 1);
+    f32 fy = ty - (f32)y0;
+    f32 fx = tx - (f32)x0;
+    const size_t o00 = ((size_t)y0 * flow.nx + x0) * 2 + (size_t)ch;
+    const size_t o01 = ((size_t)y0 * flow.nx + x1) * 2 + (size_t)ch;
+    const size_t o10 = ((size_t)y1 * flow.nx + x0) * 2 + (size_t)ch;
+    const size_t o11 = ((size_t)y1 * flow.nx + x1) * 2 + (size_t)ch;
+    f32 top = flow.flow[o00] + (flow.flow[o01] - flow.flow[o00]) * fx;
+    f32 bot = flow.flow[o10] + (flow.flow[o11] - flow.flow[o10]) * fx;
+    ok = true;
+    return top + (bot - top) * fy;
+}
+
+static inline f32 smoothstep01(f32 x) {
+    x = clampf(x, 0.f, 1.f);
+    return x * x * (3.f - 2.f * x);
+}
+
+static f32 median_inplace(std::vector<f32>& vals) {
+    if (vals.empty()) return 0.f;
+    const size_t mid = vals.size() / 2;
+    using Diff = std::vector<f32>::difference_type;
+    std::nth_element(vals.begin(), vals.begin() + (Diff)mid, vals.end());
+    f32 m = vals[mid];
+    if ((vals.size() & 1u) == 0u) {
+        std::nth_element(vals.begin(), vals.begin() + (Diff)(mid - 1), vals.end());
+        m = 0.5f * (m + vals[mid - 1]);
+    }
+    return m;
+}
+
+} // namespace
+
+void apply_forward_backward_confidence(FlowField& forward, const FlowField& backward,
+                                       int tile_size, const Config& cfg) {
+    const size_t n = (size_t)std::max(0, forward.ny) * (size_t)std::max(0, forward.nx);
+    forward.fb_confidence.assign(n, 1.f);
+    if (!cfg.fb_consistency_enabled) return;
+    if (n == 0 || forward.flow.empty() || backward.flow.empty()) return;
+    if (forward.ny != backward.ny || forward.nx != backward.nx) return;
+
+    std::vector<f32> err(n, std::numeric_limits<f32>::quiet_NaN());
+    std::atomic<long long> valid_count{0}, invalid_count{0}, rejected_count{0};
+    const f32 min_err = std::max(0.f, cfg.fb_consistency_min_error);
+    const f32 k = std::max(0.f, cfg.fb_consistency_sigma);
+    const int rad = std::max(1, std::min(8, cfg.fb_consistency_radius));
+
+    parallel_rows(forward.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < forward.nx; ++tx) {
+            const f32 fdx = forward.dx(ty, tx);
+            const f32 fdy = forward.dy(ty, tx);
+            const f32 sx = (f32)tx + fdx / (f32)std::max(1, tile_size);
+            const f32 sy = (f32)ty + fdy / (f32)std::max(1, tile_size);
+            bool okx = false, oky = false;
+            const f32 bdx = sample_flow_bilinear(backward, sy, sx, 0, okx);
+            const f32 bdy = sample_flow_bilinear(backward, sy, sx, 1, oky);
+            if (okx && oky) {
+                const f32 ex = fdx + bdx;
+                const f32 ey = fdy + bdy;
+                err[(size_t)ty * forward.nx + tx] = std::sqrt(ex * ex + ey * ey);
+                valid_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    std::vector<f32> valid_err;
+    valid_err.reserve(n);
+    for (f32 v : err) {
+        if (std::isfinite(v)) valid_err.push_back(v);
+    }
+    if (!valid_err.empty()) {
+        std::sort(valid_err.begin(), valid_err.end());
+        auto pct = [&](f32 q) {
+            const size_t last = valid_err.size() - 1;
+            const f32 pos = clampf(q, 0.f, 1.f) * (f32)last;
+            const size_t lo = (size_t)std::floor(pos);
+            const size_t hi = std::min(last, lo + 1);
+            const f32 t = pos - (f32)lo;
+            return valid_err[lo] + (valid_err[hi] - valid_err[lo]) * t;
+        };
+        prof_add_cpu("fb#p50-error", (double)pct(0.50f));
+        prof_add_cpu("fb#p75-error", (double)pct(0.75f));
+        prof_add_cpu("fb#p90-error", (double)pct(0.90f));
+        prof_add_cpu("fb#p95-error", (double)pct(0.95f));
+        prof_add_cpu("fb#p99-error", (double)pct(0.99f));
+    }
+
+    parallel_rows(forward.ny, cfg.num_threads, [&](int ty) {
+        std::vector<f32> vals;
+        std::vector<f32> devs;
+        vals.reserve((size_t)(2 * rad + 1) * (size_t)(2 * rad + 1));
+        devs.reserve(vals.capacity());
+        for (int tx = 0; tx < forward.nx; ++tx) {
+            const size_t idx = (size_t)ty * forward.nx + tx;
+            const f32 e = err[idx];
+            if (!std::isfinite(e)) {
+                forward.fb(ty, tx) = 1.f;
+                invalid_count.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            vals.clear();
+            for (int yy = ty - rad; yy <= ty + rad; ++yy) {
+                if (yy < 0 || yy >= forward.ny) continue;
+                for (int xx = tx - rad; xx <= tx + rad; ++xx) {
+                    if (xx < 0 || xx >= forward.nx) continue;
+                    const f32 v = err[(size_t)yy * forward.nx + xx];
+                    if (std::isfinite(v)) vals.push_back(v);
+                }
+            }
+            if (vals.size() < 4) {
+                forward.fb(ty, tx) = 1.f;
+                continue;
+            }
+            std::vector<f32> vals_copy = vals;
+            const f32 med = median_inplace(vals_copy);
+            devs.clear();
+            for (f32 v : vals) devs.push_back(std::fabs(v - med));
+            const f32 mad = median_inplace(devs);
+            const f32 sigma = 1.4826f * mad + 1.0e-4f;
+            const f32 start = std::max(min_err, med + k * sigma);
+            const f32 stop = start + std::max(0.25f, sigma);
+            const f32 c = 1.f - smoothstep01((e - start) / (stop - start));
+            forward.fb(ty, tx) = c;
+            if (c < 0.999f)
+                rejected_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    prof_add_cpu("fb#enabled", 1.0);
+    prof_add_cpu("fb#valid-tiles", (double)valid_count.load());
+    prof_add_cpu("fb#invalid-tiles", (double)invalid_count.load());
+    prof_add_cpu("fb#penalized-tiles", (double)rejected_count.load());
+    prof_add_cpu("fb#min-error", (double)min_err);
+    prof_add_cpu("fb#sigma-k", (double)k);
 }
 
 } // namespace hhsr

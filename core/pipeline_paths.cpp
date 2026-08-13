@@ -1191,6 +1191,22 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                init.dy * grey_scale_y,
                                init.angle);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
+        FlowField backward_flow;
+        if (work.fb_consistency_enabled &&
+            flow.ny > 0 && flow.nx > 0 && !flow.flow.empty()) {
+            const double t_fb_align = prof_now_ms();
+            Image comp_grey_padded = pad_image_circular(comp_grey, tile_size);
+            Pyramid comp_pyr = build_pyramid(comp_grey_padded, work.bm_factors);
+            const f32 init_dx = init.dx * grey_scale_x;
+            const f32 init_dy = init.dy * grey_scale_y;
+            const f32 ca = std::cos(init.angle);
+            const f32 sa = std::sin(init.angle);
+            const f32 inv_dx = -ca * init_dx - sa * init_dy;
+            const f32 inv_dy =  sa * init_dx - ca * init_dy;
+            backward_flow = align(comp_pyr, comp_grey, ref_grey, work, tile_size,
+                                  inv_dx, inv_dy, -init.angle);
+            prof_add_cpu("comp:fb-align", prof_now_ms() - t_fb_align);
+        }
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the flow is on a half-res tile grid with half-res
         // displacements, while robustness and merge both index it as
@@ -1199,6 +1215,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // so the FFT path is unaffected.
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                      comp_grey.h, comp_grey.w, tile_size);
+        if (work.fb_consistency_enabled &&
+            backward_flow.ny > 0 && backward_flow.nx > 0 && !backward_flow.flow.empty()) {
+            backward_flow = flow_to_raw_tile_grid(backward_flow, comp.h, comp.w,
+                                                  comp_grey.h, comp_grey.w, tile_size);
+            apply_forward_backward_confidence(flow, backward_flow, tile_size, work);
+        }
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());

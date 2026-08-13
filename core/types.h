@@ -42,11 +42,13 @@ struct FlowField {
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
     std::vector<uint32_t> aperture_limited; // ny*nx, 1 = Hessian says 1D/aperture-limited
+    std::vector<f32> fb_confidence; // ny*nx, 0..1 geometric confidence
 
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
-        aperture_limited((size_t)ny_ * nx_, 0u) {}
+        aperture_limited((size_t)ny_ * nx_, 0u),
+        fb_confidence((size_t)ny_ * nx_, 1.f) {}
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
@@ -54,6 +56,8 @@ struct FlowField {
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
     inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
+    inline f32& fb(int ty, int tx) { return fb_confidence[(size_t)ty * nx + tx]; }
+    inline f32 fb(int ty, int tx) const { return fb_confidence[(size_t)ty * nx + tx]; }
 };
 
 // Per-grey-pixel 2x2 covariance field (steerable kernels): [h, w, 4] = xx,xy,yx,yy.
@@ -70,20 +74,6 @@ struct CovField {
 };
 
 enum class GreyMethod { FFT, Decimate };
-
-// How the alignment field is carried from one pyramid level to the next.
-//
-// Candidate is what 460-main does and what this port has always used: the new
-// tile takes its parent's vector or one of two neighbours', whichever gives the
-// lowest L1 patch distance. The output is always a vector some block match
-// actually evaluated.
-//
-// The other three are torch.nn.functional.interpolate modes, matching
-// flow_upscale_mode in the python-z variant (whose own default is Nearest).
-// Bilinear and Bicubic blend neighbouring tiles, so they can produce
-// displacements no search ever tested -- across a motion boundary that is a
-// vector belonging to neither side.
-enum class FlowUpscale { Candidate, Nearest, Bilinear, Bicubic };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };
 
@@ -141,6 +131,25 @@ struct IspParams {
     // Re-adds the detail layer above unity for local micro-contrast. Distinct
     // from sharpening: no high-pass, no halos, no noise amplification.
     float local_contrast = 0.20f;
+    // Chroma noise reduction, applied to the linear merge before anything else
+    // in the render. 0 disables it.
+    //
+    // Colour noise is structurally the worst channel here and nothing upstream
+    // removes it. The merge accumulates each colour from same-colour Bayer
+    // samples only, so red and blue get half the samples green does. The camera
+    // matrix then amplifies what is left unevenly -- the row norms of
+    // kDefaultCamToSrgb are R 1.34, G 0.82, B 0.89 -- leaving red roughly 1.9x
+    // noisier than green, which is why the blotching reads as red/magenta. And
+    // vibrance is literally a chroma multiplier, so it amplifies it again,
+    // hardest in the flat desaturated areas where it shows most.
+    //
+    // Filtering chroma is close to free perceptually: chroma carries very little
+    // detail, which is why every JPEG subsamples it. Luminance is preserved
+    // exactly here -- only the colour difference from luma is smoothed -- so
+    // this cannot soften the image, only desaturate fine colour detail.
+    float chroma_denoise = 0.75f;
+    // Radius of the chroma filter in FULL-RESOLUTION pixels.
+    float chroma_denoise_radius = 12.f;
     // Hold saturation and hue in the skin band. Without a face detector this is
     // the cheap substitute, and it is what stops strong tone mapping plus
     // vibrance turning skin orange.
@@ -223,7 +232,7 @@ struct Config {
     // resident for the burst, and the FFT grey has 4x the pixels of the
     // decimate grey, so roughly +120MB at 12MP. It saves compute, since those
     // gradients are currently rebuilt per frame.
-    bool align_ica_per_level_fft = true;
+    bool align_ica_per_level_fft = false;
 
     // True when ICA should run on every pyramid level rather than only the
     // finest.
@@ -283,11 +292,6 @@ struct Config {
     // the same Hessian aperture-limited test, instead of repairing the flow.
     bool  flow_reject_1d_enabled = false;
 
-    // Python-z default.yaml uses nearest flow upsampling between pyramid
-    // levels. Candidate remains selectable from the app, but it is the
-    // 460-main variant rather than the python-z default.
-    FlowUpscale flow_upscale = FlowUpscale::Nearest;
-
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
     // With this false the plan stays empty, so every frame enters align() with a
@@ -307,6 +311,16 @@ struct Config {
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
     float r_Mt = 0.8f;
+    // Optional forward/backward geometry gate. It computes the reverse flow
+    // for the same frame pair and suppresses only local outliers:
+    //   ||V_f(p) + V_b(p + V_f(p))|| > local_median + k * local_MAD
+    // and above a minimum raw-pixel error. This catches smooth-looking wrong
+    // repeated-pattern correspondences without treating the whole frame as a
+    // precision test.
+    bool  fb_consistency_enabled = false;
+    float fb_consistency_min_error = 0.75f;
+    float fb_consistency_sigma = 3.0f;
+    int   fb_consistency_radius = 2;
     // Scales the estimated sensor noise variance subtracted before the HF
     // loss ratio. >1 assumes more noise, so less of the local variance counts
     // as signal and fewer areas are flagged as high-frequency detail; <1 is

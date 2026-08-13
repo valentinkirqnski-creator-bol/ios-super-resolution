@@ -87,6 +87,10 @@ struct TuningParams: Equatable, Codable {
     var r_s1: Float = 2.0
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
+    var fb_consistency_enabled: Bool = false
+    var fb_consistency_min_error: Float = 0.75
+    var fb_consistency_sigma: Float = 3.0
+    var fb_consistency_radius: Int = 2
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
     var hf_artifact_removal_enabled: Bool = false
@@ -96,10 +100,6 @@ struct TuningParams: Equatable, Codable {
     /// neighbours. Repairs the aperture problem on long edges, where the
     /// along-edge component is unobservable inside one tile but determined by
     /// the neighbours. Static scenes only.
-    /// How the flow is carried between pyramid levels.
-    /// 0 = candidate selection (460-main),
-    /// 1 = nearest (python-z default), 2 = bilinear, 3 = bicubic.
-    var flow_upscale_mode: Int = 1
     var flow_regularize_enabled: Bool = false
     var flow_regularize_threshold: Float = 1.0
     var flow_regularize_aperture_ratio: Float = 0.15
@@ -135,9 +135,11 @@ struct TuningParams: Equatable, Codable {
     /// implementation does, instead of only on the finest. Half-res 2x2 grey
     /// only -- the full-res FFT path is unaffected either way.
     var align_ica_per_level: Bool = true
-    /// Extend the above to the full-res FFT grey, matching python-z's
-    /// block-match-then-ICA sequence at every pyramid level.
-    var align_ica_per_level_fft: Bool = true
+    /// Extend the above to the full-res FFT grey. Without it that path feeds
+    /// integer-only flow into a finest level whose search radius is 1, so the
+    /// correction budget is already spent when level 0 starts. Costs roughly
+    /// +120MB at 12MP, because the reference gradient cache goes resident.
+    var align_ica_per_level_fft: Bool = false
     /// Finest-level block-match search radius. 0 keeps the built-in 1.
     var align_fine_search_radius: Int = 0
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
@@ -154,6 +156,10 @@ struct TuningParams: Equatable, Codable {
     var isp_colour_strength: Float = 1.0
     var isp_contrast: Float = 0.55
     var isp_vibrance: Float = 0.50
+    /// Chroma noise reduction. Luma is preserved exactly, so this cannot
+    /// soften detail -- only fine colour variation.
+    var isp_chroma_denoise: Float = 0.75
+    var isp_chroma_radius: Float = 12.0
     var isp_saturation: Float = 1.0
     var isp_local_contrast: Float = 0.20
     var isp_skin_protect: Bool = true
@@ -172,10 +178,11 @@ struct TuningParams: Equatable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
+        case fb_consistency_enabled, fb_consistency_min_error
+        case fb_consistency_sigma, fb_consistency_radius
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
-        case flow_upscale_mode
         case flow_regularize_enabled, flow_regularize_threshold, flow_regularize_aperture_ratio
         case flow_reject_1d_enabled
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
@@ -193,6 +200,7 @@ struct TuningParams: Equatable, Codable {
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
+        case isp_chroma_denoise, isp_chroma_radius
         case isp_colour_strength, isp_highlight_knee
         case acc_rob_rad_max, acc_rob_max_multiplier
     }
@@ -205,11 +213,14 @@ struct TuningParams: Equatable, Codable {
         r_s1 = try c.decodeIfPresent(Float.self, forKey: .r_s1) ?? r_s1
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
+        fb_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .fb_consistency_enabled) ?? fb_consistency_enabled
+        fb_consistency_min_error = try c.decodeIfPresent(Float.self, forKey: .fb_consistency_min_error) ?? fb_consistency_min_error
+        fb_consistency_sigma = try c.decodeIfPresent(Float.self, forKey: .fb_consistency_sigma) ?? fb_consistency_sigma
+        fb_consistency_radius = try c.decodeIfPresent(Int.self, forKey: .fb_consistency_radius) ?? fb_consistency_radius
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
-        flow_upscale_mode = try c.decodeIfPresent(Int.self, forKey: .flow_upscale_mode) ?? flow_upscale_mode
         flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
         flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
@@ -245,6 +256,10 @@ struct TuningParams: Equatable, Codable {
         isp_colour_strength = try c.decodeIfPresent(Float.self, forKey: .isp_colour_strength) ?? isp_colour_strength
         isp_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_contrast) ?? isp_contrast
         isp_vibrance = try c.decodeIfPresent(Float.self, forKey: .isp_vibrance) ?? isp_vibrance
+        isp_chroma_denoise = try c.decodeIfPresent(
+            Float.self, forKey: .isp_chroma_denoise) ?? isp_chroma_denoise
+        isp_chroma_radius = try c.decodeIfPresent(
+            Float.self, forKey: .isp_chroma_radius) ?? isp_chroma_radius
         isp_saturation = try c.decodeIfPresent(Float.self, forKey: .isp_saturation) ?? isp_saturation
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
@@ -309,19 +324,11 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 13
+        let defaultsVersion = 12
         let verKey = "TuningParamsDefaultsVersion"
-        let storedVersion = UserDefaults.standard.integer(forKey: verKey)
-        if storedVersion < defaultsVersion {
+        if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
-            var params = TuningParams.appDefaults
-            if storedVersion > 0,
-               let data = UserDefaults.standard.data(forKey: "TuningParams"),
-               let saved = try? JSONDecoder().decode(TuningParams.self, from: data) {
-                params = saved
-                params.flow_upscale_mode = TuningParams.appDefaults.flow_upscale_mode
-                params.align_ica_per_level_fft = TuningParams.appDefaults.align_ica_per_level_fft
-            }
+            let params = TuningParams.appDefaults
             if let data = try? JSONEncoder().encode(params) {
                 UserDefaults.standard.set(data, forKey: "TuningParams")
             }
@@ -1821,11 +1828,14 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s1": NSNumber(value: tuningParams.r_s1),
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
+            "fb_consistency_enabled": NSNumber(value: tuningParams.fb_consistency_enabled),
+            "fb_consistency_min_error": NSNumber(value: tuningParams.fb_consistency_min_error),
+            "fb_consistency_sigma": NSNumber(value: tuningParams.fb_consistency_sigma),
+            "fb_consistency_radius": NSNumber(value: tuningParams.fb_consistency_radius),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
-            "flow_upscale_mode": NSNumber(value: tuningParams.flow_upscale_mode),
             "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
             "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
@@ -1861,6 +1871,8 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_colour_strength": NSNumber(value: tuningParams.isp_colour_strength),
             "isp_contrast": NSNumber(value: tuningParams.isp_contrast),
             "isp_vibrance": NSNumber(value: tuningParams.isp_vibrance),
+            "isp_chroma_denoise": NSNumber(value: tuningParams.isp_chroma_denoise),
+            "isp_chroma_radius": NSNumber(value: tuningParams.isp_chroma_radius),
             "isp_saturation": NSNumber(value: tuningParams.isp_saturation),
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),

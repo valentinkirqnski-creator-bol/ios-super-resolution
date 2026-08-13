@@ -823,6 +823,11 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            if (cfg.fb_consistency_enabled &&
+                pidx < flow.fb_confidence.size()) {
+                const f32 c_fb = clampf(flow.fb_confidence[pidx], 0.f, 1.f);
+                r_val *= c_fb;
+            }
             R.at(y, x) = r_val;
         }
     }

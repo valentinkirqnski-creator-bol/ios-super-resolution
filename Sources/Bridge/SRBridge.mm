@@ -311,6 +311,17 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
     if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
     if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
+    if (tuning[@"fb_consistency_enabled"])
+        cfg.fb_consistency_enabled = tuning[@"fb_consistency_enabled"].boolValue;
+    if (tuning[@"fb_consistency_min_error"])
+        cfg.fb_consistency_min_error =
+            std::max(0.f, tuning[@"fb_consistency_min_error"].floatValue);
+    if (tuning[@"fb_consistency_sigma"])
+        cfg.fb_consistency_sigma =
+            std::max(0.f, tuning[@"fb_consistency_sigma"].floatValue);
+    if (tuning[@"fb_consistency_radius"])
+        cfg.fb_consistency_radius =
+            std::max(1, std::min(8, tuning[@"fb_consistency_radius"].intValue));
     // Alignment grey: FFT low-pass at full resolution, or the 2x2 Bayer quad
     // average at half resolution that Wronski et al. describe. The quad average
     // also constrains displacements to multiples of 2 Bayer pixels, so shifted
@@ -324,14 +335,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
     if (tuning[@"hf_min_texture_snr"])
         cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
-    if (tuning[@"flow_upscale_mode"]) {
-        switch (tuning[@"flow_upscale_mode"].intValue) {
-            case 1:  cfg.flow_upscale = FlowUpscale::Nearest;  break;
-            case 2:  cfg.flow_upscale = FlowUpscale::Bilinear; break;
-            case 3:  cfg.flow_upscale = FlowUpscale::Bicubic;  break;
-            default: cfg.flow_upscale = FlowUpscale::Candidate; break;
-        }
-    }
     if (tuning[@"flow_regularize_enabled"])
         cfg.flow_regularize_enabled = tuning[@"flow_regularize_enabled"].boolValue;
     if (tuning[@"flow_regularize_threshold"])
@@ -399,6 +402,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"isp_colour_strength"]) cfg.isp.colour_strength = tuning[@"isp_colour_strength"].floatValue;
     if (tuning[@"isp_contrast"])       cfg.isp.contrast = tuning[@"isp_contrast"].floatValue;
     if (tuning[@"isp_vibrance"])       cfg.isp.vibrance = tuning[@"isp_vibrance"].floatValue;
+    if (tuning[@"isp_chroma_denoise"]) cfg.isp.chroma_denoise = tuning[@"isp_chroma_denoise"].floatValue;
+    if (tuning[@"isp_chroma_radius"])  cfg.isp.chroma_denoise_radius = tuning[@"isp_chroma_radius"].floatValue;
     if (tuning[@"isp_saturation"])     cfg.isp.saturation = tuning[@"isp_saturation"].floatValue;
     if (tuning[@"isp_local_contrast"]) cfg.isp.local_contrast = tuning[@"isp_local_contrast"].floatValue;
     if (tuning[@"isp_skin_protect"])   cfg.isp.skin_protect = tuning[@"isp_skin_protect"].boolValue;
@@ -814,6 +819,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
+    // Before isp_analyse, so the automatic exposure and the local gain map are
+    // derived from the cleaned image rather than from the noise.
+    if (g_isp.enabled)
+        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
@@ -902,6 +911,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // Analysed at full resolution even though the preview is downscaled, so the
     // thumbnail and the exported JPEG get the same exposure and gain map and
     // cannot disagree about how the shot looks.
+    // Before isp_analyse, so the automatic exposure and the local gain map are
+    // derived from the cleaned image rather than from the noise.
+    if (g_isp.enabled)
+        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
