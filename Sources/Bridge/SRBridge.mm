@@ -324,6 +324,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
     if (tuning[@"hf_min_texture_snr"])
         cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
+    if (tuning[@"flow_upscale_mode"]) {
+        switch (tuning[@"flow_upscale_mode"].intValue) {
+            case 1:  cfg.flow_upscale = FlowUpscale::Nearest;  break;
+            case 2:  cfg.flow_upscale = FlowUpscale::Bilinear; break;
+            case 3:  cfg.flow_upscale = FlowUpscale::Bicubic;  break;
+            default: cfg.flow_upscale = FlowUpscale::Candidate; break;
+        }
+    }
     if (tuning[@"flow_regularize_enabled"])
         cfg.flow_regularize_enabled = tuning[@"flow_regularize_enabled"].boolValue;
     if (tuning[@"flow_regularize_threshold"])

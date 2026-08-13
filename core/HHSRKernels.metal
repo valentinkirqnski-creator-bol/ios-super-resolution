@@ -2394,7 +2394,21 @@ struct AlignUpscaleParams {
     uint up_ny, up_nx;
     int ts;
     int ref_h, ref_w, mov_h, mov_w;
+    // 0 nearest, 1 bilinear, 2 bicubic. Field order and size must stay in
+    // lockstep with AlignUpscaleParamsCPU in metal_gpu.mm, which
+    // static_asserts the size.
+    int up_mode;
 };
+
+// torch.nn.functional.interpolate cubic weights, A = -0.75.
+inline void cubic_weights_torch(float t, thread float* w) {
+    const float A = -0.75f;
+    const float t1 = t + 1.f, t2 = t, t3 = 1.f - t, t4 = 2.f - t;
+    w[0] = ((A * t1 - 5.f * A) * t1 + 8.f * A) * t1 - 4.f * A;
+    w[1] = ((A + 2.f) * t2 - (A + 3.f)) * t2 * t2 + 1.f;
+    w[2] = ((A + 2.f) * t3 - (A + 3.f)) * t3 * t3 + 1.f;
+    w[3] = ((A * t4 - 5.f * A) * t4 + 8.f * A) * t4 - 4.f * A;
+}
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
 kernel void align_upscale_flow(device const float* in_flow [[buffer(0)]],
@@ -2403,17 +2417,63 @@ kernel void align_upscale_flow(device const float* in_flow [[buffer(0)]],
                                uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.target_nx || gid.y >= p.target_ny) return;
     uint o = (gid.y * p.target_nx + gid.x) * 2u;
-    if (gid.y < p.up_ny && gid.x < p.up_nx) {
+    if (gid.y >= p.up_ny || gid.x >= p.up_nx) {
+        out_flow[o + 0u] = 0.f;
+        out_flow[o + 1u] = 0.f;
+        return;
+    }
+    const float sfac = float(p.upsample_factor);
+    const int maxy = int(p.in_ny) - 1, maxx = int(p.in_nx) - 1;
+
+    if (p.up_mode == 0) {                       // nearest
         uint sy = min(p.in_ny - 1u, gid.y / p.repeat_factor);
         uint sx = min(p.in_nx - 1u, gid.x / p.repeat_factor);
         uint s = (sy * p.in_nx + sx) * 2u;
-        float sfac = float(p.upsample_factor);
         out_flow[o + 0u] = in_flow[s + 0u] * sfac;
         out_flow[o + 1u] = in_flow[s + 1u] * sfac;
-    } else {
-        out_flow[o + 0u] = 0.f;
-        out_flow[o + 1u] = 0.f;
+        return;
     }
+
+    // align_corners=False: src = (dst + 0.5) / scale - 0.5
+    const float inv_rep = 1.f / float(p.repeat_factor);
+    const float fy = (float(gid.y) + 0.5f) * inv_rep - 0.5f;
+    const float fx = (float(gid.x) + 0.5f) * inv_rep - 0.5f;
+    const int iy = int(floor(fy)), ix = int(floor(fx));
+    const float ry = fy - float(iy), rx = fx - float(ix);
+
+    float vdx = 0.f, vdy = 0.f;
+    if (p.up_mode == 1) {                       // bilinear
+        const int y0 = clamp(iy, 0, maxy), y1 = clamp(iy + 1, 0, maxy);
+        const int x0 = clamp(ix, 0, maxx), x1 = clamp(ix + 1, 0, maxx);
+        const uint i00 = (uint(y0) * p.in_nx + uint(x0)) * 2u;
+        const uint i01 = (uint(y0) * p.in_nx + uint(x1)) * 2u;
+        const uint i10 = (uint(y1) * p.in_nx + uint(x0)) * 2u;
+        const uint i11 = (uint(y1) * p.in_nx + uint(x1)) * 2u;
+        const float tdx = mix(in_flow[i00 + 0u], in_flow[i01 + 0u], rx);
+        const float bdx = mix(in_flow[i10 + 0u], in_flow[i11 + 0u], rx);
+        const float tdy = mix(in_flow[i00 + 1u], in_flow[i01 + 1u], rx);
+        const float bdy = mix(in_flow[i10 + 1u], in_flow[i11 + 1u], rx);
+        vdx = mix(tdx, bdx, ry);
+        vdy = mix(tdy, bdy, ry);
+    } else {                                    // bicubic
+        float wy[4], wx[4];
+        cubic_weights_torch(ry, wy);
+        cubic_weights_torch(rx, wx);
+        for (int j = 0; j < 4; ++j) {
+            const int sy = clamp(iy - 1 + j, 0, maxy);
+            float rowx = 0.f, rowy = 0.f;
+            for (int i = 0; i < 4; ++i) {
+                const int sx = clamp(ix - 1 + i, 0, maxx);
+                const uint s = (uint(sy) * p.in_nx + uint(sx)) * 2u;
+                rowx += wx[i] * in_flow[s + 0u];
+                rowy += wx[i] * in_flow[s + 1u];
+            }
+            vdx += wy[j] * rowx;
+            vdy += wy[j] * rowy;
+        }
+    }
+    out_flow[o + 0u] = vdx * sfac;
+    out_flow[o + 1u] = vdy * sfac;
 }
 
 // ---------------------------------------------------------------------------

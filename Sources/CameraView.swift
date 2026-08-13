@@ -703,6 +703,28 @@ struct CameraView: View {
     // an operator overload the checker has to resolve, and there were enough of
     // them here to matter.
     @ViewBuilder
+    private var flowUpscaleSection: some View {
+        Picker("Flow Upscaling", selection: $cam.tuningParams.flow_upscale_mode) {
+            Text("Candidate").tag(0)
+            Text("Nearest").tag(1)
+            Text("Bilinear").tag(2)
+            Text("Bicubic").tag(3)
+        }
+        .pickerStyle(.segmented)
+        Text("""
+             How a tile's motion is carried to the next pyramid level. Candidate is the \
+             reference behaviour: the new tile takes its parent's vector or one of two \
+             neighbours', whichever matches best, so it is always a vector some search \
+             actually tested. Nearest, Bilinear and Bicubic are the interpolate modes from \
+             the Python variant; the blending ones can invent a displacement no search \
+             evaluated, which across a motion boundary belongs to neither side. Measured on \
+             a handheld burst these change the flow field a great deal and the output almost \
+             not at all.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+    }
+
+    @ViewBuilder
     private var flowRegularizeSection: some View {
         Toggle("Hessian Aperture Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
         Text("""
@@ -1112,6 +1134,8 @@ struct CameraView: View {
                             .font(.caption2).foregroundColor(.secondary)
 
                         fineAlignmentSection
+
+                        flowUpscaleSection
 
                         flowRegularizeSection
 

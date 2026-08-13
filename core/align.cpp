@@ -619,9 +619,21 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
 }
 
 // upscale_lvl — nearest (default.yaml flow_upscale_mode)
+// torch.nn.functional.interpolate cubic weights, A = -0.75 (PyTorch's value).
+// Two polynomials: |t| <= 1 for the inner pair, 1 < |t| < 2 for the outer.
+static inline void cubic_weights_torch(f32 t, f32 w[4]) {
+    constexpr f32 A = -0.75f;
+    const f32 t1 = t + 1.f, t2 = t, t3 = 1.f - t, t4 = 2.f - t;
+    w[0] = ((A * t1 - 5.f * A) * t1 + 8.f * A) * t1 - 4.f * A;
+    w[1] = ((A + 2.f) * t2 - (A + 3.f)) * t2 * t2 + 1.f;
+    w[2] = ((A + 2.f) * t3 - (A + 3.f)) * t3 * t3 + 1.f;
+    w[3] = ((A * t4 - 5.f * A) * t4 + 8.f * A) * t4 - 4.f * A;
+}
+
 static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
                                int upsample_factor, int new_tile_size,
-                               int prev_tile_size) {
+                               int prev_tile_size,
+                               FlowUpscale mode = FlowUpscale::Nearest) {
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
     if (repeat_factor < 1) repeat_factor = 1;
@@ -629,14 +641,60 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
     int up_ny = in.ny * repeat_factor;
     int up_nx = in.nx * repeat_factor;
     FlowField upsampled(up_ny, up_nx);
+    // align_corners=False, the default F.interpolate uses with scale_factor:
+    // src = (dst + 0.5) / scale - 0.5.
+    const f32 inv_rep = 1.f / (f32)repeat_factor;
+    auto clampi = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
     for (int ty = 0; ty < up_ny; ++ty) {
         for (int tx = 0; tx < up_nx; ++tx) {
-            int sy = std::min(in.ny - 1, ty / repeat_factor);
-            int sx = std::min(in.nx - 1, tx / repeat_factor);
-            upsampled.dx(ty, tx) = in.dx(sy, sx) * (f32)upsample_factor;
-            upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
-            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
-                upsampled.aperture(ty, tx) = in.aperture(sy, sx);
+            f32 vdx, vdy;
+            if (mode == FlowUpscale::Nearest) {
+                const int sy = std::min(in.ny - 1, ty / repeat_factor);
+                const int sx = std::min(in.nx - 1, tx / repeat_factor);
+                vdx = in.dx(sy, sx);
+                vdy = in.dy(sy, sx);
+            } else {
+                const f32 fy = ((f32)ty + 0.5f) * inv_rep - 0.5f;
+                const f32 fx = ((f32)tx + 0.5f) * inv_rep - 0.5f;
+                const int iy = (int)std::floor(fy), ix = (int)std::floor(fx);
+                const f32 ry = fy - (f32)iy, rx = fx - (f32)ix;
+                if (mode == FlowUpscale::Bilinear) {
+                    const int y0 = clampi(iy, in.ny - 1), y1 = clampi(iy + 1, in.ny - 1);
+                    const int x0 = clampi(ix, in.nx - 1), x1 = clampi(ix + 1, in.nx - 1);
+                    const f32 tdx = in.dx(y0, x0) + (in.dx(y0, x1) - in.dx(y0, x0)) * rx;
+                    const f32 bdx = in.dx(y1, x0) + (in.dx(y1, x1) - in.dx(y1, x0)) * rx;
+                    const f32 tdy = in.dy(y0, x0) + (in.dy(y0, x1) - in.dy(y0, x0)) * rx;
+                    const f32 bdy = in.dy(y1, x0) + (in.dy(y1, x1) - in.dy(y1, x0)) * rx;
+                    vdx = tdx + (bdx - tdx) * ry;
+                    vdy = tdy + (bdy - tdy) * ry;
+                } else {   // Bicubic
+                    f32 wy[4], wx[4];
+                    cubic_weights_torch(ry, wy);
+                    cubic_weights_torch(rx, wx);
+                    vdx = 0.f;
+                    vdy = 0.f;
+                    for (int j = 0; j < 4; ++j) {
+                        const int sy = clampi(iy - 1 + j, in.ny - 1);
+                        f32 rowx = 0.f, rowy = 0.f;
+                        for (int i = 0; i < 4; ++i) {
+                            const int sx = clampi(ix - 1 + i, in.nx - 1);
+                            rowx += wx[i] * in.dx(sy, sx);
+                            rowy += wx[i] * in.dy(sy, sx);
+                        }
+                        vdx += wy[j] * rowx;
+                        vdy += wy[j] * rowy;
+                    }
+                }
+            }
+            upsampled.dx(ty, tx) = vdx * (f32)upsample_factor;
+            upsampled.dy(ty, tx) = vdy * (f32)upsample_factor;
+            // The aperture flag is a per-tile property of the reference, not an
+            // interpolatable quantity, so it is always taken nearest.
+            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx) {
+                const int ay = std::min(in.ny - 1, ty / repeat_factor);
+                const int ax = std::min(in.nx - 1, tx / repeat_factor);
+                upsampled.aperture(ty, tx) = in.aperture(ay, ax);
+            }
         }
     }
 
@@ -1054,7 +1112,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1]
                           : ts;
-            flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
+            flow = (cfg.flow_upscale == FlowUpscale::Candidate)
+                       ? upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts)
+                       : upscale_flow(flow, ny, nx, upsample_factor, ts, prev_ts,
+                                      cfg.flow_upscale);
         }
 
         std::string metric = "L2";

@@ -70,6 +70,20 @@ struct CovField {
 };
 
 enum class GreyMethod { FFT, Decimate };
+
+// How the alignment field is carried from one pyramid level to the next.
+//
+// Candidate is what 460-main does and what this port has always used: the new
+// tile takes its parent's vector or one of two neighbours', whichever gives the
+// lowest L1 patch distance. The output is always a vector some block match
+// actually evaluated.
+//
+// The other three are torch.nn.functional.interpolate modes, matching
+// flow_upscale_mode in the python-z variant (whose own default is Nearest).
+// Bilinear and Bicubic blend neighbouring tiles, so they can produce
+// displacements no search ever tested -- across a motion boundary that is a
+// vector belonging to neither side.
+enum class FlowUpscale { Candidate, Nearest, Bilinear, Bicubic };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };
 
@@ -268,6 +282,14 @@ struct Config {
     // Test switch: force merge robustness to zero for every tile that passes
     // the same Hessian aperture-limited test, instead of repairing the flow.
     bool  flow_reject_1d_enabled = false;
+
+    // Candidate keeps the shipped behaviour exactly; the interpolating modes
+    // are opt-in. Measured on an 8-frame handheld burst, switching mode changes
+    // the FINAL flow field a great deal (RMS 12-18 px against Candidate, only
+    // 16% of tiles identical under Bilinear) because a coarse-level choice is
+    // amplified by every later upsample, yet the merged image was unchanged to
+    // two decimals in edge width. Treat it as an experiment, not a fix.
+    FlowUpscale flow_upscale = FlowUpscale::Candidate;
 
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.

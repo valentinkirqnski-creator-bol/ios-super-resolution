@@ -2013,8 +2013,10 @@ struct AlignUpscaleParamsCPU {
     uint32_t upsample_factor, repeat_factor, up_ny, up_nx;
     int32_t ts;
     int32_t ref_h, ref_w, mov_h, mov_w;
+    // Keep in lockstep with AlignUpscaleParams in HHSRKernels.metal.
+    int32_t up_mode = 0;
 };
-static_assert(sizeof(AlignUpscaleParamsCPU) == 52, "AlignUpscaleParamsCPU");
+static_assert(sizeof(AlignUpscaleParamsCPU) == 56, "AlignUpscaleParamsCPU");
 
 // One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
 // retain all levels at once (full-res sticky cache jetsams on 1×).
@@ -2128,7 +2130,8 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
                                   int target_ny, int target_nx,
                                   int upsample_factor, int new_tile_size,
                                   int prev_tile_size,
-                                  int ref_h, int ref_w, int mov_h, int mov_w) {
+                                  int ref_h, int ref_w, int mov_h, int mov_w,
+                                  FlowUpscale up_mode) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -2153,18 +2156,31 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     p.ref_w = (int32_t)ref_w;
     p.mov_h = (int32_t)mov_h;
     p.mov_w = (int32_t)mov_w;
+    p.up_mode = (up_mode == FlowUpscale::Bilinear) ? 1
+              : (up_mode == FlowUpscale::Bicubic)  ? 2 : 0;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
-    id<MTLComputePipelineState> pipe = c.pipe("align_upscale_flow_460");
+    // Candidate selection needs the two images to score patches against; the
+    // interpolating modes read only the incoming field, so they take the
+    // simpler kernel and leave buffers 1 and 2 unbound.
+    const bool candidate = (up_mode == FlowUpscale::Candidate);
+    id<MTLComputePipelineState> pipe =
+        c.pipe(candidate ? "align_upscale_flow_460" : "align_upscale_flow");
     if (!pipe) return false;
-    [enc setBuffer:b_in offset:0 atIndex:0];
-    [enc setBuffer:b_ref offset:0 atIndex:1];
-    [enc setBuffer:b_mov offset:0 atIndex:2];
-    [enc setBuffer:b_out offset:0 atIndex:3];
-    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    if (candidate) {
+        [enc setBuffer:b_in offset:0 atIndex:0];
+        [enc setBuffer:b_ref offset:0 atIndex:1];
+        [enc setBuffer:b_mov offset:0 atIndex:2];
+        [enc setBuffer:b_out offset:0 atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+    } else {
+        [enc setBuffer:b_in offset:0 atIndex:0];
+        [enc setBuffer:b_out offset:0 atIndex:1];
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+    }
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:upscale-flow");
@@ -2270,7 +2286,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             id<MTLBuffer> b_up = nil;
             if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
                                        b_up, ny, nx, upsample_factor, ts, prev_ts,
-                                       r.h, r.w, m.h, m.w) || !b_up)
+                                       r.h, r.w, m.h, m.w, cfg.flow_upscale) || !b_up)
                 return false;
             b_flow = b_up;
             flow_ny = ny;
