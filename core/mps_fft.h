@@ -64,4 +64,14 @@ void mps_fft_prewarm(int h, int w);
 // off the shutter path.
 void mps_fft_release_all();
 
+// Drop only the staging buffers, keeping the compiled graph.
+//
+// The buffers are the memory -- two Shared allocations of h*w floats, ~96MB
+// at 12MP and ~384MB at 48MP -- and they are what has to go before the merge
+// peak. The compiled graph is small by comparison but costs ~1100ms at 12MP
+// to rebuild, and releasing it meant the next burst paid that compile on its
+// reference frame whenever the background prewarm had not finished. Same
+// memory recovered, without the recompile.
+void mps_fft_release_buffers();
+
 }  // namespace hhsr

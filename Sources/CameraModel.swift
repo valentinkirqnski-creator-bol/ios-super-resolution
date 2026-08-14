@@ -160,7 +160,7 @@ struct TuningParams: Equatable, Codable {
     var isp_vibrance: Float = 0.50
     /// Chroma noise reduction. Luma is preserved exactly, so this cannot
     /// soften detail -- only fine colour variation.
-    var isp_chroma_denoise: Float = 0.75
+    var isp_chroma_denoise: Float = 0.0
     var isp_chroma_radius: Float = 12.0
     var isp_saturation: Float = 1.0
     var isp_local_contrast: Float = 0.20

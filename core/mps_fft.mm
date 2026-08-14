@@ -246,6 +246,15 @@ void mps_fft_prewarm(int h, int w) {
     }
 }
 
+void mps_fft_release_buffers() {
+    if (@available(iOS 16.0, macOS 13.0, *)) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_in_buf = nil;
+        g_out_buf = nil;
+        g_buf_elems = 0;
+    }
+}
+
 void mps_fft_release_all() {
     if (@available(iOS 16.0, macOS 13.0, *)) {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -303,6 +312,7 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w,
 
 void mps_fft_prewarm(int, int) {}
 void mps_fft_release_all() {}
+void mps_fft_release_buffers() {}
 bool mps_grey_lowpass(const float*, float*, int, int, void*) { return false; }
 
 #endif

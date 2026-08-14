@@ -1516,7 +1516,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // the compiled plan as well as the staging buffers -- is dead weight through
     // the merge, which is where peak footprint occurs. Rebuilt after the burst
     // below, off the shutter path.
-    mps_fft_release_all();
+    // Buffers only. Releasing the compiled graph as well meant the next burst
+    // recompiled it (~1100ms at 12MP) on its reference frame whenever the
+    // detached prewarm had not finished -- which is the intermittent slow FFT.
+    // The buffers are the memory that has to go before the merge peak.
+    mps_fft_release_buffers();
     clear_align_ref_ica_cache();
     ref_grey = Image();
     ref_pyr = Pyramid();
