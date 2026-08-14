@@ -1483,6 +1483,7 @@ struct RobMaskParams {
     uint motion_edge_neighborhood_radius;
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
+    float flow_reject_1d_residual_threshold;
     uint aperture_reject_enabled;
     uint _pad0;
 };
@@ -1719,6 +1720,82 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     }
 }
 
+kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
+                                   device const float* comp_means [[buffer(1)]],
+                                   device const float* ref_means [[buffer(2)]],
+                                   device const float* ref_vars [[buffer(3)]],
+                                   device const float* std_curve [[buffer(4)]],
+                                   device const float* diff_curve [[buffer(5)]],
+                                   device const float* flow [[buffer(6)]],
+                                   constant RobMaskParams& p [[buffer(7)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.flow_nx || gid.y >= p.flow_ny) return;
+    uint pidx = gid.y * p.flow_nx + gid.x;
+    tile_high[pidx] = 0u;
+
+    int y0, y1, x0, x1;
+    float flow_x, flow_y;
+    uint fi = pidx * 2u;
+    if (p.nch == 1u) {
+        y0 = int(gid.y) * int(p.tile_size);
+        y1 = min(y0 + int(p.tile_size), int(p.h));
+        x0 = int(gid.x) * int(p.tile_size);
+        x1 = min(x0 + int(p.tile_size), int(p.w));
+        flow_x = flow[fi + 0u];
+        flow_y = flow[fi + 1u];
+    } else {
+        y0 = (int(gid.y) * int(p.tile_size) + 1) / 2;
+        y1 = min(((int(gid.y) + 1) * int(p.tile_size) + 1) / 2, int(p.h));
+        x0 = (int(gid.x) * int(p.tile_size) + 1) / 2;
+        x1 = min(((int(gid.x) + 1) * int(p.tile_size) + 1) / 2, int(p.w));
+        flow_x = 0.5f * flow[fi + 0u];
+        flow_y = 0.5f * flow[fi + 1u];
+    }
+
+    uint count = 0u;
+    uint high_count = 0u;
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            float sample_x = float(x) + flow_x;
+            float sample_y = float(y) + flow_y;
+            float d_sq_ = 0.f;
+            float sigma_sq_ = 0.f;
+            for (uint ch = 0u; ch < p.nch; ++ch) {
+                uint o = (uint(y) * p.w + uint(x)) * p.nch + ch;
+                float brightness = ref_means[o];
+                int id_noise = lround_away(1000.f * brightness);
+                if (!isfinite(brightness))
+                    id_noise = 0;
+                else if (id_noise < 0)
+                    id_noise = 0;
+                else if (id_noise >= int(p.curve_n))
+                    id_noise = int(p.curve_n) - 1;
+                uint id = uint(id_noise);
+                float sigma_t = std_curve[id];
+                float d_t = diff_curve[id];
+                float sigma_p_sq = ref_vars[o];
+                sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+                float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
+                                                        sample_y, sample_x, ch);
+                float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
+                float d_p_sq = d_p_ * d_p_;
+                float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
+            }
+            float ratio = (sigma_sq_ > 0.f && isfinite(sigma_sq_))
+                ? d_sq_ / sigma_sq_
+                : (d_sq_ > 0.f ? INFINITY : 0.f);
+            if (!isfinite(ratio)) continue;
+            ++count;
+            if (ratio > p.flow_reject_1d_residual_threshold) ++high_count;
+        }
+    }
+
+    if (count == 0u) return;
+    uint need = max(2u, uint(ceil(float(count) * 0.10f)));
+    tile_high[pidx] = high_count >= need ? 1u : 0u;
+}
+
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(3)]],
@@ -1731,7 +1808,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* ref_hf_loss [[buffer(5)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           device const uint* aperture_limited [[buffer(12)]],
-                          device const uint* match_ambiguous [[buffer(13)]],
+                          device const uint* tile_residual_high [[buffer(13)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1844,7 +1921,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     bool aperture_reject =
         p.aperture_reject_enabled != 0u &&
         aperture_limited[pidx] != 0u &&
-        match_ambiguous[pidx] != 0u;
+        tile_residual_high[pidx] != 0u;
     bool hard_reject = hf_reject || edge_reject || aperture_reject;
     float r_val = hard_reject
         ? 0.f

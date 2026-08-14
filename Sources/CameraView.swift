@@ -776,19 +776,19 @@ struct CameraView: View {
                     }
 
                     Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
-                    Text("Rejects one-dimensional tiles only when their block match is ambiguous.")
+                    Text("Rejects one-dimensional tiles only when their aligned residual is high.")
                         .font(.caption2).foregroundColor(.secondary)
 
                     if cam.tuningParams.flow_reject_1d_enabled {
                         HStack {
-                            Text("Ambiguity Ratio")
+                            Text("1D Residual")
                             Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.flow_reject_1d_ambiguity_ratio))
+                            Text(String(format: "%.2f", cam.tuningParams.flow_reject_1d_residual_threshold))
                                 .monospacedDigit()
                         }
-                        Slider(value: $cam.tuningParams.flow_reject_1d_ambiguity_ratio,
-                               in: 1.01...1.30,
-                               step: 0.01)
+                        Slider(value: $cam.tuningParams.flow_reject_1d_residual_threshold,
+                               in: 0.0...8.0,
+                               step: 0.05)
                     }
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)

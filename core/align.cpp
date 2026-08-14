@@ -452,7 +452,7 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, const Config& cfg,
                                   int num_threads) {
-    const bool write_ambiguity = cfg.flow_reject_1d_enabled;
+    const bool write_ambiguity = false;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
@@ -473,7 +473,7 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, const Config& cfg,
                                   int num_threads) {
-    const bool write_ambiguity = cfg.flow_reject_1d_enabled;
+    const bool write_ambiguity = false;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&

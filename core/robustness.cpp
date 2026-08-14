@@ -685,6 +685,51 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     }
 }
 
+static std::vector<uint32_t> compute_tile_residual_high(const Image& d_sq,
+                                                        const Image& sigma_sq,
+                                                        const FlowField& flow,
+                                                        int tile_size,
+                                                        int guide_channels,
+                                                        f32 residual_threshold) {
+    const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
+    std::vector<uint32_t> out(n_tiles, 0u);
+    if (n_tiles == 0 || tile_size <= 0 || !std::isfinite(residual_threshold))
+        return out;
+
+    std::vector<uint32_t> count(n_tiles, 0u);
+    std::vector<uint32_t> high_count(n_tiles, 0u);
+    for (int y = 0; y < d_sq.h; ++y) {
+        for (int x = 0; x < d_sq.w; ++x) {
+            int ty, tx;
+            if (guide_channels == 3) {
+                ty = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
+                tx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
+            } else {
+                ty = y / tile_size;
+                tx = x / tile_size;
+            }
+            if (ty < 0 || ty >= flow.ny || tx < 0 || tx >= flow.nx) continue;
+            const size_t pidx = (size_t)ty * flow.nx + tx;
+            const f32 sig = sigma_sq.at(y, x);
+            const f32 dsq = d_sq.at(y, x);
+            const f32 ratio = (sig > 0.f && std::isfinite(sig))
+                ? dsq / sig
+                : (dsq > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
+            if (!std::isfinite(ratio)) continue;
+            ++count[pidx];
+            if (ratio > residual_threshold) ++high_count[pidx];
+        }
+    }
+
+    for (size_t i = 0; i < n_tiles; ++i) {
+        if (count[i] == 0) continue;
+        const uint32_t need = std::max<uint32_t>(
+            2u, (uint32_t)std::ceil((double)count[i] * 0.10));
+        out[i] = high_count[i] >= need ? 1u : 0u;
+    }
+    return out;
+}
+
 static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                   std::vector<uint32_t>* irregular_out = nullptr) {
     const f32 inf = std::numeric_limits<f32>::infinity();
@@ -825,6 +870,12 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     Image d_sq, sigma_sq;
     apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc, d_sq, sigma_sq);
+    std::vector<uint32_t> tile_residual_high;
+    if (cfg.flow_reject_1d_enabled) {
+        tile_residual_high = compute_tile_residual_high(
+            d_sq, sigma_sq, flow, tile_size, ref_stats.means.c,
+            cfg.flow_reject_1d_residual_threshold);
+    }
 
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
@@ -880,9 +931,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool aperture_reject =
                 cfg.flow_reject_1d_enabled &&
                 pidx < flow.aperture_limited.size() &&
-                pidx < flow.match_ambiguous.size() &&
+                pidx < tile_residual_high.size() &&
                 flow.aperture_limited[pidx] != 0u &&
-                flow.match_ambiguous[pidx] != 0u;
+                tile_residual_high[pidx] != 0u;
             const bool hard_reject = hf_reject || edge_reject || aperture_reject;
             f32 r_val = hard_reject
                 ? 0.f

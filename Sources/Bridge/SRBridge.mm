@@ -332,6 +332,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"flow_reject_1d_ambiguity_ratio"])
         cfg.flow_reject_1d_ambiguity_ratio =
             std::max(1.f, tuning[@"flow_reject_1d_ambiguity_ratio"].floatValue);
+    if (tuning[@"flow_reject_1d_residual_threshold"])
+        cfg.flow_reject_1d_residual_threshold =
+            std::max(0.f, tuning[@"flow_reject_1d_residual_threshold"].floatValue);
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])

@@ -162,7 +162,7 @@ static MetalCtx& ctx() {
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
-            "rob_make_mask", "rob_local_min_5x5",
+            "rob_tile_residual_high", "rob_make_mask", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
@@ -1126,10 +1126,11 @@ struct RobMaskParamsCPU {
     uint32_t motion_edge_neighborhood_radius = 0;
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
+    float flow_reject_1d_residual_threshold = 0.f;
     uint32_t aperture_reject_enabled = 0;
     uint32_t _pad0 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 84, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1492,13 +1493,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     const bool aperture_reject_on =
         cfg.flow_reject_1d_enabled &&
-        flow.aperture_limited.size() == n_tiles &&
-        flow.match_ambiguous.size() == n_tiles;
+        flow.aperture_limited.size() == n_tiles;
     id<MTLBuffer> b_aperture = aperture_reject_on
         ? buf(flow.aperture_limited.data(), flow.aperture_limited.size() * sizeof(uint32_t))
         : b_motion;
-    id<MTLBuffer> b_ambiguous = aperture_reject_on
-        ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
+    id<MTLBuffer> b_tile_residual_high = aperture_reject_on
+        ? buf(nullptr, n_tiles * sizeof(uint32_t))
         : b_motion;
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
@@ -1511,7 +1511,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_motion || !b_aperture || !b_ambiguous || !b_flow ||
+        !b_S || !b_motion || !b_aperture || !b_tile_residual_high || !b_flow ||
         !b_R || !b_out)
         return Image();
 
@@ -1535,10 +1535,26 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
+    mp.flow_reject_1d_residual_threshold = cfg.flow_reject_1d_residual_threshold;
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
+    if (aperture_reject_on) {
+        [enc setBuffer:b_tile_residual_high offset:0 atIndex:0];
+        [enc setBuffer:b_gmeans offset:0 atIndex:1];
+        [enc setBuffer:b_ref_m offset:0 atIndex:2];
+        [enc setBuffer:b_ref_v offset:0 atIndex:3];
+        [enc setBuffer:b_std offset:0 atIndex:4];
+        [enc setBuffer:b_diff offset:0 atIndex:5];
+        [enc setBuffer:b_flow offset:0 atIndex:6];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+        dispatch2(enc, c.pipe("rob_tile_residual_high"), mp.flow_nx, mp.flow_ny);
+        [enc endEncoding];
+
+        enc = [cmd computeCommandEncoder];
+        if (!enc) return Image();
+    }
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_gmeans offset:0 atIndex:1];
     [enc setBuffer:b_ref_m offset:0 atIndex:3];
@@ -1551,7 +1567,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_flow offset:0 atIndex:10];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     [enc setBuffer:b_aperture offset:0 atIndex:12];
-    [enc setBuffer:b_ambiguous offset:0 atIndex:13];
+    [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -2328,16 +2344,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             flow_nx = nx;
         }
 
-        if (cfg.flow_reject_1d_enabled) {
-            b_ambiguity = buf(nullptr, (size_t)ny * (size_t)nx * sizeof(uint32_t));
-            if (!b_ambiguity) return false;
-            ambiguity_ny = ny;
-            ambiguity_nx = nx;
-        } else {
-            b_ambiguity = nil;
-            ambiguity_ny = 0;
-            ambiguity_nx = 0;
-        }
+        b_ambiguity = nil;
+        ambiguity_ny = 0;
+        ambiguity_nx = 0;
 
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
@@ -2347,13 +2356,13 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, true,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
-                                          cfg.flow_reject_1d_enabled);
+                                          false);
         else
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, false,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
-                                          cfg.flow_reject_1d_enabled);
+                                          false);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --

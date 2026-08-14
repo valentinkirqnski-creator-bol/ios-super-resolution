@@ -328,17 +328,20 @@ struct Config {
     float r_s2 = 12.0f;
     float r_Mt = 0.8f;
     // Test switch from the aperture experiments: force merge robustness to zero
-    // only when a tile is one-dimensional and its block-match winner is
-    // ambiguous. This does not repair flow; it rejects unsafe 1D tiles.
+    // only when a tile is one-dimensional and its aligned guide residual is
+    // high. This does not repair flow; it rejects unsafe 1D tiles.
     bool  flow_reject_1d_enabled = false;
     // A tile is considered one-dimensional when lambda2/lambda1 is below this
     // ratio. Higher catches more edge-like tiles; lower limits rejection to
     // very purely one-dimensional tiles.
     float flow_regularize_aperture_ratio = 0.15f;
-    // A 1D tile is rejected only when the second-best block match is closer
-    // than this multiple of the best match. 1.10 means the runner-up is less
-    // than 10% worse, so the match is not trusted.
+    // Legacy setting kept for old saved app preferences. The current 1D reject
+    // gate uses flow_reject_1d_residual_threshold instead.
     float flow_reject_1d_ambiguity_ratio = 1.10f;
+    // A 1D tile is rejected only when enough pixels in that tile have
+    // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
+    // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.
+    float flow_reject_1d_residual_threshold = 2.5f;
     // Scales the estimated sensor noise variance subtracted before the HF
     // loss ratio. >1 assumes more noise, so less of the local variance counts
     // as signal and fewer areas are flagged as high-frequency detail; <1 is
