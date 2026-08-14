@@ -151,6 +151,68 @@ static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
     return (l1 > 0.f) && (l2 < aperture_ratio * l1);
 }
 
+struct MotionPrior {
+    f32 dx0 = 0.f;
+    f32 dy0 = 0.f;
+    f32 rot = 0.f;
+};
+
+static f32 median_flow_component(const std::vector<f32>& flow, int ch) {
+    const size_t n = flow.size() / 2u;
+    if (n == 0u) return 0.f;
+    std::vector<f32> vals;
+    vals.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const f32 v = flow[i * 2u + (size_t)ch];
+        if (std::isfinite(v)) vals.push_back(v);
+    }
+    if (vals.empty()) return 0.f;
+    const size_t mid = vals.size() / 2u;
+    std::nth_element(vals.begin(),
+                     vals.begin() +
+                         static_cast<std::vector<f32>::difference_type>(mid),
+                     vals.end());
+    return vals[mid];
+}
+
+static MotionPrior make_motion_prior(const std::vector<f32>& flow,
+                                     const Config& cfg,
+                                     f32 initial_dx, f32 initial_dy,
+                                     f32 initial_rotation_rad) {
+    // When global pre-alignment is disabled, initial_dx/dy are usually zero.
+    // Comparing 1D tiles against zero then marks normal handheld translation as
+    // aperture drift. Fall back to the robust frame translation already present
+    // in the final flow field; this keeps static straight edges from being
+    // rejected just because the camera moved.
+    if (cfg.global_prealignment_enabled &&
+        std::isfinite(initial_dx) && std::isfinite(initial_dy)) {
+        MotionPrior p;
+        p.dx0 = initial_dx;
+        p.dy0 = initial_dy;
+        p.rot = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
+        return p;
+    }
+    MotionPrior p;
+    p.dx0 = median_flow_component(flow, 0);
+    p.dy0 = median_flow_component(flow, 1);
+    p.rot = 0.f;
+    return p;
+}
+
+static inline void motion_prior_at_tile(const MotionPrior& p,
+                                        int tx, int ty, int tile_size,
+                                        int finest_w, int finest_h,
+                                        f32& dx, f32& dy) {
+    const f32 ca = std::cos(p.rot), sa = std::sin(p.rot);
+    const f32 cx = 0.5f * (f32)std::max(0, finest_w - 1);
+    const f32 cy = 0.5f * (f32)std::max(0, finest_h - 1);
+    const f32 px = ((f32)tx + 0.5f) * (f32)tile_size;
+    const f32 py = ((f32)ty + 0.5f) * (f32)tile_size;
+    const f32 rx = px - cx, ry = py - cy;
+    dx = p.dx0 + (ca * rx - sa * ry - rx);
+    dy = p.dy0 + (sa * rx + ca * ry - ry);
+}
+
 } // namespace
 
 // ============================================================================
@@ -932,12 +994,9 @@ static void mark_aperture_weak_error(FlowField& flow, const HessianField* hess,
     if (!hess || hess->ny != flow.ny || hess->nx != flow.nx) return;
 
     const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    const f32 dx0 = std::isfinite(initial_dx) ? initial_dx : 0.f;
-    const f32 dy0 = std::isfinite(initial_dy) ? initial_dy : 0.f;
-    const f32 a = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
-    const f32 ca = std::cos(a), sa = std::sin(a);
-    const f32 cx = 0.5f * (f32)std::max(0, finest_w - 1);
-    const f32 cy = 0.5f * (f32)std::max(0, finest_h - 1);
+    const MotionPrior prior =
+        make_motion_prior(flow.flow, cfg, initial_dx, initial_dy,
+                          initial_rotation_rad);
 
     parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
@@ -953,14 +1012,12 @@ static void mark_aperture_weak_error(FlowField& flow, const HessianField* hess,
             const f32 l2 = tr * 0.5f - disc;
             if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;
 
-            // Global prediction for this tile: translation plus the rotation's
-            // own contribution at this position. Same construction as
-            // make_global_initial_flow, evaluated at the finest level.
-            const f32 px = ((f32)tx + 0.5f) * (f32)tile_size;
-            const f32 py = ((f32)ty + 0.5f) * (f32)tile_size;
-            const f32 rx = px - cx, ry = py - cy;
-            const f32 gx = dx0 + (ca * rx - sa * ry - rx);
-            const f32 gy = dy0 + (sa * rx + ca * ry - ry);
+            // Neutral camera-motion prediction for this tile. With global
+            // prealignment this is translation plus rotation; otherwise it is a
+            // robust translation from the final tile field.
+            f32 gx = 0.f, gy = 0.f;
+            motion_prior_at_tile(prior, tx, ty, tile_size,
+                                 finest_w, finest_h, gx, gy);
 
             // Weak eigenvector via the Jacobi angle, not the closed form: on a
             // horizontal edge l1 equals h11 to within rounding, so (l1 - h11) is
@@ -1038,20 +1095,17 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
     auto sdx = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 0u]; };
     auto sdy = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 1u]; };
 
-    // Global pre-alignment, in the same grey pixels as everything else here.
+    // Camera-motion prior, in the same grey pixels as everything else here.
     // The neighbour median cannot see a failure that is coherent across the
     // neighbourhood, and a long straight edge produces exactly that: every tile
     // along it is aperture-limited in the same direction and free to drift the
     // same way, so the median agrees with the centre and nothing is repaired
-    // while the whole edge sits displaced. The global fit is the only estimate
-    // in the pipeline that cannot drift with them, because it is measured from
-    // the entire frame at once.
-    const f32 gdx0 = std::isfinite(initial_dx) ? initial_dx : 0.f;
-    const f32 gdy0 = std::isfinite(initial_dy) ? initial_dy : 0.f;
-    const f32 grot = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
-    const f32 gca = std::cos(grot), gsa = std::sin(grot);
-    const f32 gcx = 0.5f * (f32)std::max(0, finest_w - 1);
-    const f32 gcy = 0.5f * (f32)std::max(0, finest_h - 1);
+    // while the whole edge sits displaced. Prefer the global pre-alignment when
+    // present; otherwise use the robust median flow of the frame rather than
+    // zero, so ordinary handheld translation does not look like drift.
+    const MotionPrior prior =
+        make_motion_prior(src, cfg, initial_dx, initial_dy,
+                          initial_rotation_rad);
     const f32 global_weight = clampf(cfg.flow_regularize_global_weight, 0.f, 1.f);
 
     parallel_rows(ny, cfg.num_threads, [&](int ty) {
@@ -1123,13 +1177,10 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
             const f32 f_v = dx * vx + dy * vy;        // measured, unreliable
             const f32 m_v = mx * vx + my * vy;        // neighbours' value
 
-            // Global prediction for this tile: translation plus the rotation's
-            // contribution at this position, projected onto the weak axis.
-            const f32 gpx = ((f32)tx + 0.5f) * (f32)tile_size;
-            const f32 gpy = ((f32)ty + 0.5f) * (f32)tile_size;
-            const f32 grx = gpx - gcx, gry = gpy - gcy;
-            const f32 g_dx = gdx0 + (gca * grx - gsa * gry - grx);
-            const f32 g_dy = gdy0 + (gsa * grx + gca * gry - gry);
+            // Camera-motion prior for this tile, projected onto the weak axis.
+            f32 g_dx = 0.f, g_dy = 0.f;
+            motion_prior_at_tile(prior, tx, ty, tile_size,
+                                 finest_w, finest_h, g_dx, g_dy);
             const f32 g_v = g_dx * vx + g_dy * vy;
 
             // Lean on the global fit in proportion to how little the tile can

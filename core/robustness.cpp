@@ -734,6 +734,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
+    Image residual_noise_ratio(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
@@ -752,12 +753,28 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
             const f32 sample_x = (f32)x + flow_x;
             const f32 sample_y = (f32)y + flow_y;
+            f32 noise_ratio_sum = 0.f;
+            int noise_ratio_n = 0;
             for (int ch = 0; ch < d_p.c; ++ch) {
                 const f32 comp = sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
-                d_p.at(y, x, ch) = std::isfinite(comp)
+                const f32 dp = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();
+                d_p.at(y, x, ch) = dp;
+                f32 brightness = ref_stats.means.at(y, x, ch);
+                int id_noise = (int)std::lround(1000.f * brightness);
+                if (!std::isfinite(brightness))
+                    id_noise = 0;
+                else if (id_noise < 0)
+                    id_noise = 0;
+                else if (id_noise >= (int)nc.diff_curve.size())
+                    id_noise = (int)nc.diff_curve.size() - 1;
+                const f32 d_t = nc.diff_curve[(size_t)id_noise];
+                noise_ratio_sum += (dp * dp) / std::max(d_t * d_t, 1e-8f);
+                ++noise_ratio_n;
             }
+            residual_noise_ratio.at(y, x) =
+                noise_ratio_n > 0 ? noise_ratio_sum / (f32)noise_ratio_n : 0.f;
         }
     }
 
@@ -827,33 +844,42 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             if (aperture_eligible && pidx < flow.aperture_weak_error.size()) {
-                const f32 wp = clampf(cfg.aperture_post_strength, 0.f, 1.f);
-                const bool observable =
-                    wp > 0.f && pidx < flow.aperture_post_error.size() &&
-                    flow.aperture_post_error[pidx] >= 0.f;
-                if (observable) {
-                    // The image is direct evidence and outranks the model. The
-                    // weak-error test and the repair both derive from the global
-                    // fit, so they agree when it is wrong; multiplying them in
-                    // here would make that agreement unfalsifiable -- the image
-                    // could add suppression but never withdraw it. Where the
-                    // warped frame can be measured along e2, it decides.
-                    const f32 psig = std::max(1e-6f, cfg.aperture_post_sigma_px);
-                    const f32 pex = std::max(
-                        0.f, flow.aperture_post_error[pidx] - cfg.aperture_post_safe_px);
-                    const f32 pt = pex / psig;
-                    const f32 c_post = std::exp(-0.5f * pt * pt);
-                    r_val *= 1.f - wp * (1.f - c_post);
-                } else {
-                    // Nothing measurable along the edge: fall back to agreement
-                    // with the global prior, which is the only signal left.
-                    const f32 sigma = std::max(1e-6f, cfg.aperture_weak_sigma_px);
-                    const f32 excess = std::max(
-                        0.f, flow.aperture_weak_error[pidx] - cfg.aperture_weak_safe_px);
+                const f32 w_ap = clampf(cfg.flow_reject_1d_strength, 0.f, 1.f);
+                if (cfg.aperture_residual_enabled) {
+                    const f32 safe = std::max(0.f, cfg.aperture_residual_safe_ratio);
+                    const f32 sigma = std::max(1e-6f, cfg.aperture_residual_sigma_ratio);
+                    const f32 excess = std::max(0.f, residual_noise_ratio.at(y, x) - safe);
                     const f32 t = excess / sigma;
-                    const f32 c_aperture = std::exp(-0.5f * t * t);
-                    const f32 w = clampf(cfg.flow_reject_1d_strength, 0.f, 1.f);
-                    r_val *= 1.f - w * (1.f - c_aperture);
+                    const f32 c_residual = std::exp(-0.5f * t * t);
+                    r_val *= 1.f - w_ap * (1.f - c_residual);
+                } else {
+                    const f32 wp = clampf(cfg.aperture_post_strength, 0.f, 1.f);
+                    const bool observable =
+                        wp > 0.f && pidx < flow.aperture_post_error.size() &&
+                        flow.aperture_post_error[pidx] >= 0.f;
+                    if (observable) {
+                        // The image is direct evidence and outranks the model. The
+                        // weak-error test and the repair both derive from the global
+                        // fit, so they agree when it is wrong; multiplying them in
+                        // here would make that agreement unfalsifiable -- the image
+                        // could add suppression but never withdraw it. Where the
+                        // warped frame can be measured along e2, it decides.
+                        const f32 psig = std::max(1e-6f, cfg.aperture_post_sigma_px);
+                        const f32 pex = std::max(
+                            0.f, flow.aperture_post_error[pidx] - cfg.aperture_post_safe_px);
+                        const f32 pt = pex / psig;
+                        const f32 c_post = std::exp(-0.5f * pt * pt);
+                        r_val *= 1.f - wp * (1.f - c_post);
+                    } else {
+                        // Nothing measurable along the edge: fall back to agreement
+                        // with the global prior, which is the only signal left.
+                        const f32 sigma = std::max(1e-6f, cfg.aperture_weak_sigma_px);
+                        const f32 excess = std::max(
+                            0.f, flow.aperture_weak_error[pidx] - cfg.aperture_weak_safe_px);
+                        const f32 t = excess / sigma;
+                        const f32 c_aperture = std::exp(-0.5f * t * t);
+                        r_val *= 1.f - w_ap * (1.f - c_aperture);
+                    }
                 }
             }
             if (cfg.fb_consistency_enabled &&

@@ -1437,6 +1437,9 @@ struct RobMaskParams {
     float aperture_post_strength;
     float aperture_post_safe_px;
     float aperture_post_sigma_px;
+    uint aperture_residual_enabled;
+    float aperture_residual_safe_ratio;
+    float aperture_residual_sigma_ratio;
     uint _pad0;
 };
 
@@ -1689,7 +1692,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* aperture_post_error [[buffer(15)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
-    float d_sq_ = 0.f, sigma_sq_ = 0.f;
+    float d_sq_ = 0.f, sigma_sq_ = 0.f, residual_noise_ratio = 0.f;
     int patch_idy;
     int patch_idx;
     float flow_x;
@@ -1735,9 +1738,11 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
+        residual_noise_ratio += d_p_sq / max(d_t * d_t, 1e-8f);
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
         d_sq_ += d_p_sq * shrink * shrink;
     }
+    residual_noise_ratio /= max(1.f, float(p.nch));
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -1806,21 +1811,30 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // step could be solved the image decides, otherwise fall back to agreement
     // with the global prior. A negative post error means "not measured".
     if (aperture_eligible) {
-        float wp = clamp(p.aperture_post_strength, 0.f, 1.f);
-        bool observable = wp > 0.f && aperture_post_error[pidx] >= 0.f;
-        if (observable) {
-            float psig = max(1e-6f, p.aperture_post_sigma_px);
-            float pex = max(0.f, aperture_post_error[pidx] - p.aperture_post_safe_px);
-            float pt = pex / psig;
-            float c_post = exp(-0.5f * pt * pt);
-            r_val *= 1.f - wp * (1.f - c_post);
+        float w = clamp(p.aperture_reject_strength, 0.f, 1.f);
+        if (p.aperture_residual_enabled != 0u) {
+            float safe = max(0.f, p.aperture_residual_safe_ratio);
+            float rsig = max(1e-6f, p.aperture_residual_sigma_ratio);
+            float rexcess = max(0.f, residual_noise_ratio - safe);
+            float rt = rexcess / rsig;
+            float c_residual = exp(-0.5f * rt * rt);
+            r_val *= 1.f - w * (1.f - c_residual);
         } else {
-            float sigma = max(1e-6f, p.aperture_weak_sigma_px);
-            float excess = max(0.f, aperture_weak_error[pidx] - p.aperture_weak_safe_px);
-            float t = excess / sigma;
-            float c_aperture = exp(-0.5f * t * t);
-            float w = clamp(p.aperture_reject_strength, 0.f, 1.f);
-            r_val *= 1.f - w * (1.f - c_aperture);
+            float wp = clamp(p.aperture_post_strength, 0.f, 1.f);
+            bool observable = wp > 0.f && aperture_post_error[pidx] >= 0.f;
+            if (observable) {
+                float psig = max(1e-6f, p.aperture_post_sigma_px);
+                float pex = max(0.f, aperture_post_error[pidx] - p.aperture_post_safe_px);
+                float pt = pex / psig;
+                float c_post = exp(-0.5f * pt * pt);
+                r_val *= 1.f - wp * (1.f - c_post);
+            } else {
+                float sigma = max(1e-6f, p.aperture_weak_sigma_px);
+                float excess = max(0.f, aperture_weak_error[pidx] - p.aperture_weak_safe_px);
+                float t = excess / sigma;
+                float c_aperture = exp(-0.5f * t * t);
+                r_val *= 1.f - w * (1.f - c_aperture);
+            }
         }
     }
     if (p.fb_enabled != 0u) {

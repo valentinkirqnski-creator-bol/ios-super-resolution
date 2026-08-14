@@ -122,6 +122,12 @@ struct TuningParams: Equatable, Codable {
     var aperture_post_strength: Float = 0.0
     var aperture_post_safe_px: Float = 0.20
     var aperture_post_sigma_px: Float = 0.30
+    /// Only reject 1D tiles when the aligned-frame residual is too high for
+    /// the estimated noise. This keeps static straight edges from being
+    /// discarded just because they are 1D.
+    var aperture_residual_enabled: Bool = true
+    var aperture_residual_safe_ratio: Float = 16.0
+    var aperture_residual_sigma_ratio: Float = 8.0
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -207,6 +213,7 @@ struct TuningParams: Equatable, Codable {
         case flow_reject_1d_enabled, flow_reject_1d_strength
         case aperture_weak_safe_px, aperture_weak_sigma_px
         case aperture_post_strength, aperture_post_safe_px, aperture_post_sigma_px
+        case aperture_residual_enabled, aperture_residual_safe_ratio, aperture_residual_sigma_ratio
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -265,6 +272,12 @@ struct TuningParams: Equatable, Codable {
             Float.self, forKey: .aperture_post_safe_px) ?? aperture_post_safe_px
         aperture_post_sigma_px = try c.decodeIfPresent(
             Float.self, forKey: .aperture_post_sigma_px) ?? aperture_post_sigma_px
+        aperture_residual_enabled = try c.decodeIfPresent(
+            Bool.self, forKey: .aperture_residual_enabled) ?? aperture_residual_enabled
+        aperture_residual_safe_ratio = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_residual_safe_ratio) ?? aperture_residual_safe_ratio
+        aperture_residual_sigma_ratio = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_residual_sigma_ratio) ?? aperture_residual_sigma_ratio
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1889,6 +1902,9 @@ final class CameraModel: NSObject, ObservableObject {
             "aperture_post_strength": NSNumber(value: tuningParams.aperture_post_strength),
             "aperture_post_safe_px": NSNumber(value: tuningParams.aperture_post_safe_px),
             "aperture_post_sigma_px": NSNumber(value: tuningParams.aperture_post_sigma_px),
+            "aperture_residual_enabled": NSNumber(value: tuningParams.aperture_residual_enabled),
+            "aperture_residual_safe_ratio": NSNumber(value: tuningParams.aperture_residual_safe_ratio),
+            "aperture_residual_sigma_ratio": NSNumber(value: tuningParams.aperture_residual_sigma_ratio),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),

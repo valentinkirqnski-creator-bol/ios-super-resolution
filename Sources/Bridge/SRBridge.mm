@@ -360,6 +360,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.aperture_post_safe_px = std::max(0.0f, tuning[@"aperture_post_safe_px"].floatValue);
     if (tuning[@"aperture_post_sigma_px"])
         cfg.aperture_post_sigma_px = std::max(0.01f, tuning[@"aperture_post_sigma_px"].floatValue);
+    if (tuning[@"aperture_residual_enabled"])
+        cfg.aperture_residual_enabled = tuning[@"aperture_residual_enabled"].boolValue;
+    if (tuning[@"aperture_residual_safe_ratio"])
+        cfg.aperture_residual_safe_ratio =
+            std::max(0.0f, tuning[@"aperture_residual_safe_ratio"].floatValue);
+    if (tuning[@"aperture_residual_sigma_ratio"])
+        cfg.aperture_residual_sigma_ratio =
+            std::max(0.01f, tuning[@"aperture_residual_sigma_ratio"].floatValue);
     if (tuning[@"aperture_weak_safe_px"])
         cfg.aperture_weak_safe_px =
             std::max(0.0f, tuning[@"aperture_weak_safe_px"].floatValue);

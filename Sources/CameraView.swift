@@ -746,6 +746,24 @@ struct CameraView: View {
             Text("After repair, asks the image whether the edge still wants to move along itself. The only test here not derived from the global pre-alignment, so it is what catches a wrong global fit. Silent where the edge carries no gradient along itself to measure with.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+            Toggle("Require Residual Evidence", isOn: $cam.tuningParams.aperture_residual_enabled)
+            if cam.tuningParams.aperture_residual_enabled {
+                HStack {
+                    Text("Residual Safe Ratio")
+                    Spacer()
+                    Text(String(format: "%.1fx", cam.tuningParams.aperture_residual_safe_ratio))
+                }
+                Slider(value: $cam.tuningParams.aperture_residual_safe_ratio, in: 1.0...64.0)
+                HStack {
+                    Text("Residual Falloff")
+                    Spacer()
+                    Text(String(format: "%.1fx", cam.tuningParams.aperture_residual_sigma_ratio))
+                }
+                Slider(value: $cam.tuningParams.aperture_residual_sigma_ratio, in: 1.0...32.0)
+                Text("1D tiles are suppressed only when the aligned comparison frame still differs from the reference more than expected noise. Higher Safe Ratio protects more static straight edges; lower catches more aperture artifacts.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
             Text("A 1D tile is only suppressed by how far it drifted along its own edge, relative to the global pre-alignment. Drift under Safe Drift merges untouched; beyond it confidence falls off as a Gaussian of this width.")
                 .font(.caption)
                 .foregroundColor(.secondary)

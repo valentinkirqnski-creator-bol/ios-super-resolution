@@ -1134,9 +1134,12 @@ struct RobMaskParamsCPU {
     float aperture_post_strength = 0.f;
     float aperture_post_safe_px = 0.20f;
     float aperture_post_sigma_px = 0.30f;
+    uint32_t aperture_residual_enabled = 1;
+    float aperture_residual_safe_ratio = 16.f;
+    float aperture_residual_sigma_ratio = 8.f;
     uint32_t _pad0 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 108, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 124, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1565,6 +1568,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.aperture_post_strength = cfg.aperture_post_strength;
     mp.aperture_post_safe_px = cfg.aperture_post_safe_px;
     mp.aperture_post_sigma_px = cfg.aperture_post_sigma_px;
+    mp.aperture_residual_enabled = cfg.aperture_residual_enabled ? 1u : 0u;
+    mp.aperture_residual_safe_ratio = cfg.aperture_residual_safe_ratio;
+    mp.aperture_residual_sigma_ratio = cfg.aperture_residual_sigma_ratio;
     mp.fb_enabled = fb_on ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];

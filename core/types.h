@@ -387,6 +387,16 @@ struct Config {
     // that cannot be measured along the edge cannot be seen along it either, so
     // reporting nothing is right rather than merely safe.
     float aperture_post_min_energy = 1e-4f;
+    // When enabled, the 1D aperture gate needs direct image evidence: after
+    // applying the tile flow, the aligned-frame residual must be high relative
+    // to the expected frame-to-frame noise. This keeps the useful old
+    // "reject 1D" targeting, but stops rejecting every static straight edge.
+    bool  aperture_residual_enabled = true;
+    // Residual ratio is mean((aligned - reference)^2 / expected_noise_diff^2)
+    // over the guide channels at the sampled robustness pixel. Higher values
+    // reject less; lower values make the 1D rejection more aggressive.
+    float aperture_residual_safe_ratio = 16.0f;
+    float aperture_residual_sigma_ratio = 8.0f;
 
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
