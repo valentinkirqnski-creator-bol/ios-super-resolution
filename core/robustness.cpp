@@ -815,14 +815,47 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            const bool aperture_reject =
+            // Eligibility, not verdict: being 1D only says the tile cannot
+            // observe motion along its edge. The evidence is how far it drifted
+            // along that direction relative to the global model.
+            const bool aperture_eligible =
                 cfg.flow_reject_1d_enabled &&
                 pidx < flow.aperture_limited.size() &&
                 flow.aperture_limited[pidx] != 0u;
-            const bool hard_reject = hf_reject || edge_reject || aperture_reject;
+            const bool hard_reject = hf_reject || edge_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            if (aperture_eligible && pidx < flow.aperture_weak_error.size()) {
+                const f32 wp = clampf(cfg.aperture_post_strength, 0.f, 1.f);
+                const bool observable =
+                    wp > 0.f && pidx < flow.aperture_post_error.size() &&
+                    flow.aperture_post_error[pidx] >= 0.f;
+                if (observable) {
+                    // The image is direct evidence and outranks the model. The
+                    // weak-error test and the repair both derive from the global
+                    // fit, so they agree when it is wrong; multiplying them in
+                    // here would make that agreement unfalsifiable -- the image
+                    // could add suppression but never withdraw it. Where the
+                    // warped frame can be measured along e2, it decides.
+                    const f32 psig = std::max(1e-6f, cfg.aperture_post_sigma_px);
+                    const f32 pex = std::max(
+                        0.f, flow.aperture_post_error[pidx] - cfg.aperture_post_safe_px);
+                    const f32 pt = pex / psig;
+                    const f32 c_post = std::exp(-0.5f * pt * pt);
+                    r_val *= 1.f - wp * (1.f - c_post);
+                } else {
+                    // Nothing measurable along the edge: fall back to agreement
+                    // with the global prior, which is the only signal left.
+                    const f32 sigma = std::max(1e-6f, cfg.aperture_weak_sigma_px);
+                    const f32 excess = std::max(
+                        0.f, flow.aperture_weak_error[pidx] - cfg.aperture_weak_safe_px);
+                    const f32 t = excess / sigma;
+                    const f32 c_aperture = std::exp(-0.5f * t * t);
+                    const f32 w = clampf(cfg.flow_reject_1d_strength, 0.f, 1.f);
+                    r_val *= 1.f - w * (1.f - c_aperture);
+                }
+            }
             if (cfg.fb_consistency_enabled &&
                 pidx < flow.fb_confidence.size()) {
                 const f32 c_fb = clampf(flow.fb_confidence[pidx], 0.f, 1.f);

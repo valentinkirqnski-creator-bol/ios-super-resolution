@@ -103,9 +103,25 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_enabled: Bool = false
     var flow_regularize_threshold: Float = 1.0
     var flow_regularize_aperture_ratio: Float = 0.15
+    /// Lower edge of the anisotropy ramp. >= the ratio reproduces the hard gate.
+    var flow_regularize_soft_ratio_low: Float = 1.0
+    /// Cap on weak-direction pull toward the neighbours, in grey pixels. 0 = off.
+    var flow_regularize_max_residual: Float = 0.0
+    /// Share of the repair target taken from the global fit rather than neighbours.
+    var flow_regularize_global_weight: Float = 1.0
     /// Test switch: reject every tile whose Hessian says it is one-dimensional
     /// instead of repairing only the uncertain flow component.
     var flow_reject_1d_enabled: Bool = false
+    /// 1 zeroes a 1D tile (original behaviour); below 1 keeps that fraction.
+    var flow_reject_1d_strength: Float = 1.0
+    /// Weak-direction error below which a 1D tile is left alone, raw pixels.
+    var aperture_weak_safe_px: Float = 0.15
+    /// Gaussian falloff width above that, raw pixels.
+    var aperture_weak_sigma_px: Float = 0.30
+    /// Post-warp directional validation. 0 disables it.
+    var aperture_post_strength: Float = 0.0
+    var aperture_post_safe_px: Float = 0.20
+    var aperture_post_sigma_px: Float = 0.30
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -185,8 +201,12 @@ struct TuningParams: Equatable, Codable {
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
-        case flow_regularize_enabled, flow_regularize_threshold, flow_regularize_aperture_ratio
-        case flow_reject_1d_enabled
+        case flow_regularize_enabled, flow_regularize_threshold
+        case flow_regularize_soft_ratio_low, flow_regularize_max_residual, flow_regularize_aperture_ratio
+        case flow_regularize_global_weight
+        case flow_reject_1d_enabled, flow_reject_1d_strength
+        case aperture_weak_safe_px, aperture_weak_sigma_px
+        case aperture_post_strength, aperture_post_safe_px, aperture_post_sigma_px
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
@@ -226,7 +246,25 @@ struct TuningParams: Equatable, Codable {
         flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
         flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
+        flow_regularize_soft_ratio_low = try c.decodeIfPresent(
+            Float.self, forKey: .flow_regularize_soft_ratio_low) ?? flow_regularize_soft_ratio_low
+        flow_regularize_max_residual = try c.decodeIfPresent(
+            Float.self, forKey: .flow_regularize_max_residual) ?? flow_regularize_max_residual
+        flow_regularize_global_weight = try c.decodeIfPresent(
+            Float.self, forKey: .flow_regularize_global_weight) ?? flow_regularize_global_weight
         flow_reject_1d_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_reject_1d_enabled) ?? flow_reject_1d_enabled
+        flow_reject_1d_strength = try c.decodeIfPresent(
+            Float.self, forKey: .flow_reject_1d_strength) ?? flow_reject_1d_strength
+        aperture_weak_safe_px = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_weak_safe_px) ?? aperture_weak_safe_px
+        aperture_weak_sigma_px = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_weak_sigma_px) ?? aperture_weak_sigma_px
+        aperture_post_strength = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_post_strength) ?? aperture_post_strength
+        aperture_post_safe_px = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_post_safe_px) ?? aperture_post_safe_px
+        aperture_post_sigma_px = try c.decodeIfPresent(
+            Float.self, forKey: .aperture_post_sigma_px) ?? aperture_post_sigma_px
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -1841,7 +1879,16 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
             "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
+            "flow_regularize_soft_ratio_low": NSNumber(value: tuningParams.flow_regularize_soft_ratio_low),
+            "flow_regularize_max_residual": NSNumber(value: tuningParams.flow_regularize_max_residual),
+            "flow_regularize_global_weight": NSNumber(value: tuningParams.flow_regularize_global_weight),
             "flow_reject_1d_enabled": NSNumber(value: tuningParams.flow_reject_1d_enabled),
+            "flow_reject_1d_strength": NSNumber(value: tuningParams.flow_reject_1d_strength),
+            "aperture_weak_safe_px": NSNumber(value: tuningParams.aperture_weak_safe_px),
+            "aperture_weak_sigma_px": NSNumber(value: tuningParams.aperture_weak_sigma_px),
+            "aperture_post_strength": NSNumber(value: tuningParams.aperture_post_strength),
+            "aperture_post_safe_px": NSNumber(value: tuningParams.aperture_post_safe_px),
+            "aperture_post_sigma_px": NSNumber(value: tuningParams.aperture_post_sigma_px),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),

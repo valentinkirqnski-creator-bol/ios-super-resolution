@@ -718,6 +718,41 @@ struct CameraView: View {
             .font(.caption2).foregroundColor(.secondary)
 
         Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
+        if cam.tuningParams.flow_reject_1d_enabled {
+            HStack {
+                Text("Rejection Strength")
+                Spacer()
+                Text(String(format: "%.0f%%", cam.tuningParams.flow_reject_1d_strength * 100))
+            }
+            Slider(value: $cam.tuningParams.flow_reject_1d_strength, in: 0.0...1.0)
+            HStack {
+                Text("Safe Drift")
+                Spacer()
+                Text(String(format: "%.2f px", cam.tuningParams.aperture_weak_safe_px))
+            }
+            Slider(value: $cam.tuningParams.aperture_weak_safe_px, in: 0.0...1.0)
+            HStack {
+                Text("Falloff Width")
+                Spacer()
+                Text(String(format: "%.2f px", cam.tuningParams.aperture_weak_sigma_px))
+            }
+            Slider(value: $cam.tuningParams.aperture_weak_sigma_px, in: 0.05...1.5)
+            HStack {
+                Text("Post-Warp Check")
+                Spacer()
+                Text(String(format: "%.0f%%", cam.tuningParams.aperture_post_strength * 100))
+            }
+            Slider(value: $cam.tuningParams.aperture_post_strength, in: 0.0...1.0)
+            Text("After repair, asks the image whether the edge still wants to move along itself. The only test here not derived from the global pre-alignment, so it is what catches a wrong global fit. Silent where the edge carries no gradient along itself to measure with.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("A 1D tile is only suppressed by how far it drifted along its own edge, relative to the global pre-alignment. Drift under Safe Drift merges untouched; beyond it confidence falls off as a Gaussian of this width.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("100% discards a 1D tile entirely. Lower keeps some of its contribution, so those regions still denoise instead of falling back to the reference frame alone.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
         Text("""
              Test mode: instead of repairing these aperture-limited tiles, force their merge \
              robustness to zero. This should show as black blocks in the saved robustness \
@@ -749,6 +784,35 @@ struct CameraView: View {
                 Text(String(format: "%.2f", cam.tuningParams.flow_regularize_aperture_ratio))
                     .monospacedDigit()
             }
+            HStack {
+                Text("Soft Blend From")
+                Spacer()
+                Text(softBlendLabel)
+            }
+            Slider(value: $cam.tuningParams.flow_regularize_soft_ratio_low, in: 0.0...1.0)
+            Text("Below the aperture ratio this ramps the repair instead of switching it on abruptly. At or above the ratio it is the original hard gate.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            HStack {
+                Text("Max Weak Pull")
+                Spacer()
+                Text(maxPullLabel)
+            }
+            Slider(value: $cam.tuningParams.flow_regularize_max_residual, in: 0.0...8.0)
+            HStack {
+                Text("Global Prior Weight")
+                Spacer()
+                Text(String(format: "%.0f%%", cam.tuningParams.flow_regularize_global_weight * 100))
+            }
+            Slider(value: $cam.tuningParams.flow_regularize_global_weight, in: 0.0...1.0)
+            Text("Where a tile is most one-dimensional, take the repair target from the global pre-alignment rather than the neighbouring tiles. Neighbours cannot detect a whole edge drifting together; the global fit can. 0% is neighbours only.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("Caps how far a repaired tile is dragged toward its neighbours, in grey pixels. Protects a straight edge on a moving object. 0 = uncapped.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
             Slider(value: $cam.tuningParams.flow_regularize_aperture_ratio,
                    in: 0.05...0.75,
                    step: 0.05)
@@ -803,6 +867,18 @@ struct CameraView: View {
             return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
         }
         return "Frame 0 is the merge base, so pre-alignment runs inside the alignment pass at roughly the cost of one thumbnail per frame."
+    }
+
+    private var softBlendLabel: String {
+        let v = cam.tuningParams.flow_regularize_soft_ratio_low
+        if v >= cam.tuningParams.flow_regularize_aperture_ratio { return "hard gate" }
+        return String(format: "%.2f", v)
+    }
+
+    private var maxPullLabel: String {
+        let v = cam.tuningParams.flow_regularize_max_residual
+        if v <= 0 { return "uncapped" }
+        return String(format: "%.1f px", v)
     }
 
     @ViewBuilder

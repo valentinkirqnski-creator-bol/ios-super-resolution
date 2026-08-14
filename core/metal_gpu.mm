@@ -1128,10 +1128,15 @@ struct RobMaskParamsCPU {
     // same order. A mismatch here is silent on the shader side.
     uint32_t aperture_reject_enabled = 0;
     uint32_t fb_enabled = 0;
+    float aperture_reject_strength = 1.f;
+    float aperture_weak_safe_px = 0.15f;
+    float aperture_weak_sigma_px = 0.30f;
+    float aperture_post_strength = 0.f;
+    float aperture_post_safe_px = 0.20f;
+    float aperture_post_sigma_px = 0.30f;
     uint32_t _pad0 = 0;
-    uint32_t _pad1 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 88, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 108, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1482,13 +1487,35 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
+    const size_t n_tiles = (size_t)flow.ny * (size_t)flow.nx;
+    // Both arrays, not just the flag: the shader indexes aperture_weak_error
+    // under the same condition, so a size mismatch there would read past the
+    // fallback buffer rather than simply skipping the test.
+    // All three arrays: the shader indexes every one of them under this single
+    // flag, so a short one would read past its fallback buffer.
     const bool aperture_reject_on =
         cfg.flow_reject_1d_enabled &&
-        flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx;
+        flow.aperture_limited.size() == n_tiles &&
+        flow.aperture_weak_error.size() == n_tiles &&
+        flow.aperture_post_error.size() == n_tiles;
     id<MTLBuffer> b_aperture = aperture_reject_on
         ? buf(flow.aperture_limited.data(),
               flow.aperture_limited.size() * sizeof(uint32_t))
         : b_motion;
+    // Same gate as b_aperture: when off, point at any live buffer so the
+    // binding is set (Metal faults at dispatch on an unset one) and let the
+    // shader's aperture_eligible test keep it unread.
+    static const float kDummyWeak = 0.f;
+    id<MTLBuffer> b_weak = aperture_reject_on
+        ? buf(flow.aperture_weak_error.data(),
+              flow.aperture_weak_error.size() * sizeof(float))
+        : buf(&kDummyWeak, sizeof(kDummyWeak));
+    // -1 = not measured, which is what the fallback path must see.
+    static const float kDummyPost = -1.f;
+    id<MTLBuffer> b_post = aperture_reject_on
+        ? buf(flow.aperture_post_error.data(),
+              flow.aperture_post_error.size() * sizeof(float))
+        : buf(&kDummyPost, sizeof(kDummyPost));
     const bool fb_on =
         cfg.fb_consistency_enabled &&
         flow.fb_confidence.size() == (size_t)flow.ny * (size_t)flow.nx;
@@ -1532,6 +1559,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
+    mp.aperture_reject_strength = cfg.flow_reject_1d_strength;
+    mp.aperture_weak_safe_px = cfg.aperture_weak_safe_px;
+    mp.aperture_weak_sigma_px = cfg.aperture_weak_sigma_px;
+    mp.aperture_post_strength = cfg.aperture_post_strength;
+    mp.aperture_post_safe_px = cfg.aperture_post_safe_px;
+    mp.aperture_post_sigma_px = cfg.aperture_post_sigma_px;
     mp.fb_enabled = fb_on ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -1549,6 +1582,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     [enc setBuffer:b_aperture offset:0 atIndex:12];
     [enc setBuffer:b_fb offset:0 atIndex:13];
+    [enc setBuffer:b_weak offset:0 atIndex:14];
+    [enc setBuffer:b_post offset:0 atIndex:15];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

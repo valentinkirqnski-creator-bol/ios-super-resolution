@@ -342,8 +342,33 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"flow_regularize_aperture_ratio"])
         cfg.flow_regularize_aperture_ratio =
             std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
+    if (tuning[@"flow_regularize_soft_ratio_low"])
+        cfg.flow_regularize_soft_ratio_low =
+            std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_soft_ratio_low"].floatValue));
+    if (tuning[@"flow_regularize_global_weight"])
+        cfg.flow_regularize_global_weight =
+            std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_global_weight"].floatValue));
+    if (tuning[@"flow_regularize_max_residual"])
+        cfg.flow_regularize_max_residual =
+            std::max(0.0f, tuning[@"flow_regularize_max_residual"].floatValue);
     if (tuning[@"flow_reject_1d_enabled"])
         cfg.flow_reject_1d_enabled = tuning[@"flow_reject_1d_enabled"].boolValue;
+    if (tuning[@"aperture_post_strength"])
+        cfg.aperture_post_strength =
+            std::max(0.0f, std::min(1.0f, tuning[@"aperture_post_strength"].floatValue));
+    if (tuning[@"aperture_post_safe_px"])
+        cfg.aperture_post_safe_px = std::max(0.0f, tuning[@"aperture_post_safe_px"].floatValue);
+    if (tuning[@"aperture_post_sigma_px"])
+        cfg.aperture_post_sigma_px = std::max(0.01f, tuning[@"aperture_post_sigma_px"].floatValue);
+    if (tuning[@"aperture_weak_safe_px"])
+        cfg.aperture_weak_safe_px =
+            std::max(0.0f, tuning[@"aperture_weak_safe_px"].floatValue);
+    if (tuning[@"aperture_weak_sigma_px"])
+        cfg.aperture_weak_sigma_px =
+            std::max(0.01f, tuning[@"aperture_weak_sigma_px"].floatValue);
+    if (tuning[@"flow_reject_1d_strength"])
+        cfg.flow_reject_1d_strength =
+            std::max(0.0f, std::min(1.0f, tuning[@"flow_reject_1d_strength"].floatValue));
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])

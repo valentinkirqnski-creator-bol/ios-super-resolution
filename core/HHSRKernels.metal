@@ -1431,8 +1431,13 @@ struct RobMaskParams {
     // metal_gpu.mm, which static_asserts the size.
     uint aperture_reject_enabled;
     uint fb_enabled;
+    float aperture_reject_strength;
+    float aperture_weak_safe_px;
+    float aperture_weak_sigma_px;
+    float aperture_post_strength;
+    float aperture_post_safe_px;
+    float aperture_post_sigma_px;
     uint _pad0;
-    uint _pad1;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1680,6 +1685,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           device const uint* aperture_limited [[buffer(12)]],
                           device const float* fb_confidence [[buffer(13)]],
+                          device const float* aperture_weak_error [[buffer(14)]],
+                          device const float* aperture_post_error [[buffer(15)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1789,12 +1796,33 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    bool aperture_reject =
+    bool aperture_eligible =
         p.aperture_reject_enabled != 0u && aperture_limited[pidx] != 0u;
-    bool hard_reject = hf_reject || edge_reject || aperture_reject;
+    bool hard_reject = hf_reject || edge_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    // Mirror of robustness.cpp, including the precedence: where the post-warp
+    // step could be solved the image decides, otherwise fall back to agreement
+    // with the global prior. A negative post error means "not measured".
+    if (aperture_eligible) {
+        float wp = clamp(p.aperture_post_strength, 0.f, 1.f);
+        bool observable = wp > 0.f && aperture_post_error[pidx] >= 0.f;
+        if (observable) {
+            float psig = max(1e-6f, p.aperture_post_sigma_px);
+            float pex = max(0.f, aperture_post_error[pidx] - p.aperture_post_safe_px);
+            float pt = pex / psig;
+            float c_post = exp(-0.5f * pt * pt);
+            r_val *= 1.f - wp * (1.f - c_post);
+        } else {
+            float sigma = max(1e-6f, p.aperture_weak_sigma_px);
+            float excess = max(0.f, aperture_weak_error[pidx] - p.aperture_weak_safe_px);
+            float t = excess / sigma;
+            float c_aperture = exp(-0.5f * t * t);
+            float w = clamp(p.aperture_reject_strength, 0.f, 1.f);
+            r_val *= 1.f - w * (1.f - c_aperture);
+        }
+    }
     if (p.fb_enabled != 0u) {
         r_val *= clamp(fb_confidence[pidx], 0.f, 1.f);
     }

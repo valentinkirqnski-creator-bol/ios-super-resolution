@@ -812,6 +812,169 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
 //
 // Not safe on a moving subject: across a genuine motion boundary the
 // neighbours' median is a motion that belongs to neither side. Off by default.
+// Per-tile weak-direction disagreement with the global pre-alignment.
+//
+// For an aperture-limited tile the image constrains motion across the edge and
+// says nothing about motion along it, so that is the only component where a
+// disagreement with the global model is evidence of drift rather than of real
+// local motion. Everything else -- parallax, a moving subject, genuine local
+// flow -- shows up in the strong direction, which this deliberately ignores.
+//
+// Runs after regularize_flow_aperture so it measures what survives the repair:
+// a tile the repair pulled back into line reports a small error and keeps its
+// robustness, one still adrift reports a large one.
+//
+// The value is in the flow's own units (grey pixels); flow_to_raw_tile_grid
+// scales it with the displacements.
+// Post-warp directional residual: the one test here that asks the image rather
+// than another model.
+//
+// After the repaired flow is applied, solve a one-dimensional Lucas-Kanade step
+// restricted to the weak axis -- how far the warped frame still wants to move
+// along the direction the tile could not observe:
+//
+//   delta2 = -sum(g * r) / (sum(g * g) + eps),   g = grad(I_ref) . e2
+//                                                r = I_mov(x + v) - I_ref(x)
+//
+// Repair and the weak-error rejection both lean on the global pre-alignment, so
+// they agree when the global fit is wrong. This does not: it is measured from
+// the two images directly, and it is what stops the loop becoming self
+// consistent around a bad prior.
+//
+// The denominator is also the observability test. On a true aperture edge
+// grad(I).e2 is small by construction, so below aperture_post_min_energy the
+// solve is fitting noise and the tile reports 0 -- no penalty. That is the
+// right answer and not just the safe one: a displacement that leaves no
+// gradient signature along the edge leaves no visible signature either.
+static void mark_aperture_post_warp_error(FlowField& flow, const HessianField* hess,
+                                          const Image& ref, const Image& moving,
+                                          const Config& cfg, int tile_size) {
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
+    const size_t n_tiles = (size_t)flow.ny * (size_t)flow.nx;
+    if (flow.aperture_post_error.size() != n_tiles)
+        flow.aperture_post_error.assign(n_tiles, -1.f);
+    // -1 until measured: a tile that never reaches the solve must fall back to
+    // the prior-based test, not be read as "measured and perfectly aligned".
+    std::fill(flow.aperture_post_error.begin(), flow.aperture_post_error.end(), -1.f);
+    if (!(cfg.aperture_post_strength > 0.f)) return;
+    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx) return;
+    if (ref.h <= 2 || ref.w <= 2 || moving.h <= 2 || moving.w <= 2) return;
+
+    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
+    const f32 min_energy = std::max(0.f, cfg.aperture_post_min_energy);
+
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const size_t idx = (size_t)ty * flow.nx + tx;
+            if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx &&
+                flow.aperture_limited[idx] == 0u)
+                continue;                       // only where the axis is meaningful
+
+            const f32* h = hess->at(ty, tx);
+            const f32 h00 = h[0], h01 = h[1], h11 = h[3];
+            const f32 tr = h00 + h11;
+            if (!(tr > 0.f)) continue;
+            const f32 det = h00 * h11 - h01 * h[2];
+            const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
+            const f32 l1 = tr * 0.5f + disc;
+            const f32 l2 = tr * 0.5f - disc;
+            if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;
+
+            const f32 theta = 0.5f * std::atan2(2.f * h01, h00 - h11);
+            const f32 vx = -std::sin(theta), vy = std::cos(theta);   // along the edge
+
+            const f32 fdx = flow.dx(ty, tx), fdy = flow.dy(ty, tx);
+            const int y0 = ty * tile_size, x0 = tx * tile_size;
+            const int y1 = std::min(ref.h - 1, y0 + tile_size);
+            const int x1 = std::min(ref.w - 1, x0 + tile_size);
+
+            double num = 0.0, den = 0.0;
+            for (int y = std::max(1, y0); y < y1; ++y) {
+                for (int x = std::max(1, x0); x < x1; ++x) {
+                    // Central differences, matching compute_sobel_grad{x,y}.
+                    const f32 gx = ref.at(y, x + 1) - ref.at(y, x - 1);
+                    const f32 gy = ref.at(y + 1, x) - ref.at(y - 1, x);
+                    const f32 g = gx * vx + gy * vy;
+                    if (g == 0.f) continue;
+                    const f32 sx = (f32)x + fdx, sy = (f32)y + fdy;
+                    if (!(sx >= 0.f && sy >= 0.f &&
+                          sx <= (f32)(moving.w - 1) && sy <= (f32)(moving.h - 1)))
+                        continue;
+                    const int mx0 = (int)sx, my0 = (int)sy;
+                    const int mx1 = std::min(moving.w - 1, mx0 + 1);
+                    const int my1 = std::min(moving.h - 1, my0 + 1);
+                    const f32 fx = sx - (f32)mx0, fy = sy - (f32)my0;
+                    const f32 mv =
+                        (1.f - fy) * ((1.f - fx) * moving.at(my0, mx0) +
+                                      fx * moving.at(my0, mx1)) +
+                        fy * ((1.f - fx) * moving.at(my1, mx0) +
+                              fx * moving.at(my1, mx1));
+                    const f32 r = mv - ref.at(y, x);
+                    num += (double)g * (double)r;
+                    den += (double)g * (double)g;
+                }
+            }
+            if (!(den > (double)min_energy)) continue;   // not observable -> 0
+            flow.aperture_post_error[idx] =
+                (f32)std::fabs(-num / (den + 1e-12));
+        }
+    });
+}
+
+static void mark_aperture_weak_error(FlowField& flow, const HessianField* hess,
+                                     const Config& cfg, int tile_size,
+                                     int finest_h, int finest_w,
+                                     f32 initial_dx, f32 initial_dy,
+                                     f32 initial_rotation_rad) {
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
+    if (flow.aperture_weak_error.size() != (size_t)flow.ny * (size_t)flow.nx)
+        flow.aperture_weak_error.assign((size_t)flow.ny * (size_t)flow.nx, 0.f);
+    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx) return;
+
+    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
+    const f32 dx0 = std::isfinite(initial_dx) ? initial_dx : 0.f;
+    const f32 dy0 = std::isfinite(initial_dy) ? initial_dy : 0.f;
+    const f32 a = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
+    const f32 ca = std::cos(a), sa = std::sin(a);
+    const f32 cx = 0.5f * (f32)std::max(0, finest_w - 1);
+    const f32 cy = 0.5f * (f32)std::max(0, finest_h - 1);
+
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const size_t idx = (size_t)ty * flow.nx + tx;
+            flow.aperture_weak_error[idx] = 0.f;
+            const f32* h = hess->at(ty, tx);
+            const f32 h00 = h[0], h01 = h[1], h11 = h[3];
+            const f32 tr = h00 + h11;
+            if (!(tr > 0.f)) continue;
+            const f32 det = h00 * h11 - h01 * h[2];
+            const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
+            const f32 l1 = tr * 0.5f + disc;
+            const f32 l2 = tr * 0.5f - disc;
+            if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;
+
+            // Global prediction for this tile: translation plus the rotation's
+            // own contribution at this position. Same construction as
+            // make_global_initial_flow, evaluated at the finest level.
+            const f32 px = ((f32)tx + 0.5f) * (f32)tile_size;
+            const f32 py = ((f32)ty + 0.5f) * (f32)tile_size;
+            const f32 rx = px - cx, ry = py - cy;
+            const f32 gx = dx0 + (ca * rx - sa * ry - rx);
+            const f32 gy = dy0 + (sa * rx + ca * ry - ry);
+
+            // Weak eigenvector via the Jacobi angle, not the closed form: on a
+            // horizontal edge l1 equals h11 to within rounding, so (l1 - h11) is
+            // cancellation noise that hands back the wrong axis.
+            const f32 theta = 0.5f * std::atan2(2.f * h01, h00 - h11);
+            const f32 ux = std::cos(theta), uy = std::sin(theta);  // across
+            const f32 vx = -uy, vy = ux;                           // along
+            const f32 ex = flow.dx(ty, tx) - gx;
+            const f32 ey = flow.dy(ty, tx) - gy;
+            flow.aperture_weak_error[idx] = std::fabs(ex * vx + ey * vy);
+        }
+    });
+}
+
 static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
                                         const Config& cfg) {
     const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
@@ -840,7 +1003,10 @@ static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hes
 }
 
 static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
-                                     const Config& cfg) {
+                                     const Config& cfg, int tile_size,
+                                     int finest_h, int finest_w,
+                                     f32 initial_dx, f32 initial_dy,
+                                     f32 initial_rotation_rad) {
     if (!cfg.flow_regularize_enabled) return;
     if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
     const f32 thr = std::max(0.f, cfg.flow_regularize_threshold);
@@ -871,6 +1037,22 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
     const std::vector<f32> src = flow.flow;
     auto sdx = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 0u]; };
     auto sdy = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 1u]; };
+
+    // Global pre-alignment, in the same grey pixels as everything else here.
+    // The neighbour median cannot see a failure that is coherent across the
+    // neighbourhood, and a long straight edge produces exactly that: every tile
+    // along it is aperture-limited in the same direction and free to drift the
+    // same way, so the median agrees with the centre and nothing is repaired
+    // while the whole edge sits displaced. The global fit is the only estimate
+    // in the pipeline that cannot drift with them, because it is measured from
+    // the entire frame at once.
+    const f32 gdx0 = std::isfinite(initial_dx) ? initial_dx : 0.f;
+    const f32 gdy0 = std::isfinite(initial_dy) ? initial_dy : 0.f;
+    const f32 grot = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
+    const f32 gca = std::cos(grot), gsa = std::sin(grot);
+    const f32 gcx = 0.5f * (f32)std::max(0, finest_w - 1);
+    const f32 gcy = 0.5f * (f32)std::max(0, finest_h - 1);
+    const f32 global_weight = clampf(cfg.flow_regularize_global_weight, 0.f, 1.f);
 
     parallel_rows(ny, cfg.num_threads, [&](int ty) {
         f32 bx[9], by[9];
@@ -910,7 +1092,21 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
             const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
             const f32 l1 = tr * 0.5f + disc;          // across the edge
             const f32 l2 = tr * 0.5f - disc;          // along it
-            if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;  // well determined
+            if (!(l1 > 0.f)) continue;
+            // Anisotropy. q ~ 0 is a pure edge (nothing observable along it),
+            // q ~ 1 is a corner. alpha is how far the tile is trusted in its
+            // weak direction: 1 keeps the measurement, 0 takes the neighbours'.
+            //
+            // With soft_low >= aperture_ratio, smoothstepf degenerates to a step
+            // at aperture_ratio and this is exactly the hard gate it replaces --
+            // which is the shipped default, so behaviour is unchanged until the
+            // ramp is asked for. Lowering soft_low turns the step into a ramp,
+            // so a tile near the boundary is blended rather than flipped between
+            // "measured" and "replaced" by a hundredth of eigenvalue ratio.
+            const f32 q = l2 / l1;
+            const f32 alpha = smoothstepf(cfg.flow_regularize_soft_ratio_low,
+                                          aperture_ratio, q);
+            if (alpha >= 1.f) continue;               // well determined
             n_aperture.fetch_add(1, std::memory_order_relaxed);
 
             // Principal direction as a Jacobi rotation angle, not from the
@@ -926,9 +1122,42 @@ static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
 
             const f32 f_v = dx * vx + dy * vy;        // measured, unreliable
             const f32 m_v = mx * vx + my * vy;        // neighbours' value
-            if (std::fabs(f_v - m_v) <= thr) continue;
+
+            // Global prediction for this tile: translation plus the rotation's
+            // contribution at this position, projected onto the weak axis.
+            const f32 gpx = ((f32)tx + 0.5f) * (f32)tile_size;
+            const f32 gpy = ((f32)ty + 0.5f) * (f32)tile_size;
+            const f32 grx = gpx - gcx, gry = gpy - gcy;
+            const f32 g_dx = gdx0 + (gca * grx - gsa * gry - grx);
+            const f32 g_dy = gdy0 + (gsa * grx + gca * gry - gry);
+            const f32 g_v = g_dx * vx + g_dy * vy;
+
+            // Lean on the global fit in proportion to how little the tile can
+            // see for itself: 1 - alpha is exactly "how much has to be borrowed
+            // from elsewhere". A tile at q ~ 0 takes the global value; one near
+            // the ratio boundary leans on its neighbours, who are the better
+            // source when the motion is genuinely local.
+            const f32 gw = global_weight * (1.f - alpha);
+            const f32 prior_v = m_v + (g_v - m_v) * gw;
+
+            // Deadband against the prior, not the median: testing the median
+            // here would skip precisely the coherent-drift case this exists to
+            // catch, where the tile agrees with neighbours that are all wrong.
+            if (std::fabs(f_v - prior_v) <= thr) continue;
             // Keep the reliable component exactly as measured; move only along v.
-            const f32 corr = m_v - f_v;
+            //
+            // The tile keeps alpha of its own weak-direction disagreement and
+            // gives up the rest. At alpha = 0 that is the full replacement this
+            // did before. max_pull then bounds how far the result may still sit
+            // from the neighbours along v, so a tile that is aperture-limited
+            // AND genuinely moving differently -- a straight edge on a moving
+            // object -- cannot be dragged an unbounded distance onto the
+            // background's motion. In GREY pixels: on the decimate grey one
+            // unit here is two raw pixels.
+            f32 resid = alpha * (f_v - prior_v);
+            const f32 max_resid = cfg.flow_regularize_max_residual;
+            if (max_resid > 0.f) resid = clampf(resid, -max_resid, max_resid);
+            const f32 corr = (prior_v + resid) - f_v;
             dx += corr * vx;
             dy += corr * vy;
             n_fixed.fetch_add(1, std::memory_order_relaxed);
@@ -977,7 +1206,14 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 gh.nx = flow_gpu.nx;
             }
             mark_aperture_limited_tiles(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg);
-            regularize_flow_aperture(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg);
+            regularize_flow_aperture(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg,
+                                     tile_size, ref_grey.h, ref_grey.w,
+                                     initial_dx, initial_dy, initial_rotation_rad);
+            mark_aperture_weak_error(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg,
+                                     tile_size, ref_grey.h, ref_grey.w,
+                                     initial_dx, initial_dy, initial_rotation_rad);
+            mark_aperture_post_warp_error(flow_gpu, gh.data.empty() ? nullptr : &gh,
+                                          ref_grey, moving_grey, cfg, tile_size);
             return flow_gpu;
         }
     }
@@ -1102,7 +1338,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
              g_ref_ica_cache.levels[0].hess.nx == flow.nx)
         reg_hess = &g_ref_ica_cache.levels[0].hess;
     mark_aperture_limited_tiles(flow, reg_hess, cfg);
-    regularize_flow_aperture(flow, reg_hess, cfg);
+    regularize_flow_aperture(flow, reg_hess, cfg, tile_size,
+                             ref_grey.h, ref_grey.w,
+                             initial_dx, initial_dy, initial_rotation_rad);
+    mark_aperture_weak_error(flow, reg_hess, cfg, tile_size,
+                             ref_grey.h, ref_grey.w,
+                             initial_dx, initial_dy, initial_rotation_rad);
+    mark_aperture_post_warp_error(flow, reg_hess, ref_grey, moving_grey, cfg, tile_size);
     return flow;
 }
 
@@ -1149,6 +1391,18 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
             if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.aperture(ty, tx) = flow.aperture(gy, gx);
+            // A magnitude along a direction, so it scales with the displacements
+            // it was measured from -- which puts it in raw pixels, the units the
+            // Gaussian's safe/sigma are specified in.
+            if (flow.aperture_weak_error.size() == (size_t)flow.ny * (size_t)flow.nx)
+                out.aperture_weak_error[(size_t)ty * out.nx + tx] =
+                    flow.aperture_weak_error[(size_t)gy * flow.nx + gx] * sx;
+            if (flow.aperture_post_error.size() == (size_t)flow.ny * (size_t)flow.nx) {
+                // Scale the magnitude, preserve the negative sentinel.
+                const f32 pe = flow.aperture_post_error[(size_t)gy * flow.nx + gx];
+                out.aperture_post_error[(size_t)ty * out.nx + tx] =
+                    (pe < 0.f) ? pe : pe * sx;
+            }
             if (flow.fb_confidence.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.fb(ty, tx) = flow.fb(gy, gx);
         }
