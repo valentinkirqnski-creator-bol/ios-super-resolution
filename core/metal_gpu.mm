@@ -1139,7 +1139,7 @@ struct RobMaskParamsCPU {
     float aperture_residual_sigma_ratio = 8.f;
     uint32_t _pad0 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 124, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 120, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
