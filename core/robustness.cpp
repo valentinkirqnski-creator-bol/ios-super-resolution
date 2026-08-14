@@ -1,5 +1,6 @@
 #include "stages.h"
 #include "parallel.h"
+#include "pixel4a_noise_curves.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -262,6 +263,30 @@ static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
     return true;
 }
 
+static int closest_pixel4a_curve_iso(int iso) {
+    int best = pixel4a_noise::kIsos[0];
+    int best_d = std::abs(iso - best);
+    for (int i = 1; i < pixel4a_noise::kIsoCount; ++i) {
+        int d = std::abs(iso - pixel4a_noise::kIsos[i]);
+        if (d < best_d) {
+            best = pixel4a_noise::kIsos[i];
+            best_d = d;
+        }
+    }
+    return best;
+}
+
+static bool load_bundled_pixel4a_noise_curves(int iso, NoiseCurves& nc) {
+    iso = closest_pixel4a_curve_iso(iso);
+    int idx = pixel4a_noise::index_for_iso(iso);
+    if (idx < 0) return false;
+    const float* std_curve = pixel4a_noise::kStdCurves[idx];
+    const float* diff_curve = pixel4a_noise::kDiffCurves[idx];
+    nc.std_curve.assign(std_curve, std_curve + pixel4a_noise::kBins);
+    nc.diff_curve.assign(diff_curve, diff_curve + pixel4a_noise::kBins);
+    return true;
+}
+
 static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
     // Cache like Python (curves built once per alpha/beta, reused every frame).
     static NoiseCurves cached;
@@ -317,6 +342,29 @@ static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
     return cached;
 }
 
+static const NoiseCurves& make_noise_curves(const Config& cfg) {
+    if (cfg.debug_pixel4a_noise_profile) {
+        static NoiseCurves cached_pixel4a;
+        static int cached_iso = 0;
+        int iso = cfg.debug_pixel4a_noise_curve_iso > 0
+            ? cfg.debug_pixel4a_noise_curve_iso
+            : 100;
+        iso = closest_pixel4a_curve_iso(iso);
+        if (!cached_pixel4a.std_curve.empty() && cached_iso == iso)
+            return cached_pixel4a;
+
+        NoiseCurves nc;
+        if (load_bundled_pixel4a_noise_curves(iso, nc)) {
+            cached_pixel4a = std::move(nc);
+            cached_iso = iso;
+            std::printf("[noise] Loaded bundled Pixel 4a ISO %d curves (%d bins)\n",
+                        iso, pixel4a_noise::kBins);
+            return cached_pixel4a;
+        }
+    }
+    return make_noise_curves(cfg.alpha, cfg.beta);
+}
+
 } // namespace
 
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
@@ -326,9 +374,22 @@ f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
     return nc.std_curve[(size_t)id];
 }
 
+f32 noise_std_at_brightness(f32 brightness, const Config& cfg) {
+    const NoiseCurves& nc = make_noise_curves(cfg);
+    int id = (int)std::lround(1000.f * brightness);
+    return nc.std_curve[(size_t)id];
+}
+
 void fetch_noise_curves(f32 alpha, f32 beta,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
     const NoiseCurves& nc = make_noise_curves(alpha, beta);
+    std_curve = nc.std_curve;
+    diff_curve = nc.diff_curve;
+}
+
+void fetch_noise_curves(const Config& cfg,
+                        std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
+    const NoiseCurves& nc = make_noise_curves(cfg);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
 }
@@ -726,7 +787,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     return Image();
 #else
 
-    const NoiseCurves& nc = make_noise_curves(cfg.alpha, cfg.beta);
+    const NoiseCurves& nc = make_noise_curves(cfg);
 
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
@@ -734,7 +795,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
-    Image residual_noise_ratio(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
@@ -753,28 +813,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
             const f32 sample_x = (f32)x + flow_x;
             const f32 sample_y = (f32)y + flow_y;
-            f32 noise_ratio_sum = 0.f;
-            int noise_ratio_n = 0;
             for (int ch = 0; ch < d_p.c; ++ch) {
                 const f32 comp = sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
                 const f32 dp = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();
                 d_p.at(y, x, ch) = dp;
-                f32 brightness = ref_stats.means.at(y, x, ch);
-                int id_noise = (int)std::lround(1000.f * brightness);
-                if (!std::isfinite(brightness))
-                    id_noise = 0;
-                else if (id_noise < 0)
-                    id_noise = 0;
-                else if (id_noise >= (int)nc.diff_curve.size())
-                    id_noise = (int)nc.diff_curve.size() - 1;
-                const f32 d_t = nc.diff_curve[(size_t)id_noise];
-                noise_ratio_sum += (dp * dp) / std::max(d_t * d_t, 1e-8f);
-                ++noise_ratio_n;
             }
-            residual_noise_ratio.at(y, x) =
-                noise_ratio_n > 0 ? noise_ratio_sum / (f32)noise_ratio_n : 0.f;
         }
     }
 
@@ -832,61 +877,16 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            // Eligibility, not verdict: being 1D only says the tile cannot
-            // observe motion along its edge. The evidence is how far it drifted
-            // along that direction relative to the global model.
-            const bool aperture_eligible =
+            const bool aperture_reject =
                 cfg.flow_reject_1d_enabled &&
                 pidx < flow.aperture_limited.size() &&
-                flow.aperture_limited[pidx] != 0u;
-            const bool hard_reject = hf_reject || edge_reject;
+                pidx < flow.match_ambiguous.size() &&
+                flow.aperture_limited[pidx] != 0u &&
+                flow.match_ambiguous[pidx] != 0u;
+            const bool hard_reject = hf_reject || edge_reject || aperture_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
-            if (aperture_eligible && pidx < flow.aperture_weak_error.size()) {
-                const f32 w_ap = clampf(cfg.flow_reject_1d_strength, 0.f, 1.f);
-                if (cfg.aperture_residual_enabled) {
-                    const f32 safe = std::max(0.f, cfg.aperture_residual_safe_ratio);
-                    const f32 sigma = std::max(1e-6f, cfg.aperture_residual_sigma_ratio);
-                    const f32 excess = std::max(0.f, residual_noise_ratio.at(y, x) - safe);
-                    const f32 t = excess / sigma;
-                    const f32 c_residual = std::exp(-0.5f * t * t);
-                    r_val *= 1.f - w_ap * (1.f - c_residual);
-                } else {
-                    const f32 wp = clampf(cfg.aperture_post_strength, 0.f, 1.f);
-                    const bool observable =
-                        wp > 0.f && pidx < flow.aperture_post_error.size() &&
-                        flow.aperture_post_error[pidx] >= 0.f;
-                    if (observable) {
-                        // The image is direct evidence and outranks the model. The
-                        // weak-error test and the repair both derive from the global
-                        // fit, so they agree when it is wrong; multiplying them in
-                        // here would make that agreement unfalsifiable -- the image
-                        // could add suppression but never withdraw it. Where the
-                        // warped frame can be measured along e2, it decides.
-                        const f32 psig = std::max(1e-6f, cfg.aperture_post_sigma_px);
-                        const f32 pex = std::max(
-                            0.f, flow.aperture_post_error[pidx] - cfg.aperture_post_safe_px);
-                        const f32 pt = pex / psig;
-                        const f32 c_post = std::exp(-0.5f * pt * pt);
-                        r_val *= 1.f - wp * (1.f - c_post);
-                    } else {
-                        // Nothing measurable along the edge: fall back to agreement
-                        // with the global prior, which is the only signal left.
-                        const f32 sigma = std::max(1e-6f, cfg.aperture_weak_sigma_px);
-                        const f32 excess = std::max(
-                            0.f, flow.aperture_weak_error[pidx] - cfg.aperture_weak_safe_px);
-                        const f32 t = excess / sigma;
-                        const f32 c_aperture = std::exp(-0.5f * t * t);
-                        r_val *= 1.f - w_ap * (1.f - c_aperture);
-                    }
-                }
-            }
-            if (cfg.fb_consistency_enabled &&
-                pidx < flow.fb_confidence.size()) {
-                const f32 c_fb = clampf(flow.fb_confidence[pidx], 0.f, 1.f);
-                r_val *= c_fb;
-            }
             R.at(y, x) = r_val;
         }
     }

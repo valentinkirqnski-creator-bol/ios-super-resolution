@@ -297,6 +297,8 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         } else {
             cfg.has_noise_profile = false;
         }
+        if (cfg.debug_pixel4a_noise_profile)
+            apply_pixel4a_noise_profile(cfg, raw.imgdata.other.iso_speed);
 
         // Python: black_level_per_channel[R,G,B,(G2)]; index by CFA color.
         float black_ch[4];

@@ -87,47 +87,14 @@ struct TuningParams: Equatable, Codable {
     var r_s1: Float = 2.0
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
-    var fb_consistency_enabled: Bool = false
-    var fb_consistency_min_error: Float = 0.75
-    var fb_consistency_sigma: Float = 3.0
-    var fb_consistency_radius: Int = 2
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
     var hf_artifact_removal_enabled: Bool = false
     var hf_variance_loss_threshold: Float = 0.75
     var hf_min_texture_snr: Float = 4.0
-    /// Median-filter a tile's flow component when it disagrees with its
-    /// neighbours. Repairs the aperture problem on long edges, where the
-    /// along-edge component is unobservable inside one tile but determined by
-    /// the neighbours. Static scenes only.
-    var flow_regularize_enabled: Bool = false
-    var flow_regularize_threshold: Float = 1.0
-    var flow_regularize_aperture_ratio: Float = 0.15
-    /// Lower edge of the anisotropy ramp. >= the ratio reproduces the hard gate.
-    var flow_regularize_soft_ratio_low: Float = 1.0
-    /// Cap on weak-direction pull toward the neighbours, in grey pixels. 0 = off.
-    var flow_regularize_max_residual: Float = 0.0
-    /// Share of the repair target taken from the global fit rather than neighbours.
-    var flow_regularize_global_weight: Float = 1.0
-    /// Test switch: reject every tile whose Hessian says it is one-dimensional
-    /// instead of repairing only the uncertain flow component.
     var flow_reject_1d_enabled: Bool = false
-    /// 1 zeroes a 1D tile (original behaviour); below 1 keeps that fraction.
-    var flow_reject_1d_strength: Float = 1.0
-    /// Weak-direction error below which a 1D tile is left alone, raw pixels.
-    var aperture_weak_safe_px: Float = 0.15
-    /// Gaussian falloff width above that, raw pixels.
-    var aperture_weak_sigma_px: Float = 0.30
-    /// Post-warp directional validation. 0 disables it.
-    var aperture_post_strength: Float = 0.0
-    var aperture_post_safe_px: Float = 0.20
-    var aperture_post_sigma_px: Float = 0.30
-    /// Only reject 1D tiles when the aligned-frame residual is too high for
-    /// the estimated noise. This keeps static straight edges from being
-    /// discarded just because they are 1D.
-    var aperture_residual_enabled: Bool = true
-    var aperture_residual_safe_ratio: Float = 16.0
-    var aperture_residual_sigma_ratio: Float = 8.0
+    var flow_regularize_aperture_ratio: Float = 0.15
+    var flow_reject_1d_ambiguity_ratio: Float = 1.10
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -138,6 +105,7 @@ struct TuningParams: Equatable, Codable {
     var k_stretch: Float = 4.0
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
+    var debug_pixel4a_noise_profile: Bool = false
     var alignment_tile_size: Int = 0
     var global_prealignment_enabled: Bool = true
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
@@ -164,8 +132,6 @@ struct TuningParams: Equatable, Codable {
     /// correction budget is already spent when level 0 starts. Costs roughly
     /// +120MB at 12MP, because the reference gradient cache goes resident.
     var align_ica_per_level_fft: Bool = false
-    /// Finest-level block-match search radius. 0 keeps the built-in 1.
-    var align_fine_search_radius: Int = 0
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -202,22 +168,15 @@ struct TuningParams: Equatable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
-        case fb_consistency_enabled, fb_consistency_min_error
-        case fb_consistency_sigma, fb_consistency_radius
         case alignment_grey_fft
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
-        case flow_regularize_enabled, flow_regularize_threshold
-        case flow_regularize_soft_ratio_low, flow_regularize_max_residual, flow_regularize_aperture_ratio
-        case flow_regularize_global_weight
-        case flow_reject_1d_enabled, flow_reject_1d_strength
-        case aperture_weak_safe_px, aperture_weak_sigma_px
-        case aperture_post_strength, aperture_post_safe_px, aperture_post_sigma_px
-        case aperture_residual_enabled, aperture_residual_safe_ratio, aperture_residual_sigma_ratio
+        case flow_reject_1d_enabled, flow_regularize_aperture_ratio
+        case flow_reject_1d_ambiguity_ratio
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, alignment_tile_size
+        case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
@@ -225,7 +184,7 @@ struct TuningParams: Equatable, Codable {
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, align_fine_search_radius
+        case align_ica_per_level_fft
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -242,42 +201,13 @@ struct TuningParams: Equatable, Codable {
         r_s1 = try c.decodeIfPresent(Float.self, forKey: .r_s1) ?? r_s1
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
-        fb_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .fb_consistency_enabled) ?? fb_consistency_enabled
-        fb_consistency_min_error = try c.decodeIfPresent(Float.self, forKey: .fb_consistency_min_error) ?? fb_consistency_min_error
-        fb_consistency_sigma = try c.decodeIfPresent(Float.self, forKey: .fb_consistency_sigma) ?? fb_consistency_sigma
-        fb_consistency_radius = try c.decodeIfPresent(Int.self, forKey: .fb_consistency_radius) ?? fb_consistency_radius
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
-        flow_regularize_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_regularize_enabled) ?? flow_regularize_enabled
-        flow_regularize_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_threshold) ?? flow_regularize_threshold
-        flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
-        flow_regularize_soft_ratio_low = try c.decodeIfPresent(
-            Float.self, forKey: .flow_regularize_soft_ratio_low) ?? flow_regularize_soft_ratio_low
-        flow_regularize_max_residual = try c.decodeIfPresent(
-            Float.self, forKey: .flow_regularize_max_residual) ?? flow_regularize_max_residual
-        flow_regularize_global_weight = try c.decodeIfPresent(
-            Float.self, forKey: .flow_regularize_global_weight) ?? flow_regularize_global_weight
         flow_reject_1d_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_reject_1d_enabled) ?? flow_reject_1d_enabled
-        flow_reject_1d_strength = try c.decodeIfPresent(
-            Float.self, forKey: .flow_reject_1d_strength) ?? flow_reject_1d_strength
-        aperture_weak_safe_px = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_weak_safe_px) ?? aperture_weak_safe_px
-        aperture_weak_sigma_px = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_weak_sigma_px) ?? aperture_weak_sigma_px
-        aperture_post_strength = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_post_strength) ?? aperture_post_strength
-        aperture_post_safe_px = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_post_safe_px) ?? aperture_post_safe_px
-        aperture_post_sigma_px = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_post_sigma_px) ?? aperture_post_sigma_px
-        aperture_residual_enabled = try c.decodeIfPresent(
-            Bool.self, forKey: .aperture_residual_enabled) ?? aperture_residual_enabled
-        aperture_residual_safe_ratio = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_residual_safe_ratio) ?? aperture_residual_safe_ratio
-        aperture_residual_sigma_ratio = try c.decodeIfPresent(
-            Float.self, forKey: .aperture_residual_sigma_ratio) ?? aperture_residual_sigma_ratio
+        flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
+        flow_reject_1d_ambiguity_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_ambiguity_ratio) ?? flow_reject_1d_ambiguity_ratio
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -288,6 +218,8 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
+        debug_pixel4a_noise_profile = try c.decodeIfPresent(
+            Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
         global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
@@ -318,7 +250,6 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
-        align_fine_search_radius = try c.decodeIfPresent(Int.self, forKey: .align_fine_search_radius) ?? align_fine_search_radius
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1881,30 +1812,13 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s1": NSNumber(value: tuningParams.r_s1),
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
-            "fb_consistency_enabled": NSNumber(value: tuningParams.fb_consistency_enabled),
-            "fb_consistency_min_error": NSNumber(value: tuningParams.fb_consistency_min_error),
-            "fb_consistency_sigma": NSNumber(value: tuningParams.fb_consistency_sigma),
-            "fb_consistency_radius": NSNumber(value: tuningParams.fb_consistency_radius),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
-            "flow_regularize_enabled": NSNumber(value: tuningParams.flow_regularize_enabled),
-            "flow_regularize_threshold": NSNumber(value: tuningParams.flow_regularize_threshold),
-            "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
-            "flow_regularize_soft_ratio_low": NSNumber(value: tuningParams.flow_regularize_soft_ratio_low),
-            "flow_regularize_max_residual": NSNumber(value: tuningParams.flow_regularize_max_residual),
-            "flow_regularize_global_weight": NSNumber(value: tuningParams.flow_regularize_global_weight),
             "flow_reject_1d_enabled": NSNumber(value: tuningParams.flow_reject_1d_enabled),
-            "flow_reject_1d_strength": NSNumber(value: tuningParams.flow_reject_1d_strength),
-            "aperture_weak_safe_px": NSNumber(value: tuningParams.aperture_weak_safe_px),
-            "aperture_weak_sigma_px": NSNumber(value: tuningParams.aperture_weak_sigma_px),
-            "aperture_post_strength": NSNumber(value: tuningParams.aperture_post_strength),
-            "aperture_post_safe_px": NSNumber(value: tuningParams.aperture_post_safe_px),
-            "aperture_post_sigma_px": NSNumber(value: tuningParams.aperture_post_sigma_px),
-            "aperture_residual_enabled": NSNumber(value: tuningParams.aperture_residual_enabled),
-            "aperture_residual_safe_ratio": NSNumber(value: tuningParams.aperture_residual_safe_ratio),
-            "aperture_residual_sigma_ratio": NSNumber(value: tuningParams.aperture_residual_sigma_ratio),
+            "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
+            "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
@@ -1915,6 +1829,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
+            "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
             "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
@@ -1943,7 +1858,6 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
-            "align_fine_search_radius": NSNumber(value: tuningParams.align_fine_search_radius),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)

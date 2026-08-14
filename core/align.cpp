@@ -138,79 +138,59 @@ static f32 clamped_aperture_ratio(const Config& cfg) {
     return std::min(std::max(aperture_ratio, 0.f), 1.f);
 }
 
+static f32 clamped_ambiguity_ratio(const Config& cfg) {
+    f32 ambiguity_ratio = cfg.flow_reject_1d_ambiguity_ratio;
+    if (!std::isfinite(ambiguity_ratio)) ambiguity_ratio = 1.10f;
+    return std::max(ambiguity_ratio, 1.f);
+}
+
+static uint32_t match_is_ambiguous(f32 best_cost, f32 second_cost,
+                                   f32 ambiguity_ratio) {
+    if (!std::isfinite(best_cost) || !std::isfinite(second_cost)) return 0u;
+    if (best_cost < 0.f) best_cost = 0.f;
+    if (second_cost < 0.f) second_cost = 0.f;
+    const f32 denom = std::max(best_cost, 1e-12f);
+    return (second_cost / denom) < ambiguity_ratio ? 1u : 0u;
+}
+
 static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
                                f32 aperture_ratio) {
     const f32* h = hess.at(ty, tx);
     const f32 h00 = h[0], h01 = h[1], h11 = h[3];
     const f32 tr = h00 + h11;
     const f32 det = h00 * h11 - h01 * h[2];
-    if (!(tr > 0.f)) return false; // flat: weak in both directions, not a 1D edge.
+    if (!(tr > 0.f)) return false; // Flat: weak in both directions, not a 1D edge.
     const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
     const f32 l1 = tr * 0.5f + disc;
     const f32 l2 = tr * 0.5f - disc;
     return (l1 > 0.f) && (l2 < aperture_ratio * l1);
 }
 
-struct MotionPrior {
-    f32 dx0 = 0.f;
-    f32 dy0 = 0.f;
-    f32 rot = 0.f;
-};
+static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
+                                        const Config& cfg) {
+    const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
+    flow.aperture_limited.assign(n, 0u);
+    if (!cfg.flow_reject_1d_enabled) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
+    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx ||
+        hess->data.size() < n * 4u)
+        return;
 
-static f32 median_flow_component(const std::vector<f32>& flow, int ch) {
-    const size_t n = flow.size() / 2u;
-    if (n == 0u) return 0.f;
-    std::vector<f32> vals;
-    vals.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        const f32 v = flow[i * 2u + (size_t)ch];
-        if (std::isfinite(v)) vals.push_back(v);
+    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
+    std::atomic<long long> n_marked{0};
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            if (hessian_tile_is_1d(*hess, ty, tx, aperture_ratio)) {
+                flow.aperture(ty, tx) = 1u;
+                n_marked.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    if (prof_enabled()) {
+        prof_add_cpu("flow1d#enabled", 1.0);
+        prof_add_cpu("flow1d#aperture-ratio", (double)aperture_ratio);
+        prof_add_cpu("flow1d#rejected-tiles", (double)n_marked.load());
     }
-    if (vals.empty()) return 0.f;
-    const size_t mid = vals.size() / 2u;
-    std::nth_element(vals.begin(),
-                     vals.begin() +
-                         static_cast<std::vector<f32>::difference_type>(mid),
-                     vals.end());
-    return vals[mid];
-}
-
-static MotionPrior make_motion_prior(const std::vector<f32>& flow,
-                                     const Config& cfg,
-                                     f32 initial_dx, f32 initial_dy,
-                                     f32 initial_rotation_rad) {
-    // When global pre-alignment is disabled, initial_dx/dy are usually zero.
-    // Comparing 1D tiles against zero then marks normal handheld translation as
-    // aperture drift. Fall back to the robust frame translation already present
-    // in the final flow field; this keeps static straight edges from being
-    // rejected just because the camera moved.
-    if (cfg.global_prealignment_enabled &&
-        std::isfinite(initial_dx) && std::isfinite(initial_dy)) {
-        MotionPrior p;
-        p.dx0 = initial_dx;
-        p.dy0 = initial_dy;
-        p.rot = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
-        return p;
-    }
-    MotionPrior p;
-    p.dx0 = median_flow_component(flow, 0);
-    p.dy0 = median_flow_component(flow, 1);
-    p.rot = 0.f;
-    return p;
-}
-
-static inline void motion_prior_at_tile(const MotionPrior& p,
-                                        int tx, int ty, int tile_size,
-                                        int finest_w, int finest_h,
-                                        f32& dx, f32& dy) {
-    const f32 ca = std::cos(p.rot), sa = std::sin(p.rot);
-    const f32 cx = 0.5f * (f32)std::max(0, finest_w - 1);
-    const f32 cy = 0.5f * (f32)std::max(0, finest_h - 1);
-    const f32 px = ((f32)tx + 0.5f) * (f32)tile_size;
-    const f32 py = ((f32)ty + 0.5f) * (f32)tile_size;
-    const f32 rx = px - cx, ry = py - cy;
-    dx = p.dx0 + (ca * rx - sa * ry - rx);
-    dy = p.dy0 + (sa * rx + ca * ry - ry);
 }
 
 } // namespace
@@ -285,7 +265,8 @@ static bool env_flag_on(const char* name) {
 
 static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
                                      int tile_size, int search_radius,
-                                     FlowField& flow, int num_threads) {
+                                     FlowField& flow, f32 ambiguity_ratio,
+                                     bool write_ambiguity, int num_threads) {
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
     int R = search_radius;
@@ -314,6 +295,8 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
     buffers.reserve((size_t)ny);
     for (int i = 0; i < ny; ++i)
         buffers.emplace_back(N, corr_size, wh);
+    if (write_ambiguity)
+        flow.match_ambiguous.assign((size_t)std::max(0, ny) * (size_t)std::max(0, nx), 0u);
 
     parallel_rows(ny, num_threads, [&](int ty) {
         RowBuffers& b = buffers[(size_t)ty];
@@ -326,11 +309,15 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
             int flow_dy = torch_round_to_int(flow.dy(ty, tx));
 
             std::fill(b.ref_tile_padded.begin(), b.ref_tile_padded.end(), 0.f);
+            f32 ref_sq = 0.f;
             for (int i = 0; i < ts; ++i) {
                 for (int j = 0; j < ts; ++j) {
                     int ry = oy + i, rx = ox + j;
-                    if (ry < ref.h && rx < ref.w)
-                        b.ref_tile_padded[(size_t)(i + R) * N + (j + R)] = ref.at(ry, rx);
+                    if (ry < ref.h && rx < ref.w) {
+                        f32 rv = ref.at(ry, rx);
+                        b.ref_tile_padded[(size_t)(i + R) * N + (j + R)] = rv;
+                        ref_sq += rv * rv;
+                    }
                 }
             }
 
@@ -371,31 +358,48 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
                 }
             }
 
-            f32 best_err = 1e30f;
+            f32 best_rank = 1e30f;
+            f32 second_rank = 1e30f;
+            f32 best_cost = std::numeric_limits<f32>::infinity();
+            f32 second_cost = std::numeric_limits<f32>::infinity();
             int best_dy = 0, best_dx = 0;
             for (int i = 0; i < corr_size; ++i) {
                 for (int j = 0; j < corr_size; ++j) {
                     f32 err = b.L2_search[(size_t)i * corr_size + j]
                             - 2.f * b.corrs[(size_t)i * corr_size + j];
-                    if (err < best_err) {
-                        best_err = err;
+                    f32 cost = std::max(0.f, ref_sq + err);
+                    if (err < best_rank) {
+                        second_rank = best_rank;
+                        second_cost = best_cost;
+                        best_rank = err;
+                        best_cost = cost;
                         best_dy = i - corr_size / 2;
                         best_dx = j - corr_size / 2;
+                    } else if (err < second_rank) {
+                        second_rank = err;
+                        second_cost = cost;
                     }
                 }
             }
             flow.dx(ty, tx) += (f32)best_dx;
             flow.dy(ty, tx) += (f32)best_dy;
+            if (write_ambiguity)
+                flow.ambiguous(ty, tx) =
+                    match_is_ambiguous(best_cost, second_cost, ambiguity_ratio);
         }
     });
 }
 
 static void block_match_level_direct_460(const Image& ref, const Image& moving,
                                          int tile_size, int search_radius,
-                                         FlowField& flow, bool l1, int num_threads) {
+                                         FlowField& flow, bool l1,
+                                         f32 ambiguity_ratio, bool write_ambiguity,
+                                         int num_threads) {
     const int ny = flow.ny, nx = flow.nx;
     const int ts = tile_size;
     const int R = search_radius;
+    if (write_ambiguity)
+        flow.match_ambiguous.assign((size_t)std::max(0, ny) * (size_t)std::max(0, nx), 0u);
     parallel_rows(ny, num_threads, [&](int ty) {
         for (int tx = 0; tx < nx; ++tx) {
             const int oy = ty * ts;
@@ -403,6 +407,7 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
             const f32 local_fx = flow.dx(ty, tx);
             const f32 local_fy = flow.dy(ty, tx);
             f32 min_dist = std::numeric_limits<f32>::infinity();
+            f32 second_dist = std::numeric_limits<f32>::infinity();
             int min_shift_x = 0, min_shift_y = 0;
             for (int sdy = -R; sdy <= R; ++sdy) {
                 for (int sdx = -R; sdx <= R; ++sdx) {
@@ -425,29 +430,40 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                     }
                     if (!valid) dist = std::numeric_limits<f32>::infinity();
                     if (dist < min_dist) {
+                        second_dist = min_dist;
                         min_dist = dist;
                         min_shift_y = sdy;
                         min_shift_x = sdx;
+                    } else if (dist < second_dist) {
+                        second_dist = dist;
                     }
                 }
             }
             flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
             flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+            if (write_ambiguity)
+                flow.ambiguous(ty, tx) =
+                    match_is_ambiguous(min_dist, second_dist, ambiguity_ratio);
         }
     });
 }
 
 static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
-                                  FlowField& flow, int num_threads) {
+                                  FlowField& flow, const Config& cfg,
+                                  int num_threads) {
+    const bool write_ambiguity = cfg.flow_reject_1d_enabled;
+    const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
-        if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow))
+        if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow,
+                                       ambiguity_ratio, write_ambiguity))
             return;
     }
 #endif
-    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow, false, num_threads);
+    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
+                                 false, ambiguity_ratio, write_ambiguity, num_threads);
 }
 
 // ============================================================================
@@ -455,13 +471,18 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
 // ============================================================================
 static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
-                                  FlowField& flow, int num_threads) {
+                                  FlowField& flow, const Config& cfg,
+                                  int num_threads) {
+    const bool write_ambiguity = cfg.flow_reject_1d_enabled;
+    const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&
-        block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow))
+        block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow,
+                                   ambiguity_ratio, write_ambiguity))
         return;
 #endif
-    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow, true, num_threads);
+    block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
+                                 true, ambiguity_ratio, write_ambiguity, num_threads);
     return;
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
@@ -700,6 +721,8 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
             if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
                 upsampled.aperture(ty, tx) = in.aperture(sy, sx);
+            if (in.match_ambiguous.size() == (size_t)in.ny * (size_t)in.nx)
+                upsampled.ambiguous(ty, tx) = in.ambiguous(sy, sx);
         }
     }
 
@@ -711,6 +734,8 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
                 out.dy(ty, tx) = upsampled.dy(ty, tx);
                 if (upsampled.aperture_limited.size() == (size_t)up_ny * (size_t)up_nx)
                     out.aperture(ty, tx) = upsampled.aperture(ty, tx);
+                if (upsampled.match_ambiguous.size() == (size_t)up_ny * (size_t)up_nx)
+                    out.ambiguous(ty, tx) = upsampled.ambiguous(ty, tx);
             }
         }
     }
@@ -736,8 +761,6 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
 
             const int prev_x = tx / repeat_factor;
             const int prev_y = ty / repeat_factor;
-            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
-                out.aperture(ty, tx) = in.aperture(prev_y, prev_x);
             const int ups_x = tx % repeat_factor;
             const int ups_y = ty % repeat_factor;
             const int x_shift = (2 * ups_x + 1 > repeat_factor) ? 1 : -1;
@@ -782,6 +805,30 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             }
             out.dx(ty, tx) = cand[best_i][0];
             out.dy(ty, tx) = cand[best_i][1];
+            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx) {
+                int ap_y = prev_y;
+                int ap_x = prev_x;
+                if (best_i == 1) {
+                    ap_y = cand_y;
+                    ap_x = prev_x;
+                } else if (best_i == 2) {
+                    ap_y = prev_y;
+                    ap_x = cand_x;
+                }
+                out.aperture(ty, tx) = in.aperture(ap_y, ap_x);
+            }
+            if (in.match_ambiguous.size() == (size_t)in.ny * (size_t)in.nx) {
+                int am_y = prev_y;
+                int am_x = prev_x;
+                if (best_i == 1) {
+                    am_y = cand_y;
+                    am_x = prev_x;
+                } else if (best_i == 2) {
+                    am_y = prev_y;
+                    am_x = cand_x;
+                }
+                out.ambiguous(ty, tx) = in.ambiguous(am_y, am_x);
+            }
         }
     }
     return out;
@@ -836,403 +883,6 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
     return flow;
 }
 
-// Replace a tile's displacement component with the local median when it
-// disagrees with its neighbours.
-//
-// Every tile is solved independently and nothing downstream ties one to the
-// next, so a tile whose evidence does not determine its motion is free to
-// return anything. The classic case is a tile holding one long edge and
-// nothing else: the component across the edge is well determined, the one
-// ALONG it is unobservable, and the block match picks whichever of a set of
-// near-identical candidates wins on noise. Neighbouring tiles on the same edge
-// each pick independently, and the merged edge acquires a tile-period wobble.
-//
-// That ambiguity is local, not global. The along-edge motion is shared with the
-// neighbours, and one tile over there is usually a corner, a gap or an end that
-// fixes it. Taking the median supplies what the tile could not see.
-//
-// Which direction is unobservable is decided by the Hessian, not by the axes.
-// H is symmetric, so its eigenvectors are the directions of most and least
-// gradient energy: the large one points across the edge (well determined), the
-// small one along it (ambiguous). The flow is projected onto that pair, the
-// reliable component is kept exactly as measured, and only the ambiguous one
-// takes the neighbours' value.
-//
-// Doing it per axis instead is only correct when the edge happens to be
-// horizontal or vertical. On a diagonal edge neither dx nor dy is the outlier
-// -- both are part right and part wrong -- so an axis-aligned rule either
-// over-corrects the reliable direction or misses the ambiguous one entirely.
-//
-// Two gates, and a tile must fail both to be touched: it has to be genuinely
-// aperture-limited (l2/l1 below kApertureRatio) and its ambiguous component has
-// to disagree with the neighbours by more than the threshold. A well-determined
-// tile is returned untouched no matter what its neighbours say, which is what
-// keeps this from smoothing real structure away.
-//
-// Without a Hessian -- no cached reference gradients for this grid -- it falls
-// back to the per-axis form, which is the axis-aligned special case.
-//
-// Not safe on a moving subject: across a genuine motion boundary the
-// neighbours' median is a motion that belongs to neither side. Off by default.
-// Per-tile weak-direction disagreement with the global pre-alignment.
-//
-// For an aperture-limited tile the image constrains motion across the edge and
-// says nothing about motion along it, so that is the only component where a
-// disagreement with the global model is evidence of drift rather than of real
-// local motion. Everything else -- parallax, a moving subject, genuine local
-// flow -- shows up in the strong direction, which this deliberately ignores.
-//
-// Runs after regularize_flow_aperture so it measures what survives the repair:
-// a tile the repair pulled back into line reports a small error and keeps its
-// robustness, one still adrift reports a large one.
-//
-// The value is in the flow's own units (grey pixels); flow_to_raw_tile_grid
-// scales it with the displacements.
-// Post-warp directional residual: the one test here that asks the image rather
-// than another model.
-//
-// After the repaired flow is applied, solve a one-dimensional Lucas-Kanade step
-// restricted to the weak axis -- how far the warped frame still wants to move
-// along the direction the tile could not observe:
-//
-//   delta2 = -sum(g * r) / (sum(g * g) + eps),   g = grad(I_ref) . e2
-//                                                r = I_mov(x + v) - I_ref(x)
-//
-// Repair and the weak-error rejection both lean on the global pre-alignment, so
-// they agree when the global fit is wrong. This does not: it is measured from
-// the two images directly, and it is what stops the loop becoming self
-// consistent around a bad prior.
-//
-// The denominator is also the observability test. On a true aperture edge
-// grad(I).e2 is small by construction, so below aperture_post_min_energy the
-// solve is fitting noise and the tile reports 0 -- no penalty. That is the
-// right answer and not just the safe one: a displacement that leaves no
-// gradient signature along the edge leaves no visible signature either.
-static void mark_aperture_post_warp_error(FlowField& flow, const HessianField* hess,
-                                          const Image& ref, const Image& moving,
-                                          const Config& cfg, int tile_size) {
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
-    const size_t n_tiles = (size_t)flow.ny * (size_t)flow.nx;
-    if (flow.aperture_post_error.size() != n_tiles)
-        flow.aperture_post_error.assign(n_tiles, -1.f);
-    // -1 until measured: a tile that never reaches the solve must fall back to
-    // the prior-based test, not be read as "measured and perfectly aligned".
-    std::fill(flow.aperture_post_error.begin(), flow.aperture_post_error.end(), -1.f);
-    if (!(cfg.aperture_post_strength > 0.f)) return;
-    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx) return;
-    if (ref.h <= 2 || ref.w <= 2 || moving.h <= 2 || moving.w <= 2) return;
-
-    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    const f32 min_energy = std::max(0.f, cfg.aperture_post_min_energy);
-
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            const size_t idx = (size_t)ty * flow.nx + tx;
-            if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx &&
-                flow.aperture_limited[idx] == 0u)
-                continue;                       // only where the axis is meaningful
-
-            const f32* h = hess->at(ty, tx);
-            const f32 h00 = h[0], h01 = h[1], h11 = h[3];
-            const f32 tr = h00 + h11;
-            if (!(tr > 0.f)) continue;
-            const f32 det = h00 * h11 - h01 * h[2];
-            const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
-            const f32 l1 = tr * 0.5f + disc;
-            const f32 l2 = tr * 0.5f - disc;
-            if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;
-
-            const f32 theta = 0.5f * std::atan2(2.f * h01, h00 - h11);
-            const f32 vx = -std::sin(theta), vy = std::cos(theta);   // along the edge
-
-            const f32 fdx = flow.dx(ty, tx), fdy = flow.dy(ty, tx);
-            const int y0 = ty * tile_size, x0 = tx * tile_size;
-            const int y1 = std::min(ref.h - 1, y0 + tile_size);
-            const int x1 = std::min(ref.w - 1, x0 + tile_size);
-
-            double num = 0.0, den = 0.0;
-            for (int y = std::max(1, y0); y < y1; ++y) {
-                for (int x = std::max(1, x0); x < x1; ++x) {
-                    // Central differences, matching compute_sobel_grad{x,y}.
-                    const f32 gx = ref.at(y, x + 1) - ref.at(y, x - 1);
-                    const f32 gy = ref.at(y + 1, x) - ref.at(y - 1, x);
-                    const f32 g = gx * vx + gy * vy;
-                    if (g == 0.f) continue;
-                    const f32 sx = (f32)x + fdx, sy = (f32)y + fdy;
-                    if (!(sx >= 0.f && sy >= 0.f &&
-                          sx <= (f32)(moving.w - 1) && sy <= (f32)(moving.h - 1)))
-                        continue;
-                    const int mx0 = (int)sx, my0 = (int)sy;
-                    const int mx1 = std::min(moving.w - 1, mx0 + 1);
-                    const int my1 = std::min(moving.h - 1, my0 + 1);
-                    const f32 fx = sx - (f32)mx0, fy = sy - (f32)my0;
-                    const f32 mv =
-                        (1.f - fy) * ((1.f - fx) * moving.at(my0, mx0) +
-                                      fx * moving.at(my0, mx1)) +
-                        fy * ((1.f - fx) * moving.at(my1, mx0) +
-                              fx * moving.at(my1, mx1));
-                    const f32 r = mv - ref.at(y, x);
-                    num += (double)g * (double)r;
-                    den += (double)g * (double)g;
-                }
-            }
-            if (!(den > (double)min_energy)) continue;   // not observable -> 0
-            flow.aperture_post_error[idx] =
-                (f32)std::fabs(-num / (den + 1e-12));
-        }
-    });
-}
-
-static void mark_aperture_weak_error(FlowField& flow, const HessianField* hess,
-                                     const Config& cfg, int tile_size,
-                                     int finest_h, int finest_w,
-                                     f32 initial_dx, f32 initial_dy,
-                                     f32 initial_rotation_rad) {
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
-    if (flow.aperture_weak_error.size() != (size_t)flow.ny * (size_t)flow.nx)
-        flow.aperture_weak_error.assign((size_t)flow.ny * (size_t)flow.nx, 0.f);
-    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx) return;
-
-    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    const MotionPrior prior =
-        make_motion_prior(flow.flow, cfg, initial_dx, initial_dy,
-                          initial_rotation_rad);
-
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            const size_t idx = (size_t)ty * flow.nx + tx;
-            flow.aperture_weak_error[idx] = 0.f;
-            const f32* h = hess->at(ty, tx);
-            const f32 h00 = h[0], h01 = h[1], h11 = h[3];
-            const f32 tr = h00 + h11;
-            if (!(tr > 0.f)) continue;
-            const f32 det = h00 * h11 - h01 * h[2];
-            const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
-            const f32 l1 = tr * 0.5f + disc;
-            const f32 l2 = tr * 0.5f - disc;
-            if (!(l1 > 0.f) || l2 >= aperture_ratio * l1) continue;
-
-            // Neutral camera-motion prediction for this tile. With global
-            // prealignment this is translation plus rotation; otherwise it is a
-            // robust translation from the final tile field.
-            f32 gx = 0.f, gy = 0.f;
-            motion_prior_at_tile(prior, tx, ty, tile_size,
-                                 finest_w, finest_h, gx, gy);
-
-            // Weak eigenvector via the Jacobi angle, not the closed form: on a
-            // horizontal edge l1 equals h11 to within rounding, so (l1 - h11) is
-            // cancellation noise that hands back the wrong axis.
-            const f32 theta = 0.5f * std::atan2(2.f * h01, h00 - h11);
-            const f32 ux = std::cos(theta), uy = std::sin(theta);  // across
-            const f32 vx = -uy, vy = ux;                           // along
-            const f32 ex = flow.dx(ty, tx) - gx;
-            const f32 ey = flow.dy(ty, tx) - gy;
-            flow.aperture_weak_error[idx] = std::fabs(ex * vx + ey * vy);
-        }
-    });
-}
-
-static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
-                                        const Config& cfg) {
-    const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
-    flow.aperture_limited.assign(n, 0u);
-    if (!cfg.flow_reject_1d_enabled) return;
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
-    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx ||
-        hess->data.size() < n * 4u)
-        return;
-
-    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    std::atomic<long long> n_marked{0};
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            if (hessian_tile_is_1d(*hess, ty, tx, aperture_ratio)) {
-                flow.aperture(ty, tx) = 1u;
-                n_marked.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    });
-    if (prof_enabled()) {
-        prof_add_cpu("flow1d#enabled", 1.0);
-        prof_add_cpu("flow1d#aperture-ratio", (double)aperture_ratio);
-        prof_add_cpu("flow1d#rejected-tiles", (double)n_marked.load());
-    }
-}
-
-static void regularize_flow_aperture(FlowField& flow, const HessianField* hess,
-                                     const Config& cfg, int tile_size,
-                                     int finest_h, int finest_w,
-                                     f32 initial_dx, f32 initial_dy,
-                                     f32 initial_rotation_rad) {
-    if (!cfg.flow_regularize_enabled) return;
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
-    const f32 thr = std::max(0.f, cfg.flow_regularize_threshold);
-    const int ny = flow.ny, nx = flow.nx;
-    // Second eigenvalue below this fraction of the first counts as
-    // aperture-limited. Measured on a real frame at 16px tiles the median tile
-    // sits at 0.64 and is nowhere near the default, while a strong edge is
-    // under 0.05; 0.15 takes the genuinely one-dimensional tiles and leaves the
-    // rest. Exposed as a setting because some static edge failures are less
-    // perfectly one-dimensional once noise, letters, reflections and Bayer
-    // texture enter the tile.
-    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    const bool use_h = hess && hess->ny == ny && hess->nx == nx &&
-                       hess->data.size() >= (size_t)ny * (size_t)nx * 4u;
-
-    // Counters, not timings. Setting the threshold to 0.1px and seeing no
-    // change has three possible causes that look identical from the outside --
-    // the Hessian never arrived, no tile passed the anisotropy gate, or tiles
-    // were corrected and the artifact is something else entirely. These
-    // separate them in the profile without a debugger.
-    std::atomic<long long> n_aperture{0}, n_fixed{0};
-    double sum_corr = 0.0;
-    std::mutex corr_mu;
-
-    // Read from a copy: filtering in place would feed already-corrected tiles
-    // back into their neighbours' medians and let one repair cascade across the
-    // field, which is smoothing rather than outlier replacement.
-    const std::vector<f32> src = flow.flow;
-    auto sdx = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 0u]; };
-    auto sdy = [&](int y, int x) { return src[((size_t)y * nx + x) * 2u + 1u]; };
-
-    // Camera-motion prior, in the same grey pixels as everything else here.
-    // The neighbour median cannot see a failure that is coherent across the
-    // neighbourhood, and a long straight edge produces exactly that: every tile
-    // along it is aperture-limited in the same direction and free to drift the
-    // same way, so the median agrees with the centre and nothing is repaired
-    // while the whole edge sits displaced. Prefer the global pre-alignment when
-    // present; otherwise use the robust median flow of the frame rather than
-    // zero, so ordinary handheld translation does not look like drift.
-    const MotionPrior prior =
-        make_motion_prior(src, cfg, initial_dx, initial_dy,
-                          initial_rotation_rad);
-    const f32 global_weight = clampf(cfg.flow_regularize_global_weight, 0.f, 1.f);
-
-    parallel_rows(ny, cfg.num_threads, [&](int ty) {
-        f32 bx[9], by[9];
-        for (int tx = 0; tx < nx; ++tx) {
-            int n = 0;
-            for (int i = -1; i <= 1; ++i) {
-                const int yy = std::min(std::max(ty + i, 0), ny - 1);
-                for (int j = -1; j <= 1; ++j) {
-                    const int xx = std::min(std::max(tx + j, 0), nx - 1);
-                    bx[n] = sdx(yy, xx);
-                    by[n] = sdy(yy, xx);
-                    ++n;
-                }
-            }
-            std::nth_element(bx, bx + n / 2, bx + n);
-            std::nth_element(by, by + n / 2, by + n);
-            const f32 mx = bx[n / 2], my = by[n / 2];
-            f32& dx = flow.dx(ty, tx);
-            f32& dy = flow.dy(ty, tx);
-
-            if (!use_h) {
-                if (std::fabs(dx - mx) > thr) dx = mx;
-                if (std::fabs(dy - my) > thr) dy = my;
-                continue;
-            }
-
-            const f32* h = hess->at(ty, tx);
-            const f32 h00 = h[0], h01 = h[1], h11 = h[3];
-            const f32 tr = h00 + h11;
-            const f32 det = h00 * h11 - h01 * h[2];
-            if (!(tr > 0.f)) {
-                // No gradient at all: nothing here was ever observable.
-                if (std::fabs(dx - mx) > thr) dx = mx;
-                if (std::fabs(dy - my) > thr) dy = my;
-                continue;
-            }
-            const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
-            const f32 l1 = tr * 0.5f + disc;          // across the edge
-            const f32 l2 = tr * 0.5f - disc;          // along it
-            if (!(l1 > 0.f)) continue;
-            // Anisotropy. q ~ 0 is a pure edge (nothing observable along it),
-            // q ~ 1 is a corner. alpha is how far the tile is trusted in its
-            // weak direction: 1 keeps the measurement, 0 takes the neighbours'.
-            //
-            // With soft_low >= aperture_ratio, smoothstepf degenerates to a step
-            // at aperture_ratio and this is exactly the hard gate it replaces --
-            // which is the shipped default, so behaviour is unchanged until the
-            // ramp is asked for. Lowering soft_low turns the step into a ramp,
-            // so a tile near the boundary is blended rather than flipped between
-            // "measured" and "replaced" by a hundredth of eigenvalue ratio.
-            const f32 q = l2 / l1;
-            const f32 alpha = smoothstepf(cfg.flow_regularize_soft_ratio_low,
-                                          aperture_ratio, q);
-            if (alpha >= 1.f) continue;               // well determined
-            n_aperture.fetch_add(1, std::memory_order_relaxed);
-
-            // Principal direction as a Jacobi rotation angle, not from the
-            // closed form (l1 - d, b). On the case this exists to handle -- a
-            // horizontal edge, where h00 and h01 are both near zero -- l1
-            // equals h11 to within rounding, so (l1 - h11) is pure cancellation
-            // noise that can dwarf h01 and hand back the wrong axis. atan2
-            // subtracts nothing nearly equal and is exact at every degenerate
-            // orientation.
-            const f32 theta = 0.5f * std::atan2(2.f * h01, h00 - h11);
-            const f32 ux = std::cos(theta), uy = std::sin(theta);  // across the edge
-            const f32 vx = -uy, vy = ux;                           // along it
-
-            const f32 f_v = dx * vx + dy * vy;        // measured, unreliable
-            const f32 m_v = mx * vx + my * vy;        // neighbours' value
-
-            // Camera-motion prior for this tile, projected onto the weak axis.
-            f32 g_dx = 0.f, g_dy = 0.f;
-            motion_prior_at_tile(prior, tx, ty, tile_size,
-                                 finest_w, finest_h, g_dx, g_dy);
-            const f32 g_v = g_dx * vx + g_dy * vy;
-
-            // Lean on the global fit in proportion to how little the tile can
-            // see for itself: 1 - alpha is exactly "how much has to be borrowed
-            // from elsewhere". A tile at q ~ 0 takes the global value; one near
-            // the ratio boundary leans on its neighbours, who are the better
-            // source when the motion is genuinely local.
-            const f32 gw = global_weight * (1.f - alpha);
-            const f32 prior_v = m_v + (g_v - m_v) * gw;
-
-            // Deadband against the prior, not the median: testing the median
-            // here would skip precisely the coherent-drift case this exists to
-            // catch, where the tile agrees with neighbours that are all wrong.
-            if (std::fabs(f_v - prior_v) <= thr) continue;
-            // Keep the reliable component exactly as measured; move only along v.
-            //
-            // The tile keeps alpha of its own weak-direction disagreement and
-            // gives up the rest. At alpha = 0 that is the full replacement this
-            // did before. max_pull then bounds how far the result may still sit
-            // from the neighbours along v, so a tile that is aperture-limited
-            // AND genuinely moving differently -- a straight edge on a moving
-            // object -- cannot be dragged an unbounded distance onto the
-            // background's motion. In GREY pixels: on the decimate grey one
-            // unit here is two raw pixels.
-            f32 resid = alpha * (f_v - prior_v);
-            const f32 max_resid = cfg.flow_regularize_max_residual;
-            if (max_resid > 0.f) resid = clampf(resid, -max_resid, max_resid);
-            const f32 corr = (prior_v + resid) - f_v;
-            dx += corr * vx;
-            dy += corr * vy;
-            n_fixed.fetch_add(1, std::memory_order_relaxed);
-            {
-                std::lock_guard<std::mutex> lk(corr_mu);
-                sum_corr += std::fabs((double)corr);
-            }
-        }
-    });
-
-    if (prof_enabled()) {
-        const long long tiles = (long long)ny * nx;
-        const long long ap = n_aperture.load();
-        const long long fx = n_fixed.load();
-        prof_add_cpu("flowreg#tiles", (double)tiles);
-        prof_add_cpu("flowreg#hessian-ok", use_h ? 1.0 : 0.0);
-        prof_add_cpu("flowreg#aperture-ratio", (double)aperture_ratio);
-        prof_add_cpu("flowreg#aperture-limited", (double)ap);
-        prof_add_cpu("flowreg#corrected", (double)fx);
-        prof_add_cpu("flowreg#px-moved-total", sum_corr);
-    }
-}
-
-// ============================================================================
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
@@ -1247,24 +897,14 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
                         initial_dx, initial_dy, initial_rotation_rad)) {
-            // On the host, after the readback: the field is one vector per tile,
-            // a few hundred KB, so filtering it here costs nothing measurable
-            // and keeps a single implementation for both backends.
-            HessianField gh;
-            if ((cfg.flow_regularize_enabled || cfg.flow_reject_1d_enabled) &&
-                metal_fetch_ref_hessian(flow_gpu.ny, flow_gpu.nx, gh.data)) {
-                gh.ny = flow_gpu.ny;
-                gh.nx = flow_gpu.nx;
+            if (cfg.flow_reject_1d_enabled) {
+                Image gx = compute_sobel_gradx(ref_grey);
+                Image gy = compute_sobel_grady(ref_grey);
+                HessianField hess = compute_hessian(gx, gy, tile_size);
+                mark_aperture_limited_tiles(flow_gpu, &hess, cfg);
+            } else {
+                mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
             }
-            mark_aperture_limited_tiles(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg);
-            regularize_flow_aperture(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg,
-                                     tile_size, ref_grey.h, ref_grey.w,
-                                     initial_dx, initial_dy, initial_rotation_rad);
-            mark_aperture_weak_error(flow_gpu, gh.data.empty() ? nullptr : &gh, cfg,
-                                     tile_size, ref_grey.h, ref_grey.w,
-                                     initial_dx, initial_dy, initial_rotation_rad);
-            mark_aperture_post_warp_error(flow_gpu, gh.data.empty() ? nullptr : &gh,
-                                          ref_grey, moving_grey, cfg, tile_size);
             return flow_gpu;
         }
     }
@@ -1319,11 +959,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                      ? cfg.bm_tile_sizes[lvl] : tile_size;
         int radius = (lvl < (int)cfg.bm_search_radii.size())
                      ? cfg.bm_search_radii[lvl] : 2;
-        // Finest level only: the default 1 leaves no margin once anything
-        // upstream contributes error. The Metal search derives its candidate
-        // span from this same radius, so both paths widen together.
-        if (lvl == 0 && cfg.align_fine_search_radius > 0)
-            radius = cfg.align_fine_search_radius;
 
         // Tile grid from padded ref level (Python: h // tile_size)
         int ny = r.h / ts;
@@ -1350,9 +985,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             metric = cfg.bm_metrics[lvl];
 
         if (metric == "L1")
-            block_match_level_L1(r, m, ts, radius, flow, cfg.num_threads);
+            block_match_level_L1(r, m, ts, radius, flow, cfg, cfg.num_threads);
         else
-            block_match_level_L2(r, m, ts, radius, flow, cfg.num_threads);
+            block_match_level_L2(r, m, ts, radius, flow, cfg, cfg.num_threads);
 
         // alignment.py align_lvl: block matching, then ICA, at this level --
         // before the flow is upscaled and its error multiplied.
@@ -1369,8 +1004,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // With per-level ICA the loop above already refined level 0, and repeating
     // it here would run ICA twice on the finest scale.
     // Coarse-only leaves the finest level to this pass, so it must still run.
-    // Kept past the block so regularisation can read it; the per-level cache
-    // holds the equivalent when the loop above refined the finest level.
     HessianField finest_hess;
     if (!ica_all || cfg.ica_per_level_coarse_only()) {
         Image gx = compute_sobel_gradx(ref_grey);
@@ -1381,21 +1014,15 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow, tile_size,
                          cfg.ica_n_iter, cfg.num_threads);
     }
-    const HessianField* reg_hess = nullptr;
-    if (finest_hess.ny == flow.ny && finest_hess.nx == flow.nx)
-        reg_hess = &finest_hess;
-    else if (!g_ref_ica_cache.levels.empty() &&
-             g_ref_ica_cache.levels[0].hess.ny == flow.ny &&
-             g_ref_ica_cache.levels[0].hess.nx == flow.nx)
-        reg_hess = &g_ref_ica_cache.levels[0].hess;
-    mark_aperture_limited_tiles(flow, reg_hess, cfg);
-    regularize_flow_aperture(flow, reg_hess, cfg, tile_size,
-                             ref_grey.h, ref_grey.w,
-                             initial_dx, initial_dy, initial_rotation_rad);
-    mark_aperture_weak_error(flow, reg_hess, cfg, tile_size,
-                             ref_grey.h, ref_grey.w,
-                             initial_dx, initial_dy, initial_rotation_rad);
-    mark_aperture_post_warp_error(flow, reg_hess, ref_grey, moving_grey, cfg, tile_size);
+    const HessianField* mark_hess = nullptr;
+    if (!finest_hess.data.empty()) {
+        mark_hess = &finest_hess;
+    } else if (!g_ref_ica_cache.levels.empty() &&
+               g_ref_ica_cache.levels[0].hess.ny == flow.ny &&
+               g_ref_ica_cache.levels[0].hess.nx == flow.nx) {
+        mark_hess = &g_ref_ica_cache.levels[0].hess;
+    }
+    mark_aperture_limited_tiles(flow, mark_hess, cfg);
     return flow;
 }
 
@@ -1442,172 +1069,11 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
             if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.aperture(ty, tx) = flow.aperture(gy, gx);
-            // A magnitude along a direction, so it scales with the displacements
-            // it was measured from -- which puts it in raw pixels, the units the
-            // Gaussian's safe/sigma are specified in.
-            if (flow.aperture_weak_error.size() == (size_t)flow.ny * (size_t)flow.nx)
-                out.aperture_weak_error[(size_t)ty * out.nx + tx] =
-                    flow.aperture_weak_error[(size_t)gy * flow.nx + gx] * sx;
-            if (flow.aperture_post_error.size() == (size_t)flow.ny * (size_t)flow.nx) {
-                // Scale the magnitude, preserve the negative sentinel.
-                const f32 pe = flow.aperture_post_error[(size_t)gy * flow.nx + gx];
-                out.aperture_post_error[(size_t)ty * out.nx + tx] =
-                    (pe < 0.f) ? pe : pe * sx;
-            }
-            if (flow.fb_confidence.size() == (size_t)flow.ny * (size_t)flow.nx)
-                out.fb(ty, tx) = flow.fb(gy, gx);
+            if (flow.match_ambiguous.size() == (size_t)flow.ny * (size_t)flow.nx)
+                out.ambiguous(ty, tx) = flow.ambiguous(gy, gx);
         }
     }
     return out;
-}
-
-namespace {
-
-static inline f32 sample_flow_bilinear(const FlowField& flow, f32 ty, f32 tx, int ch,
-                                       bool& ok) {
-    ok = false;
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return 0.f;
-    if (!(ty >= 0.f && ty <= (f32)(flow.ny - 1) &&
-          tx >= 0.f && tx <= (f32)(flow.nx - 1)))
-        return 0.f;
-    int y0 = (int)std::floor(ty);
-    int x0 = (int)std::floor(tx);
-    int y1 = std::min(y0 + 1, flow.ny - 1);
-    int x1 = std::min(x0 + 1, flow.nx - 1);
-    f32 fy = ty - (f32)y0;
-    f32 fx = tx - (f32)x0;
-    const size_t o00 = ((size_t)y0 * flow.nx + x0) * 2 + (size_t)ch;
-    const size_t o01 = ((size_t)y0 * flow.nx + x1) * 2 + (size_t)ch;
-    const size_t o10 = ((size_t)y1 * flow.nx + x0) * 2 + (size_t)ch;
-    const size_t o11 = ((size_t)y1 * flow.nx + x1) * 2 + (size_t)ch;
-    f32 top = flow.flow[o00] + (flow.flow[o01] - flow.flow[o00]) * fx;
-    f32 bot = flow.flow[o10] + (flow.flow[o11] - flow.flow[o10]) * fx;
-    ok = true;
-    return top + (bot - top) * fy;
-}
-
-static inline f32 smoothstep01(f32 x) {
-    x = clampf(x, 0.f, 1.f);
-    return x * x * (3.f - 2.f * x);
-}
-
-static f32 median_inplace(std::vector<f32>& vals) {
-    if (vals.empty()) return 0.f;
-    const size_t mid = vals.size() / 2;
-    using Diff = std::vector<f32>::difference_type;
-    std::nth_element(vals.begin(), vals.begin() + (Diff)mid, vals.end());
-    f32 m = vals[mid];
-    if ((vals.size() & 1u) == 0u) {
-        std::nth_element(vals.begin(), vals.begin() + (Diff)(mid - 1), vals.end());
-        m = 0.5f * (m + vals[mid - 1]);
-    }
-    return m;
-}
-
-} // namespace
-
-void apply_forward_backward_confidence(FlowField& forward, const FlowField& backward,
-                                       int tile_size, const Config& cfg) {
-    const size_t n = (size_t)std::max(0, forward.ny) * (size_t)std::max(0, forward.nx);
-    forward.fb_confidence.assign(n, 1.f);
-    if (!cfg.fb_consistency_enabled) return;
-    if (n == 0 || forward.flow.empty() || backward.flow.empty()) return;
-    if (forward.ny != backward.ny || forward.nx != backward.nx) return;
-
-    std::vector<f32> err(n, std::numeric_limits<f32>::quiet_NaN());
-    std::atomic<long long> valid_count{0}, invalid_count{0}, rejected_count{0};
-    const f32 min_err = std::max(0.f, cfg.fb_consistency_min_error);
-    const f32 k = std::max(0.f, cfg.fb_consistency_sigma);
-    const int rad = std::max(1, std::min(8, cfg.fb_consistency_radius));
-
-    parallel_rows(forward.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < forward.nx; ++tx) {
-            const f32 fdx = forward.dx(ty, tx);
-            const f32 fdy = forward.dy(ty, tx);
-            const f32 sx = (f32)tx + fdx / (f32)std::max(1, tile_size);
-            const f32 sy = (f32)ty + fdy / (f32)std::max(1, tile_size);
-            bool okx = false, oky = false;
-            const f32 bdx = sample_flow_bilinear(backward, sy, sx, 0, okx);
-            const f32 bdy = sample_flow_bilinear(backward, sy, sx, 1, oky);
-            if (okx && oky) {
-                const f32 ex = fdx + bdx;
-                const f32 ey = fdy + bdy;
-                err[(size_t)ty * forward.nx + tx] = std::sqrt(ex * ex + ey * ey);
-                valid_count.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    });
-
-    std::vector<f32> valid_err;
-    valid_err.reserve(n);
-    for (f32 v : err) {
-        if (std::isfinite(v)) valid_err.push_back(v);
-    }
-    if (!valid_err.empty()) {
-        std::sort(valid_err.begin(), valid_err.end());
-        auto pct = [&](f32 q) {
-            const size_t last = valid_err.size() - 1;
-            const f32 pos = clampf(q, 0.f, 1.f) * (f32)last;
-            const size_t lo = (size_t)std::floor(pos);
-            const size_t hi = std::min(last, lo + 1);
-            const f32 t = pos - (f32)lo;
-            return valid_err[lo] + (valid_err[hi] - valid_err[lo]) * t;
-        };
-        prof_add_cpu("fb#p50-error", (double)pct(0.50f));
-        prof_add_cpu("fb#p75-error", (double)pct(0.75f));
-        prof_add_cpu("fb#p90-error", (double)pct(0.90f));
-        prof_add_cpu("fb#p95-error", (double)pct(0.95f));
-        prof_add_cpu("fb#p99-error", (double)pct(0.99f));
-    }
-
-    parallel_rows(forward.ny, cfg.num_threads, [&](int ty) {
-        std::vector<f32> vals;
-        std::vector<f32> devs;
-        vals.reserve((size_t)(2 * rad + 1) * (size_t)(2 * rad + 1));
-        devs.reserve(vals.capacity());
-        for (int tx = 0; tx < forward.nx; ++tx) {
-            const size_t idx = (size_t)ty * forward.nx + tx;
-            const f32 e = err[idx];
-            if (!std::isfinite(e)) {
-                forward.fb(ty, tx) = 1.f;
-                invalid_count.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-
-            vals.clear();
-            for (int yy = ty - rad; yy <= ty + rad; ++yy) {
-                if (yy < 0 || yy >= forward.ny) continue;
-                for (int xx = tx - rad; xx <= tx + rad; ++xx) {
-                    if (xx < 0 || xx >= forward.nx) continue;
-                    const f32 v = err[(size_t)yy * forward.nx + xx];
-                    if (std::isfinite(v)) vals.push_back(v);
-                }
-            }
-            if (vals.size() < 4) {
-                forward.fb(ty, tx) = 1.f;
-                continue;
-            }
-            std::vector<f32> vals_copy = vals;
-            const f32 med = median_inplace(vals_copy);
-            devs.clear();
-            for (f32 v : vals) devs.push_back(std::fabs(v - med));
-            const f32 mad = median_inplace(devs);
-            const f32 sigma = 1.4826f * mad + 1.0e-4f;
-            const f32 start = std::max(min_err, med + k * sigma);
-            const f32 stop = start + std::max(0.25f, sigma);
-            const f32 c = 1.f - smoothstep01((e - start) / (stop - start));
-            forward.fb(ty, tx) = c;
-            if (c < 0.999f)
-                rejected_count.fetch_add(1, std::memory_order_relaxed);
-        }
-    });
-
-    prof_add_cpu("fb#enabled", 1.0);
-    prof_add_cpu("fb#valid-tiles", (double)valid_count.load());
-    prof_add_cpu("fb#invalid-tiles", (double)invalid_count.load());
-    prof_add_cpu("fb#penalized-tiles", (double)rejected_count.load());
-    prof_add_cpu("fb#min-error", (double)min_err);
-    prof_add_cpu("fb#sigma-k", (double)k);
 }
 
 } // namespace hhsr

@@ -311,17 +311,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
     if (tuning[@"r_s2"]) cfg.r_s2 = tuning[@"r_s2"].floatValue;
     if (tuning[@"r_Mt"]) cfg.r_Mt = tuning[@"r_Mt"].floatValue;
-    if (tuning[@"fb_consistency_enabled"])
-        cfg.fb_consistency_enabled = tuning[@"fb_consistency_enabled"].boolValue;
-    if (tuning[@"fb_consistency_min_error"])
-        cfg.fb_consistency_min_error =
-            std::max(0.f, tuning[@"fb_consistency_min_error"].floatValue);
-    if (tuning[@"fb_consistency_sigma"])
-        cfg.fb_consistency_sigma =
-            std::max(0.f, tuning[@"fb_consistency_sigma"].floatValue);
-    if (tuning[@"fb_consistency_radius"])
-        cfg.fb_consistency_radius =
-            std::max(1, std::min(8, tuning[@"fb_consistency_radius"].intValue));
     // Alignment grey: FFT low-pass at full resolution, or the 2x2 Bayer quad
     // average at half resolution that Wronski et al. describe. The quad average
     // also constrains displacements to multiples of 2 Bayer pixels, so shifted
@@ -335,48 +324,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
     if (tuning[@"hf_min_texture_snr"])
         cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
-    if (tuning[@"flow_regularize_enabled"])
-        cfg.flow_regularize_enabled = tuning[@"flow_regularize_enabled"].boolValue;
-    if (tuning[@"flow_regularize_threshold"])
-        cfg.flow_regularize_threshold = tuning[@"flow_regularize_threshold"].floatValue;
-    if (tuning[@"flow_regularize_aperture_ratio"])
-        cfg.flow_regularize_aperture_ratio =
-            std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
-    if (tuning[@"flow_regularize_soft_ratio_low"])
-        cfg.flow_regularize_soft_ratio_low =
-            std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_soft_ratio_low"].floatValue));
-    if (tuning[@"flow_regularize_global_weight"])
-        cfg.flow_regularize_global_weight =
-            std::max(0.0f, std::min(1.0f, tuning[@"flow_regularize_global_weight"].floatValue));
-    if (tuning[@"flow_regularize_max_residual"])
-        cfg.flow_regularize_max_residual =
-            std::max(0.0f, tuning[@"flow_regularize_max_residual"].floatValue);
     if (tuning[@"flow_reject_1d_enabled"])
         cfg.flow_reject_1d_enabled = tuning[@"flow_reject_1d_enabled"].boolValue;
-    if (tuning[@"aperture_post_strength"])
-        cfg.aperture_post_strength =
-            std::max(0.0f, std::min(1.0f, tuning[@"aperture_post_strength"].floatValue));
-    if (tuning[@"aperture_post_safe_px"])
-        cfg.aperture_post_safe_px = std::max(0.0f, tuning[@"aperture_post_safe_px"].floatValue);
-    if (tuning[@"aperture_post_sigma_px"])
-        cfg.aperture_post_sigma_px = std::max(0.01f, tuning[@"aperture_post_sigma_px"].floatValue);
-    if (tuning[@"aperture_residual_enabled"])
-        cfg.aperture_residual_enabled = tuning[@"aperture_residual_enabled"].boolValue;
-    if (tuning[@"aperture_residual_safe_ratio"])
-        cfg.aperture_residual_safe_ratio =
-            std::max(0.0f, tuning[@"aperture_residual_safe_ratio"].floatValue);
-    if (tuning[@"aperture_residual_sigma_ratio"])
-        cfg.aperture_residual_sigma_ratio =
-            std::max(0.01f, tuning[@"aperture_residual_sigma_ratio"].floatValue);
-    if (tuning[@"aperture_weak_safe_px"])
-        cfg.aperture_weak_safe_px =
-            std::max(0.0f, tuning[@"aperture_weak_safe_px"].floatValue);
-    if (tuning[@"aperture_weak_sigma_px"])
-        cfg.aperture_weak_sigma_px =
-            std::max(0.01f, tuning[@"aperture_weak_sigma_px"].floatValue);
-    if (tuning[@"flow_reject_1d_strength"])
-        cfg.flow_reject_1d_strength =
-            std::max(0.0f, std::min(1.0f, tuning[@"flow_reject_1d_strength"].floatValue));
+    if (tuning[@"flow_regularize_aperture_ratio"])
+        cfg.flow_regularize_aperture_ratio =
+            std::max(0.f, std::min(1.f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
+    if (tuning[@"flow_reject_1d_ambiguity_ratio"])
+        cfg.flow_reject_1d_ambiguity_ratio =
+            std::max(1.f, tuning[@"flow_reject_1d_ambiguity_ratio"].floatValue);
     if (tuning[@"motion_edge_rejection_enabled"])
         cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
     if (tuning[@"motion_edge_threshold"])
@@ -394,6 +349,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
+    if (tuning[@"debug_pixel4a_noise_profile"])
+        cfg.debug_pixel4a_noise_profile = tuning[@"debug_pixel4a_noise_profile"].boolValue;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;
         cfg.alignment_tile_size =
@@ -445,10 +402,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
     if (tuning[@"align_ica_per_level_fft"])
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
-    if (tuning[@"align_fine_search_radius"]) {
-        const int r = tuning[@"align_fine_search_radius"].intValue;
-        cfg.align_fine_search_radius = (r >= 1 && r <= 4) ? r : 0;
-    }
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
@@ -505,10 +458,18 @@ static NSDictionary *TIFFMetadata(NSDictionary *metadata) {
     return DictValue(metadata, @"{TIFF}");
 }
 
+static NSDictionary *EXIFMetadata(NSDictionary *metadata) {
+    if (!metadata) return nil;
+    NSDictionary *exif = DictValue(metadata, (__bridge NSString *)kCGImagePropertyExifDictionary);
+    if (exif) return exif;
+    return DictValue(metadata, @"{Exif}");
+}
+
 static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) {
     NSDictionary *metadata = DictValue(frame, @"metadata");
     NSDictionary *dng = DNGMetadata(metadata);
     NSDictionary *tiff = TIFFMetadata(metadata);
+    NSDictionary *exif = EXIFMetadata(metadata);
 
     cfg.camera_make = NSStringToStd(FirstValueForKeys(tiff, @[
         (__bridge NSString *)kCGImagePropertyTIFFMake, @"Make"
@@ -603,6 +564,13 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
             cfg.alpha > 0.f && std::isfinite(cfg.alpha) && std::isfinite(cfg.beta);
     } else {
         cfg.has_noise_profile = false;
+    }
+    if (cfg.debug_pixel4a_noise_profile) {
+        const float iso = FirstNumber(FirstValueForKeys(exif, @[
+            (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings,
+            @"ISOSpeedRatings", @"PhotographicSensitivity", @"ISO"
+        ]), 100.f);
+        apply_pixel4a_noise_profile(cfg, iso);
     }
 
     std::vector<double> color;

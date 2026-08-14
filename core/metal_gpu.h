@@ -33,13 +33,17 @@ Image compute_grey_fft_metal(const Image& raw);
 // Returns false on failure (caller must not fall back to CPU).
 bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
-                                FlowField& flow);
+                                FlowField& flow,
+                                float ambiguity_ratio = 1.10f,
+                                bool write_ambiguity = false);
 
 // L1 BM for ts==16 (default finest level). Same warp-reduce + broken argmin
 // as align.cpp. Returns false if unsupported (ts!=16 or R>1) or GPU fail.
 bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
-                                FlowField& flow);
+                                FlowField& flow,
+                                float ambiguity_ratio = 1.10f,
+                                bool write_ambiguity = false);
 
 // ICA refine one pyramid level (ICA.py ica_kernel_8/16). Same bilinear rules,
 // modf/trunc, butterfly reduce order, and Ax=B update as align.cpp / Python.
@@ -64,11 +68,6 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
 
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
-
-// Cached reference ICA Hessian for the tile grid [ny, nx], packed ny*nx*4
-// (h00,h01,h10,h11). Used by flow regularisation to find each tile's
-// unobservable direction. False when no cached level matches that grid.
-bool metal_fetch_ref_hessian(int ny, int nx, std::vector<float>& out);
 
 // num/den → packed RGB16 (same math as encode_band_rows DNG path). Preview
 // sampling stays on the host. Returns false → caller uses CPU encode.

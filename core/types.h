@@ -42,31 +42,13 @@ struct FlowField {
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
     std::vector<uint32_t> aperture_limited; // ny*nx, 1 = Hessian says 1D/aperture-limited
-    // ny*nx. For an aperture-limited tile, |(v_local - v_global) . e2|: how far
-    // this tile's flow disagrees with the global pre-alignment along the
-    // direction the image cannot constrain. Raw pixels once the field has been
-    // through flow_to_raw_tile_grid. Zero where the tile is well determined.
-    std::vector<f32> aperture_weak_error;
-    // ny*nx. |delta_2|: after the repaired flow is applied, how far the warped
-    // image still wants to move along the weak direction, from a 1-D
-    // Lucas-Kanade step restricted to e2. Independent of the global prior --
-    // this asks the image, not another model. Raw pixels after
-    // flow_to_raw_tile_grid.
-    //
-    // NEGATIVE means no measurement: either the tile is not aperture-limited or
-    // grad(I).e2 carried too little energy to solve. That has to be distinct
-    // from 0, because 0 now means "measured, and aligned" -- which outranks the
-    // prior-based test, while "not measured" falls back to it.
-    std::vector<f32> aperture_post_error;
-    std::vector<f32> fb_confidence; // ny*nx, 0..1 geometric confidence
+    std::vector<uint32_t> match_ambiguous;  // ny*nx, 1 = best BM match is not clearly unique
 
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
         aperture_limited((size_t)ny_ * nx_, 0u),
-        aperture_weak_error((size_t)ny_ * nx_, 0.f),
-        aperture_post_error((size_t)ny_ * nx_, -1.f),   // -1 = not measured
-        fb_confidence((size_t)ny_ * nx_, 1.f) {}
+        match_ambiguous((size_t)ny_ * nx_, 0u) {}
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
@@ -74,8 +56,8 @@ struct FlowField {
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
     inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
-    inline f32& fb(int ty, int tx) { return fb_confidence[(size_t)ty * nx + tx]; }
-    inline f32 fb(int ty, int tx) const { return fb_confidence[(size_t)ty * nx + tx]; }
+    inline uint32_t& ambiguous(int ty, int tx) { return match_ambiguous[(size_t)ty * nx + tx]; }
+    inline uint32_t ambiguous(int ty, int tx) const { return match_ambiguous[(size_t)ty * nx + tx]; }
 };
 
 // Per-grey-pixel 2x2 covariance field (steerable kernels): [h, w, 4] = xx,xy,yx,yy.
@@ -201,6 +183,11 @@ struct Config {
     float alpha = 1.80710882e-4f;
     float beta  = 3.1937599182128e-6f;
     bool  has_noise_profile = false;
+    // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
+    // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
+    // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.
+    bool  debug_pixel4a_noise_profile = false;
+    int   debug_pixel4a_noise_curve_iso = 0;
 
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
@@ -283,121 +270,6 @@ struct Config {
         return align_ica_per_level_fft && grey_method == GreyMethod::FFT;
     }
 
-    // Override the finest level's block-match search radius. 0 keeps
-    // bm_search_radii[0].
-    //
-    // The default of 1 assumes the flow arriving from level 1 is already
-    // sub-pixel, which is only true when ICA has run there. Raising it buys
-    // margin directly, at (2r+1)^2 / 9 times the finest level's search cost:
-    // 2.8x at radius 2, 5.4x at radius 3. The finest level is the most
-    // expensive one, so this is not free.
-    int align_fine_search_radius = 0;
-    // Median-filter a tile's displacement component when it disagrees with its
-    // neighbours by more than flow_regularize_threshold pixels.
-    //
-    // The aperture problem is local, not global: a tile holding one long edge
-    // cannot see its along-edge motion, but that motion is shared with the
-    // neighbours and one tile over there is usually a corner or an end that
-    // determines it. Applied per component, so on a horizontal edge the
-    // unobservable dx is repaired and the well-determined dy is left alone.
-    //
-    // Aimed at static scenes, where the true field is one rigid transform and
-    // any tile-to-tile disagreement is error. Across a genuine motion boundary
-    // the neighbours' median belongs to neither side, so leave it off when the
-    // subject moves.
-    bool  flow_regularize_enabled = false;
-    float flow_regularize_threshold = 1.0f;
-    // A tile is considered aperture-limited when lambda2/lambda1 is below this
-    // ratio. Higher catches more edge-like tiles; lower limits repair to very
-    // one-dimensional tiles.
-    float flow_regularize_aperture_ratio = 0.15f;
-    // Lower edge of the anisotropy ramp. The repair blends between taking the
-    // neighbours' weak-direction value (at or below this) and keeping the
-    // tile's own (at flow_regularize_aperture_ratio and above).
-    //
-    // Default 1.0 is >= the ratio, which makes smoothstepf degenerate to a step
-    // and reproduces the hard gate exactly -- so this is inert until set below
-    // the ratio. 0.05 with the 0.15 ratio gives the ramp: a tile at q = 0.10
-    // then keeps half its measured disagreement instead of all or none.
-    float flow_regularize_soft_ratio_low = 1.0f;
-    // Cap on how far a repaired tile may still sit from the PRIOR along the weak
-    // direction, in GREY pixels (two raw px on the decimate grey). 0 disables it.
-    //
-    // Named for what it bounds: the residual, not the correction. A tile 2px off
-    // with alpha = 0 is still moved the full 2px whatever this is set to --
-    // the cap constrains where the result lands, not how far it travelled.
-    float flow_regularize_max_residual = 0.0f;
-    // How much of the repair target comes from the global pre-alignment rather
-    // than the neighbour median, scaled by (1 - alpha) so it applies hardest
-    // where the tile can see least. 0 restores the neighbour-only behaviour.
-    //
-    // The median is blind to drift that is coherent across the neighbourhood,
-    // which is the normal failure for a long straight edge: every tile along it
-    // is aperture-limited in the same direction, so they drift together, the
-    // median agrees with the centre and nothing is repaired. The global fit is
-    // measured from the whole frame and cannot drift with them.
-    float flow_regularize_global_weight = 1.0f;
-    // Test switch: force merge robustness to zero for every tile that passes
-    // the same Hessian aperture-limited test, instead of repairing the flow.
-    bool  flow_reject_1d_enabled = false;
-    // How hard a 1D tile is rejected. 1 zeroes it -- the original behaviour and
-    // the default. Below 1 it keeps that fraction of its robustness instead.
-    //
-    // The rejection is all-or-nothing per tile AND derived from the reference
-    // alone, so a tile holding a strong edge in the reference contributes
-    // nothing from any frame, in every burst, whether or not that frame was
-    // actually misaligned there. It is not rejecting bad frames, it is
-    // permanently excluding regions -- which is why it over-rejects even at a
-    // low aperture ratio: lowering the ratio shrinks the set of excluded tiles
-    // but each one is still excluded completely.
-    //
-    // A partial weight keeps the same targeting and reduces the cost: an
-    // aperture-limited tile still merges, just with less confidence, so those
-    // regions keep some denoising and super-resolution instead of falling back
-    // to reference-only.
-    float flow_reject_1d_strength = 1.0f;
-    // The structure-tensor gate is an ELIGIBILITY test, not a verdict. A tile
-    // being one-dimensional says the image cannot constrain motion along the
-    // edge; it does not say this frame got it wrong. Rejecting on the flag alone
-    // discards every strongly 1D edge including perfectly aligned ones, which is
-    // why it costs so much merge even when the targeting is right.
-    //
-    // The evidence is the weak-direction disagreement with the global
-    // pre-alignment, |(v_local - v_global) . e2|, carried per tile in
-    // FlowField::aperture_weak_error. Confidence falls off as a Gaussian in the
-    // excess over aperture_weak_safe_px:
-    //
-    //   C = exp(-0.5 * ((max(0, d_weak - safe)) / sigma)^2)      for q < ratio
-    //   C = 1                                                    otherwise
-    //
-    // so a straight edge that agrees with the global model (d_weak ~ 0.04px)
-    // merges untouched, and one that has drifted along itself (~0.55px) is
-    // suppressed. Both in RAW pixels.
-    float aperture_weak_safe_px  = 0.15f;
-    float aperture_weak_sigma_px = 0.30f;
-    // Post-warp directional validation. Same Gaussian shape, applied to the
-    // residual the IMAGE still shows along e2 after the repair, so it is the one
-    // term in this loop not derived from the global prior. 0 disables it.
-    float aperture_post_strength  = 0.0f;
-    float aperture_post_safe_px   = 0.20f;
-    float aperture_post_sigma_px  = 0.30f;
-    // Minimum directional gradient energy, summed over the tile, before the
-    // post-warp step is trusted. On a true aperture edge grad(I).e2 is small by
-    // construction, so below this the 1-D solve is fitting noise -- and an error
-    // that cannot be measured along the edge cannot be seen along it either, so
-    // reporting nothing is right rather than merely safe.
-    float aperture_post_min_energy = 1e-4f;
-    // When enabled, the 1D aperture gate needs direct image evidence: after
-    // applying the tile flow, the aligned-frame residual must be high relative
-    // to the expected frame-to-frame noise. This keeps the useful old
-    // "reject 1D" targeting, but stops rejecting every static straight edge.
-    bool  aperture_residual_enabled = true;
-    // Residual ratio is mean((aligned - reference)^2 / expected_noise_diff^2)
-    // over the guide channels at the sampled robustness pixel. Higher values
-    // reject less; lower values make the 1D rejection more aggressive.
-    float aperture_residual_safe_ratio = 16.0f;
-    float aperture_residual_sigma_ratio = 8.0f;
-
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
     // With this false the plan stays empty, so every frame enters align() with a
@@ -455,16 +327,18 @@ struct Config {
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
     float r_Mt = 0.8f;
-    // Optional forward/backward geometry gate. It computes the reverse flow
-    // for the same frame pair and suppresses only local outliers:
-    //   ||V_f(p) + V_b(p + V_f(p))|| > local_median + k * local_MAD
-    // and above a minimum raw-pixel error. This catches smooth-looking wrong
-    // repeated-pattern correspondences without treating the whole frame as a
-    // precision test.
-    bool  fb_consistency_enabled = false;
-    float fb_consistency_min_error = 0.75f;
-    float fb_consistency_sigma = 3.0f;
-    int   fb_consistency_radius = 2;
+    // Test switch from the aperture experiments: force merge robustness to zero
+    // only when a tile is one-dimensional and its block-match winner is
+    // ambiguous. This does not repair flow; it rejects unsafe 1D tiles.
+    bool  flow_reject_1d_enabled = false;
+    // A tile is considered one-dimensional when lambda2/lambda1 is below this
+    // ratio. Higher catches more edge-like tiles; lower limits rejection to
+    // very purely one-dimensional tiles.
+    float flow_regularize_aperture_ratio = 0.15f;
+    // A 1D tile is rejected only when the second-best block match is closer
+    // than this multiple of the best match. 1.10 means the runner-up is less
+    // than 10% worse, so the match is not trusted.
+    float flow_reject_1d_ambiguity_ratio = 1.10f;
     // Scales the estimated sensor noise variance subtracted before the HF
     // loss ratio. >1 assumes more noise, so less of the local variance counts
     // as signal and fewer areas are flagged as high-frequency detail; <1 is
@@ -578,6 +452,28 @@ struct Config {
 };
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+inline int round_pixel4a_noise_curve_iso(f32 iso) {
+    if (!std::isfinite(iso) || iso <= 0.f)
+        iso = 100.f;
+    const double n = std::round(std::log2((double)iso / 100.0));
+    int rounded = (int)std::lround(100.0 * std::pow(2.0, n));
+    if (rounded < 50) rounded = 50;
+    if (rounded > 3200) rounded = 3200;
+    return rounded;
+}
+
+inline void apply_pixel4a_noise_profile(Config& cfg, f32 iso) {
+    constexpr f32 kPixel4aAlphaIso100 = 1.80710882e-4f;
+    constexpr f32 kPixel4aBetaIso100  = 3.1937599182128e-6f;
+    if (!std::isfinite(iso) || iso <= 0.f)
+        iso = 100.f;
+    const f32 scale = iso / 100.f;
+    cfg.alpha = kPixel4aAlphaIso100 * scale;
+    cfg.beta = kPixel4aBetaIso100 * scale * scale;
+    cfg.has_noise_profile = true;
+    cfg.debug_pixel4a_noise_curve_iso = round_pixel4a_noise_curve_iso(iso);
+}
 
 inline f32 smoothstepf(f32 edge0, f32 edge1, f32 x) {
     if (edge1 <= edge0) return x >= edge1 ? 1.f : 0.f;

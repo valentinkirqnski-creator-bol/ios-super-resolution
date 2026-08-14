@@ -457,6 +457,9 @@ struct AlignLocalSearch460Params {
     int ts, R;
     int ref_h, ref_w, mov_h, mov_w;
     uint l1;
+    float ambiguity_ratio;
+    uint write_ambiguity;
+    uint _pad0;
 };
 
 // One threadgroup per tile; threads split the candidate shifts.
@@ -470,15 +473,19 @@ struct AlignLocalSearch460Params {
 // which reproduces the original sdy-outer / sdx-inner first-minimum-wins scan.
 //
 // Threadgroup memory is supplied by the host: [0] = ts*ts floats for the tile,
-// [1]/[2] = one float/int per lane for the reduction. `lanes` must be a power of
-// two (the host enforces this) for the tree reduction to cover every element.
+// [1]/[2] = best float/int per lane, [3]/[4] = second-best float/int per lane.
+// `lanes` must be a power of two (the host enforces this) for the tree
+// reduction to cover every element.
 kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    device const float* mov [[buffer(1)]],
                                    device float* flow [[buffer(2)]],
                                    constant AlignLocalSearch460Params& p [[buffer(3)]],
+                                   device uint* ambiguity [[buffer(4)]],
                                    threadgroup float* ref_tile [[threadgroup(0)]],
                                    threadgroup float* red_dist [[threadgroup(1)]],
                                    threadgroup int* red_cand [[threadgroup(2)]],
+                                   threadgroup float* red_second_dist [[threadgroup(3)]],
+                                   threadgroup int* red_second_cand [[threadgroup(4)]],
                                    uint tile_id [[threadgroup_position_in_grid]],
                                    uint lane [[thread_position_in_threadgroup]],
                                    uint lanes [[threads_per_threadgroup]]) {
@@ -515,7 +522,9 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float best_dist = INFINITY;
+    float second_dist = INFINITY;
     int best_cand = kNone;
+    int second_cand = kNone;
 
     if (ref_in) {
         const int ifx = int(local_fx);
@@ -542,26 +551,63 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                 }
             }
             if (dist < best_dist) {
+                second_dist = best_dist;
+                second_cand = best_cand;
                 best_dist = dist;
                 best_cand = c;
+            } else if (dist < second_dist) {
+                second_dist = dist;
+                second_cand = c;
             }
         }
     }
 
     red_dist[lane] = best_dist;
     red_cand[lane] = best_cand;
+    red_second_dist[lane] = second_dist;
+    red_second_cand[lane] = second_cand;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint s = lanes >> 1u; s > 0u; s >>= 1u) {
         if (lane < s) {
-            const float od = red_dist[lane + s];
-            const int oc = red_cand[lane + s];
-            if (oc != kNone &&
-                (od < red_dist[lane] ||
-                 (od == red_dist[lane] && oc < red_cand[lane]))) {
-                red_dist[lane] = od;
-                red_cand[lane] = oc;
+            float bd = red_dist[lane];
+            int bc = red_cand[lane];
+            float sd = red_second_dist[lane];
+            int sc = red_second_cand[lane];
+
+            const float od0 = red_dist[lane + s];
+            const int oc0 = red_cand[lane + s];
+            if (oc0 != kNone) {
+                if (bc == kNone || od0 < bd || (od0 == bd && oc0 < bc)) {
+                    sd = bd;
+                    sc = bc;
+                    bd = od0;
+                    bc = oc0;
+                } else if (oc0 != bc &&
+                           (sc == kNone || od0 < sd || (od0 == sd && oc0 < sc))) {
+                    sd = od0;
+                    sc = oc0;
+                }
             }
+
+            const float od1 = red_second_dist[lane + s];
+            const int oc1 = red_second_cand[lane + s];
+            if (oc1 != kNone) {
+                if (bc == kNone || od1 < bd || (od1 == bd && oc1 < bc)) {
+                    sd = bd;
+                    sc = bc;
+                    bd = od1;
+                    bc = oc1;
+                } else if (oc1 != bc &&
+                           (sc == kNone || od1 < sd || (od1 == sd && oc1 < sc))) {
+                    sd = od1;
+                    sc = oc1;
+                }
+            }
+            red_dist[lane] = bd;
+            red_cand[lane] = bc;
+            red_second_dist[lane] = sd;
+            red_second_cand[lane] = sc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -576,6 +622,14 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
         }
         flow[tile_id * 2u + 0u] = local_fx + float(sdx);
         flow[tile_id * 2u + 1u] = local_fy + float(sdy);
+        if (p.write_ambiguity != 0u) {
+            const float b = max(red_dist[0], 0.f);
+            const float s = max(red_second_dist[0], 0.f);
+            const float denom = max(b, 1.0e-12f);
+            ambiguity[tile_id] =
+                (isfinite(b) && isfinite(s) && (s / denom) < p.ambiguity_ratio)
+                    ? 1u : 0u;
+        }
     }
 }
 
@@ -1430,16 +1484,6 @@ struct RobMaskParams {
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
     uint aperture_reject_enabled;
-    uint fb_enabled;
-    float aperture_reject_strength;
-    float aperture_weak_safe_px;
-    float aperture_weak_sigma_px;
-    float aperture_post_strength;
-    float aperture_post_safe_px;
-    float aperture_post_sigma_px;
-    uint aperture_residual_enabled;
-    float aperture_residual_safe_ratio;
-    float aperture_residual_sigma_ratio;
     uint _pad0;
 };
 
@@ -1687,12 +1731,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* ref_hf_loss [[buffer(5)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           device const uint* aperture_limited [[buffer(12)]],
-                          device const float* fb_confidence [[buffer(13)]],
-                          device const float* aperture_weak_error [[buffer(14)]],
-                          device const float* aperture_post_error [[buffer(15)]],
+                          device const uint* match_ambiguous [[buffer(13)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
-    float d_sq_ = 0.f, sigma_sq_ = 0.f, residual_noise_ratio = 0.f;
+    float d_sq_ = 0.f, sigma_sq_ = 0.f;
     int patch_idy;
     int patch_idx;
     float flow_x;
@@ -1738,11 +1780,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
-        residual_noise_ratio += d_p_sq / max(d_t * d_t, 1e-8f);
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
         d_sq_ += d_p_sq * shrink * shrink;
     }
-    residual_noise_ratio /= max(1.f, float(p.nch));
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -1801,45 +1841,14 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    bool aperture_eligible =
-        p.aperture_reject_enabled != 0u && aperture_limited[pidx] != 0u;
-    bool hard_reject = hf_reject || edge_reject;
+    bool aperture_reject =
+        p.aperture_reject_enabled != 0u &&
+        aperture_limited[pidx] != 0u &&
+        match_ambiguous[pidx] != 0u;
+    bool hard_reject = hf_reject || edge_reject || aperture_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
-    // Mirror of robustness.cpp, including the precedence: where the post-warp
-    // step could be solved the image decides, otherwise fall back to agreement
-    // with the global prior. A negative post error means "not measured".
-    if (aperture_eligible) {
-        float w = clamp(p.aperture_reject_strength, 0.f, 1.f);
-        if (p.aperture_residual_enabled != 0u) {
-            float safe = max(0.f, p.aperture_residual_safe_ratio);
-            float rsig = max(1e-6f, p.aperture_residual_sigma_ratio);
-            float rexcess = max(0.f, residual_noise_ratio - safe);
-            float rt = rexcess / rsig;
-            float c_residual = exp(-0.5f * rt * rt);
-            r_val *= 1.f - w * (1.f - c_residual);
-        } else {
-            float wp = clamp(p.aperture_post_strength, 0.f, 1.f);
-            bool observable = wp > 0.f && aperture_post_error[pidx] >= 0.f;
-            if (observable) {
-                float psig = max(1e-6f, p.aperture_post_sigma_px);
-                float pex = max(0.f, aperture_post_error[pidx] - p.aperture_post_safe_px);
-                float pt = pex / psig;
-                float c_post = exp(-0.5f * pt * pt);
-                r_val *= 1.f - wp * (1.f - c_post);
-            } else {
-                float sigma = max(1e-6f, p.aperture_weak_sigma_px);
-                float excess = max(0.f, aperture_weak_error[pidx] - p.aperture_weak_safe_px);
-                float t = excess / sigma;
-                float c_aperture = exp(-0.5f * t * t);
-                r_val *= 1.f - w * (1.f - c_aperture);
-            }
-        }
-    }
-    if (p.fb_enabled != 0u) {
-        r_val *= clamp(fb_confidence[pidx], 0.f, 1.f);
-    }
     R[gid.y * p.w + gid.x] = r_val;
 }
 

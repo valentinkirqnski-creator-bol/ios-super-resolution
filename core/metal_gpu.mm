@@ -1127,19 +1127,9 @@ struct RobMaskParamsCPU {
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
     uint32_t aperture_reject_enabled = 0;
-    uint32_t fb_enabled = 0;
-    float aperture_reject_strength = 1.f;
-    float aperture_weak_safe_px = 0.15f;
-    float aperture_weak_sigma_px = 0.30f;
-    float aperture_post_strength = 0.f;
-    float aperture_post_safe_px = 0.20f;
-    float aperture_post_sigma_px = 0.30f;
-    uint32_t aperture_residual_enabled = 1;
-    float aperture_residual_safe_ratio = 16.f;
-    float aperture_residual_sigma_ratio = 8.f;
     uint32_t _pad0 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 120, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 80, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1353,6 +1343,8 @@ static id<MTLBuffer> g_rob_diff_curve = nil;
 static size_t g_rob_curve_n = 0;
 static float g_rob_curve_alpha = std::numeric_limits<float>::quiet_NaN();
 static float g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
+static bool g_rob_curve_pixel4a = false;
+static int g_rob_curve_pixel4a_iso = 0;
 
 static void clear_rob_ref_gpu() {
     g_rob_ref_hf = nil;
@@ -1366,6 +1358,8 @@ static void clear_rob_ref_gpu() {
     g_rob_curve_n = 0;
     g_rob_curve_alpha = std::numeric_limits<float>::quiet_NaN();
     g_rob_curve_beta  = std::numeric_limits<float>::quiet_NaN();
+    g_rob_curve_pixel4a = false;
+    g_rob_curve_pixel4a_iso = 0;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -1475,57 +1469,37 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     }
 
     if (!g_rob_std_curve || !g_rob_diff_curve ||
-        g_rob_curve_alpha != cfg.alpha || g_rob_curve_beta != cfg.beta) {
+        g_rob_curve_alpha != cfg.alpha ||
+        g_rob_curve_beta != cfg.beta ||
+        g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
+        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso) {
         std::vector<f32> std_curve, diff_curve;
-        fetch_noise_curves(cfg.alpha, cfg.beta, std_curve, diff_curve);
+        fetch_noise_curves(cfg, std_curve, diff_curve);
         if (std_curve.empty() || diff_curve.empty()) return Image();
         g_rob_std_curve = buf(std_curve.data(), std_curve.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_curve.data(), diff_curve.size() * sizeof(float));
         g_rob_curve_n = std_curve.size();
         g_rob_curve_alpha = cfg.alpha;
         g_rob_curve_beta = cfg.beta;
+        g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
+        g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
     }
     if (g_rob_curve_n == 0) return Image();
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
-    const size_t n_tiles = (size_t)flow.ny * (size_t)flow.nx;
-    // Both arrays, not just the flag: the shader indexes aperture_weak_error
-    // under the same condition, so a size mismatch there would read past the
-    // fallback buffer rather than simply skipping the test.
-    // All three arrays: the shader indexes every one of them under this single
-    // flag, so a short one would read past its fallback buffer.
+    const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     const bool aperture_reject_on =
         cfg.flow_reject_1d_enabled &&
         flow.aperture_limited.size() == n_tiles &&
-        flow.aperture_weak_error.size() == n_tiles &&
-        flow.aperture_post_error.size() == n_tiles;
+        flow.match_ambiguous.size() == n_tiles;
     id<MTLBuffer> b_aperture = aperture_reject_on
-        ? buf(flow.aperture_limited.data(),
-              flow.aperture_limited.size() * sizeof(uint32_t))
+        ? buf(flow.aperture_limited.data(), flow.aperture_limited.size() * sizeof(uint32_t))
         : b_motion;
-    // Same gate as b_aperture: when off, point at any live buffer so the
-    // binding is set (Metal faults at dispatch on an unset one) and let the
-    // shader's aperture_eligible test keep it unread.
-    static const float kDummyWeak = 0.f;
-    id<MTLBuffer> b_weak = aperture_reject_on
-        ? buf(flow.aperture_weak_error.data(),
-              flow.aperture_weak_error.size() * sizeof(float))
-        : buf(&kDummyWeak, sizeof(kDummyWeak));
-    // -1 = not measured, which is what the fallback path must see.
-    static const float kDummyPost = -1.f;
-    id<MTLBuffer> b_post = aperture_reject_on
-        ? buf(flow.aperture_post_error.data(),
-              flow.aperture_post_error.size() * sizeof(float))
-        : buf(&kDummyPost, sizeof(kDummyPost));
-    const bool fb_on =
-        cfg.fb_consistency_enabled &&
-        flow.fb_confidence.size() == (size_t)flow.ny * (size_t)flow.nx;
-    static const float kDummyFb = 1.f;
-    id<MTLBuffer> b_fb = fb_on
-        ? buf(flow.fb_confidence.data(), flow.fb_confidence.size() * sizeof(float))
-        : buf(&kDummyFb, sizeof(kDummyFb));
+    id<MTLBuffer> b_ambiguous = aperture_reject_on
+        ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
+        : b_motion;
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_ref_hf = b_ref_v;
@@ -1537,7 +1511,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_motion || !b_aperture || !b_fb || !b_flow ||
+        !b_S || !b_motion || !b_aperture || !b_ambiguous || !b_flow ||
         !b_R || !b_out)
         return Image();
 
@@ -1562,16 +1536,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
-    mp.aperture_reject_strength = cfg.flow_reject_1d_strength;
-    mp.aperture_weak_safe_px = cfg.aperture_weak_safe_px;
-    mp.aperture_weak_sigma_px = cfg.aperture_weak_sigma_px;
-    mp.aperture_post_strength = cfg.aperture_post_strength;
-    mp.aperture_post_safe_px = cfg.aperture_post_safe_px;
-    mp.aperture_post_sigma_px = cfg.aperture_post_sigma_px;
-    mp.aperture_residual_enabled = cfg.aperture_residual_enabled ? 1u : 0u;
-    mp.aperture_residual_safe_ratio = cfg.aperture_residual_safe_ratio;
-    mp.aperture_residual_sigma_ratio = cfg.aperture_residual_sigma_ratio;
-    mp.fb_enabled = fb_on ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1587,9 +1551,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_flow offset:0 atIndex:10];
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     [enc setBuffer:b_aperture offset:0 atIndex:12];
-    [enc setBuffer:b_fb offset:0 atIndex:13];
-    [enc setBuffer:b_weak offset:0 atIndex:14];
-    [enc setBuffer:b_post offset:0 atIndex:15];
+    [enc setBuffer:b_ambiguous offset:0 atIndex:13];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1777,7 +1739,10 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
                                   id<MTLBuffer> b_flow,
                                   int ref_h, int ref_w, int mov_h, int mov_w,
                                   int tile_size, int search_radius,
-                                  int ny, int nx, bool l1) {
+                                  int ny, int nx, bool l1,
+                                  id<MTLBuffer> b_ambiguity = nil,
+                                  float ambiguity_ratio = 1.10f,
+                                  bool write_ambiguity = false) {
     if (search_radius < 0 || tile_size <= 0) return false;
     if (ny <= 0 || nx <= 0) return true;
     auto& c = ctx();
@@ -1786,8 +1751,11 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
         int32_t ts, R;
         int32_t ref_h, ref_w, mov_h, mov_w;
         uint32_t l1;
+        float ambiguity_ratio;
+        uint32_t write_ambiguity;
+        uint32_t _pad0 = 0;
     };
-    static_assert(sizeof(AlignLocalSearch460ParamsCPU) == 36,
+    static_assert(sizeof(AlignLocalSearch460ParamsCPU) == 48,
                   "AlignLocalSearch460ParamsCPU layout");
     AlignLocalSearch460ParamsCPU p{};
     p.ny = (uint32_t)ny;
@@ -1799,6 +1767,9 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     p.mov_h = (int32_t)mov_h;
     p.mov_w = (int32_t)mov_w;
     p.l1 = l1 ? 1u : 0u;
+    if (!std::isfinite(ambiguity_ratio)) ambiguity_ratio = 1.10f;
+    p.ambiguity_ratio = std::max(ambiguity_ratio, 1.0f);
+    p.write_ambiguity = (write_ambiguity && b_ambiguity) ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
@@ -1810,6 +1781,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setBuffer:b_mov offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc setBuffer:(b_ambiguity ? b_ambiguity : b_flow) offset:0 atIndex:4];
 
     // One threadgroup per tile: lanes split the candidate shifts and the kernel
     // stages the reference tile on-chip. `lanes` must be a power of two for the
@@ -1823,7 +1795,8 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     NSUInteger lanes = 64;
     while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
     auto red_bytes = [&](NSUInteger n) -> NSUInteger {
-        return align16(n * sizeof(float)) + align16(n * sizeof(int));
+        return align16(n * sizeof(float)) + align16(n * sizeof(int)) +
+               align16(n * sizeof(float)) + align16(n * sizeof(int));
     };
     while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
     if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
@@ -1832,6 +1805,8 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:1];
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:3];
+    [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:4];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
@@ -1956,43 +1931,65 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
 
 bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
-                                FlowField& flow) {
+                                FlowField& flow,
+                                float ambiguity_ratio,
+                                bool write_ambiguity) {
     if (!metal_gpu_init()) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
     id<MTLBuffer> ref_img = buf(ref.data.data(), ref.data.size() * sizeof(float));
     id<MTLBuffer> mov_img = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> flow_b = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    if (!ref_img || !mov_img || !flow_b) return false;
+    if (write_ambiguity)
+        flow.match_ambiguous.assign((size_t)ny * (size_t)nx, 0u);
+    id<MTLBuffer> b_ambiguity = write_ambiguity
+        ? buf(nullptr, flow.match_ambiguous.size() * sizeof(uint32_t))
+        : nil;
+    if (!ref_img || !mov_img || !flow_b || (write_ambiguity && !b_ambiguity)) return false;
     if (!local_search_460_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
                                moving.h, moving.w, tile_size, search_radius,
-                               ny, nx, false))
+                               ny, nx, false, b_ambiguity,
+                               ambiguity_ratio, write_ambiguity))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
     if (!align_drain()) return false;
     memcpy(flow.flow.data(), [flow_b contents], flow.flow.size() * sizeof(float));
+    if (write_ambiguity)
+        memcpy(flow.match_ambiguous.data(), [b_ambiguity contents],
+               flow.match_ambiguous.size() * sizeof(uint32_t));
     return true;
 }
 
 bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
-                                FlowField& flow) {
+                                FlowField& flow,
+                                float ambiguity_ratio,
+                                bool write_ambiguity) {
     if (!metal_gpu_init()) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
     id<MTLBuffer> b_ref = buf(ref.data.data(), ref.data.size() * sizeof(float));
     id<MTLBuffer> b_mov = buf(moving.data.data(), moving.data.size() * sizeof(float));
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    if (!b_ref || !b_mov || !b_flow) return false;
+    if (write_ambiguity)
+        flow.match_ambiguous.assign((size_t)ny * (size_t)nx, 0u);
+    id<MTLBuffer> b_ambiguity = write_ambiguity
+        ? buf(nullptr, flow.match_ambiguous.size() * sizeof(uint32_t))
+        : nil;
+    if (!b_ref || !b_mov || !b_flow || (write_ambiguity && !b_ambiguity)) return false;
     if (!local_search_460_bufs(b_ref, b_mov, b_flow, ref.h, ref.w,
                                moving.h, moving.w, tile_size, search_radius,
-                               ny, nx, true))
+                               ny, nx, true, b_ambiguity,
+                               ambiguity_ratio, write_ambiguity))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
     if (!align_drain()) return false;
     memcpy(flow.flow.data(), [b_flow contents], flow.flow.size() * sizeof(float));
+    if (write_ambiguity)
+        memcpy(flow.match_ambiguous.data(), [b_ambiguity contents],
+               flow.match_ambiguous.size() * sizeof(uint32_t));
     return true;
 }
 
@@ -2287,7 +2284,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     }
 
     id<MTLBuffer> b_flow = nil;
+    id<MTLBuffer> b_ambiguity = nil;
     int flow_ny = 0, flow_nx = 0;
+    int ambiguity_ny = 0, ambiguity_nx = 0;
     const bool ica_all = cfg.ica_every_level();
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
@@ -2329,15 +2328,32 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             flow_nx = nx;
         }
 
+        if (cfg.flow_reject_1d_enabled) {
+            b_ambiguity = buf(nullptr, (size_t)ny * (size_t)nx * sizeof(uint32_t));
+            if (!b_ambiguity) return false;
+            ambiguity_ny = ny;
+            ambiguity_nx = nx;
+        } else {
+            b_ambiguity = nil;
+            ambiguity_ny = 0;
+            ambiguity_nx = 0;
+        }
+
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
         bool bm_ok = false;
         if (metric == "L1")
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
-                                          m.h, m.w, ts, radius, ny, nx, true);
+                                          m.h, m.w, ts, radius, ny, nx, true,
+                                          b_ambiguity,
+                                          cfg.flow_reject_1d_ambiguity_ratio,
+                                          cfg.flow_reject_1d_enabled);
         else
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
-                                          m.h, m.w, ts, radius, ny, nx, false);
+                                          m.h, m.w, ts, radius, ny, nx, false,
+                                          b_ambiguity,
+                                          cfg.flow_reject_1d_ambiguity_ratio,
+                                          cfg.flow_reject_1d_enabled);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --
@@ -2402,34 +2418,13 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
-    return true;
-}
-
-// Copy a cached reference Hessian back to the host so flow regularisation can
-// tell which direction each tile could actually observe.
-//
-// Matched on grid size rather than on the slot key: the finest level is
-// prepared from ref_grey by the single ICA pass and from ref_pyr.levels[0] by
-// the per-level one, which are equal in content but different allocations, so
-// the key would depend on which path ran. The grid is what the flow field is
-// indexed by, and align_metal already refuses to proceed unless it matches.
-//
-// ny*nx*4 floats -- about 3MB for 16px tiles on a 48MP frame -- and the
-// reference does not change within a burst, so this is one small readback per
-// burst rather than per frame.
-bool metal_fetch_ref_hessian(int ny, int nx, std::vector<float>& out) {
-    if (ny <= 0 || nx <= 0) return false;
-    auto& c = ctx();
-    const size_t need = (size_t)ny * (size_t)nx * 4u;
-    for (int i = 0; i < MetalCtx::kIcaSlots; ++i) {
-        const auto& sl = c.ica[i];
-        if (!sl.hess || sl.ny != ny || sl.nx != nx) continue;
-        if ([sl.hess length] < need * sizeof(float)) continue;
-        out.resize(need);
-        memcpy(out.data(), [sl.hess contents], need * sizeof(float));
-        return true;
+    if (cfg.flow_reject_1d_enabled && b_ambiguity &&
+        ambiguity_ny == flow_ny && ambiguity_nx == flow_nx) {
+        flow_out.match_ambiguous.assign((size_t)flow_ny * (size_t)flow_nx, 0u);
+        memcpy(flow_out.match_ambiguous.data(), [b_ambiguity contents],
+               flow_out.match_ambiguous.size() * sizeof(uint32_t));
     }
-    return false;
+    return true;
 }
 
 void metal_clear_ref_ica_cache() {

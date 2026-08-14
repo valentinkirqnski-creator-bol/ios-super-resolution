@@ -96,13 +96,6 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
 
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
-        FlowField backward_flow;
-        if (work.fb_consistency_enabled &&
-            flow.ny > 0 && flow.nx > 0 && !flow.flow.empty()) {
-            Image comp_grey_padded = pad_image_circular(comp_grey, tile_size);
-            Pyramid comp_pyr = build_pyramid(comp_grey_padded, work.bm_factors);
-            backward_flow = align(comp_pyr, comp_grey, ref_grey, work, tile_size);
-        }
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the field is on a grey tile grid carrying grey-pixel
         // displacements, while compute_robustness and merge_comp both index it
@@ -113,12 +106,6 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         // assert). No-op for the full-resolution FFT grey.
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                      comp_grey.h, comp_grey.w, tile_size);
-        if (work.fb_consistency_enabled &&
-            backward_flow.ny > 0 && backward_flow.nx > 0 && !backward_flow.flow.empty()) {
-            backward_flow = flow_to_raw_tile_grid(backward_flow, comp.h, comp.w,
-                                                  comp_grey.h, comp_grey.w, tile_size);
-            apply_forward_backward_confidence(flow, backward_flow, tile_size, work);
-        }
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -193,21 +180,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method);
         FrameData& fd = frames[k - 1];
         fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
-        FlowField backward_flow;
-        if (work.fb_consistency_enabled &&
-            fd.flow.ny > 0 && fd.flow.nx > 0 && !fd.flow.flow.empty()) {
-            Image comp_grey_padded = pad_image_circular(comp_grey, tile_size);
-            Pyramid comp_pyr = build_pyramid(comp_grey_padded, work.bm_factors);
-            backward_flow = align(comp_pyr, comp_grey, ref_grey, work, tile_size);
-        }
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
                                         comp_grey.h, comp_grey.w, tile_size);
-        if (work.fb_consistency_enabled &&
-            backward_flow.ny > 0 && backward_flow.nx > 0 && !backward_flow.flow.empty()) {
-            backward_flow = flow_to_raw_tile_grid(backward_flow, burst[k].h, burst[k].w,
-                                                  comp_grey.h, comp_grey.w, tile_size);
-            apply_forward_backward_confidence(fd.flow, backward_flow, tile_size, work);
-        }
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {

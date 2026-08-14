@@ -53,7 +53,7 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     for (f32 v : ref_raw.data) sum += v;
     f32 brightness = sum / (f32)ref_raw.data.size();
     if (out_brightness) *out_brightness = brightness;
-    f32 sigma = noise_std_at_brightness(brightness, cfg.alpha, cfg.beta);
+    f32 sigma = noise_std_at_brightness(brightness, cfg);
     f32 snr = (sigma > 1e-8f) ? brightness / sigma : 15.f;
     snr = clampf(snr, 6.f, 30.f);
 

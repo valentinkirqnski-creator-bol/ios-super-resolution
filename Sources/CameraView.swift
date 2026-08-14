@@ -693,156 +693,6 @@ struct CameraView: View {
         }
     }
 
-    // Extracted, not inlined into tuningSettingsView. That body is one
-    // expression and the Swift type checker gives up on it past a certain size
-    // -- "unable to type-check this expression in reasonable time". A computed
-    // property is type-checked on its own, and it also counts as one child
-    // against the 10-child ViewBuilder limit instead of six.
-    //
-    // Long help text lives in one literal each: `+` between string literals is
-    // an operator overload the checker has to resolve, and there were enough of
-    // them here to matter.
-    @ViewBuilder
-    private var flowRegularizeSection: some View {
-        Toggle("Hessian Aperture Repair", isOn: $cam.tuningParams.flow_regularize_enabled)
-        Text("""
-             A tile holding one long edge -- a grille slat, a chrome strip -- cannot see how \
-             far it moved ALONG that edge, so it picks at random and the merged edge wobbles \
-             from tile to tile. This uses the tile Hessian eigenvalues to find that weak \
-             direction from the tile's own gradients and \
-             takes only that component from the neighbours, keeping the direction it could \
-             measure exactly as measured. Tiles with structure in both directions are left \
-             alone entirely. For static scenes: across a real motion boundary the \
-             neighbours' motion belongs to neither side.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-
-        Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
-        if cam.tuningParams.flow_reject_1d_enabled {
-            HStack {
-                Text("Rejection Strength")
-                Spacer()
-                Text(String(format: "%.0f%%", cam.tuningParams.flow_reject_1d_strength * 100))
-            }
-            Slider(value: $cam.tuningParams.flow_reject_1d_strength, in: 0.0...1.0)
-            HStack {
-                Text("Safe Drift")
-                Spacer()
-                Text(String(format: "%.2f px", cam.tuningParams.aperture_weak_safe_px))
-            }
-            Slider(value: $cam.tuningParams.aperture_weak_safe_px, in: 0.0...1.0)
-            HStack {
-                Text("Falloff Width")
-                Spacer()
-                Text(String(format: "%.2f px", cam.tuningParams.aperture_weak_sigma_px))
-            }
-            Slider(value: $cam.tuningParams.aperture_weak_sigma_px, in: 0.05...1.5)
-            HStack {
-                Text("Post-Warp Check")
-                Spacer()
-                Text(String(format: "%.0f%%", cam.tuningParams.aperture_post_strength * 100))
-            }
-            Slider(value: $cam.tuningParams.aperture_post_strength, in: 0.0...1.0)
-            Text("After repair, asks the image whether the edge still wants to move along itself. The only test here not derived from the global pre-alignment, so it is what catches a wrong global fit. Silent where the edge carries no gradient along itself to measure with.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Toggle("Require Residual Evidence", isOn: $cam.tuningParams.aperture_residual_enabled)
-            if cam.tuningParams.aperture_residual_enabled {
-                HStack {
-                    Text("Residual Safe Ratio")
-                    Spacer()
-                    Text(String(format: "%.1fx", cam.tuningParams.aperture_residual_safe_ratio))
-                }
-                Slider(value: $cam.tuningParams.aperture_residual_safe_ratio, in: 1.0...64.0)
-                HStack {
-                    Text("Residual Falloff")
-                    Spacer()
-                    Text(String(format: "%.1fx", cam.tuningParams.aperture_residual_sigma_ratio))
-                }
-                Slider(value: $cam.tuningParams.aperture_residual_sigma_ratio, in: 1.0...32.0)
-                Text("1D tiles are suppressed only when the aligned comparison frame still differs from the reference more than expected noise. Higher Safe Ratio protects more static straight edges; lower catches more aperture artifacts.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            Text("A 1D tile is only suppressed by how far it drifted along its own edge, relative to the global pre-alignment. Drift under Safe Drift merges untouched; beyond it confidence falls off as a Gaussian of this width.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Text("100% discards a 1D tile entirely. Lower keeps some of its contribution, so those regions still denoise instead of falling back to the reference frame alone.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-        }
-        Text("""
-             Test mode: instead of repairing these aperture-limited tiles, force their merge \
-             robustness to zero. This should show as black blocks in the saved robustness \
-             mask anywhere the Hessian says the tile is one-dimensional.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-
-        if cam.tuningParams.flow_regularize_enabled {
-            HStack {
-                Text("Disagreement")
-                Spacer()
-                Text(String(format: "%.1f px", cam.tuningParams.flow_regularize_threshold))
-                    .monospacedDigit()
-            }
-            Slider(value: $cam.tuningParams.flow_regularize_threshold, in: 0.25...4.0)
-            Text("""
-                 How far the ambiguous component may differ from the neighbours' before it \
-                 is replaced. Lower corrects more. Only tiles that are genuinely \
-                 one-dimensional are considered, so raising this narrows the repair rather \
-                 than protecting real structure -- that is already protected.
-                 """)
-                .font(.caption2).foregroundColor(.secondary)
-        }
-
-        if cam.tuningParams.flow_regularize_enabled || cam.tuningParams.flow_reject_1d_enabled {
-            HStack {
-                Text("Aperture Ratio")
-                Spacer()
-                Text(String(format: "%.2f", cam.tuningParams.flow_regularize_aperture_ratio))
-                    .monospacedDigit()
-            }
-            HStack {
-                Text("Soft Blend From")
-                Spacer()
-                Text(softBlendLabel)
-            }
-            Slider(value: $cam.tuningParams.flow_regularize_soft_ratio_low, in: 0.0...1.0)
-            Text("Below the aperture ratio this ramps the repair instead of switching it on abruptly. At or above the ratio it is the original hard gate.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-
-            HStack {
-                Text("Max Weak Pull")
-                Spacer()
-                Text(maxPullLabel)
-            }
-            Slider(value: $cam.tuningParams.flow_regularize_max_residual, in: 0.0...8.0)
-            HStack {
-                Text("Global Prior Weight")
-                Spacer()
-                Text(String(format: "%.0f%%", cam.tuningParams.flow_regularize_global_weight * 100))
-            }
-            Slider(value: $cam.tuningParams.flow_regularize_global_weight, in: 0.0...1.0)
-            Text("Where a tile is most one-dimensional, take the repair target from the global pre-alignment rather than the neighbouring tiles. Neighbours cannot detect a whole edge drifting together; the global fit can. 0% is neighbours only.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Text("Caps how far a repaired tile is dragged toward its neighbours, in grey pixels. Protects a straight edge on a moving object. 0 = uncapped.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-
-            Slider(value: $cam.tuningParams.flow_regularize_aperture_ratio,
-                   in: 0.05...0.75,
-                   step: 0.05)
-            Text("""
-                 Maximum lambda2/lambda1 for a tile to be repaired. Higher catches more \
-                 edge-like tiles; lower keeps the repair or rejection limited to very \
-                 one-dimensional edges. Default is 0.15.
-                 """)
-                .font(.caption2).foregroundColor(.secondary)
-        }
-    }
-
     @ViewBuilder
     private var fineAlignmentSection: some View {
         Toggle("ICA Per Level In FFT Mode", isOn: $cam.tuningParams.align_ica_per_level_fft)
@@ -852,24 +702,6 @@ struct CameraView: View {
              correction budget is spent before it starts and tile-shaped displacements \
              survive. Coarse levels only -- the finest is refined either way -- which keeps \
              the extra reference gradients to about a quarter of a frame.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-
-        Stepper(value: $cam.tuningParams.align_fine_search_radius, in: 0...4) {
-            HStack {
-                Text("Finest Search Radius")
-                Spacer()
-                Text(cam.tuningParams.align_fine_search_radius == 0
-                     ? "default (1)"
-                     : String(cam.tuningParams.align_fine_search_radius))
-                    .foregroundColor(.secondary)
-                    .monospacedDigit()
-            }
-        }
-        Text("""
-             How far the finest pyramid level may correct the flow it inherits. Raising it \
-             buys margin when something upstream adds error, at (2r+1)^2/9 times that \
-             level's search cost: 2.8x at 2, 5.4x at 3. This is the most expensive level.
              """)
             .font(.caption2).foregroundColor(.secondary)
     }
@@ -885,18 +717,6 @@ struct CameraView: View {
             return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
         }
         return "Frame 0 is the merge base, so pre-alignment runs inside the alignment pass at roughly the cost of one thumbnail per frame."
-    }
-
-    private var softBlendLabel: String {
-        let v = cam.tuningParams.flow_regularize_soft_ratio_low
-        if v >= cam.tuningParams.flow_regularize_aperture_ratio { return "hard gate" }
-        return String(format: "%.2f", v)
-    }
-
-    private var maxPullLabel: String {
-        let v = cam.tuningParams.flow_regularize_max_residual
-        if v <= 0 { return "uncapped" }
-        return String(format: "%.1f px", v)
     }
 
     @ViewBuilder
@@ -930,39 +750,6 @@ struct CameraView: View {
                     }
                     Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
 
-                    Toggle("Forward/Backward Gate", isOn: $cam.tuningParams.fb_consistency_enabled)
-                    Text("Extra geometry check: computes reverse flow and only darkens tiles whose forward/backward error is a local outlier.")
-                        .font(.caption2).foregroundColor(.secondary)
-
-                    if cam.tuningParams.fb_consistency_enabled {
-                        HStack {
-                            Text("FB Min Error")
-                            Spacer()
-                            Text(String(format: "%.2f px", cam.tuningParams.fb_consistency_min_error))
-                        }
-                        Slider(value: $cam.tuningParams.fb_consistency_min_error,
-                               in: 0.2...3.0,
-                               step: 0.05)
-
-                        HStack {
-                            Text("FB Sigma")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.fb_consistency_sigma))
-                        }
-                        Slider(value: $cam.tuningParams.fb_consistency_sigma,
-                               in: 1.0...6.0,
-                               step: 0.25)
-
-                        Stepper(value: $cam.tuningParams.fb_consistency_radius,
-                                in: 1...8) {
-                            HStack {
-                                Text("FB Neighborhood")
-                                Spacer()
-                                Text("\(cam.tuningParams.fb_consistency_radius)")
-                            }
-                        }
-                    }
-
                     Toggle("Alignment Grey: FFT", isOn: $cam.tuningParams.alignment_grey_fft)
                     Text(cam.tuningParams.alignment_grey_fft
                          ? "Full-res FFT low-pass. Slower."
@@ -986,6 +773,22 @@ struct CameraView: View {
                             Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))
                         }
                         Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
+                    }
+
+                    Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
+                    Text("Rejects one-dimensional tiles only when their block match is ambiguous.")
+                        .font(.caption2).foregroundColor(.secondary)
+
+                    if cam.tuningParams.flow_reject_1d_enabled {
+                        HStack {
+                            Text("Ambiguity Ratio")
+                            Spacer()
+                            Text(String(format: "%.2f", cam.tuningParams.flow_reject_1d_ambiguity_ratio))
+                                .monospacedDigit()
+                        }
+                        Slider(value: $cam.tuningParams.flow_reject_1d_ambiguity_ratio,
+                               in: 1.01...1.30,
+                               step: 0.01)
                     }
 
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
@@ -1034,6 +837,10 @@ struct CameraView: View {
     private var kernelsSection: some View {
                 Section(header: Text("Steerable Kernels (Merging)")) {
                     Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
+                    Toggle("Debug Pixel 4a Noise", isOn: $cam.tuningParams.debug_pixel4a_noise_profile)
+                    Text("Ignores the captured DNG NoiseProfile and uses bundled Pixel 4a correction curves at the rounded ISO. For Python parity/debugging only.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
 
                     Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
 
@@ -1253,8 +1060,6 @@ struct CameraView: View {
                             .font(.caption2).foregroundColor(.secondary)
 
                         fineAlignmentSection
-
-                        flowRegularizeSection
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
                         Text(cam.tuningParams.acc_rob_adaptive

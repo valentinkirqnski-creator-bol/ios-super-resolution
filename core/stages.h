@@ -39,11 +39,6 @@ Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size);
 
-// Fill forward.fb_confidence from forward/backward consistency. Both fields
-// must be on the same tile grid and in the same pixel units.
-void apply_forward_backward_confidence(FlowField& forward, const FlowField& backward,
-                                       int tile_size, const Config& cfg);
-
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 
@@ -76,9 +71,12 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
+f32 noise_std_at_brightness(f32 brightness, const Config& cfg);
 
 // Full noise curves (1001 bins) for GPU upload — same cache as CPU robustness.
 void fetch_noise_curves(f32 alpha, f32 beta,
+                        std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
+void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 
 // Robustness mask r at raw resolution [h, w, 1].

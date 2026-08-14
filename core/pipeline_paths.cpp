@@ -1028,7 +1028,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // compiler cannot vectorize because float addition is not associative.
         // Reusing the result is bit-identical; a parallel reduction would not be.
         const f32 brightness = ref_brightness;
-        const f32 sigma = noise_std_at_brightness(brightness, work.alpha, work.beta);
+        const f32 sigma = noise_std_at_brightness(brightness, work);
         const f32 snr = (sigma > 1e-8f) ? brightness / sigma : 0.f;
         char buf[288];
         const int t0 = work.bm_tile_sizes.size() > 0 ? work.bm_tile_sizes[0] : -1;
@@ -1261,28 +1261,28 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         const f32 grey_scale_x = ref_w > 0 ? (f32)ref_grey.w / (f32)ref_w : 1.f;
         const f32 grey_scale_y = ref_h > 0 ? (f32)ref_grey.h / (f32)ref_h : 1.f;
+        // Counters, not timings. A prior that does nothing looks identical from
+        // the outside to one that is working and simply not needed, and there
+        // are three ways it silently becomes zero: pre-alignment disabled, the
+        // NCC score falling under the 0.03 validity gate, or the transform
+        // being valid but genuinely near zero. These separate them.
+        prof_add_cpu("prealign#frames", 1.0);
+        if (init.valid) prof_add_cpu("prealign#valid", 1.0);
+        prof_add_cpu("prealign#score-sum", (double)init.score);
+        prof_add_cpu("prealign#dx-abs-sum", std::fabs((double)init.dx));
+        prof_add_cpu("prealign#dy-abs-sum", std::fabs((double)init.dy));
+        prof_add_cpu("prealign#angle-abs-sum-deg",
+                     std::fabs((double)init.angle) * 180.0 / 3.14159265358979323846);
+        // What actually reaches align(), in grey pixels -- if this is zero the
+        // prior cannot be influencing anything downstream.
+        prof_add_cpu("prealign#grey-dx-abs-sum",
+                     std::fabs((double)(init.dx * grey_scale_x)));
         const double t_align = prof_now_ms();
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
                                init.dx * grey_scale_x,
                                init.dy * grey_scale_y,
                                init.angle);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
-        FlowField backward_flow;
-        if (work.fb_consistency_enabled &&
-            flow.ny > 0 && flow.nx > 0 && !flow.flow.empty()) {
-            const double t_fb_align = prof_now_ms();
-            Image comp_grey_padded = pad_image_circular(comp_grey, tile_size);
-            Pyramid comp_pyr = build_pyramid(comp_grey_padded, work.bm_factors);
-            const f32 init_dx = init.dx * grey_scale_x;
-            const f32 init_dy = init.dy * grey_scale_y;
-            const f32 ca = std::cos(init.angle);
-            const f32 sa = std::sin(init.angle);
-            const f32 inv_dx = -ca * init_dx - sa * init_dy;
-            const f32 inv_dy =  sa * init_dx - ca * init_dy;
-            backward_flow = align(comp_pyr, comp_grey, ref_grey, work, tile_size,
-                                  inv_dx, inv_dy, -init.angle);
-            prof_add_cpu("comp:fb-align", prof_now_ms() - t_fb_align);
-        }
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the flow is on a half-res tile grid with half-res
         // displacements, while robustness and merge both index it as
@@ -1291,12 +1291,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // so the FFT path is unaffected.
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                      comp_grey.h, comp_grey.w, tile_size);
-        if (work.fb_consistency_enabled &&
-            backward_flow.ny > 0 && backward_flow.nx > 0 && !backward_flow.flow.empty()) {
-            backward_flow = flow_to_raw_tile_grid(backward_flow, comp.h, comp.w,
-                                                  comp_grey.h, comp_grey.w, tile_size);
-            apply_forward_backward_confidence(flow, backward_flow, tile_size, work);
-        }
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
