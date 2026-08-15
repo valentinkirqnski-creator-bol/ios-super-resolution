@@ -406,6 +406,21 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
             const int ox = tx * ts;
             const f32 local_fx = flow.dx(ty, tx);
             const f32 local_fy = flow.dy(ty, tx);
+            // Round the search centre, do not truncate. The reference rounds
+            // (extract_flow_patches does flow.round(); the L1 kernels do
+            // round(alignment)), and truncation displaces the centre by up to a
+            // full pixel where rounding caps it at half. Level 0 searches with
+            // radius 1, so a whole-pixel offset can put the true optimum outside
+            // the window entirely, leaving ICA to recover a full pixel from the
+            // edge of its basin.
+            //
+            // Only fractional input flow is affected, so this is inert on the
+            // FFT path -- every level there receives integer flow -- and live on
+            // the decimate path, where per-level ICA hands each level a
+            // fractional estimate. Hoisted out of the inner loops; it was being
+            // recomputed per sampled pixel.
+            const int base_fx = cuda_round_to_int(local_fx);
+            const int base_fy = cuda_round_to_int(local_fy);
             f32 min_dist = std::numeric_limits<f32>::infinity();
             f32 second_dist = std::numeric_limits<f32>::infinity();
             int min_shift_x = 0, min_shift_y = 0;
@@ -417,8 +432,8 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                         for (int j = 0; j < ts; ++j) {
                             const int rx = ox + j;
                             const int ry = oy + i;
-                            const int mx = rx + (int)local_fx + sdx;
-                            const int my = ry + (int)local_fy + sdy;
+                            const int mx = rx + base_fx + sdx;
+                            const int my = ry + base_fy + sdy;
                             if (!(rx >= 0 && rx < ref.w && ry >= 0 && ry < ref.h &&
                                   mx >= 0 && mx < moving.w && my >= 0 && my < moving.h)) {
                                 valid = false;
@@ -617,11 +632,27 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // math.modf + int() truncation toward zero (ICA.py)
-                f32 frac_x = fx - std::trunc(fx);
-                int floor_off_x = (int)std::trunc(fx);
-                f32 frac_y = fy - std::trunc(fy);
-                int floor_off_y = (int)std::trunc(fy);
+                // floor, not trunc. ICA.py uses math.modf + int(), which
+                // truncates toward zero, so a negative displacement such as
+                // -0.25 yields offset 0 and fraction -0.25. bilinear_ica then
+                // evaluates m00 + (m01 - m00) * (-0.25): the right position, but
+                // reached by extrapolating from the pair to the RIGHT of it
+                // instead of interpolating from the pair that straddles it.
+                //
+                // Positive displacements interpolate, negative ones extrapolate,
+                // so the converged sub-pixel flow differs by direction. Measured
+                // on a synthetic shift at ts=16: 0.075px of spread between +0.75
+                // and -0.75, against 0.0025px with floor. It does not reduce the
+                // peak error -- both variants carry the same ~0.11px bilinear
+                // shrinkage toward zero -- but it makes that error symmetric, so
+                // frames drifting left and right land consistently rather than
+                // scattering by direction.
+                const f32 base_x = std::floor(fx);
+                const f32 base_y = std::floor(fy);
+                f32 frac_x = fx - base_x;
+                int floor_off_x = (int)base_x;
+                f32 frac_y = fy - base_y;
+                int floor_off_y = (int)base_y;
 
                 std::fill(s_B0.begin(), s_B0.end(), 0.f);
                 std::fill(s_B1.begin(), s_B1.end(), 0.f);

@@ -527,8 +527,10 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
     int second_cand = kNone;
 
     if (ref_in) {
-        const int ifx = int(local_fx);
-        const int ify = int(local_fy);
+        // Round, do not truncate -- see block_match_level_direct_460 in
+        // align.cpp. round() here matches std::lround: ties away from zero.
+        const int ifx = int(round(local_fx));
+        const int ify = int(round(local_fy));
         for (int c = int(lane); c < ncand; c += int(lanes)) {
             const int row = c / span;
             const int sdy = row - R;
@@ -2297,8 +2299,9 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         // configuration ever selects these sizes.
         if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
-            float floor_fx = trunc(fx);
-            float floor_fy = trunc(fy);
+            // floor, not trunc -- see ica_refine_level in align.cpp.
+            float floor_fx = floor(fx);
+            float floor_fy = floor(fy);
             float frac_x = fx - floor_fx;
             float frac_y = fy - floor_fy;
             int floor_off_x = int(floor_fx);
@@ -2359,9 +2362,12 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 
     // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
-        // math.modf + int() truncation toward zero (ICA.py)
-        float floor_fx = trunc(fx);
-        float floor_fy = trunc(fy);
+        // floor, not trunc. ICA.py truncates toward zero, which turns the
+        // bilinear sample into an extrapolation for negative displacements and
+        // makes the converged flow direction-dependent. See ica_refine_level in
+        // align.cpp for the measurement.
+        float floor_fx = floor(fx);
+        float floor_fy = floor(fy);
         float frac_x = fx - floor_fx;
         float frac_y = fy - floor_fy;
         int floor_off_x = int(floor_fx);
