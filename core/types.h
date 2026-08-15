@@ -226,26 +226,50 @@ struct Config {
     // ImageIO path in SRBridge.mm for the device -- and a stored copy filled by
     // only one of them silently pinned the device to the fallback constants.
     //
-    // The unweighted mean over the three channels matches the reference
-    // implementation. It is not the variance of the grey mix, which weights
-    // green twice; that is a separate question from the white balance scaling
-    // and is deliberately left alone here.
+    // The mean is over the three GUIDE channels, and green is not like the
+    // other two. compute_guide packs a Bayer quad into RGB by taking R and B
+    // from their single sites but averaging the two green ones:
+    //
+    //     guide.G = 0.5 * (G1 + G2)
+    //
+    // Averaging two independent samples halves the variance, so the guide's
+    // green channel carries half the noise its profile entry describes, while
+    // R and B carry all of it:
+    //
+    //     Var(guide.R) = a'_R*I + b'_R
+    //     Var(guide.G) = (a'_G*I + b'_G) / 2
+    //     Var(guide.B) = a'_B*I + b'_B
+    //
+    // apply_noise_model scores all three guide channels against one scalar
+    // curve, so that scalar should be the mean of those three variances -- which
+    // is the /3 below with green weighted by a half, not an unweighted mean.
+    //
+    // This diverges from the reference, which weights all three equally. The
+    // correction is small (about -10% on alpha and -6% on beta at typical white
+    // balance gains) and always in the direction of trusting the data slightly
+    // less. Guarded on bayer_mode: a non-Bayer guide is the raw plane itself,
+    // with no quad averaging to account for.
     float noise_wb_gain(int c) const {
         if (!raw_prewhitened) return 1.f;   // nothing applied yet, profile stands
         if (c < 0 || c > 2) return 1.f;
         const float g = white_balance[c] / white_balance[1];
         return (std::isfinite(g) && g > 0.f) ? g : 1.f;
     }
+    // Per-guide-channel variance weight: 1/2 for green under a Bayer CFA.
+    float noise_guide_weight(int c) const {
+        return (bayer_mode && c == 1) ? 0.5f : 1.f;
+    }
     float noise_alpha() const {
         float s = 0.f;
-        for (int c = 0; c < 3; ++c) s += alpha_dng[c] * noise_wb_gain(c);
+        for (int c = 0; c < 3; ++c)
+            s += alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
         return s / 3.f;
     }
     float noise_beta() const {
         float s = 0.f;
         for (int c = 0; c < 3; ++c) {
             const float g = noise_wb_gain(c);
-            s += beta_dng[c] * g * g;
+            s += beta_dng[c] * g * g * noise_guide_weight(c);
         }
         return s / 3.f;
     }
