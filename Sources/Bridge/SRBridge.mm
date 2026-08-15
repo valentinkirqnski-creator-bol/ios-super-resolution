@@ -567,8 +567,15 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
                 ok = false;
         }
         cfg.has_noise_profile = ok;
+        if (ok) {
+            std::printf("[SRBridge] NoiseProfile read: nplanes=%zu alpha_dng=[%.6g,%.6g,%.6g] "
+                        "beta_dng=[%.6g,%.6g,%.6g]\n",
+                        nplanes, cfg.alpha_dng[0], cfg.alpha_dng[1], cfg.alpha_dng[2],
+                        cfg.beta_dng[0], cfg.beta_dng[1], cfg.beta_dng[2]);
+        }
     } else {
         cfg.has_noise_profile = false;
+        std::printf("[SRBridge] NoiseProfile not found in metadata (size %zu)\n", noise.size());
     }
     if (cfg.debug_pixel4a_noise_profile) {
         const float iso = FirstNumber(FirstValueForKeys(exif, @[
