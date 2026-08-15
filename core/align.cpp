@@ -184,6 +184,14 @@ static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
     return (l1 > 0.f) && (l2 < aperture_ratio * l1);
 }
 
+}  // namespace
+// Closed here on purpose: compute_motion_irregular is declared in stages.h and
+// called from pipeline_paths, so it has to have external linkage. Leaving it in
+// the anonymous namespace above defined hhsr::{anonymous}::compute_motion_irregular,
+// a distinct overload from the declared hhsr:: one, and every call in this file
+// then saw both and was ambiguous. The anonymous namespace reopens directly
+// after it.
+
 // Wronski's motion prior, measured on the grid alignment produced.
 //
 // Identical arithmetic to compute_s in robustness.cpp; the point is purely
@@ -331,6 +339,8 @@ std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
     }
     return out;
 }
+
+namespace {  // reopened -- everything below is file-local again
 
 // Measured with sx = sy = 1, which is already raw units on the FFT grey.
 // flow_to_raw_tile_grid recomputes with the true scale when they differ.
