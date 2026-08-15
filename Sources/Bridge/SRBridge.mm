@@ -773,13 +773,6 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     if (preview.w <= 0) return NO;
 
-    // Write debug log to .log file alongside the output DNG
-    if (!cfg.debug_string_capture.empty()) {
-        NSString *logPath = [[outPath stringByDeletingPathExtension] stringByAppendingPathExtension:@"log"];
-        NSString *logContent = [NSString stringWithUTF8String:cfg.debug_string_capture.c_str()];
-        [logContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
 }
@@ -831,13 +824,6 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     }
 
     if (preview.w <= 0) return NO;
-
-    // Write debug log to .log file alongside the output DNG
-    if (!cfg.debug_string_capture.empty()) {
-        NSString *logPath = [[outPath stringByDeletingPathExtension] stringByAppendingPathExtension:@"log"];
-        NSString *logContent = [NSString stringWithUTF8String:cfg.debug_string_capture.c_str()];
-        [logContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
