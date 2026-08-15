@@ -190,23 +190,44 @@ static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
 // where it runs. Robustness sees the flow only after flow_to_raw_tile_grid has
 // duplicated each grey tile across a 2x2 block of raw tiles and scaled the
 // displacements by 2, and the 3x3 span measured there is not the same quantity.
-static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
+// sx/sy convert the stored displacements into the units r_Mt is defined in.
+//
+// The reference keeps its flow array in RAW pixels throughout -- robustness.py
+// divides by 2 when the guide is half resolution ("the flow must be divided by
+// 2"), and compute_s consumes that same array unscaled. So M_th is a raw-pixel
+// threshold. Alignment on the decimate grey stores half-resolution
+// displacements, and measuring their span directly would compare grey pixels
+// against a raw-pixel threshold -- an effective 2x loosening on that path and
+// no change on FFT, which is exactly the kind of silent unit mismatch that
+// makes r_Mt look inert.
+std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
+                                               f32 sx, f32 sy, int num_threads) {
     const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
-    if (n == 0 || flow.flow.empty()) {
-        flow.motion_irregular.clear();
-        return;
-    }
-    const f32 Mt = std::isfinite(cfg.r_Mt) ? cfg.r_Mt : 0.f;
-    flow.motion_irregular.assign(n, 0u);
+    std::vector<uint32_t> out;
+    if (n == 0 || flow.flow.empty()) return out;
+    if (!std::isfinite(Mt)) Mt = 0.f;
+    if (!std::isfinite(sx) || sx <= 0.f) sx = 1.f;
+    if (!std::isfinite(sy) || sy <= 0.f) sy = 1.f;
+    out.assign(n, 0u);
+    // Distribution of M itself, not just how many cleared the threshold. One
+    // run then answers whether r_Mt is in the right range at all: if the
+    // percentiles sit far below it nothing will ever fire whatever it is set
+    // to, and if they sit far above it everything fires. Comparing the flagged
+    // percentage at two thresholds cannot distinguish those from a threshold
+    // that is simply mistuned.
+    const bool want_stats = prof_enabled();
+    std::vector<f32> m_sq;
+    if (want_stats) m_sq.assign(n, 0.f);
     const f32 inf = std::numeric_limits<f32>::infinity();
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+    parallel_rows(flow.ny, num_threads, [&](int ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
             for (int i = -1; i <= 1; ++i) {
                 for (int j = -1; j <= 1; ++j) {
                     const int yy = ty + i, xx = tx + j;
                     if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                    const f32 fx = flow.dx(yy, xx), fy = flow.dy(yy, xx);
+                    const f32 fx = flow.dx(yy, xx) * sx;
+                    const f32 fy = flow.dy(yy, xx) * sy;
                     mnx = std::min(mnx, fx);
                     mxx = std::max(mxx, fx);
                     mny = std::min(mny, fy);
@@ -214,9 +235,40 @@ static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
                 }
             }
             const f32 d0 = mxx - mnx, d1 = mxy - mny;
-            flow.irregular(ty, tx) = (d0 * d0 + d1 * d1 > Mt * Mt) ? 1u : 0u;
+            const f32 m2 = d0 * d0 + d1 * d1;
+            const size_t idx = (size_t)ty * flow.nx + tx;
+            out[idx] = (m2 > Mt * Mt) ? 1u : 0u;
+            if (want_stats) m_sq[idx] = m2;
         }
     });
+    if (want_stats && n > 0) {
+        size_t flagged = 0;
+        for (uint32_t v : out) flagged += (v != 0u) ? 1u : 0u;
+        auto pct_at = [&](double q) {
+            const size_t k = std::min(n - 1, (size_t)(q * (double)(n - 1)));
+            std::nth_element(m_sq.begin(), m_sq.begin() + k, m_sq.end());
+            return std::sqrt((double)m_sq[k]);   // stored squared
+        };
+        // Order matters: nth_element partially sorts, so ascending quantiles
+        // stay valid on the progressively partitioned range.
+        const double p50 = pct_at(0.50);
+        const double p90 = pct_at(0.90);
+        const double pmax = pct_at(1.00);
+        prof_add_cpu("motionM#r_Mt-used", (double)Mt);
+        prof_add_cpu("motionM#scale-x", (double)sx);
+        prof_add_cpu("motionM#pct-irregular", 100.0 * (double)flagged / (double)n);
+        prof_add_cpu("motionM#p50", p50);
+        prof_add_cpu("motionM#p90", p90);
+        prof_add_cpu("motionM#max", pmax);
+    }
+    return out;
+}
+
+// Measured with sx = sy = 1, which is already raw units on the FFT grey.
+// flow_to_raw_tile_grid recomputes with the true scale when they differ.
+static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
+    flow.motion_irregular =
+        compute_motion_irregular(flow, cfg.r_Mt, 1.f, 1.f, cfg.num_threads);
 }
 
 static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
@@ -1176,7 +1228,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 // Returns the input unchanged when the grey is already full resolution, so the
 // FFT path is unaffected.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
-                                int grey_h, int grey_w, int tile_size) {
+                                int grey_h, int grey_w, int tile_size,
+                                f32 r_Mt, int num_threads) {
     if (flow.nx <= 0 || flow.ny <= 0 || flow.flow.empty() ||
         raw_h <= 0 || raw_w <= 0 || grey_h <= 0 || grey_w <= 0 ||
         tile_size <= 0)
@@ -1190,11 +1243,16 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     const int raw_ny = (raw_h + tile_size - 1) / tile_size;
     const int raw_nx = (raw_w + tile_size - 1) / tile_size;
     FlowField out(raw_ny, raw_nx);
-    // Carried through the same nearest-tile mapping as the displacements, so a
-    // raw tile inherits the verdict measured for the grey tile it came from.
-    // Re-deriving it here instead would measure the span of the duplicated
-    // field, which is a different and over-sensitive quantity.
-    const bool carry_motion = flow.has_motion_prior();
+    // Re-measured here rather than carried, because only this function knows
+    // the grey-to-raw scale that puts the span into the units r_Mt is defined
+    // in. Measured on the INPUT grid so the 3x3 neighbourhood spans three
+    // distinct alignment tiles -- after the mapping below, three consecutive
+    // raw tiles cover only two, which is a narrower and noisier estimate of the
+    // same quantity. Then mapped with the displacements.
+    std::vector<uint32_t> src_irregular;
+    if (flow.has_motion_prior())
+        src_irregular = compute_motion_irregular(flow, r_Mt, sx, sy, num_threads);
+    const bool carry_motion = src_irregular.size() == (size_t)flow.ny * flow.nx;
     if (carry_motion) out.motion_irregular.assign((size_t)raw_ny * raw_nx, 0u);
     for (int ty = 0; ty < raw_ny; ++ty) {
         const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
@@ -1210,7 +1268,8 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 out.aperture(ty, tx) = flow.aperture(gy, gx);
             if (flow.match_ambiguous.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.ambiguous(ty, tx) = flow.ambiguous(gy, gx);
-            if (carry_motion) out.irregular(ty, tx) = flow.irregular(gy, gx);
+            if (carry_motion)
+                out.irregular(ty, tx) = src_irregular[(size_t)gy * flow.nx + gx];
         }
     }
     return out;
