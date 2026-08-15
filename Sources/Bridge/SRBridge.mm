@@ -584,7 +584,14 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
         noise_log = buf;
     }
     // Save log alongside the DNG for inspection on device
-    cfg.debug_string_capture = noise_log;
+    char full_log[512];
+    std::snprintf(full_log, sizeof(full_log),
+                 "%s\nwhite_balance: R=%.6g G=%.6g B=%.6g\nblack_levels: R=%.1f G=%.1f B=%.1f\nwhite_level: %.1f",
+                 noise_log.c_str(),
+                 cfg.white_balance[0], cfg.white_balance[1], cfg.white_balance[2],
+                 cfg.black_levels[0], cfg.black_levels[1], cfg.black_levels[2],
+                 cfg.white_level);
+    cfg.debug_string_capture = full_log;
     if (cfg.debug_pixel4a_noise_profile) {
         const float iso = FirstNumber(FirstValueForKeys(exif, @[
             (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings,

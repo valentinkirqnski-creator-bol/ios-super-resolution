@@ -308,16 +308,30 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
                 cfg.beta_dng[c] = nb[c];
             }
             cfg.has_noise_profile = true;
-            char buf[256];
+            char buf[512];
             std::snprintf(buf, sizeof(buf),
-                         "NoiseProfile: alpha_dng=[%.6g,%.6g,%.6g] "
-                         "beta_dng=[%.6g,%.6g,%.6g]",
+                         "NoiseProfile: alpha_dng=[%.6g,%.6g,%.6g] beta_dng=[%.6g,%.6g,%.6g]\n"
+                         "white_balance: R=%.6g G=%.6g B=%.6g\n"
+                         "black_levels: R=%.1f G=%.1f B=%.1f\n"
+                         "white_level: %.1f",
                          cfg.alpha_dng[0], cfg.alpha_dng[1], cfg.alpha_dng[2],
-                         cfg.beta_dng[0], cfg.beta_dng[1], cfg.beta_dng[2]);
+                         cfg.beta_dng[0], cfg.beta_dng[1], cfg.beta_dng[2],
+                         cfg.white_balance[0], cfg.white_balance[1], cfg.white_balance[2],
+                         cfg.black_levels[0], cfg.black_levels[1], cfg.black_levels[2],
+                         cfg.white_level);
             cfg.debug_string_capture = buf;
         } else {
             cfg.has_noise_profile = false;
-            cfg.debug_string_capture = "NoiseProfile: NOT FOUND (using fallback)";
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                         "NoiseProfile: NOT FOUND (using fallback)\n"
+                         "white_balance: R=%.6g G=%.6g B=%.6g\n"
+                         "black_levels: R=%.1f G=%.1f B=%.1f\n"
+                         "white_level: %.1f",
+                         cfg.white_balance[0], cfg.white_balance[1], cfg.white_balance[2],
+                         cfg.black_levels[0], cfg.black_levels[1], cfg.black_levels[2],
+                         cfg.white_level);
+            cfg.debug_string_capture = buf;
         }
         if (cfg.debug_pixel4a_noise_profile)
             apply_pixel4a_noise_profile(cfg, raw.imgdata.other.iso_speed);
