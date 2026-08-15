@@ -138,6 +138,24 @@ static f32 clamped_aperture_ratio(const Config& cfg) {
     return std::min(std::max(aperture_ratio, 0.f), 1.f);
 }
 
+// ICA damping ratio: the eigenvalue ratio the solve is regularized toward.
+// Shares flow_regularize_aperture_ratio with mark_aperture_limited_tiles, since
+// both express the same thing -- the ratio below which a tile is 1D. 0 disables.
+static f32 ica_damp_ratio(const Config& cfg) {
+    if (!cfg.ica_regularize_enabled) return 0.f;
+    const f32 r = cfg.flow_regularize_aperture_ratio;
+    if (!std::isfinite(r) || r <= 0.f) return 0.f;
+    return std::min(r, 1.f);
+}
+
+// Per-iteration step bound: whatever the block matching that preceded ICA could
+// have reached. A larger step means ICA has left the region the search actually
+// evaluated. 0 disables.
+static f32 ica_max_step(const Config& cfg, int search_radius) {
+    if (!cfg.ica_regularize_enabled) return 0.f;
+    return (f32)std::max(1, search_radius);
+}
+
 static f32 clamped_ambiguity_ratio(const Config& cfg) {
     f32 ambiguity_ratio = cfg.flow_reject_1d_ambiguity_ratio;
     if (!std::isfinite(ambiguity_ratio)) ambiguity_ratio = 1.10f;
@@ -637,11 +655,12 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                               const Image& grady, const Image& moving,
                               const HessianField& hessian,
                               FlowField& flow, int tile_size, int n_iter,
-                              int num_threads) {
+                              int num_threads,
+                              f32 damp_ratio, f32 max_step) {
 #ifdef __APPLE__
     // Metal ica_kernel_8/16 — same math/order as CPU path below / Python ICA.py.
     if (ica_refine_level_metal(ref, gradx, grady, hessian.data, moving, flow,
-                               tile_size, n_iter))
+                               tile_size, n_iter, damp_ratio, max_step))
         return;
 #endif
     int ny = flow.ny, nx = flow.nx;
@@ -659,6 +678,18 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
 
             const f32* h = hessian.at(ty, tx);
             f32 h00 = h[0], h01 = h[1], h10 = h[2], h11 = h[3];
+            // Levenberg-Marquardt damping toward the aperture ratio. The
+            // Hessian is fixed across the iterations below, so this is done
+            // once per tile. See Config::ica_regularize_enabled.
+            if (damp_ratio > 0.f) {
+                const f32 tr = h00 + h11;
+                const f32 d0 = h00 * h11 - h01 * h10;
+                const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - d0));
+                const f32 l1 = tr * 0.5f + disc;
+                const f32 l2 = tr * 0.5f - disc;
+                const f32 lam = damp_ratio * l1 - l2;   // > 0 only when l2/l1 < ratio
+                if (lam > 0.f) { h00 += lam; h11 += lam; }
+            }
             f32 det = h00 * h11 - h01 * h10;
             if (std::fabs(det) < 1e-10f) continue;
             f32 det_inv = 1.f / det;
@@ -726,8 +757,18 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                     }
                     f32 B0 = warp_reduce_ica64(s_B0);
                     f32 B1 = warp_reduce_ica64(s_B1);
-                    fx += det_inv * (h11 * B0 - h01 * B1);
-                    fy += det_inv * (-h10 * B0 + h00 * B1);
+                    f32 dfx = det_inv * (h11 * B0 - h01 * B1);
+                    f32 dfy = det_inv * (-h10 * B0 + h00 * B1);
+                    if (max_step > 0.f) {
+                        const f32 st = std::sqrt(dfx * dfx + dfy * dfy);
+                        if (st > max_step) {
+                            const f32 k = max_step / st;
+                            dfx *= k;
+                            dfy *= k;
+                        }
+                    }
+                    fx += dfx;
+                    fy += dfy;
                 } else {
                     for (int i = 0; i < ts; ++i) {
                         int py = oy + i;
@@ -757,8 +798,18 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                         B0 = warp_then_block_reduce_sum(s_B0, nt);
                         B1 = warp_then_block_reduce_sum(s_B1, nt);
                     }
-                    fx += det_inv * (h11 * B0 - h01 * B1);
-                    fy += det_inv * (-h10 * B0 + h00 * B1);
+                    f32 dfx = det_inv * (h11 * B0 - h01 * B1);
+                    f32 dfy = det_inv * (-h10 * B0 + h00 * B1);
+                    if (max_step > 0.f) {
+                        const f32 st = std::sqrt(dfx * dfx + dfy * dfy);
+                        if (st > max_step) {
+                            const f32 k = max_step / st;
+                            dfx *= k;
+                            dfy *= k;
+                        }
+                    }
+                    fx += dfx;
+                    fy += dfy;
                 }
             }
 
@@ -1072,7 +1123,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             if (L.hess.ny == flow.ny && L.hess.nx == flow.nx)
                 ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts,
-                                 cfg.ica_n_iter, cfg.num_threads);
+                                 cfg.ica_n_iter, cfg.num_threads,
+                                 ica_damp_ratio(cfg),
+                                 ica_max_step(cfg, radius));
         }
     }
 
@@ -1087,8 +1140,11 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         finest_hess = compute_hessian(gx, gy, tile_size);
         debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
         debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
+        const int finest_radius = cfg.bm_search_radii.empty() ? 1
+                                                              : cfg.bm_search_radii[0];
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow, tile_size,
-                         cfg.ica_n_iter, cfg.num_threads);
+                         cfg.ica_n_iter, cfg.num_threads,
+                         ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
     }
     const HessianField* mark_hess = nullptr;
     if (!finest_hess.data.empty()) {

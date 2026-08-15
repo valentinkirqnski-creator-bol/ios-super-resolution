@@ -451,6 +451,26 @@ struct Config {
     // ratio. Higher catches more edge-like tiles; lower limits rejection to
     // very purely one-dimensional tiles.
     float flow_regularize_aperture_ratio = 0.15f;
+    // Regularize the ICA solve. Two independent guards, both on by default:
+    //
+    //   damping -- add lambda = ratio*l1 - l2 to the Hessian diagonal when the
+    //     eigenvalue ratio falls below flow_regularize_aperture_ratio, capping
+    //     the effective condition number at 1/ratio. A 1D edge has one large
+    //     eigenvalue and one at the noise level; inverting that unregularized
+    //     hands the unconstrained direction a step of B/l2 with l2 ~ 0, driven
+    //     entirely by noise. Measured on a synthetic edge at ts=16: l1 = 8.03,
+    //     l2 = 0.0125, step gain 80x along the aperture axis. Damping drops
+    //     that to 0.83x while costing the well-constrained axis 13%.
+    //     Fires only below the ratio, so well-conditioned tiles are untouched.
+    //
+    //   step clamp -- bound one iteration's displacement to the level's block
+    //     matching search radius. Damping does not cover the other failure:
+    //     a low-gradient tile whose temporal residual is real rather than
+    //     noise (occlusion, subject motion, a large incoming misalignment) is
+    //     near-isotropic, so no damping applies, yet the step scales as
+    //     residual/gradient. Measured at 5.1px for a 30x residual. The clamp
+    //     bounds ICA to what the search that preceded it could have reached.
+    bool  ica_regularize_enabled = true;
     // Legacy setting kept for old saved app preferences. The current 1D reject
     // gate uses flow_reject_1d_residual_threshold instead.
     float flow_reject_1d_ambiguity_ratio = 1.10f;

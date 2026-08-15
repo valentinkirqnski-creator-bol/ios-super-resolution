@@ -48,10 +48,13 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
 // ICA refine one pyramid level (ICA.py ica_kernel_8/16). Same bilinear rules,
 // modf/trunc, butterfly reduce order, and Ax=B update as align.cpp / Python.
 // hess: packed [ny*nx*4] = 00,01,10,11. Returns false if ts not in {8,16}.
+// damp_ratio: Levenberg-Marquardt damping toward that eigenvalue ratio, 0 off.
+// max_step: per-iteration displacement bound in pixels, 0 off.
 bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
                             const std::vector<float>& hess_packed,
                             const Image& moving, FlowField& flow,
-                            int tile_size, int n_iter);
+                            int tile_size, int n_iter,
+                            float damp_ratio = 0.f, float max_step = 0.f);
 
 // Exact cuda_downsample / grey_pyramid.cpp downsample_by (valid gauss + stride).
 bool downsample_by_metal(const Image& src, int factor, Image& out);

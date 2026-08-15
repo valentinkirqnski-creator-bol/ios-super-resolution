@@ -2195,7 +2195,9 @@ struct IcaParams {
     uint ref_h, ref_w, mov_h, mov_w;
     uint ny, nx, ts, n_iter;
     uint clamp_edge; // 1 → ica_kernel_8 clamp; 0 → ica_kernel_16 zero-OOB
-    uint _pad0, _pad1, _pad2; // 48 bytes for setBytes
+    float damp_ratio;  // LM damping toward this eigenvalue ratio; 0 disables
+    float max_step;    // per-iteration displacement bound in px; 0 disables
+    uint _pad0;        // 48 bytes for setBytes
 };
 
 inline float sample_mov(device const float* mov, int y, int x,
@@ -2289,6 +2291,18 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     uint ho = tid * 4u;
     float h00 = hess[ho + 0u], h01 = hess[ho + 1u];
     float h10 = hess[ho + 2u], h11 = hess[ho + 3u];
+    // Levenberg-Marquardt damping toward the aperture ratio -- see
+    // ica_refine_level in align.cpp. The Hessian is fixed across the iterations
+    // below, so this runs once per tile.
+    if (p.damp_ratio > 0.f) {
+        float tr = h00 + h11;
+        float d0 = h00 * h11 - h01 * h10;
+        float disc = sqrt(max(0.f, tr * tr * 0.25f - d0));
+        float l1 = tr * 0.5f + disc;
+        float l2 = tr * 0.5f - disc;
+        float lam = p.damp_ratio * l1 - l2;   // > 0 only when l2/l1 < ratio
+        if (lam > 0.f) { h00 += lam; h11 += lam; }
+    }
     float det = h00 * h11 - h01 * h10;
     if (fabs(det) < 1e-10f) return; // leave flow unchanged; pure divide-by-zero preflight
     float det_inv = 1.f / det;
@@ -2355,8 +2369,14 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
                     }
                 }
             }
-            fx += det_inv * (h11 * B0 - h01 * B1);
-            fy += det_inv * (-h10 * B0 + h00 * B1);
+            float dfx = det_inv * (h11 * B0 - h01 * B1);
+            float dfy = det_inv * (-h10 * B0 + h00 * B1);
+            if (p.max_step > 0.f) {
+                float st = sqrt(dfx * dfx + dfy * dfy);
+                if (st > p.max_step) { float k = p.max_step / st; dfx *= k; dfy *= k; }
+            }
+            fx += dfx;
+            fy += dfy;
         }
         flow[tid * 2u + 0u] = fx;
         flow[tid * 2u + 1u] = fy;
@@ -2411,8 +2431,14 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         // next iteration's fill is consistent without broadcasting them.
         float B0 = s_B0[0];
         float B1 = s_B1[0];
-        fx += det_inv * (h11 * B0 - h01 * B1);
-        fy += det_inv * (-h10 * B0 + h00 * B1);
+        float dfx = det_inv * (h11 * B0 - h01 * B1);
+        float dfy = det_inv * (-h10 * B0 + h00 * B1);
+        if (p.max_step > 0.f) {
+            float st = sqrt(dfx * dfx + dfy * dfy);
+            if (st > p.max_step) { float k = p.max_step / st; dfx *= k; dfy *= k; }
+        }
+        fx += dfx;
+        fy += dfy;
         threadgroup_barrier(mem_flags::mem_threadgroup); // before the next refill
     }
 
