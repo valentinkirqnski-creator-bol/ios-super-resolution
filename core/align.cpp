@@ -201,7 +201,8 @@ static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
 // no change on FFT, which is exactly the kind of silent unit mismatch that
 // makes r_Mt look inert.
 std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
-                                               f32 sx, f32 sy, int num_threads) {
+                                               f32 sx, f32 sy, int num_threads,
+                                               bool detrend) {
     const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     std::vector<uint32_t> out;
     if (n == 0 || flow.flow.empty()) return out;
@@ -220,21 +221,87 @@ std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
     if (want_stats) m_sq.assign(n, 0.f);
     const f32 inf = std::numeric_limits<f32>::infinity();
     parallel_rows(flow.ny, num_threads, [&](int ty) {
+        f32 vx[9], vy[9];
+        int oi[9], oj[9];
         for (int tx = 0; tx < flow.nx; ++tx) {
-            f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
+            int cnt = 0;
             for (int i = -1; i <= 1; ++i) {
                 for (int j = -1; j <= 1; ++j) {
                     const int yy = ty + i, xx = tx + j;
                     if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                    const f32 fx = flow.dx(yy, xx) * sx;
-                    const f32 fy = flow.dy(yy, xx) * sy;
-                    mnx = std::min(mnx, fx);
-                    mxx = std::max(mxx, fx);
-                    mny = std::min(mny, fy);
-                    mxy = std::max(mxy, fy);
+                    vx[cnt] = flow.dx(yy, xx) * sx;
+                    vy[cnt] = flow.dy(yy, xx) * sy;
+                    oi[cnt] = i;
+                    oj[cnt] = j;
+                    ++cnt;
                 }
             }
-            const f32 d0 = mxx - mnx, d1 = mxy - mny;
+
+            // Remove the local linear trend before measuring the spread.
+            //
+            // A rigid rotation by theta has a flow gradient of exactly theta
+            // everywhere, so max-minus-min over the neighbourhood reads
+            // theta*2T*sqrt(2) at EVERY tile -- uniform across the frame.
+            // Measured on a 12MP geometry at tile 16: 0.790 at 1 degree, 1.580
+            // at 2. Against r_Mt = 0.8 that is a step function, 0% of tiles
+            // below about one degree and 100% above, which is why changing the
+            // threshold does nothing on a rotating burst: it is comparing two
+            // values that both sit under a uniform M.
+            //
+            // Rotation, zoom and any smooth camera motion are exactly linear in
+            // tile position, so fitting a plane and taking the residual sends
+            // their contribution to zero while a genuine discontinuity keeps
+            // most of its jump -- a step of h leaves a residual span of h/2.
+            // That restores r_Mt to what the paper means by it: a detector for
+            // motion BOUNDARIES, not for smooth motion that merely is not
+            // constant.
+            bool detrended = false;
+            if (detrend && cnt >= 4) {
+                f32 m00 = (f32)cnt, m01 = 0, m02 = 0, m11 = 0, m12 = 0, m22 = 0;
+                for (int k = 0; k < cnt; ++k) {
+                    const f32 jj = (f32)oj[k], ii = (f32)oi[k];
+                    m01 += jj;  m02 += ii;
+                    m11 += jj * jj;  m12 += ii * jj;  m22 += ii * ii;
+                }
+                // Symmetric 3x3 cofactors; geometry only, shared by both axes.
+                const f32 c00 = m11 * m22 - m12 * m12;
+                const f32 c01 = m02 * m12 - m01 * m22;
+                const f32 c02 = m01 * m12 - m02 * m11;
+                const f32 det = m00 * c00 + m01 * c01 + m02 * c02;
+                if (std::fabs(det) > 1e-6f) {
+                    const f32 c11 = m00 * m22 - m02 * m02;
+                    const f32 c12 = m02 * m01 - m00 * m12;
+                    const f32 c22 = m00 * m11 - m01 * m01;
+                    const f32 inv = 1.f / det;
+                    f32 sx0 = 0, sx1 = 0, sx2 = 0, sy0 = 0, sy1 = 0, sy2 = 0;
+                    for (int k = 0; k < cnt; ++k) {
+                        const f32 jj = (f32)oj[k], ii = (f32)oi[k];
+                        sx0 += vx[k];  sx1 += vx[k] * jj;  sx2 += vx[k] * ii;
+                        sy0 += vy[k];  sy1 += vy[k] * jj;  sy2 += vy[k] * ii;
+                    }
+                    const f32 ax = inv * (c00 * sx0 + c01 * sx1 + c02 * sx2);
+                    const f32 bx = inv * (c01 * sx0 + c11 * sx1 + c12 * sx2);
+                    const f32 cx = inv * (c02 * sx0 + c12 * sx1 + c22 * sx2);
+                    const f32 ay = inv * (c00 * sy0 + c01 * sy1 + c02 * sy2);
+                    const f32 by = inv * (c01 * sy0 + c11 * sy1 + c12 * sy2);
+                    const f32 cy = inv * (c02 * sy0 + c12 * sy1 + c22 * sy2);
+                    for (int k = 0; k < cnt; ++k) {
+                        const f32 jj = (f32)oj[k], ii = (f32)oi[k];
+                        vx[k] -= ax + bx * jj + cx * ii;
+                        vy[k] -= ay + by * jj + cy * ii;
+                    }
+                    detrended = true;
+                }
+            }
+            (void)detrended;
+
+            f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
+            for (int k = 0; k < cnt; ++k) {
+                mnx = std::min(mnx, vx[k]);  mxx = std::max(mxx, vx[k]);
+                mny = std::min(mny, vy[k]);  mxy = std::max(mxy, vy[k]);
+            }
+            const f32 d0 = (cnt > 0) ? (mxx - mnx) : 0.f;
+            const f32 d1 = (cnt > 0) ? (mxy - mny) : 0.f;
             const f32 m2 = d0 * d0 + d1 * d1;
             const size_t idx = (size_t)ty * flow.nx + tx;
             out[idx] = (m2 > Mt * Mt) ? 1u : 0u;
@@ -256,6 +323,7 @@ std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
         const double pmax = pct_at(1.00);
         prof_add_cpu("motionM#r_Mt-used", (double)Mt);
         prof_add_cpu("motionM#scale-x", (double)sx);
+        prof_add_cpu("motionM#detrended", detrend ? 1.0 : 0.0);
         prof_add_cpu("motionM#pct-irregular", 100.0 * (double)flagged / (double)n);
         prof_add_cpu("motionM#p50", p50);
         prof_add_cpu("motionM#p90", p90);
@@ -268,7 +336,8 @@ std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
 // flow_to_raw_tile_grid recomputes with the true scale when they differ.
 static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
     flow.motion_irregular =
-        compute_motion_irregular(flow, cfg.r_Mt, 1.f, 1.f, cfg.num_threads);
+        compute_motion_irregular(flow, cfg.r_Mt, 1.f, 1.f, cfg.num_threads,
+                                 cfg.flow_motion_prior_detrend);
 }
 
 static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
@@ -1229,7 +1298,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 // FFT path is unaffected.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size,
-                                f32 r_Mt, int num_threads) {
+                                f32 r_Mt, int num_threads, bool detrend) {
     if (flow.nx <= 0 || flow.ny <= 0 || flow.flow.empty() ||
         raw_h <= 0 || raw_w <= 0 || grey_h <= 0 || grey_w <= 0 ||
         tile_size <= 0)
@@ -1251,7 +1320,8 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     // same quantity. Then mapped with the displacements.
     std::vector<uint32_t> src_irregular;
     if (flow.has_motion_prior())
-        src_irregular = compute_motion_irregular(flow, r_Mt, sx, sy, num_threads);
+        src_irregular = compute_motion_irregular(flow, r_Mt, sx, sy, num_threads,
+                                                detrend);
     const bool carry_motion = src_irregular.size() == (size_t)flow.ny * flow.nx;
     if (carry_motion) out.motion_irregular.assign((size_t)raw_ny * raw_nx, 0u);
     for (int ty = 0; ty < raw_ny; ++ty) {

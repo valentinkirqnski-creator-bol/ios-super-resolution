@@ -442,6 +442,29 @@ struct Config {
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;
+    // Subtract the local linear trend from the flow field before measuring M.
+    //
+    // M is max-minus-min over a 3x3 tile neighbourhood, which reads a smooth
+    // gradient and a discontinuity as the same thing. A rigid rotation by theta
+    // has a flow gradient of exactly theta everywhere, so M comes out uniform
+    // across the whole frame -- measured 0.790 at 1 degree and 1.580 at 2, on a
+    // 12MP geometry with tile 16. Against r_Mt = 0.8 that is a step function:
+    // nothing flagged below roughly one degree, everything above it. On the
+    // decimate grey the tile is 32 raw px, so it flips at half a degree.
+    //
+    // Handheld bursts rotate by one to three degrees routinely, which puts the
+    // whole frame on the strict prior and makes r_Mt inert -- 0.8 and 0.02 both
+    // sit under a uniform M and select identically.
+    //
+    // Rotation, zoom and any smooth camera motion are exactly linear in tile
+    // position, so a plane fit absorbs them completely. A genuine motion
+    // boundary is not linear and keeps most of its jump: a step of h leaves a
+    // residual span of h/2. r_Mt then means what the paper intends -- a
+    // detector for motion boundaries, not for motion that is merely not
+    // constant.
+    //
+    // Diverges from the reference, which measures the raw span.
+    bool  flow_motion_prior_detrend = true;
     float r_Mt = 0.8f;
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
