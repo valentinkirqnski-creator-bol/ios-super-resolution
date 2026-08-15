@@ -101,8 +101,9 @@ static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[
         if (std::fread(bytes.data(), 8, cnt, f) != cnt) return false;
         const uint32_t nplanes = cnt / 2u;
         // Read per-channel noise values [R, G, B]. If fewer than 3 planes,
-        // replicate the available values to fill the array.
-        // Do NOT average channels — preserve per-channel differences that were in the DNG.
+        // replicate the available value to all three channels.
+        // The DNG NoiseProfile describes the sensor BEFORE white balance multiplication.
+        // White balance scaling will be applied in noise_wb_gain(); store the raw values.
         for (int c = 0; c < 3; ++c) {
             uint32_t src_plane = (c < (int)nplanes) ? c : (nplanes - 1);
             for (int k = 0; k < 2; ++k) {
