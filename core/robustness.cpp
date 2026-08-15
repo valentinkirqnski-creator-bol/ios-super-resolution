@@ -405,18 +405,26 @@ static Image compute_guide(const Image& raw, const Config& cfg) {
     }
     int gh = raw.h / 2, gw = raw.w / 2;
     Image guide(gh, gw, 3);
+    // Divisor per colour taken from the CFA rather than assumed. Bit-identical
+    // to the previous 0.5*gsum for any Bayer pattern -- scaling by 1 and by 1/2
+    // are both exact in IEEE754 -- but it stays correct, and stays in step with
+    // Config::noise_guide_weight, if a pattern ever arrives with a different
+    // count.
+    f32 inv[3];
+    for (int c = 0; c < 3; ++c) {
+        const int n = cfg.cfa.count((uint8_t)c);
+        inv[c] = (n > 0) ? 1.f / (f32)n : 0.f;
+    }
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {
-            f32 gsum = 0.f;
+            f32 sum[3] = {0.f, 0.f, 0.f};
             for (int i = 0; i < 2; ++i) {
                 for (int j = 0; j < 2; ++j) {
-                    uint8_t c = cfg.cfa.p[i][j];
-                    f32 v = raw.at(2 * y + i, 2 * x + j);
-                    if (c == 1) gsum += v;
-                    else        guide.at(y, x, c) = v;
+                    const uint8_t c = cfg.cfa.p[i][j];
+                    if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
                 }
             }
-            guide.at(y, x, 1) = 0.5f * gsum;
+            for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c];
         }
     }
     return guide;

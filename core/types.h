@@ -190,6 +190,18 @@ struct IspParams {
 // 2x2 Bayer CFA pattern (indices into {R=0,G=1,B=2}).
 struct CFA {
     uint8_t p[2][2] = {{0, 1}, {1, 2}}; // default RGGB
+    // How many of the four sites carry this colour. compute_guide averages the
+    // sites of each colour into one guide pixel, so this is both that divisor
+    // and the factor by which averaging reduces that channel's noise variance.
+    // Two greens under any Bayer pattern, one R and one B -- but derived rather
+    // than assumed, so the guide and the noise model cannot disagree.
+    int count(uint8_t color) const {
+        int n = 0;
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j)
+                if (p[i][j] == color) ++n;
+        return n;
+    }
 };
 
 // Full pipeline configuration, mirroring configs/default.yaml.
@@ -255,9 +267,14 @@ struct Config {
         const float g = white_balance[c] / white_balance[1];
         return (std::isfinite(g) && g > 0.f) ? g : 1.f;
     }
-    // Per-guide-channel variance weight: 1/2 for green under a Bayer CFA.
+    // Per-guide-channel variance weight: the reciprocal of how many Bayer sites
+    // compute_guide averaged into that channel. Two greens gives 1/2, single R
+    // and B give 1. Read from the CFA rather than hardcoded, so it tracks
+    // whatever the guide actually did.
     float noise_guide_weight(int c) const {
-        return (bayer_mode && c == 1) ? 0.5f : 1.f;
+        if (!bayer_mode || c < 0 || c > 2) return 1.f;
+        const int n = cfa.count((uint8_t)c);
+        return (n > 0) ? 1.f / (float)n : 1.f;
     }
     float noise_alpha() const {
         float s = 0.f;

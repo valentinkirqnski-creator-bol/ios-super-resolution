@@ -1572,19 +1572,22 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     if (gid.x >= p.guide_w || gid.y >= p.guide_h) return;
     uint cfa[2][2] = {{p.cfa00, p.cfa01}, {p.cfa10, p.cfa11}};
     uint o = (gid.y * p.guide_w + gid.x) * 3u;
-    guide[o + 0u] = 0.f;
-    guide[o + 1u] = 0.f;
-    guide[o + 2u] = 0.f;
-    float gsum = 0.f;
+    // Divisor per colour taken from the CFA rather than assumed -- see
+    // compute_guide in robustness.cpp, which this mirrors, and
+    // Config::noise_guide_weight, which must agree with it. Bit-identical to
+    // the previous 0.5*gsum for any Bayer pattern.
+    float sum[3] = {0.f, 0.f, 0.f};
+    uint cnt[3] = {0u, 0u, 0u};
     for (int i = 0; i < 2; ++i) {
         for (int j = 0; j < 2; ++j) {
             uint c = cfa[i][j];
-            float v = raw[(gid.y * 2u + uint(i)) * p.raw_w + (gid.x * 2u + uint(j))];
-            if (c == 1u) gsum += v;
-            else guide[o + c] = v;
+            if (c > 2u) continue;
+            sum[c] += raw[(gid.y * 2u + uint(i)) * p.raw_w + (gid.x * 2u + uint(j))];
+            cnt[c] += 1u;
         }
     }
-    guide[o + 1u] = 0.5f * gsum;
+    for (uint c = 0u; c < 3u; ++c)
+        guide[o + c] = (cnt[c] > 0u) ? sum[c] / float(cnt[c]) : 0.f;
 }
 
 // Parameters for the high-frequency variance-loss map.
