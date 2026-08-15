@@ -44,11 +44,36 @@ struct FlowField {
     std::vector<uint32_t> aperture_limited; // ny*nx, 1 = Hessian says 1D/aperture-limited
     std::vector<uint32_t> match_ambiguous;  // ny*nx, 1 = best BM match is not clearly unique
 
+    // Wronski's motion prior M: 1 where the flow field varies sharply across the
+    // 3x3 tile neighbourhood (the r_Mt test), selecting the strict s1 scale.
+    //
+    // Carried on the field rather than derived at use time, because it must be
+    // measured on the grid alignment actually produced. flow_to_raw_tile_grid
+    // duplicates each grey tile across a 2x2 block of raw tiles and multiplies
+    // the displacements by 2; recomputing the span afterwards then samples only
+    // 2 distinct vectors per axis instead of 3, while the doubled displacements
+    // inflate what it does sample. For a linearly varying field those cancel,
+    // but for alignment jitter the doubling wins and the test over-fires --
+    // measured at roughly 6x the flagged area near the threshold.
+    //
+    // Deliberately NOT allocated by the constructor, unlike the two above: an
+    // all-zero vector of the right length is indistinguishable from "measured,
+    // nothing irregular". Empty means not measured, and compute_s falls back to
+    // deriving it, which is what the full-resolution FFT path relies on.
+    std::vector<uint32_t> motion_irregular;
+
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
         aperture_limited((size_t)ny_ * nx_, 0u),
         match_ambiguous((size_t)ny_ * nx_, 0u) {}
+
+    // True when motion_irregular carries a measurement for this grid.
+    inline bool has_motion_prior() const {
+        return motion_irregular.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
+    }
+    inline uint32_t& irregular(int ty, int tx) { return motion_irregular[(size_t)ty * nx + tx]; }
+    inline uint32_t irregular(int ty, int tx) const { return motion_irregular[(size_t)ty * nx + tx]; }
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }

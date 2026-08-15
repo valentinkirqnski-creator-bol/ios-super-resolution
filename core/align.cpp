@@ -166,6 +166,41 @@ static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
     return (l1 > 0.f) && (l2 < aperture_ratio * l1);
 }
 
+// Wronski's motion prior, measured on the grid alignment produced.
+//
+// Identical arithmetic to compute_s in robustness.cpp; the point is purely
+// where it runs. Robustness sees the flow only after flow_to_raw_tile_grid has
+// duplicated each grey tile across a 2x2 block of raw tiles and scaled the
+// displacements by 2, and the 3x3 span measured there is not the same quantity.
+static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
+    const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
+    if (n == 0 || flow.flow.empty()) {
+        flow.motion_irregular.clear();
+        return;
+    }
+    const f32 Mt = std::isfinite(cfg.r_Mt) ? cfg.r_Mt : 0.f;
+    flow.motion_irregular.assign(n, 0u);
+    const f32 inf = std::numeric_limits<f32>::infinity();
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
+            for (int i = -1; i <= 1; ++i) {
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    const f32 fx = flow.dx(yy, xx), fy = flow.dy(yy, xx);
+                    mnx = std::min(mnx, fx);
+                    mxx = std::max(mxx, fx);
+                    mny = std::min(mny, fy);
+                    mxy = std::max(mxy, fy);
+                }
+            }
+            const f32 d0 = mxx - mnx, d1 = mxy - mny;
+            flow.irregular(ty, tx) = (d0 * d0 + d1 * d1 > Mt * Mt) ? 1u : 0u;
+        }
+    });
+}
+
 static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
                                         const Config& cfg) {
     const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
@@ -945,6 +980,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             } else {
                 mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
             }
+            mark_motion_irregular_tiles(flow_gpu, cfg);
             return flow_gpu;
         }
     }
@@ -1063,6 +1099,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         mark_hess = &g_ref_ica_cache.levels[0].hess;
     }
     mark_aperture_limited_tiles(flow, mark_hess, cfg);
+    mark_motion_irregular_tiles(flow, cfg);
     return flow;
 }
 
@@ -1097,6 +1134,12 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     const int raw_ny = (raw_h + tile_size - 1) / tile_size;
     const int raw_nx = (raw_w + tile_size - 1) / tile_size;
     FlowField out(raw_ny, raw_nx);
+    // Carried through the same nearest-tile mapping as the displacements, so a
+    // raw tile inherits the verdict measured for the grey tile it came from.
+    // Re-deriving it here instead would measure the span of the duplicated
+    // field, which is a different and over-sensitive quantity.
+    const bool carry_motion = flow.has_motion_prior();
+    if (carry_motion) out.motion_irregular.assign((size_t)raw_ny * raw_nx, 0u);
     for (int ty = 0; ty < raw_ny; ++ty) {
         const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
         const int gy = std::max(0, std::min(flow.ny - 1,
@@ -1111,6 +1154,7 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 out.aperture(ty, tx) = flow.aperture(gy, gx);
             if (flow.match_ambiguous.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.ambiguous(ty, tx) = flow.ambiguous(gy, gx);
+            if (carry_motion) out.irregular(ty, tx) = flow.irregular(gy, gx);
         }
     }
     return out;

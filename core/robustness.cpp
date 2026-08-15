@@ -736,6 +736,18 @@ static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
     const f32 inf = std::numeric_limits<f32>::infinity();
     std::vector<f32> S((size_t)flow.ny * flow.nx, s2);
     if (irregular_out) irregular_out->assign((size_t)flow.ny * flow.nx, 0u);
+    // Measured on the alignment grid by mark_motion_irregular_tiles and carried
+    // through flow_to_raw_tile_grid. Re-deriving it from a field whose tiles
+    // have been duplicated 2x and whose displacements have been scaled 2x
+    // measures a different span; see the note on FlowField::motion_irregular.
+    if (flow.has_motion_prior()) {
+        for (size_t i = 0; i < S.size(); ++i) {
+            const bool irregular = flow.motion_irregular[i] != 0u;
+            S[i] = irregular ? s1 : s2;
+            if (irregular_out) (*irregular_out)[i] = irregular ? 1u : 0u;
+        }
+        return S;
+    }
     for (int ty = 0; ty < flow.ny; ++ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             // Python: mini = +1/0, maxi = -1/0

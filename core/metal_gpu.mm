@@ -1202,6 +1202,16 @@ static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32
     const f32 inf = std::numeric_limits<f32>::infinity();
     std::vector<f32> S((size_t)flow.ny * (size_t)flow.nx, s2);
     if (irregular_out) irregular_out->assign((size_t)flow.ny * (size_t)flow.nx, 0u);
+    // Prefer the measurement taken on the alignment grid -- see compute_s in
+    // robustness.cpp, which this mirrors.
+    if (flow.has_motion_prior()) {
+        for (size_t i = 0; i < S.size(); ++i) {
+            const bool irregular = flow.motion_irregular[i] != 0u;
+            S[i] = irregular ? s1 : s2;
+            if (irregular_out) (*irregular_out)[i] = irregular ? 1u : 0u;
+        }
+        return S;
+    }
     for (int ty = 0; ty < flow.ny; ++ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             f32 mnx = inf, mny = inf, mxx = -inf, mxy = -inf;
