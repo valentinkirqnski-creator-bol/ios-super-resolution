@@ -2274,7 +2274,7 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
     float h00 = hess[ho + 0u], h01 = hess[ho + 1u];
     float h10 = hess[ho + 2u], h11 = hess[ho + 3u];
     float det = h00 * h11 - h01 * h10;
-    if (fabs(det) < 1e-5f) return; // leave flow unchanged (460-main Python early exit)
+    if (fabs(det) < 1e-10f) return; // leave flow unchanged; pure divide-by-zero preflight
     float det_inv = 1.f / det;
 
     float fx = flow[tid * 2u + 0u];

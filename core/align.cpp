@@ -610,7 +610,7 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             const f32* h = hessian.at(ty, tx);
             f32 h00 = h[0], h01 = h[1], h10 = h[2], h11 = h[3];
             f32 det = h00 * h11 - h01 * h10;
-            if (std::fabs(det) < 1e-5f) continue;
+            if (std::fabs(det) < 1e-10f) continue;
             f32 det_inv = 1.f / det;
 
             f32 fx = flow.dx(ty, tx);
