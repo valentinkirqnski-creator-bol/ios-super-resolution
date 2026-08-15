@@ -308,8 +308,16 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
                 cfg.beta_dng[c] = nb[c];
             }
             cfg.has_noise_profile = true;
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                         "NoiseProfile: alpha_dng=[%.6g,%.6g,%.6g] "
+                         "beta_dng=[%.6g,%.6g,%.6g]",
+                         cfg.alpha_dng[0], cfg.alpha_dng[1], cfg.alpha_dng[2],
+                         cfg.beta_dng[0], cfg.beta_dng[1], cfg.beta_dng[2]);
+            cfg.debug_string_capture = buf;
         } else {
             cfg.has_noise_profile = false;
+            cfg.debug_string_capture = "NoiseProfile: NOT FOUND (using fallback)";
         }
         if (cfg.debug_pixel4a_noise_profile)
             apply_pixel4a_noise_profile(cfg, raw.imgdata.other.iso_speed);

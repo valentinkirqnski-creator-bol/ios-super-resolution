@@ -493,6 +493,7 @@ struct Config {
 
     int num_threads = 0;      // 0 => hardware_concurrency
     bool use_gpu = false;     // opt-in Vulkan compute merge (experimental)
+    std::string debug_string_capture;  // captured metadata (e.g., NoiseProfile), written to .log file
 };
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }

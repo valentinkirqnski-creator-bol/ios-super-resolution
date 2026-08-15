@@ -553,6 +553,7 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
 
     std::vector<double> noise;
     CollectNumbers(FirstValueForKeys(dng, @[@"NoiseProfile"]), noise);
+    std::string noise_log;
     if (noise.size() >= 2) {
         const size_t nplanes = noise.size() / 2u;
         // Read per-channel [R, G, B] noise without averaging, preserving differences.
@@ -568,15 +569,22 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
         }
         cfg.has_noise_profile = ok;
         if (ok) {
-            std::printf("[SRBridge] NoiseProfile read: nplanes=%zu alpha_dng=[%.6g,%.6g,%.6g] "
-                        "beta_dng=[%.6g,%.6g,%.6g]\n",
-                        nplanes, cfg.alpha_dng[0], cfg.alpha_dng[1], cfg.alpha_dng[2],
-                        cfg.beta_dng[0], cfg.beta_dng[1], cfg.beta_dng[2]);
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                         "NoiseProfile: nplanes=%zu alpha_dng=[%.6g,%.6g,%.6g] "
+                         "beta_dng=[%.6g,%.6g,%.6g]",
+                         nplanes, cfg.alpha_dng[0], cfg.alpha_dng[1], cfg.alpha_dng[2],
+                         cfg.beta_dng[0], cfg.beta_dng[1], cfg.beta_dng[2]);
+            noise_log = buf;
         }
     } else {
         cfg.has_noise_profile = false;
-        std::printf("[SRBridge] NoiseProfile not found in metadata (size %zu)\n", noise.size());
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "NoiseProfile: NOT FOUND (metadata size %zu)", noise.size());
+        noise_log = buf;
     }
+    // Save log alongside the DNG for inspection on device
+    cfg.debug_string_capture = noise_log;
     if (cfg.debug_pixel4a_noise_profile) {
         const float iso = FirstNumber(FirstValueForKeys(exif, @[
             (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings,
@@ -758,6 +766,13 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     if (preview.w <= 0) return NO;
 
+    // Write debug log to .log file alongside the output DNG
+    if (!cfg.debug_string_capture.empty()) {
+        NSString *logPath = [[outPath stringByDeletingPathExtension] stringByAppendingPathExtension:@"log"];
+        NSString *logContent = [NSString stringWithUTF8String:cfg.debug_string_capture.c_str()];
+        [logContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
 }
@@ -809,6 +824,13 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     }
 
     if (preview.w <= 0) return NO;
+
+    // Write debug log to .log file alongside the output DNG
+    if (!cfg.debug_string_capture.empty()) {
+        NSString *logPath = [[outPath stringByDeletingPathExtension] stringByAppendingPathExtension:@"log"];
+        NSString *logContent = [NSString stringWithUTF8String:cfg.debug_string_capture.c_str()];
+        [logContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
