@@ -1929,10 +1929,20 @@ final class CameraModel: NSObject, ObservableObject {
         }
 
         if ok {
-            let robURL: URL? = tuningParams.robustness_save_mask
-                ? URL(fileURLWithPath: outURL.deletingPathExtension().path + "_robustness.pgm")
-                : nil
-            saveToPhotos(url: outURL, robustnessMask: robURL, preview: preview, burstDir: burstDir)
+            // Suffixes must match write_robustness_mask_pgm in pipeline.cpp.
+            var maskSuffixes: [String] = []
+            if tuningParams.robustness_save_mask {
+                maskSuffixes.append("_robustness.pgm")
+                if tuningParams.robustness_save_s_masks {
+                    maskSuffixes.append("_robustness_s1.pgm")
+                    maskSuffixes.append("_robustness_s2.pgm")
+                }
+            }
+            let base = outURL.deletingPathExtension().path
+            let robURLs = maskSuffixes
+                .map { URL(fileURLWithPath: base + $0) }
+                .filter { FileManager.default.fileExists(atPath: $0.path) }
+            saveToPhotos(url: outURL, robustnessMasks: robURLs, preview: preview, burstDir: burstDir)
         } else {
             removeBurstDir(burstDir)
             self.burstDir = nil
@@ -2004,7 +2014,7 @@ final class CameraModel: NSObject, ObservableObject {
         return nil
     }
 
-    private func saveToPhotos(url: URL, robustnessMask: URL?, preview: UIImage?, burstDir: URL?) {
+    private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
         let format = exportFormat
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
@@ -2039,16 +2049,20 @@ final class CameraModel: NSObject, ObservableObject {
                 }
             }
 
-            var maskJPEG: URL?
-            if let rob = robustnessMask, FileManager.default.fileExists(atPath: rob.path),
-               let img = Self.uiImageFromPGM(url: rob),
-               let jpeg = img.jpegData(compressionQuality: 0.92) {
+            // Each mask becomes its own JPEG, named after the source PGM so the
+            // three are distinguishable once they land in Photos.
+            var maskJPEGs: [URL] = []
+            for rob in robustnessMasks {
+                guard FileManager.default.fileExists(atPath: rob.path),
+                      let img = Self.uiImageFromPGM(url: rob),
+                      let jpeg = img.jpegData(compressionQuality: 0.92) else { continue }
+                let stem = rob.deletingPathExtension().lastPathComponent
                 let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("robustness_mask_\(UUID().uuidString).jpg")
+                    .appendingPathComponent("\(stem)_\(UUID().uuidString).jpg")
                 try? jpeg.write(to: tmp, options: .atomic)
-                maskJPEG = tmp
+                maskJPEGs.append(tmp)
             }
-            let savedMask = maskJPEG != nil
+            let savedMask = !maskJPEGs.isEmpty
             let label = format == .jpg ? "JPG" : "DNG"
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
@@ -2062,27 +2076,31 @@ final class CameraModel: NSObject, ObservableObject {
                     opts.uniformTypeIdentifier = "com.adobe.raw-image"
                 }
                 req.addResource(with: .photo, fileURL: saveURL, options: opts)
-                if let maskJPEG {
-                    // Its own options. Reusing `opts` tagged this JPEG with
-                    // uniformTypeIdentifier "com.adobe.raw-image" whenever the
-                    // export format was DNG, so Photos was told a JPEG was a
-                    // RAW file and rejected the resource -- which is why the
-                    // mask never appeared even with the toggle on. Only the DNG
-                    // export path was affected; JPG export sets no UTI.
+                for maskJPEG in maskJPEGs {
+                    // Its own options, one fresh request per mask. Reusing
+                    // `opts` tagged the JPEG with uniformTypeIdentifier
+                    // "com.adobe.raw-image" whenever the export format was DNG,
+                    // so Photos was told a JPEG was a RAW file and rejected the
+                    // resource -- which is why the mask never appeared even with
+                    // the toggle on. Only the DNG export path was affected.
+                    //
+                    // A fresh PHAssetCreationRequest per mask matters too: a
+                    // second addResource(with: .photo,...) on the same request
+                    // is a second rendition of one asset, not a new asset.
                     let mopts = PHAssetResourceCreationOptions()
                     mopts.shouldMoveFile = false
                     let mreq = PHAssetCreationRequest.forAsset()
                     mreq.addResource(with: .photo, fileURL: maskJPEG, options: mopts)
                 }
             }, completionHandler: { success, _ in
-                if let maskJPEG { try? FileManager.default.removeItem(at: maskJPEG) }
+                for maskJPEG in maskJPEGs { try? FileManager.default.removeItem(at: maskJPEG) }
                 if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
                 DispatchQueue.main.async {
                     self.lastThumbnail = preview
                     self.finish(success: success,
                                 message: success
                                     ? (savedMask
-                                       ? "Saved \(label) + robustness mask to Photos"
+                                       ? "Saved \(label) + \(maskJPEGs.count) robustness mask\(maskJPEGs.count == 1 ? "" : "s") to Photos"
                                        : "Saved super-res \(label) to Photos")
                                     : "Could not save to Photos")
                 }
