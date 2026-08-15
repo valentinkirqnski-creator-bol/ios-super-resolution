@@ -36,8 +36,20 @@ Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
 // raw_coordinate / tile_size and add the displacement in raw pixels, so the
 // field has to be converted before either sees it. A no-op when the grey is
 // already full resolution.
+// r_Mt is the motion-prior threshold, in RAW pixels. The prior is measured
+// here rather than carried, because only this function knows the grey-to-raw
+// scale needed to express the span in those units. detrend removes the local
+// linear trend first, so smooth camera motion (rotation, zoom) does not read
+// as irregular. num_threads as in Config.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
-                                int grey_h, int grey_w, int tile_size);
+                                int grey_h, int grey_w, int tile_size,
+                                f32 r_Mt, int num_threads, bool detrend);
+
+// 1 where the flow field is irregular over the 3x3 tile neighbourhood -- the
+// r_Mt test. sx/sy scale the stored displacements into r_Mt's units.
+std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
+                                               f32 sx, f32 sy, int num_threads,
+                                               bool detrend);
 
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
