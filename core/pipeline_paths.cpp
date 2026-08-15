@@ -1927,7 +1927,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         std::snprintf(hdr, sizeof(hdr),
                       "\nburst wall %.1f ms over %d frames (%.1f ms/frame)\n",
                       wall, n, wall / std::max(1, n));
-        const std::string prof = prof_report() + hdr;
+        std::string prof = prof_report() + hdr;
+        if (!cfg.debug_string_capture.empty()) {
+            prof += "\n=== Metadata ===\n" + cfg.debug_string_capture + "\n";
+        }
         std::printf("%s", prof.c_str());
         std::fflush(stdout);
         prof_save_report(prof);
