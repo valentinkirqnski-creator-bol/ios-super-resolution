@@ -685,7 +685,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 float v = ((float)rawv - site_black[fi][fj]) / site_denom[fi][fj];
                 v *= site_wb[fi][fj];
                 if (!std::isfinite(v)) v = 0.f;
-                img.at(y, x) = clampf(v, 0.f, 1.f);
+                // No upper clip -- see load_raw_dng in raw_io.cpp.
+                img.at(y, x) = std::max(v, 0.f);
             }
         });
     }

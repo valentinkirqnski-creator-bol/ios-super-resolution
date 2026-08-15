@@ -367,17 +367,27 @@ static const NoiseCurves& make_noise_curves(const Config& cfg) {
 
 } // namespace
 
+// Python indexes std_curve[round(1000*brightness)] with no clamp, which is safe
+// there only because the loader clipped every sample to [0,1]. Now that white
+// balance is applied without an upper clip -- a 2x red gain puts any raw value
+// above 0.49 past 1.0 -- the frame mean these are called with can exceed 1 on a
+// bright scene, and the curve has 1001 entries. Clamped rather than left to
+// read past the end.
+static inline size_t noise_curve_index(f32 brightness, size_t n) {
+    if (!std::isfinite(brightness) || n == 0) return 0;
+    const long id = std::lround(1000.f * brightness);
+    if (id < 0) return 0;
+    return (size_t)std::min<long>(id, (long)n - 1);
+}
+
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta) {
-    // Python: id_noise = round(1000*brightness); std = std_curve[id_noise] — no clamp
     const NoiseCurves& nc = make_noise_curves(alpha, beta);
-    int id = (int)std::lround(1000.f * brightness);
-    return nc.std_curve[(size_t)id];
+    return nc.std_curve[noise_curve_index(brightness, nc.std_curve.size())];
 }
 
 f32 noise_std_at_brightness(f32 brightness, const Config& cfg) {
     const NoiseCurves& nc = make_noise_curves(cfg);
-    int id = (int)std::lround(1000.f * brightness);
-    return nc.std_curve[(size_t)id];
+    return nc.std_curve[noise_curve_index(brightness, nc.std_curve.size())];
 }
 
 void fetch_noise_curves(f32 alpha, f32 beta,

@@ -396,7 +396,19 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             float v = ((float)raw_image[(top + y) * stride + (left + x)] - bl) / denom;
             v *= site_wb[fi][fj];
             if (!std::isfinite(v)) v = 0.f;
-            img.at(y, x) = clampf(v, 0.f, 1.f);
+            // No upper clip. White balance multiplies red by ~2 and blue by
+            // ~1.8, so clipping to 1 here destroys every red raw value above
+            // 0.49 and every blue above 0.54 -- well short of sensor
+            // saturation. What it costs is not just highlight detail at export:
+            // a clipped region has no local variance and no gradient, so the
+            // grey it feeds alignment has no edge to match, and robustness sees
+            // two frames that clip identically as a perfect match and merges
+            // them at R = 1 regardless of whether they are aligned.
+            //
+            // The reference clips here (utils_dng load_dng_burst) and carries
+            // the same loss. Clipping now happens only where the range is
+            // genuinely bounded: the uint16 DNG and the JPEG encoder.
+            img.at(y, x) = std::max(v, 0.f);
         }
     });
     cfg.raw_prewhitened = true;

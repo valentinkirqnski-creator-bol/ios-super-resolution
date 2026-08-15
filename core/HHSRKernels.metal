@@ -25,7 +25,8 @@ kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
     float v = (float(rawv) - p.black[site]) / p.denom[site];
     v *= p.wb[site];
     if (!isfinite(v)) v = 0.f;
-    out[gid.y * p.w + gid.x] = clamp(v, 0.f, 1.f);
+    // No upper clip -- see load_raw_dng in raw_io.cpp.
+    out[gid.y * p.w + gid.x] = max(v, 0.f);
 }
 
 inline float2 cmul(float2 a, float2 b) {
