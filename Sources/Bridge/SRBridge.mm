@@ -555,16 +555,18 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
     CollectNumbers(FirstValueForKeys(dng, @[@"NoiseProfile"]), noise);
     if (noise.size() >= 2) {
         const size_t nplanes = noise.size() / 2u;
-        const size_t use = std::min<size_t>(3u, nplanes);
-        double sa = 0.0, sb = 0.0;
-        for (size_t i = 0; i < use; ++i) {
-            sa += noise[i * 2u + 0u];
-            sb += noise[i * 2u + 1u];
+        // Read per-channel [R, G, B] noise without averaging, preserving differences.
+        // If fewer than 3 planes, replicate the last one.
+        bool ok = true;
+        for (int c = 0; c < 3; ++c) {
+            size_t src_plane = (c < (int)nplanes) ? c : (nplanes - 1);
+            cfg.alpha_dng[c] = (float)noise[src_plane * 2u + 0u];
+            cfg.beta_dng[c] = (float)noise[src_plane * 2u + 1u];
+            if (!(cfg.alpha_dng[c] > 0.f && std::isfinite(cfg.alpha_dng[c]) &&
+                  std::isfinite(cfg.beta_dng[c])))
+                ok = false;
         }
-        cfg.alpha = (float)(sa / 3.0);
-        cfg.beta = (float)(sb / 3.0);
-        cfg.has_noise_profile =
-            cfg.alpha > 0.f && std::isfinite(cfg.alpha) && std::isfinite(cfg.beta);
+        cfg.has_noise_profile = ok;
     } else {
         cfg.has_noise_profile = false;
     }
