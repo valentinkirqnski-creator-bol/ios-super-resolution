@@ -1485,7 +1485,7 @@ struct RobMaskParams {
     // metal_gpu.mm, which static_asserts the size.
     float flow_reject_1d_residual_threshold;
     uint aperture_reject_enabled;
-    uint _pad0;
+    float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
 };
 
 inline float dogson_quadratic(float x) {
@@ -1918,11 +1918,15 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             edge_reject = edge_sq > th * th;
         }
     }
-    bool aperture_reject =
+    // Aperture-limited tiles are demoted to the irregular-motion prior rather
+    // than discarded -- see compute_robustness in robustness.cpp. min, not
+    // assignment: a tile already flagged motion-irregular must not be promoted.
+    bool aperture_limited_tile =
         p.aperture_reject_enabled != 0u &&
         aperture_limited[pidx] != 0u &&
         tile_residual_high[pidx] != 0u;
-    bool hard_reject = hf_reject || edge_reject || aperture_reject;
+    if (aperture_limited_tile) s = min(s, p.r_s1);
+    bool hard_reject = hf_reject || edge_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);

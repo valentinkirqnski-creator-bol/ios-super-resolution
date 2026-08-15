@@ -929,13 +929,25 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            const bool aperture_reject =
+            // Aperture-limited tiles are demoted to the irregular-motion prior
+            // rather than discarded. The tile is not wrong, it is unverifiable:
+            // the gradient constrains motion across the edge but not along it,
+            // so one component of the flow is unmeasured rather than measured
+            // badly. Zeroing threw away the component that WAS measured, and on
+            // scenes with long edges -- architecture, horizons, railings -- that
+            // removed enough of the burst to cost real detail. s1 keeps the tile
+            // contributing while holding it to the same standard as any other
+            // tile whose motion estimate is not trusted.
+            const bool aperture_limited =
                 cfg.flow_reject_1d_enabled &&
                 pidx < flow.aperture_limited.size() &&
                 pidx < tile_residual_high.size() &&
                 flow.aperture_limited[pidx] != 0u &&
                 tile_residual_high[pidx] != 0u;
-            const bool hard_reject = hf_reject || edge_reject || aperture_reject;
+            // min, not assignment: a tile already flagged motion-irregular must
+            // not be promoted, and lower s is strictly stricter here.
+            if (aperture_limited) s = std::min(s, cfg.r_s1);
+            const bool hard_reject = hf_reject || edge_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);

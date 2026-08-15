@@ -1128,7 +1128,7 @@ struct RobMaskParamsCPU {
     // same order. A mismatch here is silent on the shader side.
     float flow_reject_1d_residual_threshold = 0.f;
     uint32_t aperture_reject_enabled = 0;
-    uint32_t _pad0 = 0;
+    float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
 };
 static_assert(sizeof(RobMaskParamsCPU) == 84, "RobMaskParamsCPU");
 
@@ -1537,6 +1537,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.flow_reject_1d_residual_threshold = cfg.flow_reject_1d_residual_threshold;
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
+    mp.r_s1 = cfg.r_s1;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
