@@ -753,14 +753,23 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
     FlowField out(target_ny, target_nx);
     for (int ty = 0; ty < target_ny; ++ty) {
         for (int tx = 0; tx < target_nx; ++tx) {
-            if (tx >= repeat_factor * in.nx || ty >= repeat_factor * in.ny) {
-                out.dx(ty, tx) = 0.f;
-                out.dy(ty, tx) = 0.f;
-                continue;
-            }
-
-            const int prev_x = tx / repeat_factor;
-            const int prev_y = ty / repeat_factor;
+            // The target grid is floor(level_dims / tile_size), but the level
+            // dims come out of downsample_by, which shrinks the image by a valid
+            // convolution (4*factor pixels) before subsampling. target_n* is
+            // therefore always a little larger than repeat_factor * in.n*, at
+            // every level and every shipped configuration -- circular padding
+            // only guarantees divisibility at level 0.
+            //
+            // Those uncovered tiles form a strip along the bottom and right
+            // edges. They used to be reset to zero motion, which the finest
+            // level could not recover: its search radius is 1, so a burst with
+            // any real handheld motion left that strip unaligned. Clamping to
+            // the nearest covered coarse tile hands them the neighbouring
+            // estimate instead, and the three-candidate test below still
+            // re-verifies it against the image. upscale_flow(), the sibling
+            // above, has always clamped.
+            const int prev_x = std::min(tx / repeat_factor, in.nx - 1);
+            const int prev_y = std::min(ty / repeat_factor, in.ny - 1);
             const int ups_x = tx % repeat_factor;
             const int ups_y = ty % repeat_factor;
             const int x_shift = (2 * ups_x + 1 > repeat_factor) ? 1 : -1;

@@ -2561,14 +2561,14 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
                                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.target_nx || gid.y >= p.target_ny) return;
     uint o = (gid.y * p.target_nx + gid.x) * 2u;
-    if (gid.y >= p.repeat_factor * p.in_ny || gid.x >= p.repeat_factor * p.in_nx) {
-        out_flow[o + 0u] = 0.f;
-        out_flow[o + 1u] = 0.f;
-        return;
-    }
 
-    uint prev_x = gid.x / p.repeat_factor;
-    uint prev_y = gid.y / p.repeat_factor;
+    // target_n* always exceeds repeat_factor * in_n* (see upscale_flow_460 in
+    // align.cpp for why), leaving a strip of tiles along the bottom and right
+    // edges with no coarse tile above them. Clamp to the nearest covered tile;
+    // resetting those to zero motion left the strip unrecoverable at the finest
+    // level, whose search radius is 1.
+    uint prev_x = min(gid.x / p.repeat_factor, p.in_nx - 1u);
+    uint prev_y = min(gid.y / p.repeat_factor, p.in_ny - 1u);
     uint ups_x = gid.x % p.repeat_factor;
     uint ups_y = gid.y % p.repeat_factor;
     int x_shift = (2u * ups_x + 1u > p.repeat_factor) ? 1 : -1;
