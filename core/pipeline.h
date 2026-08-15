@@ -51,8 +51,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                   const ProgressFn& progress, int maxPreviewDim = 512);
 
 // Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
-// Path: replace ".dng" with "_robustness.pgm", or append that suffix.
+// Path: replace ".dng" with "_robustness<name_suffix>.pgm", or append that.
+// name_suffix is "" for the combined mask, "_s1"/"_s2" for the split ones.
 bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
-                               const std::string& dng_path);
+                               const std::string& dng_path,
+                               const char* name_suffix = "");
 
 } // namespace hhsr

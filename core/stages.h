@@ -80,8 +80,14 @@ void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 
 // Robustness mask r at raw resolution [h, w, 1].
+//
+// s_select_out, when non-null, also receives a per-pixel record of which motion
+// prior each pixel was scored with: 1 where the strict s1 applied (sharp local
+// variation in the flow field, or an aperture-limited tile), 0 where the
+// permissive s2 did. Used to split the accumulated mask for inspection.
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
-                         const FlowField& flow, int tile_size, const Config& cfg);
+                         const FlowField& flow, int tile_size, const Config& cfg,
+                         Image* s_select_out = nullptr);
 
 // ---- kernels.cpp --------------------------------------------------------
 CovField estimate_kernels(const Image& raw, const Config& cfg);

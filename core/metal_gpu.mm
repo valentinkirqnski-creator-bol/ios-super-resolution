@@ -1129,8 +1129,9 @@ struct RobMaskParamsCPU {
     float flow_reject_1d_residual_threshold = 0.f;
     uint32_t aperture_reject_enabled = 0;
     float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
+    uint32_t save_s_select = 0;  // 1 = also emit the per-pixel s1/s2 selector
 };
-static_assert(sizeof(RobMaskParamsCPU) == 84, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 88, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1429,7 +1430,8 @@ void metal_release_host_ref_stats(RefStats& ref_stats) {
 }
 
 static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
-                                           const FlowField& flow, int tile_size, const Config& cfg) {
+                                           const FlowField& flow, int tile_size, const Config& cfg,
+                                           Image* s_select_out) {
     if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
@@ -1510,9 +1512,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
+    // Bound unconditionally because the kernel declares it; sized for real only
+    // when asked, so the off case costs 4 bytes rather than a full mask plane.
+    const bool want_s_select = (s_select_out != nullptr);
+    id<MTLBuffer> b_s_select = buf(nullptr, want_s_select ? mask_b : sizeof(float));
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
         !b_S || !b_motion || !b_aperture || !b_tile_residual_high || !b_flow ||
-        !b_R || !b_out)
+        !b_R || !b_out || !b_s_select)
         return Image();
 
     RobMaskParamsCPU mp{};
@@ -1538,6 +1544,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.flow_reject_1d_residual_threshold = cfg.flow_reject_1d_residual_threshold;
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;
+    mp.save_s_select = want_s_select ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1569,6 +1576,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBytes:&mp length:sizeof(mp) atIndex:11];
     [enc setBuffer:b_aperture offset:0 atIndex:12];
     [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
+    [enc setBuffer:b_s_select offset:0 atIndex:14];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1591,6 +1599,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     Image r(gh, gw, 1);
     memcpy(r.data.data(), [b_out contents], mask_b);
+    // Taken from rob_make_mask's output, not rob_local_min_5x5's: the selector
+    // is a per-pixel record of which prior was applied, and eroding it would
+    // smear the boundary between the two regions.
+    if (want_s_select) {
+        *s_select_out = Image(gh, gw, 1);
+        memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
+    }
     return r;
 }
 
@@ -3343,9 +3358,11 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
 }
 
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg) {
+                               const FlowField& flow, int tile_size, const Config& cfg,
+                               Image* s_select_out) {
     @autoreleasepool {
-        return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg);
+        return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg,
+                                             s_select_out);
     }
 }
 

@@ -363,6 +363,15 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
+    // Debug: split the accumulated mask by which motion prior each pixel used,
+    // writing _robustness_s1.pgm and _robustness_s2.pgm alongside the combined
+    // one. s1 is the strict prior, applied where the flow field varies sharply
+    // (the r_Mt test) or the tile is aperture-limited; s2 is the permissive
+    // default. The two split masks sum exactly to the combined mask.
+    //
+    // Off by default: it costs one extra full-resolution float buffer per
+    // comparison frame while the mask is being built.
+    bool  robustness_save_s_masks = false;
 
     float r_t  = 0.12f;
     float r_s1 = 2.0f;

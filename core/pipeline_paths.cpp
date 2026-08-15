@@ -124,8 +124,9 @@ static Image compute_robustness_and_activity(const Image& comp,
                                              int tile_size,
                                              const Config& work,
                                              std::vector<uint8_t>& rows,
-                                             bool& has_nonzero) {
-    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+                                             bool& has_nonzero,
+                                             Image* s_select_out = nullptr) {
+    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work, s_select_out);
     has_nonzero = robustness_row_activity(rob, rows);
     return rob;
 }
@@ -660,6 +661,24 @@ static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) 
         acc_rob.data[i] += rob.data[i];
 }
 
+// Split the same sum by which motion prior scored each pixel. sel is 1 where
+// the strict s1 applied and 0 where s2 did, so the two accumulators partition
+// the robustness exactly: acc_s1 + acc_s2 == acc_rob, pixel for pixel.
+static void absorb_robustness_split(Image& acc_s1, Image& acc_s2,
+                                    const Image& rob, const Image& sel, bool& have) {
+    if (sel.data.size() != rob.data.size()) return;
+    if (!have) {
+        acc_s1 = Image(rob.h, rob.w, 1);
+        acc_s2 = Image(rob.h, rob.w, 1);
+        have = true;
+    }
+    for (size_t i = 0; i < rob.data.size(); ++i) {
+        const f32 on_s1 = sel.data[i];
+        acc_s1.data[i] += rob.data[i] * on_s1;
+        acc_s2.data[i] += rob.data[i] * (1.f - on_s1);
+    }
+}
+
 static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
                                  const std::vector<CachedCompMeta>& cached_meta,
                                  bool stream_comp_raw,
@@ -959,6 +978,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // than every mask being held until after the loop.
     Image acc_rob;
     bool have_acc_rob = false;
+    // Same sum, partitioned by which motion prior scored each pixel. Debug only,
+    // and only meaningful alongside the combined mask, so it follows the same
+    // save flag. Accumulated in the loop for the same reason acc_rob is.
+    const bool want_s_masks = work.robustness_save_mask && work.robustness_save_s_masks;
+    Image acc_rob_s1, acc_rob_s2;
+    bool have_acc_rob_split = false;
 
     const double t_snr = prof_now_ms();
     f32 ref_brightness = 0.f;
@@ -1308,13 +1333,18 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         CovField covs;
         std::vector<uint8_t> rob_rows_nonzero;
         bool rob_has_nonzero = true;
+        // Per-frame, freed at the end of this iteration once folded into the
+        // running split. Only allocated when the debug masks are requested.
+        Image rob_s_select;
+        Image* rob_s_select_ptr = want_s_masks ? &rob_s_select : nullptr;
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
                                                   tile_size, work,
                                                   rob_rows_nonzero,
-                                                  rob_has_nonzero);
+                                                  rob_has_nonzero,
+                                                  rob_s_select_ptr);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1341,9 +1371,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
                                                   tile_size, work,
                                                   rob_rows_nonzero,
-                                                  rob_has_nonzero);
+                                                  rob_has_nonzero,
+                                                  rob_s_select_ptr);
             covs = cov_fut.get();
         }
+        // Folded in here rather than beside absorb_robustness_sum, because that
+        // call is made in only two of the three stash branches -- the cached
+        // banded path defers to build_robustness_sum after the loop, and would
+        // otherwise be missing from the split entirely. Frame order matches, and
+        // rob*sel + rob*(1-sel) == rob exactly for sel in {0,1}, so the two
+        // accumulators still partition acc_rob.
+        if (want_s_masks)
+            absorb_robustness_split(acc_rob_s1, acc_rob_s2, rob, rob_s_select,
+                                    have_acc_rob_split);
         debug_dump_bin("cpp_mask_" + std::to_string(pos),
                        rob.data.data(), rob.data.size());
         if (debug) {
@@ -1894,6 +1934,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (work.robustness_save_mask && have_acc_rob) {
         if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
             report("Wrote robustness mask", 0.985f);
+        // Same normalisation as the combined mask, so the three are directly
+        // comparable: a pixel is bright in exactly one of _s1 and _s2, at the
+        // value it contributed to the combined one.
+        if (want_s_masks && have_acc_rob_split) {
+            write_robustness_mask_pgm(acc_rob_s1, n - 1, dng_path, "_s1");
+            write_robustness_mask_pgm(acc_rob_s2, n - 1, dng_path, "_s2");
+            report("Wrote s1/s2 robustness masks", 0.986f);
+        }
     }
     cached.clear();
     cached_meta.clear();

@@ -1030,11 +1030,28 @@ struct CameraView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Section(header: Text("Fallback Denoiser")) {
+                Section(header: Text("Robustness")) {
+                    Toggle("Enable Robustness", isOn: $cam.tuningParams.robustness_enabled)
+                    Text(cam.tuningParams.robustness_enabled
+                         ? "Rejects misaligned regions before they merge. Leave on for normal shooting."
+                         : "OFF — every frame merges at full weight everywhere. Ghosting and misalignment will be visible. Diagnostic only: it shows what alignment actually produced, with no mask hiding the errors.")
+                        .font(.footnote)
+                        .foregroundColor(cam.tuningParams.robustness_enabled ? .secondary : .orange)
+
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                     Text("When on, also saves a grayscale robustness mask to Photos after processing.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
+
+                    if cam.tuningParams.robustness_save_mask {
+                        Toggle("Save s1/s2 Split Masks", isOn: $cam.tuningParams.robustness_save_s_masks)
+                        Text("Also writes _robustness_s1.pgm and _robustness_s2.pgm next to the DNG. s1 is the strict motion prior, applied where the flow field varies sharply or the tile is aperture-limited; s2 is the permissive default. A pixel is bright in exactly one of the two, at the value it contributed to the combined mask, so the pair shows precisely which regions used which.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Section(header: Text("Fallback Denoiser")) {
 
                     Toggle("Enable Motion Denoiser", isOn: $cam.tuningParams.accumulated_robustness_denoiser_enabled)
                     

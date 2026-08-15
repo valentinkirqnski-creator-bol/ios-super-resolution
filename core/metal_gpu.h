@@ -88,8 +88,11 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
 // cleared (keep h/w/c) — compute_robustness_metal uses the pinned GPU copy.
 RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg);
 void metal_release_host_ref_stats(RefStats& ref_stats); // free host pixels; keep dims
+// s_select_out, when non-null, also receives a per-pixel record of which motion
+// prior was applied: 1 where the strict s1 was used, 0 where s2 was.
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg);
+                               const FlowField& flow, int tile_size, const Config& cfg,
+                               Image* s_select_out = nullptr);
 
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).

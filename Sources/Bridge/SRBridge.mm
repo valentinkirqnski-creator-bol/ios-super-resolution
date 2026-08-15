@@ -375,8 +375,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"global_prealignment_max_shift"])
         cfg.global_prealignment_max_shift =
             std::max(0, std::min(64, tuning[@"global_prealignment_max_shift"].intValue));
+    if (tuning[@"robustness_enabled"])
+        cfg.robustness_enabled = tuning[@"robustness_enabled"].boolValue;
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
+    if (tuning[@"robustness_save_s_masks"])
+        cfg.robustness_save_s_masks = tuning[@"robustness_save_s_masks"].boolValue;
     if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
         cfg.accumulated_robustness_denoiser_enabled =
             tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;

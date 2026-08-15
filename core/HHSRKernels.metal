@@ -1486,6 +1486,7 @@ struct RobMaskParams {
     float flow_reject_1d_residual_threshold;
     uint aperture_reject_enabled;
     float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
+    uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
 };
 
 inline float dogson_quadratic(float x) {
@@ -1809,6 +1810,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           constant RobMaskParams& p [[buffer(11)]],
                           device const uint* aperture_limited [[buffer(12)]],
                           device const uint* tile_residual_high [[buffer(13)]],
+                          device float* s_select [[buffer(14)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1931,6 +1933,11 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
     R[gid.y * p.w + gid.x] = r_val;
+    // Which prior this pixel ended up on. Compared against r_s1 rather than
+    // recomputing the conditions, so the record cannot drift from the value
+    // actually used above.
+    if (p.save_s_select != 0u)
+        s_select[gid.y * p.w + gid.x] = (s <= p.r_s1) ? 1.f : 0.f;
 }
 
 kernel void rob_local_min_5x5(device float* out [[buffer(0)]],

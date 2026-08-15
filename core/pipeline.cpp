@@ -14,15 +14,18 @@
 namespace hhsr {
 
 bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
-                               const std::string& dng_path) {
+                               const std::string& dng_path,
+                               const char* name_suffix) {
     if (acc_rob.data.empty() || acc_rob.h <= 0 || acc_rob.w <= 0) return false;
+    const std::string tail =
+        std::string("_robustness") + (name_suffix ? name_suffix : "") + ".pgm";
     std::string path = dng_path;
     const std::string suf = ".dng";
     if (path.size() >= suf.size() &&
         path.compare(path.size() - suf.size(), suf.size(), suf) == 0)
-        path.replace(path.size() - suf.size(), suf.size(), "_robustness.pgm");
+        path.replace(path.size() - suf.size(), suf.size(), tail);
     else
-        path += "_robustness.pgm";
+        path += tail;
 
     const f32 inv_n = 1.f / (f32)std::max(1, n_comp_frames);
     std::ofstream out(path, std::ios::binary);

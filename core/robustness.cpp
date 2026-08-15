@@ -809,11 +809,15 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 }
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
-                         const FlowField& flow, int tile_size, const Config& cfg) {
+                         const FlowField& flow, int tile_size, const Config& cfg,
+                         Image* s_select_out) {
     if (!cfg.robustness_enabled) {
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
         std::fill(r.data.begin(), r.data.end(), 1.f);
+        // Nothing was scored, so no prior was chosen. Report s2 uniformly so the
+        // split masks stay well-formed and still sum to the combined one.
+        if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
     }
     // Empty flow (e.g. grey/align failed) — do not index flow.flow.data()==nullptr.
@@ -823,12 +827,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
         std::fill(r.data.begin(), r.data.end(), 0.f);
+        if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
     }
 
 #ifdef __APPLE__
     // Metal GPU only — same Alg. robustness math as the CPU path below.
-    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg);
+    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
+                                         s_select_out);
     if (gpu.h > 0 && gpu.w > 0) return gpu;
     return Image();
 #else
@@ -888,6 +894,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         motion_irregular.assign(S.size(), 0u);
 
     Image R(h, w, 1);
+    if (s_select_out) *s_select_out = Image(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             int patch_idy, patch_idx;
@@ -952,6 +959,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             R.at(y, x) = r_val;
+            // Compared against r_s1 rather than recomputing the conditions, so
+            // the record cannot drift from the value actually used above.
+            if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
     return local_min_5x5(R);

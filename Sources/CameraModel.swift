@@ -115,7 +115,14 @@ struct TuningParams: Equatable, Codable {
     var global_prealignment_rotation_range_deg: Float = 0.0
     var global_prealignment_rotation_step_deg: Float = 0.25
     var global_prealignment_max_shift: Int = 24
+    /// Off merges every frame at full weight everywhere. Diagnostic: it shows
+    /// what the alignment actually produced, with no mask hiding the errors.
+    var robustness_enabled: Bool = true
     var robustness_save_mask: Bool = true
+    /// Also write _robustness_s1.pgm and _robustness_s2.pgm, splitting the
+    /// accumulated mask by which motion prior scored each pixel. Costs one extra
+    /// full-resolution buffer per comparison frame while the mask is built.
+    var robustness_save_s_masks: Bool = false
     var accumulated_robustness_denoiser_enabled: Bool = true
     /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
     /// band, 2 = always merge online. Online keeps memory flat in frame count
@@ -181,7 +188,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
-        case robustness_save_mask
+        case robustness_enabled, robustness_save_mask, robustness_save_s_masks
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
@@ -228,7 +235,9 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
         global_prealignment_rotation_step_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_step_deg) ?? global_prealignment_rotation_step_deg
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
+        robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
+        robustness_save_s_masks = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_s_masks) ?? robustness_save_s_masks
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
@@ -1839,7 +1848,9 @@ final class CameraModel: NSObject, ObservableObject {
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
             "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
             "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
+            "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
+            "robustness_save_s_masks": NSNumber(value: tuningParams.robustness_save_s_masks),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
