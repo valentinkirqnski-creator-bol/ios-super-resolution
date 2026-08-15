@@ -359,20 +359,6 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
         }
     }
 
-    // Compute per-channel noise after white balance. The DNG NoiseProfile gives
-    // sigma^2 = alpha*I + beta for raw data. After white balance multiplication
-    // by gain g per channel, variance scales as: alpha' = g*alpha, beta' = g^2*beta.
-    // Per-channel alpha_dng/beta_dng preserve the channel differences from the DNG
-    // (not averaged), so this calculation is accurate even for cameras with
-    // different noise on R, G, B.
-    {
-        for (int c = 0; c < 3; ++c) {
-            float g = cfg.white_balance[c] / cfg.white_balance[1];
-            if (!std::isfinite(g) || g <= 0.f) g = 1.f;
-            cfg.alpha_wb[c] = cfg.alpha_dng[c] * g;
-            cfg.beta_wb[c]  = cfg.beta_dng[c] * g * g;
-        }
-    }
 
     // Row-parallel: every output pixel is written exactly once from one input
     // sample, so this is bit-identical to the serial loop — no reduction, no

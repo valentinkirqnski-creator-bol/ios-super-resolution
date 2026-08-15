@@ -185,12 +185,45 @@ struct Config {
     float alpha_dng[3] = {1.80710882e-4f, 1.80710882e-4f, 1.80710882e-4f};
     float beta_dng[3]  = {3.1937599182128e-6f, 3.1937599182128e-6f, 3.1937599182128e-6f};
     bool  has_noise_profile = false;
-    // Per-channel noise after white balance applied. Indexed by CFA color: 0=R, 1=G, 2=B.
-    // Computed as: alpha_wb[c] = alpha_dng[c] * (wb[c] / wb[1])
-    //              beta_wb[c] = beta_dng[c] * (wb[c] / wb[1])^2
-    // Used by robustness and GAT. Greyscale robustness uses unweighted average.
-    float alpha_wb[3] = {1.80710882e-4f, 1.80710882e-4f, 1.80710882e-4f};
-    float beta_wb[3]  = {3.1937599182128e-6f, 3.1937599182128e-6f, 3.1937599182128e-6f};
+
+    // The effective noise model, derived rather than stored.
+    //
+    // Both loaders multiply every Bayer site by wb[c]/wb[G] before anything
+    // downstream sees the data, and scaling a signal by g scales the shot term
+    // of its variance by g and the read term by g^2. The NoiseProfile in the
+    // file describes the sensor before that multiplication, so consuming it
+    // unscaled understates the noise on whichever channels the white balance
+    // lifts -- typically R and B.
+    //
+    // This is derived at the point of use, from three fields every decode path
+    // already sets, precisely so that no decode path can forget to update it.
+    // There are two independent loaders -- load_raw_dng for LibRaw and the
+    // ImageIO path in SRBridge.mm for the device -- and a stored copy filled by
+    // only one of them silently pinned the device to the fallback constants.
+    //
+    // The unweighted mean over the three channels matches the reference
+    // implementation. It is not the variance of the grey mix, which weights
+    // green twice; that is a separate question from the white balance scaling
+    // and is deliberately left alone here.
+    float noise_wb_gain(int c) const {
+        if (!raw_prewhitened) return 1.f;   // nothing applied yet, profile stands
+        if (c < 0 || c > 2) return 1.f;
+        const float g = white_balance[c] / white_balance[1];
+        return (std::isfinite(g) && g > 0.f) ? g : 1.f;
+    }
+    float noise_alpha() const {
+        float s = 0.f;
+        for (int c = 0; c < 3; ++c) s += alpha_dng[c] * noise_wb_gain(c);
+        return s / 3.f;
+    }
+    float noise_beta() const {
+        float s = 0.f;
+        for (int c = 0; c < 3; ++c) {
+            const float g = noise_wb_gain(c);
+            s += beta_dng[c] * g * g;
+        }
+        return s / 3.f;
+    }
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
     // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.

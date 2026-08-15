@@ -36,10 +36,7 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
     };
 
     Image grey = compute_grey_decimate(raw, cfg.bayer_mode);
-    // Use WB-adjusted noise; average over channels for greyscale.
-    float alpha_avg = (cfg.alpha_wb[0] + cfg.alpha_wb[1] + cfg.alpha_wb[2]) / 3.f;
-    float beta_avg  = (cfg.beta_wb[0]  + cfg.beta_wb[1]  + cfg.beta_wb[2])  / 3.f;
-    Image vst = apply_gat(grey, alpha_avg, beta_avg);
+    Image vst = apply_gat(grey, cfg.noise_alpha(), cfg.noise_beta());
     Image grad = compute_gradients(vst); // [gh-1, gw-1, 2]
 
     int H = vst.h, W = vst.w;

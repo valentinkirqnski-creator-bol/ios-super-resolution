@@ -1027,10 +1027,8 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
     p.selection = 0u; // 460-main kernels.py always uses hard thresholding.
-    float alpha_avg = (cfg.alpha_wb[0] + cfg.alpha_wb[1] + cfg.alpha_wb[2]) / 3.f;
-    float beta_avg = (cfg.beta_wb[0] + cfg.beta_wb[1] + cfg.beta_wb[2]) / 3.f;
-    p.alpha = alpha_avg;
-    p.beta = beta_avg;
+    p.alpha = cfg.noise_alpha();
+    p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
     p.k_denoise = cfg.k_denoise;
     p.D_th = cfg.D_th;
@@ -1183,11 +1181,9 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     hp.h = (uint32_t)guide_h;
     hp.w = (uint32_t)guide_w;
     hp.nch = (uint32_t)nch;
-    float alpha_avg = (cfg.alpha_wb[0] + cfg.alpha_wb[1] + cfg.alpha_wb[2]) / 3.f;
-    float beta_avg = (cfg.beta_wb[0] + cfg.beta_wb[1] + cfg.beta_wb[2]) / 3.f;
-    hp.alpha = alpha_avg;
+    hp.alpha = cfg.noise_alpha();
     hp.min_texture_snr = cfg.hf_min_texture_snr;
-    hp.beta = beta_avg;
+    hp.beta = cfg.noise_beta();
     enc = [cmd computeCommandEncoder];
     if (!enc) return false;
     [enc setBuffer:b_loss offset:0 atIndex:0];
@@ -1474,8 +1470,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     }
 
     if (!g_rob_std_curve || !g_rob_diff_curve ||
-        (g_rob_curve_alpha != ((cfg.alpha_wb[0] + cfg.alpha_wb[1] + cfg.alpha_wb[2]) / 3.f)) ||
-        (g_rob_curve_beta != ((cfg.beta_wb[0] + cfg.beta_wb[1] + cfg.beta_wb[2]) / 3.f)) ||
+        g_rob_curve_alpha != cfg.noise_alpha() ||
+        g_rob_curve_beta != cfg.noise_beta() ||
         g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
         g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso) {
         std::vector<f32> std_curve, diff_curve;
@@ -1484,8 +1480,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         g_rob_std_curve = buf(std_curve.data(), std_curve.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_curve.data(), diff_curve.size() * sizeof(float));
         g_rob_curve_n = std_curve.size();
-        g_rob_curve_alpha = (cfg.alpha_wb[0] + cfg.alpha_wb[1] + cfg.alpha_wb[2]) / 3.f;
-        g_rob_curve_beta = (cfg.beta_wb[0] + cfg.beta_wb[1] + cfg.beta_wb[2]) / 3.f;
+        g_rob_curve_alpha = cfg.noise_alpha();
+        g_rob_curve_beta = cfg.noise_beta();
         g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
         g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
     }
@@ -1534,10 +1530,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
     mp.motion_edge_threshold = cfg.motion_edge_threshold;
     mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
-    float alpha_avg = (cfg.alpha_wb[0] + cfg.alpha_wb[1] + cfg.alpha_wb[2]) / 3.f;
-    float beta_avg = (cfg.beta_wb[0] + cfg.beta_wb[1] + cfg.beta_wb[2]) / 3.f;
-    mp.alpha = alpha_avg;
-    mp.beta = beta_avg;
+    mp.alpha = cfg.noise_alpha();
+    mp.beta = cfg.noise_beta();
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
