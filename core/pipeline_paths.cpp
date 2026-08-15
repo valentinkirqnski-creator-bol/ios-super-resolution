@@ -1032,10 +1032,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         const f32 snr = (sigma > 1e-8f) ? brightness / sigma : 0.f;
         char buf[288];
         const int t0 = work.bm_tile_sizes.size() > 0 ? work.bm_tile_sizes[0] : -1;
+        // Show average of per-channel noise for brevity.
+        float alpha_avg = (work.alpha_wb[0] + work.alpha_wb[1] + work.alpha_wb[2]) / 3.f;
+        float beta_avg  = (work.beta_wb[0] + work.beta_wb[1] + work.beta_wb[2]) / 3.f;
         std::snprintf(buf, sizeof(buf),
             "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f",
             work.has_noise_profile ? "OK" : "FALLBACK",
-            work.alpha, work.beta, brightness, sigma, snr, t0, work.r_t);
+            alpha_avg, beta_avg, brightness, sigma, snr, t0, work.r_t);
         report(buf, 0.065f);
     }
     (void)t_snr;

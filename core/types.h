@@ -179,10 +179,18 @@ struct Config {
     GreyMethod grey_method = GreyMethod::FFT;
 
     // Noise model: sigma^2 = alpha * I + beta   (already scaled for ISO).
+    // Raw DNG values, per-channel, before white balance. Indexed by CFA color: 0=R, 1=G, 2=B.
     // Defaults are Pixel-ish fallbacks; overwritten from DNG NoiseProfile (0xC761).
-    float alpha = 1.80710882e-4f;
-    float beta  = 3.1937599182128e-6f;
+    // Set in load_raw_dng from the DNG tag; NOT averaged, preserves per-channel differences.
+    float alpha_dng[3] = {1.80710882e-4f, 1.80710882e-4f, 1.80710882e-4f};
+    float beta_dng[3]  = {3.1937599182128e-6f, 3.1937599182128e-6f, 3.1937599182128e-6f};
     bool  has_noise_profile = false;
+    // Per-channel noise after white balance applied. Indexed by CFA color: 0=R, 1=G, 2=B.
+    // Computed as: alpha_wb[c] = alpha_dng[c] * (wb[c] / wb[1])
+    //              beta_wb[c] = beta_dng[c] * (wb[c] / wb[1])^2
+    // Used by robustness and GAT. Greyscale robustness uses unweighted average.
+    float alpha_wb[3] = {1.80710882e-4f, 1.80710882e-4f, 1.80710882e-4f};
+    float beta_wb[3]  = {3.1937599182128e-6f, 3.1937599182128e-6f, 3.1937599182128e-6f};
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
     // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.
@@ -472,8 +480,13 @@ inline void apply_pixel4a_noise_profile(Config& cfg, f32 iso) {
     if (!std::isfinite(iso) || iso <= 0.f)
         iso = 100.f;
     const f32 scale = iso / 100.f;
-    cfg.alpha = kPixel4aAlphaIso100 * scale;
-    cfg.beta = kPixel4aBetaIso100 * scale * scale;
+    // Pixel 4a uses the same profile for all channels (no per-channel differentiation).
+    const f32 a = kPixel4aAlphaIso100 * scale;
+    const f32 b = kPixel4aBetaIso100 * scale * scale;
+    for (int c = 0; c < 3; ++c) {
+        cfg.alpha_dng[c] = a;
+        cfg.beta_dng[c] = b;
+    }
     cfg.has_noise_profile = true;
     cfg.debug_pixel4a_noise_curve_iso = round_pixel4a_noise_curve_iso(iso);
 }

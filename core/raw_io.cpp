@@ -58,9 +58,11 @@ std::vector<Image> synth_burst(int h, int w, int n, unsigned seed) {
 #ifdef HAVE_LIBRAW
 
 // DNG NoiseProfile tag 0xC761 (DOUBLE). Python: tags['Image Tag 0xC761'].
+// Returns per-channel values [R, G, B] WITHOUT averaging, preserving per-channel differences.
 // Walks IFD0 + SubIFDs (330) + IFD chain. Supports II (LE) and MM (BE) — Apple
 // ProRAW/DNG is often MM; old LE-only path silently fell back to Pixel α/β.
-static bool try_read_dng_noise_profile(const std::string& path, float& alpha, float& beta) {
+// alpha_rgb and beta_rgb are output arrays of 3 floats each.
+static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[3], float beta_rgb[3]) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     uint8_t hdr[8];
@@ -92,21 +94,20 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
 
     uint32_t ifd0 = u32(hdr + 4);
 
-    auto parse_noise_at = [&](uint32_t data_off, uint32_t cnt, float& a_out, float& b_out) -> bool {
+    auto parse_noise_at = [&](uint32_t data_off, uint32_t cnt, float a_out[3], float b_out[3]) -> bool {
         if (cnt < 2 || (cnt % 2u) != 0) return false;
         std::vector<uint8_t> bytes((size_t)cnt * 8u);
         if (std::fseek(f, (long)data_off, SEEK_SET) != 0) return false;
         if (std::fread(bytes.data(), 8, cnt, f) != cnt) return false;
-        double sa = 0, sb = 0;
         const uint32_t nplanes = cnt / 2u;
-        // Python super_resolution.py (bayer): always sum(::2)/3 and sum(1::2)/3 —
-        // even when the tag has only one plane. Dividing by nplanes alone made α≈3×
-        // too large on Apple DNGs → whitened robustness masks.
-        const uint32_t use = (nplanes >= 3) ? 3u : nplanes;
-        for (uint32_t pi = 0; pi < use; ++pi) {
+        // Read per-channel noise values [R, G, B]. If fewer than 3 planes,
+        // replicate the available values to fill the array.
+        // Do NOT average channels — preserve per-channel differences that were in the DNG.
+        for (int c = 0; c < 3; ++c) {
+            uint32_t src_plane = (c < (int)nplanes) ? c : (nplanes - 1);
             for (int k = 0; k < 2; ++k) {
                 uint8_t raw8[8];
-                const uint8_t* src = bytes.data() + (size_t)(2 * pi + (uint32_t)k) * 8u;
+                const uint8_t* src = bytes.data() + (size_t)(2 * src_plane + (uint32_t)k) * 8u;
                 if (le) {
                     std::memcpy(raw8, src, 8);
                 } else {
@@ -114,15 +115,18 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
                 }
                 double d;
                 std::memcpy(&d, raw8, 8);
-                if (k == 0) sa += d; else sb += d;
+                if (k == 0) a_out[c] = (float)d; else b_out[c] = (float)d;
             }
         }
-        a_out = (float)(sa / 3.0);
-        b_out = (float)(sb / 3.0);
-        return a_out > 0.f && std::isfinite(a_out) && std::isfinite(b_out);
+        bool ok = true;
+        for (int c = 0; c < 3; ++c) {
+            if (!(a_out[c] > 0.f && std::isfinite(a_out[c]) && std::isfinite(b_out[c])))
+                ok = false;
+        }
+        return ok;
     };
 
-    auto scan_ifd = [&](uint32_t off, float& a_out, float& b_out,
+    auto scan_ifd = [&](uint32_t off, float a_out[3], float b_out[3],
                         std::vector<uint32_t>& subifds, uint32_t& next_ifd) -> bool {
         next_ifd = 0;
         if (off == 0) return false;
@@ -157,9 +161,10 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
                 const uint32_t data_off = (cnt * 8u > 4u)
                     ? val
                     : (uint32_t)(off + 2u + (uint32_t)i * 12u + 8u);
-                float aa = 0, bb = 0;
+                float aa[3], bb[3];
                 if (parse_noise_at(data_off, cnt, aa, bb)) {
-                    a_out = aa; b_out = bb; found = true;
+                    for (int c = 0; c < 3; ++c) { a_out[c] = aa[c]; b_out[c] = bb[c]; }
+                    found = true;
                 }
                 if (std::fseek(f, ent_end, SEEK_SET) != 0) return found;
             }
@@ -168,7 +173,7 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
         return found;
     };
 
-    float a = 0, b = 0;
+    float a[3] = {0, 0, 0}, b[3] = {0, 0, 0};
     std::vector<uint32_t> queue;
     queue.push_back(ifd0);
     std::vector<uint32_t> visited;
@@ -188,8 +193,10 @@ static bool try_read_dng_noise_profile(const std::string& path, float& alpha, fl
     }
     std::fclose(f);
     if (!ok) return false;
-    alpha = a;
-    beta = b;
+    for (int c = 0; c < 3; ++c) {
+        alpha_rgb[c] = a[c];
+        beta_rgb[c] = b[c];
+    }
     return true;
 }
 
@@ -289,10 +296,16 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             case 6:  cfg.orientation = 6; break;
             default: cfg.orientation = 1; break;
         }
-        float na = 0.f, nb = 0.f;
+        float na[3], nb[3];
+        for (int c = 0; c < 3; ++c) {
+            na[c] = cfg.alpha_dng[c];
+            nb[c] = cfg.beta_dng[c];
+        }
         if (try_read_dng_noise_profile(path, na, nb)) {
-            cfg.alpha = na;
-            cfg.beta = nb;
+            for (int c = 0; c < 3; ++c) {
+                cfg.alpha_dng[c] = na[c];
+                cfg.beta_dng[c] = nb[c];
+            }
             cfg.has_noise_profile = true;
         } else {
             cfg.has_noise_profile = false;
@@ -343,6 +356,21 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             }
             // Python: k = white_balance[channel] / white_balance[1]
             site_wb[i][j] = cfg.white_balance[c] / cfg.white_balance[1];
+        }
+    }
+
+    // Compute per-channel noise after white balance. The DNG NoiseProfile gives
+    // sigma^2 = alpha*I + beta for raw data. After white balance multiplication
+    // by gain g per channel, variance scales as: alpha' = g*alpha, beta' = g^2*beta.
+    // Per-channel alpha_dng/beta_dng preserve the channel differences from the DNG
+    // (not averaged), so this calculation is accurate even for cameras with
+    // different noise on R, G, B.
+    {
+        for (int c = 0; c < 3; ++c) {
+            float g = cfg.white_balance[c] / cfg.white_balance[1];
+            if (!std::isfinite(g) || g <= 0.f) g = 1.f;
+            cfg.alpha_wb[c] = cfg.alpha_dng[c] * g;
+            cfg.beta_wb[c]  = cfg.beta_dng[c] * g * g;
         }
     }
 
