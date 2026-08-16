@@ -413,6 +413,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"chain_consistency_enabled"])
         cfg.chain_consistency_enabled = tuning[@"chain_consistency_enabled"].boolValue;
+    if (tuning[@"robustness_min_pool_radius"])
+        cfg.robustness_min_pool_radius = tuning[@"robustness_min_pool_radius"].intValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

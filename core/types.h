@@ -515,6 +515,34 @@ struct Config {
     // comparison frame while the mask is being built.
     bool  robustness_save_s_masks = false;
 
+    // Eq. 9's safety-margin min-filter (local_min_5x5 in robustness.cpp / the
+    // rob_local_min_5x5 kernel), in GUIDE pixels -- 2 is the paper's literal
+    // 5x5 window and is the default here for exact backward compatibility.
+    //
+    // Widen this to fix a specific failure mode a 5x5 window (guide-radius 2
+    // -> raw-radius 4, an 8-9 raw px reach) is too small for: a single
+    // alignment tile (16 raw px) straddling two different real motions --
+    // e.g. a diagonal edge crossing the tile grid -- has only one flow
+    // vector to warp the whole tile with, so d^2 (and therefore R) ends up
+    // depending on what FRACTION of that tile's area the edge happens to
+    // clip, which varies tile-to-tile purely from where the fixed square
+    // grid falls relative to the edge. Two adjacent tiles right next to the
+    // same real misalignment can then read R=0.07 and R=0.94: neither r_Mt
+    // nor chain_consistency_enabled can fix this, because both only ever
+    // change s (the prior), and the difference here is in d^2, not s. This
+    // is the one lever that changes the SPATIAL reach of a rejection instead:
+    // widening it lets a confidently-rejected tile pull its low-R verdict
+    // out far enough to also cover a same-edge neighbour that would otherwise
+    // read misleadingly high.
+    //
+    // The tradeoff is real and not free: it erodes the accepted region
+    // around EVERY rejection in EVERY photo, not just a diagonal edge, which
+    // costs some frame-count/denoising near legitimate motion boundaries in
+    // general. Left at the paper default rather than widened preemptively,
+    // because that tradeoff has not been checked on a device -- raise it to
+    // A/B against the default 5x5.
+    int   robustness_min_pool_radius = 2;
+
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
     float r_s2 = 12.0f;

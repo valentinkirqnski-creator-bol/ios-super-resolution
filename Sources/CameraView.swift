@@ -723,6 +723,23 @@ struct CameraView: View {
              bursts on-device.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Stepper(value: $cam.tuningParams.robustness_min_pool_radius,
+                in: 0...10) {
+            HStack {
+                Text("Robustness Min-Pool Radius")
+                Spacer()
+                Text("\(cam.tuningParams.robustness_min_pool_radius)")
+            }
+        }
+        Text("""
+             Eq. 9's safety-margin min-filter, in guide pixels -- 2 is the paper's literal \
+             5x5 window. Wider lets a confidently-rejected tile pull its verdict out far \
+             enough to cover a same-edge neighbour tile that reads misleadingly high because \
+             a single alignment tile can only hold one flow vector for two different real \
+             motions. Costs some accepted-region erosion near every rejection, not just that \
+             one case -- raise to A/B against the default.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body

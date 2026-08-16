@@ -1456,7 +1456,10 @@ struct RobGuideParams {
 
 struct RobStatsParams {
     uint h, w, nch;
-    uint _pad0;
+    // Min-filter radius in guide pixels for rob_local_min_5x5 (was _pad0).
+    // Ignored by the other kernels that share this params struct
+    // (rob_lowpass_gaussian5x5, guide/stats).
+    uint radius;
 };
 
 struct RobDogsonParams {
@@ -1979,10 +1982,11 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     int y = int(gid.y), x = int(gid.x);
     int H = int(p.h), W = int(p.w);
+    int radius = int(p.radius);
     float mn = INFINITY;
-    for (int i = -2; i <= 2; ++i) {
+    for (int i = -radius; i <= radius; ++i) {
         int yy = clamp_edge(y + i, H - 1);
-        for (int j = -2; j <= 2; ++j) {
+        for (int j = -radius; j <= radius; ++j) {
             int xx = clamp_edge(x + j, W - 1);
             mn = min(mn, R[uint(yy) * p.w + uint(xx)]);
         }

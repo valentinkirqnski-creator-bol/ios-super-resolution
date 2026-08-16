@@ -835,15 +835,20 @@ static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
     return S;
 }
 
-static Image local_min_5x5(const Image& R) {
+// Eq. 9's safety-margin min-filter. radius=2 is the paper's literal 5x5
+// window (Config::robustness_min_pool_radius's default); wider values trade
+// accepted-region erosion around every rejection for reach past a single
+// alignment tile -- see the field's comment in types.h.
+static Image local_min_pool(const Image& R, int radius) {
+    if (radius < 0) radius = 0;
     Image r(R.h, R.w, 1);
     const f32 inf = std::numeric_limits<f32>::infinity();
     for (int y = 0; y < R.h; ++y) {
         for (int x = 0; x < R.w; ++x) {
             f32 mn = inf;
-            for (int i = -2; i <= 2; ++i) {
+            for (int i = -radius; i <= radius; ++i) {
                 int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
-                for (int j = -2; j <= 2; ++j) {
+                for (int j = -radius; j <= radius; ++j) {
                     int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
                     mn = std::min(mn, R.at(yy, xx));
                 }
@@ -1069,7 +1074,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
-    return local_min_5x5(R);
+    return local_min_pool(R, cfg.robustness_min_pool_radius);
 #endif
 }
 

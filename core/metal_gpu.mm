@@ -1099,7 +1099,10 @@ struct RobGuideParamsCPU {
 static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
 
 struct RobStatsParamsCPU {
-    uint32_t h, w, nch, _pad0 = 0;
+    uint32_t h, w, nch;
+    // Min-filter radius in guide pixels for rob_local_min_5x5 (was _pad0).
+    // Ignored by the other kernels that share this params struct.
+    uint32_t radius = 2;
 };
 static_assert(sizeof(RobStatsParamsCPU) == 16, "RobStatsParamsCPU");
 
@@ -1656,6 +1659,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     sp.h = (uint32_t)gh;
     sp.w = (uint32_t)gw;
     sp.nch = 1u;
+    sp.radius = (uint32_t)std::max(0, cfg.robustness_min_pool_radius);
     enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_out offset:0 atIndex:0];
