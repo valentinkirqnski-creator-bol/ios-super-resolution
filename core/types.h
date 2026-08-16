@@ -290,6 +290,25 @@ struct Config {
         }
         return s / 3.f;
     }
+    // Per-channel counterparts of the above, undivided by 3 and not summed
+    // across channels. compute_robustness's Monte Carlo curve (apply_noise_
+    // model) scores each guide channel against its own brightness; feeding
+    // that a curve built from the cross-channel mean of R/G/B mixes their
+    // (generally different, especially post-white-balance) noise
+    // characteristics into one shared answer. These let each channel build
+    // and look up its own curve instead. noise_alpha()/noise_beta() stay as
+    // they are for the callers that genuinely want one representative
+    // scalar for the whole (single-channel) grey image -- kernel estimation
+    // (kernels.cpp apply_gat) and SNR auto-tuning.
+    float noise_alpha_ch(int c) const {
+        if (c < 0 || c > 2) return 0.f;
+        return alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
+    }
+    float noise_beta_ch(int c) const {
+        if (c < 0 || c > 2) return 0.f;
+        const float g = noise_wb_gain(c);
+        return beta_dng[c] * g * g * noise_guide_weight(c);
+    }
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
     // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.

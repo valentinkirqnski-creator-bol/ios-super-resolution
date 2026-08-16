@@ -108,6 +108,13 @@ void fetch_noise_curves(f32 alpha, f32 beta,
 void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 
+// Per-guide-channel counterpart: ch's curve is built from Config::
+// noise_alpha_ch(ch)/noise_beta_ch(ch) rather than the cross-channel mean.
+// Falls back to the shared bundled table when debug_pixel4a_noise_profile
+// is set (no per-channel data exists for it).
+void fetch_noise_curves_channel(const Config& cfg, int ch,
+                                std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
+
 // Robustness mask r at raw resolution [h, w, 1].
 //
 // s_select_out, when non-null, also receives a per-pixel record of which motion

@@ -287,24 +287,12 @@ static bool load_bundled_pixel4a_noise_curves(int iso, NoiseCurves& nc) {
     return true;
 }
 
-static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
-    // Cache like Python (curves built once per alpha/beta, reused every frame).
-    static NoiseCurves cached;
-    static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
-    static f32 cached_beta  = std::numeric_limits<f32>::quiet_NaN();
-    static bool cached_from_file = false;
-    if (alpha == cached_alpha && beta == cached_beta)
-        return cached;
-
+// Pure builder, no caching -- shared by the single-slot and per-channel
+// cache wrappers below so the ~1e5-patch Monte Carlo logic exists once.
+static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
-    if (try_load_python_noise_curves(alpha, beta, nc)) {
-        cached = std::move(nc);
-        cached_alpha = alpha;
-        cached_beta = beta;
-        cached_from_file = true;
-        return cached;
-    }
-    (void)cached_from_file;
+    if (try_load_python_noise_curves(alpha, beta, nc))
+        return nc;
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
@@ -335,10 +323,19 @@ static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
         interp_MC_range(nc, imin, imax);
     }
 
-    cached = std::move(nc);
+    return nc;
+}
+
+static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
+    // Cache like Python (curves built once per alpha/beta, reused every frame).
+    static NoiseCurves cached;
+    static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
+    static f32 cached_beta  = std::numeric_limits<f32>::quiet_NaN();
+    if (alpha == cached_alpha && beta == cached_beta)
+        return cached;
+    cached = build_noise_curves(alpha, beta);
     cached_alpha = alpha;
     cached_beta = beta;
-    cached_from_file = false;
     return cached;
 }
 
@@ -363,6 +360,37 @@ static const NoiseCurves& make_noise_curves(const Config& cfg) {
         }
     }
     return make_noise_curves(cfg.noise_alpha(), cfg.noise_beta());
+}
+
+// Per-guide-channel curve, 3 independently cached slots (one per CFA colour)
+// rather than routing through the single-slot cache above: R/G/B typically
+// have different alpha'/beta' after white balance, so 3 calls through a
+// 1-slot cache would evict and rebuild the Monte Carlo curve on every call --
+// 3x the cost every frame instead of once per burst. debug_pixel4a_noise_
+// profile has no per-channel data (it's a fixed bundled table for parity
+// checks against the reference implementation), so every channel shares
+// that one curve, same as before this function existed.
+static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch) {
+    static NoiseCurves cached[3];
+    static f32 cached_alpha[3] = {std::numeric_limits<f32>::quiet_NaN(),
+                                  std::numeric_limits<f32>::quiet_NaN(),
+                                  std::numeric_limits<f32>::quiet_NaN()};
+    static f32 cached_beta[3] = {std::numeric_limits<f32>::quiet_NaN(),
+                                 std::numeric_limits<f32>::quiet_NaN(),
+                                 std::numeric_limits<f32>::quiet_NaN()};
+    ch = std::max(0, std::min(2, ch));
+    if (alpha == cached_alpha[ch] && beta == cached_beta[ch])
+        return cached[ch];
+    cached[ch] = build_noise_curves(alpha, beta);
+    cached_alpha[ch] = alpha;
+    cached_beta[ch] = beta;
+    return cached[ch];
+}
+
+static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
+    if (cfg.debug_pixel4a_noise_profile)
+        return make_noise_curves(cfg);
+    return make_noise_curves_channel(cfg.noise_alpha_ch(ch), cfg.noise_beta_ch(ch), ch);
 }
 
 } // namespace
@@ -400,6 +428,13 @@ void fetch_noise_curves(f32 alpha, f32 beta,
 void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
     const NoiseCurves& nc = make_noise_curves(cfg);
+    std_curve = nc.std_curve;
+    diff_curve = nc.diff_curve;
+}
+
+void fetch_noise_curves_channel(const Config& cfg, int ch,
+                                std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
+    const NoiseCurves& nc = make_noise_curves_channel(cfg, ch);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
 }
@@ -673,15 +708,21 @@ static Image upscale_warp_stats(const Image& guide_stats,
     return out;
 }
 
+// nc_ch: one curve pointer per guide channel (ref_means.c of them -- 3 for
+// Bayer, 1 otherwise), each channel scored against its own curve rather
+// than all channels sharing one built from the cross-channel mean of
+// alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
+// make_noise_curves_channel.
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves& nc, Image& d_sq, Image& sigma_sq) {
-    const int nc_ch = ref_means.c;
+                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq) {
+    const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
             f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
-            for (int ch = 0; ch < nc_ch; ++ch) {
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
                 // Python: id_noise = round(1000 * brightness) — no clamp.
                 int id_noise = (int)std::lround(1000.f * brightness);
@@ -872,7 +913,16 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     return Image();
 #else
 
-    const NoiseCurves& nc = make_noise_curves(cfg);
+    // One curve per guide channel (3 for Bayer, matching R/(G1+G2)/2/B; 1
+    // otherwise) rather than one curve shared by all channels -- see
+    // Config::noise_alpha_ch/noise_beta_ch and make_noise_curves_channel.
+    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
+    if (ref_stats.means.c == 3) {
+        for (int ch = 0; ch < 3; ++ch)
+            nc_ch[ch] = &make_noise_curves_channel(cfg, ch);
+    } else {
+        nc_ch[0] = &make_noise_curves(cfg);
+    }
 
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;
@@ -909,7 +959,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc, d_sq, sigma_sq);
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(

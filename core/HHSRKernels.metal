@@ -1860,8 +1860,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         else if (id_noise >= int(p.curve_n))
             id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
-        float sigma_t = std_curve[id];
-        float d_t = diff_curve[id];
+        // std_curve/diff_curve hold up to 3 concatenated per-channel curves
+        // (metal_gpu.mm), each ch its own -- not one shared by every guide
+        // channel. See Config::noise_alpha_ch/noise_beta_ch (types.h).
+        uint curve_id = ch * p.curve_n + id;
+        float sigma_t = std_curve[curve_id];
+        float d_t = diff_curve[curve_id];
         float sigma_p_sq = ref_vars[o];
         sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
