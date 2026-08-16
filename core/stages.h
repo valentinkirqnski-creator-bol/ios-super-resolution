@@ -51,6 +51,18 @@ std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
                                                f32 sx, f32 sy, int num_threads,
                                                bool detrend);
 
+// Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
+// field produced by an external neural flow estimator (PWCNet), as a
+// drop-in alternative to align()+flow_to_raw_tile_grid for any downstream
+// consumer. dense_flow: dx plane (guide_h*guide_w floats) followed by dy
+// plane (guide_h*guide_w floats), values in GUIDE-pixel units -- the layout
+// a Core ML (1,2,guide_h,guide_w) MLMultiArray output has. See align.cpp
+// for what's intentionally left unset (aperture_limited, match_ambiguous,
+// motion_irregular) and why.
+FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
+                                int raw_h, int raw_w, int tile_size,
+                                f32 r_Mt, int num_threads, bool detrend);
+
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 
@@ -80,6 +92,11 @@ struct RefStats {
     Image hf_loss;   // 1-channel high-frequency variance-loss map
 }; // guide resolution [h/2, w/2, ch] for Bayer
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
+
+// Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer
+// mode). Exposed so callers besides robustness.cpp (neural_flow's caller)
+// can build the exact same guide image the classical path scores against.
+Image compute_guide(const Image& raw, const Config& cfg);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);

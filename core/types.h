@@ -327,6 +327,17 @@ struct Config {
     // search radius -- so this is 3px at the finest level.
     std::vector<int> bm_search_radii = {3, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
+
+    // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
+    // alignment through the bundled PWCNet Core ML model (neural_flow.h)
+    // instead of align()'s block-matching pyramid, then re-uses the exact
+    // same flow_to_raw_tile_grid-derived path into compute_robustness/merge
+    // -- only the source of the flow field changes, not anything downstream
+    // of it. Falls back to the classical path per-frame if neural_flow_
+    // available() is false (model missing/failed to load) or the guide
+    // image isn't the fixed size the bundled model was converted for.
+    bool use_neural_flow = false;
+
     int  ica_n_iter = 3;
     // Run ICA after block matching on EVERY pyramid level, not only the finest.
     //

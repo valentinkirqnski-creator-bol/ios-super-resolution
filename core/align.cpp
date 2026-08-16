@@ -1369,4 +1369,66 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     return out;
 }
 
+// Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
+// field produced by an external neural flow estimator (PWCNet), re-using
+// flow_to_raw_tile_grid's grey-to-raw scaling so the result is a drop-in
+// replacement for align()'s output at any downstream consumer
+// (compute_robustness, merge, ...).
+//
+// dense_flow: dx plane (guide_h*guide_w floats) followed by dy plane
+// (guide_h*guide_w floats), values in GUIDE-pixel units -- the layout a
+// Core ML (1,2,guide_h,guide_w) MLMultiArray output has.
+//
+// aperture_limited / match_ambiguous are left unset (all zero): those are
+// specific to the block matcher's own candidate search and have no
+// equivalent for a dense CNN flow field -- match_ambiguous-based rejection
+// (robustness.cpp) simply never fires for tiles sourced this way.
+// motion_irregular is likewise left unmeasured here; flow_to_raw_tile_grid
+// only recomputes it when the input already carries one, so downstream
+// compute_s falls back to its own derivation from the raw-tile output, same
+// as any other flow source that doesn't pre-measure it.
+FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
+                                int raw_h, int raw_w, int tile_size,
+                                f32 r_Mt, int num_threads, bool detrend) {
+    if (!dense_flow || guide_h <= 0 || guide_w <= 0 || raw_h <= 0 || raw_w <= 0 || tile_size <= 0)
+        return FlowField();
+
+    const f32* dx_plane = dense_flow;
+    const f32* dy_plane = dense_flow + (size_t)guide_h * (size_t)guide_w;
+
+    const int gny = (guide_h + tile_size - 1) / tile_size;
+    const int gnx = (guide_w + tile_size - 1) / tile_size;
+    FlowField flow_guide(gny, gnx);
+
+    // Average-pool the dense flow into tile_size x tile_size guide-pixel
+    // blocks -- the same granularity flow_to_raw_tile_grid expects an input
+    // tile grid to already be at (it re-derives the grey/raw ratio from
+    // guide_h/guide_w and this same tile_size).
+    parallel_rows(gny, num_threads, [&](int ty) {
+        const int y0 = ty * tile_size;
+        const int y1 = std::min(guide_h, y0 + tile_size);
+        for (int tx = 0; tx < gnx; ++tx) {
+            const int x0 = tx * tile_size;
+            const int x1 = std::min(guide_w, x0 + tile_size);
+            double sum_dx = 0.0, sum_dy = 0.0;
+            int n = 0;
+            for (int y = y0; y < y1; ++y) {
+                for (int x = x0; x < x1; ++x) {
+                    const size_t idx = (size_t)y * guide_w + x;
+                    sum_dx += dx_plane[idx];
+                    sum_dy += dy_plane[idx];
+                    ++n;
+                }
+            }
+            if (n > 0) {
+                flow_guide.dx(ty, tx) = (f32)(sum_dx / n);
+                flow_guide.dy(ty, tx) = (f32)(sum_dy / n);
+            }
+        }
+    });
+
+    return flow_to_raw_tile_grid(flow_guide, raw_h, raw_w, guide_h, guide_w,
+                                 tile_size, r_Mt, num_threads, detrend);
+}
+
 } // namespace hhsr

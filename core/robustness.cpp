@@ -404,9 +404,10 @@ void fetch_noise_curves(const Config& cfg,
     diff_curve = nc.diff_curve;
 }
 
-namespace {
-
-static Image compute_guide(const Image& raw, const Config& cfg) {
+// Not in the anonymous namespace below: neural_flow's caller (pipeline_paths.cpp)
+// needs the exact same guide image the classical robustness path scores
+// against, rather than re-deriving its own and risking the two drifting.
+Image compute_guide(const Image& raw, const Config& cfg) {
     if (!cfg.bayer_mode) {
         // Python: guide_img = raw.reshape((1, H, W))
         Image g(raw.h, raw.w, 1);
@@ -439,6 +440,8 @@ static Image compute_guide(const Image& raw, const Config& cfg) {
     }
     return guide;
 }
+
+namespace {
 
 static Image local_lowpass_gaussian5x5(const Image& guide) {
     static constexpr f32 k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};

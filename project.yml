@@ -55,6 +55,7 @@ targets:
           - "mps_fft.mm"
           - "debug_utils.mm"
           - "prof.mm"
+          - "neural_flow.mm"
           - "HHSRKernels.metal"
       # LibRaw (fetched by scripts/fetch_libraw.sh before generating).
       # Exclude the *_ph.cpp aggregator units — they re-include the split
@@ -92,3 +93,4 @@ targets:
       - sdk: libz.tbd
       - sdk: CoreImage.framework
       - sdk: ImageIO.framework
+      - sdk: CoreML.framework

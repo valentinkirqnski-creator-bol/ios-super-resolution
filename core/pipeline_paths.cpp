@@ -13,6 +13,7 @@
 #include "preset_lut.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
+#include "neural_flow.h"
 #endif
 #include <vector>
 #include <array>
@@ -1136,6 +1137,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     metal_release_host_ref_stats(ref_stats);
 #endif
 
+    // Built once per burst, reused for every comparison frame below --
+    // compute_guide(ref, ...) doesn't change per comp frame. Only touched
+    // when the Settings toggle is on and the model actually loaded, so this
+    // costs nothing on the classical path.
+#if defined(__APPLE__)
+    Image ref_guide_neural;
+    if (work.use_neural_flow && neural_flow_available())
+        ref_guide_neural = compute_guide(ref, work);
+#endif
+
     // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
     // Peak during analyze ≈ ref + one comparison (+ optional prefetch on 2×).
 
@@ -1304,21 +1315,46 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_add_cpu("prealign#grey-dx-abs-sum",
                      std::fabs((double)(init.dx * grey_scale_x)));
         const double t_align = prof_now_ms();
-        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
-                               init.dx * grey_scale_x,
-                               init.dy * grey_scale_y,
-                               init.angle);
+        FlowField flow;
+        bool used_neural_flow = false;
+#if defined(__APPLE__)
+        // Settings "Use Neural Flow": PWCNet via Core ML in place of the
+        // block-matching pyramid. Feeds the exact same downstream path
+        // (flow_from_dense_guide mirrors flow_to_raw_tile_grid's grey/raw
+        // scaling) -- only the source of the flow field changes. Falls back
+        // to the classical path below on any failure (model unavailable,
+        // guide size mismatch, Core ML prediction error) rather than
+        // producing a frame with no flow at all.
+        if (work.use_neural_flow && ref_guide_neural.h > 0) {
+            Image comp_guide_neural = compute_guide(comp, work);
+            std::vector<f32> dense_flow;
+            if (neural_flow_estimate(ref_guide_neural, comp_guide_neural, dense_flow)) {
+                flow = flow_from_dense_guide(dense_flow.data(),
+                                             ref_guide_neural.h, ref_guide_neural.w,
+                                             comp.h, comp.w, tile_size,
+                                             work.r_Mt, work.num_threads,
+                                             work.flow_motion_prior_detrend);
+                used_neural_flow = true;
+            }
+        }
+#endif
+        if (!used_neural_flow) {
+            flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
+                        init.dx * grey_scale_x,
+                        init.dy * grey_scale_y,
+                        init.angle);
+            // Alignment ran on the grey. With the Bayer quad average that is
+            // half resolution, so the flow is on a half-res tile grid with
+            // half-res displacements, while robustness and merge both index
+            // it as raw_coordinate / tile_size and add raw pixels. Convert
+            // here, before anything downstream sees it. No-op when the grey
+            // is full resolution, so the FFT path is unaffected.
+            flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
+                                         comp_grey.h, comp_grey.w, tile_size,
+                                         work.r_Mt, work.num_threads,
+                                         work.flow_motion_prior_detrend);
+        }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
-        // Alignment ran on the grey. With the Bayer quad average that is half
-        // resolution, so the flow is on a half-res tile grid with half-res
-        // displacements, while robustness and merge both index it as
-        // raw_coordinate / tile_size and add raw pixels. Convert here, before
-        // anything downstream sees it. No-op when the grey is full resolution,
-        // so the FFT path is unaffected.
-        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
-                                     comp_grey.h, comp_grey.w, tile_size,
-                                     work.r_Mt, work.num_threads,
-                                     work.flow_motion_prior_detrend);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());

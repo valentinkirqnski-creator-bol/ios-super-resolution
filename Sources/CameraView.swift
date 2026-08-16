@@ -704,6 +704,14 @@ struct CameraView: View {
              the extra reference gradients to about a quarter of a frame.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
+        Text("""
+             Replaces the block-matching pyramid with a PWCNet model run on-device via \
+             Core ML, feeding the same robustness/merge math either way. Falls back to the \
+             classical path per-frame if the bundled model is missing or fails to load. \
+             Experimental -- not yet validated against real bursts on-device.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body
