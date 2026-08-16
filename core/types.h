@@ -300,7 +300,25 @@ struct Config {
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
     std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
-    std::vector<int> bm_search_radii = {1, 4, 4, 4};
+    // Finest level raised from 1 to 2.
+    //
+    // The align_ica_per_level comment below works out the budget: with factors
+    // {1,2,4,4} the flow arriving at a level carries up to 0.5*factor of
+    // residual, so levels 2 and 1 receive 2px against a radius of 4 and have
+    // slack, while level 0 received 1px against a radius of 1 and had none.
+    //
+    // 4 was tried and measured worse on a burst of repetitive line structure:
+    // adjacent tiles differing by more than 4px went from 19.8% to 28.0%, and
+    // tiles with M >= 8px from 30.0% to 35.3%. A wider window does not only find
+    // better matches, it finds more near-ties, and on a repeating pattern the
+    // minimum among near-ties is close to arbitrary. The paper's small finest
+    // radius is acting as a regularizer, holding level 0 near what the coarser
+    // levels agreed on. 2 restores a little slack without opening the window far
+    // enough to make ties common: 25 candidates against 9, rather than 81.
+    //
+    // Note this also sets the ICA step clamp, which bounds one iteration to the
+    // level's search radius -- 1px becomes 2px at the finest level.
+    std::vector<int> bm_search_radii = {2, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
     // Run ICA after block matching on EVERY pyramid level, not only the finest.
