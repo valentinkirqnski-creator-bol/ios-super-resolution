@@ -62,6 +62,27 @@ struct FlowField {
     // deriving it, which is what the full-resolution FFT path relies on.
     std::vector<uint32_t> motion_irregular;
 
+    // 1 where this tile's own direct-to-reference flow disagrees with an
+    // independent redundant measurement: this frame's shift to the PREVIOUS
+    // burst frame, composed with that previous frame's own already-computed
+    // shift to the reference. See compute_chain_closure in align.cpp.
+    //
+    // The point is what r_Mt/motion_irregular structurally cannot do: M is a
+    // single-frame 3x3-neighbourhood span, so it cannot tell a real, smoothly
+    // varying displacement field (camera rotation -- every tile disagrees with
+    // its neighbour by roughly the same amount, and none of that is wrong)
+    // from a genuine local misalignment (one tile's match is simply bad). A
+    // second, independently-run measurement reproduces real geometry but
+    // rarely reproduces a bad match by coincidence, so disagreement between
+    // the two is real evidence the direct flow is untrustworthy regardless of
+    // how locally smooth it looks.
+    //
+    // Deliberately NOT allocated by the constructor, same reasoning as
+    // motion_irregular: empty means not measured (first comparison frame in a
+    // burst has no predecessor to check against, and the whole feature is
+    // opt-in via Config::chain_consistency_enabled).
+    std::vector<uint32_t> chain_inconsistent;
+
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
@@ -506,6 +527,35 @@ struct Config {
     // that rotates by more than ~1 degree pushes the whole frame onto the
     // strict prior s1 regardless of whether any tile is actually misaligned.
     float r_Mt = 0.8f;
+
+    // Settings "Chain Consistency Check" toggle -- redundant frame-to-
+    // neighbour-frame corroboration of each tile's direct-to-reference flow,
+    // after ImageStackAlignator (kunzmi): shift(i->ref) should equal
+    // shift(i->i-1) + shift(i-1->ref) if both measurements are honest.
+    // Disagreement beyond chain_closure_threshold_px demotes the tile to
+    // r_s_chain regardless of r_Mt/M -- see FlowField::chain_inconsistent for
+    // why this catches what M structurally cannot (rotation vs. genuine local
+    // misalignment). Costs one extra lightweight single-level block match per
+    // comparison frame (align.cpp compute_chain_closure), not a second full
+    // pyramid+ICA alignment.
+    //
+    // Off by default: this is new, and there is no local Mac to build or run
+    // the Metal mirror against -- it is validated only by GitHub Actions CI on
+    // push. Turn on to A/B against the classical r_Mt-only mask.
+    bool  chain_consistency_enabled = false;
+    // Raw-pixel closure-error magnitude above which a tile is flagged. Below
+    // this, the two independent measurements are considered to agree.
+    float chain_closure_threshold_px = 6.0f;
+    // Raw-pixel search radius for the corroboration block match around the
+    // predicted (seed) relative shift.
+    int   chain_search_radius_px = 8;
+    // Motion-prior scale applied to a chain-inconsistent tile, in place of
+    // r_s1. Deliberately much stricter than r_s1 (near-zero): a closure
+    // failure means the flow itself is corroborated wrong, not merely
+    // suspicious, so d^2 downstream is measured at the wrong warped position
+    // and cannot be trusted at any similarity threshold.
+    float r_s_chain = 0.05f;
+
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
     // high. This does not repair flow; it rejects unsafe 1D tiles.

@@ -61,6 +61,19 @@ FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
                                 int raw_h, int raw_w, int tile_size,
                                 f32 r_Mt, int num_threads);
 
+// Redundant frame-to-previous-frame corroboration of a frame's own
+// direct-to-reference flow (ImageStackAlignator's shift-consistency
+// principle) -- 1 per raw tile where the two independent measurements
+// disagree by more than closure_threshold_px. See align.cpp and
+// FlowField::chain_inconsistent for the full reasoning.
+std::vector<uint32_t> compute_chain_closure(const Image& prev_guide, const Image& cur_guide,
+                                            const FlowField& flow_cur_to_ref,
+                                            const FlowField& flow_prev_to_ref,
+                                            int raw_h, int raw_w, int raw_tile_size,
+                                            f32 closure_threshold_px,
+                                            int base_search_radius_px,
+                                            int num_threads);
+
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 

@@ -1491,7 +1491,11 @@ struct RobMaskParams {
     float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
-    uint _pad1;
+    uint chain_reject_enabled;  // 1 = demote chain-inconsistent tiles (was _pad1)
+    float r_s_chain;      // motion prior for chain-inconsistent tiles
+    uint _pad2;
+    uint _pad3;
+    uint _pad4;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1820,6 +1824,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const uint* tile_residual_high [[buffer(13)]],
                           device float* s_select [[buffer(14)]],
                           device const uint* match_ambiguous [[buffer(15)]],
+                          device const uint* chain_inconsistent [[buffer(16)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1948,6 +1953,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // offset was chosen for producing a small difference.
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
         s = min(s, p.r_s1);
+    // Independent redundant measurement (this frame's shift to the previous
+    // burst frame, composed with that frame's own shift to the reference)
+    // disagrees with this tile's direct flow -- see RobMaskParamsCPU /
+    // FlowField::chain_inconsistent. Demoted to r_s_chain, not r_s1: a
+    // closure failure means the flow is corroborated wrong, not suspicious.
+    if (p.chain_reject_enabled != 0u && chain_inconsistent[pidx] != 0u)
+        s = min(s, p.r_s_chain);
     bool hard_reject = hf_reject || edge_reject;
     float r_val = hard_reject
         ? 0.f

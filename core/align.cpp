@@ -1366,4 +1366,103 @@ FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
                                  tile_size, r_Mt, num_threads);
 }
 
+// Redundant frame-to-previous-frame corroboration of this frame's own
+// direct-to-reference flow -- see FlowField::chain_inconsistent for the
+// reasoning (ImageStackAlignator's shift(i->ref) == shift(i->i-1) +
+// shift(i-1->ref) consistency principle).
+//
+// prev_guide/cur_guide: guide-resolution images (compute_guide's output --
+// raw/2 for Bayer, raw resolution otherwise) for the previous and current
+// comparison frames, any channel count. flow_cur_to_ref/flow_prev_to_ref:
+// both frames' own direct-to-reference flow, already expressed on the SAME
+// raw tile grid (flow_to_raw_tile_grid's output) -- so composing the
+// predicted relative shift is a same-index lookup, not a warp/resample.
+//
+// Cost: one single-level, no-pyramid, no-ICA block match at guide
+// resolution -- the same per-tile SAD kernel block_match_level_L1 already
+// runs at finer pyramid levels, just run once more here instead of a second
+// full align().
+std::vector<uint32_t> compute_chain_closure(const Image& prev_guide, const Image& cur_guide,
+                                            const FlowField& flow_cur_to_ref,
+                                            const FlowField& flow_prev_to_ref,
+                                            int raw_h, int raw_w, int raw_tile_size,
+                                            f32 closure_threshold_px,
+                                            int base_search_radius_px,
+                                            int num_threads) {
+    const int ny = flow_cur_to_ref.ny, nx = flow_cur_to_ref.nx;
+    std::vector<uint32_t> out;
+    if (ny <= 0 || nx <= 0 || flow_cur_to_ref.flow.empty()) return out;
+    if (flow_prev_to_ref.ny != ny || flow_prev_to_ref.nx != nx ||
+        flow_prev_to_ref.flow.empty())
+        return out;
+    if (prev_guide.h <= 0 || prev_guide.w <= 0 ||
+        cur_guide.h != prev_guide.h || cur_guide.w != prev_guide.w ||
+        cur_guide.c != prev_guide.c || raw_h <= 0 || raw_w <= 0 || raw_tile_size <= 0)
+        return out;
+
+    // Single-channel average -- a rough SAD corroboration match needs only
+    // enough signal to localize a shift, not full colour.
+    Image prev_grey(prev_guide.h, prev_guide.w, 1);
+    Image cur_grey(cur_guide.h, cur_guide.w, 1);
+    const f32 inv_c = 1.f / (f32)std::max(1, prev_guide.c);
+    for (int y = 0; y < prev_guide.h; ++y) {
+        for (int x = 0; x < prev_guide.w; ++x) {
+            f32 sp = 0.f, sc = 0.f;
+            for (int ch = 0; ch < prev_guide.c; ++ch) {
+                sp += prev_guide.at(y, x, ch);
+                sc += cur_guide.at(y, x, ch);
+            }
+            prev_grey.at(y, x) = sp * inv_c;
+            cur_grey.at(y, x) = sc * inv_c;
+        }
+    }
+
+    const f32 guide_sx = (f32)prev_guide.w / (f32)raw_w;
+    const f32 guide_sy = (f32)prev_guide.h / (f32)raw_h;
+    const f32 guide_s = 0.5f * (guide_sx + guide_sy);
+    const int guide_ts = std::max(1, (int)std::lround((f32)raw_tile_size * guide_s));
+    const int guide_radius = std::max(1, (int)std::lround((f32)base_search_radius_px * guide_s));
+
+    // Seed every tile with the predicted relative shift: what frame i's
+    // motion relative to frame i-1 would be if both frames' own alignment to
+    // the reference is honest.
+    FlowField probe(ny, nx);
+    for (int ty = 0; ty < ny; ++ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            const f32 pred_dx_raw = flow_cur_to_ref.dx(ty, tx) - flow_prev_to_ref.dx(ty, tx);
+            const f32 pred_dy_raw = flow_cur_to_ref.dy(ty, tx) - flow_prev_to_ref.dy(ty, tx);
+            probe.dx(ty, tx) = pred_dx_raw * guide_sx;
+            probe.dy(ty, tx) = pred_dy_raw * guide_sy;
+        }
+    }
+
+    // Same ambiguity ratio clamped_ambiguity_ratio() falls back to -- this
+    // corroboration match has no Config of its own to read one from.
+    block_match_level_direct_460(prev_grey, cur_grey, guide_ts, guide_radius, probe,
+                                 /*l1=*/true, /*ambiguity_ratio=*/1.10f,
+                                 /*write_ambiguity=*/true, num_threads);
+
+    out.assign((size_t)ny * nx, 0u);
+    const f32 th_sq = closure_threshold_px * closure_threshold_px;
+    for (int ty = 0; ty < ny; ++ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            const f32 pred_dx_raw = flow_cur_to_ref.dx(ty, tx) - flow_prev_to_ref.dx(ty, tx);
+            const f32 pred_dy_raw = flow_cur_to_ref.dy(ty, tx) - flow_prev_to_ref.dy(ty, tx);
+            const f32 actual_dx_raw = probe.dx(ty, tx) / guide_sx;
+            const f32 actual_dy_raw = probe.dy(ty, tx) / guide_sy;
+            const f32 res_dx = actual_dx_raw - pred_dx_raw;
+            const f32 res_dy = actual_dy_raw - pred_dy_raw;
+            const f32 closure_sq = res_dx * res_dx + res_dy * res_dy;
+            const size_t idx = (size_t)ty * nx + tx;
+            // An ambiguous corroboration read (near-tied minima) neither
+            // confirms nor refutes the seed -- do not flag on inconclusive
+            // evidence.
+            const bool ambiguous = idx < probe.match_ambiguous.size() &&
+                                   probe.match_ambiguous[idx] != 0u;
+            out[idx] = (!ambiguous && closure_sq > th_sq) ? 1u : 0u;
+        }
+    }
+    return out;
+}
+
 } // namespace hhsr

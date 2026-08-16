@@ -1221,6 +1221,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         spill_pending = false;
     };
+    // Chain-consistency state (Config::chain_consistency_enabled): the guide
+    // image and raw-tile-grid direct-to-reference flow of the previous
+    // PROCESSED comparison frame, carried across iterations so each frame can
+    // be corroborated against its temporal neighbour -- see
+    // compute_chain_closure in align.cpp. Empty until the second comparison
+    // frame in the burst produces a chain to check against. Left unpopulated
+    // (and compute_guide never called) when the feature is off, so this costs
+    // nothing by default.
+    Image prev_chain_guide;
+    FlowField prev_chain_flow;
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
@@ -1363,6 +1373,26 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             report("Frame " + std::to_string(k + 1) + ": Metal alignment failed",
                    0.08f + 0.35f * (float)(pos + 1) / std::max(1, n - 1));
             continue;
+        }
+
+        // Chain consistency: corroborate this frame's direct-to-reference flow
+        // against an independent second measurement (this frame's shift to
+        // the previous processed frame, composed with that frame's own
+        // already-known shift to the reference). Needs comp (raw) while it is
+        // still resident, so this runs before comp is freed further down.
+        if (work.chain_consistency_enabled) {
+            const double t_chain = prof_now_ms();
+            Image cur_chain_guide = compute_guide(comp, work);
+            if (prev_chain_guide.h > 0 && prev_chain_flow.ny > 0) {
+                flow.chain_inconsistent = compute_chain_closure(
+                    prev_chain_guide, cur_chain_guide, flow, prev_chain_flow,
+                    comp.h, comp.w, tile_size,
+                    work.chain_closure_threshold_px, work.chain_search_radius_px,
+                    work.num_threads);
+            }
+            prev_chain_guide = std::move(cur_chain_guide);
+            prev_chain_flow = flow;
+            prof_add_cpu("comp:chain-closure", prof_now_ms() - t_chain);
         }
 
         Image rob;

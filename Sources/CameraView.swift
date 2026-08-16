@@ -712,6 +712,17 @@ struct CameraView: View {
              Experimental -- not yet validated against real bursts on-device.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Chain Consistency Check", isOn: $cam.tuningParams.chain_consistency_enabled)
+        Text("""
+             Corroborates each frame's own flow against an independent second measurement: \
+             its shift to the previous burst frame, composed with that frame's already-known \
+             shift to the reference. Demotes a tile when the two disagree, regardless of what \
+             the motion-prior span (r_Mt) says -- this is what tells apart a real, smoothly \
+             varying rotation gradient from a genuine local misalignment, which r_Mt's \
+             single-frame span alone cannot. Experimental -- not yet validated against real \
+             bursts on-device.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body

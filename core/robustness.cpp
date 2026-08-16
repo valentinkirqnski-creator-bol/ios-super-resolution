@@ -1048,6 +1048,17 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
+            // An independent redundant measurement (this frame's shift to the
+            // previous burst frame, composed with that frame's own shift to
+            // the reference) disagrees with this tile's direct flow. Unlike
+            // aperture/ambiguous above, demoted to r_s_chain rather than
+            // r_s1: a closure failure means the flow is corroborated wrong,
+            // not merely suspicious. See FlowField::chain_inconsistent.
+            const bool chain_inconsistent =
+                cfg.chain_consistency_enabled &&
+                pidx < flow.chain_inconsistent.size() &&
+                flow.chain_inconsistent[pidx] != 0u;
+            if (chain_inconsistent) s = std::min(s, cfg.r_s_chain);
             const bool hard_reject = hf_reject || edge_reject;
             f32 r_val = hard_reject
                 ? 0.f

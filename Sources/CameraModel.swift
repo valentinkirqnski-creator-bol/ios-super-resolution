@@ -145,6 +145,16 @@ struct TuningParams: Equatable, Codable {
     /// same robustness/merge math either way. Falls back to the classical
     /// path per-frame if the model isn't bundled or fails to load.
     var use_neural_flow: Bool = false
+    /// Redundant frame-to-neighbour-frame corroboration of each comparison
+    /// frame's own direct-to-reference flow (ImageStackAlignator's
+    /// shift-consistency principle): a tile is demoted when this frame's
+    /// shift to the previous burst frame, composed with that frame's own
+    /// already-known shift to the reference, disagrees with its direct flow.
+    /// Catches genuine misalignment under camera rotation that r_Mt's
+    /// single-frame local span alone cannot tell apart from a real, smooth
+    /// rotation gradient. Off by default: new, unverified on-device (no local
+    /// Mac -- only GitHub Actions CI on push).
+    var chain_consistency_enabled: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -197,7 +207,7 @@ struct TuningParams: Equatable, Codable {
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, use_neural_flow
+        case align_ica_per_level_fft, use_neural_flow, chain_consistency_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -267,6 +277,7 @@ struct TuningParams: Equatable, Codable {
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
+        chain_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .chain_consistency_enabled) ?? chain_consistency_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1879,6 +1890,7 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
+            "chain_consistency_enabled": NSNumber(value: tuningParams.chain_consistency_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)

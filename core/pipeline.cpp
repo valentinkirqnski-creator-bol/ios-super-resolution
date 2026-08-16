@@ -92,6 +92,10 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     int nch = work.bayer_mode ? 3 : 1;
     Image num(Hs, Ws, nch), den(Hs, Ws, nch);
 
+    // See pipeline_paths.cpp for the reasoning; here all frames are already
+    // resident, so this is just the previous iteration's own state.
+    Image prev_chain_guide;
+    FlowField prev_chain_flow;
     for (int k = 1; k < n; ++k) {
         float base = 0.05f + 0.85f * (float)(k - 1) / std::max(1, n - 1);
         report("Frame " + std::to_string(k + 1) + ": align", base);
@@ -110,6 +114,18 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads);
+        if (work.chain_consistency_enabled) {
+            Image cur_chain_guide = compute_guide(comp, work);
+            if (prev_chain_guide.h > 0 && prev_chain_flow.ny > 0) {
+                flow.chain_inconsistent = compute_chain_closure(
+                    prev_chain_guide, cur_chain_guide, flow, prev_chain_flow,
+                    comp.h, comp.w, tile_size,
+                    work.chain_closure_threshold_px, work.chain_search_radius_px,
+                    work.num_threads);
+            }
+            prev_chain_guide = std::move(cur_chain_guide);
+            prev_chain_flow = flow;
+        }
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -178,6 +194,10 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     Image acc_rob;
     bool have_acc_rob = false;
 
+    // See pipeline_paths.cpp for the reasoning; here all frames are already
+    // resident, so this is just the previous iteration's own state.
+    Image prev_chain_guide;
+    FlowField prev_chain_flow;
     for (int k = 1; k < n; ++k) {
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.03f + 0.50f * (float)(k - 1) / std::max(1, n - 1));
@@ -187,6 +207,18 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
                                         comp_grey.h, comp_grey.w, tile_size,
                                         work.r_Mt, work.num_threads);
+        if (work.chain_consistency_enabled) {
+            Image cur_chain_guide = compute_guide(burst[k], work);
+            if (prev_chain_guide.h > 0 && prev_chain_flow.ny > 0) {
+                fd.flow.chain_inconsistent = compute_chain_closure(
+                    prev_chain_guide, cur_chain_guide, fd.flow, prev_chain_flow,
+                    burst[k].h, burst[k].w, tile_size,
+                    work.chain_closure_threshold_px, work.chain_search_radius_px,
+                    work.num_threads);
+            }
+            prev_chain_guide = std::move(cur_chain_guide);
+            prev_chain_flow = fd.flow;
+        }
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {
