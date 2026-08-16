@@ -38,18 +38,16 @@ Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
 // already full resolution.
 // r_Mt is the motion-prior threshold, in RAW pixels. The prior is measured
 // here rather than carried, because only this function knows the grey-to-raw
-// scale needed to express the span in those units. detrend removes the local
-// linear trend first, so smooth camera motion (rotation, zoom) does not read
-// as irregular. num_threads as in Config.
+// scale needed to express the span in those units. num_threads as in Config.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size,
-                                f32 r_Mt, int num_threads, bool detrend);
+                                f32 r_Mt, int num_threads);
 
 // 1 where the flow field is irregular over the 3x3 tile neighbourhood -- the
-// r_Mt test. sx/sy scale the stored displacements into r_Mt's units.
+// r_Mt test (Wronski et al. Eq. 7/8, literally: raw max-min span, no
+// detrending). sx/sy scale the stored displacements into r_Mt's units.
 std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
-                                               f32 sx, f32 sy, int num_threads,
-                                               bool detrend);
+                                               f32 sx, f32 sy, int num_threads);
 
 // Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
 // field produced by an external neural flow estimator (PWCNet), as a
@@ -61,7 +59,7 @@ std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
 // motion_irregular) and why.
 FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
                                 int raw_h, int raw_w, int tile_size,
-                                f32 r_Mt, int num_threads, bool detrend);
+                                f32 r_Mt, int num_threads);
 
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
