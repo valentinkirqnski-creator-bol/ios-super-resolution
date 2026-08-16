@@ -522,6 +522,27 @@ struct Config {
     // Legacy setting kept for old saved app preferences. The current 1D reject
     // gate uses flow_reject_1d_residual_threshold instead.
     float flow_reject_1d_ambiguity_ratio = 1.10f;
+    // Produce and consume the block-matching ambiguity flag: a tile is marked
+    // when its second-best match costs less than ambiguity_ratio times the best,
+    // i.e. the cost surface has two near-equal minima.
+    //
+    // This is the only signal in the pipeline that does not come from the image
+    // residual. Block matching picks the offset that minimises L1, and the
+    // robustness mask then scores that offset by the difference it produces --
+    // so an error created by minimising the difference is invisible to a test
+    // that measures it. On repetitive structure the wrong period matches nearly
+    // as well as the right one, and it is selected precisely because it looked
+    // good. Measured on the ok/ burst: tiles whose neighbours disagree by 8-128
+    // px still merge at R ~ 0.74, because d^2/sigma^2 there is only ~0.74.
+    //
+    // The cost surface breaks that circularity -- two near-equal minima are
+    // visible whatever either one scores.
+    //
+    // Accumulated down the pyramid rather than overwritten per level: a wrong
+    // match at the coarsest level is 8 px x 32 abs factor = 256 raw px of error,
+    // so the flag has to survive from where the mistake is made to where the
+    // mask is applied. upscale_flow_460 already propagates it.
+    bool  flow_reject_ambiguous_enabled = true;
     // A 1D tile is rejected only when enough pixels in that tile have
     // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
     // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.

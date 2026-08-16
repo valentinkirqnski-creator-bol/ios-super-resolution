@@ -1130,8 +1130,10 @@ struct RobMaskParamsCPU {
     uint32_t aperture_reject_enabled = 0;
     float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
     uint32_t save_s_select = 0;  // 1 = also emit the per-pixel s1/s2 selector
+    uint32_t ambiguous_enabled = 0;  // 1 = demote tiles with an ambiguous match
+    uint32_t _pad1 = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 88, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1555,6 +1557,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
+    const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
+                        flow.match_ambiguous.size() == n_tiles;
+    mp.ambiguous_enabled = amb_on ? 1u : 0u;
+    id<MTLBuffer> b_match_amb = amb_on
+        ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
+        : b_motion;
+    if (!b_match_amb) return Image();
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1587,6 +1596,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_aperture offset:0 atIndex:12];
     [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
     [enc setBuffer:b_s_select offset:0 atIndex:14];
+    [enc setBuffer:b_match_amb offset:0 atIndex:15];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -2124,8 +2134,9 @@ struct AlignUpscaleParamsCPU {
     uint32_t upsample_factor, repeat_factor, up_ny, up_nx;
     int32_t ts;
     int32_t ref_h, ref_w, mov_h, mov_w;
+    uint32_t carry_ambiguity = 0;   // 1 = propagate the block-matching ambiguity flag
 };
-static_assert(sizeof(AlignUpscaleParamsCPU) == 52, "AlignUpscaleParamsCPU");
+static_assert(sizeof(AlignUpscaleParamsCPU) == 56, "AlignUpscaleParamsCPU");
 
 // One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
 // retain all levels at once (full-res sticky cache jetsams on 1×).
@@ -2239,7 +2250,9 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
                                   int target_ny, int target_nx,
                                   int upsample_factor, int new_tile_size,
                                   int prev_tile_size,
-                                  int ref_h, int ref_w, int mov_h, int mov_w) {
+                                  int ref_h, int ref_w, int mov_h, int mov_w,
+                                  id<MTLBuffer> b_amb_in = nil,
+                                  __strong id<MTLBuffer>* b_amb_out = nullptr) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -2249,6 +2262,14 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     const size_t out_b = (size_t)target_ny * (size_t)target_nx * 2u * sizeof(float);
     b_out = buf(nullptr, out_b);
     if (!b_out) return false;
+    // The grid changes size between levels, so the ambiguity flag needs its own
+    // resized buffer here, filled by the kernel from whichever coarse tile
+    // supplied the winning candidate.
+    const bool carry_amb = (b_amb_in != nil && b_amb_out != nullptr);
+    if (carry_amb) {
+        *b_amb_out = buf(nullptr, (size_t)target_ny * (size_t)target_nx * sizeof(uint32_t));
+        if (!*b_amb_out) return false;
+    }
 
     AlignUpscaleParamsCPU p{};
     p.in_ny = (uint32_t)in_ny;
@@ -2264,6 +2285,7 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     p.ref_w = (int32_t)ref_w;
     p.mov_h = (int32_t)mov_h;
     p.mov_w = (int32_t)mov_w;
+    p.carry_ambiguity = carry_amb ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
@@ -2276,6 +2298,10 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     [enc setBuffer:b_mov offset:0 atIndex:2];
     [enc setBuffer:b_out offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
+    // Bound unconditionally because the kernel declares them; harmless aliases
+    // when carry_amb is false, since the kernel guards on p.carry_ambiguity.
+    [enc setBuffer:(carry_amb ? b_amb_in : b_in) offset:0 atIndex:5];
+    [enc setBuffer:(carry_amb ? *b_amb_out : b_out) offset:0 atIndex:6];
     dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
     [enc endEncoding];
     prof_tag_gpu(cmd, "align:upscale-flow");
@@ -2349,6 +2375,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     id<MTLBuffer> b_ambiguity = nil;
     int flow_ny = 0, flow_nx = 0;
     int ambiguity_ny = 0, ambiguity_nx = 0;
+    const bool want_amb = cfg.flow_reject_ambiguous_enabled;
     const bool ica_all = cfg.ica_every_level();
 
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
@@ -2381,18 +2408,33 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.bm_tile_sizes[lvl + 1] : ts;
             id<MTLBuffer> b_up = nil;
+            id<MTLBuffer> b_amb_up = nil;
             if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
                                        b_up, ny, nx, upsample_factor, ts, prev_ts,
-                                       r.h, r.w, m.h, m.w) || !b_up)
+                                       r.h, r.w, m.h, m.w,
+                                       want_amb ? b_ambiguity : nil,
+                                       want_amb ? &b_amb_up : nullptr) || !b_up)
                 return false;
             b_flow = b_up;
+            if (want_amb && b_amb_up) {
+                b_ambiguity = b_amb_up;
+                ambiguity_ny = ny;
+                ambiguity_nx = nx;
+            }
             flow_ny = ny;
             flow_nx = nx;
         }
 
-        b_ambiguity = nil;
-        ambiguity_ny = 0;
-        ambiguity_nx = 0;
+        // Not reset per level: the flag accumulates from the coarsest level,
+        // where a wrong match is 8px x 32 abs factor = 256 raw px of error, down
+        // to the finest. The upscale above resized and propagated it, and
+        // local_search ORs its own finding into it.
+        if (want_amb && (!b_ambiguity || ambiguity_ny != ny || ambiguity_nx != nx)) {
+            b_ambiguity = buf(nullptr, (size_t)ny * (size_t)nx * sizeof(uint32_t));
+            if (!b_ambiguity) return false;
+            ambiguity_ny = ny;
+            ambiguity_nx = nx;
+        }
 
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
@@ -2402,13 +2444,13 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, true,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
-                                          false);
+                                          want_amb);
         else
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, false,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
-                                          false);
+                                          want_amb);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --
@@ -2477,7 +2519,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     flow_out = FlowField(flow_ny, flow_nx);
     memcpy(flow_out.flow.data(), [b_flow contents],
            flow_out.flow.size() * sizeof(float));
-    if (cfg.flow_reject_1d_enabled && b_ambiguity &&
+    if (want_amb && b_ambiguity &&
         ambiguity_ny == flow_ny && ambiguity_nx == flow_nx) {
         flow_out.match_ambiguous.assign((size_t)flow_ny * (size_t)flow_nx, 0u);
         memcpy(flow_out.match_ambiguous.data(), [b_ambiguity contents],

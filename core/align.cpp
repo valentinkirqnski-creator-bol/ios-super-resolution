@@ -479,8 +479,15 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
     buffers.reserve((size_t)ny);
     for (int i = 0; i < ny; ++i)
         buffers.emplace_back(N, corr_size, wh);
-    if (write_ambiguity)
-        flow.match_ambiguous.assign((size_t)std::max(0, ny) * (size_t)std::max(0, nx), 0u);
+    // Size it if this is the first level, but do NOT clear it otherwise: the
+    // value already there was propagated down from the coarser level by
+    // upscale_flow_460, and a wrong match up there is what produces the large
+    // errors. The per-tile write below ORs into it.
+    if (write_ambiguity) {
+        const size_t n_amb = (size_t)std::max(0, ny) * (size_t)std::max(0, nx);
+        if (flow.match_ambiguous.size() != n_amb)
+            flow.match_ambiguous.assign(n_amb, 0u);
+    }
 
     parallel_rows(ny, num_threads, [&](int ty) {
         RowBuffers& b = buffers[(size_t)ty];
@@ -568,7 +575,7 @@ static void block_match_level_L2_cpu(const Image& ref, const Image& moving,
             flow.dx(ty, tx) += (f32)best_dx;
             flow.dy(ty, tx) += (f32)best_dy;
             if (write_ambiguity)
-                flow.ambiguous(ty, tx) =
+                flow.ambiguous(ty, tx) |=
                     match_is_ambiguous(best_cost, second_cost, ambiguity_ratio);
         }
     });
@@ -582,8 +589,15 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
     const int ny = flow.ny, nx = flow.nx;
     const int ts = tile_size;
     const int R = search_radius;
-    if (write_ambiguity)
-        flow.match_ambiguous.assign((size_t)std::max(0, ny) * (size_t)std::max(0, nx), 0u);
+    // Size it if this is the first level, but do NOT clear it otherwise: the
+    // value already there was propagated down from the coarser level by
+    // upscale_flow_460, and a wrong match up there is what produces the large
+    // errors. The per-tile write below ORs into it.
+    if (write_ambiguity) {
+        const size_t n_amb = (size_t)std::max(0, ny) * (size_t)std::max(0, nx);
+        if (flow.match_ambiguous.size() != n_amb)
+            flow.match_ambiguous.assign(n_amb, 0u);
+    }
     parallel_rows(ny, num_threads, [&](int ty) {
         for (int tx = 0; tx < nx; ++tx) {
             const int oy = ty * ts;
@@ -641,7 +655,7 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
             flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
             flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
             if (write_ambiguity)
-                flow.ambiguous(ty, tx) =
+                flow.ambiguous(ty, tx) |=
                     match_is_ambiguous(min_dist, second_dist, ambiguity_ratio);
         }
     });
@@ -651,7 +665,7 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, const Config& cfg,
                                   int num_threads) {
-    const bool write_ambiguity = false;
+    const bool write_ambiguity = cfg.flow_reject_ambiguous_enabled;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
@@ -672,7 +686,7 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int tile_size, int search_radius,
                                   FlowField& flow, const Config& cfg,
                                   int num_threads) {
-    const bool write_ambiguity = false;
+    const bool write_ambiguity = cfg.flow_reject_ambiguous_enabled;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&

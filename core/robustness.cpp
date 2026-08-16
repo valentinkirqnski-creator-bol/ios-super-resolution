@@ -984,6 +984,17 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             // min, not assignment: a tile already flagged motion-irregular must
             // not be promoted, and lower s is strictly stricter here.
             if (aperture_limited) s = std::min(s, cfg.r_s1);
+            // Block matching found two near-equal minima here, so the offset it
+            // picked is not distinguishable from at least one other. Demote to
+            // the strict prior. This is the one input to the mask that does not
+            // come from the image residual, which matters because the residual
+            // cannot see this failure: the wrong offset was selected precisely
+            // for producing a small difference.
+            const bool match_ambiguous =
+                cfg.flow_reject_ambiguous_enabled &&
+                pidx < flow.match_ambiguous.size() &&
+                flow.match_ambiguous[pidx] != 0u;
+            if (match_ambiguous) s = std::min(s, cfg.r_s1);
             const bool hard_reject = hf_reject || edge_reject;
             f32 r_val = hard_reject
                 ? 0.f

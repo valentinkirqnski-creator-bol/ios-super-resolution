@@ -629,7 +629,7 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
             const float b = max(red_dist[0], 0.f);
             const float s = max(red_second_dist[0], 0.f);
             const float denom = max(b, 1.0e-12f);
-            ambiguity[tile_id] =
+            ambiguity[tile_id] |=
                 (isfinite(b) && isfinite(s) && (s / denom) < p.ambiguity_ratio)
                     ? 1u : 0u;
         }
@@ -1490,6 +1490,8 @@ struct RobMaskParams {
     uint aperture_reject_enabled;
     float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
+    uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
+    uint _pad1;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1817,6 +1819,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const uint* aperture_limited [[buffer(12)]],
                           device const uint* tile_residual_high [[buffer(13)]],
                           device float* s_select [[buffer(14)]],
+                          device const uint* match_ambiguous [[buffer(15)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1934,6 +1937,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         aperture_limited[pidx] != 0u &&
         tile_residual_high[pidx] != 0u;
     if (aperture_limited_tile) s = min(s, p.r_s1);
+    // Two near-equal minima in the block-matching cost surface: the offset that
+    // was picked is not distinguishable from another. See compute_robustness in
+    // robustness.cpp -- this is the only mask input that is not derived from the
+    // image residual, and the residual cannot see this failure because the wrong
+    // offset was chosen for producing a small difference.
+    if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
+        s = min(s, p.r_s1);
     bool hard_reject = hf_reject || edge_reject;
     float r_val = hard_reject
         ? 0.f
@@ -2575,6 +2585,7 @@ struct AlignUpscaleParams {
     uint up_ny, up_nx;
     int ts;
     int ref_h, ref_w, mov_h, mov_w;
+    uint carry_ambiguity;   // 1 = propagate the block-matching ambiguity flag
 };
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
@@ -2605,6 +2616,8 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
                                    device const float* mov [[buffer(2)]],
                                    device float* out_flow [[buffer(3)]],
                                    constant AlignUpscaleParams& p [[buffer(4)]],
+                                   device const uint* in_amb [[buffer(5)]],
+                                   device uint* out_amb [[buffer(6)]],
                                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.target_nx || gid.y >= p.target_ny) return;
     uint o = (gid.y * p.target_nx + gid.x) * 2u;
@@ -2635,6 +2648,7 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
     int oy = int(gid.y) * p.ts;
     float best = INFINITY;
     float2 best_flow = cand0;
+    uint best_ci = 0u;
     for (uint ci = 0u; ci < 3u; ++ci) {
         float2 c = (ci == 0u) ? cand0 : ((ci == 1u) ? cand1 : cand2);
         // The sampled region is a full ts x ts rectangle in both images, so
@@ -2663,10 +2677,20 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
         if (dist < best) {
             best = dist;
             best_flow = c;
+            best_ci = ci;
         }
     }
     out_flow[o + 0u] = best_flow.x;
     out_flow[o + 1u] = best_flow.y;
+    // Carry the ambiguity flag from whichever coarse tile supplied the winning
+    // candidate, exactly as upscale_flow_460 does on the CPU. A wrong match at
+    // the coarsest level is 8px x 32 abs factor = 256 raw px, so the flag has to
+    // survive from there down to where the mask is applied.
+    if (p.carry_ambiguity != 0u) {
+        uint sy = (best_ci == 1u) ? cand_y : prev_y;
+        uint sx = (best_ci == 2u) ? cand_x : prev_x;
+        out_amb[gid.y * p.target_nx + gid.x] = in_amb[sy * p.in_nx + sx];
+    }
 }
 
 struct MergeNormParams {
