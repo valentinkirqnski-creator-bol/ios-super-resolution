@@ -307,18 +307,25 @@ struct Config {
     // residual, so levels 2 and 1 receive 2px against a radius of 4 and have
     // slack, while level 0 received 1px against a radius of 1 and had none.
     //
-    // 4 was tried and measured worse on a burst of repetitive line structure:
-    // adjacent tiles differing by more than 4px went from 19.8% to 28.0%, and
-    // tiles with M >= 8px from 30.0% to 35.3%. A wider window does not only find
-    // better matches, it finds more near-ties, and on a repeating pattern the
-    // minimum among near-ties is close to arbitrary. The paper's small finest
-    // radius is acting as a regularizer, holding level 0 near what the coarser
-    // levels agreed on. 2 restores a little slack without opening the window far
-    // enough to make ties common: 25 candidates against 9, rather than 81.
+    // Measured on the ok/ burst -- repetitive straight-line structure, the
+    // adverse case for this parameter -- comparing 0728 against 0727:
     //
-    // Note this also sets the ICA step clamp, which bounds one iteration to the
-    // level's search radius -- 1px becomes 2px at the finest level.
-    std::vector<int> bm_search_radii = {2, 4, 4, 4};
+    //   finest radius                    1        2        3        4
+    //   adjacent tiles differing >4px    19.8%    22.2%    25.1%    28.0%
+    //   tiles with M >= 8px              30.0%    31.8%    33.8%    35.3%
+    //   mean R in the 8-32 M band        0.734    0.737    0.751    0.757
+    //   candidates evaluated per tile    9        25       49       81
+    //
+    // Monotonic in the wrong direction on that scene: a wider window does not
+    // only find better matches, it finds more near-ties, and on a repeating
+    // pattern the minimum among near-ties is close to arbitrary. The paper's
+    // small finest radius acts as a regularizer, holding level 0 near what the
+    // coarser levels agreed on. Content with genuine fine-scale motion and no
+    // repetition was never tested and may prefer the wider window.
+    //
+    // Also sets the ICA step clamp, which bounds one iteration to the level's
+    // search radius -- so this is 3px at the finest level.
+    std::vector<int> bm_search_radii = {3, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
     int  ica_n_iter = 3;
     // Run ICA after block matching on EVERY pyramid level, not only the finest.
