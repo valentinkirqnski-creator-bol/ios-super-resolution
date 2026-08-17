@@ -432,6 +432,26 @@ struct Config {
         return align_ica_per_level_fft && grey_method == GreyMethod::FFT;
     }
 
+    // How many RAW pixels one alignment-grey pixel spans. The FFT grey is
+    // full resolution (1); the decimate grey averages each Bayer quad, so it
+    // is half resolution (2).
+    //
+    // bm_tile_sizes is defined in RAW pixels -- that is what the UI shows and
+    // what robustness/merge index the flow field with. Block matching runs on
+    // the grey, so it must divide by this to get the tile size in grey pixels.
+    // Without that division a "16" tile is 16 grey px = 32 raw px on the
+    // decimate path and 16 raw px on FFT: the same setting meaning two
+    // different physical extents, and flow blocks twice the requested size.
+    int alignment_grey_scale() const {
+        return (bayer_mode && grey_method == GreyMethod::Decimate) ? 2 : 1;
+    }
+    // bm_tile_sizes[lvl] converted from raw pixels into alignment-grey
+    // pixels. Floored at 8: the Metal block-matching kernels are specialised
+    // for 8/16/32/64 and 4 would fall off that path.
+    int grey_tile_size(int raw_tile_size) const {
+        const int s = alignment_grey_scale();
+        return (s <= 1) ? raw_tile_size : std::max(8, raw_tile_size / s);
+    }
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
     // With this false the plan stays empty, so every frame enters align() with a

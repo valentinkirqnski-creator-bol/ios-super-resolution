@@ -41,7 +41,8 @@ Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
 // scale needed to express the span in those units. num_threads as in Config.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size,
-                                f32 r_Mt, int num_threads);
+                                f32 r_Mt, int num_threads,
+                                int guide_tile_size = 0);
 
 // 1 where the flow field is irregular over the 3x3 tile neighbourhood -- the
 // r_Mt test (Wronski et al. Eq. 7/8, literally: raw max-min span, no

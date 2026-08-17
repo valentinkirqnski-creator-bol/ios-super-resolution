@@ -2364,7 +2364,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         moving_grey.h <= 0 || moving_grey.w <= 0) return false;
     // Fine-first levels[]: params arrays are fine→coarse, so index with lvl.
     for (int lvl = 0; lvl < nlev; ++lvl) {
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
+        // Grey-domain tile size -- bm_tile_sizes is in RAW pixels. Mirrors
+        // align() in align.cpp; see Config::grey_tile_size.
+        int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                     ? cfg.bm_tile_sizes[lvl] : tile_size);
         if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
@@ -2419,7 +2422,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     for (int lvl = nlev - 1; lvl >= 0; --lvl) {
         const Image& r = ref_pyr.levels[(size_t)lvl];
         const Lev& m = mov_pyr[(size_t)lvl];
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size()) ? cfg.bm_tile_sizes[lvl] : tile_size;
+        // Grey-domain tile size -- bm_tile_sizes is in RAW pixels. Mirrors
+        // align() in align.cpp; see Config::grey_tile_size.
+        int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                     ? cfg.bm_tile_sizes[lvl] : tile_size);
         int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
         id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
@@ -2444,7 +2450,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
-                          ? cfg.bm_tile_sizes[lvl + 1] : ts;
+                          ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1]) : ts;
             id<MTLBuffer> b_up = nil;
             id<MTLBuffer> b_amb_up = nil;
             if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,

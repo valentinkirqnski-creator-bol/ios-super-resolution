@@ -1138,8 +1138,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             // full-resolution set here is the allocation that fails.
             if (lvl == 0 && cfg.ica_per_level_coarse_only()) continue;
             const Image& r = ref_pyr.levels[lvl];
-            int ts = (lvl < (int)cfg.bm_tile_sizes.size())
-                         ? cfg.bm_tile_sizes[lvl] : tile_size;
+            int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                         ? cfg.bm_tile_sizes[lvl] : tile_size);
             RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
             L.gx = compute_sobel_gradx(r);
             L.gy = compute_sobel_grady(r);
@@ -1163,8 +1163,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         const Image& r = ref_pyr.levels[lvl];
         const Image& m = mov_pyr.levels[lvl];
 
-        int ts = (lvl < (int)cfg.bm_tile_sizes.size())
-                     ? cfg.bm_tile_sizes[lvl] : tile_size;
+        // Grey-domain tile size: bm_tile_sizes is in RAW pixels, the pyramid
+        // is built on the alignment grey. See Config::grey_tile_size.
+        int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
+                     ? cfg.bm_tile_sizes[lvl] : tile_size);
         int radius = (lvl < (int)cfg.bm_search_radii.size())
                      ? cfg.bm_search_radii[lvl] : 2;
 
@@ -1183,7 +1185,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
-                          ? cfg.bm_tile_sizes[lvl + 1]
+                          ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1])
                           : ts;
             flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
         }
@@ -1218,12 +1220,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!ica_all || cfg.ica_per_level_coarse_only()) {
         Image gx = compute_sobel_gradx(ref_grey);
         Image gy = compute_sobel_grady(ref_grey);
-        finest_hess = compute_hessian(gx, gy, tile_size);
+        finest_hess = compute_hessian(gx, gy, cfg.grey_tile_size(tile_size));
         debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
         debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
         const int finest_radius = cfg.bm_search_radii.empty() ? 1
                                                               : cfg.bm_search_radii[0];
-        ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow, tile_size,
+        ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow,
+                         cfg.grey_tile_size(tile_size),
                          cfg.ica_n_iter, cfg.num_threads,
                          ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
     }
@@ -1256,9 +1259,14 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 //
 // Returns the input unchanged when the grey is already full resolution, so the
 // FFT path is unaffected.
+// tile_size is in RAW pixels (the raw tile grid this builds); guide_tile_size
+// is the size the alignment actually used on the grey. They differ by
+// Config::alignment_grey_scale on the decimate path -- passing one value for
+// both is what made a raw tile map to the wrong source tile.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size,
-                                f32 r_Mt, int num_threads) {
+                                f32 r_Mt, int num_threads, int guide_tile_size) {
+    if (guide_tile_size <= 0) guide_tile_size = tile_size;
     if (flow.nx <= 0 || flow.ny <= 0 || flow.flow.empty() ||
         raw_h <= 0 || raw_w <= 0 || grey_h <= 0 || grey_w <= 0 ||
         tile_size <= 0)
@@ -1286,11 +1294,11 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     for (int ty = 0; ty < raw_ny; ++ty) {
         const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
         const int gy = std::max(0, std::min(flow.ny - 1,
-            (int)std::floor((raw_cy / sy) / (f32)tile_size)));
+            (int)std::floor((raw_cy / sy) / (f32)guide_tile_size)));
         for (int tx = 0; tx < raw_nx; ++tx) {
             const f32 raw_cx = ((f32)tx + 0.5f) * (f32)tile_size;
             const int gx = std::max(0, std::min(flow.nx - 1,
-                (int)std::floor((raw_cx / sx) / (f32)tile_size)));
+                (int)std::floor((raw_cx / sx) / (f32)guide_tile_size)));
             out.dx(ty, tx) = flow.dx(gy, gx) * sx;
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
             if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx)
@@ -1363,7 +1371,7 @@ FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
     });
 
     return flow_to_raw_tile_grid(flow_guide, raw_h, raw_w, guide_h, guide_w,
-                                 tile_size, r_Mt, num_threads);
+                                 tile_size, r_Mt, num_threads, tile_size);
 }
 
 } // namespace hhsr

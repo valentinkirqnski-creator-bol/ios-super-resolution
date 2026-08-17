@@ -1350,7 +1350,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // is full resolution, so the FFT path is unaffected.
             flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                          comp_grey.h, comp_grey.w, tile_size,
-                                         work.r_Mt, work.num_threads);
+                                         work.r_Mt, work.num_threads,
+                                         work.grey_tile_size(tile_size));
         }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");

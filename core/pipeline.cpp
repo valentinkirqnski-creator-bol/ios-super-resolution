@@ -109,7 +109,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         // assert). No-op for the full-resolution FFT grey.
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                      comp_grey.h, comp_grey.w, tile_size,
-                                     work.r_Mt, work.num_threads);
+                                     work.r_Mt, work.num_threads,
+                                     work.grey_tile_size(tile_size));
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -186,7 +187,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
                                         comp_grey.h, comp_grey.w, tile_size,
-                                        work.r_Mt, work.num_threads);
+                                        work.r_Mt, work.num_threads,
+                                        work.grey_tile_size(tile_size));
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {
