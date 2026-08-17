@@ -1540,10 +1540,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
         g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
-        const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch)
-                                       : cfg.noise_alpha_robustness();
-        const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch)
-                                       : cfg.noise_beta_robustness();
+        const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch(ch) : cfg.noise_alpha();
+        const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch(ch) : cfg.noise_beta();
         if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b) curves_stale = true;
     }
     if (curves_stale) {
@@ -1565,10 +1563,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
             }
             std::copy(std_curve.begin(), std_curve.end(), std_all.begin() + (size_t)ch * n);
             std::copy(diff_curve.begin(), diff_curve.end(), diff_all.begin() + (size_t)ch * n);
-            g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch)
-                                                     : cfg.noise_alpha_robustness();
-            g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch)
-                                                    : cfg.noise_beta_robustness();
+            g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch(ch) : cfg.noise_alpha();
+            g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch(ch) : cfg.noise_beta();
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
