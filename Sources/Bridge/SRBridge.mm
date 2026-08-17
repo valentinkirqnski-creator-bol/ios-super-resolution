@@ -415,6 +415,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.chain_consistency_enabled = tuning[@"chain_consistency_enabled"].boolValue;
     if (tuning[@"robustness_min_pool_radius"])
         cfg.robustness_min_pool_radius = tuning[@"robustness_min_pool_radius"].intValue;
+    if (tuning[@"align_ambiguous_fallback_enabled"])
+        cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

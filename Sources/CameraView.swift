@@ -740,6 +740,19 @@ struct CameraView: View {
              one case -- raise to A/B against the default.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Ambiguous-Match Fallback", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
+        Text("""
+             ImageStackAlignator's "no reasonable peak -> fall back": when a block match at \
+             any pyramid level is ambiguous (near-tied best/second-best cost), keeps that \
+             tile's flow at whatever the coarser level already gave it instead of trusting a \
+             match that isn't distinguishable from noise. Targets flat/self-similar regions \
+             where an always-applied match is locally erratic yet still looks plausible after \
+             warping, so the robustness mask never catches it. Changes what flow gets \
+             computed for every ambiguous tile at every level -- bigger blast radius than the \
+             other experimental toggles here. Experimental -- not yet validated against real \
+             bursts on-device.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body

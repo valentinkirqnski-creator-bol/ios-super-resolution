@@ -521,6 +521,7 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                                          int tile_size, int search_radius,
                                          FlowField& flow, bool l1,
                                          f32 ambiguity_ratio, bool write_ambiguity,
+                                         bool fallback_on_ambiguous,
                                          int num_threads) {
     const int ny = flow.ny, nx = flow.nx;
     const int ts = tile_size;
@@ -588,11 +589,26 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                     }
                 }
             }
-            flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
-            flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+            // ImageStackAlignator's "no reasonable peak -> fall back" --
+            // see Config::align_ambiguous_fallback_enabled. Computed
+            // whenever either consumer wants it: write_ambiguity persists
+            // the flag for downstream robustness demotion, fallback_on_
+            // ambiguous uses it here to decide whether to trust this
+            // level's match at all.
+            const bool ambiguous_here = (write_ambiguity || fallback_on_ambiguous) &&
+                match_is_ambiguous(min_dist, second_dist, ambiguity_ratio) != 0u;
+            if (fallback_on_ambiguous && ambiguous_here) {
+                // Leave the seed as-is: the coarser level's estimate, or at
+                // the coarsest level, the global/thumbnail pre-alignment
+                // initial flow.
+                flow.dx(ty, tx) = local_fx;
+                flow.dy(ty, tx) = local_fy;
+            } else {
+                flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
+                flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+            }
             if (write_ambiguity)
-                flow.ambiguous(ty, tx) |=
-                    match_is_ambiguous(min_dist, second_dist, ambiguity_ratio);
+                flow.ambiguous(ty, tx) |= ambiguous_here ? 1u : 0u;
         }
     });
 }
@@ -603,16 +619,19 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                                   int num_threads) {
     const bool write_ambiguity = cfg.flow_reject_ambiguous_enabled;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
+    const bool fallback_on_ambiguous = cfg.align_ambiguous_fallback_enabled;
 #ifdef __APPLE__
     // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
         if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow,
-                                       ambiguity_ratio, write_ambiguity))
+                                       ambiguity_ratio, write_ambiguity,
+                                       fallback_on_ambiguous))
             return;
     }
 #endif
     block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
-                                 false, ambiguity_ratio, write_ambiguity, num_threads);
+                                 false, ambiguity_ratio, write_ambiguity,
+                                 fallback_on_ambiguous, num_threads);
 }
 
 // ============================================================================
@@ -624,14 +643,17 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                                   int num_threads) {
     const bool write_ambiguity = cfg.flow_reject_ambiguous_enabled;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
+    const bool fallback_on_ambiguous = cfg.align_ambiguous_fallback_enabled;
 #ifdef __APPLE__
     if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&
         block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow,
-                                   ambiguity_ratio, write_ambiguity))
+                                   ambiguity_ratio, write_ambiguity,
+                                   fallback_on_ambiguous))
         return;
 #endif
     block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
-                                 true, ambiguity_ratio, write_ambiguity, num_threads);
+                                 true, ambiguity_ratio, write_ambiguity,
+                                 fallback_on_ambiguous, num_threads);
     return;
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
@@ -1438,9 +1460,15 @@ std::vector<uint32_t> compute_chain_closure(const Image& prev_guide, const Image
 
     // Same ambiguity ratio clamped_ambiguity_ratio() falls back to -- this
     // corroboration match has no Config of its own to read one from.
+    // fallback_on_ambiguous=false: this probe wants the raw best-effort
+    // match to compare against the prediction, not align.cpp's own
+    // seed-preserving fallback -- an ambiguous read is handled by this
+    // function's own caller-side check instead (see the ambiguous flag read
+    // below).
     block_match_level_direct_460(prev_grey, cur_grey, guide_ts, guide_radius, probe,
                                  /*l1=*/true, /*ambiguity_ratio=*/1.10f,
-                                 /*write_ambiguity=*/true, num_threads);
+                                 /*write_ambiguity=*/true,
+                                 /*fallback_on_ambiguous=*/false, num_threads);
 
     out.assign((size_t)ny * nx, 0u);
     const f32 th_sq = closure_threshold_px * closure_threshold_px;

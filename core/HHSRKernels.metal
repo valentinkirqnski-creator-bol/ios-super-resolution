@@ -460,7 +460,9 @@ struct AlignLocalSearch460Params {
     uint l1;
     float ambiguity_ratio;
     uint write_ambiguity;
-    uint _pad0;
+    // ImageStackAlignator's "no reasonable peak -> fall back" (was _pad0).
+    // See Config::align_ambiguous_fallback_enabled in types.h.
+    uint fallback_on_ambiguous;
 };
 
 // One threadgroup per tile; threads split the candidate shifts.
@@ -623,16 +625,28 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
             sdy = row - R;
             sdx = (c - row * span) - R;
         }
-        flow[tile_id * 2u + 0u] = local_fx + float(sdx);
-        flow[tile_id * 2u + 1u] = local_fy + float(sdy);
-        if (p.write_ambiguity != 0u) {
+        // ImageStackAlignator's "no reasonable peak -> fall back" (see
+        // Config::align_ambiguous_fallback_enabled). Computed whenever
+        // either consumer wants it -- red_dist[0]/red_second_dist[0] are
+        // already available from the reduction above regardless of
+        // write_ambiguity, so this costs nothing extra to test.
+        bool ambiguous_here = false;
+        if (c != kNone && (p.write_ambiguity != 0u || p.fallback_on_ambiguous != 0u)) {
             const float b = max(red_dist[0], 0.f);
             const float s = max(red_second_dist[0], 0.f);
             const float denom = max(b, 1.0e-12f);
-            ambiguity[tile_id] |=
-                (isfinite(b) && isfinite(s) && (s / denom) < p.ambiguity_ratio)
-                    ? 1u : 0u;
+            ambiguous_here = isfinite(b) && isfinite(s) && (s / denom) < p.ambiguity_ratio;
         }
+        if (p.fallback_on_ambiguous != 0u && ambiguous_here) {
+            // Leave the seed as-is: the coarser level's estimate, or at the
+            // coarsest level, the global/thumbnail pre-alignment initial flow.
+            sdx = 0;
+            sdy = 0;
+        }
+        flow[tile_id * 2u + 0u] = local_fx + float(sdx);
+        flow[tile_id * 2u + 1u] = local_fy + float(sdy);
+        if (p.write_ambiguity != 0u)
+            ambiguity[tile_id] |= ambiguous_here ? 1u : 0u;
     }
 }
 

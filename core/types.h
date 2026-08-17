@@ -571,6 +571,36 @@ struct Config {
     // the Metal mirror against -- it is validated only by GitHub Actions CI on
     // push. Turn on to A/B against the classical r_Mt-only mask.
     bool  chain_consistency_enabled = false;
+
+    // ImageStackAlignator (kunzmi): "if patch tracking doesn't find a
+    // reasonable peak to determine the shift, it falls back to zero shift...
+    // either the shift from the previous level is unchanged or the shift
+    // from global pre-alignment is used as last fallback." When a tile's
+    // block match at any pyramid level is ambiguous (near-tied best/second-
+    // best cost -- the existing flow_reject_1d_ambiguity_ratio test), this
+    // discards the found offset and leaves that tile's flow at whatever the
+    // coarser level (or, at the coarsest level, the global/thumbnail
+    // pre-alignment seed) already gave it, instead of applying a match that
+    // isn't distinguishable from noise.
+    //
+    // Targets a specific failure this session characterized: in a flat or
+    // self-similar region with no reliable signal at any pyramid scale, an
+    // always-applied match is essentially arbitrary -- locally erratic
+    // tile-to-tile (huge M) yet visually plausible after warping (low d^2,
+    // since the content has no real texture to reveal the error), so the
+    // robustness mask never catches it. Falling back to the seed instead
+    // keeps that tile smooth and consistent with its neighbours (usually the
+    // rotation-aware global initial estimate from make_global_initial_flow),
+    // fixing the flow itself rather than only vetoing its contribution
+    // downstream the way chain_consistency_enabled or a magnitude check on M
+    // would.
+    //
+    // Off by default: this changes what flow vector gets computed for every
+    // ambiguous tile at every pyramid level, on both CPU and Metal block
+    // matching (L1 and L2) -- a bigger-blast-radius change than the
+    // downstream-only toggles above, and unverified on-device (no local Mac,
+    // only GitHub Actions CI on push).
+    bool  align_ambiguous_fallback_enabled = false;
     // Raw-pixel closure-error magnitude above which a tile is flagged. Below
     // this, the two independent measurements are considered to agree.
     float chain_closure_threshold_px = 6.0f;
