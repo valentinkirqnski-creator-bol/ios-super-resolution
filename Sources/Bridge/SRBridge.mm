@@ -411,6 +411,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
     if (tuning[@"use_neural_flow"])
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
+    if (tuning[@"robustness_raw_resolution_enabled"])
+        cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

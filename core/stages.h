@@ -89,7 +89,14 @@ struct RefStats {
     Image means;
     Image stds;
     Image hf_loss;   // 1-channel high-frequency variance-loss map
-}; // guide resolution [h/2, w/2, ch] for Bayer
+    // Dodgson-quadratic upscale of means/stds to raw resolution (Algorithm
+    // 6's literal R <- Zeros(H,W) path -- see Config::
+    // robustness_raw_resolution_enabled). Computed once per burst here
+    // rather than once per comparison frame, since the reference doesn't
+    // change. Empty unless that toggle is on.
+    Image means_hires;
+    Image stds_hires;
+}; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer

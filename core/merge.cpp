@@ -179,8 +179,19 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 flowx = flow.dx(py, px);
             const f32 flowy = flow.dy(py, px);
 
-            const f32 rob_y = cfg.bayer_mode ? (lr_y - 0.5f) / 2.f : lr_y;
-            const f32 rob_x = cfg.bayer_mode ? (lr_x - 0.5f) / 2.f : lr_x;
+            // Which coordinate space R lives in is decided by R's ACTUAL
+            // dimensions, not Config::robustness_raw_resolution_active():
+            // the raw-resolution path returns an empty image when the hires
+            // ref stats are missing and silently falls through to the
+            // guide-resolution path, so the flag can say "raw" while the mask
+            // handed to us is guide. Trusting the flag there would sample R
+            // at half the correct position everywhere.
+            const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
+            f32 rob_y = lr_y, rob_x = lr_x;
+            if (!rob_is_raw && cfg.bayer_mode) {
+                rob_y = (lr_y - 0.5f) / 2.f;
+                rob_x = (lr_x - 0.5f) / 2.f;
+            }
             const f32 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
 
             const f32 lr_mov_x = lr_x + flowx;
@@ -266,7 +277,12 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 // (high clamp only — no max(0,·))
                 f32 acc_y = coarse_y;
                 f32 acc_x = coarse_x;
-                if (cfg.bayer_mode) {
+                // acc_rob inherits whatever resolution the per-frame R had --
+                // read that off its own dimensions rather than the config
+                // flag, same reasoning as accumulate_comp's rob_is_raw above.
+                const bool acc_is_raw =
+                    (acc_rob->h == lr_h && acc_rob->w == lr_w);
+                if (!acc_is_raw && cfg.bayer_mode) {
                     acc_y = (coarse_y - 0.5f) / 2.f;
                     acc_x = (coarse_x - 0.5f) / 2.f;
                 }

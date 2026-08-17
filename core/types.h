@@ -526,6 +526,42 @@ struct Config {
     // that rotates by more than ~1 degree pushes the whole frame onto the
     // strict prior s1 regardless of whether any tile is actually misaligned.
     float r_Mt = 0.8f;
+
+    // Algorithm 6 as the IPOL article reads it: R is allocated as
+    // Zeros(H,W) -- RAW resolution -- and gets there by Dodgson-quadratic
+    // upscaling the guide-resolution (H/2,W/2) local statistics, warping
+    // the comparison frame's stats by the flow in the process, THEN
+    // computing d^2/sigma^2/R per raw pixel, and only then applying the
+    // 5x5 local-min (so the min spans 5x5 RAW px, not 5x5 guide px = 10x10
+    // raw). This port has always computed d/sigma/R directly at guide
+    // resolution instead (matching Wronski's own text and the 460-main
+    // reference; the IPOL/python-p reference implements the upscale via
+    // cuda_uspcale_dogson). The upscale itself already existed here
+    // (robustness.cpp's upscale_warp_stats / the Metal rob_dogson kernel)
+    // but was never wired into compute_robustness -- this toggle wires it
+    // in. The statistics stay guide-resolution either way; only where the
+    // ratio is EVALUATED and where the local-min RUNS changes.
+    //
+    // Restricted to grey_method == Decimate: that path's flow field is
+    // already the coarser of the two, so the guide-resolution mask on top
+    // compounds two sources of lost precision; FFT's flow already carries
+    // native raw-tile-grid granularity, so the case for this is weaker
+    // there.
+    //
+    // Off by default: ~4x the pixel count for R and the new upscale
+    // buffers, and merge.cpp's R-sampling coordinate math has to know
+    // which resolution R actually is this run (it reads it off the mask's
+    // own dimensions rather than trusting this flag, because this path
+    // silently falls back to guide resolution when the hires ref stats
+    // are missing).
+    bool robustness_raw_resolution_enabled = false;
+    // True when the raw-resolution path should actually run this call --
+    // single place both conditions live, so robustness.cpp, merge.cpp and
+    // the Metal dispatch code in metal_gpu.mm can't drift out of step on
+    // which one gates it.
+    bool robustness_raw_resolution_active() const {
+        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
+    }
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
     // high. This does not repair flow; it rejects unsafe 1D tiles.

@@ -712,6 +712,11 @@ struct CameraView: View {
              Experimental -- not yet validated against real bursts on-device.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
+        Text("""
+             Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, R is computed there, and              the 5x5 local-min then spans 5x5 RAW pixels as intended -- at guide resolution              the same window is effectively 10x10 raw pixels, which is what makes rejection              regions look oversized and blocky. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body
