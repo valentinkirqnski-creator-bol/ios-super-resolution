@@ -1510,7 +1510,7 @@ struct RobMaskParams {
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint chain_reject_enabled;  // 1 = demote chain-inconsistent tiles (was _pad1)
     float r_s_chain;      // motion prior for chain-inconsistent tiles
-    uint _pad2;
+    uint motion_magnitude_veto_enabled;  // 1 = hard-reject on M veto (was _pad2)
     uint _pad3;
     uint _pad4;
 };
@@ -1842,6 +1842,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device float* s_select [[buffer(14)]],
                           device const uint* match_ambiguous [[buffer(15)]],
                           device const uint* chain_inconsistent [[buffer(16)]],
+                          device const uint* motion_magnitude_reject [[buffer(17)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1977,7 +1978,14 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // closure failure means the flow is corroborated wrong, not suspicious.
     if (p.chain_reject_enabled != 0u && chain_inconsistent[pidx] != 0u)
         s = min(s, p.r_s_chain);
-    bool hard_reject = hf_reject || edge_reject;
+    // Hard magnitude veto on M (Fix A) -- unconditional, unlike the s-clamps
+    // above: M this large is not a plausible local displacement regardless
+    // of why the match went wrong or how good d^2 looks. See
+    // RobMaskParamsCPU / Config::motion_magnitude_veto_enabled.
+    bool motion_magnitude_reject_tile =
+        p.motion_magnitude_veto_enabled != 0u &&
+        motion_magnitude_reject[pidx] != 0u;
+    bool hard_reject = hf_reject || edge_reject || motion_magnitude_reject_tile;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);

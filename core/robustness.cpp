@@ -1064,7 +1064,17 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 pidx < flow.chain_inconsistent.size() &&
                 flow.chain_inconsistent[pidx] != 0u;
             if (chain_inconsistent) s = std::min(s, cfg.r_s_chain);
-            const bool hard_reject = hf_reject || edge_reject;
+            // Hard magnitude veto on M (Fix A) -- unconditional, unlike the
+            // s-clamps above: M this large is not a plausible local
+            // displacement regardless of why the match went wrong, and
+            // regardless of how good d^2 looks (the whole point -- see
+            // Config::motion_magnitude_veto_enabled). Grouped with
+            // hf_reject/edge_reject, the mask's other unconditional zeros.
+            const bool motion_magnitude_reject =
+                cfg.motion_magnitude_veto_enabled &&
+                pidx < flow.motion_magnitude_reject.size() &&
+                flow.motion_magnitude_reject[pidx] != 0u;
+            const bool hard_reject = hf_reject || edge_reject || motion_magnitude_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);

@@ -175,6 +175,14 @@ struct TuningParams: Equatable, Codable {
     /// tile at every level, on both CPU and Metal -- bigger blast radius
     /// than the downstream-only toggles above, unverified on-device.
     var align_ambiguous_fallback_enabled: Bool = false
+    /// Hard magnitude veto on M (Fix A): reject a tile's contribution
+    /// outright when M exceeds motion_magnitude_veto_px, regardless of why
+    /// the flow went wrong or how good the pixel residual looks. Doesn't
+    /// depend on diagnosing a specific failure mechanism the way the two
+    /// toggles above do. Off by default -- unverified on-device, and a wrong
+    /// threshold could clip real, large single-frame parallax.
+    var motion_magnitude_veto_enabled: Bool = false
+    var motion_magnitude_veto_px: Float = 150.0
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -229,6 +237,7 @@ struct TuningParams: Equatable, Codable {
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
         case align_ica_per_level_fft, use_neural_flow, chain_consistency_enabled
         case robustness_min_pool_radius, align_ambiguous_fallback_enabled
+        case motion_magnitude_veto_enabled, motion_magnitude_veto_px
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -301,6 +310,8 @@ struct TuningParams: Equatable, Codable {
         chain_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .chain_consistency_enabled) ?? chain_consistency_enabled
         robustness_min_pool_radius = try c.decodeIfPresent(Int.self, forKey: .robustness_min_pool_radius) ?? robustness_min_pool_radius
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
+        motion_magnitude_veto_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_magnitude_veto_enabled) ?? motion_magnitude_veto_enabled
+        motion_magnitude_veto_px = try c.decodeIfPresent(Float.self, forKey: .motion_magnitude_veto_px) ?? motion_magnitude_veto_px
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1916,6 +1927,8 @@ final class CameraModel: NSObject, ObservableObject {
             "chain_consistency_enabled": NSNumber(value: tuningParams.chain_consistency_enabled),
             "robustness_min_pool_radius": NSNumber(value: tuningParams.robustness_min_pool_radius),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
+            "motion_magnitude_veto_enabled": NSNumber(value: tuningParams.motion_magnitude_veto_enabled),
+            "motion_magnitude_veto_px": NSNumber(value: tuningParams.motion_magnitude_veto_px),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)

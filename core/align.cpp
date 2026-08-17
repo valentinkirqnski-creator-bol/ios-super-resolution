@@ -286,6 +286,14 @@ static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
         compute_motion_irregular(flow, cfg.r_Mt, 1.f, 1.f, cfg.num_threads);
 }
 
+// Same measurement, second and much larger threshold -- see
+// Config::motion_magnitude_veto_enabled and FlowField::motion_magnitude_reject.
+static void mark_motion_magnitude_reject_tiles(FlowField& flow, const Config& cfg) {
+    flow.motion_magnitude_reject =
+        compute_motion_irregular(flow, cfg.motion_magnitude_veto_px, 1.f, 1.f,
+                                 cfg.num_threads);
+}
+
 static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
                                         const Config& cfg) {
     const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
@@ -1135,6 +1143,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
             }
             mark_motion_irregular_tiles(flow_gpu, cfg);
+            mark_motion_magnitude_reject_tiles(flow_gpu, cfg);
             return flow_gpu;
         }
     }
@@ -1259,6 +1268,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     }
     mark_aperture_limited_tiles(flow, mark_hess, cfg);
     mark_motion_irregular_tiles(flow, cfg);
+    mark_motion_magnitude_reject_tiles(flow, cfg);
     return flow;
 }
 
@@ -1280,7 +1290,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 // FFT path is unaffected.
 FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 int grey_h, int grey_w, int tile_size,
-                                f32 r_Mt, int num_threads) {
+                                f32 r_Mt, f32 motion_magnitude_veto_px,
+                                int num_threads) {
     if (flow.nx <= 0 || flow.ny <= 0 || flow.flow.empty() ||
         raw_h <= 0 || raw_w <= 0 || grey_h <= 0 || grey_w <= 0 ||
         tile_size <= 0)
@@ -1305,6 +1316,16 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
         src_irregular = compute_motion_irregular(flow, r_Mt, sx, sy, num_threads);
     const bool carry_motion = src_irregular.size() == (size_t)flow.ny * flow.nx;
     if (carry_motion) out.motion_irregular.assign((size_t)raw_ny * raw_nx, 0u);
+    // Same re-measurement, second threshold -- see
+    // Config::motion_magnitude_veto_enabled.
+    std::vector<uint32_t> src_magnitude_reject;
+    if (flow.has_motion_magnitude_prior())
+        src_magnitude_reject = compute_motion_irregular(flow, motion_magnitude_veto_px,
+                                                        sx, sy, num_threads);
+    const bool carry_magnitude =
+        src_magnitude_reject.size() == (size_t)flow.ny * flow.nx;
+    if (carry_magnitude)
+        out.motion_magnitude_reject.assign((size_t)raw_ny * raw_nx, 0u);
     for (int ty = 0; ty < raw_ny; ++ty) {
         const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
         const int gy = std::max(0, std::min(flow.ny - 1,
@@ -1321,6 +1342,9 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 out.ambiguous(ty, tx) = flow.ambiguous(gy, gx);
             if (carry_motion)
                 out.irregular(ty, tx) = src_irregular[(size_t)gy * flow.nx + gx];
+            if (carry_magnitude)
+                out.motion_magnitude_reject[(size_t)ty * raw_nx + tx] =
+                    src_magnitude_reject[(size_t)gy * flow.nx + gx];
         }
     }
     return out;
@@ -1346,7 +1370,8 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
 // as any other flow source that doesn't pre-measure it.
 FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
                                 int raw_h, int raw_w, int tile_size,
-                                f32 r_Mt, int num_threads) {
+                                f32 r_Mt, f32 motion_magnitude_veto_px,
+                                int num_threads) {
     if (!dense_flow || guide_h <= 0 || guide_w <= 0 || raw_h <= 0 || raw_w <= 0 || tile_size <= 0)
         return FlowField();
 
@@ -1385,7 +1410,8 @@ FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
     });
 
     return flow_to_raw_tile_grid(flow_guide, raw_h, raw_w, guide_h, guide_w,
-                                 tile_size, r_Mt, num_threads);
+                                 tile_size, r_Mt, motion_magnitude_veto_px,
+                                 num_threads);
 }
 
 // Redundant frame-to-previous-frame corroboration of this frame's own

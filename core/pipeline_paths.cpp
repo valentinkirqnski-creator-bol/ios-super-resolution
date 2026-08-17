@@ -1342,7 +1342,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 flow = flow_from_dense_guide(dense_flow.data(),
                                              ref_guide_neural.h, ref_guide_neural.w,
                                              comp.h, comp.w, tile_size,
-                                             work.r_Mt, work.num_threads);
+                                             work.r_Mt, work.motion_magnitude_veto_px,
+                                             work.num_threads);
                 used_neural_flow = true;
             }
         }
@@ -1360,7 +1361,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // is full resolution, so the FFT path is unaffected.
             flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                          comp_grey.h, comp_grey.w, tile_size,
-                                         work.r_Mt, work.num_threads);
+                                         work.r_Mt, work.motion_magnitude_veto_px,
+                                         work.num_threads);
         }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");

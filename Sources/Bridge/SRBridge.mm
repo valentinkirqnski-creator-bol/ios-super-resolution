@@ -417,6 +417,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_min_pool_radius = tuning[@"robustness_min_pool_radius"].intValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
+    if (tuning[@"motion_magnitude_veto_enabled"])
+        cfg.motion_magnitude_veto_enabled = tuning[@"motion_magnitude_veto_enabled"].boolValue;
+    if (tuning[@"motion_magnitude_veto_px"])
+        cfg.motion_magnitude_veto_px = tuning[@"motion_magnitude_veto_px"].floatValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

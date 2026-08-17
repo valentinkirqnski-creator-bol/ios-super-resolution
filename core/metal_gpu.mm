@@ -1136,7 +1136,7 @@ struct RobMaskParamsCPU {
     uint32_t ambiguous_enabled = 0;  // 1 = demote tiles with an ambiguous match
     uint32_t chain_reject_enabled = 0;  // 1 = demote chain-inconsistent tiles (was _pad1)
     float r_s_chain = 0.f;  // motion prior for chain-inconsistent tiles
-    uint32_t _pad2 = 0;
+    uint32_t motion_magnitude_veto_enabled = 0;  // 1 = hard-reject on M veto (was _pad2)
     uint32_t _pad3 = 0;
     uint32_t _pad4 = 0;
 };
@@ -1619,6 +1619,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         : b_motion;
     if (!b_chain) return Image();
 
+    const bool magnitude_veto_on = cfg.motion_magnitude_veto_enabled &&
+                                   flow.motion_magnitude_reject.size() == n_tiles;
+    mp.motion_magnitude_veto_enabled = magnitude_veto_on ? 1u : 0u;
+    id<MTLBuffer> b_magnitude = magnitude_veto_on
+        ? buf(flow.motion_magnitude_reject.data(),
+              flow.motion_magnitude_reject.size() * sizeof(uint32_t))
+        : b_motion;
+    if (!b_magnitude) return Image();
+
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     if (aperture_reject_on) {
@@ -1652,6 +1661,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_s_select offset:0 atIndex:14];
     [enc setBuffer:b_match_amb offset:0 atIndex:15];
     [enc setBuffer:b_chain offset:0 atIndex:16];
+    [enc setBuffer:b_magnitude offset:0 atIndex:17];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

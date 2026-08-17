@@ -753,6 +753,23 @@ struct CameraView: View {
              bursts on-device.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Motion Magnitude Veto", isOn: $cam.tuningParams.motion_magnitude_veto_enabled)
+        HStack {
+            Text("Veto Threshold (px)")
+            Spacer()
+            Text("\(Int(cam.tuningParams.motion_magnitude_veto_px))")
+        }
+        Slider(value: $cam.tuningParams.motion_magnitude_veto_px, in: 50...300, step: 10)
+        Text("""
+             Hard-rejects a tile's contribution outright when M (the same 3x3-neighbourhood \
+             flow span r_Mt measures, against a much larger threshold) exceeds this, \
+             regardless of why the flow went wrong or how good the pixel residual looks. \
+             Doesn't depend on diagnosing a specific failure mechanism the way the two \
+             toggles above do -- targets the catastrophic flat-shadow/foliage clusters \
+             (M~200-300px) directly. Experimental -- not yet validated against real bursts \
+             on-device; a threshold set too low could clip real, large single-frame parallax.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body

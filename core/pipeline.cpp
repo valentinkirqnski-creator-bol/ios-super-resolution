@@ -113,7 +113,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         // assert). No-op for the full-resolution FFT grey.
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
                                      comp_grey.h, comp_grey.w, tile_size,
-                                     work.r_Mt, work.num_threads);
+                                     work.r_Mt, work.motion_magnitude_veto_px,
+                                     work.num_threads);
         if (work.chain_consistency_enabled) {
             Image cur_chain_guide = compute_guide(comp, work);
             if (prev_chain_guide.h > 0 && prev_chain_flow.ny > 0) {
@@ -206,7 +207,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
                                         comp_grey.h, comp_grey.w, tile_size,
-                                        work.r_Mt, work.num_threads);
+                                        work.r_Mt, work.motion_magnitude_veto_px,
+                                        work.num_threads);
         if (work.chain_consistency_enabled) {
             Image cur_chain_guide = compute_guide(burst[k], work);
             if (prev_chain_guide.h > 0 && prev_chain_flow.ny > 0) {

@@ -83,6 +83,22 @@ struct FlowField {
     // opt-in via Config::chain_consistency_enabled).
     std::vector<uint32_t> chain_inconsistent;
 
+    // 1 where M (the same 3x3 raw-span measurement as motion_irregular, but
+    // against Config::motion_magnitude_veto_px -- a far larger threshold
+    // than r_Mt) is big enough that the flow is not a plausible local
+    // displacement under any explanation (rotation, parallax, real motion),
+    // regardless of why the match went wrong. Unlike motion_irregular
+    // (selects the strict s prior) or chain_inconsistent (selects r_s_chain),
+    // this is meant to force a HARD reject (R=0 unconditionally) alongside
+    // hf_reject/edge_reject in robustness.cpp -- see
+    // Config::motion_magnitude_veto_enabled for why a hard veto here doesn't
+    // depend on correctly diagnosing the failure mechanism the way
+    // chain_inconsistent and align_ambiguous_fallback_enabled do.
+    //
+    // Deliberately NOT allocated by the constructor, same reasoning as
+    // motion_irregular: empty means not measured.
+    std::vector<uint32_t> motion_magnitude_reject;
+
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
@@ -95,6 +111,11 @@ struct FlowField {
     }
     inline uint32_t& irregular(int ty, int tx) { return motion_irregular[(size_t)ty * nx + tx]; }
     inline uint32_t irregular(int ty, int tx) const { return motion_irregular[(size_t)ty * nx + tx]; }
+
+    // True when motion_magnitude_reject carries a measurement for this grid.
+    inline bool has_motion_magnitude_prior() const {
+        return motion_magnitude_reject.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
+    }
 
     inline f32& dx(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
@@ -601,6 +622,29 @@ struct Config {
     // downstream-only toggles above, and unverified on-device (no local Mac,
     // only GitHub Actions CI on push).
     bool  align_ambiguous_fallback_enabled = false;
+
+    // Hard magnitude veto on M (Fix A from this session's diagnosis):
+    // unlike chain_consistency_enabled and align_ambiguous_fallback_enabled,
+    // which each target a SPECIFIC guessed failure mechanism (cross-frame
+    // disagreement; an ambiguous match wrongly trusted) and both moved the
+    // needle less than expected on real bursts, this doesn't try to diagnose
+    // why a tile's flow is wrong -- it only looks at the RESULT. M this large
+    // (measured this session: the catastrophic flat-shadow/foliage clusters
+    // sit at M~200-300px raw, two orders of magnitude past the ~8-128px band
+    // legitimate parallax/rotation occupies) is not a plausible local
+    // displacement under any explanation, regardless of mechanism.
+    //
+    // motion_magnitude_veto_px is always measured (cheap: the same 3x3-span
+    // computation motion_irregular already does, just against a second,
+    // much larger threshold) -- only whether it's ACTED on on the robustness
+    // side is gated by this toggle, so turning it on requires no realignment
+    // pass. Off by default: unverified on-device, and a wrong threshold
+    // could clip real, large single-frame parallax as easily as noise.
+    bool  motion_magnitude_veto_enabled = false;
+    // Raw-pixel M threshold for the hard veto. Comfortably above the
+    // measured legitimate parallax/rotation band (8-128px) and far below the
+    // catastrophic clusters (200-300px) -- see motion_magnitude_veto_enabled.
+    float motion_magnitude_veto_px = 150.0f;
     // Raw-pixel closure-error magnitude above which a tile is flagged. Below
     // this, the two independent measurements are considered to agree.
     float chain_closure_threshold_px = 6.0f;
