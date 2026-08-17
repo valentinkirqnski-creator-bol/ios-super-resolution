@@ -333,6 +333,11 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
                          cfg.white_level);
             cfg.debug_string_capture = buf;
         }
+        // Always record which bundled noise curve this frame's ISO selects --
+        // python-p loads its .npy tables unconditionally, so this is not gated
+        // on the pixel4a debug switch. See Config::noise_curve_iso.
+        cfg.noise_curve_iso =
+            round_pixel4a_noise_curve_iso(raw.imgdata.other.iso_speed);
         if (cfg.debug_pixel4a_noise_profile)
             apply_pixel4a_noise_profile(cfg, raw.imgdata.other.iso_speed);
 

@@ -318,19 +318,21 @@ struct Config {
         const int n = cfa.count((uint8_t)c);
         return (n > 0) ? 1.f / (float)n : 1.f;
     }
+    // python-p, super_resolution.py:337-338, verbatim:
+    //     alpha = sum([x[0] for x in tags['Image Tag 0xC761'].values[::2]])/3
+    //     beta  = sum([x[0] for x in tags['Image Tag 0xC761'].values[1::2]])/3
+    // A plain unweighted mean of the DNG NoiseProfile values -- NO white
+    // balance gain and NO guide-quad weighting. This port applied both
+    // (noise_wb_gain / noise_guide_weight above), which is defensible on the
+    // merits -- the profile describes the pre-WB signal, and compute_guide
+    // averages two greens -- but it is a different number than python-p feeds
+    // to the GAT in kernel estimation, so the covariances differ. Parity wins;
+    // the two helpers stay for the per-channel accessors below.
     float noise_alpha() const {
-        float s = 0.f;
-        for (int c = 0; c < 3; ++c)
-            s += alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
-        return s / 3.f;
+        return (alpha_dng[0] + alpha_dng[1] + alpha_dng[2]) / 3.f;
     }
     float noise_beta() const {
-        float s = 0.f;
-        for (int c = 0; c < 3; ++c) {
-            const float g = noise_wb_gain(c);
-            s += beta_dng[c] * g * g * noise_guide_weight(c);
-        }
-        return s / 3.f;
+        return (beta_dng[0] + beta_dng[1] + beta_dng[2]) / 3.f;
     }
     // Per-channel counterparts of the above, undivided by 3 and not summed
     // across channels. compute_robustness's Monte Carlo curve (apply_noise_
@@ -380,6 +382,22 @@ struct Config {
     // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.
     bool  debug_pixel4a_noise_profile = false;
     int   debug_pixel4a_noise_curve_iso = 0;
+    // Frame ISO, already clipped to [100,3200] and log-rounded to a bundled
+    // curve ISO by round_pixel4a_noise_curve_iso. Set unconditionally from the
+    // DNG on load -- NOT a debug field.
+    //
+    // python-p never derives the robustness curves from alpha/beta: process()
+    // (super_resolution.py:347-351) loads data/noise_model_{std,diff}_ISO_N.npy
+    // and leaves the Monte Carlo call commented out:
+    //     std_curve  = np.load(std_noise_model_path)
+    //     diff_curve = np.load(diff_noise_model_path)
+    //     ## Use this to compute noise curves on the fly
+    //     # std_curve, diff_curve = run_fast_MC(alpha, beta)
+    // Those .npy tables are bit-identical to the bundled kStdCurves/kDiffCurves
+    // in pixel4a_noise_curves.h (verified value-by-value at ISO 100), so
+    // selecting by this ISO reproduces python-p exactly, while alpha/beta stay
+    // free to come from the actual DNG for the GAT.
+    int   noise_curve_iso = 100;
 
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
@@ -904,12 +922,22 @@ struct Config {
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// python-p: utils_dng.load_dng_burst clips ISO to [100, 3200] BEFORE anything
+// sees it, then utils.round_iso maps it to the nearest power-of-two multiple of
+// 100 in LOG space:
+//     ISO = max(100, min(3200, ISO))
+//     round_iso(iso) = 100 * 2 ** round(log2(iso / 100))
+// The floor is therefore 100, never 50 -- data/ ships ISO 100..3200 only, so a
+// 50 here would select a curve python-p cannot pick. (This port bundles an
+// extra ISO-50 table; it stays available for non-parity callers but is now
+// unreachable from the clamp below, matching python-p's candidate set.)
 inline int round_pixel4a_noise_curve_iso(f32 iso) {
     if (!std::isfinite(iso) || iso <= 0.f)
         iso = 100.f;
+    iso = clampf(iso, 100.f, 3200.f);
     const double n = std::round(std::log2((double)iso / 100.0));
     int rounded = (int)std::lround(100.0 * std::pow(2.0, n));
-    if (rounded < 50) rounded = 50;
+    if (rounded < 100) rounded = 100;
     if (rounded > 3200) rounded = 3200;
     return rounded;
 }

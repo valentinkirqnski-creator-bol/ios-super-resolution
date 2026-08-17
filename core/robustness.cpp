@@ -340,23 +340,32 @@ static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
 }
 
 static const NoiseCurves& make_noise_curves(const Config& cfg) {
-    if (cfg.debug_pixel4a_noise_profile) {
-        static NoiseCurves cached_pixel4a;
+    // python-p ALWAYS loads its bundled tables for the robustness curves --
+    // process() (super_resolution.py:347-348) does np.load on
+    // data/noise_model_{std,diff}_ISO_N.npy and the run_fast_MC call right
+    // below it is commented out. So this is the default path, not a debug one.
+    // The Monte Carlo builder below is kept for the debug_noise_model_disabled
+    // case and for callers that pass explicit alpha/beta.
+    if (!cfg.debug_noise_model_disabled) {
+        static NoiseCurves cached_bundled;
         static int cached_iso = 0;
-        int iso = cfg.debug_pixel4a_noise_curve_iso > 0
-            ? cfg.debug_pixel4a_noise_curve_iso
-            : 100;
+        int iso = cfg.debug_pixel4a_noise_profile &&
+                          cfg.debug_pixel4a_noise_curve_iso > 0
+                      ? cfg.debug_pixel4a_noise_curve_iso
+                      : cfg.noise_curve_iso;
+        if (iso <= 0) iso = 100;
         iso = closest_pixel4a_curve_iso(iso);
-        if (!cached_pixel4a.std_curve.empty() && cached_iso == iso)
-            return cached_pixel4a;
+        if (!cached_bundled.std_curve.empty() && cached_iso == iso)
+            return cached_bundled;
 
         NoiseCurves nc;
         if (load_bundled_pixel4a_noise_curves(iso, nc)) {
-            cached_pixel4a = std::move(nc);
+            cached_bundled = std::move(nc);
             cached_iso = iso;
-            std::printf("[noise] Loaded bundled Pixel 4a ISO %d curves (%d bins)\n",
-                        iso, pixel4a_noise::kBins);
-            return cached_pixel4a;
+            std::printf("[noise] Loaded bundled ISO %d curves (%d bins) "
+                        "-- python-p data/noise_model_*_ISO_%d.npy\n",
+                        iso, pixel4a_noise::kBins, iso);
+            return cached_bundled;
         }
     }
     return make_noise_curves(cfg.noise_alpha_robustness(), cfg.noise_beta_robustness());
