@@ -179,11 +179,18 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const f32 flowx = flow.dx(py, px);
             const f32 flowy = flow.dy(py, px);
 
-            // Config::robustness_raw_resolution_active: robustness is raw
-            // resolution this run (same coordinate space as lr_y/lr_x
-            // already), not guide -- skip the guide-scale conversion.
+            // Which coordinate space R lives in is decided by R's ACTUAL
+            // dimensions, not by Config::robustness_raw_resolution_active.
+            // The two can disagree: compute_robustness's raw-resolution path
+            // returns an empty image on a shape mismatch or on missing hires
+            // ref stats, and falls through to the guide-resolution path -- so
+            // the flag can say "raw" while the mask handed to us is guide.
+            // Trusting the flag there samples R at half the correct position,
+            // silently pairing every pixel with a robustness value from
+            // somewhere else in the frame.
+            const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
             f32 rob_y = lr_y, rob_x = lr_x;
-            if (!cfg.robustness_raw_resolution_active() && cfg.bayer_mode) {
+            if (!rob_is_raw && cfg.bayer_mode) {
                 rob_y = (lr_y - 0.5f) / 2.f;
                 rob_x = (lr_x - 0.5f) / 2.f;
             }
@@ -272,10 +279,12 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 // (high clamp only — no max(0,·))
                 f32 acc_y = coarse_y;
                 f32 acc_x = coarse_x;
-                // acc_rob inherits whatever resolution the per-frame R had --
-                // raw when Config::robustness_raw_resolution_active, same as
-                // accumulate_comp's rob_y/rob_x above.
-                if (!cfg.robustness_raw_resolution_active() && cfg.bayer_mode) {
+                // acc_rob inherits whatever resolution the per-frame R had, so
+                // read that off its own dimensions rather than the config flag
+                // -- see the matching note in accumulate_comp.
+                const bool acc_is_raw =
+                    (acc_rob->h == lr_h && acc_rob->w == lr_w);
+                if (!acc_is_raw && cfg.bayer_mode) {
                     acc_y = (coarse_y - 0.5f) / 2.f;
                     acc_x = (coarse_x - 0.5f) / 2.f;
                 }

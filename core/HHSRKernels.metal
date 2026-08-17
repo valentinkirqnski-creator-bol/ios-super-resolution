@@ -1034,7 +1034,10 @@ static inline void merge_comp_contrib(device const float* img,
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
     // (merge.cpp) for the mirrored fix.
     float rob_y = lr_y, rob_x = lr_x;
-    if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+    // Decide from R's ACTUAL dimensions, not p.raw_res_robustness: the
+    // raw-resolution path can silently fall back to guide resolution while the
+    // flag still says raw. See accumulate_comp in merge.cpp.
+    if (!(p.rob_h == p.lr_h && p.rob_w == p.lr_w) && p.bayer != 0u) {
         rob_y = (lr_y - 0.5f) / 2.f;
         rob_x = (lr_x - 0.5f) / 2.f;
     }
@@ -1207,7 +1210,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
     if (p.robustness_denoise) {
         // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
         float acc_y = coarse_y, acc_x = coarse_x;
-        if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+        if (!(p.acc_h == p.lr_h && p.acc_w == p.lr_w) && p.bayer != 0u) {
             acc_y = (coarse_y - 0.5f) / 2.f;
             acc_x = (coarse_x - 0.5f) / 2.f;
         }

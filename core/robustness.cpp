@@ -1355,7 +1355,15 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
-    return local_min_pool(R, cfg.robustness_min_pool_radius);
+    // Algorithm 9's window is defined on R, and python-p's R is at RAW
+    // resolution (local_min is called on the Dodgson-upscaled d_sq/sigma_sq),
+    // so its 5x5 spans 5x5 RAW pixels. This path's R is at GUIDE resolution,
+    // where the same radius would span 10x10 raw pixels -- twice the physical
+    // reach, eroding twice as much accepted area around every rejection.
+    // Halve it so both paths pool the same real-world area.
+    const int guide_radius =
+        std::max(1, (int)std::lround(cfg.robustness_min_pool_radius * 0.5f));
+    return local_min_pool(R, guide_radius);
 #endif
 }
 
