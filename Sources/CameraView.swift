@@ -770,6 +770,17 @@ struct CameraView: View {
              on-device; a threshold set too low could clip real, large single-frame parallax.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Disable Noise Model (Robustness)", isOn: $cam.tuningParams.debug_noise_model_disabled)
+        Text("""
+             Debug: zeroes the noise model as read by the robustness mask ONLY -- merge \
+             sharpening (kernel estimation) and SNR auto-tuning keep using the real value, so \
+             this can't quietly change anything else while investigating the mask. With it \
+             on, R is scored from the raw measured local variance and the raw (unshrunk) \
+             pixel difference, isolating whether a tile's colour difference reads small \
+             because the noise model forgave it, or because the content genuinely is that \
+             flat/self-similar. Diagnostic only -- leave off for normal use.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body

@@ -421,6 +421,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_magnitude_veto_enabled = tuning[@"motion_magnitude_veto_enabled"].boolValue;
     if (tuning[@"motion_magnitude_veto_px"])
         cfg.motion_magnitude_veto_px = tuning[@"motion_magnitude_veto_px"].floatValue;
+    if (tuning[@"debug_noise_model_disabled"])
+        cfg.debug_noise_model_disabled = tuning[@"debug_noise_model_disabled"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

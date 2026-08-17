@@ -351,6 +351,30 @@ struct Config {
         const float g = noise_wb_gain(c);
         return beta_dng[c] * g * g * noise_guide_weight(c);
     }
+    // Debug: zero the noise model as read by the robustness mask ONLY --
+    // kernel estimation (kernels.cpp apply_gat) and SNR auto-tuning keep
+    // reading the real noise_alpha()/noise_beta() untouched, so this can't
+    // quietly change merge sharpening while investigating the mask. With it
+    // on, apply_noise_model's sigma_t and d_t both collapse to 0 for every
+    // brightness bin, so sigma_sq_ = max(measured_variance, 0) and shrink =
+    // d_p_sq/(d_p_sq+0) = 1 -- i.e. R is scored from the RAW measured local
+    // variance and the RAW (unshrunk) pixel difference, isolating whether a
+    // tile's d^2 reads small because the noise model forgave it or because
+    // the content genuinely is that flat/self-similar. See the four
+    // *_robustness() accessors below, which are the only things this gates.
+    bool debug_noise_model_disabled = false;
+    float noise_alpha_robustness() const {
+        return debug_noise_model_disabled ? 0.f : noise_alpha();
+    }
+    float noise_beta_robustness() const {
+        return debug_noise_model_disabled ? 0.f : noise_beta();
+    }
+    float noise_alpha_ch_robustness(int c) const {
+        return debug_noise_model_disabled ? 0.f : noise_alpha_ch(c);
+    }
+    float noise_beta_ch_robustness(int c) const {
+        return debug_noise_model_disabled ? 0.f : noise_beta_ch(c);
+    }
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
     // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.

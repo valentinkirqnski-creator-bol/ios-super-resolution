@@ -359,7 +359,7 @@ static const NoiseCurves& make_noise_curves(const Config& cfg) {
             return cached_pixel4a;
         }
     }
-    return make_noise_curves(cfg.noise_alpha(), cfg.noise_beta());
+    return make_noise_curves(cfg.noise_alpha_robustness(), cfg.noise_beta_robustness());
 }
 
 // Per-guide-channel curve, 3 independently cached slots (one per CFA colour)
@@ -390,7 +390,8 @@ static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch)
 static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
     if (cfg.debug_pixel4a_noise_profile)
         return make_noise_curves(cfg);
-    return make_noise_curves_channel(cfg.noise_alpha_ch(ch), cfg.noise_beta_ch(ch), ch);
+    return make_noise_curves_channel(cfg.noise_alpha_ch_robustness(ch),
+                                     cfg.noise_beta_ch_robustness(ch), ch);
 }
 
 } // namespace
@@ -559,7 +560,8 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
 static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     if (!std::isfinite(brightness)) brightness = 0.f;
     brightness = clampf(brightness, 0.f, 1.f);
-    f32 v = std::max(cfg.noise_alpha() * brightness + cfg.noise_beta(), 0.f);
+    f32 v = std::max(cfg.noise_alpha_robustness() * brightness +
+                     cfg.noise_beta_robustness(), 0.f);
     if (nch == 3 && ch == 1)
         v *= 0.5f; // green guide channel is the average of two Bayer greens.
     return v;
@@ -640,7 +642,8 @@ static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
         brightness = std::max(brightness, guide_brightness(comp_means, new_y, new_x));
     }
     const f32 noise_var =
-        std::max(0.f, cfg.noise_alpha() * brightness + cfg.noise_beta());
+        std::max(0.f, cfg.noise_alpha_robustness() * brightness +
+                          cfg.noise_beta_robustness());
     const f32 noise_edge_floor =
         std::max(0.f, cfg.motion_edge_noise_floor_multiplier) * std::sqrt(noise_var);
     const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
