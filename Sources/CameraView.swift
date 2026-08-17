@@ -785,11 +785,11 @@ struct CameraView: View {
         Text("""
              Algorithm 6 (Wronski et al.), read literally: computes the robustness mask at \
              raw resolution (Dodgson-quadratic upscale + flow-warp of the guide-resolution \
-             local stats) instead of directly at guide resolution, which this port has always \
-             done -- finer than a guide pixel is finer than this mask could previously ever \
-             draw a rejection boundary. Only takes effect with "Alignment Grey: FFT" below \
-             turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count for \
-             the mask itself; experimental and unverified on-device.
+             local stats) instead of directly at guide resolution -- a rejection boundary \
+             finer than a guide pixel is finer than this mask could otherwise draw. \
+             Applies to every grey method, matching the reference implementation, which \
+             does this upscale unconditionally. Leave ON for reference parity. \
+             ~4x the pixel count for the mask itself.
              """)
             .font(.caption2).foregroundColor(.secondary)
     }

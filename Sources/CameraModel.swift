@@ -96,7 +96,11 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
     var flow_reject_1d_residual_threshold: Float = 2.5
-    var motion_edge_rejection_enabled: Bool = true
+    /// OFF for reference parity: the reference's robustness has no
+    /// edge-strength test and no R=0 override tied to one -- its
+    /// motion-irregularity signal only ever selects between the s1/s2 priors.
+    /// This veto is an addition of this port with no counterpart there.
+    var motion_edge_rejection_enabled: Bool = false
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
     var motion_edge_noise_floor_multiplier: Float = 1.0
@@ -193,12 +197,15 @@ struct TuningParams: Equatable, Codable {
     /// Algorithm 6 (Wronski et al.), read literally: computes d^2/sigma^2/R
     /// at RAW resolution (Dodgson-quadratic upscale + flow-warp of the
     /// guide-resolution local stats) instead of directly at guide
-    /// resolution, which this port has always done. Only takes effect when
-    /// "Alignment Grey: FFT" below is OFF (Decimate) -- that path's flow
-    /// is already coarser than FFT's, so a guide-resolution mask on top
-    /// compounds two sources of lost precision instead of one. ~4x the
-    /// pixel count for the mask; unverified on-device.
-    var robustness_raw_resolution_enabled: Bool = false
+    /// resolution, which this port used to do.
+    ///
+    /// ON by default, and NOT tied to the grey method any more: python-p runs
+    /// this upscale unconditionally in init_robustness/compute_robustness --
+    /// it is simply how ComputeRobustness works there. The old
+    /// "only with Alignment Grey: FFT off" restriction was this port's own
+    /// invention, and because the app ships FFT, it meant the raw-resolution
+    /// path never actually ran. Costs ~4x the pixel count for the mask.
+    var robustness_raw_resolution_enabled: Bool = true
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -221,9 +228,15 @@ struct TuningParams: Equatable, Codable {
     var isp_local_contrast: Float = 0.20
     var isp_skin_protect: Bool = true
 
-    var acc_rob_adaptive: Bool = true
-    /// Only used when acc_rob_adaptive is off.
-    var acc_rob_max_frame_count: Float = 2.0
+    /// OFF for reference parity: the reference uses a hard step (full
+    /// enlargement below the frame-count threshold, none above, with the
+    /// accumulator overwritten below it), not this port's continuous
+    /// always-accumulating curve.
+    var acc_rob_adaptive: Bool = false
+    /// Only used when acc_rob_adaptive is off. 8 is the reference's own
+    /// 'accumulated robustness denoiser'.'merge'.'max frame count'; the 2
+    /// that used to be here was simply wrong.
+    var acc_rob_max_frame_count: Float = 8.0
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 8.0
 
