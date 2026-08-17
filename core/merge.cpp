@@ -89,21 +89,16 @@ static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
 
-static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32 x) {
+// python-p's accumulate() (merge.py:417-423): "The robustness coefficient is
+// known for every raw pixel, and implicitely interpolated to HR using nearest
+// neighboor interpolations" -- a plain round()+clamp, no blending. Bilinear
+// here would smear a sharp misalignment boundary into neighbouring, correctly
+// -aligned pixels; matching python-p 1:1 means matching that hard edge too.
+static inline f32 sample_robustness_nearest(const Image& robustness, f32 y, f32 x) {
     if (robustness.h <= 0 || robustness.w <= 0) return 0.f;
-    y = std::min(std::max(y, 0.f), (f32)(robustness.h - 1));
-    x = std::min(std::max(x, 0.f), (f32)(robustness.w - 1));
-    const int y0 = (int)std::floor(y);
-    const int x0 = (int)std::floor(x);
-    const int y1 = std::min(y0 + 1, robustness.h - 1);
-    const int x1 = std::min(x0 + 1, robustness.w - 1);
-    const f32 fy = y - (f32)y0;
-    const f32 fx = x - (f32)x0;
-    const f32 top = robustness.at(y0, x0) +
-                    (robustness.at(y0, x1) - robustness.at(y0, x0)) * fx;
-    const f32 bot = robustness.at(y1, x0) +
-                    (robustness.at(y1, x1) - robustness.at(y1, x0)) * fx;
-    return top + (bot - top) * fy;
+    const int yi = std::min(std::max(cuda_round_to_int(y), 0), robustness.h - 1);
+    const int xi = std::min(std::max(cuda_round_to_int(x), 0), robustness.w - 1);
+    return robustness.at(yi, xi);
 }
 
 // Bilinear cov sample + invert.
@@ -187,7 +182,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 rob_y = (lr_y - 0.5f) / 2.f;
                 rob_x = (lr_x - 0.5f) / 2.f;
             }
-            const f32 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
+            const f32 local_r = sample_robustness_nearest(robustness, rob_y, rob_x);
 
             const f32 lr_mov_x = lr_x + flowx;
             const f32 lr_mov_y = lr_y + flowy;

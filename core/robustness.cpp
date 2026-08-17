@@ -723,20 +723,15 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            // Eq. 6 aggregates each term into ONE scalar across channels
-            // first (sigma = sqrt(sum of per-channel variances), Eq 6's d/
-            // d_ms/d_md are bare per-pixel scalars, not per-channel), and
-            // only then applies max()/shrinkage once. Summing per-channel
-            // max(measured, noise-floor) instead of max-of-sums is not the
-            // same computation: max(a,b) >= a and >= b always, so
-            // sum(max(a_c,b_c)) >= max(sum(a_c), sum(b_c)) in every case,
-            // strictly greater whenever which term dominates differs across
-            // channels (e.g. a colored edge: real structure in one channel,
-            // near-zero in the others). That inflates sigma^2, which shrinks
-            // d^2/sigma^2 and makes R more forgiving than Eq. 6 specifies
-            // exactly in that mixed-channel-dominance case.
-            f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-            f32 d_ms_sq = 0.f, d_md_sq = 0.f;
+            // python-p's cuda_apply_noise_model (robustness.py:563-581), quoted
+            // verbatim: max() and the shrinkage are both applied PER CHANNEL,
+            // inside the channel loop, then accumulated -- not summed-then-
+            // combined-once. This is a looser bound than combining once after
+            // summing (sum(max(a_c,b_c)) >= max(sum(a_c),sum(b_c)) whenever
+            // channels disagree on which term dominates), but python-p is the
+            // reference this port now tracks 1:1, so its per-channel order is
+            // reproduced here exactly rather than "corrected".
+            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -751,15 +746,15 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                sigma_ms_sq += ref_vars.at(y, x, ch);
-                sigma_md_sq += sigma_t * sigma_t;
+
+                f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+
                 f32 d_p_ = d_p.at(y, x, ch);
-                d_ms_sq += d_p_ * d_p_;
-                d_md_sq += d_t * d_t;
+                f32 d_p_sq = d_p_ * d_p_;
+                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
             }
-            f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-            f32 d_sq_ = d_ms_sq * shrink * shrink;
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }

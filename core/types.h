@@ -682,24 +682,19 @@ struct Config {
     // upscale_warp_stats / the Metal rob_dogson kernel) but was never wired
     // into compute_robustness -- this toggle wires it in.
     //
-    // Restricted to grey_method == Decimate: that path's flow field is
-    // already coarser than FFT's (real block matching only at half
-    // resolution, then duplicated 2x2 to fill the raw tile grid -- see
-    // flow_to_raw_tile_grid), so a guide-resolution robustness mask on top
-    // compounds two sources of lost precision instead of one; FFT's flow
-    // already carries native raw-tile-grid granularity, so the case for
-    // this is weaker there.
-    //
-    // Off by default: ~4x the pixel count for R and the new upscale
-    // buffers, unverified on-device, and merge.cpp's R-sampling coordinate
-    // math has to know which resolution R actually is this run.
-    bool robustness_raw_resolution_enabled = false;
+    // python-p (the reference this port is now tracking 1:1) runs this
+    // upscale unconditionally -- it is not gated by grey/alignment method,
+    // it is simply how ComputeRobustness works. Gating it behind
+    // grey_method == Decimate was this port's own invention and meant the
+    // raw-resolution path never ran at all under the app's actual default
+    // (grey_method == FFT), silently falling back to the guide-resolution
+    // approximation every time. On by default now, unconditionally.
+    bool robustness_raw_resolution_enabled = true;
     // True when the raw-resolution path should actually run this call --
-    // single place both conditions live, so robustness.cpp, merge.cpp and
-    // the Metal dispatch code in metal_gpu.mm can't drift out of step on
-    // which one gates it.
+    // single place this lives, so robustness.cpp, merge.cpp and the Metal
+    // dispatch code in metal_gpu.mm can't drift out of step.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
+        return robustness_raw_resolution_enabled;
     }
     // Raw-pixel closure-error magnitude above which a tile is flagged. Below
     // this, the two independent measurements are considered to agree.
@@ -741,7 +736,16 @@ struct Config {
     //     near-isotropic, so no damping applies, yet the step scales as
     //     residual/gradient. Measured at 5.1px for a 30x residual. The clamp
     //     bounds ICA to what the search that preceded it could have reached.
-    bool  ica_regularize_enabled = true;
+    //
+    // Off by default now: python-p's ICA.py (ICA_get_new_flow/solve_2x2) has
+    // neither guard -- a raw, unclamped Cramer's-rule solve every iteration,
+    // its only safety check a bare |det|<1e-10 skip (confirmed by exhaustive
+    // grep of ICA.py/linalg.py for clamp/clip/regulariz/damp/eigenvalue/
+    // lambda). Suppressing exactly the large, easily-detectable step this
+    // regularization targets may be suppressing the signal that downstream
+    // rejection needs to see; matching python-p 1:1 means matching its
+    // absence too.
+    bool  ica_regularize_enabled = false;
     // Legacy setting kept for old saved app preferences. The current 1D reject
     // gate uses flow_reject_1d_residual_threshold instead.
     float flow_reject_1d_ambiguity_ratio = 1.10f;
@@ -765,7 +769,13 @@ struct Config {
     // match at the coarsest level is 8 px x 32 abs factor = 256 raw px of error,
     // so the flag has to survive from where the mistake is made to where the
     // mask is applied. upscale_flow_460 already propagates it.
-    bool  flow_reject_ambiguous_enabled = true;
+    //
+    // Off by default now: exhaustive search of python-p (block_matching.py,
+    // robustness.py, ICA.py, merge.py, kernels.py) found no second-best-cost
+    // tracking, ratio test, or "ambiguous" concept anywhere -- block matching
+    // there tracks a single min_dist and nothing else. This whole mechanism
+    // has no python-p counterpart, so matching it 1:1 means it stays off.
+    bool  flow_reject_ambiguous_enabled = false;
     // A 1D tile is rejected only when enough pixels in that tile have
     // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
     // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.
@@ -803,7 +813,13 @@ struct Config {
     // reading as high-frequency detail, and it scales with brightness through
     // the noise model rather than being a fixed number.
     float hf_min_texture_snr = 4.0f;
-    bool  motion_edge_rejection_enabled = true;
+    // Off by default now: python-p's robustness.py (cuda_compute_s +
+    // cuda_robustness_threshold) has no edge-strength/gradient computation
+    // anywhere and no R=0 override tied to it -- confirmed by a full read of
+    // the file. Its motion-irregular signal only ever selects between s1/s2,
+    // same as this port's compute_s already does; this extra hard-edge veto
+    // on top has no python-p counterpart.
+    bool  motion_edge_rejection_enabled = false;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
     float motion_edge_noise_floor_multiplier = 1.0f;
@@ -823,14 +839,17 @@ struct Config {
     // banding until the burst is long. 0 compares the two and picks.
     int   merge_arch = 0;
     // Adapt the reference-kernel enlargement continuously to the accumulated
-    // robustness, instead of the reference implementation's step. Off gives the
-    // reference behaviour exactly, including the accumulator overwrite, which is
-    // what tools/compare_dng.py needs to line up with the Python.
-    bool  acc_rob_adaptive = true;
-    // Only consulted when acc_rob_adaptive is false. 2 is the reference's own
-    // value for the merge variant; its median and gauss blocks say 8, and taking
-    // 8 from those is what made the step fire on every pixel of every burst.
-    float acc_rob_max_frame_count = 2.0f;
+    // robustness, instead of python-p's own step function. Off (the default,
+    // matching python-p exactly) gives its behaviour verbatim, including the
+    // accumulator overwrite below the threshold -- confirmed directly against
+    // python-p/.../merge.py's denoise_power_merge/denoise_range_merge and the
+    // num[...]=val / den[...]=acc overwrite branch.
+    bool  acc_rob_adaptive = false;
+    // Only consulted when acc_rob_adaptive is false. python-p's own
+    // 'accumulated robustness denoiser'['merge']['max frame count'] is 8
+    // (params.py), confirmed by direct quote -- not 2. The earlier guess of 2
+    // here was wrong.
+    float acc_rob_max_frame_count = 8.0f;
     // Total frames in the burst, filled in by the pipeline rather than tuned.
     // The reference-kernel enlargement is derived from this and the accumulated
     // robustness, so there is no threshold to set. 0 means unknown, which

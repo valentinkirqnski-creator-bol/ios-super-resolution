@@ -6,6 +6,7 @@
 #include <cmath>
 #include <mutex>
 #include <complex>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <algorithm>
@@ -1128,6 +1129,23 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     int nlev = (int)ref_pyr.levels.size();
 
+    // HHSR_DUMP_FLOW_TILE="ty,tx" (raw/finest-level tile-grid coords) +
+    // HHSR_DUMP_FLOW_FRAME=<1-based comp frame index>: print the flow vector
+    // at that tile, mapped proportionally into each pyramid level's own tile
+    // grid, after block matching and after ICA at every level -- to find
+    // which stage introduces a catastrophic flow value.
+    static int s_dump_call = 0;
+    ++s_dump_call;
+    int dump_ty = -1, dump_tx = -1, dump_frame = -1;
+    if (const char* t = std::getenv("HHSR_DUMP_FLOW_TILE")) {
+        std::sscanf(t, "%d,%d", &dump_ty, &dump_tx);
+        if (const char* f = std::getenv("HHSR_DUMP_FLOW_FRAME"))
+            dump_frame = std::atoi(f);
+        if (dump_frame > 0 && dump_frame != s_dump_call) { dump_ty = -1; dump_tx = -1; }
+    }
+    const int finest_ny = ref_grey.h / tile_size;
+    const int finest_nx = ref_grey.w / tile_size;
+
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
@@ -1228,6 +1246,15 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg, cfg.num_threads);
 
+        if (dump_ty >= 0) {
+            int lty = std::min(flow.ny - 1, std::max(0, (dump_ty * flow.ny) / finest_ny));
+            int ltx = std::min(flow.nx - 1, std::max(0, (dump_tx * flow.nx) / finest_nx));
+            std::fprintf(stderr, "[dumpflow] call=%d lvl=%d grid=%dx%d ts=%d radius=%d "
+                                 "afterBM dx=%.2f dy=%.2f\n",
+                         s_dump_call, lvl, flow.ny, flow.nx, ts, radius,
+                         flow.dx(lty, ltx), flow.dy(lty, ltx));
+        }
+
         // alignment.py align_lvl: block matching, then ICA, at this level --
         // before the flow is upscaled and its error multiplied.
         if (ica_all && lvl < (int)g_ref_ica_cache.levels.size() &&
@@ -1238,6 +1265,15 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                                  cfg.ica_n_iter, cfg.num_threads,
                                  ica_damp_ratio(cfg),
                                  ica_max_step(cfg, radius));
+        }
+
+        if (dump_ty >= 0) {
+            int lty = std::min(flow.ny - 1, std::max(0, (dump_ty * flow.ny) / finest_ny));
+            int ltx = std::min(flow.nx - 1, std::max(0, (dump_tx * flow.nx) / finest_nx));
+            std::fprintf(stderr, "[dumpflow] call=%d lvl=%d grid=%dx%d "
+                                 "afterICA dx=%.2f dy=%.2f\n",
+                         s_dump_call, lvl, flow.ny, flow.nx,
+                         flow.dx(lty, ltx), flow.dy(lty, ltx));
         }
     }
 
@@ -1257,6 +1293,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow, tile_size,
                          cfg.ica_n_iter, cfg.num_threads,
                          ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
+        if (dump_ty >= 0) {
+            std::fprintf(stderr, "[dumpflow] call=%d FINAL(finest ICA) dx=%.2f dy=%.2f\n",
+                         s_dump_call, flow.dx(dump_ty, dump_tx), flow.dy(dump_ty, dump_tx));
+        }
+    } else if (dump_ty >= 0) {
+        std::fprintf(stderr, "[dumpflow] call=%d FINAL(no finest pass) dx=%.2f dy=%.2f\n",
+                     s_dump_call, flow.dx(dump_ty, dump_tx), flow.dy(dump_ty, dump_tx));
     }
     const HessianField* mark_hess = nullptr;
     if (!finest_hess.data.empty()) {

@@ -1003,25 +1003,17 @@ inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
     return int(p.cfa11);
 }
 
-inline float sample_robustness_bilinear(device const float* robustness,
-                                        uint h, uint w,
-                                        float y, float x) {
+// python-p's accumulate() (merge.py:417-423) samples R with a plain
+// round()+clamp -- "implicitely interpolated to HR using nearest neighboor
+// interpolations", no blending. See merge.cpp's sample_robustness_nearest
+// (CPU mirror) for the full rationale.
+inline float sample_robustness_nearest(device const float* robustness,
+                                       uint h, uint w,
+                                       float y, float x) {
     if (h == 0u || w == 0u) return 0.f;
-    y = clamp(y, 0.f, float(h - 1u));
-    x = clamp(x, 0.f, float(w - 1u));
-    int y0 = int(floor(y));
-    int x0 = int(floor(x));
-    int y1 = min(y0 + 1, int(h) - 1);
-    int x1 = min(x0 + 1, int(w) - 1);
-    float fy = y - float(y0);
-    float fx = x - float(x0);
-    float top = robustness[uint(y0) * w + uint(x0)] +
-                (robustness[uint(y0) * w + uint(x1)] -
-                 robustness[uint(y0) * w + uint(x0)]) * fx;
-    float bot = robustness[uint(y1) * w + uint(x0)] +
-                (robustness[uint(y1) * w + uint(x1)] -
-                 robustness[uint(y1) * w + uint(x0)]) * fx;
-    return top + (bot - top) * fy;
+    int yi = clamp(lround_away(y), 0, int(h) - 1);
+    int xi = clamp(lround_away(x), 0, int(w) - 1);
+    return robustness[uint(yi) * w + uint(xi)];
 }
 
 // Alg. 4 — merge.cpp accumulate_comp
@@ -1061,7 +1053,7 @@ static inline void merge_comp_contrib(device const float* img,
         rob_y = (lr_y - 0.5f) / 2.f;
         rob_x = (lr_x - 0.5f) / 2.f;
     }
-    float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
+    float local_r = sample_robustness_nearest(robustness, p.rob_h, p.rob_w,
                                                rob_y, rob_x);
     // Nothing to accumulate where the frame is fully rejected. Every
     // contribution is w * local_r * c or w * local_r, so all nine taps produce
@@ -1885,16 +1877,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     int new_idy = lround_away(sample_y);
     bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
                     0 <= new_idy && new_idy < int(p.h));
-    // Eq. 6 aggregates each term into ONE scalar across channels first
-    // (sigma = sqrt(sum of per-channel variances); d/d_ms/d_md are bare
-    // per-pixel scalars, not per-channel), and only then applies max()/
-    // shrinkage once -- see the mirrored comment in apply_noise_model
-    // (robustness.cpp). Summing per-channel max(measured, noise-floor)
-    // instead of max-of-sums is not the same computation and is
-    // systematically more forgiving whenever which term dominates differs
-    // across channels (e.g. a colored edge).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // python-p's cuda_apply_noise_model (robustness.py:563-581): max() and
+    // shrinkage are both applied PER CHANNEL, inside the channel loop, then
+    // accumulated -- see the mirrored comment in apply_noise_model
+    // (robustness.cpp). Reproduced here exactly rather than "corrected" to a
+    // combine-once-after-summing order python-p does not use.
+    sigma_sq_ = 0.f;
+    d_sq_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -1915,17 +1904,15 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
+        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+        d_sq_ += d_p_sq * shrink * shrink;
     }
-    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    d_sq_ = d_ms_sq * shrink * shrink;
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -2080,11 +2067,9 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
-    // Same aggregate-then-max / aggregate-then-shrink as rob_make_mask's
-    // fixed form -- see the comment there and in apply_noise_model
-    // (robustness.cpp).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // Same per-channel max/shrink-then-accumulate as rob_make_mask's fixed
+    // form -- see the comment there and in apply_noise_model (robustness.cpp).
+    float sigma_sq_ = 0.f, d_sq_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2099,16 +2084,14 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
+        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+        d_sq_ += d_p_sq * shrink * shrink;
     }
-    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    float d_sq_ = d_ms_sq * shrink * shrink;
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
