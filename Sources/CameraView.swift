@@ -759,7 +759,7 @@ struct CameraView: View {
             Spacer()
             Text("\(Int(cam.tuningParams.motion_magnitude_veto_px))")
         }
-        Slider(value: $cam.tuningParams.motion_magnitude_veto_px, in: 50...300, step: 10)
+        Slider(value: $cam.tuningParams.motion_magnitude_veto_px, in: 0...300, step: 1)
         Text("""
              Hard-rejects a tile's contribution outright when M (the same 3x3-neighbourhood \
              flow span r_Mt measures, against a much larger threshold) exceeds this, \
