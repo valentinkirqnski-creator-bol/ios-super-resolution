@@ -385,12 +385,10 @@ struct Config {
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
     std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
-    // Finest level raised from 1 to 2.
-    //
-    // The align_ica_per_level comment below works out the budget: with factors
-    // {1,2,4,4} the flow arriving at a level carries up to 0.5*factor of
-    // residual, so levels 2 and 1 receive 2px against a radius of 4 and have
-    // slack, while level 0 received 1px against a radius of 1 and had none.
+    // Restored to python-p's own value (params.py searchRadia[-1] = 1) after
+    // this port had it raised to 3. The port's own measurement below is what
+    // settles it, not just parity for parity's sake: on the ok/ burst's
+    // repetitive/flat structure, widening this window is monotonically WORSE.
     //
     // Measured on the ok/ burst -- repetitive straight-line structure, the
     // adverse case for this parameter -- comparing 0728 against 0727:
@@ -401,16 +399,18 @@ struct Config {
     //   mean R in the 8-32 M band        0.734    0.737    0.751    0.757
     //   candidates evaluated per tile    9        25       49       81
     //
-    // Monotonic in the wrong direction on that scene: a wider window does not
-    // only find better matches, it finds more near-ties, and on a repeating
-    // pattern the minimum among near-ties is close to arbitrary. The paper's
-    // small finest radius acts as a regularizer, holding level 0 near what the
-    // coarser levels agreed on. Content with genuine fine-scale motion and no
-    // repetition was never tested and may prefer the wider window.
+    // A wider window does not only find better matches, it finds more
+    // near-ties, and on flat/repeating content the minimum among near-ties is
+    // close to arbitrary -- upscale_flow_460's 3-candidate argmin (parent vs.
+    // vertical- vs. horizontal-neighbor tile) inherits that same ambiguity one
+    // level up, so a wider finest radius compounds it rather than fixing it.
+    // The paper's small finest radius is a regularizer, holding level 0 near
+    // what the coarser levels already agreed on.
     //
-    // Also sets the ICA step clamp, which bounds one iteration to the level's
-    // search radius -- so this is 3px at the finest level.
-    std::vector<int> bm_search_radii = {3, 4, 4, 4};
+    // Also sets the ICA step clamp (moot while ica_regularize_enabled is off,
+    // since ica_max_step returns 0 unconditionally then) -- 1px at the finest
+    // level, matching python-p, once regularization is back on.
+    std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
 
     // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
