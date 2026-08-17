@@ -778,6 +778,54 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     }
 }
 
+// Same computation as apply_noise_model, with compute_dist folded in: d_p is
+// derived per pixel from ref_means/comp_means instead of being read from a
+// materialised array. At raw resolution that array is H*W*3 floats (146 MB on
+// a 12 MP frame) written once and read once, which is what pushed a >2-frame
+// FFT burst past the memory limit. Arithmetic is unchanged -- the two paths
+// share this one body, so they cannot drift.
+static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
+                                    const Image& ref_vars,
+                                    const NoiseCurves* const nc_ch[3],
+                                    Image& d_sq, Image& sigma_sq) {
+    const int n_ch = ref_means.c;
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    parallel_rows(ref_means.h, 0, [&](int y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const NoiseCurves& nc = *nc_ch[ch];
+                f32 brightness = ref_means.at(y, x, ch);
+                int id_noise = (int)std::lround(1000.f * brightness);
+                if (!std::isfinite(brightness))
+                    id_noise = 0;
+                else if (id_noise < 0)
+                    id_noise = 0;
+                else if (id_noise >= (int)nc.std_curve.size())
+                    id_noise = (int)nc.std_curve.size() - 1;
+                f32 sigma_t = nc.std_curve[(size_t)id_noise];
+                f32 d_t = nc.diff_curve[(size_t)id_noise];
+
+                f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+
+                // compute_dist, inline. OOB in the Dodgson upscale wrote +inf
+                // into comp_means, which must stay +inf here so R lands at 0.
+                const f32 comp = comp_means.at(y, x, ch);
+                f32 d_p_ = std::isfinite(comp)
+                    ? std::fabs(brightness - comp)
+                    : std::numeric_limits<f32>::infinity();
+                f32 d_p_sq = d_p_ * d_p_;
+                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
+            }
+            d_sq.at(y, x) = d_sq_;
+            sigma_sq.at(y, x) = sigma_sq_;
+        }
+    });
+}
+
 static std::vector<uint32_t> compute_tile_residual_high(const Image& d_sq,
                                                         const Image& sigma_sq,
                                                         const FlowField& flow,
@@ -975,11 +1023,21 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // guide is a byproduct of local_stats_3x3 but, like the guide-resolution
     // path above, is never read -- apply_noise_model only ever uses the
     // REFERENCE's variance (ref_vars), so it isn't worth its own upscale pass.
-    Image guide = compute_guide(comp_raw, cfg);
-    Image comp_means_guide, comp_vars_guide;
-    local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
-    Image comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
-                                          tile_size, cfg.num_threads);
+    // Memory: at raw resolution every one of these is H*W*3 floats -- 146 MB
+    // each on a 12 MP frame. The scopes below are deliberate, freeing each
+    // guide-resolution buffer the moment it is dead so the peak is the
+    // upscaled comp_means plus the outputs, not the whole chain at once.
+    Image comp_means;
+    {
+        Image comp_means_guide;
+        {
+            Image guide = compute_guide(comp_raw, cfg);
+            Image comp_vars_guide; // byproduct, never read -- freed with this scope
+            local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
+        }
+        comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
+                                        tile_size, cfg.num_threads);
+    }
 
     const Image& ref_means = ref_stats.means_hires;
     const Image& ref_vars = ref_stats.stds_hires;
@@ -988,20 +1046,13 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     if (comp_means.h != h || comp_means.w != w || comp_means.c != nch)
         return Image();
 
-    Image d_p(h, w, nch);
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            for (int ch = 0; ch < nch; ++ch) {
-                const f32 comp = comp_means.at(y, x, ch);
-                d_p.at(y, x, ch) = std::isfinite(comp)
-                    ? std::fabs(ref_means.at(y, x, ch) - comp)
-                    : std::numeric_limits<f32>::infinity();
-            }
-        }
-    }
-
+    // d_p folded into the noise model rather than materialised. python-p keeps
+    // it as its own array (compute_dist -> apply_noise_model), but it is read
+    // exactly once, by the very next stage, and at raw resolution that array
+    // costs another 146 MB. Computing |ref - comp| inline is arithmetically
+    // identical, just never stored.
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_means, ref_vars, nc_ch, d_sq, sigma_sq);
+    apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(
@@ -1081,6 +1132,14 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            // An out-of-bounds Dodgson sample writes +inf into comp_means, so
+            // d_sq is +inf and the shrink term is inf/inf = NaN, making r_val
+            // NaN. python-p's clamp is min(max_, max(min_, x)), whose CUDA
+            // fmaxf/fminf return the non-NaN operand and so yield 0 -- which is
+            // the documented intent there ("infinte will imply R = 0").
+            // clampf's comparisons are both false for NaN, so it would return
+            // NaN and poison every merge accumulator that touches this pixel.
+            if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
@@ -1282,6 +1341,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            // An out-of-bounds Dodgson sample writes +inf into comp_means, so
+            // d_sq is +inf and the shrink term is inf/inf = NaN, making r_val
+            // NaN. python-p's clamp is min(max_, max(min_, x)), whose CUDA
+            // fmaxf/fminf return the non-NaN operand and so yield 0 -- which is
+            // the documented intent there ("infinte will imply R = 0").
+            // clampf's comparisons are both false for NaN, so it would return
+            // NaN and poison every merge accumulator that touches this pixel.
+            if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
             // Compared against r_s1 rather than recomputing the conditions, so
             // the record cannot drift from the value actually used above.

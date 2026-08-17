@@ -1991,6 +1991,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    // OOB Dodgson sample -> comp_means +inf -> d_sq +inf -> shrink inf/inf
+    // = NaN. Metal's clamp() would propagate the NaN; python-p's
+    // min(max_, max(min_, x)) yields 0. See robustness.cpp for the full note.
+    if (!isfinite(r_val)) r_val = 0.f;
     R[gid.y * p.w + gid.x] = r_val;
     // Which prior this pixel ended up on. Compared against r_s1 rather than
     // recomputing the conditions, so the record cannot drift from the value
@@ -2092,6 +2096,10 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     float r_val = motion_magnitude_reject_tile
         ? 0.f
         : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
+    // OOB Dodgson sample -> comp_means +inf -> d_sq +inf -> shrink inf/inf
+    // = NaN. Metal's clamp() would propagate the NaN; python-p's
+    // min(max_, max(min_, x)) yields 0. See robustness.cpp for the full note.
+    if (!isfinite(r_val)) r_val = 0.f;
     R[out_o] = r_val;
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
