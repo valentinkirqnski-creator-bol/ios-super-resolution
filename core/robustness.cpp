@@ -667,7 +667,15 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
         for (int j = -1; j <= 1; ++j) {
             int x_ = (int)clampf((f32)(center_x + j), 0.f, (f32)(stats.w - 1));
             f32 dx = (f32)x_ - LR_x;
-            f32 w = wy * dogson_quadratic(dx);
+            // python-p cuda_uspcale_dogson (robustness.py:458):
+            //   w = dogson_biquadratic_kernel(dx,dy) + 1e-6
+            // The epsilon is added to EVERY tap, not just when the kernel sum
+            // would be zero, so it shifts the normalised weights slightly on
+            // every pixel -- reproduce it exactly, not just its divide-by-zero
+            // guard. dogson_biquadratic_kernel is itself separable
+            // (utils_image.py:399-400: quadratic(x) * quadratic(y)), matching
+            // the wy * dogson_quadratic(dx) product used here.
+            f32 w = wy * dogson_quadratic(dx) + 1e-6f;
             buf += stats.at(y_, x_, ch) * w;
             w_acc += w;
         }
@@ -940,13 +948,15 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
     }
 
-    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
-    if (ref_stats.means.c == 3) {
-        for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &make_noise_curves_channel(cfg, ch);
-    } else {
-        nc_ch[0] = &make_noise_curves(cfg);
-    }
+    // ONE curve shared by every guide channel, matching python-p exactly.
+    // cuda_apply_noise_model (robustness.py:566-569) indexes std_curve /
+    // diff_curve by brightness alone -- they are 1-D arrays with no channel
+    // axis -- and process() builds them from a single scalar alpha/beta
+    // averaged across R/G/B. This port previously built a separate curve per
+    // channel from per-channel white-balanced alpha'/beta'; that is a
+    // different (arguably better-motivated) model, but it is not python-p's.
+    const NoiseCurves& nc_shared = make_noise_curves(cfg);
+    const NoiseCurves* nc_ch[3] = {&nc_shared, &nc_shared, &nc_shared};
 
     // Comparison frame's own local stats, still built at guide resolution
     // (compute_guide/local_stats_3x3 are unchanged) -- only the upscale step
@@ -1108,16 +1118,11 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         // started).
     }
 
-    // One curve per guide channel (3 for Bayer, matching R/(G1+G2)/2/B; 1
-    // otherwise) rather than one curve shared by all channels -- see
-    // Config::noise_alpha_ch/noise_beta_ch and make_noise_curves_channel.
-    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
-    if (ref_stats.means.c == 3) {
-        for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &make_noise_curves_channel(cfg, ch);
-    } else {
-        nc_ch[0] = &make_noise_curves(cfg);
-    }
+    // ONE curve shared by every guide channel -- python-p's std_curve /
+    // diff_curve are 1-D (brightness only, no channel axis). Same reasoning as
+    // the raw-resolution path above.
+    const NoiseCurves& nc_shared = make_noise_curves(cfg);
+    const NoiseCurves* nc_ch[3] = {&nc_shared, &nc_shared, &nc_shared};
 
     Image guide = compute_guide(comp_raw, cfg);
     Image comp_means, comp_vars;

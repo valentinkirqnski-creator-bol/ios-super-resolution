@@ -396,19 +396,25 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             float v = ((float)raw_image[(top + y) * stride + (left + x)] - bl) / denom;
             v *= site_wb[fi][fj];
             if (!std::isfinite(v)) v = 0.f;
-            // No upper clip. White balance multiplies red by ~2 and blue by
-            // ~1.8, so clipping to 1 here destroys every red raw value above
-            // 0.49 and every blue above 0.54 -- well short of sensor
-            // saturation. What it costs is not just highlight detail at export:
-            // a clipped region has no local variance and no gradient, so the
-            // grey it feeds alignment has no edge to match, and robustness sees
-            // two frames that clip identically as a perfect match and merges
-            // them at R = 1 regardless of whether they are aligned.
+            // python-p clips here -- utils_dng.load_dng_burst, verbatim:
+            //     ref_raw[i::2, j::2] = (ref_raw[...] - black) / (white - black)
+            //     ref_raw[i::2, j::2] *= white_balance[c] / white_balance[1]
+            //     ref_raw = np.clip(ref_raw, 0.0, 1.0)
+            // and this port must match it bit for bit.
             //
-            // The reference clips here (utils_dng load_dng_burst) and carries
-            // the same loss. Clipping now happens only where the range is
-            // genuinely bounded: the uint16 DNG and the JPEG encoder.
-            img.at(y, x) = std::max(v, 0.f);
+            // This port previously skipped the upper clip deliberately, on the
+            // reasoning that white balance multiplies red by ~2 and blue by
+            // ~1.8, so clipping to 1 discards every red raw value above 0.49
+            // well short of sensor saturation -- and that a clipped region has
+            // no local variance and no gradient, so the grey it feeds
+            // alignment has no edge to match. That reasoning is sound in
+            // isolation, but it is NOT what python-p does, and the raw values
+            // here feed compute_grey_fft, whose output drives every level of
+            // block matching. An unclipped highlight changes the FFT's input
+            // spectrum, hence the low-passed grey, hence which candidate wins
+            // in block matching -- so this single line propagates into the
+            // alignment of the whole frame. Parity wins.
+            img.at(y, x) = clampf(v, 0.f, 1.f);
         }
     });
     cfg.raw_prewhitened = true;

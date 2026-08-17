@@ -939,50 +939,35 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
     return top + frac_y * (bot - top);
 }
 
-// raw_det=true -> accumulate (comp); false -> accumulate_ref
+// raw_det retained for call-site compatibility; both python-p paths
+// (merge.py accumulate + accumulate_ref) are identical -- see merge.cpp
+// interp_inv_cov for the quoted source.
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
                            bool raw_det) {
+    (void)raw_det;
     float frac_x = kmap_j - trunc(kmap_j);
     float frac_y = kmap_i - trunc(kmap_i);
-    int fx, fy;
-    if (raw_det) {
-        fx = max(int(kmap_j), 0);
-        fy = max(int(kmap_i), 0);
-    } else {
-        fx = max(int(floor(kmap_j)), 0);
-        fy = max(int(floor(kmap_i)), 0);
-    }
+    // math.floor in BOTH python-p paths, not int()-truncation.
+    int fx = max(int(floor(kmap_j)), 0);
+    int fy = max(int(floor(kmap_i)), 0);
     int cx = min(fx + 1, int(cov_w) - 1);
     int cy = min(fy + 1, int(cov_h) - 1);
 
     float xx = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 0);
     float xy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 1);
     float yy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 3);
-    if (raw_det) {
-        float det = xx * yy - xy * xy;
-        if (fabs(det) > 1e-10f) {
-            float inv_det = 1.f / det;
-            ixx =  inv_det * yy;
-            ixy = -inv_det * xy;
-            iyy =  inv_det * xx;
-        } else {
-            ixx = 1.f; ixy = 0.f; iyy = 1.f;
-        }
+    float det = xx * yy - xy * xy;
+    if (fabs(det) > 1e-10f) {
+        float inv_det = 1.f / det;
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
     } else {
-        // invert_sym_2x2 / invert_2x2 with EPSILON_DIV
-        float det = xx * yy - xy * xy;
-        if (fabs(det) > 1e-10f) {
-            float det_i = 1.f / det;
-            ixx =  yy * det_i;
-            ixy = -xy * det_i;
-            iyy =  xx * det_i;
-        } else {
-            ixx = 1.f; ixy = 0.f; iyy = 1.f;
-        }
+        ixx = 1.f; ixy = 0.f; iyy = 1.f;
     }
-    soften_inv_cov(ixx, ixy, iyy);
+    // No soften_inv_cov -- python-p has no such cap.
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -1747,7 +1732,9 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
                 for (int j = -1; j <= 1; ++j) {
                     int x_ = clamp_edge(center_x + j, int(p.in_w) - 1);
                     float dx = float(x_) - LR_x;
-                    float w = wy * dogson_quadratic(dx);
+                    // + 1e-6 on every tap, matching python-p
+                    // (robustness.py:458). See sample_dogson in robustness.cpp.
+                    float w = wy * dogson_quadratic(dx) + 1e-6f;
                     buf += stats[(uint(y_) * p.in_w + uint(x_)) * p.nch + ch] * w;
                     w_acc += w;
                 }
@@ -2482,9 +2469,10 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         // configuration ever selects these sizes.
         if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
-            // floor, not trunc -- see ica_refine_level in align.cpp.
-            float floor_fx = floor(fx);
-            float floor_fy = floor(fy);
+            // trunc, not floor -- python-p ICA.py uses math.modf + int().
+            // See ica_refine_level in align.cpp.
+            float floor_fx = trunc(fx);
+            float floor_fy = trunc(fy);
             float frac_x = fx - floor_fx;
             float frac_y = fy - floor_fy;
             int floor_off_x = int(floor_fx);
@@ -2551,12 +2539,12 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 
     // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
-        // floor, not trunc. ICA.py truncates toward zero, which turns the
-        // bilinear sample into an extrapolation for negative displacements and
-        // makes the converged flow direction-dependent. See ica_refine_level in
-        // align.cpp for the measurement.
-        float floor_fx = floor(fx);
-        float floor_fy = floor(fy);
+        // trunc, not floor. ICA.py truncates toward zero (math.modf + int()),
+        // which turns the bilinear sample into an extrapolation for negative
+        // displacements. Reproduced verbatim for parity -- see
+        // ica_refine_level in align.cpp.
+        float floor_fx = trunc(fx);
+        float floor_fy = trunc(fy);
         float frac_x = fx - floor_fx;
         float frac_y = fy - floor_fy;
         int floor_off_x = int(floor_fx);

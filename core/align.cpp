@@ -810,23 +810,26 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // floor, not trunc. ICA.py uses math.modf + int(), which
-                // truncates toward zero, so a negative displacement such as
-                // -0.25 yields offset 0 and fraction -0.25. bilinear_ica then
-                // evaluates m00 + (m01 - m00) * (-0.25): the right position, but
+                // trunc, not floor -- matching python-p exactly. ICA.py:352-355
+                // uses math.modf + int():
+                //     normalised_pos_x, floor_x = math.modf(new_idx)
+                //     floor_x = int(floor_x)
+                // math.modf truncates toward zero and gives the fractional part
+                // the SIGN of the input, so a negative displacement such as
+                // -0.25 yields offset 0 and fraction -0.25, and
+                // bilinear_interpolation then evaluates
+                // m00*(1-(-0.25)) + m01*(-0.25) -- the right position, but
                 // reached by extrapolating from the pair to the RIGHT of it
-                // instead of interpolating from the pair that straddles it.
+                // rather than interpolating from the pair that straddles it.
                 //
-                // Positive displacements interpolate, negative ones extrapolate,
-                // so the converged sub-pixel flow differs by direction. Measured
-                // on a synthetic shift at ts=16: 0.075px of spread between +0.75
-                // and -0.75, against 0.0025px with floor. It does not reduce the
-                // peak error -- both variants carry the same ~0.11px bilinear
-                // shrinkage toward zero -- but it makes that error symmetric, so
-                // frames drifting left and right land consistently rather than
-                // scattering by direction.
-                const f32 base_x = std::floor(fx);
-                const f32 base_y = std::floor(fy);
+                // This port previously used floor here, deliberately: measured
+                // on a synthetic shift at ts=16, trunc costs 0.075px of spread
+                // between +0.75 and -0.75 against 0.0025px with floor, because
+                // positive displacements interpolate while negative ones
+                // extrapolate. floor is the better numerical choice and it is
+                // not what python-p computes, so it goes.
+                const f32 base_x = std::trunc(fx);
+                const f32 base_y = std::trunc(fy);
                 f32 frac_x = fx - base_x;
                 int floor_off_x = (int)base_x;
                 f32 frac_y = fy - base_y;
@@ -989,14 +992,23 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             // every level and every shipped configuration -- circular padding
             // only guarantees divisibility at level 0.
             //
-            // Those uncovered tiles form a strip along the bottom and right
-            // edges. They used to be reset to zero motion, which the finest
-            // level could not recover: its search radius is 1, so a burst with
-            // any real handheld motion left that strip unaligned. Clamping to
-            // the nearest covered coarse tile hands them the neighbouring
-            // estimate instead, and the three-candidate test below still
-            // re-verifies it against the image. upscale_flow(), the sibling
-            // above, has always clamped.
+            // python-p zeroes those uncovered edge tiles outright
+            // (block_matching.py:298-302):
+            //     if (subtile_x >= repeatFactor*n_tiles_x_prev or
+            //         subtile_y >= repeatFactor*n_tiles_y_prev):
+            //         upsampledAlignments[...] = 0; return
+            // This port used to clamp to the nearest covered coarse tile
+            // instead, reasoning that zeroing left the bottom/right strip
+            // unaligned and the finest level's radius-1 search could not
+            // recover it. That is a real weakness of python-p's choice, but it
+            // IS python-p's choice, and a clamped tile inherits a flow from a
+            // tile that never covered it -- exactly the wrong-neighbour
+            // inheritance this session traced as a source of large bogus flow.
+            if (tx >= repeat_factor * in.nx || ty >= repeat_factor * in.ny) {
+                out.dx(ty, tx) = 0.f;
+                out.dy(ty, tx) = 0.f;
+                continue;
+            }
             const int prev_x = std::min(tx / repeat_factor, in.nx - 1);
             const int prev_y = std::min(ty / repeat_factor, in.ny - 1);
             const int ups_x = tx % repeat_factor;
@@ -1039,6 +1051,40 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                 if (dist < best_dist) {
                     best_dist = dist;
                     best_i = ci;
+                }
+            }
+            // HHSR_DUMP_UPS="ty,tx" (target-grid coords): print the 3
+            // candidates and their L1 costs for this tile, to see whether a
+            // wrong-neighbour win is a clear margin or a near-tie.
+            if (const char* du = std::getenv("HHSR_DUMP_UPS")) {
+                int uty = -1, utx = -1;
+                std::sscanf(du, "%d,%d", &uty, &utx);
+                if (uty == ty && utx == tx) {
+                    f32 costs[3];
+                    for (int ci = 0; ci < 3; ++ci) {
+                        f32 d = 0.f; bool ok = true;
+                        for (int i = 0; i < new_tile_size && ok; ++i)
+                            for (int j = 0; j < new_tile_size; ++j) {
+                                const int rx = ox + j, ry = oy + i;
+                                const int mx = rx + (int)cand[ci][0];
+                                const int my = ry + (int)cand[ci][1];
+                                if (!(rx >= 0 && rx < ref.w && ry >= 0 && ry < ref.h &&
+                                      mx >= 0 && mx < moving.w && my >= 0 && my < moving.h)) {
+                                    ok = false; break;
+                                }
+                                d += std::fabs(ref.at(ry, rx) - moving.at(my, mx));
+                            }
+                        costs[ci] = ok ? d : std::numeric_limits<f32>::infinity();
+                    }
+                    std::fprintf(stderr,
+                        "[dumpups] tile=(%d,%d) rf=%d parent=(%d,%d) candY=(%d,%d) candX=(%d,%d)\n"
+                        "          c0(parent)=(%.1f,%.1f) cost=%.6f\n"
+                        "          c1(vert)  =(%.1f,%.1f) cost=%.6f\n"
+                        "          c2(horiz) =(%.1f,%.1f) cost=%.6f  -> best=%d\n",
+                        ty, tx, repeat_factor, prev_y, prev_x, cand_y, prev_x, prev_y, cand_x,
+                        cand[0][0], cand[0][1], costs[0],
+                        cand[1][0], cand[1][1], costs[1],
+                        cand[2][0], cand[2][1], costs[2], best_i);
                 }
             }
             out.dx(ty, tx) = cand[best_i][0];
@@ -1143,8 +1189,29 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             dump_frame = std::atoi(f);
         if (dump_frame > 0 && dump_frame != s_dump_call) { dump_ty = -1; dump_tx = -1; }
     }
-    const int finest_ny = ref_grey.h / tile_size;
-    const int finest_nx = ref_grey.w / tile_size;
+    // Ancestor tile index at every level for the dumped finest-level tile.
+    // NOT a proportional rescale of the grid dims -- upscale_flow_460 maps a
+    // child tile t to parent t/repeat_factor, and repeat_factor depends on
+    // both bm_factors and the tile-size ratio, so a proportional map lands on
+    // the wrong tile at coarse levels (off by one for ts changes).
+    std::vector<int> anc_ty((size_t)std::max(1, nlev), -1);
+    std::vector<int> anc_tx((size_t)std::max(1, nlev), -1);
+    if (dump_ty >= 0 && nlev > 0) {
+        anc_ty[0] = dump_ty;
+        anc_tx[0] = dump_tx;
+        for (int lvl = 1; lvl < nlev; ++lvl) {
+            const int child_ts = (lvl - 1 < (int)cfg.bm_tile_sizes.size())
+                                 ? cfg.bm_tile_sizes[lvl - 1] : tile_size;
+            const int par_ts = (lvl < (int)cfg.bm_tile_sizes.size())
+                               ? cfg.bm_tile_sizes[lvl] : tile_size;
+            const int uf = (lvl < (int)cfg.bm_factors.size()) ? cfg.bm_factors[lvl] : 1;
+            const int tile_ratio = child_ts / std::max(1, par_ts);
+            int rf = uf / std::max(1, tile_ratio);
+            if (rf < 1) rf = 1;
+            anc_ty[lvl] = anc_ty[lvl - 1] / rf;
+            anc_tx[lvl] = anc_tx[lvl - 1] / rf;
+        }
+    }
 
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
@@ -1246,12 +1313,12 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg, cfg.num_threads);
 
-        if (dump_ty >= 0) {
-            int lty = std::min(flow.ny - 1, std::max(0, (dump_ty * flow.ny) / finest_ny));
-            int ltx = std::min(flow.nx - 1, std::max(0, (dump_tx * flow.nx) / finest_nx));
+        if (dump_ty >= 0 && lvl < (int)anc_ty.size() && anc_ty[lvl] >= 0) {
+            int lty = std::min(flow.ny - 1, std::max(0, anc_ty[lvl]));
+            int ltx = std::min(flow.nx - 1, std::max(0, anc_tx[lvl]));
             std::fprintf(stderr, "[dumpflow] call=%d lvl=%d grid=%dx%d ts=%d radius=%d "
-                                 "afterBM dx=%.2f dy=%.2f\n",
-                         s_dump_call, lvl, flow.ny, flow.nx, ts, radius,
+                                 "tile=(%d,%d) afterBM dx=%.2f dy=%.2f\n",
+                         s_dump_call, lvl, flow.ny, flow.nx, ts, radius, lty, ltx,
                          flow.dx(lty, ltx), flow.dy(lty, ltx));
         }
 
@@ -1267,9 +1334,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                                  ica_max_step(cfg, radius));
         }
 
-        if (dump_ty >= 0) {
-            int lty = std::min(flow.ny - 1, std::max(0, (dump_ty * flow.ny) / finest_ny));
-            int ltx = std::min(flow.nx - 1, std::max(0, (dump_tx * flow.nx) / finest_nx));
+        if (dump_ty >= 0 && lvl < (int)anc_ty.size() && anc_ty[lvl] >= 0) {
+            int lty = std::min(flow.ny - 1, std::max(0, anc_ty[lvl]));
+            int ltx = std::min(flow.nx - 1, std::max(0, anc_tx[lvl]));
             std::fprintf(stderr, "[dumpflow] call=%d lvl=%d grid=%dx%d "
                                  "afterICA dx=%.2f dy=%.2f\n",
                          s_dump_call, lvl, flow.ny, flow.nx,

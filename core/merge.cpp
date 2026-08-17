@@ -106,19 +106,20 @@ static inline f32 sample_robustness_nearest(const Image& robustness, f32 y, f32 
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
                                   f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
-    // math.modf: fractional part keeps sign of value
+    // math.modf: fractional part keeps sign of value (linalg.py interpolate_cov
+    // reads the fraction with modf, so a negative grey_pos gives a negative
+    // weight -- reproduced here rather than normalised).
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
-    int fx, fy;
-    if (raw_det) {
-        // Python accumulate: floor_x = max(int(kmap_j), 0) — no high clamp
-        fx = std::max((int)kmap_j, 0);
-        fy = std::max((int)kmap_i, 0);
-    } else {
-        // Python accumulate_ref: floor_x = int(max(math.floor(grey_pos), 0))
-        fx = std::max((int)std::floor(kmap_j), 0);
-        fy = std::max((int)std::floor(kmap_i), 0);
-    }
+    // BOTH python-p paths index with math.floor, not int()-truncation:
+    //   merge.py:451-452 (accumulate, comp)     floor_x = int(max(math.floor(grey_pos[1]), 0))
+    //   merge.py:171-172 (accumulate_ref, ref)  floor_x = int(max(math.floor(grey_pos[1]), 0))
+    // This port had the comp path on (int)kmap_j -- truncation -- which only
+    // agrees with floor for non-negative coordinates. grey_pos goes negative
+    // near the top/left edge, since it is (pos - 0.5)/2.
+    const int fx = std::max((int)std::floor(kmap_j), 0);
+    const int fy = std::max((int)std::floor(kmap_i), 0);
+    (void)raw_det;
     int cx = std::min(fx + 1, covs.w - 1), cy = std::min(fy + 1, covs.h - 1);
 
     const f32* tl = covs.at(fy, fx);
@@ -132,22 +133,26 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
         return top + frac_y * (bot - top);
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
-    if (raw_det) {
-        f32 det = xx * yy - xy * xy;
-        if (std::fabs(det) > 1e-10f) {
-            f32 inv_det = 1.f / det;
-            ixx =  inv_det * yy;
-            ixy = -inv_det * xy;
-            iyy =  inv_det * xx;
-        } else {
-            ixx = 1.f;
-            ixy = 0.f;
-            iyy = 1.f;
-        }
+    // Both python-p paths use the identical guard (merge.py:190-197 for
+    // accumulate_ref, merge.py:470-477 for accumulate):
+    //     if abs(det) > EPSILON_DIV: invert_2x2(...)
+    //     else:                      identity
+    // with EPSILON_DIV = 1e-10 (utils.py:21). No separate ref/comp variant.
+    f32 det = xx * yy - xy * xy;
+    if (std::fabs(det) > 1e-10f) {
+        f32 inv_det = 1.f / det;
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
     } else {
-        invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
+        ixx = 1.f;
+        ixy = 0.f;
+        iyy = 1.f;
     }
-    soften_inv_cov(ixx, ixy, iyy);
+    // No soften_inv_cov: python-p never bounds the inverted covariance. That
+    // guard capped |entries| at 32 to stop a near-singular inversion producing
+    // an infinitely sharp kernel (green/black speckle); python-p relies on the
+    // EPSILON_DIV check above alone, and matching it means dropping the cap.
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().

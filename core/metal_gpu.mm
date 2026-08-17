@@ -1546,36 +1546,30 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
         g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
+    // ONE curve shared by every guide channel, matching python-p: its
+    // std_curve/diff_curve are 1-D (brightness only, no channel axis) and are
+    // built from a single scalar alpha/beta. The concatenated 3-slot buffer
+    // layout is kept so rob_make_mask's std_curve[ch*p.curve_n + id] indexing
+    // is unchanged -- all three slots now just hold the same curve.
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
-        const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch)
-                                       : cfg.noise_alpha_robustness();
-        const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch)
-                                       : cfg.noise_beta_robustness();
+        const f32 a = cfg.noise_alpha_robustness();
+        const f32 b = cfg.noise_beta_robustness();
         if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b) curves_stale = true;
     }
     if (curves_stale) {
         std::vector<f32> std_all, diff_all;
         size_t n = 0;
+        std::vector<f32> std_curve, diff_curve;
+        fetch_noise_curves(cfg, std_curve, diff_curve);
+        if (std_curve.empty() || diff_curve.empty()) return Image();
+        n = std_curve.size();
+        std_all.resize(n * (size_t)curve_nch);
+        diff_all.resize(n * (size_t)curve_nch);
         for (int ch = 0; ch < curve_nch; ++ch) {
-            std::vector<f32> std_curve, diff_curve;
-            if (curve_nch == 3)
-                fetch_noise_curves_channel(cfg, ch, std_curve, diff_curve);
-            else
-                fetch_noise_curves(cfg, std_curve, diff_curve);
-            if (std_curve.empty() || diff_curve.empty()) return Image();
-            if (ch == 0) {
-                n = std_curve.size();
-                std_all.resize(n * (size_t)curve_nch);
-                diff_all.resize(n * (size_t)curve_nch);
-            } else if (std_curve.size() != n || diff_curve.size() != n) {
-                return Image();
-            }
             std::copy(std_curve.begin(), std_curve.end(), std_all.begin() + (size_t)ch * n);
             std::copy(diff_curve.begin(), diff_curve.end(), diff_all.begin() + (size_t)ch * n);
-            g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch)
-                                                     : cfg.noise_alpha_robustness();
-            g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch)
-                                                    : cfg.noise_beta_robustness();
+            g_rob_curve_alpha[ch] = cfg.noise_alpha_robustness();
+            g_rob_curve_beta[ch] = cfg.noise_beta_robustness();
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
@@ -1737,36 +1731,30 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
         g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
+    // ONE curve shared by every guide channel, matching python-p: its
+    // std_curve/diff_curve are 1-D (brightness only, no channel axis) and are
+    // built from a single scalar alpha/beta. The concatenated 3-slot buffer
+    // layout is kept so rob_make_mask's std_curve[ch*p.curve_n + id] indexing
+    // is unchanged -- all three slots now just hold the same curve.
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
-        const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch)
-                                       : cfg.noise_alpha_robustness();
-        const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch)
-                                       : cfg.noise_beta_robustness();
+        const f32 a = cfg.noise_alpha_robustness();
+        const f32 b = cfg.noise_beta_robustness();
         if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b) curves_stale = true;
     }
     if (curves_stale) {
         std::vector<f32> std_all, diff_all;
         size_t n = 0;
+        std::vector<f32> std_curve, diff_curve;
+        fetch_noise_curves(cfg, std_curve, diff_curve);
+        if (std_curve.empty() || diff_curve.empty()) return Image();
+        n = std_curve.size();
+        std_all.resize(n * (size_t)curve_nch);
+        diff_all.resize(n * (size_t)curve_nch);
         for (int ch = 0; ch < curve_nch; ++ch) {
-            std::vector<f32> std_curve, diff_curve;
-            if (curve_nch == 3)
-                fetch_noise_curves_channel(cfg, ch, std_curve, diff_curve);
-            else
-                fetch_noise_curves(cfg, std_curve, diff_curve);
-            if (std_curve.empty() || diff_curve.empty()) return Image();
-            if (ch == 0) {
-                n = std_curve.size();
-                std_all.resize(n * (size_t)curve_nch);
-                diff_all.resize(n * (size_t)curve_nch);
-            } else if (std_curve.size() != n || diff_curve.size() != n) {
-                return Image();
-            }
             std::copy(std_curve.begin(), std_curve.end(), std_all.begin() + (size_t)ch * n);
             std::copy(diff_curve.begin(), diff_curve.end(), diff_all.begin() + (size_t)ch * n);
-            g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch)
-                                                     : cfg.noise_alpha_robustness();
-            g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch)
-                                                    : cfg.noise_beta_robustness();
+            g_rob_curve_alpha[ch] = cfg.noise_alpha_robustness();
+            g_rob_curve_beta[ch] = cfg.noise_beta_robustness();
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
