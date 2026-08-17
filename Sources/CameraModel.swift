@@ -190,6 +190,15 @@ struct TuningParams: Equatable, Codable {
     /// because the noise model forgave it, or because the content genuinely
     /// is that flat/self-similar underneath.
     var debug_noise_model_disabled: Bool = false
+    /// Algorithm 6 (Wronski et al.), read literally: computes d^2/sigma^2/R
+    /// at RAW resolution (Dodgson-quadratic upscale + flow-warp of the
+    /// guide-resolution local stats) instead of directly at guide
+    /// resolution, which this port has always done. Only takes effect when
+    /// "Alignment Grey: FFT" below is OFF (Decimate) -- that path's flow
+    /// is already coarser than FFT's, so a guide-resolution mask on top
+    /// compounds two sources of lost precision instead of one. ~4x the
+    /// pixel count for the mask; unverified on-device.
+    var robustness_raw_resolution_enabled: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -245,7 +254,7 @@ struct TuningParams: Equatable, Codable {
         case align_ica_per_level_fft, use_neural_flow, chain_consistency_enabled
         case robustness_min_pool_radius, align_ambiguous_fallback_enabled
         case motion_magnitude_veto_enabled, motion_magnitude_veto_px
-        case debug_noise_model_disabled
+        case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -321,6 +330,7 @@ struct TuningParams: Equatable, Codable {
         motion_magnitude_veto_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_magnitude_veto_enabled) ?? motion_magnitude_veto_enabled
         motion_magnitude_veto_px = try c.decodeIfPresent(Float.self, forKey: .motion_magnitude_veto_px) ?? motion_magnitude_veto_px
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
+        robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1939,6 +1949,7 @@ final class CameraModel: NSObject, ObservableObject {
             "motion_magnitude_veto_enabled": NSNumber(value: tuningParams.motion_magnitude_veto_enabled),
             "motion_magnitude_veto_px": NSNumber(value: tuningParams.motion_magnitude_veto_px),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
+            "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)

@@ -862,7 +862,10 @@ struct MergeCompParams {
     uint cfa01;
     uint cfa10;
     uint cfa11;
-    uint _pad0;
+    // 1 = robustness is raw resolution this run (Config::
+    // robustness_raw_resolution_active), not guide -- skip the guide-scale
+    // conversion below (was _pad0).
+    uint raw_res_robustness;
     uint _pad1;
     uint _pad2;
     uint _pad3;
@@ -892,7 +895,10 @@ struct MergeRefParams {
     uint cfa11;
     uint adaptive;
     float max_frame_count;
-    uint _pad0;
+    // 1 = acc_rob is raw resolution this run (Config::
+    // robustness_raw_resolution_active) -- skip the guide-scale conversion
+    // below (was _pad0).
+    uint raw_res_robustness;
 };
 
 // std::lround half-away-from-zero.
@@ -1046,8 +1052,15 @@ static inline void merge_comp_contrib(device const float* img,
     float flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
     float flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
 
-    float rob_y = p.bayer ? (lr_y - 0.5f) / 2.f : lr_y;
-    float rob_x = p.bayer ? (lr_x - 0.5f) / 2.f : lr_x;
+    // p.raw_res_robustness: robustness is raw resolution this run (Config::
+    // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
+    // already -- skip the guide-scale conversion. See CPU accumulate_comp
+    // (merge.cpp) for the mirrored fix.
+    float rob_y = lr_y, rob_x = lr_x;
+    if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+        rob_y = (lr_y - 0.5f) / 2.f;
+        rob_x = (lr_x - 0.5f) / 2.f;
+    }
     float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
                                                rob_y, rob_x);
     // Nothing to accumulate where the frame is fully rejected. Every
@@ -1216,8 +1229,11 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
     int rad = 1;
     if (p.robustness_denoise) {
         // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
-        float acc_y = p.bayer ? (coarse_y - 0.5f) / 2.f : coarse_y;
-        float acc_x = p.bayer ? (coarse_x - 0.5f) / 2.f : coarse_x;
+        float acc_y = coarse_y, acc_x = coarse_x;
+        if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+            acc_y = (coarse_y - 0.5f) / 2.f;
+            acc_x = (coarse_x - 0.5f) / 2.f;
+        }
         int ay = min(max(lround_away(acc_y), 0), int(p.acc_h) - 1);
         int ax = min(max(lround_away(acc_x), 0), int(p.acc_w) - 1);
         local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
@@ -1869,6 +1885,16 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     int new_idy = lround_away(sample_y);
     bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
                     0 <= new_idy && new_idy < int(p.h));
+    // Eq. 6 aggregates each term into ONE scalar across channels first
+    // (sigma = sqrt(sum of per-channel variances); d/d_ms/d_md are bare
+    // per-pixel scalars, not per-channel), and only then applies max()/
+    // shrinkage once -- see the mirrored comment in apply_noise_model
+    // (robustness.cpp). Summing per-channel max(measured, noise-floor)
+    // instead of max-of-sums is not the same computation and is
+    // systematically more forgiving whenever which term dominates differs
+    // across channels (e.g. a colored edge).
+    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+    float d_ms_sq = 0.f, d_md_sq = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -1889,15 +1915,17 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        float sigma_p_sq = ref_vars[o];
-        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        float d_p_sq = d_p_ * d_p_;
-        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-        d_sq_ += d_p_sq * shrink * shrink;
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
     }
+    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    d_sq_ = d_ms_sq * shrink * shrink;
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -1995,6 +2023,108 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // actually used above.
     if (p.save_s_select != 0u)
         s_select[gid.y * p.w + gid.x] = (s <= p.r_s1) ? 1.f : 0.f;
+}
+
+struct RobMaskRawParams {
+    uint h, w, nch;
+    uint tile_size;
+    uint flow_ny, flow_nx;
+    uint curve_n;
+    float r_t;
+    float r_s1;
+    uint save_s_select;
+    uint ambiguous_enabled;
+    uint chain_reject_enabled;
+    float r_s_chain;
+    uint motion_magnitude_veto_enabled;
+    uint _pad0;
+    uint _pad1;
+};
+
+// Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
+// RAW resolution here (Dodgson-quadratic upscaled from guide resolution by
+// rob_upscale_dogson, comp_means additionally warped by the flow in that
+// same pass -- see rob_dogson in metal_gpu.mm), so this kernel needs no
+// guide/raw branching and no per-pixel flow-shift/bilinear-sample the way
+// rob_make_mask does: every raw pixel of comp_means already sits in the
+// reference's coordinate frame. See Config::robustness_raw_resolution_
+// enabled and the mirrored, more heavily-commented CPU implementation,
+// compute_robustness_raw_res in robustness.cpp.
+//
+// Deliberately narrower than rob_make_mask: no hf_reject/edge_reject/
+// aperture_limited support (compute_robustness_metal_impl only takes this
+// path when hf_artifact_removal_enabled, motion_edge_rejection_enabled and
+// flow_reject_1d_enabled are all off, so those inputs would be unused here
+// regardless).
+kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
+                              device const float* comp_means [[buffer(1)]],
+                              device const float* ref_means [[buffer(2)]],
+                              device const float* ref_vars [[buffer(3)]],
+                              device const float* std_curve [[buffer(4)]],
+                              device const float* diff_curve [[buffer(5)]],
+                              device const float* S [[buffer(6)]],
+                              constant RobMaskRawParams& p [[buffer(7)]],
+                              device float* s_select [[buffer(8)]],
+                              device const uint* match_ambiguous [[buffer(9)]],
+                              device const uint* chain_inconsistent [[buffer(10)]],
+                              device const uint* motion_magnitude_reject [[buffer(11)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    uint patch_idy = gid.y / p.tile_size;
+    uint patch_idx = gid.x / p.tile_size;
+    uint out_o = gid.y * p.w + gid.x;
+    if (patch_idy >= p.flow_ny || patch_idx >= p.flow_nx) {
+        R[out_o] = 0.f;
+        if (p.save_s_select != 0u) s_select[out_o] = 0.f;
+        return;
+    }
+    uint pidx = patch_idy * p.flow_nx + patch_idx;
+
+    // Same aggregate-then-max / aggregate-then-shrink as rob_make_mask's
+    // fixed form -- see the comment there and in apply_noise_model
+    // (robustness.cpp).
+    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        uint o = out_o * p.nch + ch;
+        float brightness = ref_means[o];
+        int id_noise = lround_away(1000.f * brightness);
+        if (!isfinite(brightness))
+            id_noise = 0;
+        else if (id_noise < 0)
+            id_noise = 0;
+        else if (id_noise >= int(p.curve_n))
+            id_noise = int(p.curve_n) - 1;
+        uint id = uint(id_noise);
+        uint curve_id = ch * p.curve_n + id;
+        float sigma_t = std_curve[curve_id];
+        float d_t = diff_curve[curve_id];
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
+        float comp = comp_means[o];
+        float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
+    }
+    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    float d_sq_ = d_ms_sq * shrink * shrink;
+
+    float s = S[pidx];
+    if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
+        s = min(s, p.r_s1);
+    if (p.chain_reject_enabled != 0u && chain_inconsistent[pidx] != 0u)
+        s = min(s, p.r_s_chain);
+    bool motion_magnitude_reject_tile =
+        p.motion_magnitude_veto_enabled != 0u &&
+        motion_magnitude_reject[pidx] != 0u;
+
+    float r_val = motion_magnitude_reject_tile
+        ? 0.f
+        : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
+    R[out_o] = r_val;
+    if (p.save_s_select != 0u)
+        s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
 }
 
 kernel void rob_local_min_5x5(device float* out [[buffer(0)]],

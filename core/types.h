@@ -669,6 +669,38 @@ struct Config {
     // measured legitimate parallax/rotation band (8-128px) and far below the
     // catastrophic clusters (200-300px) -- see motion_magnitude_veto_enabled.
     float motion_magnitude_veto_px = 150.0f;
+
+    // Algorithm 6 (Wronski et al.), read literally: R is allocated as
+    // Zeros(H,W) -- RAW resolution -- and gets there by Dodgson-quadratic
+    // upscaling the guide-resolution (H/2,W/2) local statistics, warping
+    // the comparison frame's stats by the flow in the process, THEN
+    // computing d^2/sigma^2/R. This C++ port has always computed d/sigma/R
+    // directly at guide resolution instead (matching the simplified
+    // 460-main reference rather than the paper-faithful python-z reference,
+    // which does implement this upscale via its own cuda_uspcale_dogson).
+    // The upscale itself already existed in this codebase (robustness.cpp's
+    // upscale_warp_stats / the Metal rob_dogson kernel) but was never wired
+    // into compute_robustness -- this toggle wires it in.
+    //
+    // Restricted to grey_method == Decimate: that path's flow field is
+    // already coarser than FFT's (real block matching only at half
+    // resolution, then duplicated 2x2 to fill the raw tile grid -- see
+    // flow_to_raw_tile_grid), so a guide-resolution robustness mask on top
+    // compounds two sources of lost precision instead of one; FFT's flow
+    // already carries native raw-tile-grid granularity, so the case for
+    // this is weaker there.
+    //
+    // Off by default: ~4x the pixel count for R and the new upscale
+    // buffers, unverified on-device, and merge.cpp's R-sampling coordinate
+    // math has to know which resolution R actually is this run.
+    bool robustness_raw_resolution_enabled = false;
+    // True when the raw-resolution path should actually run this call --
+    // single place both conditions live, so robustness.cpp, merge.cpp and
+    // the Metal dispatch code in metal_gpu.mm can't drift out of step on
+    // which one gates it.
+    bool robustness_raw_resolution_active() const {
+        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
+    }
     // Raw-pixel closure-error magnitude above which a tile is flagged. Below
     // this, the two independent measurements are considered to agree.
     float chain_closure_threshold_px = 6.0f;

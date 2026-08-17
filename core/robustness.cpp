@@ -723,7 +723,20 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            f32 d_sq_ = 0.f, sigma_sq_ = 0.f;
+            // Eq. 6 aggregates each term into ONE scalar across channels
+            // first (sigma = sqrt(sum of per-channel variances), Eq 6's d/
+            // d_ms/d_md are bare per-pixel scalars, not per-channel), and
+            // only then applies max()/shrinkage once. Summing per-channel
+            // max(measured, noise-floor) instead of max-of-sums is not the
+            // same computation: max(a,b) >= a and >= b always, so
+            // sum(max(a_c,b_c)) >= max(sum(a_c), sum(b_c)) in every case,
+            // strictly greater whenever which term dominates differs across
+            // channels (e.g. a colored edge: real structure in one channel,
+            // near-zero in the others). That inflates sigma^2, which shrinks
+            // d^2/sigma^2 and makes R more forgiving than Eq. 6 specifies
+            // exactly in that mixed-channel-dominance case.
+            f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+            f32 d_ms_sq = 0.f, d_md_sq = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -738,13 +751,15 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                f32 sigma_p_sq = ref_vars.at(y, x, ch);
-                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                sigma_ms_sq += ref_vars.at(y, x, ch);
+                sigma_md_sq += sigma_t * sigma_t;
                 f32 d_p_ = d_p.at(y, x, ch);
-                f32 d_p_sq = d_p_ * d_p_;
-                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                d_sq_ += d_p_sq * shrink * shrink;
+                d_ms_sq += d_p_ * d_p_;
+                d_md_sq += d_t * d_t;
             }
+            f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
+            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+            f32 d_sq_ = d_ms_sq * shrink * shrink;
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }
@@ -756,7 +771,8 @@ static std::vector<uint32_t> compute_tile_residual_high(const Image& d_sq,
                                                         const FlowField& flow,
                                                         int tile_size,
                                                         int guide_channels,
-                                                        f32 residual_threshold) {
+                                                        f32 residual_threshold,
+                                                        bool already_raw_res = false) {
     const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     std::vector<uint32_t> out(n_tiles, 0u);
     if (n_tiles == 0 || tile_size <= 0 || !std::isfinite(residual_threshold))
@@ -767,7 +783,11 @@ static std::vector<uint32_t> compute_tile_residual_high(const Image& d_sq,
     for (int y = 0; y < d_sq.h; ++y) {
         for (int x = 0; x < d_sq.w; ++x) {
             int ty, tx;
-            if (guide_channels == 3) {
+            // already_raw_res: d_sq/sigma_sq were computed directly at raw
+            // resolution (Config::robustness_raw_resolution_active), so the
+            // guide->raw 2x+0.5 conversion below would double-scale them --
+            // a plain tile_size divide is already the raw tile grid.
+            if (!already_raw_res && guide_channels == 3) {
                 ty = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 tx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
             } else {
@@ -886,8 +906,172 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         local_stats_3x3(lp_guide, lp_means, lp_vars);
         st.hf_loss = high_frequency_loss_map_adaptive(st.means, st.stds, lp_vars, cfg);
     }
+    if (cfg.robustness_raw_resolution_active()) {
+        // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
+        // never warps the reference's own stats -- only Gn's). Once per
+        // burst here, not once per comparison frame.
+        st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
+                                            0, cfg.num_threads);
+        st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
+                                           0, cfg.num_threads);
+    }
     return st;
 #endif
+}
+
+// Algorithm 6, read literally: d^2/sigma^2/R computed at RAW resolution,
+// reached by Dodgson-quadratic upscaling the guide-resolution local stats
+// (warping the comparison frame's stats by the flow in the process) rather
+// than computing everything directly at guide resolution the way
+// compute_robustness below does. See Config::robustness_raw_resolution_
+// enabled for why this exists and why it's decimate-only; RefStats::
+// means_hires/stds_hires for the reference side (upscaled once per burst in
+// init_robustness, not once per comparison frame).
+//
+// hf_artifact_removal_enabled's noise floor still reads ref_stats.hf_loss,
+// which is guide-resolution (its own Dodgson upscale would be a further
+// feature, not built here) -- mapped down from the raw pixel to its parent
+// guide pixel for that one lookup. Neither that nor motion_edge_rejection_
+// enabled are the common case this toggle is meant for; both stay correct,
+// just at their existing granularity rather than the new one.
+static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
+                                        const FlowField& flow, int tile_size,
+                                        const Config& cfg, Image* s_select_out) {
+    if (ref_stats.means_hires.h <= 0 || ref_stats.means_hires.w <= 0 ||
+        ref_stats.stds_hires.h <= 0 || ref_stats.stds_hires.w <= 0) {
+        // init_robustness didn't populate the hires stats (e.g. robustness
+        // was off when the burst started and got toggled mid-burst) --
+        // no raw-res path to run.
+        return Image();
+    }
+
+    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
+    if (ref_stats.means.c == 3) {
+        for (int ch = 0; ch < 3; ++ch)
+            nc_ch[ch] = &make_noise_curves_channel(cfg, ch);
+    } else {
+        nc_ch[0] = &make_noise_curves(cfg);
+    }
+
+    // Comparison frame's own local stats, still built at guide resolution
+    // (compute_guide/local_stats_3x3 are unchanged) -- only the upscale step
+    // is new. is_ref=false: warped by the flow during the upscale, so every
+    // raw pixel of comp_means already sits in the reference's coordinate
+    // frame -- no separate shift-and-bilinear-sample afterward. comp_vars_
+    // guide is a byproduct of local_stats_3x3 but, like the guide-resolution
+    // path above, is never read -- apply_noise_model only ever uses the
+    // REFERENCE's variance (ref_vars), so it isn't worth its own upscale pass.
+    Image guide = compute_guide(comp_raw, cfg);
+    Image comp_means_guide, comp_vars_guide;
+    local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
+    Image comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
+                                          tile_size, cfg.num_threads);
+
+    const Image& ref_means = ref_stats.means_hires;
+    const Image& ref_vars = ref_stats.stds_hires;
+    const int h = ref_means.h, w = ref_means.w;
+    const int nch = ref_means.c;
+    if (comp_means.h != h || comp_means.w != w || comp_means.c != nch)
+        return Image();
+
+    Image d_p(h, w, nch);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            for (int ch = 0; ch < nch; ++ch) {
+                const f32 comp = comp_means.at(y, x, ch);
+                d_p.at(y, x, ch) = std::isfinite(comp)
+                    ? std::fabs(ref_means.at(y, x, ch) - comp)
+                    : std::numeric_limits<f32>::infinity();
+            }
+        }
+    }
+
+    Image d_sq, sigma_sq;
+    apply_noise_model(d_p, ref_means, ref_vars, nc_ch, d_sq, sigma_sq);
+    std::vector<uint32_t> tile_residual_high;
+    if (cfg.flow_reject_1d_enabled) {
+        tile_residual_high = compute_tile_residual_high(
+            d_sq, sigma_sq, flow, tile_size, ref_stats.means.c,
+            cfg.flow_reject_1d_residual_threshold, /*already_raw_res=*/true);
+    }
+
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                   (cfg.motion_edge_rejection_enabled ||
+                                    cfg.hf_artifact_removal_enabled)
+                                       ? &motion_irregular
+                                       : nullptr);
+    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
+
+    const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
+
+    Image R(h, w, 1);
+    if (s_select_out) *s_select_out = Image(h, w, 1);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            // Raw resolution throughout -- a plain tile_size divide is
+            // already the raw tile grid, no guide->raw rescale needed.
+            const int patch_idy = y / tile_size;
+            const int patch_idx = x / tile_size;
+            const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
+            if (patch_idy < 0 || patch_idy >= flow.ny ||
+                patch_idx < 0 || patch_idx >= flow.nx) {
+                R.at(y, x) = 0.f;
+                if (s_select_out) s_select_out->at(y, x) = 0.f;
+                continue;
+            }
+            f32 s = S[pidx];
+            f32 sig = sigma_sq.at(y, x);
+            const f32 ratio = (sig > 0.f && std::isfinite(sig))
+                ? d_sq.at(y, x) / sig
+                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
+            const bool residual_high =
+                std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
+            (void)residual_high;
+            const int gy = std::min(std::max(y / 2, 0), std::max(0, ref_stats.hf_loss.h - 1));
+            const int gx = std::min(std::max(x / 2, 0), std::max(0, ref_stats.hf_loss.w - 1));
+            const bool hf_reject =
+                cfg.hf_artifact_removal_enabled &&
+                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
+                have_hf_loss &&
+                ref_stats.hf_loss.at(gy, gx) > cfg.hf_variance_loss_threshold;
+            // comp_means is already warped into the reference's coordinate
+            // frame (the Dodgson upscale above), so the "moved" position for
+            // the edge-strength neighbourhood lookup is just (y,x) again.
+            const bool edge_reject =
+                motion_edge_reject(ref_means, comp_means, motion_irregular,
+                                   pidx, y, x, y, x, ratio, cfg);
+            const bool aperture_limited =
+                cfg.flow_reject_1d_enabled &&
+                pidx < flow.aperture_limited.size() &&
+                pidx < tile_residual_high.size() &&
+                flow.aperture_limited[pidx] != 0u &&
+                tile_residual_high[pidx] != 0u;
+            if (aperture_limited) s = std::min(s, cfg.r_s1);
+            const bool match_ambiguous =
+                cfg.flow_reject_ambiguous_enabled &&
+                pidx < flow.match_ambiguous.size() &&
+                flow.match_ambiguous[pidx] != 0u;
+            if (match_ambiguous) s = std::min(s, cfg.r_s1);
+            const bool chain_inconsistent =
+                cfg.chain_consistency_enabled &&
+                pidx < flow.chain_inconsistent.size() &&
+                flow.chain_inconsistent[pidx] != 0u;
+            if (chain_inconsistent) s = std::min(s, cfg.r_s_chain);
+            const bool motion_magnitude_reject =
+                cfg.motion_magnitude_veto_enabled &&
+                pidx < flow.motion_magnitude_reject.size() &&
+                flow.motion_magnitude_reject[pidx] != 0u;
+            const bool hard_reject = hf_reject || edge_reject || motion_magnitude_reject;
+            f32 r_val = hard_reject
+                ? 0.f
+                : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            R.at(y, x) = r_val;
+            if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
+        }
+    }
+    return local_min_pool(R, cfg.robustness_min_pool_radius);
 }
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
@@ -920,6 +1104,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     if (gpu.h > 0 && gpu.w > 0) return gpu;
     return Image();
 #else
+    if (cfg.robustness_raw_resolution_active()) {
+        Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
+                                                    cfg, s_select_out);
+        if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
+        // Falls through to the guide-resolution path below if the hires ref
+        // stats weren't populated (e.g. robustness was off when the burst
+        // started).
+    }
 
     // One curve per guide channel (3 for Bayer, matching R/(G1+G2)/2/B; 1
     // otherwise) rather than one curve shared by all channels -- see

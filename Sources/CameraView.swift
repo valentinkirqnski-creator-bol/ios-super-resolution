@@ -781,6 +781,17 @@ struct CameraView: View {
              flat/self-similar. Diagnostic only -- leave off for normal use.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
+        Text("""
+             Algorithm 6 (Wronski et al.), read literally: computes the robustness mask at \
+             raw resolution (Dodgson-quadratic upscale + flow-warp of the guide-resolution \
+             local stats) instead of directly at guide resolution, which this port has always \
+             done -- finer than a guide pixel is finer than this mask could previously ever \
+             draw a rejection boundary. Only takes effect with "Alignment Grey: FFT" below \
+             turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count for \
+             the mask itself; experimental and unverified on-device.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body
