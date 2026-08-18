@@ -9,7 +9,7 @@ information about merge safety", independent of tuning.
 import os, sys
 import numpy as np
 import torch
-from train_rob import (RobNet, classical_R, data, n_frames, IN_CH, GH, GW)
+from train_rob import (RobNet, classical_R, data, n_frames, n_train, IN_CH, GH, GW)
 
 SC = os.path.dirname(os.path.abspath(__file__))
 ck = torch.load(os.path.join(SC, "robnet.pt"), weights_only=False)
@@ -55,7 +55,7 @@ def det_at_fp(R, bad, target):
     th = np.quantile(g, target)             # reject the lowest-R good fraction
     return float((R[bad] < th).mean())
 
-frames = [n_frames - 1, n_frames - 2, 0]
+frames = list(range(n_train, n_frames))[:3]   # held-out reference only
 rows = []
 for fi in frames:
     ev = np.asarray(data[fi, ::2, ::2, :], dtype=np.float32)

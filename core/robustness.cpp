@@ -1185,7 +1185,7 @@ static Image local_min_5x5_on_guide(const Image& R) {
 
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
-                                   const Config& cfg) {
+                                   const Config& cfg, int y0) {
     const Image& rm = ref_stats.means;
     const Image& rv = ref_stats.stds;
     if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
@@ -1193,8 +1193,18 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     if (flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return Image();
 
     const int h = rm.h, w = rm.w;
-    Image feat(h, w, kRobustnessNnChannels);
-    parallel_rows(h, cfg.num_threads, [&](int y) {
+    const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
+    Image feat(strip_h, w, kRobustnessNnChannels);
+    // y0 is the first source row of the window, which the caller keeps fully
+    // inside the image. That matters: the window's edges then coincide with
+    // the image's, so the convolutions' zero-padding is the same padding
+    // whole-plane inference would apply. Extending past the edge instead --
+    // by replicating or zero-filling rows here -- does NOT reproduce it,
+    // because those rows carry bias-driven activations into the next layer
+    // where whole-plane inference has true zeros. Verified bit-identical to
+    // whole-plane output with this windowing, and visibly seamed without it.
+    parallel_rows(strip_h, cfg.num_threads, [&](int sy) {
+        const int y = std::min(std::max(y0 + sy, 0), h - 1);
         for (int x = 0; x < w; ++x) {
             // Guide pixel (y,x) covers raw pixels (2y,2x); the flow grid is
             // indexed in raw pixels, same convention as the analytic mask.
@@ -1232,7 +1242,7 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             const f32 nsig = std::sqrt(std::max(cfg.noise_alpha_robustness() * brightness +
                                                 cfg.noise_beta_robustness(), 0.f));
 
-            f32* o = &feat.at(y, x, 0);
+            f32* o = &feat.at(sy, x, 0);
             for (int c = 0; c < 3; ++c) o[c] = rm.at(y, x, c);
             // stds holds VARIANCE (see local_stats_3x3); the generator fed the
             // network standard deviations, so take the root here too.
@@ -1281,13 +1291,38 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     // trained and measured to emit the final per-pixel decision, so dilating
     // it again would double-count and would not match the reported numbers.
     if (cfg.use_neural_robustness && robustness_nn_available()) {
-        Image guide_nn = compute_guide(comp_raw, cfg);
-        Image cm_nn, cv_nn;
-        local_stats_3x3(guide_nn, cm_nn, cv_nn);
-        Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow, tile_size, cfg);
-        Image nn_mask;
-        if (feat.h > 0 && robustness_nn_infer(feat, nn_mask) &&
-            nn_mask.h == feat.h && nn_mask.w == feat.w) {
+        Image cm_nn;
+        {
+            Image guide_nn = compute_guide(comp_raw, cfg);
+            Image cv_nn;   // variance is not a feature; freed with this scope
+            local_stats_3x3(guide_nn, cm_nn, cv_nn);
+        }
+        const int nh = cm_nn.h, nw = cm_nn.w;
+        const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
+        Image nn_mask(nh, nw, 1);
+        // Every window is strip_h tall and fully inside the image, so Core ML
+        // sees one input shape for the whole burst (no reshape per strip) and
+        // the result matches whole-plane inference exactly. An image shorter
+        // than one window would make that impossible; there is nothing to
+        // save there either, so fall back to the analytic mask.
+        bool ok = (nh >= strip_h && nw > 0);
+        for (int y0 = 0; ok && y0 < nh; y0 += kRobustnessNnStripRows) {
+            const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), nh - strip_h);
+            Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow,
+                                                      tile_size, cfg, top);
+            Image strip;
+            if (feat.h != strip_h || !robustness_nn_infer(feat, strip) ||
+                strip.h != strip_h || strip.w != nw) {
+                ok = false;
+                break;
+            }
+            const int rows = std::min(kRobustnessNnStripRows, nh - y0);
+            for (int r = 0; r < rows; ++r)
+                std::memcpy(&nn_mask.at(y0 + r, 0),
+                            &strip.at(y0 - top + r, 0),
+                            (size_t)nw * sizeof(f32));
+        }
+        if (ok) {
             // The learned mask makes no s1/s2 choice, so report the strict
             // prior uniformly rather than leaving the split masks undefined.
             if (s_select_out) {

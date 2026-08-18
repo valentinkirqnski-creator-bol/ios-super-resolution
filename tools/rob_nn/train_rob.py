@@ -15,8 +15,8 @@ import torch
 import torch.nn as nn
 
 SC = os.path.dirname(os.path.abspath(__file__))
-PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset_train")
-NCH, GH, GW = 15, 1512, 2016
+PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset2")
+NCH, GH, GW = 16, 1512, 2016
 IN_CH = 13          # channels 0..12 are inputs; 13 = harm, 14 = ideal R
 
 meta = {}
@@ -28,14 +28,17 @@ n_pixels = meta["pixels"]
 n_frames = n_pixels // (GH * GW)
 data = np.memmap(PREFIX + ".f32", dtype=np.float32, mode="r",
                  shape=(n_frames, GH, GW, NCH))
-print(f"dataset: {n_frames} frames x {GH}x{GW} x {NCH}ch")
+N_HOLD = int(os.environ.get("ROB_HOLDOUT", 6))
+n_train = max(1, n_frames - N_HOLD)
+print(f"dataset: {n_frames} frames x {GH}x{GW} x {NCH}ch "
+      f"({n_train} train, {n_frames - n_train} held out)")
 
 # ---------------------------------------------------------------- normalisation
 # Flow is in raw pixels and can reach the hundreds; the statistics are in
 # [0,1]. Without this the flow channels would dominate the first layer purely
 # by scale. Constants are baked into the exported model so inference needs no
 # external table.
-sub = np.asarray(data[::max(1, n_frames // 4), ::16, ::16, :], dtype=np.float32)
+sub = np.asarray(data[:n_train:max(1, n_train // 4), ::16, ::16, :], dtype=np.float32)
 mu = sub[..., :IN_CH].reshape(-1, IN_CH).mean(0)
 sd = sub[..., :IN_CH].reshape(-1, IN_CH).std(0) + 1e-6
 print("input mean:", np.array2string(mu, precision=3))
@@ -81,7 +84,7 @@ def sample_batch(bs=16, ps=96, rng=None):
     rng = rng or np.random
     xs, ys = [], []
     for _ in range(bs):
-        f = rng.randint(n_frames)
+        f = rng.randint(n_train)
         y0 = rng.randint(GH - ps); x0 = rng.randint(GW - ps)
         p = np.asarray(data[f, y0:y0 + ps, x0:x0 + ps, :], dtype=np.float32)
         xs.append((p[..., :IN_CH] - mu) / sd)
@@ -113,7 +116,7 @@ if __name__ == "__main__":
 
     # ------------------------------------------------------------- evaluation
     # Held-out frame, full field, both masks scored against ground truth.
-    ev = np.asarray(data[n_frames - 1, ::2, ::2, :], dtype=np.float32)
+    ev = np.asarray(data[n_frames - 1, ::2, ::2, :], dtype=np.float32)  # held out
     ideal = ev[..., 14]
     bad = ideal < 0.5              # ground truth: merging here does damage
     print(f"\nheld-out frame: {bad.mean()*100:.2f}% of pixels should be rejected")

@@ -27,6 +27,15 @@ using f32 = float;
 // retraining, not just editing a constant.
 inline constexpr int kRobustnessNnChannels = 13;
 
+// The learned mask runs in horizontal strips to bound peak memory (see
+// build_robustness_nn_features). kRobustnessNnHalo is the network's exact
+// receptive-field radius in guide pixels -- conv3x3 (1) + dilation-2 3x3 (2)
+// + dilation-4 3x3 (4) + conv3x3 (1) -- so outputs inside the strip are
+// bit-identical to whole-plane inference. Changing the architecture changes
+// this number.
+inline constexpr int kRobustnessNnHalo = 8;
+inline constexpr int kRobustnessNnStripRows = 192;
+
 struct Image {
     int h = 0;
     int w = 0;

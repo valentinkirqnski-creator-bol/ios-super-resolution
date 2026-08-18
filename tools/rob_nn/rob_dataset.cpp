@@ -90,7 +90,27 @@ struct Xform {
     }
 };
 
-Image synth_frame(const Image& ref, const Xform& X, const Config& cfg, uint32_t seed) {
+// A rectangle of the comparison frame filled with content copied from
+// elsewhere in the reference: a stand-in for the scene changing between
+// frames -- an object moving in, an occlusion, a light flicker. Without
+// these the training set contains only camera motion, and a net trained on
+// it would learn "the flow looks plausible, therefore merge", which is
+// exactly the mistake that ghosts a moving subject.
+struct OccRect { int y0, y1, x0, x1, sy, sx; };
+
+bool in_rect(const std::vector<OccRect>& rs, float y, float x, int* which = nullptr) {
+    for (size_t i = 0; i < rs.size(); ++i) {
+        const OccRect& r = rs[i];
+        if (y >= (float)r.y0 && y < (float)r.y1 && x >= (float)r.x0 && x < (float)r.x1) {
+            if (which) *which = (int)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+Image synth_frame(const Image& ref, const Xform& X, const Config& cfg, uint32_t seed,
+                  const std::vector<OccRect>& occ) {
     Image out(ref.h, ref.w, 1);
     const float alpha = cfg.noise_alpha(), beta = cfg.noise_beta();
     // Deterministic per row so thread count can never change the data.
@@ -99,7 +119,15 @@ Image synth_frame(const Image& ref, const Xform& X, const Config& cfg, uint32_t 
         std::normal_distribution<float> gauss(0.f, 1.f);
         for (int x = 0; x < ref.w; ++x) {
             float sy, sx;
-            X.inv((float)y, (float)x, sy, sx);
+            int oi = 0;
+            if (in_rect(occ, (float)y, (float)x, &oi)) {
+                // Unrelated content, kept on the same Bayer phase so the
+                // patch is still a valid mosaic rather than a colour shift.
+                sy = (float)(y + occ[oi].sy);
+                sx = (float)(x + occ[oi].sx);
+            } else {
+                X.inv((float)y, (float)x, sy, sx);
+            }
             float v = sample_phase(ref, sy, sx, y & 1, x & 1);
             // Heteroscedastic sensor noise: var = alpha*signal + beta. The
             // reference already carries its own noise, so this is the second
@@ -193,25 +221,87 @@ int main(int argc, char** argv) {
             const uint32_t seed = (uint32_t)(ri * 1000 + fi + 1);
             std::mt19937 rng(seed);
             std::uniform_real_distribution<float> u(-1.f, 1.f);
+            std::uniform_real_distribution<float> u01(0.f, 1.f);
+
+            // Mix the motion regimes rather than training on rotation alone:
+            // a third of the frames are near-still hand tremor (the regime the
+            // published tuning was validated on), a third moderate, a third the
+            // deliberate rotation this burst actually exhibits. A net that only
+            // ever saw large motion would treat small motion as suspicious.
+            const float regime = u01(rng);
+            const float rot_scale = (regime < 0.33f) ? 0.05f : (regime < 0.66f ? 0.4f : 1.f);
+            const float sh_scale  = (regime < 0.33f) ? 0.03f : (regime < 0.66f ? 0.4f : 1.f);
             Xform X;
-            const float theta = u(rng) * rot_max_deg * (float)M_PI / 180.f;
+            const float theta = u(rng) * rot_max_deg * rot_scale * (float)M_PI / 180.f;
             X.cos_t = std::cos(theta); X.sin_t = std::sin(theta);
             X.cy = 0.5f * (float)ref.h; X.cx = 0.5f * (float)ref.w;
-            X.ty = u(rng) * shift_max_px; X.tx = u(rng) * shift_max_px;
+            X.ty = u(rng) * shift_max_px * sh_scale;
+            X.tx = u(rng) * shift_max_px * sh_scale;
 
-            Image comp = synth_frame(ref, X, work, seed);
+            // Scene changes: a handful of rectangles showing unrelated content.
+            std::vector<OccRect> occ;
+            const int n_occ = (int)(u01(rng) * 4.f);
+            for (int k = 0; k < n_occ; ++k) {
+                const int hgt = 64 + (int)(u01(rng) * 400.f);
+                const int wid = 64 + (int)(u01(rng) * 400.f);
+                OccRect r;
+                r.y0 = (int)(u01(rng) * (float)(ref.h - hgt - 1));
+                r.x0 = (int)(u01(rng) * (float)(ref.w - wid - 1));
+                r.y0 &= ~1; r.x0 &= ~1;          // keep Bayer phase
+                r.y1 = r.y0 + hgt; r.x1 = r.x0 + wid;
+                // Source offset stays even and in bounds for the whole rect.
+                r.sy = (((int)(u(rng) * 600.f)) & ~1);
+                r.sx = (((int)(u(rng) * 600.f)) & ~1);
+                if (r.y0 + r.sy < 0) r.sy = -r.y0;
+                if (r.y1 + r.sy >= ref.h) r.sy = ref.h - 1 - r.y1;
+                if (r.x0 + r.sx < 0) r.sx = -r.x0;
+                if (r.x1 + r.sx >= ref.w) r.sx = ref.w - 1 - r.x1;
+                r.sy &= ~1; r.sx &= ~1;
+                occ.push_back(r);
+            }
+
+            Image comp = synth_frame(ref, X, work, seed, occ);
             Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
             FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, ts, 0.f, 0.f, 0.f);
             flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w,
                                          ts, work.r_Mt, work.num_threads,
                                          work.grey_tile_size(ts));
 
+            // Deliberate flow corruption across the full error spectrum.
+            // Left to itself the aligner produces whichever errors it happens
+            // to make, which under-samples both ends: near-perfect tiles and
+            // catastrophic ones. Training needs the whole range, and needs it
+            // balanced, or the net only learns to score the middle. The
+            // magnitudes below span "indistinguishable from correct" to the
+            // 100+ px failures measured on this burst.
+            {
+                std::mt19937 crng(seed * 7919u + 13u);
+                std::uniform_real_distribution<float> c01(0.f, 1.f);
+                std::uniform_real_distribution<float> ang(0.f, 6.2831853f);
+                long long n_cor = 0;
+                for (int ty = 0; ty < flow.ny; ++ty)
+                    for (int tx = 0; tx < flow.nx; ++tx) {
+                        const float k = c01(crng);
+                        float mag;
+                        if      (k < 0.45f) continue;              // leave as aligned
+                        else if (k < 0.60f) mag = 0.3f + c01(crng) * 1.7f;    // subpixel..2px
+                        else if (k < 0.75f) mag = 2.f + c01(crng) * 8.f;      // 2..10px
+                        else if (k < 0.90f) mag = 10.f + c01(crng) * 40.f;    // 10..50px
+                        else                mag = 50.f + c01(crng) * 200.f;   // 50..250px
+                        const float a = ang(crng);
+                        flow.dx(ty, tx) += mag * std::cos(a);
+                        flow.dy(ty, tx) += mag * std::sin(a);
+                        ++n_cor;
+                    }
+                (void)n_cor;
+            }
+
             Image comp_guide = compute_guide(comp, work);
             Image comp_means, comp_vars;
             local_stats(comp_guide, comp_means, comp_vars);
 
             // Per-guide-pixel features and label.
-            const int NCH = 15;   // 13 inputs + harm + R_ideal
+            const int NCH = 16;   // 13 inputs + harm + R_ideal + flow error
             std::vector<float> rec((size_t)gh * gw * NCH, 0.f);
             const float alpha = work.noise_alpha(), beta = work.noise_beta();
             double sum_harm = 0.0; double sum_err = 0.0; size_t n_bad = 0;
@@ -236,6 +326,13 @@ int main(int argc, char** argv) {
                     // so error in structure finer than the guide's 3x3-mean
                     // support (the rod case) is preserved in the label even
                     // though it is invisible to d_ms.
+                    // Content that is not in the comparison frame at all
+                    // cannot be merged from it, whatever the flow says. The
+                    // fetch-vs-correct-fetch comparison below cannot see this
+                    // on its own: both sides would read the same covering
+                    // patch and agree. Ground truth knows, so mark it.
+                    const bool occluded = in_rect(occ, ty_, tx_);
+
                     float harm = 0.f, noise_sig = 0.f;
                     for (int i = 0; i < 2; ++i)
                         for (int j = 0; j < 2; ++j) {
@@ -253,7 +350,8 @@ int main(int argc, char** argv) {
                     // sensor would have produced anyway, falling off past it.
                     const float z = harm / std::max(noise_sig, 1e-6f);
                     const float z0 = 2.0f;
-                    const float r_ideal = std::exp(-(z * z) / (z0 * z0));
+                    const float r_ideal = occluded ? 0.f
+                                                   : std::exp(-(z * z) / (z0 * z0));
 
                     // Local flow span M, the same 3x3 tile statistic the
                     // classical mask uses for its motion prior.
@@ -286,17 +384,21 @@ int main(int argc, char** argv) {
                                             // dependence Wronski warned about
                     o[13] = harm;
                     o[14] = r_ideal;
+                    // Analysis only -- never an input. Lets evaluation bin
+                    // detection by how wrong the flow actually was.
+                    o[15] = std::sqrt((fex - ftx) * (fex - ftx) +
+                                      (fey - fty) * (fey - fty));
 
-                    if (harm > 3.f * noise_sig) { ++n_bad; }
+                    if (occluded || harm > 3.f * noise_sig) { ++n_bad; }
                     sum_harm += harm; sum_err += std::fabs(fex - ftx) + std::fabs(fey - fty);
                 }
             });
             std::fwrite(rec.data(), sizeof(float), rec.size(), fout);
             total_written += (size_t)gh * gw;
             const double npx = (double)gh * gw;
-            std::printf("[ref %zu frame %d] rot=%+.3fdeg shift=(%+.1f,%+.1f) "
-                        "meanFlowErr=%.2fpx  harm>3sigma: %.2f%%\n",
-                        ri, fi, theta * 180.f / (float)M_PI, X.tx, X.ty,
+            std::printf("[ref %zu frame %d] rot=%+.3fdeg shift=(%+.1f,%+.1f) occ=%d "
+                        "meanFlowErr=%.2fpx  unmergeable: %.2f%%\n",
+                        ri, fi, theta * 180.f / (float)M_PI, X.tx, X.ty, n_occ,
                         sum_err / npx, 100.0 * (double)n_bad / npx);
         }
     }
@@ -304,10 +406,10 @@ int main(int argc, char** argv) {
     // Sidecar so the trainer needs no arguments to interpret the blob.
     const std::string meta_path = out_prefix + ".meta";
     if (FILE* mf = std::fopen(meta_path.c_str(), "w")) {
-        std::fprintf(mf, "guide_h %d\nguide_w %d\nchannels 15\npixels %zu\n",
+        std::fprintf(mf, "guide_h %d\nguide_w %d\nchannels 16\npixels %zu\n",
                      gh_all, gw_all, total_written);
         std::fclose(mf);
     }
-    std::printf("wrote %s (%zu guide pixels x 15 ch)\n", bin_path.c_str(), total_written);
+    std::printf("wrote %s (%zu guide pixels x 16 ch)\n", bin_path.c_str(), total_written);
     return 0;
 }

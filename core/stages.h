@@ -148,9 +148,23 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 // the two must be read side by side to stay in step. Channels 9-12 are the
 // ones the analytic mask cannot use, and are why the network can reject a
 // tile whose photometry looks innocent.
+// Built one horizontal strip at a time. A 32-channel intermediate tensor at
+// guide resolution is ~390 MB, and Core ML holds several at once, so running
+// the network on the whole plane costs over a gigabyte on top of a burst
+// pipeline already holding several 12 MP frames -- which is a jetsam kill,
+// not a slowdown. The weights are tiny; the activations are not.
+//
+// Emits exactly kRobustnessNnStripRows + 2 * kRobustnessNnHalo rows starting
+// at source row y0, so every window has the same shape and Core ML never
+// reshapes mid-burst. The caller must keep the whole window inside the image
+// (clamping y0 near the bottom rather than padding past it): the window's
+// edges then coincide with the image's, making the convolutions' zero-padding
+// identical to whole-plane inference. Padding past the edge does not, because
+// those rows would feed bias-driven activations into the next layer where
+// whole-plane inference has true zeros -- measured as visible strip seams.
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
-                                   const Config& cfg);
+                                   const Config& cfg, int y0);
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,

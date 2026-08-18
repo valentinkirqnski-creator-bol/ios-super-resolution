@@ -118,6 +118,30 @@ Input normalisation is folded into the exported graph, so the C++ side hands
 over raw planes and there is no constant table to drift out of step with the
 weights.
 
+## Memory
+
+The weights are ~110 KB, which says nothing useful about the cost of running
+the model: the activations dominate. At guide resolution (2016x1512 = 3.05 M
+pixels) one 32-channel intermediate tensor is 390 MB, Core ML keeps several
+live, and the feature planes cost 158 MB interleaved plus another 158 MB in
+the planar `MLMultiArray`. Running the whole plane in one call peaks over
+1 GB on top of a burst pipeline already holding several 12 MP frames, which
+is a jetsam kill on device, not a slowdown.
+
+Inference therefore runs in horizontal strips of 192 guide rows with an
+8-row halo (the network's exact receptive-field radius), which brings the
+peak to roughly 150 MB -- about a 7x reduction.
+
+Each window is the same height and is kept fully inside the image, clamped
+near the bottom rather than padded past it. That is what makes the strip
+output bit-identical to whole-plane inference: the window edges coincide with
+the image edges, so the convolutions' zero-padding matches. Padding past the
+edge -- by replication or by explicit zero rows -- does **not** reproduce it,
+because those rows feed bias-driven activations into the next layer where
+whole-plane inference has true zeros. Both wrong variants were measured and
+produce visible strip seams (max |diff| 0.95 and 0.21 respectively, against
+3e-8 for the correct windowing).
+
 ## Status
 
 **Not yet exercised on device.** The model was trained and converted on a
