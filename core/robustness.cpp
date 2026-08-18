@@ -1189,6 +1189,15 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     const Image& rm = ref_stats.means;
     const Image& rv = ref_stats.stds;
     if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
+    // Dimensions are not enough. On the Metal path init_robustness returns a
+    // RefStats with h/w/c filled and the pixel vectors EMPTY -- the statistics
+    // stay resident on the GPU. Indexing that reads off the end of an empty
+    // vector on every pixel, which is an out-of-bounds read on the first
+    // comparison frame, not a graceful failure. Check the storage, not the
+    // shape.
+    if (rm.data.size() < (size_t)rm.h * rm.w * rm.c ||
+        rv.data.size() < (size_t)rv.h * rv.w * rv.c)
+        return Image();
     if (comp_means.h != rm.h || comp_means.w != rm.w || comp_means.c != 3) return Image();
     if (flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return Image();
 
@@ -1291,6 +1300,20 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     // trained and measured to emit the final per-pixel decision, so dilating
     // it again would double-count and would not match the reported numbers.
     if (cfg.use_neural_robustness && robustness_nn_available()) {
+#ifdef __APPLE__
+        // See metal_fetch_host_ref_stats: on this path the reference stats are
+        // GPU-resident by design, so bring them across before building
+        // features from them. One readback per burst, not per frame -- the
+        // copy stays in ref_stats.
+        RefStats* mutable_stats = const_cast<RefStats*>(&ref_stats);
+        if (mutable_stats->means.data.empty() &&
+            !metal_fetch_host_ref_stats(*mutable_stats)) {
+            // Could not get them; the analytic path below reads the same
+            // statistics straight from the GPU and is unaffected.
+            return compute_robustness_metal(comp_raw, ref_stats, flow, tile_size,
+                                            cfg, s_select_out);
+        }
+#endif
         Image cm_nn;
         {
             Image guide_nn = compute_guide(comp_raw, cfg);

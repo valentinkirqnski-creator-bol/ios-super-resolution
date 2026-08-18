@@ -1495,6 +1495,24 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     return st;
 }
 
+bool metal_fetch_host_ref_stats(RefStats& ref_stats) {
+    if (!g_rob_ref_m || !g_rob_ref_v) return false;
+    if (g_rob_ref_h <= 0 || g_rob_ref_w <= 0 || g_rob_ref_c <= 0) return false;
+    const size_t bytes = (size_t)g_rob_ref_h * (size_t)g_rob_ref_w *
+                         (size_t)g_rob_ref_c * sizeof(float);
+    if (g_rob_ref_bytes != bytes) return false;
+    // The stats are produced by a command buffer that was committed without a
+    // wait, so make sure it has landed before reading the contents.
+    if (!metal_merge_wait_inflight()) return false;
+    Image m(g_rob_ref_h, g_rob_ref_w, g_rob_ref_c);
+    Image v(g_rob_ref_h, g_rob_ref_w, g_rob_ref_c);
+    memcpy(m.data.data(), [g_rob_ref_m contents], bytes);
+    memcpy(v.data.data(), [g_rob_ref_v contents], bytes);
+    ref_stats.means = std::move(m);
+    ref_stats.stds = std::move(v);
+    return true;
+}
+
 void metal_release_host_ref_stats(RefStats& ref_stats) {
     // Keep h/w/c for dimension checks; drop ~2× full-res 3ch float host copies.
     const int mh = ref_stats.means.h, mw = ref_stats.means.w, mc = ref_stats.means.c;
