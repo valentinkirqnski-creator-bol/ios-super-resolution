@@ -102,10 +102,25 @@ def sample_batch(bs=16, ps=96, rng=None):
     return x, y
 
 def weighted_loss(pred, target):
-    """Rejection is rare (a few percent of pixels), so an unweighted loss is
-    minimised by predicting 1 everywhere -- exactly the failure being fixed."""
-    w = 1.0 + 8.0 * (1.0 - target)
-    return (w * (pred - target) ** 2).mean()
+    """Rejection is the minority class, so some upweighting is needed or the
+    loss is minimised by predicting 1 everywhere. But too much of it is worse:
+    at weight 8 the trained mask never emitted a value above 0.9 anywhere in a
+    real 12 MP burst -- it hedged at ~0.5 across the whole frame. AUC stayed
+    high (0.95) because ranking was fine, but the merge consumes the VALUE, not
+    the rank, so a uniform half-weight barely changed the picture. Weight 2
+    keeps the class balance correction without destroying calibration.
+
+    The extra term penalises hedging directly: predictions are pushed toward
+    the ends of [0,1] in proportion to how confident the target is, so
+    "definitely merge" and "definitely reject" stay reachable."""
+    w = 1.0 + 2.0 * (1.0 - target)
+    mse = (w * (pred - target) ** 2).mean()
+    confident = (target > 0.9) | (target < 0.1)
+    if confident.any():
+        # distance from the nearest end, only where ground truth is decisive
+        hedge = torch.min(pred[confident], 1.0 - pred[confident])
+        return mse + 0.30 * hedge.mean()
+    return mse
 
 if __name__ == "__main__":
     torch.manual_seed(0)
