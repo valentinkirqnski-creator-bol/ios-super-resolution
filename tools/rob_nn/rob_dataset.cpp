@@ -228,9 +228,18 @@ int main(int argc, char** argv) {
             // published tuning was validated on), a third moderate, a third the
             // deliberate rotation this burst actually exhibits. A net that only
             // ever saw large motion would treat small motion as suspicious.
-            const float regime = u01(rng);
-            const float rot_scale = (regime < 0.33f) ? 0.05f : (regime < 0.66f ? 0.4f : 1.f);
-            const float sh_scale  = (regime < 0.33f) ? 0.03f : (regime < 0.66f ? 0.4f : 1.f);
+            // Systematic coverage rather than random draws, so every
+            // combination is guaranteed present in every reference's frames
+            // instead of merely likely. Cycling on the frame index crosses
+            // four motion levels -- including a genuinely static camera, where
+            // the only frame-to-frame difference is noise and aliasing and the
+            // mask must NOT reject -- with occlusion counts from none to many.
+            static const float kRot[6]   = {0.f, 0.05f, 0.4f, 1.f, 1.f, 0.4f};
+            static const float kShift[6] = {0.f, 0.03f, 0.4f, 1.f, 1.f, 0.4f};
+            static const int   kOcc[6]   = {0,   0,     2,    0,   4,   6};
+            const int cfg_i = fi % 6;
+            const float rot_scale = kRot[cfg_i];
+            const float sh_scale  = kShift[cfg_i];
             Xform X;
             const float theta = u(rng) * rot_max_deg * rot_scale * (float)M_PI / 180.f;
             X.cos_t = std::cos(theta); X.sin_t = std::sin(theta);
@@ -240,7 +249,7 @@ int main(int argc, char** argv) {
 
             // Scene changes: a handful of rectangles showing unrelated content.
             std::vector<OccRect> occ;
-            const int n_occ = (int)(u01(rng) * 4.f);
+            const int n_occ = kOcc[cfg_i];
             for (int k = 0; k < n_occ; ++k) {
                 const int hgt = 64 + (int)(u01(rng) * 400.f);
                 const int wid = 64 + (int)(u01(rng) * 400.f);

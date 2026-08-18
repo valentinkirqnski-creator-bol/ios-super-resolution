@@ -61,21 +61,29 @@ def classical_R(px, s1=2.0, s2=12.0, t=0.12, Mt=0.8):
 
 # ---------------------------------------------------------------------- model
 class RobNet(nn.Module):
-    """Fully convolutional, dilated so the receptive field reaches ~30 raw px.
+    """Depthwise-separable, dilated. Receptive field 7 guide px = ~28 raw px.
 
-    The classical mask is a pointwise function of a 3x3 statistic, which is
-    why it cannot tell a tile that disagrees with its neighbours from one that
-    does not. Dilation is the cheapest way to give the decision that context
-    without a resolution pyramid.
+    The analytic mask is a pointwise function of a 3x3 statistic, which is why
+    it cannot tell a tile that disagrees with its neighbours from one that does
+    not. Dilation buys that context without a resolution pyramid.
+
+    Separable rather than dense because this runs per comparison frame over the
+    whole guide plane, where cost is set by pixels, not parameters: a dense
+    32-channel stack is 26.8k MAC/px -- 490 GMAC for a 6-frame burst, which
+    blows a 1-second budget. Factoring each 3x3 into depthwise + pointwise and
+    halving the width gives 1.4k MAC/px (26 GMAC/burst, 19x less) for the same
+    receptive field. Width 16 is also a multiple of the ANE tile width, so the
+    channel dimension packs without waste.
     """
-    def __init__(self, cin=IN_CH, w=32):
+    def __init__(self, cin=IN_CH, w=16):
         super().__init__()
+        def block(d):
+            return [nn.Conv2d(w, w, 3, padding=d, dilation=d, groups=w),
+                    nn.Conv2d(w, w, 1), nn.ReLU(inplace=True)]
         self.net = nn.Sequential(
-            nn.Conv2d(cin, w, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(w, w, 3, padding=2, dilation=2), nn.ReLU(inplace=True),
-            nn.Conv2d(w, w, 3, padding=4, dilation=4), nn.ReLU(inplace=True),
-            nn.Conv2d(w, w // 2, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(w // 2, 1, 1),
+            nn.Conv2d(cin, w, 1), nn.ReLU(inplace=True),
+            *block(1), *block(2), *block(4),
+            nn.Conv2d(w, 1, 1),
         )
     def forward(self, x):
         return torch.sigmoid(self.net(x))
