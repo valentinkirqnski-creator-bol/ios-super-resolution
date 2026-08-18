@@ -324,22 +324,6 @@ struct Config {
     // ok/ burst when this toggle first existed. Kernel estimation's GAT and
     // SNR tuning keep reading the ungated accessors above; only the mask's
     // own curve builds and noise floors read these.
-    // ImageStackAlignator's (kunzmi) noise model for the robustness mask,
-    // replacing Wronski's Monte-Carlo curves:
-    //   sigma_t^2 = alpha'*mu + beta'   evaluated analytically at the local
-    //               mean, per channel (alpha' carries the guide-quad weight,
-    //               which for green is kunzmi's /sqrt(2) exactly);
-    //   shrink    = sigma_p^2 / (sigma_p^2 + sigma_t^2)  applied to d_p --
-    //               the measured-variance Wiener form, with NO d_t term.
-    // Dropping d_t is the substantive change: Wronski's d_t is simulated
-    // from TOTAL per-frame noise, but fixed-pattern components (PRNU, row
-    // noise) are identical across a burst and cancel in the frame
-    // difference, so d_t systematically overestimates real difference noise
-    // and over-forgives misalignment. kunzmi's form never models the
-    // difference at all. Per-channel max(sigma_p, sigma_t) instead of
-    // sum-then-max, matching his kernel. Eq. 19's cross-channel l2 and the
-    // s1/s2 motion prior are kept from the Wronski structure.
-    bool noise_model_kunzmi = true;
     bool debug_noise_model_disabled = false;
     // Undo factor for the white balance baked into the loaded raw, per CFA
     // colour -- the robustness guide divides by the WB gain so its statistics

@@ -452,29 +452,8 @@ void fetch_noise_curves(f32 alpha, f32 beta,
 // Only the Metal robustness-mask host consumes these two, so they honour the
 // mask-only noise-model kill switch; SNR reads noise_std_at_brightness, which
 // stays ungated.
-// kunzmi mode: bake the analytic sigma_t(b) = sqrt(alpha'*b + beta') into the
-// std curve so the Metal kernels evaluate it through their existing lookup;
-// diff curve is zeroed (no d_t in kunzmi's model -- the kernels ignore it in
-// that mode anyway).
-static void fill_analytic_curves(f32 alpha, f32 beta,
-                                 std::vector<f32>& std_curve,
-                                 std::vector<f32>& diff_curve) {
-    const int n = k_n_brightness + 1;
-    std_curve.resize((size_t)n);
-    diff_curve.assign((size_t)n, 0.f);
-    for (int i = 0; i < n; ++i) {
-        const f32 b = (f32)i / (f32)k_n_brightness;
-        std_curve[(size_t)i] = std::sqrt(std::max(0.f, alpha * b + beta));
-    }
-}
-
 void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
-    if (cfg.noise_model_kunzmi && !cfg.debug_pixel4a_noise_profile) {
-        fill_analytic_curves(cfg.noise_alpha_robustness(), cfg.noise_beta_robustness(),
-                             std_curve, diff_curve);
-        return;
-    }
     const NoiseCurves& nc = mask_noise_curves(cfg);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
@@ -482,12 +461,6 @@ void fetch_noise_curves(const Config& cfg,
 
 void fetch_noise_curves_channel(const Config& cfg, int ch,
                                 std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
-    if (cfg.noise_model_kunzmi && !cfg.debug_pixel4a_noise_profile) {
-        fill_analytic_curves(cfg.noise_alpha_ch_robustness(ch),
-                             cfg.noise_beta_ch_robustness(ch),
-                             std_curve, diff_curve);
-        return;
-    }
     const NoiseCurves& nc = mask_noise_curves_channel(cfg, ch);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
@@ -774,41 +747,10 @@ static Image upscale_warp_stats(const Image& guide_stats,
 // alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
 // make_noise_curves_channel.
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq,
-                              const Config& cfg) {
+                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
-    if (cfg.noise_model_kunzmi) {
-        // kunzmi (RobustnessModell.cu): analytic sigma_t^2 = alpha'*mu+beta',
-        // per-channel max, and the measured-variance Wiener shrink
-        // d' = d * sigma_p^2/(sigma_p^2 + sigma_t^2). No d_t anywhere.
-        f32 a_ch[3] = {0,0,0}, b_ch[3] = {0,0,0};
-        for (int c = 0; c < n_ch && c < 3; ++c) {
-            a_ch[c] = cfg.noise_alpha_ch_robustness(c);
-            b_ch[c] = cfg.noise_beta_ch_robustness(c);
-        }
-        parallel_rows(ref_means.h, cfg.num_threads, [&](int y) {
-            for (int x = 0; x < ref_means.w; ++x) {
-                f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
-                for (int ch = 0; ch < n_ch; ++ch) {
-                    f32 mu = ref_means.at(y, x, ch);
-                    if (!std::isfinite(mu)) mu = 0.f;
-                    const f32 st_sq = std::max(0.f, a_ch[ch] * mu + b_ch[ch]);
-                    const f32 sp_sq = std::max(0.f, ref_vars.at(y, x, ch));
-                    sigma_sq_ += std::max(sp_sq, st_sq);
-                    const f32 dp = d_p.at(y, x, ch);
-                    const f32 denom = sp_sq + st_sq;
-                    const f32 shrink = (denom > 0.f) ? sp_sq / denom : 1.f;
-                    const f32 dc = dp * shrink;
-                    d_sq_ += dc * dc;
-                }
-                d_sq.at(y, x) = d_sq_;
-                sigma_sq.at(y, x) = sigma_sq_;
-            }
-        });
-        return;
-    }
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
             // Eq. 6 aggregates each term into ONE scalar across channels
@@ -867,41 +809,10 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
-                                    Image& d_sq, Image& sigma_sq, int num_threads,
-                                    const Config& cfg) {
+                                    Image& d_sq, Image& sigma_sq, int num_threads) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
-    if (cfg.noise_model_kunzmi) {
-        f32 a_ch[3] = {0,0,0}, b_ch[3] = {0,0,0};
-        for (int c = 0; c < n_ch && c < 3; ++c) {
-            a_ch[c] = cfg.noise_alpha_ch_robustness(c);
-            b_ch[c] = cfg.noise_beta_ch_robustness(c);
-        }
-        parallel_rows(ref_means.h, num_threads, [&](int y) {
-            for (int x = 0; x < ref_means.w; ++x) {
-                f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
-                for (int ch = 0; ch < n_ch; ++ch) {
-                    f32 mu = ref_means.at(y, x, ch);
-                    if (!std::isfinite(mu)) mu = 0.f;
-                    const f32 st_sq = std::max(0.f, a_ch[ch] * mu + b_ch[ch]);
-                    const f32 sp_sq = std::max(0.f, ref_vars.at(y, x, ch));
-                    sigma_sq_ += std::max(sp_sq, st_sq);
-                    const f32 comp = comp_means.at(y, x, ch);
-                    const f32 dp = std::isfinite(comp)
-                        ? std::fabs(ref_means.at(y, x, ch) - comp)
-                        : std::numeric_limits<f32>::infinity();
-                    const f32 denom = sp_sq + st_sq;
-                    const f32 shrink = (denom > 0.f) ? sp_sq / denom : 1.f;
-                    const f32 dc = dp * shrink;
-                    d_sq_ += dc * dc;
-                }
-                d_sq.at(y, x) = d_sq_;
-                sigma_sq.at(y, x) = sigma_sq_;
-            }
-        });
-        return;
-    }
     parallel_rows(ref_means.h, num_threads, [&](int y) {
         for (int x = 0; x < ref_means.w; ++x) {
             f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
@@ -1161,7 +1072,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
 
     Image d_sq, sigma_sq;
     apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
-                            cfg.num_threads, cfg);
+                            cfg.num_threads);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(
@@ -1362,7 +1273,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq, cfg);
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(

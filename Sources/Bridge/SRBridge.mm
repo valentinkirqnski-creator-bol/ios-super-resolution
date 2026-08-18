@@ -411,8 +411,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
     if (tuning[@"use_neural_flow"])
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
-    if (tuning[@"noise_model_kunzmi"])
-        cfg.noise_model_kunzmi = tuning[@"noise_model_kunzmi"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
         cfg.debug_noise_model_disabled = tuning[@"debug_noise_model_disabled"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])

@@ -145,14 +145,6 @@ struct TuningParams: Equatable, Codable {
     /// same robustness/merge math either way. Falls back to the classical
     /// path per-frame if the model isn't bundled or fails to load.
     var use_neural_flow: Bool = false
-    /// ImageStackAlignator's (kunzmi) noise model for the robustness mask:
-    /// analytic sigma_t = sqrt(alpha*mu + beta) at the local mean instead of
-    /// Monte-Carlo curves, and the Wiener shrink built from the MEASURED
-    /// local variance (sigma_p^2/(sigma_p^2 + sigma_t^2)) with no d_t term.
-    /// Dropping d_t matters: it is simulated from TOTAL per-frame noise, but
-    /// fixed-pattern noise cancels in frame differences, so d_t over-forgives
-    /// real misalignment. On by default; turn off for Wronski's curve model.
-    var noise_model_kunzmi: Bool = true
     /// Debug: zero the noise model as read by the robustness mask ONLY.
     /// R is then scored from the raw measured local variance and the raw
     /// (unshrunk) pixel difference. SNR auto-tune, the alignment tile size
@@ -223,7 +215,6 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
         case align_ica_per_level_fft, use_neural_flow
-        case noise_model_kunzmi
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -294,7 +285,6 @@ struct TuningParams: Equatable, Codable {
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
-        noise_model_kunzmi = try c.decodeIfPresent(Bool.self, forKey: .noise_model_kunzmi) ?? noise_model_kunzmi
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -1909,7 +1899,6 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
-            "noise_model_kunzmi": NSNumber(value: tuningParams.noise_model_kunzmi),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),

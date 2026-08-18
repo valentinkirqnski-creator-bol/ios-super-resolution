@@ -1507,7 +1507,7 @@ struct RobMaskParams {
     float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
-    uint kunzmi;  // 1 = analytic sigma_t + measured-variance shrink (was _pad1)
+    uint _pad1;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1896,36 +1896,18 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         // channel. See Config::noise_alpha_ch/noise_beta_ch (types.h).
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
+        float d_t = diff_curve[curve_id];
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        if (p.kunzmi != 0u) {
-            // kunzmi: per-channel max + measured-variance Wiener shrink,
-            // sigma_t here is the ANALYTIC sqrt(alpha'*mu+beta') the host
-            // bakes into std_curve. No d_t.
-            float st_sq = sigma_t * sigma_t;
-            float sp_sq = max(0.f, ref_vars[o]);
-            sigma_ms_sq += max(sp_sq, st_sq);
-            float denom = sp_sq + st_sq;
-            float shrink_c = (denom > 0.f) ? sp_sq / denom : 1.f;
-            float dc = d_p_ * shrink_c;
-            d_ms_sq += dc * dc;
-        } else {
-            float d_t = diff_curve[curve_id];
-            sigma_ms_sq += ref_vars[o];
-            sigma_md_sq += sigma_t * sigma_t;
-            d_ms_sq += d_p_ * d_p_;
-            d_md_sq += d_t * d_t;
-        }
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
     }
-    if (p.kunzmi != 0u) {
-        sigma_sq_ = sigma_ms_sq;   // already per-channel maxed
-        d_sq_ = d_ms_sq;           // already shrunk per channel
-    } else {
-        sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-        float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-        d_sq_ = d_ms_sq * shrink * shrink;
-    }
+    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    d_sq_ = d_ms_sq * shrink * shrink;
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -2023,7 +2005,7 @@ struct RobMaskRawParams {
     uint chain_reject_enabled;
     float r_s_chain;
     uint motion_magnitude_veto_enabled;
-    uint kunzmi;  // 1 = analytic sigma_t + measured-variance shrink (was _pad0)
+    uint _pad0;
     uint _pad1;
 };
 
@@ -2084,35 +2066,17 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint id = uint(id_noise);
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
+        float d_t = diff_curve[curve_id];
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        if (p.kunzmi != 0u) {
-            // See rob_make_mask: analytic sigma_t, per-channel max,
-            // measured-variance shrink, no d_t.
-            float st_sq = sigma_t * sigma_t;
-            float sp_sq = max(0.f, ref_vars[o]);
-            sigma_ms_sq += max(sp_sq, st_sq);
-            float denom = sp_sq + st_sq;
-            float shrink_c = (denom > 0.f) ? sp_sq / denom : 1.f;
-            float dc = d_p_ * shrink_c;
-            d_ms_sq += dc * dc;
-        } else {
-            float d_t = diff_curve[curve_id];
-            sigma_ms_sq += ref_vars[o];
-            sigma_md_sq += sigma_t * sigma_t;
-            d_ms_sq += d_p_ * d_p_;
-            d_md_sq += d_t * d_t;
-        }
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
     }
-    float sigma_sq_, d_sq_;
-    if (p.kunzmi != 0u) {
-        sigma_sq_ = sigma_ms_sq;
-        d_sq_ = d_ms_sq;
-    } else {
-        sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-        float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-        d_sq_ = d_ms_sq * shrink * shrink;
-    }
+    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    float d_sq_ = d_ms_sq * shrink * shrink;
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
