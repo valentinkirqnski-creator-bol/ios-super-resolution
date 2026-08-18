@@ -60,7 +60,19 @@ void robustness_nn_release_buffers() {
 bool robustness_nn_infer(const Image& feat, Image& out) {
     MLModel* model = load_model();
     if (!model) return false;
-    if (feat.h <= 0 || feat.w <= 0 || feat.c != kRobustnessNnChannels) return false;
+    if (feat.h <= 0 || feat.w <= 0 || feat.c != kRobustnessNnChannels) {
+        // This was a bare `return false`, and it is the path that fires
+        // whenever the feature layout has moved on but the bundled .mlmodelc
+        // has not. Silently falling back to the analytic mask there is
+        // indistinguishable, from the outside, from the learned mask running
+        // and simply not helping -- which cost real debugging time. Say it.
+        NSLog(@"[robustness_nn] feature/model mismatch: built %d channels at "
+              @"%dx%d, model expects %d. Using the ANALYTIC mask -- the "
+              @"bundled model predates the current feature set and must be "
+              @"retrained and re-exported.",
+              feat.c, feat.w, feat.h, kRobustnessNnChannels);
+        return false;
+    }
 
     // os_proc_available_memory reports what this process may still allocate
     // before the per-process limit, which is the number that decides a jetsam
