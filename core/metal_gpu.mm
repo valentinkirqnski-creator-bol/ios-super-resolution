@@ -1285,9 +1285,10 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        gp.wb0 = cfg.white_balance[0];
-        gp.wb1 = cfg.white_balance[1];
-        gp.wb2 = cfg.white_balance[2];
+        // WB UNDO factors (see rob_guide_bayer): sensor-space guide.
+        gp.wb0 = cfg.guide_wb_undo(0);
+        gp.wb1 = cfg.guide_wb_undo(1);
+        gp.wb2 = cfg.guide_wb_undo(2);
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];

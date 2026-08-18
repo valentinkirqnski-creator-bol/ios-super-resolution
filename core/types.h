@@ -325,17 +325,45 @@ struct Config {
     // SNR tuning keep reading the ungated accessors above; only the mask's
     // own curve builds and noise floors read these.
     bool debug_noise_model_disabled = false;
+    // Undo factor for the white balance baked into the loaded raw, per CFA
+    // colour -- the robustness guide divides by the WB gain so its statistics
+    // live in SENSOR space (ImageStackAlignator's "undo whitebalance when
+    // computing guide images"). Two things only sensor space gets right:
+    // the Monte-Carlo noise curve models sensor clipping at 1.0, which is
+    // where the un-WB'd data actually clips (WB'd red clips at ~2.0, past
+    // the curve's whole axis); and the cross-channel l2 in Eq. 19 weights
+    // all three channels in native units instead of amplifying red/blue
+    // evidence by their WB gains squared.
+    float guide_wb_undo(int c) const {
+        if (!raw_prewhitened) return 1.f;
+        const float g = noise_wb_gain(c);
+        return (std::isfinite(g) && g > 0.f) ? 1.f / g : 1.f;
+    }
+    // Robustness-mask noise accessors: SENSOR space (no WB gain), matching
+    // the un-WB'd guide above; only the guide-quad weight remains (two
+    // greens averaged). Gated by debug_noise_model_disabled. GAT/SNR keep
+    // the WB-scaled noise_alpha()/noise_beta() -- their inputs stay WB'd.
     float noise_alpha_robustness() const {
-        return debug_noise_model_disabled ? 0.f : noise_alpha();
+        if (debug_noise_model_disabled) return 0.f;
+        float s = 0.f;
+        for (int c = 0; c < 3; ++c)
+            s += alpha_dng[c] * noise_guide_weight(c);
+        return s / 3.f;
     }
     float noise_beta_robustness() const {
-        return debug_noise_model_disabled ? 0.f : noise_beta();
+        if (debug_noise_model_disabled) return 0.f;
+        float s = 0.f;
+        for (int c = 0; c < 3; ++c)
+            s += beta_dng[c] * noise_guide_weight(c);
+        return s / 3.f;
     }
     float noise_alpha_ch_robustness(int c) const {
-        return debug_noise_model_disabled ? 0.f : noise_alpha_ch(c);
+        if (debug_noise_model_disabled || c < 0 || c > 2) return 0.f;
+        return alpha_dng[c] * noise_guide_weight(c);
     }
     float noise_beta_ch_robustness(int c) const {
-        return debug_noise_model_disabled ? 0.f : noise_beta_ch(c);
+        if (debug_noise_model_disabled || c < 0 || c > 2) return 0.f;
+        return beta_dng[c] * noise_guide_weight(c);
     }
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness

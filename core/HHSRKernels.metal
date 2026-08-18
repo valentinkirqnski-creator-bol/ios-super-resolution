@@ -1605,8 +1605,13 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
             cnt[c] += 1u;
         }
     }
+    // p.wb0..2 carry the WB UNDO factor (1/gain per channel, 1.0 when the
+    // raw was not pre-whitebalanced): the guide's statistics live in sensor
+    // space -- see Config::guide_wb_undo and compute_guide in robustness.cpp,
+    // which this mirrors.
+    float undo[3] = {p.wb0, p.wb1, p.wb2};
     for (uint c = 0u; c < 3u; ++c)
-        guide[o + c] = (cnt[c] > 0u) ? sum[c] / float(cnt[c]) : 0.f;
+        guide[o + c] = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
 }
 
 // Parameters for the high-frequency variance-loss map.
