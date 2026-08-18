@@ -1185,9 +1185,9 @@ static Image local_min_5x5_on_guide(const Image& R) {
 
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
-                                   const Config& cfg, int y0) {
-    const Image& rm = ref_stats.means;
-    const Image& rv = ref_stats.stds;
+                                   const Config& cfg, int y0, bool raw_res) {
+    const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
+    const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
     if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
     // Dimensions are not enough. On the Metal path init_robustness returns a
     // RefStats with h/w/c filled and the pixel vectors EMPTY -- the statistics
@@ -1228,8 +1228,11 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             // channels are sampled bilinearly between tile centres. This does
             // not change what the merge fetches; only what the mask reasons
             // about.
-            const f32 tcy = (2.f * (f32)y) / (f32)tile_size - 0.5f;
-            const f32 tcx = (2.f * (f32)x) / (f32)tile_size - 0.5f;
+            // At raw resolution a pixel IS a raw pixel, so the tile index is a
+            // plain divide; at guide resolution it covers two.
+            const f32 pos_scale = raw_res ? 1.f : 2.f;
+            const f32 tcy = (pos_scale * (f32)y) / (f32)tile_size - 0.5f;
+            const f32 tcx = (pos_scale * (f32)x) / (f32)tile_size - 0.5f;
             const int t0y = (int)std::floor(tcy), t0x = (int)std::floor(tcx);
             const f32 ay = tcy - (f32)t0y, ax = tcx - (f32)t0x;
             auto tclamp = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
@@ -1273,8 +1276,14 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
 
             // Comparison statistics sampled where the flow points, in guide
             // units (half the raw displacement), matching the generator.
-            const int qy = std::min(std::max((int)std::lround((f32)y + 0.5f * fy), 0), h - 1);
-            const int qx = std::min(std::max((int)std::lround((f32)x + 0.5f * fx), 0), w - 1);
+            // upscale_warp_stats has already applied the flow when building the
+            // hires comparison statistics, so at raw resolution the correct
+            // sample sits at (y,x); shifting again would double-apply it.
+            int qy = y, qx = x;
+            if (!raw_res) {
+                qy = std::min(std::max((int)std::lround((f32)y + 0.5f * fy), 0), h - 1);
+                qx = std::min(std::max((int)std::lround((f32)x + 0.5f * fx), 0), w - 1);
+            }
 
             f32 brightness = 0.f;
             for (int c = 0; c < 3; ++c) brightness += rm.at(y, x, c);
@@ -1347,11 +1356,26 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                                             cfg, s_select_out);
         }
 #endif
+        // Honour the raw-resolution toggle. Previously this hook ran before the
+        // raw-res dispatch and always returned a 3 MP mask, so enabling that
+        // setting alongside the learned mask silently did nothing.
+        const bool nn_raw = cfg.robustness_raw_resolution_active() &&
+                            ref_stats.means_hires.h > 0 &&
+                            ref_stats.means_hires.data.size() ==
+                                (size_t)ref_stats.means_hires.h *
+                                ref_stats.means_hires.w * ref_stats.means_hires.c;
         Image cm_nn;
         {
             Image guide_nn = compute_guide(comp_raw, cfg);
             Image cv_nn;   // variance is not a feature; freed with this scope
             local_stats_3x3(guide_nn, cm_nn, cv_nn);
+            if (nn_raw) {
+                // Dodgson upscale + flow warp into the reference frame, the
+                // same transform the analytic raw-res path applies.
+                Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
+                                                 tile_size, cfg.num_threads);
+                cm_nn = std::move(hires);
+            }
         }
         const int nh = cm_nn.h, nw = cm_nn.w;
         const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
@@ -1365,7 +1389,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         for (int y0 = 0; ok && y0 < nh; y0 += kRobustnessNnStripRows) {
             const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), nh - strip_h);
             Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow,
-                                                      tile_size, cfg, top);
+                                                      tile_size, cfg, top, nn_raw);
             Image strip;
             if (feat.h != strip_h || !robustness_nn_infer(feat, strip) ||
                 strip.h != strip_h || strip.w != nw) {

@@ -1510,6 +1510,24 @@ bool metal_fetch_host_ref_stats(RefStats& ref_stats) {
     memcpy(v.data.data(), [g_rob_ref_v contents], bytes);
     ref_stats.means = std::move(m);
     ref_stats.stds = std::move(v);
+
+    // The raw-resolution learned mask reads the Dodgson-upscaled statistics
+    // too, and those are GPU-resident for the same reason. Only fetched when
+    // they exist -- 2 x 12 MP x 3ch x f32 is ~292 MB, so this is not something
+    // to pull across speculatively.
+    if (g_rob_ref_m_hires && g_rob_ref_v_hires &&
+        g_rob_ref_hires_h > 0 && g_rob_ref_hires_w > 0) {
+        const size_t hb = (size_t)g_rob_ref_hires_h * (size_t)g_rob_ref_hires_w *
+                          (size_t)g_rob_ref_c * sizeof(float);
+        if ([g_rob_ref_m_hires length] >= hb && [g_rob_ref_v_hires length] >= hb) {
+            Image mh(g_rob_ref_hires_h, g_rob_ref_hires_w, g_rob_ref_c);
+            Image vh(g_rob_ref_hires_h, g_rob_ref_hires_w, g_rob_ref_c);
+            memcpy(mh.data.data(), [g_rob_ref_m_hires contents], hb);
+            memcpy(vh.data.data(), [g_rob_ref_v_hires contents], hb);
+            ref_stats.means_hires = std::move(mh);
+            ref_stats.stds_hires = std::move(vh);
+        }
+    }
     return true;
 }
 

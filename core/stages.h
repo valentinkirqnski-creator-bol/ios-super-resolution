@@ -162,9 +162,19 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 // identical to whole-plane inference. Padding past the edge does not, because
 // those rows would feed bias-driven activations into the next layer where
 // whole-plane inference has true zeros -- measured as visible strip seams.
+// raw_res selects the resolution the decision is made at:
+//   false - guide resolution. ref_stats.means/.stds and a guide-resolution
+//           comp_means, sampled at the flow offset. 3 MP mask.
+//   true  - raw resolution. ref_stats.means_hires/.stds_hires and a comp_means
+//           that upscale_warp_stats has already Dodgson-upscaled AND warped
+//           into the reference frame, so it is sampled at the same (y,x). 12 MP
+//           mask, 4x the pixels and 4x the cost, but the statistics keep detail
+//           that the 3x3 guide means destroy -- which is the only way a 2-4 px
+//           feature can reach the decision at all.
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
-                                   const Config& cfg, int y0);
+                                   const Config& cfg, int y0,
+                                   bool raw_res = false);
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
