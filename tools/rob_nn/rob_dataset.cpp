@@ -322,6 +322,40 @@ int main(int argc, char** argv) {
                     const int pty = std::min(flow.ny - 1, std::max(0, ry / ts));
                     const int ptx = std::min(flow.nx - 1, std::max(0, rx / ts));
                     const float fex = flow.dx(pty, ptx), fey = flow.dy(pty, ptx);
+                    // Feature-side flow is bilinear between tile centres, to
+                    // match build_robustness_nn_features. The label above
+                    // deliberately keeps the nearest-tile flow, because that
+                    // is the vector the merge actually fetches with.
+                    const float tcy = (2.f * (float)gy) / (float)ts - 0.5f;
+                    const float tcx = (2.f * (float)gx) / (float)ts - 0.5f;
+                    const int t0y = (int)std::floor(tcy), t0x = (int)std::floor(tcx);
+                    const float ay = tcy - (float)t0y, ax = tcx - (float)t0x;
+                    auto tcl = [](int v, int hi){ return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+                    const int iy0 = tcl(t0y, flow.ny), iy1 = tcl(t0y + 1, flow.ny);
+                    const int ix0 = tcl(t0x, flow.nx), ix1 = tcl(t0x + 1, flow.nx);
+                    auto bil = [&](float v00, float v01, float v10, float v11) {
+                        const float t = v00 + (v01 - v00) * ax;
+                        const float b = v10 + (v11 - v10) * ax;
+                        return t + (b - t) * ay;
+                    };
+                    const float ffx = bil(flow.dx(iy0,ix0), flow.dx(iy0,ix1),
+                                          flow.dx(iy1,ix0), flow.dx(iy1,ix1));
+                    const float ffy = bil(flow.dy(iy0,ix0), flow.dy(iy0,ix1),
+                                          flow.dy(iy1,ix0), flow.dy(iy1,ix1));
+                    auto span_at = [&](int cy, int cx) {
+                        float mnx2 = 1e30f, mny2 = 1e30f, mxx2 = -1e30f, mxy2 = -1e30f;
+                        for (int i = -1; i <= 1; ++i)
+                            for (int j = -1; j <= 1; ++j) {
+                                const int yy = cy + i, xx = cx + j;
+                                if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                                const float vx = flow.dx(yy,xx), vy = flow.dy(yy,xx);
+                                mnx2 = std::min(mnx2,vx); mxx2 = std::max(mxx2,vx);
+                                mny2 = std::min(mny2,vy); mxy2 = std::max(mxy2,vy);
+                            }
+                        const float dxs = (mxx2 > mnx2) ? (mxx2 - mnx2) : 0.f;
+                        const float dys = (mxy2 > mny2) ? (mxy2 - mny2) : 0.f;
+                        return std::sqrt(dxs*dxs + dys*dys);
+                    };
 
                     // Ground-truth flow at this position, analytic.
                     float ty_, tx_;
@@ -373,7 +407,7 @@ int main(int argc, char** argv) {
                             mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
                             mny = std::min(mny, vy); mxy = std::max(mxy, vy);
                         }
-                    const float Mspan = std::sqrt((mxx - mnx) * (mxx - mnx) +
+                    const float Mspan_unused = std::sqrt((mxx - mnx) * (mxx - mnx) +
                                                   (mxy - mny) * (mxy - mny));
 
                     float* o = &rec[((size_t)gy * gw + gx) * NCH];
@@ -381,12 +415,15 @@ int main(int argc, char** argv) {
                     for (int c = 0; c < 3; ++c) o[3 + c] = std::sqrt(ref_vars.at(gy, gx, c));
                     // Comparison guide sampled where the estimated flow points
                     // -- the same warped statistic the classical mask differences.
-                    const float sgy = (float)gy + 0.5f * fey;
-                    const float sgx = (float)gx + 0.5f * fex;
+                    (void)Mspan_unused;
+                    const float Mspan = bil(span_at(iy0,ix0), span_at(iy0,ix1),
+                                            span_at(iy1,ix0), span_at(iy1,ix1));
+                    const float sgy = (float)gy + 0.5f * ffy;
+                    const float sgx = (float)gx + 0.5f * ffx;
                     const int qy = std::min(std::max((int)std::lround(sgy), 0), gh - 1);
                     const int qx = std::min(std::max((int)std::lround(sgx), 0), gw - 1);
                     for (int c = 0; c < 3; ++c) o[6 + c] = comp_means.at(qy, qx, c);
-                    o[9] = fex; o[10] = fey;
+                    o[9] = ffx; o[10] = ffy;
                     o[11] = Mspan;
                     o[12] = noise_sig;      // expected noise, so the net can
                                             // learn to use it without the hard

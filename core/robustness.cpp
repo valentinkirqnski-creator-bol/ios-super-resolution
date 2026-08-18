@@ -1217,26 +1217,59 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
         for (int x = 0; x < w; ++x) {
             // Guide pixel (y,x) covers raw pixels (2y,2x); the flow grid is
             // indexed in raw pixels, same convention as the analytic mask.
-            const int pty = std::min(flow.ny - 1, std::max(0, (2 * y) / tile_size));
-            const int ptx = std::min(flow.nx - 1, std::max(0, (2 * x) / tile_size));
-            const f32 fx = flow.dx(pty, ptx), fy = flow.dy(pty, ptx);
+            // The flow field is one vector per tile. Sampling it nearest --
+            // which is what the MERGE correctly does, since it must fetch the
+            // pixel the search actually evaluated -- makes three of the input
+            // channels piecewise constant over 16 raw pixels, and the network
+            // draws what it is shown: a mask tiled into visible squares with
+            // stair-stepped edges. For the DECISION "is this motion plausible
+            // and consistent with its neighbours" the tile grid is an artifact
+            // of the search, not a property of the scene, so the flow-derived
+            // channels are sampled bilinearly between tile centres. This does
+            // not change what the merge fetches; only what the mask reasons
+            // about.
+            const f32 tcy = (2.f * (f32)y) / (f32)tile_size - 0.5f;
+            const f32 tcx = (2.f * (f32)x) / (f32)tile_size - 0.5f;
+            const int t0y = (int)std::floor(tcy), t0x = (int)std::floor(tcx);
+            const f32 ay = tcy - (f32)t0y, ax = tcx - (f32)t0x;
+            auto tclamp = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+            const int iy0 = tclamp(t0y, flow.ny), iy1 = tclamp(t0y + 1, flow.ny);
+            const int ix0 = tclamp(t0x, flow.nx), ix1 = tclamp(t0x + 1, flow.nx);
+            auto bilerp = [&](f32 v00, f32 v01, f32 v10, f32 v11) {
+                const f32 top = v00 + (v01 - v00) * ax;
+                const f32 bot = v10 + (v11 - v10) * ax;
+                return top + (bot - top) * ay;
+            };
+            const f32 fx = bilerp(flow.dx(iy0, ix0), flow.dx(iy0, ix1),
+                                  flow.dx(iy1, ix0), flow.dx(iy1, ix1));
+            const f32 fy = bilerp(flow.dy(iy0, ix0), flow.dy(iy0, ix1),
+                                  flow.dy(iy1, ix0), flow.dy(iy1, ix1));
+            // Nearest tile is still needed wherever a genuinely per-tile
+            // quantity is required.
+            const int pty = tclamp((int)std::floor(tcy + 0.5f), flow.ny);
+            const int ptx = tclamp((int)std::floor(tcx + 0.5f), flow.nx);
 
             // Local span of the flow field, Wronski Eq. 7 -- the same motion
             // statistic the analytic mask reduces to a binary s1/s2 choice.
-            // Handed over as a continuous value so the network can grade it.
-            f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
-            f32 mxx = -mnx, mxy = -mnx;
-            for (int i = -1; i <= 1; ++i)
-                for (int j = -1; j <= 1; ++j) {
-                    const int yy = pty + i, xx = ptx + j;
-                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                    const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
-                    mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
-                    mny = std::min(mny, vy); mxy = std::max(mxy, vy);
-                }
-            const f32 dx_span = (mxx > mnx) ? (mxx - mnx) : 0.f;
-            const f32 dy_span = (mxy > mny) ? (mxy - mny) : 0.f;
-            const f32 Mspan = std::sqrt(dx_span * dx_span + dy_span * dy_span);
+            // Handed over as a continuous value so the network can grade it,
+            // and bilinearly blended for the same reason as the flow above.
+            auto span_at = [&](int cy, int cx) {
+                f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
+                f32 mxx = -mnx, mxy = -mnx;
+                for (int i = -1; i <= 1; ++i)
+                    for (int j = -1; j <= 1; ++j) {
+                        const int yy = cy + i, xx = cx + j;
+                        if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                        const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
+                        mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
+                        mny = std::min(mny, vy); mxy = std::max(mxy, vy);
+                    }
+                const f32 dxs = (mxx > mnx) ? (mxx - mnx) : 0.f;
+                const f32 dys = (mxy > mny) ? (mxy - mny) : 0.f;
+                return std::sqrt(dxs * dxs + dys * dys);
+            };
+            const f32 Mspan = bilerp(span_at(iy0, ix0), span_at(iy0, ix1),
+                                     span_at(iy1, ix0), span_at(iy1, ix1));
 
             // Comparison statistics sampled where the flow points, in guide
             // units (half the raw displacement), matching the generator.
