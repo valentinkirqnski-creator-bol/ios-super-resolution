@@ -926,6 +926,15 @@ static Image local_min_5x5(const Image& R) {
 
 } // namespace
 
+// Raw-resolution Eq. 9: the min is computed on the GUIDE lattice -- exactly
+// where Wronski computes it, with his 5x5-guide = 10x10-raw footprint --
+// then nearest-upsampled back to raw. The raw-res R first collapses
+// 2x2 -> guide by MIN, so the denser raw-resolution detections are
+// preserved (one rejected raw pixel still darkens its guide cell). Net:
+// R is evaluated per raw pixel (the toggle's point), but the spatial
+// safety margin is Wronski's own, on Wronski's own grid.
+static Image local_min_5x5_on_guide(const Image& R);
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
@@ -1113,18 +1122,37 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
-    // Eq. 9's min applied TWICE -- square erosion composes, so 5x5 o 5x5 =
-    // 9x9 raw px. Rationale: Wronski runs one 5x5 on the GUIDE grid, i.e. a
-    // 10x10-raw physical safety margin, and s/t/Mt were tuned against that
-    // reach. IPOL kept the 5x5 window count when it moved R to raw
-    // resolution, silently halving the margin (measured on the ok/ burst:
-    // rejected fraction 14.9% -> 11.3%). Doubling the pass restores the
-    // paper's physical reach (9x9 is the closest odd window to 10x10, which
-    // has no centre pixel) while keeping the rejection BOUNDARY at raw-pixel
-    // precision -- the point of this path. Two passes of the existing kernel
-    // rather than a radius-4 pool so CPU and Metal stay bit-identical without
-    // a new shader.
-    return local_min_5x5(local_min_5x5(R));
+    // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
+    // there (= the paper's 10x10-raw footprint), nearest-upsample back.
+    // See local_min_5x5_on_guide.
+    return local_min_5x5_on_guide(R);
+}
+
+Image robustness_local_min_on_guide(const Image& R) {
+    return local_min_5x5_on_guide(R);
+}
+
+static Image local_min_5x5_on_guide(const Image& R) {
+    const int gh = R.h / 2, gw = R.w / 2;
+    if (gh <= 0 || gw <= 0) return local_min_5x5(R);
+    Image G(gh, gw, 1);
+    for (int gy = 0; gy < gh; ++gy) {
+        for (int gx = 0; gx < gw; ++gx) {
+            f32 m = R.at(2 * gy, 2 * gx);
+            m = std::min(m, R.at(2 * gy, 2 * gx + 1));
+            m = std::min(m, R.at(2 * gy + 1, 2 * gx));
+            m = std::min(m, R.at(2 * gy + 1, 2 * gx + 1));
+            G.at(gy, gx) = m;
+        }
+    }
+    Image M = local_min_5x5(G);
+    Image out(R.h, R.w, 1);
+    for (int y = 0; y < R.h; ++y) {
+        const int gy = std::min(gh - 1, y / 2);
+        for (int x = 0; x < R.w; ++x)
+            out.at(y, x) = M.at(gy, std::min(gw - 1, x / 2));
+    }
+    return out;
 }
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
