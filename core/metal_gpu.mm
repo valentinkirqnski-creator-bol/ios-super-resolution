@@ -1145,10 +1145,19 @@ struct RobMaskRawParamsCPU {
     uint32_t chain_reject_enabled = 0;
     float r_s_chain = 0.f;
     uint32_t motion_magnitude_veto_enabled = 0;
+    uint32_t hf_enabled = 0;
+    float hf_variance_loss_threshold = 0.f;
+    uint32_t hf_h = 0, hf_w = 0;    // guide-resolution dims of ref_hf_loss
+    uint32_t motion_edge_enabled = 0;
+    float motion_edge_threshold = 0.f;
+    float motion_edge_residual_threshold = 0.f;
+    float alpha = 0.f;
+    float beta = 0.f;
+    float motion_edge_noise_floor_multiplier = 0.f;
+    uint32_t motion_edge_neighborhood_radius = 0;
     uint32_t _pad0 = 0;
-    uint32_t _pad1 = 0;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 64, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 104, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1506,9 +1515,10 @@ void metal_release_host_ref_stats(RefStats& ref_stats) {
 // at guide resolution the way compute_robustness_metal_impl below does. See
 // Config::robustness_raw_resolution_enabled and the mirrored, more heavily
 // commented CPU implementation, compute_robustness_raw_res in
-// robustness.cpp. Deliberately narrower than the guide-resolution path (no
-// hf_reject/edge_reject/aperture_limited) -- compute_robustness_metal_impl
-// only calls this when those are all off, so it never needs to.
+// robustness.cpp. Supports hf_reject and edge_reject (mirroring the CPU raw
+// path); still no aperture_limited/tile_residual_high, so
+// compute_robustness_metal_impl only calls this when flow_reject_1d_enabled
+// is off.
 static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
                                                     const FlowField& flow, int tile_size,
                                                     const Config& cfg, Image* s_select_out) {
@@ -1517,7 +1527,14 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         return Image();
     auto& c = ctx();
 
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                       (cfg.motion_edge_rejection_enabled ||
+                                        cfg.hf_artifact_removal_enabled)
+                                           ? &motion_irregular
+                                           : nullptr);
+    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -1594,7 +1611,19 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // fire.
     id<MTLBuffer> b_chain = buf(nullptr, sizeof(uint32_t));
     id<MTLBuffer> b_magnitude = buf(nullptr, sizeof(uint32_t));
-    if (!b_S || !b_R || !b_out || !b_s_select || !b_match_amb || !b_chain || !b_magnitude)
+    id<MTLBuffer> b_motion = buf(motion_irregular.data(),
+                                 motion_irregular.size() * sizeof(uint32_t));
+    // Guide-resolution variance-loss map, prepared once per burst by
+    // init_robustness alongside the guide-grid ref stats; the kernel reads
+    // it at gid/2. Inert dummy when hf rejection is off.
+    id<MTLBuffer> b_ref_hf = b_motion;
+    if (cfg.hf_artifact_removal_enabled) {
+        const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
+        if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
+        b_ref_hf = g_rob_ref_hf;
+    }
+    if (!b_S || !b_R || !b_out || !b_s_select || !b_match_amb || !b_chain ||
+        !b_magnitude || !b_motion || !b_ref_hf)
         return Image();
 
     RobMaskRawParamsCPU mp{};
@@ -1612,6 +1641,20 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.hf_h = (uint32_t)gh;
+    mp.hf_w = (uint32_t)gw;
+    mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
+    mp.motion_edge_threshold = cfg.motion_edge_threshold;
+    mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
+    // CPU motion_edge_reject reads the debug-gated accessors, so the noise
+    // floor drops out with the mask noise model -- keep that parity here.
+    mp.alpha = cfg.noise_alpha_robustness();
+    mp.beta = cfg.noise_beta_robustness();
+    mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
+    mp.motion_edge_neighborhood_radius =
+        (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1627,6 +1670,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:b_match_amb offset:0 atIndex:9];
     [enc setBuffer:b_chain offset:0 atIndex:10];
     [enc setBuffer:b_magnitude offset:0 atIndex:11];
+    [enc setBuffer:b_motion offset:0 atIndex:12];
+    [enc setBuffer:b_ref_hf offset:0 atIndex:13];
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1658,11 +1703,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
 
-    // Raw-resolution path (Algorithm 6, literally) -- only when the extras it
-    // doesn't support are off, so it's never silently missing a rejection the
-    // guide-resolution path below would have applied.
+    // Raw-resolution path (Algorithm 6, literally). hf and motion-edge
+    // rejection are supported in rob_make_mask_raw (fed from the
+    // guide-resolution maps, mirroring compute_robustness_raw_res); only the
+    // aperture/tile-residual rejection is not, so that flag alone still
+    // falls back to the guide-resolution path below.
     if (cfg.robustness_raw_resolution_active() &&
-        !cfg.hf_artifact_removal_enabled && !cfg.motion_edge_rejection_enabled &&
         !cfg.flow_reject_1d_enabled) {
         Image raw_res = compute_robustness_metal_raw_res_impl(comp_raw, flow, tile_size,
                                                                cfg, s_select_out);

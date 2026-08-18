@@ -2010,8 +2010,17 @@ struct RobMaskRawParams {
     uint chain_reject_enabled;
     float r_s_chain;
     uint motion_magnitude_veto_enabled;
+    uint hf_enabled;
+    float hf_variance_loss_threshold;
+    uint hf_h, hf_w;                 // guide-resolution dims of ref_hf_loss
+    uint motion_edge_enabled;
+    float motion_edge_threshold;
+    float motion_edge_residual_threshold;
+    float alpha;
+    float beta;
+    float motion_edge_noise_floor_multiplier;
+    uint motion_edge_neighborhood_radius;
     uint _pad0;
-    uint _pad1;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2024,11 +2033,14 @@ struct RobMaskRawParams {
 // enabled and the mirrored, more heavily-commented CPU implementation,
 // compute_robustness_raw_res in robustness.cpp.
 //
-// Deliberately narrower than rob_make_mask: no hf_reject/edge_reject/
-// aperture_limited support (compute_robustness_metal_impl only takes this
-// path when hf_artifact_removal_enabled, motion_edge_rejection_enabled and
-// flow_reject_1d_enabled are all off, so those inputs would be unused here
-// regardless).
+// hf_reject samples the guide-resolution variance-loss map at gid/2 and
+// edge_reject runs the neighbourhood test directly on the raw-resolution
+// means (comp_means is already warped into the reference frame, so the
+// "moved" lookup is the same position) -- both mirror
+// compute_robustness_raw_res. Still narrower than rob_make_mask in one way:
+// no aperture_limited/tile_residual_high support, so
+// compute_robustness_metal_impl only takes this path when
+// flow_reject_1d_enabled is off.
 kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const float* comp_means [[buffer(1)]],
                               device const float* ref_means [[buffer(2)]],
@@ -2041,6 +2053,8 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const uint* match_ambiguous [[buffer(9)]],
                               device const uint* chain_inconsistent [[buffer(10)]],
                               device const uint* motion_magnitude_reject [[buffer(11)]],
+                              device const uint* motion_irregular [[buffer(12)]],
+                              device const float* ref_hf_loss [[buffer(13)]],
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2092,7 +2106,46 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         p.motion_magnitude_veto_enabled != 0u &&
         motion_magnitude_reject[pidx] != 0u;
 
-    float r_val = motion_magnitude_reject_tile
+    // High-frequency artifact removal at raw resolution: the variance-loss
+    // map stays at guide resolution (it is the reference's, computed once
+    // per burst), so each raw pixel reads its covering guide pixel --
+    // exactly compute_robustness_raw_res's (y/2, x/2) lookup.
+    bool hf_reject = false;
+    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
+        uint gy = min(gid.y / 2u, p.hf_h - 1u);
+        uint gx = min(gid.x / 2u, p.hf_w - 1u);
+        hf_reject = ref_hf_loss[gy * p.hf_w + gx] > p.hf_variance_loss_threshold;
+    }
+    // Motion-edge rejection at raw resolution. comp_means is already warped
+    // into the reference's coordinate frame by the Dodgson pass, so the
+    // "moved" neighbourhood is the same (y, x) -- mirror the CPU path.
+    bool edge_reject = false;
+    if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
+        float ratio = (sigma_sq_ > 0.f && isfinite(sigma_sq_))
+            ? d_sq_ / sigma_sq_
+            : (d_sq_ > 0.f ? INFINITY : 0.f);
+        if (isfinite(ratio) && ratio > p.motion_edge_residual_threshold) {
+            float edge_sq = rob_edge_strength_sq_neighborhood(
+                ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
+                p.motion_edge_neighborhood_radius);
+            edge_sq = max(edge_sq,
+                          rob_edge_strength_sq_neighborhood(
+                              comp_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
+                              p.motion_edge_neighborhood_radius));
+            float brightness = rob_brightness(ref_means, p.h, p.w, p.nch,
+                                              int(gid.y), int(gid.x));
+            brightness = max(brightness,
+                             rob_brightness(comp_means, p.h, p.w, p.nch,
+                                            int(gid.y), int(gid.x)));
+            float noise_var = max(p.alpha * brightness + p.beta, 0.f);
+            float noise_edge_floor =
+                max(p.motion_edge_noise_floor_multiplier, 0.f) * sqrt(noise_var);
+            float th = max(max(p.motion_edge_threshold, 0.f), noise_edge_floor);
+            edge_reject = edge_sq > th * th;
+        }
+    }
+
+    float r_val = (hf_reject || edge_reject || motion_magnitude_reject_tile)
         ? 0.f
         : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
     // An OOB Dodgson sample arrives as +inf in comp_means -> d_sq_ = +inf ->
