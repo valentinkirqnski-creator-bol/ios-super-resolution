@@ -1183,6 +1183,32 @@ static Image local_min_5x5_on_guide(const Image& R) {
     return out;
 }
 
+f32 robustness_analytic_R(const f32* ref_mean, const f32* ref_var,
+                          const f32* comp_mean, f32 Mspan, const Config& cfg,
+                          f32* ratio_out) {
+    f32 d_ms_sq = 0.f, sig_ms_sq = 0.f, sig_md_sq = 0.f, d_md_sq = 0.f;
+    for (int c = 0; c < 3; ++c) {
+        const f32 dm = ref_mean[c] - comp_mean[c];
+        d_ms_sq += dm * dm;
+        sig_ms_sq += std::max(ref_var[c], 0.f);
+        const NoiseCurves& nc = mask_noise_curves_channel(cfg, c);
+        int id = (int)std::lround(1000.f * ref_mean[c]);
+        id = std::min(std::max(id, 0), (int)nc.std_curve.size() - 1);
+        const f32 st = nc.std_curve[(size_t)id];
+        const f32 dt = nc.diff_curve[(size_t)id];
+        sig_md_sq += st * st;
+        d_md_sq   += dt * dt;
+    }
+    const f32 sig_sq = std::max(sig_ms_sq, sig_md_sq);
+    const f32 shrink = d_ms_sq / std::max(d_ms_sq + d_md_sq, 1e-12f);
+    const f32 d_sq = d_ms_sq * shrink * shrink;
+    const f32 ratio = (sig_sq > 0.f) ? d_sq / sig_sq : 0.f;
+    if (ratio_out) *ratio_out = std::isfinite(ratio) ? ratio : 1e6f;
+    const f32 s_sel = (Mspan > cfg.r_Mt) ? cfg.r_s1 : cfg.r_s2;
+    const f32 r = s_sel * std::exp(-ratio) - cfg.r_t;
+    return std::isfinite(r) ? clampf(r, 0.f, 1.f) : 0.f;
+}
+
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0, bool raw_res) {
@@ -1303,6 +1329,31 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             o[10] = fy;
             o[11] = Mspan;
             o[12] = nsig;
+
+            // Channels 13-14: the analytic mask's own answer. Passing channel
+            // 14 straight through IS the analytic mask, so the network starts
+            // from it and only has to learn where to depart -- rather than
+            // rebuilding Eq. 5-9 from scratch and doing worse in the regions
+            // the closed form already handles.
+            //
+            // This is what fixes smooth areas. There sigma_ms collapses toward
+            // zero and the decision rests entirely on the noise floor
+            // sigma_md, which encodes sensor physics the network cannot infer
+            // from a 3x3 neighbourhood at any amount of training. Handing it
+            // the finished ratio puts that knowledge into the input.
+            f32 rmean[3], rvar[3], cmean[3];
+            for (int c = 0; c < 3; ++c) {
+                rmean[c] = rm.at(y, x, c);
+                rvar[c]  = rv.at(y, x, c);
+                cmean[c] = comp_means.at(qy, qx, c);
+            }
+            f32 ratio = 0.f;
+            const f32 r_an = robustness_analytic_R(rmean, rvar, cmean, Mspan,
+                                                   cfg, &ratio);
+            // log1p: the ratio is unbounded and heavy-tailed, and the input
+            // normalisation is fitted over the training set, not per image.
+            o[13] = std::log1p(std::max(ratio, 0.f));
+            o[14] = r_an;
         }
     });
     return feat;

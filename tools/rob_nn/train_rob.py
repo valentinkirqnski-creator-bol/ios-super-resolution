@@ -16,8 +16,11 @@ import torch.nn as nn
 
 SC = os.path.dirname(os.path.abspath(__file__))
 PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset2")
-NCH, GH, GW = 16, 1512, 2016
-IN_CH = 13          # channels 0..12 are inputs; 13 = harm, 14 = ideal R
+NCH, GH, GW = 18, 1512, 2016
+IN_CH = 15          # 0..12 raw stats, 13 = log1p(d^2/sigma^2), 14 = analytic R
+                    # 15 = harm, 16 = ideal R, 17 = flow error (analysis only)
+CH_ANALYTIC_R = 14  # the classical mask's answer, handed over as an input so
+                    # the net learns a correction rather than a replacement
 
 meta = {}
 with open(PREFIX + ".meta") as f:
@@ -45,19 +48,17 @@ print("input mean:", np.array2string(mu, precision=3))
 print("input std :", np.array2string(sd, precision=3))
 
 # ------------------------------------------------------- classical mask baseline
-def classical_R(px, s1=2.0, s2=12.0, t=0.12, Mt=0.8):
-    """Wronski Eq. 5-8 recomputed from the stored channels."""
-    ref_m, ref_s = px[..., 0:3], px[..., 3:6]
-    comp_m, nsig = px[..., 6:9], px[..., 12]
-    d_ms_sq = ((ref_m - comp_m) ** 2).sum(-1)
-    sig_ms_sq = (ref_s ** 2).sum(-1)
-    # Guide has 3 channels, each with the modelled noise floor.
-    nsq = 3.0 * nsig ** 2
-    sig_sq = np.maximum(sig_ms_sq, nsq)
-    shrink = d_ms_sq / np.maximum(d_ms_sq + nsq, 1e-12)
-    d_sq = d_ms_sq * shrink ** 2
-    s = np.where(px[..., 11] > Mt, s1, s2)
-    return np.clip(s * np.exp(-d_sq / np.maximum(sig_sq, 1e-12)) - t, 0.0, 1.0)
+def classical_R(px):
+    """The analytic mask, read straight from channel 14.
+
+    This used to re-derive Eq. 5-8 in numpy from the stored statistics, which
+    made it a THIRD implementation alongside the C++ port and the generator --
+    and it quietly used its own s1/s2/t/Mt rather than the ones the burst was
+    actually processed with, so the baseline it reported was not the mask the
+    user runs. The generator now writes the real value via the shared
+    robustness_analytic_R, so the honest baseline is simply to read it.
+    """
+    return px[..., 14]
 
 # ---------------------------------------------------------------------- model
 class RobNet(nn.Module):
@@ -96,7 +97,7 @@ def sample_batch(bs=16, ps=96, rng=None):
         y0 = rng.randint(GH - ps); x0 = rng.randint(GW - ps)
         p = np.asarray(data[f, y0:y0 + ps, x0:x0 + ps, :], dtype=np.float32)
         xs.append((p[..., :IN_CH] - mu) / sd)
-        ys.append(p[..., 14:15])
+        ys.append(p[..., 16:17])
     x = torch.from_numpy(np.stack(xs)).permute(0, 3, 1, 2)
     y = torch.from_numpy(np.stack(ys)).permute(0, 3, 1, 2)
     return x, y
@@ -140,7 +141,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------- evaluation
     # Held-out frame, full field, both masks scored against ground truth.
     ev = np.asarray(data[n_frames - 1, ::2, ::2, :], dtype=np.float32)  # held out
-    ideal = ev[..., 14]
+    ideal = ev[..., 16]
     bad = ideal < 0.5              # ground truth: merging here does damage
     print(f"\nheld-out frame: {bad.mean()*100:.2f}% of pixels should be rejected")
 

@@ -59,7 +59,7 @@ frames = list(range(n_train, n_frames))[:3]   # held-out reference only
 rows = []
 for fi in frames:
     ev = np.asarray(data[fi, ::2, ::2, :], dtype=np.float32)
-    bad = ev[..., 14] < 0.5
+    bad = ev[..., 16] < 0.5   # ideal R; 14 is now the analytic-R INPUT
     if not bad.any():
         continue
     with torch.no_grad():

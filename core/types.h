@@ -25,7 +25,7 @@ using f32 = float;
 // tools/rob_nn/rob_dataset.cpp writes them in this order and
 // tools/rob_nn/train_rob.py trains on that layout, so changing it means
 // retraining, not just editing a constant.
-inline constexpr int kRobustnessNnChannels = 13;
+inline constexpr int kRobustnessNnChannels = 15;
 
 // The learned mask runs in horizontal strips to bound peak memory (see
 // build_robustness_nn_features). kRobustnessNnHalo is the network's exact

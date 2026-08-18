@@ -142,6 +142,10 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 //   9-10  estimated flow dx, dy at this pixel, in RAW pixels
 //   11    local span of the flow field over the 3x3 tile neighbourhood (M)
 //   12    expected noise sigma at this brightness
+//   13    log1p(d^2/sigma^2), Wronski Eq. 6 -- the analytic mask's own
+//         decision statistic, compressed because it is heavy-tailed
+//   14    the analytic mask's R (Eq. 5), so the network only has to learn
+//         a correction to it rather than rediscover it
 //
 // Kept in portable C++ next to the analytic mask because this layout is a
 // contract with tools/rob_nn/rob_dataset.cpp, which writes the training set;
@@ -171,6 +175,19 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 //           mask, 4x the pixels and 4x the cost, but the statistics keep detail
 //           that the 3x3 guide means destroy -- which is the only way a 2-4 px
 //           feature can reach the decision at all.
+// The analytic mask's own decision, exposed so the learned mask can take it
+// as an input instead of rediscovering Eq. 5-9 from the raw statistics, and
+// so tools/rob_nn/rob_dataset.cpp can write the IDENTICAL value into the
+// training set. Two implementations of this formula would drift, and the
+// network would train on a hint that differs from the one it is given at
+// inference -- so there is exactly one.
+//   ref_mean/ref_var/comp_mean: 3 channels each, at the pixel being judged.
+//   Mspan: local flow span (Eq. 7), selecting s1 vs s2.
+// Returns R (Eq. 5); *ratio_out, if given, receives d^2/sigma^2 (Eq. 6).
+f32 robustness_analytic_R(const f32* ref_mean, const f32* ref_var,
+                          const f32* comp_mean, f32 Mspan, const Config& cfg,
+                          f32* ratio_out);
+
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0,

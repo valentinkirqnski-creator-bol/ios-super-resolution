@@ -310,7 +310,7 @@ int main(int argc, char** argv) {
             local_stats(comp_guide, comp_means, comp_vars);
 
             // Per-guide-pixel features and label.
-            const int NCH = 16;   // 13 inputs + harm + R_ideal + flow error
+            const int NCH = 18;   // 15 inputs + harm + R_ideal + flow error
             std::vector<float> rec((size_t)gh * gw * NCH, 0.f);
             const float alpha = work.noise_alpha(), beta = work.noise_beta();
             double sum_harm = 0.0; double sum_err = 0.0; size_t n_bad = 0;
@@ -428,11 +428,28 @@ int main(int argc, char** argv) {
                     o[12] = noise_sig;      // expected noise, so the net can
                                             // learn to use it without the hard
                                             // dependence Wronski warned about
-                    o[13] = harm;
-                    o[14] = r_ideal;
+                    // Channels 13-14 must match core/robustness.cpp EXACTLY,
+                    // so both call the one shared implementation. Computing
+                    // the analytic hint a second time here would let training
+                    // and inference drift apart silently.
+                    {
+                        f32 rmean[3], rvar[3], cmean[3];
+                        for (int c = 0; c < 3; ++c) {
+                            rmean[c] = ref_means.at(gy, gx, c);
+                            rvar[c]  = ref_vars.at(gy, gx, c);
+                            cmean[c] = comp_means.at(qy, qx, c);
+                        }
+                        f32 ratio = 0.f;
+                        const f32 r_an = robustness_analytic_R(rmean, rvar, cmean,
+                                                               Mspan, cfg, &ratio);
+                        o[13] = std::log1p(std::max(ratio, 0.f));
+                        o[14] = r_an;
+                    }
+                    o[15] = harm;
+                    o[16] = r_ideal;
                     // Analysis only -- never an input. Lets evaluation bin
                     // detection by how wrong the flow actually was.
-                    o[15] = std::sqrt((fex - ftx) * (fex - ftx) +
+                    o[17] = std::sqrt((fex - ftx) * (fex - ftx) +
                                       (fey - fty) * (fey - fty));
 
                     if (occluded || harm > 3.f * noise_sig) { ++n_bad; }
