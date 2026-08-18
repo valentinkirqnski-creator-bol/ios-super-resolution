@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#include <os/proc.h>
 #include <vector>
 
 namespace hhsr {
@@ -10,6 +11,18 @@ namespace {
 
 MLModel* g_model = nil;      // stays nil if the one load attempt below fails
 bool g_tried = false;
+
+// The input buffer is the same shape for every strip of every frame, so it is
+// allocated once and refilled rather than reallocated ~50 times per burst.
+// Churning 20 MB allocations against a pipeline that is already near the
+// footprint limit is exactly how a run dies on the second or third frame.
+MLMultiArray* g_input = nil;
+NSInteger g_input_h = 0, g_input_w = 0;
+
+// Headroom below which the learned mask declines to run and the caller falls
+// back to the analytic one. A mask that degrades is recoverable; a jetsam kill
+// loses the whole capture, so this errs toward giving up the feature.
+constexpr uint64_t kMinAvailableBytes = 220ull * 1024ull * 1024ull;
 
 MLModel* load_model() {
     if (g_tried) return g_model;
@@ -39,10 +52,26 @@ MLModel* load_model() {
 
 bool robustness_nn_available() { return load_model() != nil; }
 
+void robustness_nn_release_buffers() {
+    g_input = nil;
+    g_input_h = g_input_w = 0;
+}
+
 bool robustness_nn_infer(const Image& feat, Image& out) {
     MLModel* model = load_model();
     if (!model) return false;
     if (feat.h <= 0 || feat.w <= 0 || feat.c != kRobustnessNnChannels) return false;
+
+    // os_proc_available_memory reports what this process may still allocate
+    // before the per-process limit, which is the number that decides a jetsam
+    // kill -- not free system RAM.
+    const size_t avail = os_proc_available_memory();
+    if (avail != 0 && avail < kMinAvailableBytes) {
+        NSLog(@"[robustness_nn] only %.0f MB headroom, using analytic mask",
+              (double)avail / (1024.0 * 1024.0));
+        robustness_nn_release_buffers();
+        return false;
+    }
 
     @autoreleasepool {
         NSError* err = nil;
@@ -51,12 +80,18 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
         // on the way in. Done here rather than in the feature builder so the
         // portable side keeps the same interleaved layout everything else in
         // the pipeline uses.
-        MLMultiArray* in = [[MLMultiArray alloc]
-            initWithShape:@[@1, @(C), @(H), @(W)]
-                 dataType:MLMultiArrayDataTypeFloat32
-                    error:&err];
+        if (!g_input || g_input_h != H || g_input_w != W) {
+            g_input = [[MLMultiArray alloc]
+                initWithShape:@[@1, @(C), @(H), @(W)]
+                     dataType:MLMultiArrayDataTypeFloat32
+                        error:&err];
+            g_input_h = H;
+            g_input_w = W;
+        }
+        MLMultiArray* in = g_input;
         if (!in) {
             NSLog(@"[robustness_nn] input allocation failed: %@", err);
+            robustness_nn_release_buffers();
             return false;
         }
         float* dst = (float*)in.dataPointer;
@@ -79,7 +114,17 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
         id<MLFeatureProvider> res = [model predictionFromFeatures:input error:&err];
         if (!res) {
             NSLog(@"[robustness_nn] prediction failed: %@", err);
+            robustness_nn_release_buffers();
             return false;
+        }
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            // One line per burst, not per strip: enough to see the real
+            // footprint on device without flooding the log.
+            NSLog(@"[robustness_nn] strip %ldx%ld, headroom after first "
+                  @"prediction: %.0f MB", (long)H, (long)W,
+                  (double)os_proc_available_memory() / (1024.0 * 1024.0));
         }
         MLFeatureValue* fv = [res featureValueForName:@"robustness"];
         MLMultiArray* outArr = fv ? fv.multiArrayValue : nil;
@@ -118,6 +163,7 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
 namespace hhsr {
 bool robustness_nn_available() { return false; }
 bool robustness_nn_infer(const Image&, Image&) { return false; }
+void robustness_nn_release_buffers() {}
 } // namespace hhsr
 
 #endif

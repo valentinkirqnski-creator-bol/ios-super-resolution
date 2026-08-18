@@ -54,4 +54,9 @@ bool robustness_nn_available();
 // prediction error, unexpected output shape); `out` is left untouched.
 bool robustness_nn_infer(const Image& feat, Image& out);
 
+// Drops the cached input buffer. Called automatically whenever inference
+// fails or headroom runs short; exposed so a caller that knows the burst is
+// over can return the memory without waiting for the next failure.
+void robustness_nn_release_buffers();
+
 } // namespace hhsr
