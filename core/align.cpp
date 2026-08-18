@@ -1154,7 +1154,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     }
 
     // 460-main pads alternate images circularly before pyramid construction.
-    Image moving_padded = pad_image_circular(moving_grey, tile_size);
+    // Pad with the tile size block matching ACTUALLY uses on this grey --
+    // grey-domain, not raw. Padding with the raw tile size on the half-res
+    // decimate grey appended wrapped rows the grid didn't need (1512 is
+    // already divisible by 8), manufacturing a garbage bottom tile row whose
+    // flow seeded and neighboured the real bottom row through the
+    // coarse-to-fine upsample.
+    Image moving_padded = pad_image_circular(moving_grey, cfg.grey_tile_size(tile_size));
     Pyramid mov_pyr = build_pyramid(moving_padded, cfg.bm_factors);
 
     FlowField flow;

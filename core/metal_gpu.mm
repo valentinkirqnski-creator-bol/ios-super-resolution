@@ -2591,7 +2591,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     // Drain any work left in flight by an early return from a previous call.
     (void)align_drain();
     auto& c = ctx();
-    Image moving_padded_grey = pad_image_circular(moving_grey, tile_size);
+    Image moving_padded_grey = pad_image_circular(moving_grey, cfg.grey_tile_size(tile_size));
     id<MTLBuffer> mov0 = buf(moving_padded_grey.data.data(),
                              moving_padded_grey.data.size() * sizeof(float));
     if (!mov0) return false;

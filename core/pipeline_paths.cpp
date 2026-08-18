@@ -1103,7 +1103,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
 
     const double t_pyr = prof_now_ms();
-    Image ref_grey_padded = pad_image_circular(ref_grey, tile_size);
+    Image ref_grey_padded = pad_image_circular(ref_grey, work.grey_tile_size(tile_size));
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
     prof_add_cpu("ref:pad+pyramid", prof_now_ms() - t_pyr);
     if (debug && !ref_pyr.levels.empty()) {
