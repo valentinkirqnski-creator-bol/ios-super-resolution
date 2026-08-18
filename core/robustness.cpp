@@ -390,9 +390,8 @@ static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch)
 static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
     if (cfg.debug_pixel4a_noise_profile)
         return make_noise_curves(cfg);
-    // Sensor-space alpha/beta: the guide these curves score is un-WB'd
-    // (compute_guide divides the WB gain back out), so the thresholds must
-    // live in the same space. Only mask paths call this wrapper.
+    // WB-scaled per-channel alpha/beta, matching the WB'd guide. Only mask
+    // paths call this wrapper.
     return make_noise_curves_channel(cfg.noise_alpha_ch_robustness(ch),
                                      cfg.noise_beta_ch_robustness(ch), ch);
 }
@@ -408,7 +407,6 @@ static const NoiseCurves& mask_noise_curves(const Config& cfg) {
         return make_noise_curves(0.f, 0.f);
     if (cfg.debug_pixel4a_noise_profile)
         return make_noise_curves(cfg);
-    // Sensor space, matching the un-WB'd guide.
     return make_noise_curves(cfg.noise_alpha_robustness(), cfg.noise_beta_robustness());
 }
 static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
@@ -486,11 +484,7 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     f32 inv[3];
     for (int c = 0; c < 3; ++c) {
         const int n = cfg.cfa.count((uint8_t)c);
-        // guide_wb_undo: divide the WB gain back out so the guide -- and every
-        // statistic derived from it -- lives in sensor space, where the noise
-        // curves' clipping model and the sensor-space alpha/beta actually
-        // apply. See Config::guide_wb_undo.
-        inv[c] = ((n > 0) ? 1.f / (f32)n : 0.f) * cfg.guide_wb_undo(c);
+        inv[c] = (n > 0) ? 1.f / (f32)n : 0.f;
     }
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {

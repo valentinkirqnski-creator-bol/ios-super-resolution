@@ -1285,10 +1285,11 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        // WB UNDO factors (see rob_guide_bayer): sensor-space guide.
-        gp.wb0 = cfg.guide_wb_undo(0);
-        gp.wb1 = cfg.guide_wb_undo(1);
-        gp.wb2 = cfg.guide_wb_undo(2);
+        // Guide stays in WB space (eca686c convention): the kernel's wb
+        // multipliers are unity no-ops.
+        gp.wb0 = 1.f;
+        gp.wb1 = 1.f;
+        gp.wb2 = 1.f;
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];
