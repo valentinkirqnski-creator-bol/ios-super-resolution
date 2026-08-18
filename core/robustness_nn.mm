@@ -102,18 +102,16 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
         // the strides, and use the handler API so the pointer is guaranteed
         // valid (and large enough) for the duration of the write.
         const size_t plane = (size_t)H * (size_t)W;
-        NSArray<NSNumber*>* istr = in.strides;
-        if (istr.count != 4) {
-            NSLog(@"[robustness_nn] unexpected input rank %lu", (unsigned long)istr.count);
-            robustness_nn_release_buffers();
-            return false;
-        }
-        const NSInteger isC = istr[1].integerValue;
-        const NSInteger isH = istr[2].integerValue;
-        const NSInteger isW = istr[3].integerValue;
         const f32* src = feat.data.data();
         __block bool wrote = false;
-        [in getMutableBytesWithHandler:^(void* ptr, NSInteger len) {
+        // The handler passes the strides in, so there is no need to read
+        // .strides separately -- these are authoritative for this buffer.
+        [in getMutableBytesWithHandler:^(void* ptr, NSInteger len,
+                                         NSArray<NSNumber*>* strides) {
+            if (strides.count != 4) return;
+            const NSInteger isC = strides[1].integerValue;
+            const NSInteger isH = strides[2].integerValue;
+            const NSInteger isW = strides[3].integerValue;
             // len is in bytes; refuse rather than trust the arithmetic.
             const NSInteger need =
                 ((NSInteger)C - 1) * isC + ((NSInteger)H - 1) * isH +
@@ -130,7 +128,7 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
             wrote = true;
         }];
         if (!wrote) {
-            NSLog(@"[robustness_nn] input buffer smaller than its own strides imply");
+            NSLog(@"[robustness_nn] could not fill input (rank/size mismatch)");
             robustness_nn_release_buffers();
             return false;
         }
@@ -180,6 +178,10 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
         const NSInteger osH = (ond >= 2) ? ostr[ond - 2].integerValue : (NSInteger)W;
         const NSInteger osW = (ond >= 1) ? ostr[ond - 1].integerValue : 1;
         Image r((int)H, (int)W, 1);
+        // Captured C++ objects are const inside a block, so `r.data[...]`
+        // would yield a const reference. Take the pointer out here; the
+        // pointer is captured by value and its pointee stays writable.
+        f32* rdata = r.data.data();
         __block bool read_ok = false;
         [outArr getBytesWithHandler:^(const void* ptr, NSInteger len) {
             const NSInteger need =
@@ -188,7 +190,7 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
             const float* op = (const float*)ptr;
             for (NSInteger y = 0; y < (NSInteger)H; ++y) {
                 const float* row = op + y * osH;
-                f32* dr = &r.data[(size_t)y * (size_t)W];
+                f32* dr = rdata + (size_t)y * (size_t)W;
                 for (NSInteger x = 0; x < (NSInteger)W; ++x) {
                     float v = row[x * osW];
                     // The graph ends in a sigmoid, so this only guards
