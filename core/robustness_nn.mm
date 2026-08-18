@@ -94,13 +94,45 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
             robustness_nn_release_buffers();
             return false;
         }
-        float* dst = (float*)in.dataPointer;
-        const f32* src = feat.data.data();
+        // MLMultiArray is NOT guaranteed contiguous: it carries per-dimension
+        // strides, and ANE-backed buffers are routinely row-padded for
+        // alignment. Writing C*H*W floats linearly into a padded allocation
+        // overruns it and corrupts the heap -- which does not fault here, it
+        // crashes a frame or two later with no jetsam report. Index through
+        // the strides, and use the handler API so the pointer is guaranteed
+        // valid (and large enough) for the duration of the write.
         const size_t plane = (size_t)H * (size_t)W;
-        for (size_t c = 0; c < (size_t)C; ++c) {
-            float* dp = dst + c * plane;
-            const f32* sp = src + c;
-            for (size_t p = 0; p < plane; ++p) dp[p] = sp[p * (size_t)C];
+        NSArray<NSNumber*>* istr = in.strides;
+        if (istr.count != 4) {
+            NSLog(@"[robustness_nn] unexpected input rank %lu", (unsigned long)istr.count);
+            robustness_nn_release_buffers();
+            return false;
+        }
+        const NSInteger isC = istr[1].integerValue;
+        const NSInteger isH = istr[2].integerValue;
+        const NSInteger isW = istr[3].integerValue;
+        const f32* src = feat.data.data();
+        __block bool wrote = false;
+        [in getMutableBytesWithHandler:^(void* ptr, NSInteger len) {
+            // len is in bytes; refuse rather than trust the arithmetic.
+            const NSInteger need =
+                ((NSInteger)C - 1) * isC + ((NSInteger)H - 1) * isH +
+                ((NSInteger)W - 1) * isW + 1;
+            if (len < need * (NSInteger)sizeof(float)) return;
+            float* dst = (float*)ptr;
+            for (NSInteger c = 0; c < (NSInteger)C; ++c)
+                for (NSInteger y = 0; y < (NSInteger)H; ++y) {
+                    float* row = dst + c * isC + y * isH;
+                    const f32* sp = src + ((size_t)y * (size_t)W) * (size_t)C + (size_t)c;
+                    for (NSInteger x = 0; x < (NSInteger)W; ++x)
+                        row[x * isW] = sp[(size_t)x * (size_t)C];
+                }
+            wrote = true;
+        }];
+        if (!wrote) {
+            NSLog(@"[robustness_nn] input buffer smaller than its own strides imply");
+            robustness_nn_release_buffers();
+            return false;
         }
 
         MLDictionaryFeatureProvider* input = [[MLDictionaryFeatureProvider alloc]
@@ -140,16 +172,39 @@ bool robustness_nn_infer(const Image& feat, Image& out) {
             NSLog(@"[robustness_nn] output shape %@ != %ld pixels", outArr.shape, (long)plane);
             return false;
         }
+        // Same stride caveat on the way out, and this buffer is Core ML's,
+        // not ours -- reading it flat is how a padded ANE output walks off
+        // the end of the allocation.
+        NSArray<NSNumber*>* ostr = outArr.strides;
+        const NSInteger ond = (NSInteger)ostr.count;
+        const NSInteger osH = (ond >= 2) ? ostr[ond - 2].integerValue : (NSInteger)W;
+        const NSInteger osW = (ond >= 1) ? ostr[ond - 1].integerValue : 1;
         Image r((int)H, (int)W, 1);
-        const float* op = (const float*)outArr.dataPointer;
-        for (size_t p = 0; p < plane; ++p) {
-            float v = op[p];
-            // The graph ends in a sigmoid, so this only guards non-finite
-            // values from a malformed model -- but R multiplies every merge
-            // accumulator, and one NaN would poison the whole output pixel.
-            if (!(v > 0.f)) v = 0.f;
-            if (v > 1.f) v = 1.f;
-            r.data[p] = v;
+        __block bool read_ok = false;
+        [outArr getBytesWithHandler:^(const void* ptr, NSInteger len) {
+            const NSInteger need =
+                ((NSInteger)H - 1) * osH + ((NSInteger)W - 1) * osW + 1;
+            if (len < need * (NSInteger)sizeof(float)) return;
+            const float* op = (const float*)ptr;
+            for (NSInteger y = 0; y < (NSInteger)H; ++y) {
+                const float* row = op + y * osH;
+                f32* dr = &r.data[(size_t)y * (size_t)W];
+                for (NSInteger x = 0; x < (NSInteger)W; ++x) {
+                    float v = row[x * osW];
+                    // The graph ends in a sigmoid, so this only guards
+                    // non-finite values from a malformed model -- but R
+                    // multiplies every merge accumulator, and one NaN would
+                    // poison the whole output pixel.
+                    if (!(v > 0.f)) v = 0.f;
+                    if (v > 1.f) v = 1.f;
+                    dr[x] = v;
+                }
+            }
+            read_ok = true;
+        }];
+        if (!read_ok) {
+            NSLog(@"[robustness_nn] output buffer smaller than its own strides imply");
+            return false;
         }
         out = std::move(r);
     }
