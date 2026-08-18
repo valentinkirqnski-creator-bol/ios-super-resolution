@@ -133,6 +133,25 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 // prior each pixel was scored with: 1 where the strict s1 applied (sharp local
 // variation in the flow field, or an aperture-limited tile), 0 where the
 // permissive s2 did. Used to split the accumulated mask for inspection.
+// Feature planes for the learned robustness mask (robustness_nn.h), at guide
+// resolution, interleaved, in the exact order the model was trained on:
+//
+//   0-2   reference 3x3 local mean, RGB
+//   3-5   reference 3x3 local standard deviation, RGB
+//   6-8   comparison 3x3 local mean sampled where the estimated flow points
+//   9-10  estimated flow dx, dy at this pixel, in RAW pixels
+//   11    local span of the flow field over the 3x3 tile neighbourhood (M)
+//   12    expected noise sigma at this brightness
+//
+// Kept in portable C++ next to the analytic mask because this layout is a
+// contract with tools/rob_nn/rob_dataset.cpp, which writes the training set;
+// the two must be read side by side to stay in step. Channels 9-12 are the
+// ones the analytic mask cannot use, and are why the network can reject a
+// tile whose photometry looks innocent.
+Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
+                                   const FlowField& flow, int tile_size,
+                                   const Config& cfg);
+
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out = nullptr);

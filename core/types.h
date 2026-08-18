@@ -20,6 +20,13 @@ namespace hhsr {
 using f32 = float;
 
 // Row-major image / tensor with an arbitrary number of interleaved channels.
+// Number of feature planes the learned robustness mask consumes
+// (robustness_nn.h). Fixed by the trained weights --
+// tools/rob_nn/rob_dataset.cpp writes them in this order and
+// tools/rob_nn/train_rob.py trains on that layout, so changing it means
+// retraining, not just editing a constant.
+inline constexpr int kRobustnessNnChannels = 13;
+
 struct Image {
     int h = 0;
     int w = 0;
@@ -595,6 +602,20 @@ struct Config {
     // own dimensions rather than trusting this flag, because this path
     // silently falls back to guide resolution when the hires ref stats
     // are missing).
+    // Replace the analytic robustness mask (Wronski Eq. 5-9) with the learned
+    // one in robustness_nn.h. Off by default: the analytic mask is the
+    // reference behaviour and the network is only as good as the bursts it
+    // was trained on. Falls back automatically when the model is missing or
+    // fails to load, so enabling it can never leave the pipeline without a
+    // mask.
+    //
+    // Motivation, measured (tools/rob_nn, synthetic bursts with ground-truth
+    // motion built from real raws): the analytic mask separates harmful from
+    // harmless pixels with AUC 0.638 and cannot exceed ~26% detection at any
+    // threshold, because it pins most pixels at exactly R = 1. The network
+    // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
+    bool use_neural_robustness = false;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

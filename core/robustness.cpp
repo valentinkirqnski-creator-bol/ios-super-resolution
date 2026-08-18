@@ -1,4 +1,5 @@
 #include "stages.h"
+#include "robustness_nn.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
 #include <cstdint>
@@ -1182,6 +1183,70 @@ static Image local_min_5x5_on_guide(const Image& R) {
     return out;
 }
 
+Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
+                                   const FlowField& flow, int tile_size,
+                                   const Config& cfg) {
+    const Image& rm = ref_stats.means;
+    const Image& rv = ref_stats.stds;
+    if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
+    if (comp_means.h != rm.h || comp_means.w != rm.w || comp_means.c != 3) return Image();
+    if (flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return Image();
+
+    const int h = rm.h, w = rm.w;
+    Image feat(h, w, kRobustnessNnChannels);
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            // Guide pixel (y,x) covers raw pixels (2y,2x); the flow grid is
+            // indexed in raw pixels, same convention as the analytic mask.
+            const int pty = std::min(flow.ny - 1, std::max(0, (2 * y) / tile_size));
+            const int ptx = std::min(flow.nx - 1, std::max(0, (2 * x) / tile_size));
+            const f32 fx = flow.dx(pty, ptx), fy = flow.dy(pty, ptx);
+
+            // Local span of the flow field, Wronski Eq. 7 -- the same motion
+            // statistic the analytic mask reduces to a binary s1/s2 choice.
+            // Handed over as a continuous value so the network can grade it.
+            f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
+            f32 mxx = -mnx, mxy = -mnx;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = pty + i, xx = ptx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
+                    mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
+                    mny = std::min(mny, vy); mxy = std::max(mxy, vy);
+                }
+            const f32 dx_span = (mxx > mnx) ? (mxx - mnx) : 0.f;
+            const f32 dy_span = (mxy > mny) ? (mxy - mny) : 0.f;
+            const f32 Mspan = std::sqrt(dx_span * dx_span + dy_span * dy_span);
+
+            // Comparison statistics sampled where the flow points, in guide
+            // units (half the raw displacement), matching the generator.
+            const int qy = std::min(std::max((int)std::lround((f32)y + 0.5f * fy), 0), h - 1);
+            const int qx = std::min(std::max((int)std::lround((f32)x + 0.5f * fx), 0), w - 1);
+
+            f32 brightness = 0.f;
+            for (int c = 0; c < 3; ++c) brightness += rm.at(y, x, c);
+            brightness = clampf(brightness / 3.f, 0.f, 1.f);
+            // Gated accessors, so the noise plane vanishes with the mask
+            // noise-model toggle exactly as the analytic path's does.
+            const f32 nsig = std::sqrt(std::max(cfg.noise_alpha_robustness() * brightness +
+                                                cfg.noise_beta_robustness(), 0.f));
+
+            f32* o = &feat.at(y, x, 0);
+            for (int c = 0; c < 3; ++c) o[c] = rm.at(y, x, c);
+            // stds holds VARIANCE (see local_stats_3x3); the generator fed the
+            // network standard deviations, so take the root here too.
+            for (int c = 0; c < 3; ++c) o[3 + c] = std::sqrt(std::max(rv.at(y, x, c), 0.f));
+            for (int c = 0; c < 3; ++c) o[6 + c] = comp_means.at(qy, qx, c);
+            o[9] = fx;
+            o[10] = fy;
+            o[11] = Mspan;
+            o[12] = nsig;
+        }
+    });
+    return feat;
+}
+
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out) {
@@ -1203,6 +1268,34 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         std::fill(r.data.begin(), r.data.end(), 0.f);
         if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
+    }
+
+    // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both
+    // the Metal and CPU analytic paths, and falls through to them whenever the
+    // model is absent, fails to load, or the features cannot be built -- so a
+    // missing model degrades to the reference behaviour rather than to no mask.
+    //
+    // Eq. 9's 5x5 minimum is deliberately NOT applied on top. That step exists
+    // to spread rejection outward from a pointwise test with no spatial
+    // context; this network has a ~30 raw-pixel receptive field and was
+    // trained and measured to emit the final per-pixel decision, so dilating
+    // it again would double-count and would not match the reported numbers.
+    if (cfg.use_neural_robustness && robustness_nn_available()) {
+        Image guide_nn = compute_guide(comp_raw, cfg);
+        Image cm_nn, cv_nn;
+        local_stats_3x3(guide_nn, cm_nn, cv_nn);
+        Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow, tile_size, cfg);
+        Image nn_mask;
+        if (feat.h > 0 && robustness_nn_infer(feat, nn_mask) &&
+            nn_mask.h == feat.h && nn_mask.w == feat.w) {
+            // The learned mask makes no s1/s2 choice, so report the strict
+            // prior uniformly rather than leaving the split masks undefined.
+            if (s_select_out) {
+                *s_select_out = Image(nn_mask.h, nn_mask.w, 1);
+                std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
+            }
+            return nn_mask;
+        }
     }
 
 #ifdef __APPLE__

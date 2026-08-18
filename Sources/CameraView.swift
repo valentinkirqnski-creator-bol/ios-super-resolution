@@ -722,6 +722,15 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
+            .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
+                + "trained network. The analytic mask decides from a colour difference "
+                + "between 3x3 local means, which cannot see a misalignment that lands on "
+                + "similar-looking content or one finer than that window. The network sees "
+                + "the same statistics plus the estimated flow, its local spread and a wider "
+                + "neighbourhood. Measured against ground truth on synthetic bursts built "
+                + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
+                + "analytic mask automatically if the model is missing.")
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
