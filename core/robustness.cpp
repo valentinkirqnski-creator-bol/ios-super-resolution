@@ -393,6 +393,23 @@ static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
     return make_noise_curves_channel(cfg.noise_alpha_ch(ch), cfg.noise_beta_ch(ch), ch);
 }
 
+// Mask-only variants: honour Config::debug_noise_model_disabled by building
+// the curves from alpha = beta = 0 (so sigma_t = d_t = 0 in every bin),
+// while make_noise_curves(cfg) itself stays ungated -- it is shared with SNR
+// auto-tuning via noise_std_at_brightness, and gating it there changed the
+// alignment tile size and merge constants along with the mask (measured:
+// tile 16 -> 32), which is exactly what a diagnostic probe must not do.
+static const NoiseCurves& mask_noise_curves(const Config& cfg) {
+    if (cfg.debug_noise_model_disabled)
+        return make_noise_curves(0.f, 0.f);
+    return make_noise_curves(cfg);
+}
+static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
+    if (cfg.debug_noise_model_disabled)
+        return make_noise_curves_channel(0.f, 0.f, ch);
+    return make_noise_curves_channel(cfg, ch);
+}
+
 } // namespace
 
 // Python indexes std_curve[round(1000*brightness)] with no clamp, which is safe
@@ -425,16 +442,19 @@ void fetch_noise_curves(f32 alpha, f32 beta,
     diff_curve = nc.diff_curve;
 }
 
+// Only the Metal robustness-mask host consumes these two, so they honour the
+// mask-only noise-model kill switch; SNR reads noise_std_at_brightness, which
+// stays ungated.
 void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
-    const NoiseCurves& nc = make_noise_curves(cfg);
+    const NoiseCurves& nc = mask_noise_curves(cfg);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
 }
 
 void fetch_noise_curves_channel(const Config& cfg, int ch,
                                 std::vector<f32>& std_curve, std::vector<f32>& diff_curve) {
-    const NoiseCurves& nc = make_noise_curves_channel(cfg, ch);
+    const NoiseCurves& nc = mask_noise_curves_channel(cfg, ch);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
 }
@@ -559,7 +579,8 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
 static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     if (!std::isfinite(brightness)) brightness = 0.f;
     brightness = clampf(brightness, 0.f, 1.f);
-    f32 v = std::max(cfg.noise_alpha() * brightness + cfg.noise_beta(), 0.f);
+    f32 v = std::max(cfg.noise_alpha_robustness() * brightness +
+                     cfg.noise_beta_robustness(), 0.f);
     if (nch == 3 && ch == 1)
         v *= 0.5f; // green guide channel is the average of two Bayer greens.
     return v;
@@ -640,7 +661,8 @@ static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
         brightness = std::max(brightness, guide_brightness(comp_means, new_y, new_x));
     }
     const f32 noise_var =
-        std::max(0.f, cfg.noise_alpha() * brightness + cfg.noise_beta());
+        std::max(0.f, cfg.noise_alpha_robustness() * brightness +
+                          cfg.noise_beta_robustness());
     const f32 noise_edge_floor =
         std::max(0.f, cfg.motion_edge_noise_floor_multiplier) * std::sqrt(noise_var);
     const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
@@ -999,9 +1021,9 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     if (ref_stats.means.c == 3) {
         for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &make_noise_curves_channel(cfg, ch);
+            nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
     } else {
-        nc_ch[0] = &make_noise_curves(cfg);
+        nc_ch[0] = &mask_noise_curves(cfg);
     }
 
     // Comparison frame's own local stats, still built at guide resolution
@@ -1200,9 +1222,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     if (ref_stats.means.c == 3) {
         for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &make_noise_curves_channel(cfg, ch);
+            nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
     } else {
-        nc_ch[0] = &make_noise_curves(cfg);
+        nc_ch[0] = &mask_noise_curves(cfg);
     }
 
     Image guide = compute_guide(comp_raw, cfg);

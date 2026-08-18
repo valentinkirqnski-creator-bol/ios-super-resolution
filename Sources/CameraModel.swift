@@ -145,6 +145,12 @@ struct TuningParams: Equatable, Codable {
     /// same robustness/merge math either way. Falls back to the classical
     /// path per-frame if the model isn't bundled or fails to load.
     var use_neural_flow: Bool = false
+    /// Debug: zero the noise model as read by the robustness mask ONLY.
+    /// R is then scored from the raw measured local variance and the raw
+    /// (unshrunk) pixel difference. SNR auto-tune, the alignment tile size
+    /// and kernel estimation are unaffected -- the gate lives on the mask's
+    /// own curve builds, not the shared noise accessors.
+    var debug_noise_model_disabled: Bool = false
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -209,7 +215,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
         case align_ica_per_level_fft, use_neural_flow
-        case robustness_raw_resolution_enabled
+        case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -279,6 +285,7 @@ struct TuningParams: Equatable, Codable {
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
+        debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -1892,6 +1899,7 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
+            "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
