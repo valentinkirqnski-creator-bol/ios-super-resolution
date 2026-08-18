@@ -603,6 +603,27 @@ struct Config {
     bool robustness_raw_resolution_active() const {
         return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
     }
+    // ImageStackAlignator's rule for unreliable matches, in the author's own
+    // words: "if we cannot determine a precise shift for a given patch due to
+    // missing feature (or aperture) then no shift is applied at all." When a
+    // tile's block match at any pyramid level is ambiguous -- best and
+    // second-best cost within flow_reject_1d_ambiguity_ratio, the same test
+    // that already feeds the match_ambiguous flag -- the found offset is
+    // DISCARDED and the tile keeps its seed: the upsampled previous-level
+    // flow, or the global initial estimate at the coarsest level.
+    //
+    // This acts on the flow itself, unlike flow_reject_ambiguous_enabled's
+    // soft demotion to s1 downstream -- which is inert under rotation, where
+    // M saturates and every tile is on s1 already. Motivating measured case
+    // (ok/ burst, frame 6, flat shadow): a candidate at (82,-154) beat the
+    // sane parent (88,112) at cost 0.4546 vs 0.4968 -- ratio 1.093, inside
+    // the 1.10 ambiguity window. This rule keeps the parent there.
+    //
+    // Off by default: changes which flow gets computed for every ambiguous
+    // tile at every level, on CPU and Metal -- A/B against the default
+    // before adopting.
+    bool  align_ambiguous_fallback_enabled = false;
+
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
     // high. This does not repair flow; it rejects unsafe 1D tiles.

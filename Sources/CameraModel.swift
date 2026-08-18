@@ -145,6 +145,14 @@ struct TuningParams: Equatable, Codable {
     /// same robustness/merge math either way. Falls back to the classical
     /// path per-frame if the model isn't bundled or fails to load.
     var use_neural_flow: Bool = false
+    /// ImageStackAlignator's rule for unreliable block matches: when a
+    /// tile's best and second-best costs are near-tied (flat patch, aperture,
+    /// repetition -- no precise shift determinable), apply NO shift and keep
+    /// the seed from the coarser level / global estimate, instead of
+    /// trusting a match indistinguishable from noise. Acts on the flow
+    /// itself, unlike the s1 demotion, which is inert under rotation where
+    /// every tile is on s1 already. Off by default -- A/B before adopting.
+    var align_ambiguous_fallback_enabled: Bool = false
     /// Debug: zero the noise model as read by the robustness mask ONLY.
     /// R is then scored from the raw measured local variance and the raw
     /// (unshrunk) pixel difference. SNR auto-tune, the alignment tile size
@@ -215,6 +223,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
         case align_ica_per_level_fft, use_neural_flow
+        case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -285,6 +294,7 @@ struct TuningParams: Equatable, Codable {
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
+        align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -1899,6 +1909,7 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
+            "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),

@@ -2045,7 +2045,8 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
                                   int ny, int nx, bool l1,
                                   id<MTLBuffer> b_ambiguity = nil,
                                   float ambiguity_ratio = 1.10f,
-                                  bool write_ambiguity = false) {
+                                  bool write_ambiguity = false,
+                                  bool fallback_on_ambiguous = false) {
     if (search_radius < 0 || tile_size <= 0) return false;
     if (ny <= 0 || nx <= 0) return true;
     auto& c = ctx();
@@ -2056,7 +2057,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
         uint32_t l1;
         float ambiguity_ratio;
         uint32_t write_ambiguity;
-        uint32_t _pad0 = 0;
+        uint32_t fallback_on_ambiguous = 0;  // kunzmi: ambiguous -> keep seed
     };
     static_assert(sizeof(AlignLocalSearch460ParamsCPU) == 48,
                   "AlignLocalSearch460ParamsCPU layout");
@@ -2073,6 +2074,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     if (!std::isfinite(ambiguity_ratio)) ambiguity_ratio = 1.10f;
     p.ambiguity_ratio = std::max(ambiguity_ratio, 1.0f);
     p.write_ambiguity = (write_ambiguity && b_ambiguity) ? 1u : 0u;
+    p.fallback_on_ambiguous = fallback_on_ambiguous ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
@@ -2254,7 +2256,8 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow,
                                 float ambiguity_ratio,
-                                bool write_ambiguity) {
+                                bool write_ambiguity,
+                                bool fallback_on_ambiguous) {
     if (!metal_gpu_init()) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
@@ -2270,7 +2273,8 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
     if (!local_search_460_bufs(ref_img, mov_img, flow_b, ref.h, ref.w,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, false, b_ambiguity,
-                               ambiguity_ratio, write_ambiguity))
+                               ambiguity_ratio, write_ambiguity,
+                               fallback_on_ambiguous))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -2286,7 +2290,8 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow,
                                 float ambiguity_ratio,
-                                bool write_ambiguity) {
+                                bool write_ambiguity,
+                                bool fallback_on_ambiguous) {
     if (!metal_gpu_init()) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
@@ -2302,7 +2307,8 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
     if (!local_search_460_bufs(b_ref, b_mov, b_flow, ref.h, ref.w,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, true, b_ambiguity,
-                               ambiguity_ratio, write_ambiguity))
+                               ambiguity_ratio, write_ambiguity,
+                               fallback_on_ambiguous))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -2386,8 +2392,11 @@ struct AlignUpscaleParamsCPU {
     int32_t ts;
     int32_t ref_h, ref_w, mov_h, mov_w;
     uint32_t carry_ambiguity = 0;   // 1 = propagate the block-matching ambiguity flag
+    uint32_t fallback_on_ambiguous = 0; // 1 = keep parent candidate on a near-tie
+    float ambiguity_ratio = 1.10f;
+    uint32_t _pad0 = 0;
 };
-static_assert(sizeof(AlignUpscaleParamsCPU) == 56, "AlignUpscaleParamsCPU");
+static_assert(sizeof(AlignUpscaleParamsCPU) == 68, "AlignUpscaleParamsCPU");
 
 // One pyramid level: upload ref, Sobel gx/gy, Hessian. Temps only — do not
 // retain all levels at once (full-res sticky cache jetsams on 1×).
@@ -2503,7 +2512,9 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
                                   int prev_tile_size,
                                   int ref_h, int ref_w, int mov_h, int mov_w,
                                   id<MTLBuffer> b_amb_in = nil,
-                                  __strong id<MTLBuffer>* b_amb_out = nullptr) {
+                                  __strong id<MTLBuffer>* b_amb_out = nullptr,
+                                  bool fallback_on_ambiguous = false,
+                                  float ambiguity_ratio = 1.10f) {
     auto& c = ctx();
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
@@ -2537,6 +2548,9 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     p.mov_h = (int32_t)mov_h;
     p.mov_w = (int32_t)mov_w;
     p.carry_ambiguity = carry_amb ? 1u : 0u;
+    p.fallback_on_ambiguous = fallback_on_ambiguous ? 1u : 0u;
+    if (!std::isfinite(ambiguity_ratio)) ambiguity_ratio = 1.10f;
+    p.ambiguity_ratio = std::max(ambiguity_ratio, 1.0f);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
@@ -2670,7 +2684,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                        b_up, ny, nx, upsample_factor, ts, prev_ts,
                                        r.h, r.w, m.h, m.w,
                                        want_amb ? b_ambiguity : nil,
-                                       want_amb ? &b_amb_up : nullptr) || !b_up)
+                                       want_amb ? &b_amb_up : nullptr,
+                                       cfg.align_ambiguous_fallback_enabled,
+                                       cfg.flow_reject_1d_ambiguity_ratio) || !b_up)
                 return false;
             b_flow = b_up;
             if (want_amb && b_amb_up) {
@@ -2701,13 +2717,15 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           m.h, m.w, ts, radius, ny, nx, true,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
-                                          want_amb);
+                                          want_amb,
+                                          cfg.align_ambiguous_fallback_enabled);
         else
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, false,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
-                                          want_amb);
+                                          want_amb,
+                                          cfg.align_ambiguous_fallback_enabled);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --

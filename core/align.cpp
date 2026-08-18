@@ -521,6 +521,7 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                                          int tile_size, int search_radius,
                                          FlowField& flow, bool l1,
                                          f32 ambiguity_ratio, bool write_ambiguity,
+                                         bool fallback_on_ambiguous,
                                          int num_threads) {
     const int ny = flow.ny, nx = flow.nx;
     const int ts = tile_size;
@@ -588,11 +589,24 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                     }
                 }
             }
-            flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
-            flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+            const uint32_t ambiguous =
+                (write_ambiguity || fallback_on_ambiguous)
+                    ? match_is_ambiguous(min_dist, second_dist, ambiguity_ratio)
+                    : 0u;
+            if (fallback_on_ambiguous && ambiguous != 0u) {
+                // ImageStackAlignator's rule: no precise shift determinable
+                // (near-tied cost surface: flat patch, aperture, repetition)
+                // -> apply NO shift; the tile keeps its seed, i.e. the
+                // upsampled previous-level flow or the global initial
+                // estimate at the coarsest level.
+                flow.dx(ty, tx) = local_fx;
+                flow.dy(ty, tx) = local_fy;
+            } else {
+                flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
+                flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+            }
             if (write_ambiguity)
-                flow.ambiguous(ty, tx) |=
-                    match_is_ambiguous(min_dist, second_dist, ambiguity_ratio);
+                flow.ambiguous(ty, tx) |= ambiguous;
         }
     });
 }
@@ -602,17 +616,19 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
                                   FlowField& flow, const Config& cfg,
                                   int num_threads) {
     const bool write_ambiguity = cfg.flow_reject_ambiguous_enabled;
+    const bool fallback = cfg.align_ambiguous_fallback_enabled;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
         if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow,
-                                       ambiguity_ratio, write_ambiguity))
+                                       ambiguity_ratio, write_ambiguity, fallback))
             return;
     }
 #endif
     block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
-                                 false, ambiguity_ratio, write_ambiguity, num_threads);
+                                 false, ambiguity_ratio, write_ambiguity, fallback,
+                                 num_threads);
 }
 
 // ============================================================================
@@ -623,15 +639,17 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
                                   FlowField& flow, const Config& cfg,
                                   int num_threads) {
     const bool write_ambiguity = cfg.flow_reject_ambiguous_enabled;
+    const bool fallback = cfg.align_ambiguous_fallback_enabled;
     const f32 ambiguity_ratio = clamped_ambiguity_ratio(cfg);
 #ifdef __APPLE__
     if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&
         block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow,
-                                   ambiguity_ratio, write_ambiguity))
+                                   ambiguity_ratio, write_ambiguity, fallback))
         return;
 #endif
     block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
-                                 true, ambiguity_ratio, write_ambiguity, num_threads);
+                                 true, ambiguity_ratio, write_ambiguity, fallback,
+                                 num_threads);
     return;
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
@@ -943,7 +961,9 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
 static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                                   const FlowField& in, int target_ny, int target_nx,
                                   int upsample_factor, int new_tile_size,
-                                  int prev_tile_size) {
+                                  int prev_tile_size,
+                                  bool fallback_on_ambiguous = false,
+                                  f32 ambiguity_ratio = 1.10f) {
     int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
     int repeat_factor = upsample_factor / std::max(1, tile_ratio);
     if (repeat_factor < 1) repeat_factor = 1;
@@ -986,6 +1006,7 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             const int ox = tx * new_tile_size;
             const int oy = ty * new_tile_size;
             f32 best_dist = std::numeric_limits<f32>::infinity();
+            f32 second_dist = std::numeric_limits<f32>::infinity();
             int best_i = 0;
             for (int ci = 0; ci < 3; ++ci) {
                 f32 dist = 0.f;
@@ -1006,10 +1027,23 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                 }
                 if (!valid) dist = std::numeric_limits<f32>::infinity();
                 if (dist < best_dist) {
+                    second_dist = best_dist;
                     best_dist = dist;
                     best_i = ci;
+                } else if (dist < second_dist) {
+                    second_dist = dist;
                 }
             }
+            // ImageStackAlignator's rule extended to the candidate test: when
+            // a NEIGHBOUR tile's flow wins over the parent's by less than the
+            // ambiguity ratio, the cost surface cannot distinguish them --
+            // keep the parent (the previous level's own estimate) rather
+            // than inheriting a neighbour's unrelated motion. The measured
+            // catastrophic case this targets: neighbour (82,-154) beating
+            // parent (88,112) at 0.4546 vs 0.4968 -- ratio 1.093.
+            if (fallback_on_ambiguous && best_i != 0 &&
+                match_is_ambiguous(best_dist, second_dist, ambiguity_ratio) != 0u)
+                best_i = 0;
             out.dx(ty, tx) = cand[best_i][0];
             out.dy(ty, tx) = cand[best_i][1];
             if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx) {
@@ -1193,7 +1227,9 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1])
                           : ts;
-            flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts);
+            flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts,
+                                    cfg.align_ambiguous_fallback_enabled,
+                                    clamped_ambiguity_ratio(cfg));
         }
 
         std::string metric = "L2";

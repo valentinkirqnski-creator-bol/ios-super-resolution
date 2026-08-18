@@ -35,7 +35,8 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow,
                                 float ambiguity_ratio = 1.10f,
-                                bool write_ambiguity = false);
+                                bool write_ambiguity = false,
+                                bool fallback_on_ambiguous = false);
 
 // L1 BM for ts==16 (default finest level). Same warp-reduce + broken argmin
 // as align.cpp. Returns false if unsupported (ts!=16 or R>1) or GPU fail.
@@ -43,7 +44,8 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 int tile_size, int search_radius,
                                 FlowField& flow,
                                 float ambiguity_ratio = 1.10f,
-                                bool write_ambiguity = false);
+                                bool write_ambiguity = false,
+                                bool fallback_on_ambiguous = false);
 
 // ICA refine one pyramid level (ICA.py ica_kernel_8/16). Same bilinear rules,
 // modf/trunc, butterfly reduce order, and Ax=B update as align.cpp / Python.

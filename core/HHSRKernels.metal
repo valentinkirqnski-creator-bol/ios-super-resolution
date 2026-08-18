@@ -460,7 +460,7 @@ struct AlignLocalSearch460Params {
     uint l1;
     float ambiguity_ratio;
     uint write_ambiguity;
-    uint _pad0;
+    uint fallback_on_ambiguous;  // kunzmi: ambiguous -> keep seed, no shift
 };
 
 // One threadgroup per tile; threads split the candidate shifts.
@@ -623,16 +623,21 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
             sdy = row - R;
             sdx = (c - row * span) - R;
         }
+        const float b = max(red_dist[0], 0.f);
+        const float sec = max(red_second_dist[0], 0.f);
+        const float denom = max(b, 1.0e-12f);
+        const bool ambiguous =
+            isfinite(b) && isfinite(sec) && (sec / denom) < p.ambiguity_ratio;
+        if (p.fallback_on_ambiguous != 0u && ambiguous) {
+            // ImageStackAlignator's rule: no precise shift determinable ->
+            // apply NO shift; keep the upsampled previous-level seed.
+            sdx = 0;
+            sdy = 0;
+        }
         flow[tile_id * 2u + 0u] = local_fx + float(sdx);
         flow[tile_id * 2u + 1u] = local_fy + float(sdy);
-        if (p.write_ambiguity != 0u) {
-            const float b = max(red_dist[0], 0.f);
-            const float s = max(red_second_dist[0], 0.f);
-            const float denom = max(b, 1.0e-12f);
-            ambiguity[tile_id] |=
-                (isfinite(b) && isfinite(s) && (s / denom) < p.ambiguity_ratio)
-                    ? 1u : 0u;
-        }
+        if (p.write_ambiguity != 0u)
+            ambiguity[tile_id] |= ambiguous ? 1u : 0u;
     }
 }
 
@@ -2730,6 +2735,9 @@ struct AlignUpscaleParams {
     int ts;
     int ref_h, ref_w, mov_h, mov_w;
     uint carry_ambiguity;   // 1 = propagate the block-matching ambiguity flag
+    uint fallback_on_ambiguous; // 1 = keep parent candidate on a near-tie
+    float ambiguity_ratio;
+    uint _pad0;
 };
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
@@ -2791,6 +2799,7 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
     int ox = int(gid.x) * p.ts;
     int oy = int(gid.y) * p.ts;
     float best = INFINITY;
+    float second = INFINITY;
     float2 best_flow = cand0;
     uint best_ci = 0u;
     for (uint ci = 0u; ci < 3u; ++ci) {
@@ -2819,9 +2828,26 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
                 dist += fabs(ref[rrow + uint(j)] - mov[mrow + uint(j)]);
         }
         if (dist < best) {
+            second = best;
             best = dist;
             best_flow = c;
             best_ci = ci;
+        } else if (dist < second) {
+            second = dist;
+        }
+    }
+    // ImageStackAlignator's rule extended to the candidate test: when a
+    // NEIGHBOUR tile's flow wins over the parent's by less than the ambiguity
+    // ratio, the cost surface cannot tell them apart -- keep the parent (the
+    // previous level's own estimate) instead of inheriting a neighbour's
+    // unrelated motion.
+    if (p.fallback_on_ambiguous != 0u && best_ci != 0u) {
+        const float b = max(best, 0.f);
+        const float sec = max(second, 0.f);
+        const float denom = max(b, 1.0e-12f);
+        if (isfinite(b) && isfinite(sec) && (sec / denom) < p.ambiguity_ratio) {
+            best_flow = cand0;
+            best_ci = 0u;
         }
     }
     out_flow[o + 0u] = best_flow.x;
