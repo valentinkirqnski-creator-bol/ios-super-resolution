@@ -1628,6 +1628,11 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
+    // Eq. 9's min applied TWICE (5x5 o 5x5 = 9x9 raw): restores the paper's
+    // ~10x10-raw physical safety margin -- which s/t/Mt were tuned against on
+    // the guide grid -- while keeping the rejection boundary at raw-pixel
+    // precision. Ping-pong through the two existing buffers rather than a new
+    // radius-4 kernel, so this mirrors the CPU's double local_min_5x5 exactly.
     RobStatsParamsCPU sp{};
     sp.h = (uint32_t)ch_h;
     sp.w = (uint32_t)ch_w;
@@ -1640,13 +1645,21 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
     [enc endEncoding];
 
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return Image();
+    [enc setBuffer:b_R offset:0 atIndex:0];    // second pass: out -> R
+    [enc setBuffer:b_out offset:0 atIndex:1];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+    dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
+    [enc endEncoding];
+
     prof_tag_gpu(cmd, "robustness:raw-res");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
     Image r(ch_h, ch_w, 1);
-    memcpy(r.data.data(), [b_out contents], mask_b);
+    memcpy(r.data.data(), [b_R contents], mask_b);
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);

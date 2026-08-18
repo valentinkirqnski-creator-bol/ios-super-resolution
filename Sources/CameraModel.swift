@@ -149,9 +149,9 @@ struct TuningParams: Equatable, Codable {
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
     /// half-resolution either way -- what changes is where the ratio is
-    /// evaluated and where the 5x5 local-min runs: at raw resolution the min
-    /// spans 5x5 raw px as the IPOL article intends, instead of 5x5 guide px
-    /// = an effective 10x10 raw px. Only takes effect when "Alignment Grey:
+    /// evaluated and where the local-min runs: at raw resolution the min is
+    /// a double 5x5 (= 9x9 raw), keeping the paper's ~10x10-raw physical
+    /// margin while the rejection boundary lands at raw-pixel precision. Only takes effect when "Alignment Grey:
     /// FFT" below is OFF (Decimate) -- that path's flow is already coarser
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.

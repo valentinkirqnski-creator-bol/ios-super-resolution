@@ -1113,10 +1113,18 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
-    // 5x5 min at RAW resolution -- 5x5 raw px, the IPOL reading of Eq. 9.
-    // The guide-resolution path below min-pools the same window on the guide
-    // grid, where it spans an effective 10x10 raw px.
-    return local_min_5x5(R);
+    // Eq. 9's min applied TWICE -- square erosion composes, so 5x5 o 5x5 =
+    // 9x9 raw px. Rationale: Wronski runs one 5x5 on the GUIDE grid, i.e. a
+    // 10x10-raw physical safety margin, and s/t/Mt were tuned against that
+    // reach. IPOL kept the 5x5 window count when it moved R to raw
+    // resolution, silently halving the margin (measured on the ok/ burst:
+    // rejected fraction 14.9% -> 11.3%). Doubling the pass restores the
+    // paper's physical reach (9x9 is the closest odd window to 10x10, which
+    // has no centre pixel) while keeping the rejection BOUNDARY at raw-pixel
+    // precision -- the point of this path. Two passes of the existing kernel
+    // rather than a radius-4 pool so CPU and Metal stay bit-identical without
+    // a new shader.
+    return local_min_5x5(local_min_5x5(R));
 }
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
