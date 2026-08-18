@@ -712,6 +712,11 @@ struct CameraView: View {
              Experimental -- not yet validated against real bursts on-device.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Analytic Noise Model (kunzmi)", isOn: $cam.tuningParams.noise_model_kunzmi)
+        Text("""
+             ImageStackAlignator's noise model for the robustness mask: sigma_t computed              analytically as sqrt(alpha*mu + beta) at each pixel's local mean, and the              Wiener shrink built from the measured local variance -- no simulated              frame-difference threshold (d_t). Wronski's d_t is derived from total              per-frame noise, but fixed-pattern noise cancels between frames of a burst,              so d_t systematically over-forgives real misalignment. Off = Wronski's              Monte-Carlo curve model.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Disable Noise Model (Robustness)", isOn: $cam.tuningParams.debug_noise_model_disabled)
         Text("""
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.

@@ -1131,7 +1131,7 @@ struct RobMaskParamsCPU {
     float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
     uint32_t save_s_select = 0;  // 1 = also emit the per-pixel s1/s2 selector
     uint32_t ambiguous_enabled = 0;  // 1 = demote tiles with an ambiguous match
-    uint32_t _pad1 = 0;
+    uint32_t kunzmi = 0;  // 1 = analytic sigma_t + measured-variance shrink
 };
 static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
@@ -1145,7 +1145,7 @@ struct RobMaskRawParamsCPU {
     uint32_t chain_reject_enabled = 0;
     float r_s_chain = 0.f;
     uint32_t motion_magnitude_veto_enabled = 0;
-    uint32_t _pad0 = 0;
+    uint32_t kunzmi = 0;  // 1 = analytic sigma_t + measured-variance shrink
     uint32_t _pad1 = 0;
 };
 static_assert(sizeof(RobMaskRawParamsCPU) == 64, "RobMaskRawParamsCPU");
@@ -1388,6 +1388,7 @@ static float g_rob_curve_alpha[3] = {std::numeric_limits<float>::quiet_NaN(),
 static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
+static bool g_rob_curve_kunzmi = false;
 static bool g_rob_curve_pixel4a = false;
 static int g_rob_curve_pixel4a_iso = 0;
 
@@ -1539,7 +1540,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
-        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso ||
+        g_rob_curve_kunzmi != cfg.noise_model_kunzmi;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -1572,6 +1574,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         g_rob_curve_n = n;
         g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
         g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_kunzmi = cfg.noise_model_kunzmi;
     }
     if (g_rob_curve_n == 0) return Image();
 
@@ -1611,6 +1614,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
+    mp.kunzmi = cfg.noise_model_kunzmi ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1715,7 +1719,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
-        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso ||
+        g_rob_curve_kunzmi != cfg.noise_model_kunzmi;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -1748,6 +1753,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         g_rob_curve_n = n;
         g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
         g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_kunzmi = cfg.noise_model_kunzmi;
     }
     if (g_rob_curve_n == 0) return Image();
     id<MTLBuffer> b_std = g_rob_std_curve;
@@ -1807,6 +1813,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
+    mp.kunzmi = cfg.noise_model_kunzmi ? 1u : 0u;
     const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
