@@ -22,10 +22,16 @@ using f32 = float;
 // Row-major image / tensor with an arbitrary number of interleaved channels.
 // Number of feature planes the learned robustness mask consumes
 // (robustness_nn.h). Fixed by the trained weights --
-// tools/rob_nn/rob_dataset.cpp writes them in this order and
+// tools/rob_nn/rob_real.cpp writes them in this order and
 // tools/rob_nn/train_rob.py trains on that layout, so changing it means
 // retraining, not just editing a constant.
-inline constexpr int kRobustnessNnChannels = 15;
+//
+// This is also a HARD contract with the bundled RobustnessNet.mlmodelc. The
+// Core ML wrapper fails closed on a mismatch: it logs and returns false, and
+// the pipeline silently uses the analytic mask, so a rebuild after changing
+// this number looks like "the learned mask changed nothing". Changing it
+// means re-running train_rob.py AND export_coreml.py.
+inline constexpr int kRobustnessNnChannels = 18;
 
 // The learned mask runs in horizontal strips to bound peak memory (see
 // build_robustness_nn_features). kRobustnessNnHalo is the network's exact

@@ -1209,9 +1209,46 @@ f32 robustness_analytic_R(const f32* ref_mean, const f32* ref_var,
     return std::isfinite(r) ? clampf(r, 0.f, 1.f) : 0.f;
 }
 
+void ensure_robustness_nn_ref_hf(RefStats& rs, const Config& cfg) {
+    const Image& rm = rs.means;
+    if (rs.nn_hf.h == rm.h && rs.nn_hf.w == rm.w && !rs.nn_hf.data.empty()) return;
+    if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 ||
+        rm.data.size() < (size_t)rm.h * rm.w * rm.c)
+        return;                       // GPU-resident stats; caller fetches first
+    const int h = rm.h, w = rm.w;
+    Image hf(h, w, 1);
+    // Separable 5x5 box over the three mean planes, then the mean absolute
+    // deviation of the centre from it. Separable because the naive form is
+    // 25 taps per channel and this runs on the full guide plane.
+    Image blur(h, w, 3);
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 3; ++c) {
+                f32 s = 0.f;
+                for (int j = -2; j <= 2; ++j)
+                    s += rm.at(y, std::min(std::max(x + j, 0), w - 1), c);
+                blur.at(y, x, c) = s * 0.2f;
+            }
+    });
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            f32 acc = 0.f;
+            for (int c = 0; c < 3; ++c) {
+                f32 s = 0.f;
+                for (int i = -2; i <= 2; ++i)
+                    s += blur.at(std::min(std::max(y + i, 0), h - 1), x, c);
+                acc += std::fabs(rm.at(y, x, c) - s * 0.2f);
+            }
+            hf.at(y, x) = acc / 3.f;
+        }
+    });
+    rs.nn_hf = std::move(hf);
+}
+
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
-                                   const Config& cfg, int y0, bool raw_res) {
+                                   const Config& cfg, int y0, bool raw_res,
+                                   int rows) {
     const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
     const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
     if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
@@ -1228,8 +1265,83 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     if (flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return Image();
 
     const int h = rm.h, w = rm.w;
-    const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
+    // Channel 17's cache. Built once per burst by ensure_robustness_nn_ref_hf;
+    // at raw resolution there is no cached plane, so the channel is zero there
+    // (the raw-res path is off by default and was never trained with it).
+    const Image* hf_plane = &ref_stats.nn_hf;
+    const bool have_hf = !raw_res && hf_plane->h == rm.h && hf_plane->w == rm.w &&
+                         hf_plane->data.size() >= (size_t)rm.h * rm.w;
+    // rows == 0 selects the on-device strip height. The training generator
+    // passes the whole plane instead: it writes crops from arbitrary origins,
+    // and stitching them out of strips would only add a way to get the
+    // indexing wrong in the one place where features and labels must line up.
+    const int strip_h = (rows > 0) ? std::min(rows, h)
+                                   : (kRobustnessNnStripRows + 2 * kRobustnessNnHalo);
     Image feat(strip_h, w, kRobustnessNnChannels);
+
+    // ---- per-tile flow statistics, computed once ---------------------------
+    //
+    // These used to be recomputed inside the pixel loop, four times per pixel
+    // (once per bilinear corner) at 3 MP -- a 3x3 scan of the flow field per
+    // corner. The tile grid is ~47k entries against ~3M pixels, so hoisting it
+    // is both much cheaper and the only way the three new channels below are
+    // affordable at all.
+    const int tny = flow.ny, tnx = flow.nx;
+    std::vector<f32> t_span((size_t)tny * tnx, 0.f);   // Eq. 7's M
+    std::vector<f32> t_resid((size_t)tny * tnx, 0.f);  // |flow - local median|
+    std::vector<f32> t_rspan((size_t)tny * tnx, 0.f);  // span of that residual
+    parallel_rows(tny, cfg.num_threads, [&](int ty) {
+        f32 bx[9], by[9];
+        for (int tx = 0; tx < tnx; ++tx) {
+            f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
+            f32 mxx = -mnx, mxy = -mnx;
+            int n = 0;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= tny || xx < 0 || xx >= tnx) continue;
+                    const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
+                    mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
+                    mny = std::min(mny, vy); mxy = std::max(mxy, vy);
+                    bx[n] = vx; by[n] = vy; ++n;
+                }
+            const f32 dxs = (mxx > mnx) ? (mxx - mnx) : 0.f;
+            const f32 dys = (mxy > mny) ? (mxy - mny) : 0.f;
+            t_span[(size_t)ty * tnx + tx] = std::sqrt(dxs * dxs + dys * dys);
+
+            // Component-wise median of the 3x3 neighbourhood: a robust local
+            // model of what the flow "should" be here. The residual against it
+            // is the channel that separates the two cases the current mask
+            // conflates. Under smooth camera rotation every neighbour agrees
+            // with the local trend, so the residual is ~0 while the SPAN is
+            // large -- which is precisely why keying on the span alone (all
+            // the analytic mask can do, and measured at >70% of tiles over
+            // r_Mt on these bursts) rejects rotation. One tile that has locked
+            // onto the wrong match disagrees with its neighbours and the
+            // residual is the size of the error.
+            std::nth_element(bx, bx + n / 2, bx + n);
+            std::nth_element(by, by + n / 2, by + n);
+            const f32 ex = flow.dx(ty, tx) - bx[n / 2];
+            const f32 ey = flow.dy(ty, tx) - by[n / 2];
+            t_resid[(size_t)ty * tnx + tx] = std::sqrt(ex * ex + ey * ey);
+        }
+    });
+    // Second pass: how rough is the neighbourhood's residual in general. Gives
+    // the network a local scale to judge channel 15 against, so a large
+    // residual in an area where everything is rough (real parallax, foliage)
+    // reads differently from the same residual in a smoothly-flowing area.
+    parallel_rows(tny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < tnx; ++tx) {
+            f32 mx = 0.f;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= tny || xx < 0 || xx >= tnx) continue;
+                    mx = std::max(mx, t_resid[(size_t)yy * tnx + xx]);
+                }
+            t_rspan[(size_t)ty * tnx + tx] = mx;
+        }
+    });
     // y0 is the first source row of the window, which the caller keeps fully
     // inside the image. That matters: the window's edges then coincide with
     // the image's, so the convolutions' zero-padding is the same padding
@@ -1282,23 +1394,11 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             // statistic the analytic mask reduces to a binary s1/s2 choice.
             // Handed over as a continuous value so the network can grade it,
             // and bilinearly blended for the same reason as the flow above.
-            auto span_at = [&](int cy, int cx) {
-                f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
-                f32 mxx = -mnx, mxy = -mnx;
-                for (int i = -1; i <= 1; ++i)
-                    for (int j = -1; j <= 1; ++j) {
-                        const int yy = cy + i, xx = cx + j;
-                        if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                        const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
-                        mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
-                        mny = std::min(mny, vy); mxy = std::max(mxy, vy);
-                    }
-                const f32 dxs = (mxx > mnx) ? (mxx - mnx) : 0.f;
-                const f32 dys = (mxy > mny) ? (mxy - mny) : 0.f;
-                return std::sqrt(dxs * dxs + dys * dys);
+            auto tlook = [&](const std::vector<f32>& t) {
+                return bilerp(t[(size_t)iy0 * tnx + ix0], t[(size_t)iy0 * tnx + ix1],
+                              t[(size_t)iy1 * tnx + ix0], t[(size_t)iy1 * tnx + ix1]);
             };
-            const f32 Mspan = bilerp(span_at(iy0, ix0), span_at(iy0, ix1),
-                                     span_at(iy1, ix0), span_at(iy1, ix1));
+            const f32 Mspan = tlook(t_span);
 
             // Comparison statistics sampled where the flow points, in guide
             // units (half the raw displacement), matching the generator.
@@ -1354,6 +1454,29 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             // normalisation is fitted over the training set, not per image.
             o[13] = std::log1p(std::max(ratio, 0.f));
             o[14] = r_an;
+
+            // Channels 15-16: the flow's local CONSISTENCY, which is the
+            // evidence neither the analytic mask nor the previous feature set
+            // carried. Channel 11 (the span M) confuses "smooth camera
+            // rotation" with "one tile is wrong" -- both make neighbouring
+            // vectors differ -- and on these bursts it fires on 70-100% of
+            // tiles, so as a rejection cue it is close to a constant. The
+            // residual against the local median is near zero for the first
+            // case and the size of the error for the second; the residual's
+            // own neighbourhood span gives the local scale to read it against.
+            o[15] = tlook(t_resid);
+            o[16] = tlook(t_rspan);
+
+            // Channel 17: local high-frequency energy of the reference. The
+            // mean says how bright, the std how contrasty, but neither says
+            // how FINE the structure is -- and that is what decides whether a
+            // subpixel error costs anything. A thin rod and a soft gradient
+            // can carry the same local std.
+            //
+            // Read from the per-burst cache, never recomputed here: it depends
+            // only on the reference, and a 5x5 box over 3 channels inside this
+            // loop would cost 75 reads/px on every comparison frame.
+            o[17] = have_hf ? hf_plane->at(y, x) : 0.f;
         }
     });
     return feat;
@@ -1428,6 +1551,10 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 cm_nn = std::move(hires);
             }
         }
+        // Feature channel 17 depends only on the reference, so it is built
+        // here (once per burst -- the guard inside makes repeat calls free)
+        // rather than inside the per-pixel loop of every comparison frame.
+        ensure_robustness_nn_ref_hf(*const_cast<RefStats*>(&ref_stats), cfg);
         const int nh = cm_nn.h, nw = cm_nn.w;
         const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
         Image nn_mask(nh, nw, 1);

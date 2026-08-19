@@ -1,13 +1,47 @@
 """Train a robustness mask that predicts merge-safety directly.
 
 Inputs are what any mask could see (reference stats, warped comparison stats,
-the estimated flow and its local span, expected noise). The target is the
-ideal robustness derived from ground truth: 1 where the alignment fetched the
-right content, falling off where it did not. See rob_dataset.cpp for why that
-label is not circular.
+the estimated flow, its local consistency, expected noise, and the analytic
+mask's own answer). The target is the ideal robustness derived from ground
+truth: 1 where the alignment fetched the right content, falling off where it
+did not. See rob_real.cpp for how a real burst yields that label without
+synthesising any imagery, and why it is not circular.
 
-Also scores the classical Wronski mask against the same ground truth, which
-is the first apples-to-apples number either has had.
+Also scores the classical Wronski mask against the same ground truth, which is
+the only apples-to-apples comparison either has had.
+
+Why the loss changed, and why that is the whole point
+----------------------------------------------------
+The previous version minimised a CLASS-WEIGHTED squared error, upweighting
+rejection by `rej_w` because harmful pixels are the minority. That choice, not
+the labels, is what produced a mask stuck at mid-grey, and the arithmetic is
+worth stating because it was mistaken for a data problem twice.
+
+Weighted MSE is minimised by the WEIGHTED conditional mean. With a fraction f
+of harmful pixels at target 0 and (1-f) harmless at target 1, the optimal
+prediction for an ambiguous feature vector is
+
+    (1-f) / ((1-f) + f * (1 + rej_w))
+
+At f = 0.05 and rej_w = 8 that is 0.70; at rej_w = 2, 0.86. Neither exceeds
+0.9, so the mask CANNOT emit the top of its range no matter how clean the
+labels are or how long it trains -- which is exactly what was measured (0.0%
+of pixels above 0.9 against the analytic mask's 62-74%). The upweighting was
+the cause.
+
+So class weighting is gone by default. Imbalance is handled where it belongs,
+in how the generator places crops, and the remaining two changes address the
+other half of the problem:
+
+  * BCE rather than MSE. Both are minimised by the conditional mean, so both
+    are calibrated in principle, but MSE composed with a sigmoid has a
+    gradient carrying sigma'(z) twice over, which vanishes at both ends -- the
+    optimiser is pushed hardest in the middle and barely at all where the
+    answer is "certainly 1". BCE cancels that factor. This is the ordinary
+    reason sigmoid+MSE regressions sit in mid-range.
+  * the validity mask is honoured. Pixels the generator could not vouch for
+    carry weight 0 and must not contribute a gradient; averaging over them
+    would drag every prediction toward whatever those pixels happen to hold.
 """
 import json, os, sys
 import numpy as np
@@ -15,50 +49,89 @@ import torch
 import torch.nn as nn
 
 SC = os.path.dirname(os.path.abspath(__file__))
-PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset2")
-NCH, GH, GW = 18, 1512, 2016
-IN_CH = 15          # 0..12 raw stats, 13 = log1p(d^2/sigma^2), 14 = analytic R
-                    # 15 = harm, 16 = ideal R, 17 = flow error (analysis only)
-CH_ANALYTIC_R = 14  # the classical mask's answer, handed over as an input so
-                    # the net learns a correction rather than a replacement
+PREFIX = os.environ.get("ROB_DATA") or (
+    sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset"))
 
-meta = {}
-with open(PREFIX + ".meta") as f:
-    for line in f:
-        k, v = line.split()
-        meta[k] = int(v)
-n_pixels = meta["pixels"]
-n_frames = n_pixels // (GH * GW)
-data = np.memmap(PREFIX + ".f32", dtype=np.float32, mode="r",
-                 shape=(n_frames, GH, GW, NCH))
-N_HOLD = int(os.environ.get("ROB_HOLDOUT", 6))
-n_train = max(1, n_frames - N_HOLD)
-print(f"dataset: {n_frames} frames x {GH}x{GW} x {NCH}ch "
-      f"({n_train} train, {n_frames - n_train} held out)")
+IN_CH = 18          # see build_robustness_nn_features in core/stages.h
+NCH = 25            # 18 inputs + 7 analysis channels
+CH_HARM, CH_IDEAL_R, CH_FERR, CH_W, CH_REP = 18, 19, 20, 21, 22
+# The scene-motion label component, kept separate from the corruption harm so
+# evaluation can report occlusion and disocclusion on their own. CH_OCC is
+# "this frame disagrees with the others here" (background hidden behind a
+# moving object in THIS frame); CH_DIS is "every frame disagrees with the
+# reference here" (the reference is the odd view -- the moving object was
+# there and has since left), which is the one that ghosts a moving subject.
+CH_OCC, CH_DIS = 23, 24
+CH_ANALYTIC_R = 14  # the classical mask's answer, an INPUT, never a target
 
-# ---------------------------------------------------------------- normalisation
-# Flow is in raw pixels and can reach the hundreds; the statistics are in
-# [0,1]. Without this the flow channels would dominate the first layer purely
-# by scale. Constants are baked into the exported model so inference needs no
-# external table.
-sub = np.asarray(data[:n_train:max(1, n_train // 4), ::16, ::16, :], dtype=np.float32)
-mu = sub[..., :IN_CH].reshape(-1, IN_CH).mean(0)
-sd = sub[..., :IN_CH].reshape(-1, IN_CH).std(0) + 1e-6
-print("input mean:", np.array2string(mu, precision=3))
-print("input std :", np.array2string(sd, precision=3))
+PATTERNS = ["none", "single", "neighbours", "group_same", "smooth", "abrupt",
+            "rotation", "trans_rot", "magnitude", "direction", "edge_aligned",
+            "edge_perp", "similar", "global"]
 
-# ------------------------------------------------------- classical mask baseline
-def classical_R(px):
-    """The analytic mask, read straight from channel 14.
 
-    This used to re-derive Eq. 5-8 in numpy from the stored statistics, which
-    made it a THIRD implementation alongside the C++ port and the generator --
-    and it quietly used its own s1/s2/t/Mt rather than the ones the burst was
-    actually processed with, so the baseline it reported was not the mask the
-    user runs. The generator now writes the real value via the shared
-    robustness_analytic_R, so the honest baseline is simply to read it.
+def load_dataset(prefix):
+    """Returns (memmap, meta, records) or (None, {}, []) when absent.
+
+    The dataset is required to TRAIN but not to import RobNet -- export_
+    coreml.py only needs the architecture and IN_CH, and demanding a multi-GB
+    blob to convert an already-trained checkpoint made the exporter unrunnable.
     """
-    return px[..., 14]
+    meta = {}
+    try:
+        with open(prefix + ".meta") as f:
+            for line in f:
+                k, v = line.split()
+                meta[k] = int(v)
+    except FileNotFoundError:
+        return None, {}, []
+    gh, gw, nch = meta["guide_h"], meta["guide_w"], meta["channels"]
+    assert nch == NCH, f"expected {NCH} channels per record, sidecar says {nch}"
+    n = meta["records"]
+    data = np.memmap(prefix + ".f32", dtype=np.float32, mode="r",
+                     shape=(n, gh, gw, nch))
+    recs = []
+    with open(prefix + ".idx") as f:
+        for line in f:
+            p = line.split()
+            if len(p) < 12:
+                continue
+            recs.append(dict(rec=int(p[0]), burst=int(p[1]), ref=int(p[2]),
+                             comp=int(p[3]), variant=int(p[4]), pattern=int(p[5]),
+                             band=int(p[6]), cy=int(p[7]), cx=int(p[8]),
+                             ferr=float(p[9]), bad=float(p[10]), valid=float(p[11]),
+                             gain=float(p[12]) if len(p) > 12 else 1.0))
+    assert len(recs) == n, f"idx has {len(recs)} rows, meta says {n}"
+    return data, meta, recs
+
+
+def split_records(recs, guide_w=2016, holdout_burst=None):
+    """Train/eval split.
+
+    Two independent holdouts, because they answer different questions:
+
+      * REGION. Crops whose origin lies in the right-hand strip of the frame
+        are eval-only for every burst. This measures generalisation to unseen
+        content within scenes the model has otherwise trained on.
+      * BURST. Optionally an entire burst is withheld. This is the question the
+        user actually asked -- the previous model did well on the burst it was
+        trained on and merged sky into mountain on a new one -- and a
+        region holdout cannot answer it, since the two regions share a scene,
+        an exposure and a noise level.
+
+    Splitting on the crop ORIGIN rather than on the record index also keeps a
+    training crop from overlapping an eval crop, which would leak.
+    """
+    x_cut = int(0.62 * guide_w)
+    train, ev_region, ev_burst = [], [], []
+    for r in recs:
+        if holdout_burst is not None and r["burst"] == holdout_burst:
+            ev_burst.append(r)
+        elif r["cx"] > x_cut:
+            ev_region.append(r)
+        else:
+            train.append(r)
+    return train, ev_region, ev_burst
+
 
 # ---------------------------------------------------------------------- model
 class RobNet(nn.Module):
@@ -70,11 +143,13 @@ class RobNet(nn.Module):
 
     Separable rather than dense because this runs per comparison frame over the
     whole guide plane, where cost is set by pixels, not parameters: a dense
-    32-channel stack is 26.8k MAC/px -- 490 GMAC for a 6-frame burst, which
-    blows a 1-second budget. Factoring each 3x3 into depthwise + pointwise and
-    halving the width gives 1.4k MAC/px (26 GMAC/burst, 19x less) for the same
-    receptive field. Width 16 is also a multiple of the ANE tile width, so the
-    channel dimension packs without waste.
+    32-channel stack is 26.8k MAC/px -- 490 GMAC for a 6-frame burst. Factoring
+    each 3x3 into depthwise + pointwise and halving the width gives ~1.5k
+    MAC/px for the same receptive field. Width 16 is also a multiple of the ANE
+    tile width, so the channel dimension packs without waste.
+
+    The runtime budget (200 ms for everything the mask adds, feature
+    construction included) settles this: the dense variant is not a candidate.
     """
     def __init__(self, cin=IN_CH, w=16):
         super().__init__()
@@ -86,80 +161,125 @@ class RobNet(nn.Module):
             *block(1), *block(2), *block(4),
             nn.Conv2d(w, 1, 1),
         )
+
     def forward(self, x):
         return torch.sigmoid(self.net(x))
 
-def sample_batch(bs=16, ps=96, rng=None):
-    rng = rng or np.random
-    xs, ys = [], []
-    for _ in range(bs):
-        f = rng.randint(n_train)
-        y0 = rng.randint(GH - ps); x0 = rng.randint(GW - ps)
-        p = np.asarray(data[f, y0:y0 + ps, x0:x0 + ps, :], dtype=np.float32)
-        xs.append((p[..., :IN_CH] - mu) / sd)
-        ys.append(p[..., 16:17])
-    x = torch.from_numpy(np.stack(xs)).permute(0, 3, 1, 2)
-    y = torch.from_numpy(np.stack(ys)).permute(0, 3, 1, 2)
-    return x, y
+    def logits(self, x):
+        return self.net(x)
 
-def weighted_loss(pred, target):
-    """Rejection is the minority class, so some upweighting is needed or the
-    loss is minimised by predicting 1 everywhere. But too much of it is worse:
-    at weight 8 the trained mask never emitted a value above 0.9 anywhere in a
-    real 12 MP burst -- it hedged at ~0.5 across the whole frame. AUC stayed
-    high (0.95) because ranking was fine, but the merge consumes the VALUE, not
-    the rank, so a uniform half-weight barely changed the picture. Weight 2
-    keeps the class balance correction without destroying calibration.
 
-    The extra term penalises hedging directly: predictions are pushed toward
-    the ends of [0,1] in proportion to how confident the target is, so
-    "definitely merge" and "definitely reject" stay reachable."""
-    w = 1.0 + 2.0 * (1.0 - target)
-    mse = (w * (pred - target) ** 2).mean()
-    confident = (target > 0.9) | (target < 0.1)
-    if confident.any():
-        # distance from the nearest end, only where ground truth is decisive
-        hedge = torch.min(pred[confident], 1.0 - pred[confident])
-        return mse + 0.30 * hedge.mean()
-    return mse
+def fit_norm(data, recs, cap=192):
+    """Input mean/std over a spread of TRAINING records only.
 
-if __name__ == "__main__":
+    Fitted on the training split alone: normalisation constants derived from
+    the eval records would leak their statistics into the model, and the flow
+    channels in particular differ a lot between bursts.
+    """
+    step = max(1, len(recs) // cap)
+    sub = np.asarray([data[r["rec"], ::4, ::4, :IN_CH] for r in recs[::step]],
+                     dtype=np.float32)
+    flat = sub.reshape(-1, IN_CH)
+    mu = flat.mean(0)
+    sd = flat.std(0) + 1e-6
+    return mu.astype(np.float32), sd.astype(np.float32)
+
+
+def classical_R(px):
+    """The analytic mask, read straight from channel 14.
+
+    This used to re-derive Eq. 5-8 in numpy, which made it a THIRD
+    implementation alongside the C++ port and the generator -- and it quietly
+    used its own s1/s2/t/Mt rather than the ones the burst was processed with,
+    so the baseline it reported was not the mask the user runs. The generator
+    now writes the real value via the shared robustness_analytic_R, so the
+    honest baseline is simply to read it.
+    """
+    return px[..., CH_ANALYTIC_R]
+
+
+def main():
+    data, meta, recs = load_dataset(PREFIX)
+    if data is None:
+        raise FileNotFoundError(f"no dataset at {PREFIX}")
+    gh, gw = meta["guide_h"], meta["guide_w"]
+    holdout_burst = os.environ.get("ROB_HOLDOUT_BURST")
+    holdout_burst = int(holdout_burst) if holdout_burst else None
+    train, ev_region, ev_burst = split_records(recs, holdout_burst=holdout_burst)
+    print(f"dataset: {len(recs)} records of {gh}x{gw}x{meta['channels']}")
+    print(f"  train {len(train)}   eval-region {len(ev_region)}   "
+          f"eval-burst {len(ev_burst)}"
+          + (f" (burst {holdout_burst} withheld entirely)" if holdout_burst else ""))
+    if not train:
+        raise SystemExit("empty training split")
+
+    mu, sd = fit_norm(data, train)
+    print("input mean:", np.array2string(mu, precision=3))
+    print("input std :", np.array2string(sd, precision=3))
+
     torch.manual_seed(0)
     rng = np.random.RandomState(0)
     model = RobNet()
     nparam = sum(p.numel() for p in model.parameters())
     print(f"model: {nparam} parameters")
-    opt = torch.optim.Adam(model.parameters(), lr=2e-3)
-    steps = int(os.environ.get("ROB_STEPS", 400))
+
+    ps = int(os.environ.get("ROB_PATCH", min(96, gh, gw)))
+    bs = int(os.environ.get("ROB_BATCH", 24))
+    steps = int(os.environ.get("ROB_STEPS", 3000))
+    # Class weighting defaults OFF. See the module docstring: it is what pinned
+    # the previous mask below 0.9 everywhere. Exposed only so the trade can be
+    # re-measured, never as a default.
+    rej_w = float(os.environ.get("ROB_REJ_W", 0.0))
+
+    def sample_batch():
+        xs, ys, ws = [], [], []
+        for _ in range(bs):
+            r = train[rng.randint(len(train))]
+            y0 = rng.randint(max(1, gh - ps))
+            x0 = rng.randint(max(1, gw - ps))
+            p = np.asarray(data[r["rec"], y0:y0 + ps, x0:x0 + ps, :], dtype=np.float32)
+            xs.append((p[..., :IN_CH] - mu) / sd)
+            ys.append(p[..., CH_IDEAL_R:CH_IDEAL_R + 1])
+            ws.append(p[..., CH_W:CH_W + 1])
+        t = lambda a: torch.from_numpy(np.stack(a)).permute(0, 3, 1, 2)
+        return t(xs), t(ys), t(ws)
+
+    bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def loss_fn(logits, target, w):
+        # Validity mask first: pixels the generator could not vouch for get no
+        # gradient at all. They are not "probably fine" -- they are unknown,
+        # and letting them average in drags every prediction toward whatever
+        # they happen to contain.
+        if rej_w > 0.0:
+            w = w * (1.0 + rej_w * (1.0 - target))
+        l = bce(logits, target) * w
+        denom = w.sum().clamp_min(1.0)
+        return l.sum() / denom
+
+    lr0 = float(os.environ.get("ROB_LR", 3e-3))
+    opt = torch.optim.Adam(model.parameters(), lr=lr0)
     for it in range(steps):
-        x, y = sample_batch(rng=rng)
-        loss = weighted_loss(model(x), y)
+        for g in opt.param_groups:
+            # Cosine decay to zero. What is being fitted is a VALUE the merge
+            # multiplies by, not a ranking; holding lr flat to the last step
+            # leaves the weights bouncing around the minimum, which shows up
+            # as a squashed output range.
+            g["lr"] = lr0 * 0.5 * (1.0 + np.cos(np.pi * it / max(1, steps - 1)))
+        x, y, w = sample_batch()
+        loss = loss_fn(model.logits(x), y, w)
         opt.zero_grad(); loss.backward(); opt.step()
-        if it % 50 == 0 or it == steps - 1:
-            print(f"  step {it:4d}  loss {loss.item():.5f}")
+        if it % max(1, steps // 15) == 0 or it == steps - 1:
+            print(f"  step {it:5d}  loss {loss.item():.5f}")
 
-    # ------------------------------------------------------------- evaluation
-    # Held-out frame, full field, both masks scored against ground truth.
-    ev = np.asarray(data[n_frames - 1, ::2, ::2, :], dtype=np.float32)  # held out
-    ideal = ev[..., 16]
-    bad = ideal < 0.5              # ground truth: merging here does damage
-    print(f"\nheld-out frame: {bad.mean()*100:.2f}% of pixels should be rejected")
-
-    with torch.no_grad():
-        xin = torch.from_numpy(((ev[..., :IN_CH] - mu) / sd)).permute(2, 0, 1)[None]
-        pred = model(xin)[0, 0].numpy()
-    clas = classical_R(ev)
-
-    def score(R, name):
-        det = (R[bad] < 0.5).mean() * 100 if bad.any() else float("nan")
-        fp = (R[~bad] < 0.5).mean() * 100
-        print(f"  {name:12s} catches {det:5.1f}% of harmful pixels, "
-              f"falsely rejects {fp:5.1f}% of good ones  (mean R {R.mean():.3f})")
-    score(clas, "classical")
-    score(pred, "learned")
-
-    torch.save({"state": model.state_dict(), "mu": mu, "sd": sd},
-               os.path.join(SC, "robnet.pt"))
-    with open(os.path.join(SC, "robnet_norm.json"), "w") as f:
+    ckpt_path = os.environ.get("ROB_OUT", os.path.join(SC, "robnet.pt"))
+    torch.save({"state": model.state_dict(), "mu": mu, "sd": sd,
+                "in_ch": IN_CH, "holdout_burst": holdout_burst}, ckpt_path)
+    with open(os.path.splitext(ckpt_path)[0] + "_norm.json", "w") as f:
         json.dump({"mu": mu.tolist(), "sd": sd.tolist(), "in_ch": IN_CH}, f)
-    print("\nsaved robnet.pt")
+    print("\nsaved", ckpt_path)
+    print("run eval_rob.py for the scored comparison against the analytic mask")
+
+
+if __name__ == "__main__":
+    main()

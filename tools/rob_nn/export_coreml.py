@@ -91,8 +91,9 @@ def main():
     )
     try:
         mlmodel.input_description["features"] = (
-            "13 planes at guide resolution: ref mean RGB, ref std RGB, warped "
-            "comp mean RGB, flow dx, flow dy, local flow span M, noise sigma."
+            f"{IN_CH} planes: ref mean RGB, ref std RGB, warped comp mean RGB, "
+            "flow dx, flow dy, local flow span M, noise sigma, "
+            "log1p(d^2/sigma^2), and the analytic mask's own R."
         )
     except Exception:
         pass

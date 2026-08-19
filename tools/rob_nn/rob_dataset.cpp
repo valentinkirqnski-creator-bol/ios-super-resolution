@@ -32,9 +32,10 @@
 // right, however aliased the content is, and grows only with genuine
 // misalignment.
 //
-// Emits, at guide resolution: 13 input channels (what a mask could see) and
-// 2 target channels (harm, and the ideal R derived from it), as flat float32
-// for numpy. See tools/rob_nn/train.py.
+// Emits, at guide resolution: 15 input channels (what a mask could see) and
+// 3 target channels (harm, the ideal R derived from it, and the flow error,
+// the last for analysis only), as flat float32 for numpy. Records are square
+// crops by default -- see ROB_CROP below. See tools/rob_nn/train_rob.py.
 #include "stages.h"
 #include "parallel.h"
 #include "raw_io.h"
@@ -45,6 +46,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 using namespace hhsr;
 
@@ -184,6 +186,20 @@ int main(int argc, char** argv) {
     if (const char* v = std::getenv("ROB_ROT_DEG")) rot_max_deg = (float)std::atof(v);
     if (const char* v = std::getenv("ROB_SHIFT_PX")) shift_max_px = (float)std::atof(v);
 
+    // A full guide plane is 1512x2016x18 float32 = 219 MB per synthesised
+    // frame, so a set with enough motion and corruption variety to train on
+    // runs to several GB before it covers much. The network is fully
+    // convolutional with an 8-guide-pixel receptive-field radius, so there is
+    // nothing in a whole plane it cannot learn from crops of it -- while the
+    // same byte budget spent on crops buys many more independent draws of
+    // rotation, shift, occlusion and flow corruption, which is the axis that
+    // actually matters. ROB_CROP=0 restores whole frames.
+    int crop = 256, crops_per_frame = 8;
+    if (const char* v = std::getenv("ROB_CROP")) crop = std::atoi(v);
+    if (const char* v = std::getenv("ROB_CROPS")) crops_per_frame = std::atoi(v);
+    if (crop <= 0) { crop = 0; crops_per_frame = 1; }
+    if (crops_per_frame < 1) crops_per_frame = 1;
+
     size_t total_written = 0;
     const std::string bin_path = out_prefix + ".f32";
     FILE* fout = std::fopen(bin_path.c_str(), "wb");
@@ -214,7 +230,17 @@ int main(int argc, char** argv) {
         Image ref_means, ref_vars;
         local_stats(ref_guide, ref_means, ref_vars);
         const int gh = ref_guide.h, gw = ref_guide.w;
-        gh_all = gh; gw_all = gw;
+        const int oh = crop ? std::min(crop, gh) : gh;
+        const int ow = crop ? std::min(crop, gw) : gw;
+        if (gh_all && (gh_all != oh || gw_all != ow)) {
+            // Every record must be the same shape or the flat blob cannot be
+            // reshaped; refuse rather than write a set that silently
+            // misaligns halfway through.
+            std::printf("  record %dx%d != %dx%d from earlier refs; skipping\n",
+                        ow, oh, gw_all, gh_all);
+            continue;
+        }
+        gh_all = oh; gw_all = ow;
         std::printf("[ref %zu] %dx%d raw, guide %dx%d, ts=%d\n", ri, ref.w, ref.h, gw, gh, ts);
 
         for (int fi = 0; fi < n_frames; ++fi) {
@@ -311,12 +337,28 @@ int main(int argc, char** argv) {
 
             // Per-guide-pixel features and label.
             const int NCH = 18;   // 15 inputs + harm + R_ideal + flow error
-            std::vector<float> rec((size_t)gh * gw * NCH, 0.f);
+            std::vector<float> rec((size_t)oh * ow * NCH, 0.f);
             const float alpha = work.noise_alpha(), beta = work.noise_beta();
             double sum_harm = 0.0; double sum_err = 0.0; size_t n_bad = 0;
 
-            parallel_rows(gh, work.num_threads, [&](int gy) {
-                for (int gx = 0; gx < gw; ++gx) {
+            // Crop origins for this frame, drawn from the same rng stream as
+            // the motion so the whole set stays reproducible from the seed.
+            std::vector<std::pair<int,int>> origins;
+            for (int k = 0; k < crops_per_frame; ++k) {
+                if (!crop) { origins.push_back(std::make_pair(0, 0)); break; }
+                const int oy0 = (gh > oh) ? (int)(u01(rng) * (float)(gh - oh)) : 0;
+                const int ox0 = (gw > ow) ? (int)(u01(rng) * (float)(gw - ow)) : 0;
+                origins.push_back(std::make_pair(oy0, ox0));
+            }
+
+          for (size_t ci = 0; ci < origins.size(); ++ci) {
+            const int cy0 = origins[ci].first, cx0 = origins[ci].second;
+            std::fill(rec.begin(), rec.end(), 0.f);
+            sum_harm = 0.0; sum_err = 0.0; n_bad = 0;
+            parallel_rows(oh, work.num_threads, [&](int iy) {
+                const int gy = cy0 + iy;
+                for (int ix = 0; ix < ow; ++ix) {
+                    const int gx = cx0 + ix;
                     // Raw-space position of this guide pixel's quad origin.
                     const int ry = 2 * gy, rx = 2 * gx;
                     const int pty = std::min(flow.ny - 1, std::max(0, ry / ts));
@@ -410,7 +452,7 @@ int main(int argc, char** argv) {
                     const float Mspan_unused = std::sqrt((mxx - mnx) * (mxx - mnx) +
                                                   (mxy - mny) * (mxy - mny));
 
-                    float* o = &rec[((size_t)gy * gw + gx) * NCH];
+                    float* o = &rec[((size_t)iy * ow + ix) * NCH];
                     for (int c = 0; c < 3; ++c) o[c] = ref_means.at(gy, gx, c);
                     for (int c = 0; c < 3; ++c) o[3 + c] = std::sqrt(ref_vars.at(gy, gx, c));
                     // Comparison guide sampled where the estimated flow points
@@ -457,22 +499,27 @@ int main(int argc, char** argv) {
                 }
             });
             std::fwrite(rec.data(), sizeof(float), rec.size(), fout);
-            total_written += (size_t)gh * gw;
-            const double npx = (double)gh * gw;
-            std::printf("[ref %zu frame %d] rot=%+.3fdeg shift=(%+.1f,%+.1f) occ=%d "
-                        "meanFlowErr=%.2fpx  unmergeable: %.2f%%\n",
-                        ri, fi, theta * 180.f / (float)M_PI, X.tx, X.ty, n_occ,
-                        sum_err / npx, 100.0 * (double)n_bad / npx);
+            total_written += (size_t)oh * ow;
+            const double npx = (double)oh * ow;
+            std::printf("[ref %zu frame %d crop %zu @%d,%d] rot=%+.3fdeg "
+                        "shift=(%+.1f,%+.1f) occ=%d meanFlowErr=%.2fpx  "
+                        "unmergeable: %.2f%%\n",
+                        ri, fi, ci, cy0, cx0, theta * 180.f / (float)M_PI,
+                        X.tx, X.ty, n_occ, sum_err / npx,
+                        100.0 * (double)n_bad / npx);
+          }
         }
     }
     std::fclose(fout);
     // Sidecar so the trainer needs no arguments to interpret the blob.
     const std::string meta_path = out_prefix + ".meta";
     if (FILE* mf = std::fopen(meta_path.c_str(), "w")) {
-        std::fprintf(mf, "guide_h %d\nguide_w %d\nchannels 16\npixels %zu\n",
+        // Record shape, not the full guide plane: with ROB_CROP set these
+        // differ, and the trainer reshapes the blob by what it reads here.
+        std::fprintf(mf, "guide_h %d\nguide_w %d\nchannels 18\npixels %zu\n",
                      gh_all, gw_all, total_written);
         std::fclose(mf);
     }
-    std::printf("wrote %s (%zu guide pixels x 16 ch)\n", bin_path.c_str(), total_written);
+    std::printf("wrote %s (%zu guide pixels x 18 ch)\n", bin_path.c_str(), total_written);
     return 0;
 }

@@ -96,6 +96,13 @@ struct RefStats {
     // change. Empty unless that toggle is on.
     Image means_hires;
     Image stds_hires;
+    // Feature channel 17 for the learned mask: reference high-frequency
+    // energy, guide resolution, 1 channel. A function of the reference alone,
+    // so it is built ONCE per burst by ensure_robustness_nn_ref_hf rather
+    // than per pixel per comparison frame -- a 5x5 box over 3 channels inside
+    // the per-pixel feature loop is 75 reads/px at 3 MP on every frame, which
+    // the runtime budget does not have. Empty unless the learned mask runs.
+    Image nn_hf;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
@@ -144,11 +151,25 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 //   12    expected noise sigma at this brightness
 //   13    log1p(d^2/sigma^2), Wronski Eq. 6 -- the analytic mask's own
 //         decision statistic, compressed because it is heavy-tailed
-//   14    the analytic mask's R (Eq. 5), so the network only has to learn
-//         a correction to it rather than rediscover it
+//   14    the analytic mask's R (Eq. 5). Evidence, NOT a target: the network
+//         is trained against measured merge harm, not against this value, so
+//         it is free to overrule it (and must, since Eq. 5 is what fails on
+//         the camouflaged-misalignment case).
+//   15    |flow - component-wise median of the 3x3 tile neighbourhood|, raw
+//         px. Smooth camera rotation makes this ~0 while the span (11) is
+//         large; a single tile locked onto the wrong match makes it the size
+//         of the error. Separating those two is why rotation stopped being
+//         read as danger.
+//   16    the neighbourhood max of channel 15 -- the local roughness scale to
+//         judge 15 against, so a big residual amid real parallax reads
+//         differently from the same residual in a smoothly-flowing region.
+//   17    reference local high-frequency energy (3x3 means against their own
+//         5x5 box average). Says how FINE the structure is, which is what
+//         decides whether a subpixel error costs anything; neither the mean
+//         nor the std carries it.
 //
 // Kept in portable C++ next to the analytic mask because this layout is a
-// contract with tools/rob_nn/rob_dataset.cpp, which writes the training set;
+// contract with tools/rob_nn/rob_real.cpp, which writes the training set;
 // the two must be read side by side to stay in step. Channels 9-12 are the
 // ones the analytic mask cannot use, and are why the network can reject a
 // tile whose photometry looks innocent.
@@ -177,7 +198,7 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 //           feature can reach the decision at all.
 // The analytic mask's own decision, exposed so the learned mask can take it
 // as an input instead of rediscovering Eq. 5-9 from the raw statistics, and
-// so tools/rob_nn/rob_dataset.cpp can write the IDENTICAL value into the
+// so tools/rob_nn/rob_real.cpp can write the IDENTICAL value into the
 // training set. Two implementations of this formula would drift, and the
 // network would train on a hint that differs from the one it is given at
 // inference -- so there is exactly one.
@@ -188,10 +209,19 @@ f32 robustness_analytic_R(const f32* ref_mean, const f32* ref_var,
                           const f32* comp_mean, f32 Mspan, const Config& cfg,
                           f32* ratio_out);
 
+// Fills ref_stats.nn_hf (feature channel 17) if it is empty and the
+// reference means are host-resident. Idempotent and cheap to call; must run
+// once per burst before build_robustness_nn_features, which reads the cached
+// plane rather than recomputing it.
+void ensure_robustness_nn_ref_hf(RefStats& ref_stats, const Config& cfg);
+
+// rows: 0 uses the on-device strip height (kRobustnessNnStripRows + 2 *
+// kRobustnessNnHalo). The training generator passes the full plane height
+// instead, so features and labels are indexed in one coordinate system.
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0,
-                                   bool raw_res = false);
+                                   bool raw_res = false, int rows = 0);
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
