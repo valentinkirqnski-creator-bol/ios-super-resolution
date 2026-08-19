@@ -1,0 +1,38 @@
+Why the mask rejects in static regions -- measured on 2,440,998 held-out pixels.
+73.3% of them have EXACTLY zero injected flow error (the control case).
+
+(1) THE LABEL -- not the problem.
+    ideal R on zero-error pixels: mean 0.9998, 99.9% above 0.99
+    label == 1.0 exactly on 99.9% of zero-error pixels
+    So the target does say "fully trust this" for a genuinely safe noisy pixel.
+    This was the cheapest hypothesis to check and it is ruled out.
+
+(2) THE MODEL -- this is the problem.
+    learned R on those same provably-safe pixels:
+      mean 0.9795 | >0.99 62.1% | >0.989 64.3% | >0.98 76.3% | >0.95 89.8% | >0.90 96.0%
+    The evidence is unambiguous and the model still stops around 0.98.
+
+(3) WHAT THE GATE COSTS on provably-safe pixels
+      gate 0.989 rejects 35.7%
+      gate 0.98  rejects 23.6%
+      gate 0.95  rejects 10.2%
+      gate 0.90  rejects  4.0%
+    35.7% of perfectly safe pixels discarded is exactly the reported symptom.
+
+(4) POST-HOC CALIBRATION CANNOT FIX IT.
+    Temperature on the logit, fitted on held-out data:
+      T=1.00  provably-safe kept 64.3%   visible false-accept 0.10%
+      T=0.80  provably-safe kept 81.2%   visible false-accept 0.79%
+      T=0.70  provably-safe kept 87.4%   visible false-accept 1.42%
+      T=0.50  provably-safe kept 95.7%   visible false-accept 3.46%
+      T=0.30  provably-safe kept 98.9%   visible false-accept 7.37%
+    Temperature is a MONOTONE map, so it cannot change the ranking, and the
+    ranking is what fixes the trade-off curve. Every row above is the same
+    curve re-parameterised: T=0.5 at gate 0.989 is the same operating point as
+    gate 0.90 with no temperature (3.46% vs 3.63% visible false-accept,
+    95.7% vs 96.0% safe kept). It moves along the curve; it does not lift it.
+    Isotonic regression has the same limitation for the same reason.
+
+CONCLUSION: under-confidence on unambiguous evidence, and only a better
+RANKING helps -- i.e. a retrain. The retrain must additionally drive zero-harm
+pixels to 1.0 rather than 0.98, which is a margin problem, not a scaling one.
