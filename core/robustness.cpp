@@ -1,4 +1,10 @@
 #include "stages.h"
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 #include "robustness_nn.h"
 #include "debug_utils.h"
 #include "parallel.h"
@@ -239,6 +245,14 @@ static bool meta_matches(const std::string& dir, f32 alpha, f32 beta) {
     return close(a, (double)alpha) && close(b, (double)beta);
 }
 
+static void make_dir_if_missing(const std::string& dir) {
+#ifdef _WIN32
+    _mkdir(dir.c_str());
+#else
+    mkdir(dir.c_str(), 0755);
+#endif
+}
+
 static std::string noise_curves_search_dir() {
     if (const char* env = std::getenv("HHSR_NOISE_CURVES_DIR"))
         return std::string(env);
@@ -252,6 +266,66 @@ static std::string noise_curves_search_dir() {
 }
 
 // Load Python-dumped curves (same unseeded np.random stream as that run).
+// Persistent cache for the Monte Carlo noise curves, keyed on the (alpha,
+// beta) they were built for.
+//
+// Building them costs 7.5 s -- measured, 2.0/2.7/2.8 s for the three guide
+// channels -- and it is paid the first time anything asks for a curve, which
+// is the first comparison frame of the first burst after launch. That is
+// exactly the "very slow analyzing frame 2" the user reports, and it is NOT
+// caused by the learned mask: metal_gpu.mm asks for the same curves to upload
+// them to the GPU, so the analytic path stalls identically.
+//
+// Bundling one precomputed table was the obvious fix and does not work.
+// alpha/beta come from each DNG's own NoiseProfile and move with ISO -- these
+// six bursts are ISO 50 and ISO 64 and do not share a table -- so a single
+// bundled table would be right for one sensor at one gain and silently wrong
+// or ignored otherwise. Worse, meta_matches() treats a MISSING meta.txt as
+// "accept", so a bundled table with no metadata would be used for sensors it
+// was never built for.
+//
+// Caching what we compute, keyed on what it was computed for, fixes every
+// sensor and every ISO after the first encounter, and needs no table shipped.
+// The key is in the FILENAME rather than a meta.txt, so two different alphas
+// cannot overwrite each other -- which the single legacy std_curve.bin path
+// cannot express.
+static std::string noise_curve_key(f32 alpha, f32 beta) {
+    char buf[80];
+    std::snprintf(buf, sizeof(buf), "/mc_%.9g_%.9g", (double)alpha, (double)beta);
+    for (char* c = buf; *c; ++c)
+        if (*c == '.' || *c == '+' || *c == '-') *c = '_';
+    return std::string(buf);
+}
+
+static bool read_f32_bin(const std::string& path, std::vector<f32>& out, size_t n);
+
+static bool try_load_cached_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
+    const std::string base = noise_curves_search_dir() + noise_curve_key(alpha, beta);
+    const size_t n = (size_t)k_n_brightness + 1;
+    std::vector<f32> stdc, diffc;
+    if (!read_f32_bin(base + "_std.bin", stdc, n)) return false;
+    if (!read_f32_bin(base + "_diff.bin", diffc, n)) return false;
+    nc.std_curve = std::move(stdc);
+    nc.diff_curve = std::move(diffc);
+    return true;
+}
+
+static void save_cached_noise_curves(f32 alpha, f32 beta, const NoiseCurves& nc) {
+    const std::string dir = noise_curves_search_dir();
+    // Best effort. A read-only or missing directory just means the next launch
+    // pays the Monte Carlo again, which is the behaviour we already have.
+    make_dir_if_missing(dir);
+    const std::string base = dir + noise_curve_key(alpha, beta);
+    auto put = [](const std::string& path, const std::vector<f32>& v) {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) return;
+        std::fwrite(v.data(), sizeof(f32), v.size(), f);
+        std::fclose(f);
+    };
+    put(base + "_std.bin", nc.std_curve);
+    put(base + "_diff.bin", nc.diff_curve);
+}
+
 static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
     const std::string dir = noise_curves_search_dir();
     if (!meta_matches(dir, alpha, beta)) return false;
@@ -295,6 +369,12 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
     if (try_load_python_noise_curves(alpha, beta, nc))
         return nc;
+    // Curves this build produced on a previous run, for these exact alpha/beta.
+    if (try_load_cached_noise_curves(alpha, beta, nc)) {
+        std::printf("[noise] reused cached MC curves for alpha=%.6g beta=%.6g\n",
+                    (double)alpha, (double)beta);
+        return nc;
+    }
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
@@ -325,6 +405,7 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
         interp_MC_range(nc, imin, imax);
     }
 
+    save_cached_noise_curves(alpha, beta, nc);
     return nc;
 }
 
