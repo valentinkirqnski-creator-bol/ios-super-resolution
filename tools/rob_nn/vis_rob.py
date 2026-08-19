@@ -77,6 +77,9 @@ def main():
         for nm, m in (("analytic", an), ("learned", nn)):
             print(f"{k:>6} {nm:>10} {m.mean():>7.3f} {(m > 0.9).mean() * 100:>7.1f}% "
                   f"{(m < 0.1).mean() * 100:>7.1f}% {m.min():>7.3f} {m.max():>7.3f}")
+        # Raw mask planes for rob_merge, so the merge consumes exactly the
+        # values scored here.
+        nn.astype(np.float32).tofile(prefix + f"_mask{k:02d}.f32")
         save_png(os.path.join(outdir, f"mask_analytic{tag}.png"), an)
         save_png(os.path.join(outdir, f"mask_learned{tag}.png"), nn)
         # Side by side, plus the reference for orientation.
