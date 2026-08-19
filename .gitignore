@@ -13,3 +13,7 @@ DerivedData/
 # macOS / Xcode noise
 .DS_Store
 xcuserdata/
+
+# Python bytecode from the rob_nn tooling
+__pycache__/
+*.pyc
