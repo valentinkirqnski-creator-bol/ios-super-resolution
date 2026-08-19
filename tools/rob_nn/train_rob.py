@@ -246,16 +246,56 @@ def main():
 
     bce = nn.BCEWithLogitsLoss(reduction="none")
 
+    # The user's cost is ASYMMETRIC and the two halves of it pull in opposite
+    # directions, so the loss has to carry both at once.
+    #
+    #   a merged misalignment is unacceptable  -> false ACCEPTANCE costs FA_W x
+    #   a forgone merge is merely wasteful     -> false rejection costs 1x
+    #
+    # but also, and this is the part a plain reweighting does NOT give:
+    #
+    #   a provably-safe pixel must reach ~1.0, not 0.98. Measured on the
+    #   symmetric model, zero-harm pixels averaged 0.9795 and only 64.3% cleared
+    #   a 0.989 gate, so that gate threw away 35.7% of pixels that were
+    #   perfectly safe to merge. Rescaling cannot fix that: temperature and
+    #   isotonic are monotone, so they preserve the ranking and merely slide
+    #   along the same trade-off curve (T=0.5 at gate 0.989 lands on the same
+    #   operating point as gate 0.90 with no temperature). The curve has to be
+    #   LIFTED, which means margin, not scale.
+    #
+    # Hence the two hinge terms below. They act on the LOGIT and have constant
+    # gradient until their margin is met, so unlike BCE -- whose gradient is
+    # (p - target) and so fades to 0.02 exactly where the model is stalling --
+    # they keep pushing at the top and bottom of the range.
+    FA_W = float(os.environ.get("ROB_FA_W", 6.0))     # false-acceptance penalty
+    SAFE_W = float(os.environ.get("ROB_SAFE_W", 3.0))  # confidence on safe pixels
+    M_POS = float(os.environ.get("ROB_M_POS", 6.0))   # logit 6 = 0.9975
+    M_NEG = float(os.environ.get("ROB_M_NEG", -2.0))  # logit -2 = 0.12
+
     def loss_fn(logits, target, w):
-        # Validity mask first: pixels the generator could not vouch for get no
-        # gradient at all. They are not "probably fine" -- they are unknown,
-        # and letting them average in drags every prediction toward whatever
-        # they happen to contain.
-        if rej_w > 0.0:
-            w = w * (1.0 + rej_w * (1.0 - target))
-        l = bce(logits, target) * w
-        denom = w.sum().clamp_min(1.0)
-        return l.sum() / denom
+        # Validity first: pixels the generator could not vouch for are unknown,
+        # not "probably fine", and must contribute no gradient at all.
+        # Harm MAGNITUDE, recovered from the label. r_ideal = exp(-z^2/4) with z
+        # the mis-fetch in units of sensor sigma, so z = 2*sqrt(-ln r). Weighting
+        # by it makes visibly-wrong pixels dominate the objective and stops
+        # near-zero-harm cases -- which are numerous and invisible -- from
+        # consuming capacity.
+        z = 2.0 * torch.sqrt(torch.clamp(-torch.log(target.clamp(1e-8, 1.0)), min=0.0))
+        mag = (z / 2.0).clamp(0.0, 4.0)
+        ww = w * (1.0 + FA_W * mag)
+        l = (bce(logits, target) * ww).sum() / ww.sum().clamp_min(1.0)
+
+        # Margin: provably-safe pixels must clear the gate with headroom.
+        safe = (target > 0.999).float() * w
+        if float(safe.sum()) > 0:
+            l = l + SAFE_W * ((M_POS - logits).clamp(min=0.0) * safe).sum()                     / safe.sum().clamp_min(1.0)
+        # Margin: visibly harmful pixels must sit well below it. Without this,
+        # pushing the safe end up simply drags everything up and false
+        # acceptance rises at a fixed gate -- the failure mode to watch for.
+        bad = (target < 0.1).float() * w
+        if float(bad.sum()) > 0:
+            l = l + FA_W * ((logits - M_NEG).clamp(min=0.0) * bad).sum()                     / bad.sum().clamp_min(1.0)
+        return l
 
     lr0 = float(os.environ.get("ROB_LR", 3e-3))
     opt = torch.optim.Adam(model.parameters(), lr=lr0)

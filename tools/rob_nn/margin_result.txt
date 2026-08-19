@@ -1,0 +1,34 @@
+Asymmetric + margin retrain: what it did and did not fix.
+Held-out, 2,440,998 px. "safe" = zero injected flow error (provably safe).
+
+AT THE FIXED 0.989 GATE
+                          safe kept    visible false-accept
+  symmetric (before)        64.3%            0.10%
+  asymmetric+margin         88.3%            1.33%
+
+The static-rejection symptom is largely fixed at that gate -- rejection of
+provably-safe pixels falls 35.7% -> 11.7%. But false acceptance rose 13x, so
+this is NOT yet a lift of the curve; it is partly a move along it.
+
+AT MATCHED FALSE-ACCEPTANCE (the comparison that actually settles it)
+  visible FA budget   symmetric safe kept   asymmetric safe kept
+       <= 1.0%              81.0%                 84.0%     better
+       <= 0.5%              73.6%                 75.7%     better
+       <= 0.1%              61.5%                 50.1%     WORSE
+       == 0%           reachable (6.3% merged)   NOT REACHABLE
+
+So the retrain LIFTED the curve in the 0.5-1% region and LOWERED it below
+0.1%. The margin terms made the output more bimodal, which helps in the
+moderate regime but spends the resolution needed to separate the last tenth
+of a percent -- once almost everything is pinned at the ends there is little
+ordering left in the tail.
+
+CONSEQUENCE FOR THE USER'S REQUEST. They asked for no visible misalignment,
+i.e. the <= 0.1% column, and there the SYMMETRIC model is still the better
+one (61.5% vs 50.1% of safe pixels kept). Neither model satisfies both
+complaints at once: at <= 0.1% visible false-acceptance, 38-50% of provably
+safe pixels are still discarded. The two requirements are in genuine tension
+at this model capacity, and that tension is the honest headline.
+
+Both checkpoints are kept: robnet.pt (asymmetric+margin) and
+robnet_symmetric.pt (the previous one, better in the strict regime).
