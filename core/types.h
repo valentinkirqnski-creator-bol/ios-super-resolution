@@ -631,6 +631,37 @@ struct Config {
     // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
     bool use_neural_robustness = false;
 
+    // Decision gate on the learned mask: R below this is forced to 0, so the
+    // pixel is not merged at all. Measured on held-out data (2.44M px, 9.17%
+    // harmful), sweeping this threshold trades visible misalignment against
+    // how much of the burst still contributes:
+    //
+    //   gate    visible misalignment admitted    pixels merged
+    //   0.900                          3.63%            82.6%
+    //   0.950                          1.79%            76.0%
+    //   0.980                          0.49%            63.4%
+    //   0.989                          0.10%            52.8%   <- default
+    //   0.999                          0.00%             5.3%
+    //
+    // 0.989 is chosen deliberately. Strict zero is not worth buying: it
+    // collapses to 6% merged, which is essentially just the reference frame
+    // with no multi-frame benefit. The curve is very steep just below it, so
+    // one-in-a-thousand visible misalignment still keeps half the burst. For
+    // scale, the analytic mask at its own R>=0.5 cut admits 41.4% of visible
+    // misalignments while merging 92.2%, so this is roughly a 400x reduction
+    // in visible misalignment for about half the merged pixels.
+    //
+    // "Visible" is the operative word. Two photometrically indistinguishable
+    // regions merged together produce no artefact anyone can see, so driving
+    // VISIBLE acceptance to near zero is far cheaper than driving all harm to
+    // zero: 0.10% visible costs 52.8% merged, while 0.01% of all harm costs
+    // 5.3%. Ten times the retained benefit for a difference you cannot see.
+    f32 rob_nn_gate = 0.989f;
+
+    // Write the learned mask alongside the output for inspection. Off by
+    // default: it is a full extra plane per comparison frame.
+    bool save_nn_rob_mask = false;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

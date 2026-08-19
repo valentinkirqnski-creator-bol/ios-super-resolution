@@ -419,6 +419,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
+    if (tuning[@"rob_nn_gate"])
+        cfg.rob_nn_gate = tuning[@"rob_nn_gate"].floatValue;
+    if (tuning[@"save_nn_rob_mask"])
+        cfg.save_nn_rob_mask = tuning[@"save_nn_rob_mask"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

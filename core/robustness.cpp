@@ -1,5 +1,6 @@
 #include "stages.h"
 #include "robustness_nn.h"
+#include "debug_utils.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
 #include <cstdint>
@@ -1587,6 +1588,18 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 *s_select_out = Image(nn_mask.h, nn_mask.w, 1);
                 std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
             }
+            // Apply the decision gate. Below it the pixel is not merged at
+            // all; at or above it the network's own value is kept, so the
+            // rolloff it learned survives inside the trusted band rather than
+            // being flattened to a binary mask.
+            if (cfg.rob_nn_gate > 0.f) {
+                const f32 g = cfg.rob_nn_gate;
+                for (f32& v : nn_mask.data) if (v < g) v = 0.f;
+            }
+            // Saved AFTER gating, so what lands on disk is the mask the merge
+            // actually consumed rather than the raw network output.
+            if (cfg.save_nn_rob_mask)
+                debug_dump_bin("rob_nn_mask", nn_mask.data.data(), nn_mask.data.size());
             return nn_mask;
         }
     }
