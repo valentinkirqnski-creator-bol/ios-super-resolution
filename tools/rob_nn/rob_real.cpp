@@ -1372,10 +1372,23 @@ int main(int argc, char** argv) {
     }
     std::fclose(fout);
     std::fclose(fidx);
+    // In append mode this run's total_records is only ITS OWN contribution --
+    // writing it would tell the trainer the set is one burst long and silently
+    // train on a fraction of the data. Count what is actually in the file.
+    size_t records_in_file = total_records;
+    if (gh_all > 0 && gw_all > 0) {
+        if (FILE* bf = std::fopen(bin_path.c_str(), "rb")) {
+            std::fseek(bf, 0, SEEK_END);
+            const long long bytes = std::ftell(bf);
+            std::fclose(bf);
+            const long long per = (long long)gh_all * gw_all * NCH * (long long)sizeof(float);
+            if (per > 0 && bytes > 0) records_in_file = (size_t)(bytes / per);
+        }
+    }
     if (FILE* mf = std::fopen((out_prefix + ".meta").c_str(), "w")) {
         std::fprintf(mf, "guide_h %d\nguide_w %d\nchannels %d\nrecords %zu\npixels %zu\n",
-                     gh_all, gw_all, NCH, total_records,
-                     total_records * (size_t)gh_all * gw_all);
+                     gh_all, gw_all, NCH, records_in_file,
+                     records_in_file * (size_t)gh_all * gw_all);
         std::fclose(mf);
     }
     std::printf("wrote %s (%zu records of %dx%d x %d ch)\n",

@@ -77,6 +77,26 @@ int main(int argc, char** argv) {
 
     double t_hf = 0, t_stats = 0, t_feat = 0, t_fill = 0;
 
+    // Warm-up, timed separately and EXCLUDED from the per-frame numbers.
+    //
+    // The first call to robustness_analytic_R builds the Monte Carlo noise
+    // curves for the three guide channels. That is a large one-time cost, it
+    // is paid once per (alpha, beta) rather than once per frame, and the
+    // ANALYTIC mask pays exactly the same cost -- so it is not something the
+    // learned mask adds. Folding it into the per-frame average is how this
+    // bench first reported 2425 ms/frame for work that actually takes 175:
+    // the giveaway was that reps x reported was constant.
+    {
+        auto t0 = Clock::now();
+        Image cw;
+        RefStats cwarm = init_robustness(comp, work);
+        cw = std::move(cwarm.means);
+        build_robustness_nn_features(rs, cw, flow, ts, work, 0, false);
+        std::printf("one-time noise-curve build + first call: %.0f ms "
+                    "(shared with the analytic mask, not added by the model)\n",
+                    ms_since(t0));
+    }
+
     for (int r = 0; r < reps; ++r) {
         {   // once per burst
             RefStats tmp = rs;
