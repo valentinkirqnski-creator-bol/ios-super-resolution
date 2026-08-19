@@ -731,6 +731,25 @@ struct CameraView: View {
                 + "neighbourhood. Measured against ground truth on synthetic bursts built "
                 + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
+        HStack {
+            Text("Learned Mask Gate")
+            Spacer()
+            Text(String(format: "%.3f", cam.tuningParams.rob_nn_gate))
+                .font(.caption).monospacedDigit().foregroundColor(.secondary)
+        }
+        Slider(value: $cam.tuningParams.rob_nn_gate, in: 0.90...0.999, step: 0.001)
+            .disabled(!cam.tuningParams.use_neural_robustness)
+        Text("""
+             Below this the pixel is not merged at all. Measured on held-out data              (2.44M px, 9.17% harmful), the tradeoff is visible misalignment against how              much of the burst still contributes: 0.900 admits 3.63% of visible              misalignments and merges 82.6% of pixels; 0.950 -> 1.79% / 76.0%;              0.980 -> 0.49% / 63.4%; 0.989 -> 0.10% / 52.8%; 0.999 -> 0.00% / 5.3%.
+             0.989 is the default because strict zero is not worth buying -- it collapses              to 6% merged, essentially just the reference frame with no multi-frame              benefit. The curve is very steep just below it, so one-in-a-thousand visible              misalignment still keeps half the burst. For scale the analytic mask admits              41.4% of visible misalignments at its own R>=0.5 cut. Raise it toward 0.999              for fewer misalignments and more noise; lower it toward 0.95 for more noise              reduction and more risk.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Save Learned Robustness Mask", isOn: $cam.tuningParams.save_nn_rob_mask)
+            .disabled(!cam.tuningParams.use_neural_robustness)
+        Text("""
+             Writes the mask alongside the output, AFTER gating, so what you inspect is              what the merge actually consumed rather than the raw network output. Costs a              full extra plane per comparison frame.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
