@@ -666,6 +666,68 @@ static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
     return top + (bot - top) * fy;
 }
 
+// Catmull-Rom resample of the comparison statistics.
+//
+// The reference mean is read at an integer position and is not resampled at
+// all; the comparison mean must be read at a fractional offset, so whatever
+// kernel does that reconstruction sits on ONE side of the difference only.
+// Bilinear is a low-pass filter, and it attenuates exactly the high-frequency
+// content that a sub-pixel shift reveals -- measured against the analytic
+// shift of a band-limited signal, the fraction of the true difference that
+// survives is:
+//
+//   feature   shift   bilinear   Catmull-Rom
+//    4 guide px  0.5     70.7%       88.4%
+//    6 guide px  0.5     86.6%       97.4%
+//   10 guide px  0.5     95.1%       99.6%
+//   20 guide px  0.5     98.8%      100.0%
+//
+// So on fine structure -- 4-6 guide px is 8-12 RAW px, i.e. thin objects and
+// wires -- up to 29% of d was being destroyed before Eq. 5 ever saw it, and
+// destroyed asymmetrically, on the comparison side only. That is a systematic
+// bias toward NOT detecting small misalignments precisely where they are most
+// visible. Smooth content is unaffected either way.
+//
+// Note this is a second-order fix. It sharpens a statistic that remains
+// structurally blind: a displaced edge which preserves the local 3x3 mean
+// still yields d ~= 0 under any interpolator, because d compares means.
+//
+// Catmull-Rom (a = -0.5) is interpolating, so exact at integer offsets, and
+// needs a 4-tap support. It can overshoot near a hard edge; that is left
+// unclamped deliberately, since clamping would make the resample non-linear
+// and no longer commute with the 3x3 box the way bilinear provably does.
+static f32 catrom_w(f32 t, int k) {
+    const f32 t2 = t * t, t3 = t2 * t;
+    switch (k) {
+        case 0: return -0.5f * t3 + t2 - 0.5f * t;
+        case 1: return 1.5f * t3 - 2.5f * t2 + 1.f;
+        case 2: return -1.5f * t3 + 2.f * t2 + 0.5f * t;
+        default: return 0.5f * t3 - 0.5f * t2;
+    }
+}
+
+static f32 sample_catrom_or_inf(const Image& img, f32 y, f32 x, int ch) {
+    if (!(y >= 0.f && y < (f32)img.h && x >= 0.f && x < (f32)img.w))
+        return std::numeric_limits<f32>::infinity();
+    const int y0 = (int)std::floor(y);
+    const int x0 = (int)std::floor(x);
+    const f32 fy = y - (f32)y0;
+    const f32 fx = x - (f32)x0;
+    f32 wy[4], wx[4];
+    for (int k = 0; k < 4; ++k) { wy[k] = catrom_w(fy, k); wx[k] = catrom_w(fx, k); }
+    f32 acc = 0.f;
+    for (int i = 0; i < 4; ++i) {
+        const int yy = std::min(std::max(y0 - 1 + i, 0), img.h - 1);
+        f32 row = 0.f;
+        for (int j = 0; j < 4; ++j) {
+            const int xx = std::min(std::max(x0 - 1 + j, 0), img.w - 1);
+            row += wx[j] * img.at(yy, xx, ch);
+        }
+        acc += wy[i] * row;
+    }
+    return acc;
+}
+
 static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
                                const std::vector<uint32_t>& motion_irregular,
                                size_t pidx, int y, int x, int new_y, int new_x,
@@ -1786,7 +1848,9 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
             const f32 sample_x = (f32)x + flow_x;
             const f32 sample_y = (f32)y + flow_y;
             for (int ch = 0; ch < d_p.c; ++ch) {
-                const f32 comp = sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
+                const f32 comp = cfg.mask_sharp_resample
+                    ? sample_catrom_or_inf(comp_means, sample_y, sample_x, ch)
+                    : sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
                 const f32 dp = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();

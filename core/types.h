@@ -693,6 +693,17 @@ struct Config {
     // Write C_shape alongside the output for inspection.
     bool  save_shape_rob_mask = false;
 
+    // Resample the comparison statistics with Catmull-Rom rather than
+    // bilinear when computing Eq. 6's d. The reference side is read at an
+    // integer position and never resampled, so the interpolation kernel acts
+    // on ONE side of the difference only -- and bilinear's low-pass destroys
+    // up to 29% of d on 4-6 guide-pixel features (8-12 raw px: thin objects,
+    // wires) while leaving smooth content untouched. That is a systematic
+    // bias against detecting exactly the misalignments that show most. See
+    // sample_catrom_or_inf for the measured attenuation table.
+    // Left switchable so the change can be A/B'd against the old behaviour.
+    bool mask_sharp_resample = true;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

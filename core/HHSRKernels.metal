@@ -1512,7 +1512,7 @@ struct RobMaskParams {
     float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
-    uint _pad1;
+    uint sharp_resample;  // 1 = Catmull-Rom instead of bilinear (was _pad1)
 };
 
 inline float dogson_quadratic(float x) {
@@ -1587,6 +1587,43 @@ inline float rob_sample_bilinear_or_inf(device const float* img,
     float top = img[o00] + (img[o01] - img[o00]) * fx;
     float bot = img[o10] + (img[o11] - img[o10]) * fx;
     return top + (bot - top) * fy;
+}
+
+// Catmull-Rom twin of the above. Must stay bit-comparable with
+// sample_catrom_or_inf in core/robustness.cpp: the reference mean is read at
+// an integer position and never resampled, so the kernel used here acts on one
+// side of Eq. 6's difference only, and bilinear's low-pass removes up to 29%
+// of d on 4-6 guide-px features. Same weights, same clamped 4-tap support,
+// same deliberate absence of overshoot clamping.
+inline float rob_catrom_w(float t, int k) {
+    float t2 = t * t, t3 = t2 * t;
+    if (k == 0) return -0.5f * t3 + t2 - 0.5f * t;
+    if (k == 1) return 1.5f * t3 - 2.5f * t2 + 1.f;
+    if (k == 2) return -1.5f * t3 + 2.f * t2 + 0.5f * t;
+    return 0.5f * t3 - 0.5f * t2;
+}
+
+inline float rob_sample_catrom_or_inf(device const float* img,
+                                      uint h, uint w, uint nch,
+                                      float y, float x, uint ch) {
+    if (!(y >= 0.f && y < float(h) && x >= 0.f && x < float(w))) return INFINITY;
+    int y0 = int(floor(y));
+    int x0 = int(floor(x));
+    float fy = y - float(y0);
+    float fx = x - float(x0);
+    float wy[4], wx[4];
+    for (int k = 0; k < 4; ++k) { wy[k] = rob_catrom_w(fy, k); wx[k] = rob_catrom_w(fx, k); }
+    float acc = 0.f;
+    for (int i = 0; i < 4; ++i) {
+        int yy = clamp(y0 - 1 + i, 0, int(h) - 1);
+        float row = 0.f;
+        for (int j = 0; j < 4; ++j) {
+            int xx = clamp(x0 - 1 + j, 0, int(w) - 1);
+            row += wx[j] * img[(uint(yy) * w + uint(xx)) * nch + ch];
+        }
+        acc += wy[i] * row;
+    }
+    return acc;
 }
 
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
@@ -1810,8 +1847,11 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
                 float d_t = diff_curve[id];
                 float sigma_p_sq = ref_vars[o];
                 sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-                float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
-                                                        sample_y, sample_x, ch);
+                float comp = p.sharp_resample != 0u
+                    ? rob_sample_catrom_or_inf(comp_means, p.h, p.w, p.nch,
+                                               sample_y, sample_x, ch)
+                    : rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
+                                                 sample_y, sample_x, ch);
                 float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
                 float d_p_sq = d_p_ * d_p_;
                 float shrink = d_p_sq / (d_p_sq + d_t * d_t);
@@ -1904,8 +1944,11 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_t = diff_curve[curve_id];
         sigma_ms_sq += ref_vars[o];
         sigma_md_sq += sigma_t * sigma_t;
-        float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
-                                                sample_y, sample_x, ch);
+        float comp = p.sharp_resample != 0u
+            ? rob_sample_catrom_or_inf(comp_means, p.h, p.w, p.nch,
+                                       sample_y, sample_x, ch)
+            : rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
+                                         sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         d_ms_sq += d_p_ * d_p_;
         d_md_sq += d_t * d_t;

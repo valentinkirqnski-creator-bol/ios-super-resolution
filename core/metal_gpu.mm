@@ -1131,7 +1131,10 @@ struct RobMaskParamsCPU {
     float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
     uint32_t save_s_select = 0;  // 1 = also emit the per-pixel s1/s2 selector
     uint32_t ambiguous_enabled = 0;  // 1 = demote tiles with an ambiguous match
-    uint32_t _pad1 = 0;
+    // 1 = Catmull-Rom resample of the comparison stats (was _pad1). Only the
+    // comparison side is resampled, so bilinear's low-pass biased d downward
+    // on fine structure; see sample_catrom_or_inf in robustness.cpp.
+    uint32_t sharp_resample = 0;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
@@ -1674,6 +1677,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
+    mp.sharp_resample = cfg.mask_sharp_resample ? 1u : 0u;
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
@@ -1893,6 +1897,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
+    mp.sharp_resample = cfg.mask_sharp_resample ? 1u : 0u;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;
