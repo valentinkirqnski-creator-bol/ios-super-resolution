@@ -162,6 +162,9 @@ struct TuningParams: Equatable, Codable {
     /// Catmull-Rom instead of bilinear when resampling the comparison
     /// statistics for Eq. 6's d. On by default; switch off to A/B.
     var mask_sharp_resample: Bool = true
+    /// Eq. 9 local-min radius in RAW pixels for the raw-resolution mask.
+    /// 0 = legacy guide-lattice reduce/min/replicate; 4 = 9x9 native raw.
+    var rob_min_raw_radius: Int = 4
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -236,6 +239,7 @@ struct TuningParams: Equatable, Codable {
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case mask_sharp_resample
+        case rob_min_raw_radius
         case use_neural_robustness
         case save_nn_rob_mask
         case robustness_shape_check_enabled, shape_use_flow_geometry, save_shape_rob_mask
@@ -311,6 +315,7 @@ struct TuningParams: Equatable, Codable {
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         mask_sharp_resample = try c.decodeIfPresent(Bool.self, forKey: .mask_sharp_resample) ?? mask_sharp_resample
+        rob_min_raw_radius = try c.decodeIfPresent(Int.self, forKey: .rob_min_raw_radius) ?? rob_min_raw_radius
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         save_nn_rob_mask = try c.decodeIfPresent(Bool.self, forKey: .save_nn_rob_mask) ?? save_nn_rob_mask
@@ -1932,6 +1937,7 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "mask_sharp_resample": NSNumber(value: tuningParams.mask_sharp_resample),
+            "rob_min_raw_radius": NSNumber(value: tuningParams.rob_min_raw_radius),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "save_nn_rob_mask": NSNumber(value: tuningParams.save_nn_rob_mask),

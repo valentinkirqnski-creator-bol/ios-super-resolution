@@ -717,6 +717,21 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        HStack {
+            Text("Eq. 9 Min Radius (raw px)")
+            Spacer()
+            Text(cam.tuningParams.rob_min_raw_radius == 0
+                 ? "guide lattice"
+                 : "\(2 * cam.tuningParams.rob_min_raw_radius + 1)x\(2 * cam.tuningParams.rob_min_raw_radius + 1) raw")
+                .font(.caption).foregroundColor(.secondary)
+        }
+        Stepper(value: $cam.tuningParams.rob_min_raw_radius, in: 0...6) { EmptyView() }
+        Text("""
+             Raw-resolution mask only. The legacy path (radius 0) min-reduces 2x2 to the              guide grid, mins 5x5 there, then replicates back with nearest -- which              preserves Wronski's 10x10-raw footprint but forces the output constant over              every 2x2 raw block, so the mask is 12 MP in size and 3 MP in decision              granularity, and its window slides 2 raw pixels per output instead of 1.
+             Radius 4 (9x9 raw) keeps the same physical support while letting a rejection              boundary land on any raw pixel. Radius 2 is a literal 5x5 raw refinement --              a quarter of the area, so a smaller safety margin than s/t/Mt were tuned              against. The min is separable, so cost is 2*(2r+1) per pixel, not (2r+1)^2.
+             This changes only how a rejection SPREADS, never whether one is found: the              operator takes minima, so it can lower R but never raise it.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Sharp Comparison Resample", isOn: $cam.tuningParams.mask_sharp_resample)
         Text("""
              Eq. 6's d is |reference mean - comparison mean|. The reference is read at an              integer position and never resampled; the comparison must be read at a              fractional offset, so the interpolation kernel acts on one side of the              difference only -- and bilinear is a low-pass filter that removes exactly              the high-frequency content a sub-pixel shift reveals. Fraction of the true              difference that survives: 4 guide px 70.7%, 6 px 86.6%, 10 px 95.1%,              20 px 98.8%. Catmull-Rom recovers most of it (88.4% / 97.4% / 99.6%).

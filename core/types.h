@@ -704,6 +704,19 @@ struct Config {
     // Left switchable so the change can be A/B'd against the old behaviour.
     bool mask_sharp_resample = true;
 
+    // Eq. 9's local-min radius, in RAW pixels, for the raw-resolution mask.
+    // 0 keeps the legacy behaviour: 2x2 min-reduce to the guide grid, 5x5 min
+    // there, nearest-replicate back -- which preserves Wronski's 10x10-raw
+    // footprint but forces the output constant over every 2x2 raw block, so
+    // the mask is 12 MP in size and 3 MP in decision granularity.
+    // 4 gives a 9x9 raw window: the same physical support, but the window
+    // slides one raw pixel per output, so a rejection boundary can land on any
+    // raw pixel. 2 gives a literal 5x5 raw refinement (a quarter of the area,
+    // so a smaller safety margin than s/t/Mt were tuned against).
+    // Only affects the raw-resolution path; the guide-resolution mask keeps
+    // its native 5x5, which is already Wronski's own lattice.
+    int rob_min_raw_radius = 4;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

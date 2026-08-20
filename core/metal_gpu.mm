@@ -1714,11 +1714,11 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
-    // Eq. 9 runs on the CPU after readback (robustness_local_min_on_guide:
-    // 2x2 min-reduce to the guide lattice, 5x5 min there = Wronski's
-    // 10x10-raw footprint on Wronski's own grid, nearest-upsample back).
-    // Kept off the GPU so the stage is one shared implementation with the
-    // CPU path -- no new shader, bit-identical results.
+    // Eq. 9 runs on the CPU after readback, via the same dispatcher the CPU
+    // path uses -- one shared implementation, no new shader, bit-identical
+    // results. cfg.rob_min_raw_radius > 0 mins natively on the raw grid
+    // (same physical support, boundary free to land on any raw pixel);
+    // 0 keeps the guide-lattice reduce / 5x5 / nearest-replicate.
     (void)b_out;
     prof_tag_gpu(cmd, "robustness:raw-res");
     [cmd commit];
@@ -1727,7 +1727,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, 1);
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    Image r = robustness_local_min_on_guide(R_pre);
+    Image r = robustness_local_min_eq9(R_pre, cfg.rob_min_raw_radius, cfg.num_threads);
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);

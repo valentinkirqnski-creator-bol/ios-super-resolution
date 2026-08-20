@@ -1044,6 +1044,7 @@ static Image local_min_5x5(const Image& R) {
 // R is evaluated per raw pixel (the toggle's point), but the spatial
 // safety margin is Wronski's own, on Wronski's own grid.
 static Image local_min_5x5_on_guide(const Image& R);
+static Image local_min_raw(const Image& R, int radius, int num_threads);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
@@ -1243,14 +1244,63 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
-    // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
-    // there (= the paper's 10x10-raw footprint), nearest-upsample back.
-    // See local_min_5x5_on_guide.
+    // Eq. 9. Natively at raw resolution when a radius is configured, which
+    // keeps the paper's physical support without quantising the boundary back
+    // to the guide lattice; otherwise Wronski's own lattice (2x2 min-reduce to
+    // guide, 5x5 min there, nearest-upsample back).
+    if (cfg.rob_min_raw_radius > 0)
+        return local_min_raw(R, cfg.rob_min_raw_radius, cfg.num_threads);
     return local_min_5x5_on_guide(R);
 }
 
 Image robustness_local_min_on_guide(const Image& R) {
     return local_min_5x5_on_guide(R);
+}
+
+// Eq. 9 evaluated natively at raw resolution.
+//
+// The guide-lattice version below reduces 2x2 to the guide grid, mins there,
+// then replicates back with nearest -- which forces the output to be constant
+// over every 2x2 raw block. It preserves Wronski's 10x10-raw FOOTPRINT but
+// throws away the raw precision that the raw-resolution path exists to
+// provide: the window slides 2 raw pixels per output instead of 1, so a
+// rejection boundary can only ever land on a guide-cell edge. The mask ends up
+// 12 MP in size and 3 MP in decision granularity.
+//
+// Doing the min directly on the raw grid keeps the same physical support while
+// letting the boundary land on any raw pixel. radius 4 gives a 9x9 window,
+// closely matching the 10-raw-wide (and phase-dependent, hence asymmetric)
+// support of the guide-lattice operation; radius 2 gives a literal 5x5.
+//
+// Separable, because min is: a 2D min is the min of the row-mins. That makes
+// the cost 2*(2r+1) per pixel rather than (2r+1)^2 -- 18 ops/px at radius 4,
+// not 81 -- so native raw resolution costs well under 2x the guide version
+// rather than the 16x a naive 2D window would.
+static Image local_min_raw(const Image& R, int radius, int num_threads) {
+    if (radius <= 0 || R.h <= 0 || R.w <= 0) return R;
+    Image tmp(R.h, R.w, 1), out(R.h, R.w, 1);
+    parallel_rows(R.h, num_threads, [&](int y) {
+        for (int x = 0; x < R.w; ++x) {
+            f32 m = std::numeric_limits<f32>::infinity();
+            const int x0 = std::max(0, x - radius), x1 = std::min(R.w - 1, x + radius);
+            for (int xx = x0; xx <= x1; ++xx) m = std::min(m, R.at(y, xx));
+            tmp.at(y, x) = m;
+        }
+    });
+    parallel_rows(R.h, num_threads, [&](int y) {
+        const int y0 = std::max(0, y - radius), y1 = std::min(R.h - 1, y + radius);
+        for (int x = 0; x < R.w; ++x) {
+            f32 m = std::numeric_limits<f32>::infinity();
+            for (int yy = y0; yy <= y1; ++yy) m = std::min(m, tmp.at(yy, x));
+            out.at(y, x) = m;
+        }
+    });
+    return out;
+}
+
+Image robustness_local_min_eq9(const Image& R, int raw_radius, int num_threads) {
+    if (raw_radius > 0) return local_min_raw(R, raw_radius, num_threads);
+    return robustness_local_min_on_guide(R);
 }
 
 static Image local_min_5x5_on_guide(const Image& R) {

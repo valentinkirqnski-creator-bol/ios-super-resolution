@@ -122,6 +122,11 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // stay bit-identical without a new shader).
 Image robustness_local_min_on_guide(const Image& R);
 
+// Eq. 9 dispatcher: raw_radius > 0 runs the min natively on the raw grid (same
+// physical support, boundary free to land on any raw pixel); 0 keeps the
+// guide-lattice reduce/min/replicate. See local_min_raw in robustness.cpp.
+Image robustness_local_min_eq9(const Image& R, int raw_radius, int num_threads);
+
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer
 // mode). Exposed so callers besides robustness.cpp (neural_flow's caller)
 // can build the exact same guide image the classical path scores against.
