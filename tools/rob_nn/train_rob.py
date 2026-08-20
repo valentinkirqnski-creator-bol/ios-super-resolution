@@ -383,23 +383,42 @@ def main():
             hurt_rot = int((rot_safe & (c_hat < 0.99)).sum())
             prio[i] = 0.25 + miss / n_bad + ROT_BOOST * hurt_rot / n_rs
 
+    # Where the quadrant pixels are, per record, found once. Rediscovering
+    # them by re-reading the whole record on every draw made sampling, not the
+    # optimiser, the cost of a training step.
+    qcache = {}
+
+    def quadrant_sites(i):
+        if i not in qcache:
+            full = np.asarray(data[train[i]["rec"], :, :, (CH_W, CH_RNORM,
+                                                           CH_IDEAL_R)],
+                              dtype=np.float32)
+            q = np.nonzero((full[..., 0] > 0) & (full[..., 1] >= 0.5) &
+                           (full[..., 2] < 0.5))
+            # At most a few hundred sites; the rest are neighbours of these and
+            # a 96 px patch centred anywhere in the cluster covers them.
+            if len(q[0]) > 256:
+                k = np.linspace(0, len(q[0]) - 1, 256).astype(int)
+                q = (q[0][k], q[1][k])
+            qcache[i] = q
+        return qcache[i]
+
     def sample_batch():
         xs, ys, ws = [], [], []
         pr = prio / prio.sum()
         for _ in range(bs):
-            r = train[rng.choice(len(train), p=pr)]
+            i = rng.choice(len(train), p=pr)
+            r = train[i]
             # Aim the patch at the quadrant when the record has one, so the
-            # 0.5%-of-pixels signal is not diluted to nothing by the crop.
+            # 1.7%-of-pixels signal is not diluted to nothing by the crop.
             y0 = rng.randint(max(1, gh - ps))
             x0 = rng.randint(max(1, gw - ps))
             if rng.rand() < 0.6:
-                full = np.asarray(data[r["rec"], :, :, :], dtype=np.float32)
-                q = np.nonzero(quadrant(full))
+                q = quadrant_sites(i)
                 if len(q[0]):
                     k = rng.randint(len(q[0]))
                     y0 = int(np.clip(q[0][k] - ps // 2, 0, max(0, gh - ps)))
                     x0 = int(np.clip(q[1][k] - ps // 2, 0, max(0, gw - ps)))
-                del full
             p, fb_ok, _ = load_record(r, y0, x0, ps, ps)
             tgt, w = target_and_weight(p, fb_ok)
             xs.append((p[..., :IN_CH] - mu) / sd)
