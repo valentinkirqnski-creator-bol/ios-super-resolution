@@ -61,11 +61,23 @@
 // "deviation from the global model" to the network as evidence would have
 // taught it a false alarm.
 //
-// Output: 23 float32 channels per guide pixel -- 18 inputs (see
+// What the label is FOR, now that the mask is multiplicative
+// ----------------------------------------------------------
+// The network no longer emits the mask. It emits a correction C in [0,1] and
+// the merge uses R_analytic * C, so the quantity to supervise is not "is this
+// pixel safe" -- the analytic mask already answers that correctly most of the
+// time -- but "by how much is the analytic mask WRONG here, in the unsafe
+// direction". Hence CH_RNORM: the record carries the analytic mask's own
+// finished answer, and train_rob.py forms the target as the ratio
+// R_ideal / R_normal clipped to 1. Where the closed form already rejects, the
+// target is exactly 1 and the network is asked to do nothing at all.
+//
+// Output: 35 float32 channels per guide pixel -- 27 inputs (see
 // build_robustness_nn_features in core/stages.h, which must agree exactly) and
-// 5 analysis channels. Records are square crops; a per-record text sidecar
-// carries burst/frame/pattern/crop so evaluation can slice by failure type,
-// by scene, and by held-out region without re-reading the pixels.
+// 8 analysis channels. Records are square crops; a per-record text sidecar
+// carries burst/frame/pattern/crop/phase so evaluation can slice by failure
+// type, by scene, by held-out region and by corrupted-versus-paired-clean
+// without re-reading the pixels.
 #include "stages.h"
 #include "parallel.h"
 #include "raw_io.h"
@@ -404,9 +416,16 @@ int main(int argc, char** argv) {
     const float band_bias[3] = {0.0f, 0.35f, -0.30f};   // toward larger/smaller errors
     const float density[3]   = {0.28f, 0.16f, 0.42f};   // fraction of tiles hit
 
-    const int NCH = 25;   // 18 inputs + 7 analysis channels
-    const int CH_HARM = 18, CH_RIDEAL = 19, CH_FERR = 20, CH_W = 21, CH_REP = 22;
-    const int CH_OCC = 23, CH_DIS = 24;
+    const int NCH = 35;   // 27 inputs + 8 analysis channels
+    const int CH_HARM = 27, CH_RIDEAL = 28, CH_FERR = 29, CH_W = 30, CH_REP = 31;
+    const int CH_OCC = 32, CH_DIS = 33;
+    // R_normal: the analytic mask this correction MULTIPLIES, written by the
+    // shared compute_robustness_analytic rather than re-derived, and taken
+    // after Eq. 9's 5x5 minimum -- because that, not the pointwise Eq. 5 in
+    // input channel 14, is the value the app multiplies at inference. The
+    // training target is a ratio against it, so getting the wrong one here
+    // would silently train the network to correct a mask nobody runs.
+    const int CH_RNORM = 34;
 
     const std::string bin_path = out_prefix + ".f32";
     FILE* fout = std::fopen(bin_path.c_str(), append ? "ab" : "wb");
@@ -840,6 +859,12 @@ int main(int argc, char** argv) {
             Image comp_guide = compute_guide(comp, work);
             Image comp_means, comp_vars;
             local_stats(comp_guide, comp_means, comp_vars, work.num_threads);
+            // Feature channels 20-26 and the match-quality search both read
+            // the UNSMOOTHED guide luma, via the same shared helper the app
+            // uses. comp_means is a 3x3 box and cannot substitute: the box is
+            // precisely what erases the shifted edge these channels exist to
+            // see.
+            Image comp_luma = guide_luma(comp_guide);
 
             for (int vi = 0; vi < variants; ++vi) {
                 const uint32_t seed = seed0 + (uint32_t)(burst_id * 1000003 + refi * 10007
@@ -1091,10 +1116,6 @@ int main(int argc, char** argv) {
                 // it. motion_irregular is deliberately dropped: it was measured
                 // on the uncorrupted field and would otherwise be a channel of
                 // ground truth leaking into the inputs.
-                FlowField fest = flow0;
-                fest.motion_irregular.clear();
-                to_flow(g, fest);
-
                 // ------------------------------------------------ crops
                 // Where did this variant's corruption actually land? A 128 px
                 // crop covers 16x16 tiles, so uniformly random crops of a
@@ -1105,23 +1126,6 @@ int main(int argc, char** argv) {
                 // tile. A third stay uniform so the set still contains large
                 // genuinely-clean expanses and the value the model learns to
                 // emit there is not an extrapolation.
-                // Inputs 0..17 come from the SHARED builder in
-                // core/robustness.cpp, not from a copy of it here. The previous
-                // generator reimplemented the layout and the two could drift
-                // silently; a single call cannot.
-                //
-                // Built once per VARIANT. It depends only on the corrupted flow,
-                // so building it inside the crop loop (as this first did)
-                // recomputed a whole 3 MP plane once per crop.
-                Image feat = build_robustness_nn_features(rs, comp_means, fest, ts,
-                                                          work, 0, /*raw_res=*/false,
-                                                          /*rows=*/gh);
-                if (feat.h != gh || feat.c != kRobustnessNnChannels) {
-                    std::printf("  feature builder returned %dx%dx%d, expected %dx%dx%d\n",
-                                feat.h, feat.w, feat.c, gh, gw, kRobustnessNnChannels);
-                    std::fclose(fout); std::fclose(fidx); return 1;
-                }
-
                 // Selected by MEASURED HARM, not by injected error. Those are
                 // not the same set and the difference is most of the training
                 // signal: corrupting a tile of clear sky by 100 px fetches an
@@ -1169,6 +1173,26 @@ int main(int argc, char** argv) {
                         if (hits >= 2) hit_tiles.push_back(t * TNX + s);
                     }
 
+                // ---------------------------------------- paired phases
+                //
+                // Every corrupted record is emitted TWICE: once with the
+                // corrupted flow and once with the baseline flow, over the SAME
+                // crop of the SAME frame pair at the SAME exposure and the same
+                // noise realisation. Only the correspondence differs.
+                //
+                // That pairing is what forces the distinction the model has to
+                // make. These bursts contain real camera rotation (0.25-2.0 deg
+                // measured), real curved motion and real parallax, and a set
+                // that shows the network rotation only in its corrupted
+                // variants teaches "rotation is dangerous" -- which is wrong,
+                // and is a mask that throws away good frames. Holding
+                // everything but the flow constant leaves the correspondence as
+                // the only thing that can explain the label.
+                //
+                // The crop origins are chosen ONCE, from the corrupted variant
+                // (where the harm probe knows which tiles matter), and reused
+                // by both phases.
+                std::vector<std::pair<int,int>> origins;
                 for (int k = 0; k < crops_per_variant; ++k) {
                     int cy0 = 0, cx0 = 0;
                     // Retry for a crop the validity mask actually vouches for:
@@ -1201,6 +1225,49 @@ int main(int argc, char** argv) {
                     }
                     cy0 = best_y; cx0 = best_x;
                     if (best_valid < 0.15f) continue;   // nothing usable here
+                    origins.emplace_back(cy0, cx0);
+                }
+                if (origins.empty()) continue;
+
+                // P_NONE is already the uncorrupted case, so its pair would be
+                // a bit-identical duplicate: one phase only.
+                const int nphase = (pat == P_NONE) ? 1 : 2;
+                for (int phase = 0; phase < nphase; ++phase) {
+                const TileGrid& gp = (phase == 0) ? g : base;
+                FlowField fph = flow0;
+                fph.motion_irregular.clear();
+                to_flow(gp, fph);
+
+                // Channels 18-19, measured on the flow BEING JUDGED. Measuring
+                // it on the baseline would hand the network the answer and
+                // score wonderfully while being useless in the app.
+                const std::vector<f32> mq = measure_match_quality(rs.nn_luma, comp_luma,
+                                                                  fph, ts, work);
+                // Inputs 0..26 come from the SHARED builder in
+                // core/robustness.cpp, not from a copy of it here. The previous
+                // generator reimplemented the layout and the two could drift
+                // silently; a single call cannot.
+                //
+                // Built once per PHASE. It depends only on the flow, so
+                // building it inside the crop loop would recompute a whole 3 MP
+                // plane once per crop.
+                Image feat = build_robustness_nn_features(rs, comp_means, fph, ts,
+                                                          work, 0, /*raw_res=*/false,
+                                                          /*rows=*/gh, &comp_luma, &mq);
+                if (feat.h != gh || feat.c != kRobustnessNnChannels) {
+                    std::printf("  feature builder returned %dx%dx%d, expected %dx%dx%d\n",
+                                feat.h, feat.w, feat.c, gh, gw, kRobustnessNnChannels);
+                    std::fclose(fout); std::fclose(fidx); return 1;
+                }
+                // The mask the correction multiplies, from the shared code the
+                // app runs. Eq. 9's 5x5 minimum is inside it.
+                Image rnorm = compute_robustness_analytic(comp, rs, fph, ts, work);
+                const bool have_rn = (rnorm.h == gh && rnorm.w == gw &&
+                                      rnorm.data.size() >= (size_t)gh * gw);
+                if (!have_rn) { std::printf("  analytic mask empty\n"); continue; }
+
+                for (size_t oi = 0; oi < origins.size(); ++oi) {
+                    const int cy0 = origins[oi].first, cx0 = origins[oi].second;
                     std::vector<float> rec((size_t)oh * ow * NCH, 0.f);
 
                     double sum_ferr = 0.0, sum_w = 0.0, sum_bad = 0.0, sum_r = 0.0;
@@ -1214,7 +1281,7 @@ int main(int argc, char** argv) {
                             // The merge fetches with the NEAREST tile's vector,
                             // so the label must be measured with that one --
                             // even though the feature channels interpolate.
-                            const float fex = g.X(pty, ptx), fey = g.Y(pty, ptx);
+                            const float fex = gp.X(pty, ptx), fey = gp.Y(pty, ptx);
                             const float ftx = base.X(pty, ptx), fty = base.Y(pty, ptx);
 
                             // HARM, measured as the photometric consequence of
@@ -1346,6 +1413,7 @@ int main(int argc, char** argv) {
                                                  std::min(ptx, tnx_hint - 1)];
                             o[CH_OCC] = occ_s;
                             o[CH_DIS] = dis_s;
+                            o[CH_RNORM] = rnorm.at(gy, gx);
                         }
                     });
                     for (size_t p = 0; p < (size_t)oh * ow; ++p) {
@@ -1359,12 +1427,13 @@ int main(int argc, char** argv) {
                     // Sidecar: everything evaluation needs to slice the set by
                     // scene, by failure type and by held-out region without
                     // touching the pixels again.
-                    std::fprintf(fidx, "%zu %d %d %d %d %d %d %d %d %.4f %.4f %.4f %.3f\n",
+                    std::fprintf(fidx, "%zu %d %d %d %d %d %d %d %d %.4f %.4f %.4f %.3f %d\n",
                                  total_records, burst_id, refi, ci, vi, pat, band,
                                  cy0, cx0, sum_w > 0 ? sum_ferr / sum_w : 0.0,
                                  sum_w > 0 ? sum_bad / sum_w : 0.0,
-                                 sum_w / ((double)oh * ow), gain);
+                                 sum_w / ((double)oh * ow), gain, phase);
                     ++total_records;
+                }
                 }
             }
         }
