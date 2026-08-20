@@ -421,6 +421,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"save_nn_rob_mask"])
         cfg.save_nn_rob_mask = tuning[@"save_nn_rob_mask"].boolValue;
+    if (tuning[@"robustness_shape_check_enabled"])
+        cfg.robustness_shape_check_enabled = tuning[@"robustness_shape_check_enabled"].boolValue;
+    if (tuning[@"shape_use_flow_geometry"])
+        cfg.shape_use_flow_geometry = tuning[@"shape_use_flow_geometry"].boolValue;
+    if (tuning[@"save_shape_rob_mask"])
+        cfg.save_shape_rob_mask = tuning[@"save_shape_rob_mask"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;

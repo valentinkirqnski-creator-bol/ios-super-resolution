@@ -738,6 +738,17 @@ struct CameraView: View {
              Writes the network's correction C alongside the output -- not R_final, which              mixes it with what the analytic mask already did. C should be close to 1              nearly everywhere; a dump that is broadly grey means the model has rescaled              the mask rather than corrected it. Costs a full extra plane per comparison              frame.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Shape Confidence (Geometric)", isOn: $cam.tuningParams.robustness_shape_check_enabled)
+        Text("""
+             Deterministic multiply on the analytic mask: R_final = R * C_shape. Compares              unsmoothed guide structure after the estimated flow (noise-normalized residual              + gradient agreement). C≈1 almost everywhere; lowers only where high-R pixels              show a clear structural mismatch -- the case 3x3 means miss during rotation /              curved motion / object motion. Never raises R. No neural network.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        if cam.tuningParams.robustness_shape_check_enabled {
+            Toggle("Shape: Use Flow Geometry", isOn: $cam.tuningParams.shape_use_flow_geometry)
+            Text("Also require disagreement with the local 3x3-median flow (rotation-safe). Off keeps the structural check alone.")
+                .font(.caption2).foregroundColor(.secondary)
+            Toggle("Save Shape Confidence Mask", isOn: $cam.tuningParams.save_shape_rob_mask)
+        }
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.

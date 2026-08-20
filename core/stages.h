@@ -106,14 +106,12 @@ struct RefStats {
     // The reference guide's LUMA, guide resolution, 1 channel, UNSMOOTHED.
     //
     // Not derivable from `means`: those are 3x3 box means (a 6x6 raw support)
-    // and the whole point of the spatial channels is the structure that box
-    // destroys. A shifted edge and an unshifted one have nearly the same 3x3
-    // mean; they do not have the same pixel values.
+    // and the whole point of the spatial channels / shape check is the
+    // structure that box destroys. A shifted edge and an unshifted one have
+    // nearly the same 3x3 mean; they do not have the same pixel values.
     //
-    // Filled by init_robustness straight from ref_raw, which is the only
-    // place the reference raw is still in scope -- including on the Metal
-    // path, where means/stds stay GPU-resident. 12 MB at 3 MP; empty unless
-    // the learned correction is enabled.
+    // Filled by init_robustness when use_neural_robustness or
+    // robustness_shape_check_enabled is on. 12 MB at 3 MP; empty otherwise.
     Image nn_luma;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
@@ -319,8 +317,8 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
                                   const FlowField& flow, int tile_size,
                                   const Config& cfg, Image* s_select_out = nullptr);
 
-// R_final. The analytic mask above, multiplied by the learned correction
-// confidence when cfg.use_neural_robustness is on and the model loaded.
+// R_final. The analytic mask above, optionally multiplied by deterministic
+// shape confidence C_shape and/or learned C_nn (both in [0,1], multiply-only).
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out = nullptr);

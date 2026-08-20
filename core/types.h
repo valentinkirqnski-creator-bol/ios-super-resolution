@@ -650,6 +650,48 @@ struct Config {
     // default: it is a full extra plane per comparison frame.
     bool save_nn_rob_mask = false;
 
+    // Deterministic geometric/shape verification layered on the analytic
+    // robustness mask (no network):
+    //
+    //     R_final = R_analytic * C_shape     C_shape in [0,1]
+    //
+    // The analytic mask (Eq. 5-9) is unchanged and remains the primary
+    // decision. C_shape is near 1 almost everywhere and only softens where
+    // unsmoothed guide structure disagrees after the estimated flow -- the
+    // failure mode Eq. 5-9 is blind to (similar 3x3 means/variance with a
+    // displaced edge: rotation leftovers, curved motion, object motion,
+    // occlusion). Never raises R. Off by default until A/B'd; when on it is
+    // deliberately conservative (see shape_* thresholds). On by default: the
+    // multiply can only lower R, and C is gated to stay ~1 except where
+    // unsmoothed structure clearly disagrees after the flow.
+    bool robustness_shape_check_enabled = true;
+    // Only spend budget where the analytic mask already trusts the pixel.
+    // Below this, C_shape = 1 exactly.
+    float shape_r_gate = 0.30f;
+    // Noise-normalized mean |ref - warped| over a 3x3 guide window. Below
+    // shape_resid_lo the photometric cue is silent; above shape_resid_hi it
+    // is fully suspicious. Units: multiples of guide-luma sigma.
+    float shape_resid_lo = 3.0f;
+    float shape_resid_hi = 8.0f;
+    // Gradient direction agreement (cosine). Cosine above shape_grad_cos_hi
+    // is a clean match; below shape_grad_cos_lo is a mismatch. Soft between.
+    float shape_grad_cos_lo = 0.0f;
+    float shape_grad_cos_hi = 0.50f;
+    // Skip the check on textureless patches: |grad_ref|/sigma must exceed
+    // this or C_shape stays 1 (noise alone must not look like structure).
+    float shape_min_edge_snr = 3.0f;
+    // Max fraction of R that shape evidence can remove: C >= 1 - strength.
+    float shape_strength = 0.90f;
+    // Optional second cue: |tile flow - local 3x3 median flow| in RAW px.
+    // Smooth camera rotation keeps this near 0; a wrong lock does not.
+    // Never sufficient alone -- multiplied with the photometric cue.
+    // Off by default; enable only if the structural check alone is weak.
+    bool  shape_use_flow_geometry = false;
+    float shape_flow_resid_lo = 1.5f;
+    float shape_flow_resid_hi = 5.0f;
+    // Write C_shape alongside the output for inspection.
+    bool  save_shape_rob_mask = false;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

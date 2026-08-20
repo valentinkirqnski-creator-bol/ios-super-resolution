@@ -3,6 +3,7 @@
 #include "debug_utils.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -984,13 +985,14 @@ static Image local_min_5x5_on_guide(const Image& R);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
-    // The learned correction needs the reference guide UNSMOOTHED (channels
-    // 20-26 and the match-quality search), and this is the last place the
-    // reference raw is in scope. It has to happen on both paths: on Metal the
-    // means and stds live on the GPU, and no readback of them can reconstruct
-    // a plane that was never boxed.
+    // The learned correction AND the deterministic shape check both need the
+    // reference guide UNSMOOTHED (shifted edges survive here; 3x3 means erase
+    // them). This is the last place the reference raw is in scope. It has to
+    // happen on both paths: on Metal the means and stds live on the GPU, and
+    // no readback of them can reconstruct a plane that was never boxed.
     auto fill_nn_luma = [&](RefStats& st) {
-        if (!cfg.use_neural_robustness) return;
+        if (!cfg.use_neural_robustness && !cfg.robustness_shape_check_enabled)
+            return;
         st.nn_luma = guide_luma(compute_guide(ref_raw, cfg));
     };
 #ifdef __APPLE__
@@ -1907,34 +1909,293 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
 #endif
 }
 
+// Softstep in [0,1]: 0 below lo, 1 above hi, Hermite between.
+static f32 shape_soft01(f32 x, f32 lo, f32 hi) {
+    if (!(hi > lo)) return (x >= hi) ? 1.f : 0.f;
+    f32 t = (x - lo) / (hi - lo);
+    t = clampf(t, 0.f, 1.f);
+    return t * t * (3.f - 2.f * t);
+}
 
-// R_final = R_analytic * C_nn.
+static f32 shape_sample_luma(const Image& luma, f32 y, f32 x) {
+    if (!(y >= 0.f && y < (f32)luma.h && x >= 0.f && x < (f32)luma.w))
+        return std::numeric_limits<f32>::quiet_NaN();
+    const int y0 = (int)std::floor(y);
+    const int x0 = (int)std::floor(x);
+    const int y1 = std::min(y0 + 1, luma.h - 1);
+    const int x1 = std::min(x0 + 1, luma.w - 1);
+    const f32 fy = y - (f32)y0;
+    const f32 fx = x - (f32)x0;
+    const f32 top = luma.at(y0, x0) + (luma.at(y0, x1) - luma.at(y0, x0)) * fx;
+    const f32 bot = luma.at(y1, x0) + (luma.at(y1, x1) - luma.at(y1, x0)) * fx;
+    return top + (bot - top) * fy;
+}
+
+// Per-tile |V - median(V_neighbours)| in RAW pixels. Smooth rotation keeps
+ // this near zero; a single wrong lock does not. Same statistic as NN
+// feature channel 15, without the bilinear blend -- one value per tile.
+static std::vector<f32> shape_flow_median_residual(const FlowField& flow,
+                                                    int num_threads) {
+    const int ny = flow.ny, nx = flow.nx;
+    std::vector<f32> out((size_t)std::max(0, ny) * (size_t)std::max(0, nx), 0.f);
+    if (ny <= 0 || nx <= 0 || flow.flow.empty()) return out;
+    parallel_rows(ny, num_threads, [&](int ty) {
+        f32 bx[9], by[9];
+        for (int tx = 0; tx < nx; ++tx) {
+            int n = 0;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = ty + i, xx = tx + j;
+                    if (yy < 0 || yy >= ny || xx < 0 || xx >= nx) continue;
+                    bx[n] = flow.dx(yy, xx);
+                    by[n] = flow.dy(yy, xx);
+                    ++n;
+                }
+            if (n <= 0) continue;
+            std::nth_element(bx, bx + n / 2, bx + n);
+            std::nth_element(by, by + n / 2, by + n);
+            const f32 ex = flow.dx(ty, tx) - bx[n / 2];
+            const f32 ey = flow.dy(ty, tx) - by[n / 2];
+            out[(size_t)ty * nx + tx] = std::sqrt(ex * ex + ey * ey);
+        }
+    });
+    return out;
+}
+
+// Deterministic C_shape in [0,1]. Multiplies R_analytic; never raises it.
 //
-// The analytic mask above is computed first and is never modified. The
-// network contributes only C in [0,1], and the ONLY thing done with it is a
-// multiply -- so the learned part cannot raise R for any pixel, on any input,
-// however badly it was trained. That guarantee is structural (sigmoid head in
-// the exported graph, multiply here); it is not something the loss is hoped
-// to achieve.
+// Cue 1 (always): noise-normalized |ref - flow-warped comp| on UNSMOOTHED
+// guide luma over a 3x3 window, gated by gradient-direction agreement so
+// correctly aligned noise does not look like misalignment.
+//
+// Cue 2 (optional): local flow residual vs 3x3 median -- rotation-safe;
+ // only strengthens a penalty that the photometric cue already supports.
+static Image compute_shape_confidence(const Image& R_normal,
+                                      const Image& ref_luma,
+                                      const Image& comp_luma,
+                                      const FlowField& flow,
+                                      int tile_size,
+                                      const Config& cfg) {
+    const int h = R_normal.h, w = R_normal.w;
+    Image C(h, w, 1);
+    std::fill(C.data.begin(), C.data.end(), 1.f);
+    if (h <= 0 || w <= 0 || tile_size <= 0) return C;
+    if (ref_luma.h != h || ref_luma.w != w || comp_luma.h != h || comp_luma.w != w)
+        return C;
+    if (ref_luma.data.empty() || comp_luma.data.empty()) return C;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return C;
+
+    const bool bayer = (cfg.bayer_mode);
+    const f32 alpha = cfg.noise_alpha_robustness();
+    const f32 beta = cfg.noise_beta_robustness();
+    const f32 r_gate = std::max(cfg.shape_r_gate, 0.f);
+    const f32 resid_lo = std::max(cfg.shape_resid_lo, 0.f);
+    const f32 resid_hi = std::max(cfg.shape_resid_hi, resid_lo + 1e-3f);
+    const f32 cos_lo = cfg.shape_grad_cos_lo;
+    const f32 cos_hi = std::max(cfg.shape_grad_cos_hi, cos_lo + 1e-3f);
+    const f32 min_edge = std::max(cfg.shape_min_edge_snr, 0.f);
+    const f32 strength = clampf(cfg.shape_strength, 0.f, 1.f);
+    const bool use_flow = cfg.shape_use_flow_geometry;
+    const f32 flow_lo = std::max(cfg.shape_flow_resid_lo, 0.f);
+    const f32 flow_hi = std::max(cfg.shape_flow_resid_hi, flow_lo + 1e-3f);
+
+    std::vector<f32> flow_resid;
+    if (use_flow)
+        flow_resid = shape_flow_median_residual(flow, cfg.num_threads);
+
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            const f32 Rn = R_normal.at(y, x);
+            if (!(Rn > r_gate) || !std::isfinite(Rn)) {
+                C.at(y, x) = 1.f;
+                continue;
+            }
+
+            // Same tile indexing the analytic mask uses on the guide grid.
+            int patch_idy, patch_idx;
+            f32 flow_x, flow_y;
+            if (bayer) {
+                patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
+                patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
+                if (patch_idy < 0 || patch_idy >= flow.ny ||
+                    patch_idx < 0 || patch_idx >= flow.nx) {
+                    C.at(y, x) = 1.f;
+                    continue;
+                }
+                // Raw displacement -> guide pixels (half). Sample comparison
+                // ONCE at this offset -- do not also use a pre-warped plane.
+                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+            } else {
+                patch_idy = y / tile_size;
+                patch_idx = x / tile_size;
+                if (patch_idy < 0 || patch_idy >= flow.ny ||
+                    patch_idx < 0 || patch_idx >= flow.nx) {
+                    C.at(y, x) = 1.f;
+                    continue;
+                }
+                flow_x = flow.dx(patch_idy, patch_idx);
+                flow_y = flow.dy(patch_idy, patch_idx);
+            }
+
+            f32 abs_sum = 0.f, ref_sum = 0.f;
+            int n = 0;
+            bool any_oob = false;
+            for (int di = -1; di <= 1; ++di) {
+                for (int dj = -1; dj <= 1; ++dj) {
+                    const int ry = y + di, rx = x + dj;
+                    if (ry < 0 || ry >= h || rx < 0 || rx >= w) continue;
+                    const f32 rv = ref_luma.at(ry, rx);
+                    const f32 cv = shape_sample_luma(comp_luma,
+                                                     (f32)ry + flow_y,
+                                                     (f32)rx + flow_x);
+                    if (!std::isfinite(cv)) { any_oob = true; continue; }
+                    abs_sum += std::fabs(rv - cv);
+                    ref_sum += rv;
+                    ++n;
+                }
+            }
+            if (n < 5) {
+                // Mostly out of frame under this flow -- already handled by
+                // the analytic path via +inf means; leave C alone.
+                C.at(y, x) = any_oob ? 1.f : 1.f;
+                continue;
+            }
+
+            const f32 mean_ref = clampf(ref_sum / (f32)n, 0.f, 1.f);
+            // Luma is the mean of guide RGB; green is already half-weighted
+            // in the Bayer guide. Match measure_match_quality's sigma.
+            const f32 sigma = std::sqrt(std::max(alpha * mean_ref + beta, 0.f));
+            const f32 sigma_floor = std::max(sigma, 1e-6f);
+            const f32 resid_snr = (abs_sum / (f32)n) / sigma_floor;
+
+            // Central-difference gradients on the unsmoothed planes.
+            auto ref_at = [&](int yy, int xx) -> f32 {
+                yy = std::min(std::max(yy, 0), h - 1);
+                xx = std::min(std::max(xx, 0), w - 1);
+                return ref_luma.at(yy, xx);
+            };
+            const f32 gx_r = 0.5f * (ref_at(y, x + 1) - ref_at(y, x - 1));
+            const f32 gy_r = 0.5f * (ref_at(y + 1, x) - ref_at(y - 1, x));
+            const f32 mag_r = std::sqrt(gx_r * gx_r + gy_r * gy_r);
+            const f32 edge_snr = mag_r / sigma_floor;
+            if (!(edge_snr > min_edge)) {
+                C.at(y, x) = 1.f;   // no structure to verify
+                continue;
+            }
+
+            const f32 c_xm = shape_sample_luma(comp_luma, (f32)y + flow_y,
+                                               (f32)(x - 1) + flow_x);
+            const f32 c_xp = shape_sample_luma(comp_luma, (f32)y + flow_y,
+                                               (f32)(x + 1) + flow_x);
+            const f32 c_ym = shape_sample_luma(comp_luma, (f32)(y - 1) + flow_y,
+                                               (f32)x + flow_x);
+            const f32 c_yp = shape_sample_luma(comp_luma, (f32)(y + 1) + flow_y,
+                                               (f32)x + flow_x);
+            f32 bad_grad = 0.f;
+            if (std::isfinite(c_xm) && std::isfinite(c_xp) &&
+                std::isfinite(c_ym) && std::isfinite(c_yp)) {
+                const f32 gx_c = 0.5f * (c_xp - c_xm);
+                const f32 gy_c = 0.5f * (c_yp - c_ym);
+                const f32 mag_c = std::sqrt(gx_c * gx_c + gy_c * gy_c);
+                // Weak warped gradient: photometric residual must carry the
+                // case; do not invent a gradient mismatch from noise.
+                if (mag_c / sigma_floor > 0.5f * min_edge) {
+                    const f32 denom = std::max(mag_r * mag_c, 1e-20f);
+                    const f32 cos_sim = clampf((gx_r * gx_c + gy_r * gy_c) / denom,
+                                               -1.f, 1.f);
+                    // High cosine -> good; low cosine -> bad.
+                    bad_grad = shape_soft01(cos_hi - cos_sim, 0.f, cos_hi - cos_lo);
+                }
+            }
+
+            const f32 bad_photo = shape_soft01(resid_snr, resid_lo, resid_hi);
+
+            f32 bad_flow = 0.f;
+            if (use_flow && !flow_resid.empty()) {
+                const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
+                if (pidx < flow_resid.size())
+                    bad_flow = shape_soft01(flow_resid[pidx], flow_lo, flow_hi);
+            }
+
+            // Strong penalty only from combined evidence. Photometric alone
+            // is never enough (aligned noise); geometry/grad alone is never
+            // enough (rotation / weak texture).
+            f32 struct_cue = bad_grad;
+            if (use_flow)
+                struct_cue = std::max(bad_grad, bad_flow);
+            const f32 evidence = bad_photo * struct_cue;
+
+            // Fade in with how strongly the analytic mask trusts the pixel,
+            // so we mostly police high-R camouflaged failures.
+            const f32 trust = shape_soft01(Rn, r_gate, std::min(1.f, r_gate + 0.35f));
+            f32 c = 1.f - strength * evidence * trust;
+            if (!std::isfinite(c)) c = 1.f;
+            C.at(y, x) = clampf(c, 0.f, 1.f);
+        }
+    });
+    return C;
+}
+
+// R_final = R_analytic * C_shape (* C_nn when the learned path is on).
+//
+// The analytic mask above is computed first and is never modified. Shape and
+// network contribute only C in [0,1], and the ONLY thing done with either is a
+// multiply -- so neither can raise R for any pixel, on any input.
 //
 // Eq. 9's 5x5 minimum has already been applied inside the analytic mask, and
 // is deliberately NOT applied again to C. That step spreads rejection outward
-// from a pointwise test with no spatial context; the correction network has a
-// 30 raw-pixel receptive field and was trained to emit its final per-pixel
-// answer, so dilating it would double-count and would not match the reported
-// numbers.
+// from a pointwise test with no spatial context; dilating C would double-count.
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out) {
     Image R = compute_robustness_analytic(comp_raw, ref_stats, flow, tile_size,
                                           cfg, s_select_out);
+    if (!cfg.robustness_enabled) return R;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return R;
+    if (R.h <= 0 || R.w <= 0) return R;
+
+    // ---- deterministic shape confidence (optional) ------------------------
+    // Guide resolution only: same reason as the learned path -- at raw
+    // resolution upscale_warp_stats has already applied the flow, and the
+    // unsmoothed luma plane lives at guide resolution.
+    if (cfg.robustness_shape_check_enabled &&
+        !cfg.robustness_raw_resolution_active()) {
+#ifdef __APPLE__
+        RefStats* mutable_stats = const_cast<RefStats*>(&ref_stats);
+        if (mutable_stats->nn_luma.data.empty() &&
+            mutable_stats->means.data.empty() &&
+            !metal_fetch_host_ref_stats(*mutable_stats)) {
+            // No host luma available; leave the analytic mask alone.
+        } else
+#endif
+        {
+            const Image* rl = &ref_stats.nn_luma;
+            if (rl->h != R.h || rl->w != R.w ||
+                rl->data.size() < (size_t)R.h * R.w) {
+                // Shape check was toggled on after init_robustness, or luma
+                // was never filled. Means are boxed and cannot reconstruct
+                // unsmoothed structure. Fail closed: skip.
+                rl = nullptr;
+            }
+            if (rl) {
+                Image comp_luma = guide_luma(compute_guide(comp_raw, cfg));
+                if (comp_luma.h == R.h && comp_luma.w == R.w) {
+                    Image C = compute_shape_confidence(R, *rl, comp_luma, flow,
+                                                       tile_size, cfg);
+                    for (size_t i = 0; i < R.data.size() && i < C.data.size(); ++i)
+                        R.data[i] *= clampf(C.data[i], 0.f, 1.f);
+                    if (cfg.save_shape_rob_mask)
+                        debug_dump_bin("rob_shape_c", C.data.data(), C.data.size());
+                }
+            }
+        }
+    }
+
     if (!cfg.use_neural_robustness) return R;
     // Degenerate inputs: the analytic mask has already answered "trust
     // everything" or "trust nothing" without looking at the flow, and the
     // correction has nothing to correct.
-    if (!cfg.robustness_enabled) return R;
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return R;
-    if (R.h <= 0 || R.w <= 0) return R;
     if (!robustness_nn_available()) return R;
 
 #ifdef __APPLE__

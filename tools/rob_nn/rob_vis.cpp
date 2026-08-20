@@ -53,7 +53,9 @@ int main(int argc, char** argv) {
     work.burst_frame_count = argc - 2;
     tune_config_snr(ref, work);
     work.r_t = cfg.r_t; work.r_s1 = cfg.r_s1; work.r_s2 = cfg.r_s2;
-    work.use_neural_robustness = true;
+    work.use_neural_robustness = true;           // fills nn_luma
+    work.robustness_shape_check_enabled = true;  // dump C_shape vs R_normal
+    work.shape_use_flow_geometry = false;        // structural-only first
     const int ts = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
 
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -81,6 +83,12 @@ int main(int argc, char** argv) {
         // compute_robustness so this cannot accidentally pick up a correction
         // and compare the model against itself.
         Image an = compute_robustness_analytic(comp, rs, flow, ts, work, nullptr);
+        // Full path with shape multiply (neural left off for this dump so the
+        // difference is purely C_shape). Temporarily clear the learned flag.
+        const bool saved_nn = work.use_neural_robustness;
+        work.use_neural_robustness = false;
+        Image fin = compute_robustness(comp, rs, flow, ts, work, nullptr);
+        work.use_neural_robustness = saved_nn;
 
         Image comp_guide = compute_guide(comp, work);
         Image comp_luma = guide_luma(comp_guide);
@@ -90,10 +98,29 @@ int main(int argc, char** argv) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "_f%02d", a - 3);
         write_f32(out + buf + ".an", an);
-        // Streamed in row bands rather than built whole. At 27 channels a
-        // guide-resolution feature tensor is 329 MB, which this host does not
-        // have; the builder is pointwise in y, so a band starting at y0 is
-        // bit-identical to those rows of the full plane.
+        write_f32(out + buf + ".final", fin);
+        // C_shape = R_final / R_normal where R_normal > eps (else 1).
+        {
+            Image C(an.h, an.w, 1);
+            for (size_t i = 0; i < an.data.size(); ++i) {
+                const f32 rn = an.data[i], rf = (i < fin.data.size()) ? fin.data[i] : rn;
+                C.data[i] = (rn > 1e-4f) ? std::min(std::max(rf / rn, 0.f), 1.f) : 1.f;
+            }
+            write_f32(out + buf + ".shape", C);
+            double m_an = 0, m_fin = 0, m_c = 0, n_low = 0;
+            size_t n = an.data.size();
+            for (size_t i = 0; i < n; ++i) {
+                m_an += an.data[i];
+                m_fin += fin.data[i];
+                m_c += C.data[i];
+                if (C.data[i] < 0.85f && an.data[i] > 0.5f) n_low += 1.0;
+            }
+            std::printf("  frame %d: R_normal mean %.3f  R_final mean %.3f  "
+                        "C mean %.3f  highR&C<0.85 %.1f%%\n",
+                        a - 3, m_an / (double)n, m_fin / (double)n,
+                        m_c / (double)n, 100.0 * n_low / (double)n);
+        }
+        // Optional NN feature dump (unchanged from before).
         {
             const int BAND = 128;
             FILE* ff = std::fopen((out + buf + ".feat").c_str(), "wb");
@@ -112,9 +139,6 @@ int main(int argc, char** argv) {
             }
             std::fclose(ff);
         }
-        double m = 0; size_t n = 0;
-        for (size_t i = 0; i < an.data.size(); ++i) { m += an.data[i]; ++n; }
-        std::printf("  frame %d: analytic mask mean %.3f\n", a - 3, m / (double)n);
     }
 
     if (FILE* f = std::fopen((out + ".dims").c_str(), "w")) {
