@@ -1990,6 +1990,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    // Mirrors the CPU guard in compute_robustness_analytic. d_sq_/sig is 0/0
+    // wherever the expected noise variance collapses to zero along with the
+    // difference, and inf/inf on an out-of-frame sample; Metal's clamp()
+    // propagates NaN, and a NaN in R poisons every merge accumulator that
+    // touches the pixel. The raw-resolution kernel below already did this; the
+    // guide-resolution one that runs by default did not.
+    if (!isfinite(r_val)) r_val = 0.f;
     R[gid.y * p.w + gid.x] = r_val;
     // Which prior this pixel ended up on. Compared against r_s1 rather than
     // recomputing the conditions, so the record cannot drift from the value

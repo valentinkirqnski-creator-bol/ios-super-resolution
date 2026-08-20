@@ -27,7 +27,30 @@ rob_real.cpp) and R_normal the analytic mask's own finished answer,
 and the loss is weighted by R_normal, because the error this model makes in
 the final mask is R_normal * (C - C_target). A pixel the analytic mask has
 already thrown away cannot be made worse or better by C, and should not
-consume capacity.
+consume capacity -- so below R_MIN_TRAIN it gets no gradient at all, not
+merely a small one. The samples that are worth anything are the quadrant
+
+    R_normal HIGH  and  R_ideal LOW
+
+which is the definition of an analytic-mask failure and the entire reason this
+model exists. It is a fraction of a percent of pixels, so patches are drawn
+towards it rather than uniformly, and the fraction is printed.
+
+Two things this training deliberately does NOT do
+-------------------------------------------------
+It does not trust the baseline flow just because the real aligner produced it.
+harm() is measured against flow_base, so where flow_base is itself wrong the
+supervision is wrong -- and that is worst exactly during rotation and complex
+motion, the cases this model exists for. fb_valid.py carries an INDEPENDENT
+forward-backward check and its verdict zeroes the weight. Nothing here calls
+the label "exact".
+
+It does not treat feature channel 25 as a measurement of anything. That
+channel is r*|g| / (|g|^2 + eps), which is first-order brightness constancy,
+and brightness constancy is violated by rotation, interpolation, aliasing,
+clipping, Bayer phase and any displacement that is not small -- i.e. by most of
+the cases of interest. It is an input the convolution may exploit and it
+appears in no label, no weight and no metric.
 
 The failure mode to design against
 ----------------------------------
@@ -37,12 +60,13 @@ against that, and the third is the one that actually decides it:
 
   1. the ratio target is exactly 1.0 wherever the analytic mask is not too
      high, which is the overwhelming majority of pixels;
-  2. the output bias starts at +5 (C = 0.993), so "do nothing" is the
+  2. the output bias starts at +8 (C = 0.99966), so "do nothing" is the
      initialisation and departures from it have to be earned;
-  3. a hinge that keeps the logit above M_POS on provably-safe pixels, with
-     constant gradient. BCE's gradient is (p - target) and fades to nothing
-     exactly where the model is drifting from 0.999 to 0.98 -- a drift that is
-     invisible in the loss and very visible in the mask.
+  3. a hinge that keeps the logit above M_POS = 8 (C = 0.99966) on
+     provably-safe pixels, with constant gradient. BCE's gradient is
+     (p - target) and fades to nothing exactly where the model is drifting from
+     0.999 to 0.98 -- a drift that is invisible in the loss and very visible in
+     the mask, because C multiplies every pixel of the frame.
 
 Reported at the end: the distribution of C on correctly-aligned pixels. If its
 mean is not within a hair of 1, the model is a failure regardless of what its
@@ -52,6 +76,9 @@ import json, os, sys
 import numpy as np
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fb_valid
 
 SC = os.path.dirname(os.path.abspath(__file__))
 PREFIX = os.environ.get("ROB_DATA") or (
@@ -80,21 +107,47 @@ PATTERNS = ["none", "single", "neighbours", "group_same", "smooth", "abrupt",
 # Below this the analytic mask has already all but rejected the pixel, so the
 # ratio target is numerically unstable and practically irrelevant.
 TGT_EPS = 0.05
+# ... and below this it gets no gradient at all. C cannot make a pixel the
+# closed form has already discarded matter, so spending capacity there is
+# spending it on nothing.
+R_MIN_TRAIN = float(os.environ.get("ROB_R_MIN", 0.2))
 
 
-def target_and_weight(px):
+def target_and_weight(px, fb_ok=None):
     """C_target and the loss weight, from a record's analysis channels.
 
     Kept in one function because eval_rob.py and mine_rob.py must form the
     target exactly as training did; two copies of this arithmetic would drift
     and the drift would look like a model regression.
+
+    fb_ok, when given, is the independent forward-backward verdict on the
+    baseline flow for each pixel (fb_valid.py). Where it is False the harm
+    label was measured against a correspondence nothing has vouched for, so the
+    pixel contributes no gradient -- it is unknown, not safe.
     """
     r_ideal = px[..., CH_IDEAL_R]
     r_norm = px[..., CH_RNORM]
+    # A NaN R_normal is possible on data generated before the analytic mask's
+    # 0/0 guard (compute_robustness_analytic); treat those pixels as unknown
+    # rather than letting one of them turn a whole batch into NaN. Substituted
+    # BEFORE the arithmetic, not after, or the multiply warns and the NaN has
+    # already propagated into tgt.
+    ok = np.isfinite(r_norm) & np.isfinite(r_ideal)
+    r_norm = np.where(ok, r_norm, 0.0)
+    r_ideal = np.where(ok, r_ideal, 0.0)
     tgt = np.clip((r_ideal + TGT_EPS) / (r_norm + TGT_EPS), 0.0, 1.0)
-    # Impact weighting: the error in the FINAL mask is r_norm * (C - target).
-    w = px[..., CH_W] * np.maximum(r_norm, 0.02)
+    # Impact weighting: the error in the FINAL mask is r_norm * (C - target),
+    # and it is exactly zero where the analytic mask has already rejected.
+    w = px[..., CH_W] * np.where(r_norm >= R_MIN_TRAIN, r_norm, 0.0) * ok
+    if fb_ok is not None:
+        w = w * fb_ok
     return tgt.astype(np.float32), w.astype(np.float32)
+
+
+def quadrant(px):
+    """The analytic mask's own failures: it trusts, and merging harms."""
+    return ((px[..., CH_W] > 0) & (px[..., CH_RNORM] >= 0.5) &
+            (px[..., CH_IDEAL_R] < 0.5))
 
 
 def load_dataset(prefix):
@@ -182,11 +235,14 @@ class RobNet(nn.Module):
     at all. That ramp is the signature of a translation-only flow fitting a
     locally rotating scene, and no pointwise statistic carries it.
 
-    The output bias starts at +5.0, i.e. C = 0.993 everywhere before a single
-    gradient step. "Leave the analytic mask alone" is the initialisation; the
-    model has to earn every departure from it.
+    The output bias starts at +8.0, i.e. C = 0.99966 everywhere before a
+    single gradient step, with the head weights zeroed so the initial output is
+    exactly constant. "Leave the analytic mask alone" is the initialisation and
+    the model has to earn every departure from it. Starting at +5 was tried
+    first and is not enough: 0.993 over a whole frame is already a 0.7%
+    darkening of the mask, which is the rescaling failure in miniature.
     """
-    def __init__(self, cin=IN_CH, w=16, bias0=5.0):
+    def __init__(self, cin=IN_CH, w=16, bias0=8.0):
         super().__init__()
         def block(d):
             return [nn.Conv2d(w, w, 3, padding=d, dilation=d, groups=w),
@@ -265,14 +321,87 @@ def main():
     bs = int(os.environ.get("ROB_BATCH", 24))
     steps = int(os.environ.get("ROB_STEPS", 4000))
 
+    # ---- the independent verdict on the baseline flow ----------------------
+    fb = fb_valid.load_fb(os.environ.get("ROB_FB", os.path.join(SC, "fb")))
+    print("\n" + fb_valid.summarise(fb))
+    if not fb:
+        print("  WARNING: training WITHOUT it. Every harm label is then only as")
+        print("  good as the aligner that produced the baseline, and that is")
+        print("  weakest exactly during rotation, which is what this model is for.")
+
+    def load_record(rec_meta, y0, x0, h, w_):
+        p = np.asarray(data[rec_meta["rec"], y0:y0 + h, x0:x0 + w_, :],
+                       dtype=np.float32)
+        sub = dict(rec_meta); sub["cy"] = rec_meta["cy"] + y0; sub["cx"] = rec_meta["cx"] + x0
+        mag = np.hypot(p[..., 9], p[..., 10])
+        fb_ok, rot = fb_valid.record_tile_maps(fb, sub, p.shape[0], p.shape[1], mag)
+        return p, fb_ok, rot
+
+    # ---- per-record sampling priority, updated during training -------------
+    #
+    # Uniform sampling spends almost all of its time on records that are
+    # already right: the quadrant this model exists for is a fraction of a
+    # percent of pixels. Two things are boosted, and the SECOND matters as much
+    # as the first:
+    #
+    #   * records where a harmful pixel the analytic mask trusts is still being
+    #     merged -- the misses;
+    #   * records where CORRECT ROTATION is being pulled below 1 -- hard
+    #     positives. Paired examples alone do not prevent the network learning
+    #     a subtle proxy for "large or non-uniform flow is suspicious", because
+    #     that proxy is right often enough to survive an unweighted average.
+    #     Mining them explicitly is what closes it, and rotation is identified
+    #     from the MEASURED global rotation (fb_check.cpp), not from flow
+    #     magnitude or flow spread, which parallax also produces.
+    prio = np.ones(len(train), np.float64)
+    mine_every = int(os.environ.get("ROB_MINE_EVERY", 400))
+    mine_n = int(os.environ.get("ROB_MINE_BATCH", 60))
+    ROT_BOOST = float(os.environ.get("ROB_ROT_BOOST", 8.0))
+
+    def remine():
+        idx = rng.choice(len(train), size=min(mine_n, len(train)), replace=False)
+        for i in idx:
+            r = train[i]
+            p, fb_ok, rot = load_record(r, 0, 0, gh, gw)
+            tgt, w = target_and_weight(p, fb_ok)
+            if w.sum() <= 0:
+                prio[i] = 0.05
+                continue
+            with torch.no_grad():
+                x = torch.from_numpy(((p[..., :IN_CH] - mu) / sd)).permute(2, 0, 1)[None]
+                for c in drop_ch:
+                    x[:, c] = 0.0
+                c_hat = model(x)[0, 0].numpy()
+            miss = ((w > 0) & (tgt < 0.5) & (c_hat > 0.5)).sum()
+            n_bad = max(int(((w > 0) & (tgt < 0.5)).sum()), 1)
+            safe = (w > 0) & (tgt > 0.999)
+            if rot is not None:
+                rot_safe = safe & (rot > fb_valid.ROT_STRONG)
+            else:
+                rot_safe = safe
+            n_rs = max(int(rot_safe.sum()), 1)
+            hurt_rot = int((rot_safe & (c_hat < 0.99)).sum())
+            prio[i] = 0.25 + miss / n_bad + ROT_BOOST * hurt_rot / n_rs
+
     def sample_batch():
         xs, ys, ws = [], [], []
+        pr = prio / prio.sum()
         for _ in range(bs):
-            r = train[rng.randint(len(train))]
+            r = train[rng.choice(len(train), p=pr)]
+            # Aim the patch at the quadrant when the record has one, so the
+            # 0.5%-of-pixels signal is not diluted to nothing by the crop.
             y0 = rng.randint(max(1, gh - ps))
             x0 = rng.randint(max(1, gw - ps))
-            p = np.asarray(data[r["rec"], y0:y0 + ps, x0:x0 + ps, :], dtype=np.float32)
-            tgt, w = target_and_weight(p)
+            if rng.rand() < 0.6:
+                full = np.asarray(data[r["rec"], :, :, :], dtype=np.float32)
+                q = np.nonzero(quadrant(full))
+                if len(q[0]):
+                    k = rng.randint(len(q[0]))
+                    y0 = int(np.clip(q[0][k] - ps // 2, 0, max(0, gh - ps)))
+                    x0 = int(np.clip(q[1][k] - ps // 2, 0, max(0, gw - ps)))
+                del full
+            p, fb_ok, _ = load_record(r, y0, x0, ps, ps)
+            tgt, w = target_and_weight(p, fb_ok)
             xs.append((p[..., :IN_CH] - mu) / sd)
             ys.append(tgt[..., None])
             ws.append(w[..., None])
@@ -281,6 +410,17 @@ def main():
         for c in drop_ch:
             x[:, c] = 0.0
         return x, y, w
+
+    # What fraction of the training set is actually the thing being fixed.
+    qn = qd = 0
+    for r in train[::max(1, len(train) // 120)]:
+        p, fb_ok, _ = load_record(r, 0, 0, gh, gw)
+        _, w = target_and_weight(p, fb_ok)
+        qn += int((quadrant(p) & (w > 0)).sum()); qd += int((w > 0).sum())
+    print(f"trainable pixels after validity + forward-backward + R_normal >= "
+          f"{R_MIN_TRAIN}: {qd}")
+    print(f"  of which the quadrant (R_normal >= 0.5 and R_ideal < 0.5): "
+          f"{100.0 * qn / max(qd, 1):.3f}%  -- oversampled, not left at this rate")
 
     bce = nn.BCEWithLogitsLoss(reduction="none")
 
@@ -299,7 +439,7 @@ def main():
     # the range where the model would otherwise quietly drift down.
     FA_W = float(os.environ.get("ROB_FA_W", 6.0))
     SAFE_W = float(os.environ.get("ROB_SAFE_W", 4.0))
-    M_POS = float(os.environ.get("ROB_M_POS", 6.0))    # logit 6 = 0.9975
+    M_POS = float(os.environ.get("ROB_M_POS", 8.0))    # logit 8 = 0.99966
     M_NEG = float(os.environ.get("ROB_M_NEG", -2.0))   # logit -2 = 0.12
 
     def loss_fn(logits, target, w):
@@ -329,11 +469,17 @@ def main():
             # leaves the weights bouncing around the minimum, which shows up as
             # a squashed output range.
             g["lr"] = lr0 * 0.5 * (1.0 + np.cos(np.pi * it / max(1, steps - 1)))
+        if it % mine_every == 0:
+            remine()
         x, y, w = sample_batch()
         loss = loss_fn(model.logits(x), y, w)
+        if not torch.isfinite(loss):
+            raise SystemExit(f"non-finite loss at step {it}; check the dataset "
+                             "for NaN in R_normal (analytic mask 0/0)")
         opt.zero_grad(); loss.backward(); opt.step()
         if it % max(1, steps // 15) == 0 or it == steps - 1:
-            print(f"  step {it:5d}  loss {loss.item():.5f}")
+            print(f"  step {it:5d}  loss {loss.item():.5f}  "
+                  f"prio max {prio.max():.2f}")
 
     ckpt_path = os.environ.get("ROB_OUT", os.path.join(SC, "robnet.pt"))
     # drop_ch travels WITH the weights. If evaluation forgot to apply it the

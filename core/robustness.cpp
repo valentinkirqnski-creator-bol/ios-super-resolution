@@ -1887,6 +1887,16 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            // The same NaN the raw-resolution path above already guards, on
+            // the path that actually runs by default -- it was only ever fixed
+            // on one of the two. d_sq/sig is 0/0 wherever the expected noise
+            // variance collapses to zero and the difference is zero with it,
+            // and inf/inf wherever an out-of-frame sample writes +inf into
+            // comp_means; clampf's comparisons are both false for NaN, so the
+            // NaN survives into R and poisons every merge accumulator that
+            // touches the pixel. Measured on ok/burst1-3: 169 pixels in a 2 M
+            // sample, i.e. rare, silent, and permanent where it happens.
+            if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
             // Compared against r_s1 rather than recomputing the conditions, so
             // the record cannot drift from the value actually used above.
@@ -1936,31 +1946,28 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     if (mutable_stats->means.data.empty() && !metal_fetch_host_ref_stats(*mutable_stats))
         return R;   // no host stats, no features; the analytic mask stands
 #endif
+    // GUIDE RESOLUTION ONLY, deliberately. At raw resolution
+    // upscale_warp_stats has already applied the flow to the comparison
+    // statistics, so the spatial channels would need an unwarped luma plane in
+    // a coordinate system nothing else in the feature vector uses -- and the
+    // model was never trained with them zeroed. Running it there would be a
+    // different model from the one that was measured, so the raw-resolution
+    // toggle simply gets the analytic mask.
+    if (cfg.robustness_raw_resolution_active()) return R;
     // init_robustness fills this from the reference raw. Empty means the
-    // learned mask was switched on mid-burst, after the reference was
-    // processed -- in which case the spatial channels the model was trained on
-    // would all be zero, which is a different model from the one that was
-    // measured. Fall back rather than run it blind.
+    // correction was switched on mid-burst, after the reference was processed,
+    // in which case seven of the twenty-seven channels would be zero. Fall
+    // back rather than run it blind.
     if (ref_stats.nn_luma.h != R.h || ref_stats.nn_luma.w != R.w ||
         ref_stats.nn_luma.data.size() < (size_t)R.h * R.w)
         return R;
 
-    const bool nn_raw = cfg.robustness_raw_resolution_active() &&
-                        ref_stats.means_hires.h > 0 &&
-                        ref_stats.means_hires.data.size() ==
-                            (size_t)ref_stats.means_hires.h *
-                            ref_stats.means_hires.w * ref_stats.means_hires.c;
     Image cm_nn, cl_nn;
     {
         Image guide_nn = compute_guide(comp_raw, cfg);
         cl_nn = guide_luma(guide_nn);
         Image cv_nn;   // variance is not a feature; freed with this scope
         local_stats_3x3(guide_nn, cm_nn, cv_nn);
-        if (nn_raw) {
-            Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
-                                             tile_size, cfg.num_threads);
-            cm_nn = std::move(hires);
-        }
     }
     // Feature channel 17 depends only on the reference, so it is built here
     // (once per burst -- the guard inside makes repeat calls free) rather than
@@ -1989,7 +1996,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     for (int y0 = 0; ok && y0 < nh; y0 += kRobustnessNnStripRows) {
         const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), nh - strip_h);
         Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow, tile_size,
-                                                  cfg, top, nn_raw, /*rows=*/0,
+                                                  cfg, top, /*raw_res=*/false, /*rows=*/0,
                                                   &cl_nn, &mq);
         Image strip;
         if (feat.h != strip_h || !robustness_nn_infer(feat, strip) ||
