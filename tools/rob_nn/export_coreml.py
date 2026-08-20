@@ -1,12 +1,26 @@
-"""Convert the trained robustness net to RobustnessNet.mlpackage.
+"""Convert the trained robustness CORRECTION to RobustnessNet.mlpackage.
 
-Input normalisation is folded into the graph as a fixed scale/bias layer, so
-the C++ side hands over raw feature planes and needs no constant table that
-could drift out of step with the weights.
+The exported graph emits C in [0,1] -- the confidence the analytic mask is
+multiplied by, NOT the mask. The sigmoid is inside the graph on purpose: the
+guarantee that the network can never raise R has to survive export, and a
+graph that emitted a logit would put that guarantee in the hands of whatever
+C++ applies it.
+
+Input normalisation is folded in as a fixed scale/bias layer, so the C++ side
+hands over raw feature planes and needs no constant table that could drift out
+of step with the weights.
 
 The model is fully convolutional, so it is exported with flexible spatial
 dimensions: the guide resolution follows the sensor, and the same weights
 serve any of them.
+
+Verify before bundling. The Core ML wrapper fails CLOSED on a channel-count
+mismatch -- it logs and returns false and the pipeline uses the plain analytic
+mask -- so an .mlmodelc built for the wrong IN_CH looks exactly like "the
+correction changed nothing". This script prints the spec's input shape at the
+end; check it against kRobustnessNnChannels before copying anything into
+Resources/, and check that the bundled file is newer than the .pt it came
+from.
 """
 import json, os, sys
 import numpy as np
@@ -37,8 +51,20 @@ def main():
     import coremltools as ct
 
     ck = torch.load(CKPT, weights_only=False, map_location="cpu")
+    if ck.get("in_ch", IN_CH) != IN_CH:
+        raise SystemExit(f"checkpoint was trained with {ck['in_ch']} input "
+                         f"channels, train_rob.py now says {IN_CH}")
+    if ck.get("drop_ch"):
+        # Those channels were zeroed during training, so the weights on them
+        # are whatever the initialiser left. Exporting without reproducing the
+        # zeroing gives a model that behaves differently from the one measured.
+        print(f"NOTE: checkpoint drops input channels {ck['drop_ch']}; "
+              "folding the zeroing into the exported first layer")
     core = RobNet()
     core.load_state_dict(ck["state"])
+    for c in ck.get("drop_ch", []):
+        with torch.no_grad():
+            core.net[0].weight[:, c] = 0.0
     model = Wrapped(core, ck["mu"], ck["sd"]).eval()
 
     example = torch.zeros(1, IN_CH, 64, 64)
@@ -85,20 +111,35 @@ def main():
         mlmodel = ct.models.MLModel(spec)
 
     mlmodel.short_description = (
-        "Per-pixel robustness mask for handheld multi-frame super-resolution. "
-        "Predicts merge safety from reference/comparison guide statistics, the "
-        "estimated flow and its local span, and the expected noise level."
+        "Per-pixel correction confidence C in [0,1] for the handheld "
+        "multi-frame super-resolution robustness mask. The pipeline uses "
+        "R_final = R_analytic * C, so this output can only lower the mask."
     )
     try:
         mlmodel.input_description["features"] = (
-            f"{IN_CH} planes: ref mean RGB, ref std RGB, warped comp mean RGB, "
-            "flow dx, flow dy, local flow span M, noise sigma, "
-            "log1p(d^2/sigma^2), and the analytic mask's own R."
+            f"{IN_CH} planes: ref mean/std RGB, warped comp mean RGB, flow "
+            "dx/dy, flow span M, noise sigma, log1p(d^2/sigma^2), analytic R, "
+            "flow residual and its span, ref high-frequency energy, match "
+            "quality and isolation, and the spatial residual block (ref luma, "
+            "warped comp luma, signed residual, ref gradient x/y, displacement "
+            "estimate, residual/sigma)."
+        )
+        mlmodel.output_description["robustness"] = (
+            "Correction confidence C in [0,1]; multiply the analytic mask by it."
         )
     except Exception:
         pass
     mlmodel.save(out_path)
     print("wrote", out_path)
+
+    # The check that stops a silent fail-closed. Print what the SPEC says, not
+    # what this script intended.
+    spec = mlmodel.get_spec()
+    inp = spec.description.input[0]
+    print(f"spec input '{inp.name}' shape: "
+          f"{list(inp.type.multiArrayType.shape)}  "
+          f"(expect channel dim {IN_CH} == kRobustnessNnChannels)")
+    print(f"spec output '{spec.description.output[0].name}'")
 
     # Parity check against the PyTorch model on random input -- catches a
     # conversion that silently reorders or drops a layer.

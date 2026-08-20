@@ -1,47 +1,52 @@
-"""Train a robustness mask that predicts merge-safety directly.
+"""Train the robustness CORRECTION: a confidence C in [0,1] the analytic mask
+is multiplied by.
 
-Inputs are what any mask could see (reference stats, warped comparison stats,
-the estimated flow, its local consistency, expected noise, and the analytic
-mask's own answer). The target is the ideal robustness derived from ground
-truth: 1 where the alignment fetched the right content, falling off where it
-did not. See rob_real.cpp for how a real burst yields that label without
-synthesising any imagery, and why it is not circular.
+    R_final = R_normal * C_nn
 
-Also scores the classical Wronski mask against the same ground truth, which is
-the only apples-to-apples comparison either has had.
+The network does not emit the mask and cannot raise it. C comes out of a
+sigmoid and the merge multiplies, so "the correction can only ever lower R" is
+a property of the graph rather than something this loss is asked to deliver.
+That matters because the analytic mask is right most of the time, and the
+previous design -- network REPLACES Eq. 5-9 -- made every weakness of the model
+a regression in regions the closed form already handled.
 
-Why the loss changed, and why that is the whole point
-----------------------------------------------------
-The previous version minimised a CLASS-WEIGHTED squared error, upweighting
-rejection by `rej_w` because harmful pixels are the minority. That choice, not
-the labels, is what produced a mask stuck at mid-grey, and the arithmetic is
-worth stating because it was mistaken for a data problem twice.
+The target, and why it is a ratio
+---------------------------------
+Supervising C against "is this pixel safe" would waste the whole model on
+pixels the closed form already rejects. What is wanted is the residual: where
+is R_normal too HIGH. So with R_ideal the harm-derived ideal robustness (see
+rob_real.cpp) and R_normal the analytic mask's own finished answer,
 
-Weighted MSE is minimised by the WEIGHTED conditional mean. With a fraction f
-of harmful pixels at target 0 and (1-f) harmless at target 1, the optimal
-prediction for an ambiguous feature vector is
+    C_target = clip((R_ideal + eps) / (R_normal + eps), 0, 1)
 
-    (1-f) / ((1-f) + f * (1 + rej_w))
+  * R_normal already at or below R_ideal  ->  C_target = 1, nothing to do.
+  * R_normal = 1 on a pixel merging would damage  ->  C_target ~ R_ideal.
+  * R_normal already 0  ->  the ratio is undefined in principle and irrelevant
+    in practice, which the eps and the impact weight below handle together.
 
-At f = 0.05 and rej_w = 8 that is 0.70; at rej_w = 2, 0.86. Neither exceeds
-0.9, so the mask CANNOT emit the top of its range no matter how clean the
-labels are or how long it trains -- which is exactly what was measured (0.0%
-of pixels above 0.9 against the analytic mask's 62-74%). The upweighting was
-the cause.
+and the loss is weighted by R_normal, because the error this model makes in
+the final mask is R_normal * (C - C_target). A pixel the analytic mask has
+already thrown away cannot be made worse or better by C, and should not
+consume capacity.
 
-So class weighting is gone by default. Imbalance is handled where it belongs,
-in how the generator places crops, and the remaining two changes address the
-other half of the problem:
+The failure mode to design against
+----------------------------------
+A model that lowers C everywhere would score well on detection and be
+worthless: it has rescaled the mask, not corrected it. Three things guard
+against that, and the third is the one that actually decides it:
 
-  * BCE rather than MSE. Both are minimised by the conditional mean, so both
-    are calibrated in principle, but MSE composed with a sigmoid has a
-    gradient carrying sigma'(z) twice over, which vanishes at both ends -- the
-    optimiser is pushed hardest in the middle and barely at all where the
-    answer is "certainly 1". BCE cancels that factor. This is the ordinary
-    reason sigmoid+MSE regressions sit in mid-range.
-  * the validity mask is honoured. Pixels the generator could not vouch for
-    carry weight 0 and must not contribute a gradient; averaging over them
-    would drag every prediction toward whatever those pixels happen to hold.
+  1. the ratio target is exactly 1.0 wherever the analytic mask is not too
+     high, which is the overwhelming majority of pixels;
+  2. the output bias starts at +5 (C = 0.993), so "do nothing" is the
+     initialisation and departures from it have to be earned;
+  3. a hinge that keeps the logit above M_POS on provably-safe pixels, with
+     constant gradient. BCE's gradient is (p - target) and fades to nothing
+     exactly where the model is drifting from 0.999 to 0.98 -- a drift that is
+     invisible in the loss and very visible in the mask.
+
+Reported at the end: the distribution of C on correctly-aligned pixels. If its
+mean is not within a hair of 1, the model is a failure regardless of what its
+detection numbers say.
 """
 import json, os, sys
 import numpy as np
@@ -52,21 +57,44 @@ SC = os.path.dirname(os.path.abspath(__file__))
 PREFIX = os.environ.get("ROB_DATA") or (
     sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset"))
 
-IN_CH = 18          # see build_robustness_nn_features in core/stages.h
-NCH = 25            # 18 inputs + 7 analysis channels
-CH_HARM, CH_IDEAL_R, CH_FERR, CH_W, CH_REP = 18, 19, 20, 21, 22
+IN_CH = 27          # see build_robustness_nn_features in core/stages.h
+NCH = 35            # 27 inputs + 8 analysis channels
+CH_HARM, CH_IDEAL_R, CH_FERR, CH_W, CH_REP = 27, 28, 29, 30, 31
 # The scene-motion label component, kept separate from the corruption harm so
 # evaluation can report occlusion and disocclusion on their own. CH_OCC is
 # "this frame disagrees with the others here" (background hidden behind a
 # moving object in THIS frame); CH_DIS is "every frame disagrees with the
 # reference here" (the reference is the odd view -- the moving object was
 # there and has since left), which is the one that ghosts a moving subject.
-CH_OCC, CH_DIS = 23, 24
-CH_ANALYTIC_R = 14  # the classical mask's answer, an INPUT, never a target
+CH_OCC, CH_DIS = 32, 33
+# The analytic mask's FINISHED answer, after Eq. 9's 5x5 minimum: the value the
+# app multiplies. Not to be confused with input channel 14, which is the
+# pointwise Eq. 5 before that minimum and is evidence, not the divisor.
+CH_RNORM = 34
+CH_ANALYTIC_R = 14
 
 PATTERNS = ["none", "single", "neighbours", "group_same", "smooth", "abrupt",
             "rotation", "trans_rot", "magnitude", "direction", "edge_aligned",
             "edge_perp", "similar", "global"]
+
+# Below this the analytic mask has already all but rejected the pixel, so the
+# ratio target is numerically unstable and practically irrelevant.
+TGT_EPS = 0.05
+
+
+def target_and_weight(px):
+    """C_target and the loss weight, from a record's analysis channels.
+
+    Kept in one function because eval_rob.py and mine_rob.py must form the
+    target exactly as training did; two copies of this arithmetic would drift
+    and the drift would look like a model regression.
+    """
+    r_ideal = px[..., CH_IDEAL_R]
+    r_norm = px[..., CH_RNORM]
+    tgt = np.clip((r_ideal + TGT_EPS) / (r_norm + TGT_EPS), 0.0, 1.0)
+    # Impact weighting: the error in the FINAL mask is r_norm * (C - target).
+    w = px[..., CH_W] * np.maximum(r_norm, 0.02)
+    return tgt.astype(np.float32), w.astype(np.float32)
 
 
 def load_dataset(prefix):
@@ -99,7 +127,8 @@ def load_dataset(prefix):
                              comp=int(p[3]), variant=int(p[4]), pattern=int(p[5]),
                              band=int(p[6]), cy=int(p[7]), cx=int(p[8]),
                              ferr=float(p[9]), bad=float(p[10]), valid=float(p[11]),
-                             gain=float(p[12]) if len(p) > 12 else 1.0))
+                             gain=float(p[12]) if len(p) > 12 else 1.0,
+                             phase=int(p[13]) if len(p) > 13 else 0))
     assert len(recs) == n, f"idx has {len(recs)} rows, meta says {n}"
     return data, meta, recs
 
@@ -112,14 +141,15 @@ def split_records(recs, guide_w=2016, holdout_burst=None):
       * REGION. Crops whose origin lies in the right-hand strip of the frame
         are eval-only for every burst. This measures generalisation to unseen
         content within scenes the model has otherwise trained on.
-      * BURST. Optionally an entire burst is withheld. This is the question the
-        user actually asked -- the previous model did well on the burst it was
-        trained on and merged sky into mountain on a new one -- and a
-        region holdout cannot answer it, since the two regions share a scene,
-        an exposure and a noise level.
+      * BURST. Optionally an entire burst is withheld. A region holdout cannot
+        answer "does this work on a scene it has never seen", since the two
+        regions share a scene, an exposure and a noise level.
 
     Splitting on the crop ORIGIN rather than on the record index also keeps a
-    training crop from overlapping an eval crop, which would leak.
+    training crop from overlapping an eval crop, which would leak. A paired
+    record shares its origin with its corrupted twin, so the pair always lands
+    on the same side of the split -- which it must, or the clean half of a pair
+    would be scoring the model on content its twin trained on.
     """
     x_cut = int(0.62 * guide_w)
     train, ev_region, ev_burst = [], [], []
@@ -137,21 +167,26 @@ def split_records(recs, guide_w=2016, holdout_burst=None):
 class RobNet(nn.Module):
     """Depthwise-separable, dilated. Receptive field 7 guide px = ~28 raw px.
 
-    The analytic mask is a pointwise function of a 3x3 statistic, which is why
-    it cannot tell a tile that disagrees with its neighbours from one that does
-    not. Dilation buys that context without a resolution pyramid.
-
     Separable rather than dense because this runs per comparison frame over the
     whole guide plane, where cost is set by pixels, not parameters: a dense
     32-channel stack is 26.8k MAC/px -- 490 GMAC for a 6-frame burst. Factoring
-    each 3x3 into depthwise + pointwise and halving the width gives ~1.5k
+    each 3x3 into depthwise + pointwise and halving the width gives ~1.6k
     MAC/px for the same receptive field. Width 16 is also a multiple of the ANE
     tile width, so the channel dimension packs without waste.
 
-    The runtime budget (200 ms for everything the mask adds, feature
-    construction included) settles this: the dense variant is not a candidate.
+    The 7-pixel receptive field is not decoration here. Feature channels 20-26
+    are PLANES of the reference luma, the warped comparison luma and their
+    residual, so the convolution stack is what turns them into a 15x15 guide-
+    pixel patch per output pixel -- and a 15x15 patch spanning most of two
+    16-raw-pixel tiles is what lets the residual's RAMP ACROSS a tile be seen
+    at all. That ramp is the signature of a translation-only flow fitting a
+    locally rotating scene, and no pointwise statistic carries it.
+
+    The output bias starts at +5.0, i.e. C = 0.993 everywhere before a single
+    gradient step. "Leave the analytic mask alone" is the initialisation; the
+    model has to earn every departure from it.
     """
-    def __init__(self, cin=IN_CH, w=16):
+    def __init__(self, cin=IN_CH, w=16, bias0=5.0):
         super().__init__()
         def block(d):
             return [nn.Conv2d(w, w, 3, padding=d, dilation=d, groups=w),
@@ -161,6 +196,9 @@ class RobNet(nn.Module):
             *block(1), *block(2), *block(4),
             nn.Conv2d(w, 1, 1),
         )
+        head = self.net[-1]
+        nn.init.zeros_(head.weight)
+        nn.init.constant_(head.bias, bias0)
 
     def forward(self, x):
         return torch.sigmoid(self.net(x))
@@ -185,19 +223,6 @@ def fit_norm(data, recs, cap=192):
     return mu.astype(np.float32), sd.astype(np.float32)
 
 
-def classical_R(px):
-    """The analytic mask, read straight from channel 14.
-
-    This used to re-derive Eq. 5-8 in numpy, which made it a THIRD
-    implementation alongside the C++ port and the generator -- and it quietly
-    used its own s1/s2/t/Mt rather than the ones the burst was processed with,
-    so the baseline it reported was not the mask the user runs. The generator
-    now writes the real value via the shared robustness_analytic_R, so the
-    honest baseline is simply to read it.
-    """
-    return px[..., CH_ANALYTIC_R]
-
-
 def main():
     data, meta, recs = load_dataset(PREFIX)
     if data is None:
@@ -210,6 +235,8 @@ def main():
     print(f"  train {len(train)}   eval-region {len(ev_region)}   "
           f"eval-burst {len(ev_burst)}"
           + (f" (burst {holdout_burst} withheld entirely)" if holdout_burst else ""))
+    npair = sum(1 for r in recs if r["phase"] == 1)
+    print(f"  paired clean phases: {npair} of {len(recs)}")
     if not train:
         raise SystemExit("empty training split")
 
@@ -223,13 +250,20 @@ def main():
     nparam = sum(p.numel() for p in model.parameters())
     print(f"model: {nparam} parameters")
 
+    # ROB_DROP_CH removes input channels by zeroing them AFTER normalisation,
+    # which is exactly equivalent to deleting them: the first 1x1 conv then
+    # receives a constant 0 on those lanes and their weights cannot influence
+    # anything. Done this way so an ablation needs no dataset regeneration --
+    # in particular the controlled with/without match-quality comparison, where
+    # both arms must otherwise be identical.
+    drop_ch = [int(t) for t in os.environ.get("ROB_DROP_CH", "").split(",")
+               if t.strip() != ""]
+    if drop_ch:
+        print(f"dropping input channels {drop_ch}")
+
     ps = int(os.environ.get("ROB_PATCH", min(96, gh, gw)))
     bs = int(os.environ.get("ROB_BATCH", 24))
-    steps = int(os.environ.get("ROB_STEPS", 3000))
-    # Class weighting defaults OFF. See the module docstring: it is what pinned
-    # the previous mask below 0.9 everywhere. Exposed only so the trade can be
-    # re-measured, never as a default.
-    rej_w = float(os.environ.get("ROB_REJ_W", 0.0))
+    steps = int(os.environ.get("ROB_STEPS", 4000))
 
     def sample_batch():
         xs, ys, ws = [], [], []
@@ -238,24 +272,53 @@ def main():
             y0 = rng.randint(max(1, gh - ps))
             x0 = rng.randint(max(1, gw - ps))
             p = np.asarray(data[r["rec"], y0:y0 + ps, x0:x0 + ps, :], dtype=np.float32)
+            tgt, w = target_and_weight(p)
             xs.append((p[..., :IN_CH] - mu) / sd)
-            ys.append(p[..., CH_IDEAL_R:CH_IDEAL_R + 1])
-            ws.append(p[..., CH_W:CH_W + 1])
+            ys.append(tgt[..., None])
+            ws.append(w[..., None])
         t = lambda a: torch.from_numpy(np.stack(a)).permute(0, 3, 1, 2)
-        return t(xs), t(ys), t(ws)
+        x, y, w = t(xs), t(ys), t(ws)
+        for c in drop_ch:
+            x[:, c] = 0.0
+        return x, y, w
 
     bce = nn.BCEWithLogitsLoss(reduction="none")
 
+    # The cost is asymmetric and the two halves pull in opposite directions.
+    #
+    #   a merged misalignment is unacceptable  -> a missed correction costs FA_W
+    #   a forgone merge is merely wasteful     -> an unneeded one costs 1
+    #
+    # but also, and this is the part a plain reweighting does not give: a
+    # provably-safe pixel must reach ~1.0, not 0.98, because C multiplies. A
+    # correction of 0.98 applied to the 95% of the frame that is perfectly
+    # aligned is a 2% darkening of the entire mask -- invisible in any average
+    # and exactly the "rescaled the mask" failure this model is not allowed to
+    # have. Hence the hinges: they act on the LOGIT with constant gradient
+    # until their margin is met, so unlike BCE they keep pushing at the top of
+    # the range where the model would otherwise quietly drift down.
+    FA_W = float(os.environ.get("ROB_FA_W", 6.0))
+    SAFE_W = float(os.environ.get("ROB_SAFE_W", 4.0))
+    M_POS = float(os.environ.get("ROB_M_POS", 6.0))    # logit 6 = 0.9975
+    M_NEG = float(os.environ.get("ROB_M_NEG", -2.0))   # logit -2 = 0.12
+
     def loss_fn(logits, target, w):
-        # Validity mask first: pixels the generator could not vouch for get no
-        # gradient at all. They are not "probably fine" -- they are unknown,
-        # and letting them average in drags every prediction toward whatever
-        # they happen to contain.
-        if rej_w > 0.0:
-            w = w * (1.0 + rej_w * (1.0 - target))
-        l = bce(logits, target) * w
-        denom = w.sum().clamp_min(1.0)
-        return l.sum() / denom
+        # Harm magnitude, recovered from the target. Weighting by it makes
+        # visibly-wrong pixels dominate the objective and stops near-zero-harm
+        # cases -- numerous, and invisible -- from consuming capacity.
+        mag = (1.0 - target).clamp(0.0, 1.0)
+        ww = w * (1.0 + FA_W * mag)
+        l = (bce(logits, target) * ww).sum() / ww.sum().clamp_min(1e-6)
+
+        safe = (target > 0.999).float() * w
+        if float(safe.sum()) > 0:
+            l = l + SAFE_W * ((M_POS - logits).clamp(min=0.0) * safe).sum() \
+                    / safe.sum().clamp_min(1e-6)
+        bad = (target < 0.2).float() * w
+        if float(bad.sum()) > 0:
+            l = l + FA_W * ((logits - M_NEG).clamp(min=0.0) * bad).sum() \
+                    / bad.sum().clamp_min(1e-6)
+        return l
 
     lr0 = float(os.environ.get("ROB_LR", 3e-3))
     opt = torch.optim.Adam(model.parameters(), lr=lr0)
@@ -263,8 +326,8 @@ def main():
         for g in opt.param_groups:
             # Cosine decay to zero. What is being fitted is a VALUE the merge
             # multiplies by, not a ranking; holding lr flat to the last step
-            # leaves the weights bouncing around the minimum, which shows up
-            # as a squashed output range.
+            # leaves the weights bouncing around the minimum, which shows up as
+            # a squashed output range.
             g["lr"] = lr0 * 0.5 * (1.0 + np.cos(np.pi * it / max(1, steps - 1)))
         x, y, w = sample_batch()
         loss = loss_fn(model.logits(x), y, w)
@@ -273,12 +336,16 @@ def main():
             print(f"  step {it:5d}  loss {loss.item():.5f}")
 
     ckpt_path = os.environ.get("ROB_OUT", os.path.join(SC, "robnet.pt"))
+    # drop_ch travels WITH the weights. If evaluation forgot to apply it the
+    # model would be fed a channel it never trained on, which looks like a
+    # mysterious accuracy collapse rather than a harness mistake.
     torch.save({"state": model.state_dict(), "mu": mu, "sd": sd,
-                "in_ch": IN_CH, "holdout_burst": holdout_burst}, ckpt_path)
+                "in_ch": IN_CH, "holdout_burst": holdout_burst,
+                "drop_ch": drop_ch}, ckpt_path)
     with open(os.path.splitext(ckpt_path)[0] + "_norm.json", "w") as f:
         json.dump({"mu": mu.tolist(), "sd": sd.tolist(), "in_ch": IN_CH}, f)
     print("\nsaved", ckpt_path)
-    print("run eval_rob.py for the scored comparison against the analytic mask")
+    print("run eval_rob.py for the two numbers that decide this")
 
 
 if __name__ == "__main__":

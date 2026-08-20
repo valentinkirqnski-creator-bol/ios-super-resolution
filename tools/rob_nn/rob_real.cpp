@@ -441,7 +441,23 @@ int main(int argc, char** argv) {
     cfg.num_threads = 0;
     cfg.alignment_tile_size = 16;
 
+    // Record ids must be GLOBAL, not per-invocation. They restarted at 0 on
+    // every append, so with three bursts appended in turn the same id appeared
+    // three times, several index rows pointed at one data row, and the trainer
+    // -- which reshapes the blob and indexes it by this id -- paired features
+    // from one record with metadata from another. That silently scrambles the
+    // per-burst and per-pattern breakouts AND leaks data across the train/eval
+    // split, since one data row can then be reached from both sides.
     size_t total_records = 0;
+    if (append) {
+        if (FILE* xf = std::fopen((out_prefix + ".idx").c_str(), "r")) {
+            int ch;
+            while ((ch = std::fgetc(xf)) != EOF)
+                if (ch == 10) ++total_records;
+            std::fclose(xf);
+            std::printf("appending after %zu existing records\n", total_records);
+        }
+    }
     int gh_all = 0, gw_all = 0;
 
     const int nf = (int)files.size();
@@ -742,6 +758,11 @@ int main(int argc, char** argv) {
                             "occluded %.2f%%, ref-anomalous %.2f%% (frame %d)\n",
                             burst_id, refi, have.size(), 100.0 * occ_hi / np,
                             100.0 * dis_hi / np, have[0]);
+                // The warped guides existed only to form the consensus above
+                // and are 12 MB each. Holding all seven through the whole
+                // variant loop is 85 MB of a budget that is already the
+                // binding constraint on this host.
+                for (auto& v : warped_g) { std::vector<float>().swap(v); }
             }
         }
 
@@ -1243,22 +1264,6 @@ int main(int argc, char** argv) {
                 // score wonderfully while being useless in the app.
                 const std::vector<f32> mq = measure_match_quality(rs.nn_luma, comp_luma,
                                                                   fph, ts, work);
-                // Inputs 0..26 come from the SHARED builder in
-                // core/robustness.cpp, not from a copy of it here. The previous
-                // generator reimplemented the layout and the two could drift
-                // silently; a single call cannot.
-                //
-                // Built once per PHASE. It depends only on the flow, so
-                // building it inside the crop loop would recompute a whole 3 MP
-                // plane once per crop.
-                Image feat = build_robustness_nn_features(rs, comp_means, fph, ts,
-                                                          work, 0, /*raw_res=*/false,
-                                                          /*rows=*/gh, &comp_luma, &mq);
-                if (feat.h != gh || feat.c != kRobustnessNnChannels) {
-                    std::printf("  feature builder returned %dx%dx%d, expected %dx%dx%d\n",
-                                feat.h, feat.w, feat.c, gh, gw, kRobustnessNnChannels);
-                    std::fclose(fout); std::fclose(fidx); return 1;
-                }
                 // The mask the correction multiplies, from the shared code the
                 // app runs. Eq. 9's 5x5 minimum is inside it.
                 Image rnorm = compute_robustness_analytic(comp, rs, fph, ts, work);
@@ -1268,6 +1273,27 @@ int main(int argc, char** argv) {
 
                 for (size_t oi = 0; oi < origins.size(); ++oi) {
                     const int cy0 = origins[oi].first, cx0 = origins[oi].second;
+                    // Inputs 0..26 come from the SHARED builder in
+                    // core/robustness.cpp, not from a copy of it here. The
+                    // previous generator reimplemented the layout and the two
+                    // could drift silently; a single call cannot.
+                    //
+                    // Built over the CROP's rows, not the whole plane. At 27
+                    // channels a full guide-resolution feature tensor is 329 MB
+                    // and this host has under a gigabyte free -- it threw
+                    // std::bad_alloc on the first variant. The builder is
+                    // pointwise in y given the tile grid, so a row window
+                    // starting at cy0 is bit-identical to the same rows of the
+                    // full plane, which is what makes this a memory change and
+                    // not a numerical one.
+                    Image feat = build_robustness_nn_features(rs, comp_means, fph, ts,
+                                                              work, cy0, /*raw_res=*/false,
+                                                              /*rows=*/oh, &comp_luma, &mq);
+                    if (feat.h != oh || feat.c != kRobustnessNnChannels) {
+                        std::printf("  feature builder returned %dx%dx%d, expected %dx%dx%d\n",
+                                    feat.h, feat.w, feat.c, oh, gw, kRobustnessNnChannels);
+                        std::fclose(fout); std::fclose(fidx); return 1;
+                    }
                     std::vector<float> rec((size_t)oh * ow * NCH, 0.f);
 
                     double sum_ferr = 0.0, sum_w = 0.0, sum_bad = 0.0, sum_r = 0.0;
@@ -1402,7 +1428,7 @@ int main(int argc, char** argv) {
                                 wt = 0.f;
 
                             float* o = &rec[((size_t)iy * ow + ix) * NCH];
-                            const f32* f = &feat.at(gy, gx, 0);
+                            const f32* f = &feat.at(iy, gx, 0);
                             for (int c = 0; c < kRobustnessNnChannels; ++c) o[c] = f[c];
                             o[CH_HARM] = harm;
                             o[CH_RIDEAL] = r_ideal;

@@ -8,8 +8,12 @@
 //   1. compute_guide + local_stats_3x3 on the comparison frame -- the mask's
 //      own copy of the comparison statistics, per frame
 //   2. ensure_robustness_nn_ref_hf -- feature channel 17, ONCE per burst
-//   3. build_robustness_nn_features -- the 18 planes, per frame, including the
-//      per-pixel robustness_analytic_R behind channels 13-14
+//   3. measure_match_quality -- channels 18-19, a 9x9 block-matching cost
+//      surface per tile, per frame. The one genuinely new cost in the
+//      multiplicative design and the first thing to cut if the budget bites.
+//   4. build_robustness_nn_features -- the 27 planes, per frame, including the
+//      per-pixel robustness_analytic_R behind channels 13-14 and the bilinear
+//      warped-luma fetch behind 20-26
 //   4. the strip loop's halo overlap, which rebuilds kRobustnessNnHalo rows
 //      twice at every strip boundary
 //   5. the interleaved -> NCHW transpose the Core ML wrapper performs while
@@ -75,7 +79,7 @@ int main(int argc, char** argv) {
                 gw, gh, gh * gw / 1e6, kRobustnessNnChannels,
                 work.num_threads ? work.num_threads : -1);
 
-    double t_hf = 0, t_stats = 0, t_feat = 0, t_fill = 0;
+    double t_hf = 0, t_stats = 0, t_feat = 0, t_fill = 0, t_mq = 0, t_luma = 0;
 
     // Warm-up, timed separately and EXCLUDED from the per-frame numbers.
     //
@@ -120,6 +124,20 @@ int main(int argc, char** argv) {
         }
         if (cm.h != gh || cm.w != gw) { std::printf("comp stats shape mismatch\n"); return 1; }
 
+        Image cl;
+        {   // The unsmoothed comparison luma channels 20-26 read, and the
+            // plane measure_match_quality searches over.
+            auto t0 = Clock::now();
+            cl = guide_luma(compute_guide(comp, work));
+            t_luma += ms_since(t0);
+        }
+        std::vector<f32> mq;
+        {
+            auto t0 = Clock::now();
+            mq = measure_match_quality(rs.nn_luma, cl, flow, ts, work);
+            t_mq += ms_since(t0);
+        }
+
         // The real strip loop, halo overlap included.
         const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
         std::vector<f32> nchw((size_t)kRobustnessNnChannels * strip_h * gw);
@@ -128,7 +146,8 @@ int main(int argc, char** argv) {
         for (int y0 = 0; y0 < gh; y0 += kRobustnessNnStripRows) {
             const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), gh - strip_h);
             if (gh < strip_h) break;
-            Image feat = build_robustness_nn_features(rs, cm, flow, ts, work, top, false);
+            Image feat = build_robustness_nn_features(rs, cm, flow, ts, work, top,
+                                                      false, 0, &cl, &mq);
             // The transpose the Core ML wrapper does on the way in. Written the
             // same way -- channel-major over an interleaved source -- so the
             // cache behaviour is representative.
@@ -150,16 +169,19 @@ int main(int argc, char** argv) {
     const double n = reps;
     std::printf("\nper comparison frame (host CPU wall clock, NOT an iPhone number)\n");
     std::printf("  comparison guide + 3x3 stats      %7.1f ms\n", t_stats / n);
+    std::printf("  comparison guide luma             %7.1f ms   (channels 20-26 + match q)\n", t_luma / n);
+    std::printf("  measure_match_quality             %7.1f ms   (channels 18-19)\n", t_mq / n);
     std::printf("  build_robustness_nn_features      %7.1f ms   (all strips, halo included)\n", t_feat / n);
     std::printf("  interleaved -> NCHW transpose     %7.1f ms   (Core ML input fill)\n", t_fill / n);
     std::printf("  ------------------------------------------\n");
     std::printf("  CPU-side total per frame          %7.1f ms\n",
-                (t_stats + t_feat + t_fill) / n);
+                (t_stats + t_luma + t_mq + t_feat + t_fill) / n);
     std::printf("  once per burst: channel 17 cache  %7.1f ms\n", t_hf / n);
     std::printf("\n  Core ML inference is NOT included -- it runs on the ANE and\n");
     std::printf("  cannot be measured on this host. The numbers above are the\n");
     std::printf("  work the mask does BEFORE the model is even called.\n");
-    const double per_burst5 = 5.0 * (t_stats + t_feat + t_fill) / n + t_hf / n;
+    const double per_burst5 = 5.0 * (t_stats + t_luma + t_mq + t_feat + t_fill) / n
+                            + t_hf / n;
     std::printf("\n  a 6-frame burst (5 comparison frames) would spend %.0f ms\n", per_burst5);
     std::printf("  of CPU on this host, against a 200 ms budget for everything.\n");
     return 0;
