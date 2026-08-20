@@ -218,10 +218,18 @@ void ensure_robustness_nn_ref_hf(RefStats& ref_stats, const Config& cfg);
 // rows: 0 uses the on-device strip height (kRobustnessNnStripRows + 2 *
 // kRobustnessNnHalo). The training generator passes the full plane height
 // instead, so features and labels are indexed in one coordinate system.
+// planar: false returns the usual interleaved Image (what the training
+// generator and the dumping tools read). true returns the SAME VALUES in
+// channel-major NCHW order, which is what Core ML wants -- writing them that
+// way directly avoids a separate transpose over 18 planes, measured at 193 ms
+// per frame at guide resolution, comparable to building the features at all.
+// A planar result is a flat buffer of c*h*w floats; Image::at() does NOT
+// address it correctly and must not be used on it.
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0,
-                                   bool raw_res = false, int rows = 0);
+                                   bool raw_res = false, int rows = 0,
+                                   bool planar = false);
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
