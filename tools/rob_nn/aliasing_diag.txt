@@ -1,0 +1,45 @@
+Over-rejection in static scenes is ALIASING CONFUSION, and the ablation says
+which channel is doing it.
+
+burst7 is a static scene with real hand tremor: real aliasing, real noise,
+zero misalignment. Every pixel is ground-truth safe, so every rejection below
+is a FALSE rejection. Split by local contrast in units of sensor sigma:
+
+  model        region     px%   mean R   >0.989   rejected(<0.5)
+  symmetric    flat      51.1%   0.949    55.9%        2.0%
+  symmetric    moderate  41.5%   0.877    10.9%        4.3%
+  symmetric    detailed   7.4%   0.731     0.7%       17.7%
+  asymmetric   flat      51.1%   0.895    82.8%       11.3%
+  asymmetric   moderate  41.5%   0.754    53.9%       25.6%
+  asymmetric   detailed   7.4%   0.529    27.2%       50.4%
+
+Rejection scales monotonically with DETAIL on a scene where nothing is
+misaligned. That is the signature of aliasing being read as misalignment --
+detail is exactly where sub-pixel lattice differences between frames are
+largest.
+
+Both failures are present and they are distinguishable:
+  * aliasing confusion: detailed 0.7% above the gate against flat 55.9%
+  * under-confidence:  even FLAT static pixels only reach 55.9% above 0.989
+
+ABLATION (replace a channel by its training mean, symmetric model, burst7):
+
+           ablated      mean R all   mean R detailed   rejected detailed
+   none (baseline)         0.9028            0.7310             17.7%
+   ch13 log(d2/s2)         0.7757            0.3250             82.6%
+   ch14 analytic R         0.8827            0.6328             31.8%
+      ch13+14 both         0.7839            0.3452             84.4%
+   ch6-8 comp mean         0.8719            0.6822             24.4%
+ch15 flow residual         0.9061            0.7385             16.7%
+        ch17 ref HF        0.9025            0.6929             24.5%
+
+The decision is dominated by channel 13, log1p(d^2/sigma^2) -- the photometric
+statistic that CANNOT separate aliasing from misalignment, since both show up
+only as a colour difference. Meanwhile channel 15, the flow residual against
+the local median, is the geometric evidence that CAN separate them, and
+ablating it changes almost nothing (+0.0075): the model is barely using it.
+
+So the model is deciding with the one statistic that is blind to the
+distinction and ignoring the one that is not. That is a features/objective
+problem, not a parameter-count problem, and it is why more capacity would not
+have helped.
