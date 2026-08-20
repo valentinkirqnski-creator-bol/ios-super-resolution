@@ -717,6 +717,13 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Sharp Comparison Resample", isOn: $cam.tuningParams.mask_sharp_resample)
+        Text("""
+             Eq. 6's d is |reference mean - comparison mean|. The reference is read at an              integer position and never resampled; the comparison must be read at a              fractional offset, so the interpolation kernel acts on one side of the              difference only -- and bilinear is a low-pass filter that removes exactly              the high-frequency content a sub-pixel shift reveals. Fraction of the true              difference that survives: 4 guide px 70.7%, 6 px 86.6%, 10 px 95.1%,              20 px 98.8%. Catmull-Rom recovers most of it (88.4% / 97.4% / 99.6%).
+             4-6 guide px is 8-12 RAW px -- thin objects and wires. There a misalignment              at d^2/sigma^2 = 3 that should be fully rejected was instead merged at 33%              weight. Broad content was never affected. Turn OFF to compare against the              old behaviour; it changes nothing where the flow lands on a whole pixel.
+             This does NOT fix the larger blindness: a displaced edge that preserves the              local 3x3 mean still gives d ~= 0 under any interpolator, because d compares              means and not structure.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Disable Noise Model (Robustness)", isOn: $cam.tuningParams.debug_noise_model_disabled)
         Text("""
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
