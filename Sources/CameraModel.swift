@@ -173,7 +173,6 @@ struct TuningParams: Equatable, Codable {
     /// Gate on the learned mask: R below this is not merged. 0.989 admits
     /// 0.10% visible misalignment while still merging 52.8% of pixels;
     /// lower it toward 0.95 for more noise reduction and more risk.
-    var rob_nn_gate: Double = 0.989
     /// Write the learned robustness mask alongside the output.
     var save_nn_rob_mask: Bool = false
     var robustness_raw_resolution_enabled: Bool = false
@@ -233,7 +232,6 @@ struct TuningParams: Equatable, Codable {
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case use_neural_robustness
-        case rob_nn_gate
         case save_nn_rob_mask
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -308,7 +306,6 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
-        rob_nn_gate = try c.decodeIfPresent(Double.self, forKey: .rob_nn_gate) ?? rob_nn_gate
         save_nn_rob_mask = try c.decodeIfPresent(Bool.self, forKey: .save_nn_rob_mask) ?? save_nn_rob_mask
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -1926,7 +1923,6 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
-            "rob_nn_gate": NSNumber(value: tuningParams.rob_nn_gate),
             "save_nn_rob_mask": NSNumber(value: tuningParams.save_nn_rob_mask),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),

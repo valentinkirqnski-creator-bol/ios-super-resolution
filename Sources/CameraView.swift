@@ -722,32 +722,20 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
-            .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
-                + "trained network. The analytic mask decides from a colour difference "
-                + "between 3x3 local means, which cannot see a misalignment that lands on "
-                + "similar-looking content or one finer than that window. The network sees "
-                + "the same statistics plus the estimated flow, its local spread and a wider "
-                + "neighbourhood. Measured against ground truth on synthetic bursts built "
-                + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
-                + "analytic mask automatically if the model is missing.")
-        HStack {
-            Text("Learned Mask Gate")
-            Spacer()
-            Text(String(format: "%.3f", cam.tuningParams.rob_nn_gate))
-                .font(.caption).monospacedDigit().foregroundColor(.secondary)
-        }
-        Slider(value: $cam.tuningParams.rob_nn_gate, in: 0.90...0.999, step: 0.001)
-            .disabled(!cam.tuningParams.use_neural_robustness)
-        Text("""
-             Below this the pixel is not merged at all. Measured on held-out data              (2.44M px, 9.17% harmful), the tradeoff is visible misalignment against how              much of the burst still contributes: 0.900 admits 3.63% of visible              misalignments and merges 82.6% of pixels; 0.950 -> 1.79% / 76.0%;              0.980 -> 0.49% / 63.4%; 0.989 -> 0.10% / 52.8%; 0.999 -> 0.00% / 5.3%.
-             0.989 is the default because strict zero is not worth buying -- it collapses              to 6% merged, essentially just the reference frame with no multi-frame              benefit. The curve is very steep just below it, so one-in-a-thousand visible              misalignment still keeps half the burst. For scale the analytic mask admits              41.4% of visible misalignments at its own R>=0.5 cut. Raise it toward 0.999              for fewer misalignments and more noise; lower it toward 0.95 for more noise              reduction and more risk.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Learned Robustness Correction", isOn: $cam.tuningParams.use_neural_robustness)
+            .help("Multiplies the analytic robustness mask (Wronski Eq. 5-9) by a learned "
+                + "per-pixel confidence in [0,1]. The analytic mask is unchanged and stays "
+                + "the primary decision; the network can only ever LOWER it, which is a "
+                + "property of the architecture rather than of the training. It exists for "
+                + "the failures Eq. 5-9 is structurally blind to -- camera rotation leaving "
+                + "a tile translation-aligned, curved motion, local object motion, "
+                + "occlusion, tiles matched onto similar-looking content -- where a shifted "
+                + "edge leaves the local mean and variance almost unchanged. Falls back to "
+                + "the plain analytic mask if the model is missing.")
         Toggle("Save Learned Robustness Mask", isOn: $cam.tuningParams.save_nn_rob_mask)
             .disabled(!cam.tuningParams.use_neural_robustness)
         Text("""
-             Writes the mask alongside the output, AFTER gating, so what you inspect is              what the merge actually consumed rather than the raw network output. Costs a              full extra plane per comparison frame.
+             Writes the network's correction C alongside the output -- not R_final, which              mixes it with what the analytic mask already did. C should be close to 1              nearly everywhere; a dump that is broadly grey means the model has rescaled              the mask rather than corrected it. Costs a full extra plane per comparison              frame.
              """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)

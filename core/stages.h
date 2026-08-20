@@ -103,6 +103,18 @@ struct RefStats {
     // the per-pixel feature loop is 75 reads/px at 3 MP on every frame, which
     // the runtime budget does not have. Empty unless the learned mask runs.
     Image nn_hf;
+    // The reference guide's LUMA, guide resolution, 1 channel, UNSMOOTHED.
+    //
+    // Not derivable from `means`: those are 3x3 box means (a 6x6 raw support)
+    // and the whole point of the spatial channels is the structure that box
+    // destroys. A shifted edge and an unshifted one have nearly the same 3x3
+    // mean; they do not have the same pixel values.
+    //
+    // Filled by init_robustness straight from ref_raw, which is the only
+    // place the reference raw is still in scope -- including on the Metal
+    // path, where means/stds stay GPU-resident. 12 MB at 3 MP; empty unless
+    // the learned correction is enabled.
+    Image nn_luma;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
@@ -168,6 +180,57 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 //         decides whether a subpixel error costs anything; neither the mean
 //         nor the std carries it.
 //
+//   --- match quality: the shape of the block-matching cost surface --------
+//   18    log(cost at the chosen offset / best cost in a +-4 grey-px window).
+//         0 when the offset being judged IS the best correspondence on offer,
+//         positive in proportion to how much better something nearby was.
+//   19    log(best rival outside the winner basin / best cost). How ISOLATED
+//         that minimum is. Aliasing changes the residual at the BOTTOM of the
+//         cost surface without flattening it, so a correctly aligned but
+//         aliased tile still has a sharp isolated minimum, while a tile
+//         matched onto similar-looking content elsewhere has several
+//         near-ties. No photometric channel separates those two; the cost
+//         surface shape does. Zero when match_q is null.
+//
+//   --- the spatial residual: what statistics provably cannot carry --------
+//
+//   Channels 0-19 are all local STATISTICS, and a rotation error can leave
+//   every one of them almost unchanged while shifting an edge by a pixel:
+//
+//       reference edge:   |          warped edge:     |
+//
+//   Same mean, same variance, same noise, same flow smoothness -- and a
+//   duplicated edge in the merged output. Only spatial structure separates
+//   them, so the network is given the residual itself and the reference
+//   gradient it has to be read against. Because the network is fully
+//   convolutional with a 7-guide-pixel receptive field, handing it these as
+//   PLANES gives it a 15x15 guide-pixel (30 raw-pixel) patch around every
+//   pixel at the cost of four extra reads -- the same information a per-pixel
+//   patch gather would provide, without the gather.
+//
+//   Seeing the residual VARY ACROSS a tile is the point. A translation-only
+//   flow that is fitting a locally rotating scene leaves a residual that
+//   ramps from one side of the tile to the other; a correct match leaves a
+//   residual that is noise everywhere. That difference is invisible to any
+//   pointwise statistic and obvious to a dilated convolution.
+//
+//   20    reference guide luma, unsmoothed
+//   21    comparison guide luma, unsmoothed, sampled bilinearly where the
+//         estimated flow points (flow is in RAW px, so the guide offset is
+//         half of it)
+//   22    signed residual, channel 20 minus channel 21
+//   23    d(reference luma)/dx, guide px
+//   24    d(reference luma)/dy, guide px
+//   25    regularised local displacement estimate: the residual projected
+//         onto the reference gradient, r*|g| / (|g|^2 + eps), clamped to
+//         +-4 guide px. Where the gradient is real this is directly "how far
+//         off, in pixels, along the edge normal"; where it is not, it decays
+//         to 0 instead of exploding. This is the channel that reads a shifted
+//         edge as a shift rather than as a brightness change, and its
+//         VARIATION over a tile is the rotation signature.
+//   26    residual over the expected sensor noise sigma -- the same residual
+//         as 22, in the units that decide whether it is signal at all.
+//
 // Kept in portable C++ next to the analytic mask because this layout is a
 // contract with tools/rob_nn/rob_real.cpp, which writes the training set;
 // the two must be read side by side to stay in step. Channels 9-12 are the
@@ -218,11 +281,46 @@ void ensure_robustness_nn_ref_hf(RefStats& ref_stats, const Config& cfg);
 // rows: 0 uses the on-device strip height (kRobustnessNnStripRows + 2 *
 // kRobustnessNnHalo). The training generator passes the full plane height
 // instead, so features and labels are indexed in one coordinate system.
+// comp_luma / match_q are the inputs for channels 20-26 and 18-19. Either may
+// be null, in which case those channels are written as zero -- exactly
+// equivalent to the model never having had them, which is what a caller that
+// has not measured them must accept.
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0,
-                                   bool raw_res = false, int rows = 0);
+                                   bool raw_res = false, int rows = 0,
+                                   const Image* comp_luma = nullptr,
+                                   const std::vector<f32>* match_q = nullptr);
 
+// Per-tile match quality for feature channels 18-19, measured on guide-
+// resolution LUMA planes (the reference and the comparison, both unwarped)
+// over the flow own raw-pixel tile grid. Two floats per tile.
+//
+// Recomputed here rather than carried out of align.cpp: the aligner tracks
+// second_dist at two search sites across every pyramid level with their own
+// upsample and fallback paths, and threading a continuous value through all
+// of them is a large change to make before knowing the statistic earns its
+// keep on the multiplicative model.
+std::vector<f32> measure_match_quality(const Image& ref_luma, const Image& comp_luma,
+                                       const FlowField& flow, int tile_size,
+                                       const Config& cfg);
+
+// Guide-resolution luma (the mean of the guide colour planes), unsmoothed.
+// Feature channels 20-26 and measure_match_quality both read it; exposed so
+// tools/rob_nn builds the identical plane rather than a second copy of the
+// formula.
+Image guide_luma(const Image& guide);
+
+// The analytic mask alone, Eq. 5-9, exactly as it has always been. Split out
+// so the learned correction multiplies a value it cannot alter, and so
+// tools/rob_nn can write the same R_normal into the training set that the app
+// multiplies at inference.
+Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_stats,
+                                  const FlowField& flow, int tile_size,
+                                  const Config& cfg, Image* s_select_out = nullptr);
+
+// R_final. The analytic mask above, multiplied by the learned correction
+// confidence when cfg.use_neural_robustness is on and the model loaded.
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out = nullptr);

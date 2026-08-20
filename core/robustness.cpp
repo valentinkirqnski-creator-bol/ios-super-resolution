@@ -503,6 +503,24 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     return guide;
 }
 
+// See stages.h. One plane, guide resolution, unsmoothed -- the input the
+// spatial residual channels and measure_match_quality both read. A plain mean
+// over the guide colour planes rather than a luminance weighting: the
+// robustness decision is about geometry, and an unweighted mean keeps the
+// green channel from dominating what is really a structure detector.
+Image guide_luma(const Image& guide) {
+    Image l(guide.h, guide.w, 1);
+    if (guide.c <= 0) return l;
+    const f32 inv = 1.f / (f32)guide.c;
+    for (int y = 0; y < guide.h; ++y)
+        for (int x = 0; x < guide.w; ++x) {
+            f32 s = 0.f;
+            for (int c = 0; c < guide.c; ++c) s += guide.at(y, x, c);
+            l.at(y, x) = s * inv;
+        }
+    return l;
+}
+
 namespace {
 
 static Image local_lowpass_gaussian5x5(const Image& guide) {
@@ -966,10 +984,19 @@ static Image local_min_5x5_on_guide(const Image& R);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
+    // The learned correction needs the reference guide UNSMOOTHED (channels
+    // 20-26 and the match-quality search), and this is the last place the
+    // reference raw is in scope. It has to happen on both paths: on Metal the
+    // means and stds live on the GPU, and no readback of them can reconstruct
+    // a plane that was never boxed.
+    auto fill_nn_luma = [&](RefStats& st) {
+        if (!cfg.use_neural_robustness) return;
+        st.nn_luma = guide_luma(compute_guide(ref_raw, cfg));
+    };
 #ifdef __APPLE__
     // Metal GPU only — same math as the CPU path below (golden reference).
     RefStats gpu = init_robustness_metal(ref_raw, cfg);
-    if (gpu.means.h > 0 && gpu.means.w > 0) return gpu;
+    if (gpu.means.h > 0 && gpu.means.w > 0) { fill_nn_luma(gpu); return gpu; }
     return RefStats();
 #else
     RefStats st;
@@ -995,6 +1022,7 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
                                            0, cfg.num_threads);
     }
+    fill_nn_luma(st);
     return st;
 #endif
 }
@@ -1210,6 +1238,122 @@ f32 robustness_analytic_R(const f32* ref_mean, const f32* ref_var,
     return std::isfinite(r) ? clampf(r, 0.f, 1.f) : 0.f;
 }
 
+// See stages.h. Two scale-free statistics from the block-matching cost surface
+// around the offset the mask is being asked to judge.
+//
+// This is carried over from an earlier experiment (branch matchq-mask-4da49a9)
+// where it was the one feature change that lifted the accuracy curve instead
+// of sliding along it. Its first version was WRONG and the measurement caught
+// it: comparing the chosen offset against a ring 2-3 px away scored
+// uncorrupted tiles 0.09 and corrupted ones 0.78, backwards. It was measuring
+// local STEEPNESS -- as large at a wrong offset sitting on a gradient as at a
+// right one -- and its exclusion ring hid the true optimum whenever the error
+// was smaller than the ring. Both statistics below are anchored on the MINIMUM
+// over a real search window instead, which is the question that matters.
+//
+//   [0]  log(cost at the chosen offset / best cost anywhere in the window).
+//        0 when the offset being judged IS the best correspondence available,
+//        positive in proportion to how much better something nearby would have
+//        been. This is what detects a misaligned tile.
+//
+//   [1]  log(best rival outside the winner basin / best cost). How UNIQUE that
+//        best match is: large when the minimum is sharp and isolated, near 0
+//        when several candidates tie. This is the evidence that does NOT
+//        confuse aliasing with misalignment -- aliasing changes the residual
+//        at the bottom of the cost surface without flattening it, so a
+//        correctly aligned aliased tile keeps a sharp isolated minimum, while
+//        a tile matched onto similar-looking content elsewhere does not.
+//
+// Both are ratios of two costs measured on the same tile, so tile contrast and
+// brightness cancel and no contrast-dependent statistic is reintroduced. Both
+// are floored at the sensor noise, because two costs that are both within the
+// noise are not meaningfully different and without the floor a flat tile
+// manufactures enormous ratios out of nothing.
+//
+// MEASURED ON THE FLOW BEING JUDGED, never on a known-good one. Measuring at
+// the true offset would hand the network the answer and score wonderfully
+// while being useless in the app.
+std::vector<f32> measure_match_quality(const Image& ref_luma, const Image& comp_luma,
+                                       const FlowField& flow, int tile_size,
+                                       const Config& cfg) {
+    std::vector<f32> out((size_t)flow.ny * flow.nx * 2, 0.f);
+    if (ref_luma.h <= 0 || comp_luma.h <= 0 || tile_size <= 0) return out;
+    if (ref_luma.data.empty() || comp_luma.data.empty()) return out;
+    // The flow is on a RAW tile grid carrying RAW displacements; the luma
+    // planes are guide resolution, i.e. half of raw.
+    const f32 g_per_raw = 0.5f;
+    const int tg = std::max(2, (int)std::lround(tile_size * g_per_raw));
+    const int RS = 4;                       // search radius, guide px
+    const int W = 2 * RS + 1;
+    // Every second pixel in each axis. The cost surface is a tile-level
+    // statistic and 16 samples of an 8x8 tile estimate it to well inside the
+    // noise, while the full scan is 81 offsets x 64 pixels x 47k tiles = 247
+    // MOP per comparison frame, which the 200 ms budget for the whole
+    // correction cannot afford four times over.
+    const int St = 2;
+    const f32 alpha = cfg.noise_alpha_robustness(), beta = cfg.noise_beta_robustness();
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        std::vector<double> c((size_t)W * W, 1e30);
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const int oy = (int)std::lround(ty * tile_size * g_per_raw);
+            const int ox = (int)std::lround(tx * tile_size * g_per_raw);
+            const f32 fx = flow.dx(ty, tx) * g_per_raw;
+            const f32 fy = flow.dy(ty, tx) * g_per_raw;
+            double sr = 0; int nref = 0;
+            std::fill(c.begin(), c.end(), 1e30);
+            for (int ddy = -RS; ddy <= RS; ++ddy)
+                for (int ddx = -RS; ddx <= RS; ++ddx) {
+                    double acc = 0; int n = 0;
+                    for (int i = 0; i < tg; i += St)
+                        for (int j = 0; j < tg; j += St) {
+                            const int ry = oy + i, rx = ox + j;
+                            if (ry < 0 || rx < 0 || ry >= ref_luma.h || rx >= ref_luma.w) continue;
+                            const int my = (int)std::lround(ry + fy) + ddy;
+                            const int mx = (int)std::lround(rx + fx) + ddx;
+                            if (my < 0 || mx < 0 || my >= comp_luma.h || mx >= comp_luma.w) continue;
+                            const f32 r = ref_luma.at(ry, rx);
+                            acc += std::fabs(r - comp_luma.at(my, mx));
+                            if (ddy == 0 && ddx == 0) { sr += r; ++nref; }
+                            ++n;
+                        }
+                    if (n >= 8) c[(size_t)(ddy + RS) * W + (ddx + RS)] = acc / (double)n;
+                }
+            if (nref < 8) continue;
+            const double mean_ref = sr / nref;
+            const double c0 = c[(size_t)RS * W + RS];
+            if (c0 > 1e29) continue;
+            double cmin = 1e30; int by = 0, bx = 0;
+            for (int ddy = -RS; ddy <= RS; ++ddy)
+                for (int ddx = -RS; ddx <= RS; ++ddx) {
+                    const double v = c[(size_t)(ddy + RS) * W + (ddx + RS)];
+                    if (v < cmin) { cmin = v; by = ddy; bx = ddx; }
+                }
+            // Best rival OUTSIDE the winner basin, so the runner-up is a
+            // genuinely different correspondence rather than the same one a
+            // pixel over.
+            double crival = 1e30;
+            for (int ddy = -RS; ddy <= RS; ++ddy)
+                for (int ddx = -RS; ddx <= RS; ++ddx) {
+                    const int dy2 = ddy - by, dx2 = ddx - bx;
+                    if (dy2 * dy2 + dx2 * dx2 < 4) continue;      // >= 2 px away
+                    crival = std::min(crival, c[(size_t)(ddy + RS) * W + (ddx + RS)]);
+                }
+            const f32 nsig = std::sqrt(std::max(
+                alpha * (f32)std::min(std::max(mean_ref, 0.0), 1.0) + beta, 0.f));
+            const double floor_c = std::max((double)nsig, 1e-7);
+            const double den = std::max(cmin, floor_c);
+            const f32 offby = (f32)std::log(std::max(std::max(c0, floor_c) / den, 1.0));
+            const f32 uniq = (crival < 1e29)
+                ? (f32)std::log(std::max(std::max(crival, floor_c) / den, 1.0)) : 0.f;
+            out[((size_t)ty * flow.nx + tx) * 2 + 0] =
+                std::isfinite(offby) ? std::min(offby, 8.f) : 0.f;
+            out[((size_t)ty * flow.nx + tx) * 2 + 1] =
+                std::isfinite(uniq) ? std::min(uniq, 8.f) : 0.f;
+        }
+    });
+    return out;
+}
+
 void ensure_robustness_nn_ref_hf(RefStats& rs, const Config& cfg) {
     const Image& rm = rs.means;
     if (rs.nn_hf.h == rm.h && rs.nn_hf.w == rm.w && !rs.nn_hf.data.empty()) return;
@@ -1249,7 +1393,8 @@ void ensure_robustness_nn_ref_hf(RefStats& rs, const Config& cfg) {
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0, bool raw_res,
-                                   int rows) {
+                                   int rows, const Image* comp_luma,
+                                   const std::vector<f32>* match_q) {
     const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
     const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
     if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
@@ -1272,6 +1417,21 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     const Image* hf_plane = &ref_stats.nn_hf;
     const bool have_hf = !raw_res && hf_plane->h == rm.h && hf_plane->w == rm.w &&
                          hf_plane->data.size() >= (size_t)rm.h * rm.w;
+    // Channels 20-26. Guide-resolution planes only: at raw resolution the
+    // comparison statistics have already been Dodgson-upscaled AND warped, so
+    // an unwarped luma plane would be in a different coordinate system from
+    // everything around it -- the exact double-warp confusion this file has
+    // been bitten by before. The raw-res path is off by default and was never
+    // trained with these channels, so they are simply zero there.
+    const Image* rl = &ref_stats.nn_luma;
+    const bool have_sp = !raw_res && comp_luma != nullptr &&
+                         rl->h == rm.h && rl->w == rm.w &&
+                         rl->data.size() >= (size_t)rm.h * rm.w &&
+                         comp_luma->h == rm.h && comp_luma->w == rm.w &&
+                         comp_luma->data.size() >= (size_t)rm.h * rm.w;
+    // Channels 18-19.
+    const bool have_mq = match_q != nullptr &&
+                         match_q->size() >= (size_t)flow.ny * flow.nx * 2;
     // rows == 0 selects the on-device strip height. The training generator
     // passes the whole plane instead: it writes crops from arbitrary origins,
     // and stitching them out of strips would only add a way to get the
@@ -1478,14 +1638,80 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             // only on the reference, and a 5x5 box over 3 channels inside this
             // loop would cost 75 reads/px on every comparison frame.
             o[17] = have_hf ? hf_plane->at(y, x) : 0.f;
+
+            // Channels 18-19: the shape of the block-matching cost surface at
+            // the tile this pixel sits in. Bilinear between tile centres for
+            // the same reason the flow channels are -- a piecewise-constant
+            // input makes the network draw the tile grid.
+            if (have_mq) {
+                auto mq = [&](int t, int u, int k) {
+                    return (*match_q)[((size_t)t * tnx + u) * 2 + k];
+                };
+                o[18] = bilerp(mq(iy0, ix0, 0), mq(iy0, ix1, 0),
+                               mq(iy1, ix0, 0), mq(iy1, ix1, 0));
+                o[19] = bilerp(mq(iy0, ix0, 1), mq(iy0, ix1, 1),
+                               mq(iy1, ix0, 1), mq(iy1, ix1, 1));
+            } else {
+                o[18] = 0.f; o[19] = 0.f;
+            }
+
+            // Channels 20-26: the spatial residual. Everything above is a
+            // local statistic and a one-pixel edge shift moves none of them
+            // appreciably; this is the evidence that does move.
+            //
+            // The comparison luma is fetched BILINEARLY at the sub-pixel
+            // position the flow points to, not at the nearest pixel. Rounding
+            // here would quantise the residual to whole guide pixels, i.e. to
+            // two RAW pixels, and the errors this correction exists to catch
+            // start below one.
+            if (have_sp) {
+                const f32 sy = (f32)y + 0.5f * fy;
+                const f32 sx = (f32)x + 0.5f * fx;
+                const f32 cy = std::min(std::max(sy, 0.f), (f32)(h - 1));
+                const f32 cx = std::min(std::max(sx, 0.f), (f32)(w - 1));
+                const int by0 = (int)cy, bx0 = (int)cx;
+                const int by1 = std::min(by0 + 1, h - 1), bx1 = std::min(bx0 + 1, w - 1);
+                const f32 wy = cy - (f32)by0, wx = cx - (f32)bx0;
+                const f32 ctop = comp_luma->at(by0, bx0) +
+                                 (comp_luma->at(by0, bx1) - comp_luma->at(by0, bx0)) * wx;
+                const f32 cbot = comp_luma->at(by1, bx0) +
+                                 (comp_luma->at(by1, bx1) - comp_luma->at(by1, bx0)) * wx;
+                const f32 cl = ctop + (cbot - ctop) * wy;
+                const f32 rlv = rl->at(y, x);
+                const f32 res = rlv - cl;
+                const int xm = (x > 0) ? x - 1 : 0, xp = (x < w - 1) ? x + 1 : w - 1;
+                const int ym = (y > 0) ? y - 1 : 0, yp = (y < h - 1) ? y + 1 : h - 1;
+                const f32 gx = 0.5f * (rl->at(y, xp) - rl->at(y, xm));
+                const f32 gy = 0.5f * (rl->at(yp, x) - rl->at(ym, x));
+                o[20] = rlv;
+                o[21] = cl;
+                o[22] = res;
+                o[23] = gx;
+                o[24] = gy;
+                // Regularised displacement estimate. For a pure translation e
+                // along the edge normal the residual is r ~ e.g, so e ~ r|g| /
+                // |g|^2 -- but that divides by zero on flat content, where the
+                // residual is pure noise and the answer must be "no evidence",
+                // not "infinity". Tikhonov with the NOISE as the regulariser
+                // gives exactly that: it decays smoothly to 0 as the gradient
+                // falls below what the sensor can distinguish from grain.
+                const f32 g2 = gx * gx + gy * gy;
+                const f32 gm = std::sqrt(g2);
+                const f32 eps = std::max(4.f * nsig * nsig, 1e-8f);
+                const f32 disp = res * gm / (g2 + eps);
+                o[25] = std::min(std::max(disp, -4.f), 4.f);
+                o[26] = res / std::max(nsig, 1e-6f);
+            } else {
+                for (int c = 20; c < 27; ++c) o[c] = 0.f;
+            }
         }
     });
     return feat;
 }
 
-Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
-                         const FlowField& flow, int tile_size, const Config& cfg,
-                         Image* s_select_out) {
+Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_stats,
+                                  const FlowField& flow, int tile_size, const Config& cfg,
+                                  Image* s_select_out) {
     if (!cfg.robustness_enabled) {
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
@@ -1504,104 +1730,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         std::fill(r.data.begin(), r.data.end(), 0.f);
         if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
-    }
-
-    // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both
-    // the Metal and CPU analytic paths, and falls through to them whenever the
-    // model is absent, fails to load, or the features cannot be built -- so a
-    // missing model degrades to the reference behaviour rather than to no mask.
-    //
-    // Eq. 9's 5x5 minimum is deliberately NOT applied on top. That step exists
-    // to spread rejection outward from a pointwise test with no spatial
-    // context; this network has a ~30 raw-pixel receptive field and was
-    // trained and measured to emit the final per-pixel decision, so dilating
-    // it again would double-count and would not match the reported numbers.
-    if (cfg.use_neural_robustness && robustness_nn_available()) {
-#ifdef __APPLE__
-        // See metal_fetch_host_ref_stats: on this path the reference stats are
-        // GPU-resident by design, so bring them across before building
-        // features from them. One readback per burst, not per frame -- the
-        // copy stays in ref_stats.
-        RefStats* mutable_stats = const_cast<RefStats*>(&ref_stats);
-        if (mutable_stats->means.data.empty() &&
-            !metal_fetch_host_ref_stats(*mutable_stats)) {
-            // Could not get them; the analytic path below reads the same
-            // statistics straight from the GPU and is unaffected.
-            return compute_robustness_metal(comp_raw, ref_stats, flow, tile_size,
-                                            cfg, s_select_out);
-        }
-#endif
-        // Honour the raw-resolution toggle. Previously this hook ran before the
-        // raw-res dispatch and always returned a 3 MP mask, so enabling that
-        // setting alongside the learned mask silently did nothing.
-        const bool nn_raw = cfg.robustness_raw_resolution_active() &&
-                            ref_stats.means_hires.h > 0 &&
-                            ref_stats.means_hires.data.size() ==
-                                (size_t)ref_stats.means_hires.h *
-                                ref_stats.means_hires.w * ref_stats.means_hires.c;
-        Image cm_nn;
-        {
-            Image guide_nn = compute_guide(comp_raw, cfg);
-            Image cv_nn;   // variance is not a feature; freed with this scope
-            local_stats_3x3(guide_nn, cm_nn, cv_nn);
-            if (nn_raw) {
-                // Dodgson upscale + flow warp into the reference frame, the
-                // same transform the analytic raw-res path applies.
-                Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
-                                                 tile_size, cfg.num_threads);
-                cm_nn = std::move(hires);
-            }
-        }
-        // Feature channel 17 depends only on the reference, so it is built
-        // here (once per burst -- the guard inside makes repeat calls free)
-        // rather than inside the per-pixel loop of every comparison frame.
-        ensure_robustness_nn_ref_hf(*const_cast<RefStats*>(&ref_stats), cfg);
-        const int nh = cm_nn.h, nw = cm_nn.w;
-        const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
-        Image nn_mask(nh, nw, 1);
-        // Every window is strip_h tall and fully inside the image, so Core ML
-        // sees one input shape for the whole burst (no reshape per strip) and
-        // the result matches whole-plane inference exactly. An image shorter
-        // than one window would make that impossible; there is nothing to
-        // save there either, so fall back to the analytic mask.
-        bool ok = (nh >= strip_h && nw > 0);
-        for (int y0 = 0; ok && y0 < nh; y0 += kRobustnessNnStripRows) {
-            const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), nh - strip_h);
-            Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow,
-                                                      tile_size, cfg, top, nn_raw);
-            Image strip;
-            if (feat.h != strip_h || !robustness_nn_infer(feat, strip) ||
-                strip.h != strip_h || strip.w != nw) {
-                ok = false;
-                break;
-            }
-            const int rows = std::min(kRobustnessNnStripRows, nh - y0);
-            for (int r = 0; r < rows; ++r)
-                std::memcpy(&nn_mask.at(y0 + r, 0),
-                            &strip.at(y0 - top + r, 0),
-                            (size_t)nw * sizeof(f32));
-        }
-        if (ok) {
-            // The learned mask makes no s1/s2 choice, so report the strict
-            // prior uniformly rather than leaving the split masks undefined.
-            if (s_select_out) {
-                *s_select_out = Image(nn_mask.h, nn_mask.w, 1);
-                std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
-            }
-            // Apply the decision gate. Below it the pixel is not merged at
-            // all; at or above it the network's own value is kept, so the
-            // rolloff it learned survives inside the trusted band rather than
-            // being flattened to a binary mask.
-            if (cfg.rob_nn_gate > 0.f) {
-                const f32 g = cfg.rob_nn_gate;
-                for (f32& v : nn_mask.data) if (v < g) v = 0.f;
-            }
-            // Saved AFTER gating, so what lands on disk is the mask the merge
-            // actually consumed rather than the raw network output.
-            if (cfg.save_nn_rob_mask)
-                debug_dump_bin("rob_nn_mask", nn_mask.data.data(), nn_mask.data.size());
-            return nn_mask;
-        }
     }
 
 #ifdef __APPLE__
@@ -1767,6 +1895,125 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
     return local_min_5x5(R);
 #endif
+}
+
+
+// R_final = R_analytic * C_nn.
+//
+// The analytic mask above is computed first and is never modified. The
+// network contributes only C in [0,1], and the ONLY thing done with it is a
+// multiply -- so the learned part cannot raise R for any pixel, on any input,
+// however badly it was trained. That guarantee is structural (sigmoid head in
+// the exported graph, multiply here); it is not something the loss is hoped
+// to achieve.
+//
+// Eq. 9's 5x5 minimum has already been applied inside the analytic mask, and
+// is deliberately NOT applied again to C. That step spreads rejection outward
+// from a pointwise test with no spatial context; the correction network has a
+// 30 raw-pixel receptive field and was trained to emit its final per-pixel
+// answer, so dilating it would double-count and would not match the reported
+// numbers.
+Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
+                         const FlowField& flow, int tile_size, const Config& cfg,
+                         Image* s_select_out) {
+    Image R = compute_robustness_analytic(comp_raw, ref_stats, flow, tile_size,
+                                          cfg, s_select_out);
+    if (!cfg.use_neural_robustness) return R;
+    // Degenerate inputs: the analytic mask has already answered "trust
+    // everything" or "trust nothing" without looking at the flow, and the
+    // correction has nothing to correct.
+    if (!cfg.robustness_enabled) return R;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return R;
+    if (R.h <= 0 || R.w <= 0) return R;
+    if (!robustness_nn_available()) return R;
+
+#ifdef __APPLE__
+    // See metal_fetch_host_ref_stats: on this path the reference stats are
+    // GPU-resident by design, so bring them across before building features
+    // from them. One readback per burst, not per frame -- the copy stays in
+    // ref_stats.
+    RefStats* mutable_stats = const_cast<RefStats*>(&ref_stats);
+    if (mutable_stats->means.data.empty() && !metal_fetch_host_ref_stats(*mutable_stats))
+        return R;   // no host stats, no features; the analytic mask stands
+#endif
+    // init_robustness fills this from the reference raw. Empty means the
+    // learned mask was switched on mid-burst, after the reference was
+    // processed -- in which case the spatial channels the model was trained on
+    // would all be zero, which is a different model from the one that was
+    // measured. Fall back rather than run it blind.
+    if (ref_stats.nn_luma.h != R.h || ref_stats.nn_luma.w != R.w ||
+        ref_stats.nn_luma.data.size() < (size_t)R.h * R.w)
+        return R;
+
+    const bool nn_raw = cfg.robustness_raw_resolution_active() &&
+                        ref_stats.means_hires.h > 0 &&
+                        ref_stats.means_hires.data.size() ==
+                            (size_t)ref_stats.means_hires.h *
+                            ref_stats.means_hires.w * ref_stats.means_hires.c;
+    Image cm_nn, cl_nn;
+    {
+        Image guide_nn = compute_guide(comp_raw, cfg);
+        cl_nn = guide_luma(guide_nn);
+        Image cv_nn;   // variance is not a feature; freed with this scope
+        local_stats_3x3(guide_nn, cm_nn, cv_nn);
+        if (nn_raw) {
+            Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
+                                             tile_size, cfg.num_threads);
+            cm_nn = std::move(hires);
+        }
+    }
+    // Feature channel 17 depends only on the reference, so it is built here
+    // (once per burst -- the guard inside makes repeat calls free) rather than
+    // inside the per-pixel loop of every comparison frame.
+    ensure_robustness_nn_ref_hf(*const_cast<RefStats*>(&ref_stats), cfg);
+    // Channels 18-19, one measurement per tile per comparison frame.
+    const std::vector<f32> mq = measure_match_quality(ref_stats.nn_luma, cl_nn,
+                                                      flow, tile_size, cfg);
+
+    const int nh = cm_nn.h, nw = cm_nn.w;
+    // The correction is only meaningful on the grid the analytic mask lives
+    // on. A mismatch means the raw-resolution toggle and the mask disagree
+    // (compute_robustness_raw_res silently returns guide resolution when the
+    // hires reference stats are missing), and resampling C to fit would apply
+    // it half a plane out of position.
+    if (nh != R.h || nw != R.w) return R;
+
+    const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
+    Image nn_c(nh, nw, 1);
+    // Every window is strip_h tall and fully inside the image, so Core ML sees
+    // one input shape for the whole burst (no reshape per strip) and the
+    // result matches whole-plane inference exactly. An image shorter than one
+    // window would make that impossible; there is nothing to save there
+    // either, so leave the analytic mask alone.
+    bool ok = (nh >= strip_h && nw > 0);
+    for (int y0 = 0; ok && y0 < nh; y0 += kRobustnessNnStripRows) {
+        const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), nh - strip_h);
+        Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow, tile_size,
+                                                  cfg, top, nn_raw, /*rows=*/0,
+                                                  &cl_nn, &mq);
+        Image strip;
+        if (feat.h != strip_h || !robustness_nn_infer(feat, strip) ||
+            strip.h != strip_h || strip.w != nw) {
+            ok = false;
+            break;
+        }
+        const int rows = std::min(kRobustnessNnStripRows, nh - y0);
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(&nn_c.at(y0 + r, 0), &strip.at(y0 - top + r, 0),
+                        (size_t)nw * sizeof(f32));
+    }
+    if (!ok) return R;   // fails closed: the analytic mask is the fallback
+
+    // The multiply. Clamped defensively so a model that somehow emits a value
+    // outside [0,1] -- a bad export, a numerical edge -- still cannot raise R.
+    for (size_t i = 0; i < R.data.size() && i < nn_c.data.size(); ++i)
+        R.data[i] *= clampf(nn_c.data[i], 0.f, 1.f);
+    // Saved as C, not as R_final: the question this dump exists to answer is
+    // "what did the network do", and R_final mixes that with what the analytic
+    // mask already did.
+    if (cfg.save_nn_rob_mask)
+        debug_dump_bin("rob_nn_c", nn_c.data.data(), nn_c.data.size());
+    return R;
 }
 
 } // namespace hhsr

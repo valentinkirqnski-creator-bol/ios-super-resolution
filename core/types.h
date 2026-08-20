@@ -20,7 +20,7 @@ namespace hhsr {
 using f32 = float;
 
 // Row-major image / tensor with an arbitrary number of interleaved channels.
-// Number of feature planes the learned robustness mask consumes
+// Number of feature planes the learned robustness CORRECTION consumes
 // (robustness_nn.h). Fixed by the trained weights --
 // tools/rob_nn/rob_real.cpp writes them in this order and
 // tools/rob_nn/train_rob.py trains on that layout, so changing it means
@@ -31,7 +31,7 @@ using f32 = float;
 // the pipeline silently uses the analytic mask, so a rebuild after changing
 // this number looks like "the learned mask changed nothing". Changing it
 // means re-running train_rob.py AND export_coreml.py.
-inline constexpr int kRobustnessNnChannels = 18;
+inline constexpr int kRobustnessNnChannels = 27;
 
 // The learned mask runs in horizontal strips to bound peak memory (see
 // build_robustness_nn_features). kRobustnessNnHalo is the network's exact
@@ -617,46 +617,34 @@ struct Config {
     // own dimensions rather than trusting this flag, because this path
     // silently falls back to guide resolution when the hires ref stats
     // are missing).
-    // Replace the analytic robustness mask (Wronski Eq. 5-9) with the learned
-    // one in robustness_nn.h. Off by default: the analytic mask is the
-    // reference behaviour and the network is only as good as the bursts it
-    // was trained on. Falls back automatically when the model is missing or
-    // fails to load, so enabling it can never leave the pipeline without a
-    // mask.
+    // Multiply the analytic robustness mask (Wronski Eq. 5-9) by a learned
+    // per-pixel CORRECTION confidence C in [0,1]:
     //
-    // Motivation, measured (tools/rob_nn, synthetic bursts with ground-truth
-    // motion built from real raws): the analytic mask separates harmful from
-    // harmless pixels with AUC 0.638 and cannot exceed ~26% detection at any
-    // threshold, because it pins most pixels at exactly R = 1. The network
-    // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
+    //     R_final = R_analytic * C_nn
+    //
+    // The analytic mask is untouched and remains the primary decision. The
+    // network can only ever LOWER it -- that is a property of the
+    // architecture (sigmoid head, multiply), not of the loss, so no amount of
+    // bad training can make the mask trust a pixel the closed form distrusts.
+    //
+    // Off by default; falls back to the plain analytic mask when the model is
+    // missing or fails to load, so enabling it can never leave the pipeline
+    // without a mask.
+    //
+    // What it is for. Eq. 5-9 decides from d^2/sigma^2 between 3x3 means of
+    // the guide, which is blind to a whole class of failure: camera rotation
+    // that leaves a tile translation-aligned, curved camera motion, local
+    // object motion, occlusion, and tiles matched onto similar-looking
+    // content. Those keep the local mean and variance almost unchanged while
+    // shifting an edge by a pixel, so R stays high and the merge duplicates
+    // the edge. The correction network is given the spatial residual
+    // (channels 20-26 -- see build_robustness_nn_features) precisely because
+    // pure statistics cannot separate a shifted edge from an unshifted one.
+    //
+    // It is NOT a generally stricter mask. C is near 1 almost everywhere by
+    // construction and by measurement; a model whose mean C is well below 1
+    // has merely rescaled the mask and is a regression, not an improvement.
     bool use_neural_robustness = false;
-
-    // Decision gate on the learned mask: R below this is forced to 0, so the
-    // pixel is not merged at all. Measured on held-out data (2.44M px, 9.17%
-    // harmful), sweeping this threshold trades visible misalignment against
-    // how much of the burst still contributes:
-    //
-    //   gate    visible misalignment admitted    pixels merged
-    //   0.900                          3.63%            82.6%
-    //   0.950                          1.79%            76.0%
-    //   0.980                          0.49%            63.4%
-    //   0.989                          0.10%            52.8%   <- default
-    //   0.999                          0.00%             5.3%
-    //
-    // 0.989 is chosen deliberately. Strict zero is not worth buying: it
-    // collapses to 6% merged, which is essentially just the reference frame
-    // with no multi-frame benefit. The curve is very steep just below it, so
-    // one-in-a-thousand visible misalignment still keeps half the burst. For
-    // scale, the analytic mask at its own R>=0.5 cut admits 41.4% of visible
-    // misalignments while merging 92.2%, so this is roughly a 400x reduction
-    // in visible misalignment for about half the merged pixels.
-    //
-    // "Visible" is the operative word. Two photometrically indistinguishable
-    // regions merged together produce no artefact anyone can see, so driving
-    // VISIBLE acceptance to near zero is far cheaper than driving all harm to
-    // zero: 0.10% visible costs 52.8% merged, while 0.01% of all harm costs
-    // 5.3%. Ten times the retained benefit for a difference you cannot see.
-    f32 rob_nn_gate = 0.989f;
 
     // Write the learned mask alongside the output for inspection. Off by
     // default: it is a full extra plane per comparison frame.
