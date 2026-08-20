@@ -174,7 +174,7 @@ struct TuningParams: Equatable, Codable {
     var save_nn_rob_mask: Bool = false
     /// Deterministic geometric/shape multiply on the analytic mask.
     var robustness_shape_check_enabled: Bool = true
-    var shape_use_flow_geometry: Bool = false
+    var shape_use_flow_geometry: Bool = true
     var save_shape_rob_mask: Bool = false
     var robustness_raw_resolution_enabled: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++

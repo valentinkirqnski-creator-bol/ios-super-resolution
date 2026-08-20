@@ -2098,14 +2098,27 @@ static Image compute_shape_confidence(const Image& R_normal,
                 const f32 gx_c = 0.5f * (c_xp - c_xm);
                 const f32 gy_c = 0.5f * (c_yp - c_ym);
                 const f32 mag_c = std::sqrt(gx_c * gx_c + gy_c * gy_c);
-                // Weak warped gradient: photometric residual must carry the
-                // case; do not invent a gradient mismatch from noise.
-                if (mag_c / sigma_floor > 0.5f * min_edge) {
+                const f32 edge_c = mag_c / sigma_floor;
+                // Critical case the first version missed: ref has a real edge
+                // but the flow samples past it, so the warped patch is flat.
+                // Cosine is undefined/noise there; treating "weak warped grad"
+                // as "no gradient cue" left evidence = photo * 0 = 0, so C
+                // stayed 1 on exactly the camouflaged misalignment we want.
+                // A strong ref edge that disappears after the warp IS the
+                // structural failure signal.
+                if (edge_c > 0.5f * min_edge) {
                     const f32 denom = std::max(mag_r * mag_c, 1e-20f);
                     const f32 cos_sim = clampf((gx_r * gx_c + gy_r * gy_c) / denom,
                                                -1.f, 1.f);
-                    // High cosine -> good; low cosine -> bad.
                     bad_grad = shape_soft01(cos_hi - cos_sim, 0.f, cos_hi - cos_lo);
+                    // Magnitude collapse even with similar direction (phase
+                    // slip along a long edge).
+                    const f32 mag_ratio = mag_c / std::max(mag_r, 1e-20f);
+                    const f32 bad_mag = shape_soft01(1.f - mag_ratio, 0.35f, 0.85f);
+                    bad_grad = std::max(bad_grad, bad_mag);
+                } else {
+                    // Ref edge present, warped almost flat after this flow.
+                    bad_grad = shape_soft01(edge_snr - edge_c, 1.0f, min_edge);
                 }
             }
 
@@ -2118,9 +2131,8 @@ static Image compute_shape_confidence(const Image& R_normal,
                     bad_flow = shape_soft01(flow_resid[pidx], flow_lo, flow_hi);
             }
 
-            // Strong penalty only from combined evidence. Photometric alone
-            // is never enough (aligned noise); geometry/grad alone is never
-            // enough (rotation / weak texture).
+            // Photometric excess on textured content, times a structural /
+            // geometric disagreement. Missing-edge counts as structural.
             f32 struct_cue = bad_grad;
             if (use_flow)
                 struct_cue = std::max(bad_grad, bad_flow);

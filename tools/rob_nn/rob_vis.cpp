@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     work.r_t = cfg.r_t; work.r_s1 = cfg.r_s1; work.r_s2 = cfg.r_s2;
     work.use_neural_robustness = true;           // fills nn_luma
     work.robustness_shape_check_enabled = true;  // dump C_shape vs R_normal
-    work.shape_use_flow_geometry = false;        // structural-only first
+    work.shape_use_flow_geometry = true;         // rotation-safe flow cue on
     const int ts = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
 
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);

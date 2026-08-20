@@ -671,8 +671,8 @@ struct Config {
     // Noise-normalized mean |ref - warped| over a 3x3 guide window. Below
     // shape_resid_lo the photometric cue is silent; above shape_resid_hi it
     // is fully suspicious. Units: multiples of guide-luma sigma.
-    float shape_resid_lo = 3.0f;
-    float shape_resid_hi = 8.0f;
+    float shape_resid_lo = 2.5f;
+    float shape_resid_hi = 7.0f;
     // Gradient direction agreement (cosine). Cosine above shape_grad_cos_hi
     // is a clean match; below shape_grad_cos_lo is a mismatch. Soft between.
     float shape_grad_cos_lo = 0.0f;
@@ -685,8 +685,9 @@ struct Config {
     // Optional second cue: |tile flow - local 3x3 median flow| in RAW px.
     // Smooth camera rotation keeps this near 0; a wrong lock does not.
     // Never sufficient alone -- multiplied with the photometric cue.
-    // Off by default; enable only if the structural check alone is weak.
-    bool  shape_use_flow_geometry = false;
+    // On by default: catches wrong locks whose residual stays low but the
+    // tile disagrees with the smooth local motion field (rotation-safe).
+    bool  shape_use_flow_geometry = true;
     float shape_flow_resid_lo = 1.5f;
     float shape_flow_resid_hi = 5.0f;
     // Write C_shape alongside the output for inspection.
