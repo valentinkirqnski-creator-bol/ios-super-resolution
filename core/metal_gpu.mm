@@ -1677,7 +1677,6 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.sharp_resample = cfg.mask_sharp_resample ? 1u : 0u;
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;

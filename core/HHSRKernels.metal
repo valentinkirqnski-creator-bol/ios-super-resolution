@@ -1847,11 +1847,11 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
                 float d_t = diff_curve[id];
                 float sigma_p_sq = ref_vars[o];
                 sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-                float comp = p.sharp_resample != 0u
-                    ? rob_sample_catrom_or_inf(comp_means, p.h, p.w, p.nch,
-                                               sample_y, sample_x, ch)
-                    : rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
-                                                 sample_y, sample_x, ch);
+                // Bilinear on purpose: this is rob_tile_residual_high's own
+                // statistic, not Eq. 6's d, and the CPU tile-residual path was
+                // not switched. Making them differ would diverge CPU from GPU.
+                float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
+                                                        sample_y, sample_x, ch);
                 float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
                 float d_p_sq = d_p_ * d_p_;
                 float shrink = d_p_sq / (d_p_sq + d_t * d_t);
