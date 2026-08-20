@@ -1,0 +1,43 @@
+burst7 retrain: helps a lot against the asymmetric model, and is a WASH against
+the symmetric one once misalignment is matched.
+
+All numbers on the corrected index (the previous split leaked -- see 3785b40 --
+so earlier figures are not comparable).
+
+AT THE FIXED 0.989 GATE
+                 visible FA    safe kept        burst7 static kept
+                 (bursts1-6)   @<=0.1%FA     flat  moderate  detailed
+  symmetric          0.27%       41.1%      69.4%    39.1%     8.3%
+  asymmetric         1.39%        1.9%      92.2%    79.4%    48.1%
+  asym + burst7      1.14%       37.7%      97.4%    94.3%    47.3%
+
+Against the ASYMMETRIC model, burst7 is a clear win: static retention rises
+across every band and safe retention at a matched budget goes 1.9% -> 37.7%.
+
+But that comparison flatters it, because visible false-acceptance differs.
+Matched instead to the symmetric model's own misalignment rate:
+
+  new model gated at 0.99820 -> visible FA 0.247% (symmetric 0.265% at 0.989)
+     safe kept, bursts1-6      61.5%   vs  58.5%    +3.0  better
+     burst7 static, flat       61.4%   vs  69.4%    -8.0  worse
+     burst7 static, moderate   29.5%   vs  39.1%    -9.6  worse
+     burst7 static, detailed   10.3%   vs   8.3%    +2.0  better
+     burst7 static, ALL        44.7%   vs  52.7%    -8.0  worse
+
+So the apparent static win at a FIXED gate was mostly the gate being looser in
+practice for the new model. At matched misalignment the curve did not lift: it
+moved along, which is the same failure the temperature table established as
+the standard to beat, and it does not beat it.
+
+The one genuine gain is exactly where burst7 was aimed -- DETAILED static
+content, 8.3% -> 10.3% at matched misalignment. That is the aliasing case, and
+it moved in the right direction, but 10.3% retention is still poor: nine out of
+ten provably-safe detailed pixels are still discarded.
+
+READ TOGETHER WITH THE ABLATION (aliasing_diag.txt): the model decides with
+channel 13, log(d^2/sigma^2), which cannot separate aliasing from
+misalignment, and ignores channel 15, the flow residual, which can. Adding
+counter-examples did not make it switch which evidence it uses. That points at
+the objective or the features rather than at the data, and is the next thing
+to change -- e.g. denying it channel 13/14 outright, so it is forced onto the
+geometric evidence, and measuring what that costs.
