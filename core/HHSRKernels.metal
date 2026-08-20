@@ -1513,6 +1513,8 @@ struct RobMaskParams {
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint sharp_resample;  // 1 = Catmull-Rom instead of bilinear (was _pad1)
+    uint s_bilinear;      // 1 = interpolate Eq. 8's prior between tile centres
+    uint _pad2;           // keep 16-byte alignment for setBytes
 };
 
 inline float dogson_quadratic(float x) {
@@ -1595,6 +1597,24 @@ inline float rob_sample_bilinear_or_inf(device const float* img,
 // side of Eq. 6's difference only, and bilinear's low-pass removes up to 29%
 // of d on 4-6 guide-px features. Same weights, same clamped 4-tap support,
 // same deliberate absence of overshoot clamping.
+// Bilinear sample of Eq. 8's per-tile prior s between tile centres. Twin of
+// sample_s_bilinear in core/robustness.cpp -- keep them in step. Eq. 8 is a
+// hard s1/s2 switch, a six-fold step in R at s1=2 vs s2=12, and the nearest
+// lookup puts that step on the 16-raw-px alignment grid, which is visible as a
+// tile pattern (worst under rotation, where M crosses Mth along an arc).
+inline float rob_sample_s_bilinear(device const float* S, uint ny, uint nx,
+                                   float tcy, float tcx) {
+    int y0 = int(floor(tcy)), x0 = int(floor(tcx));
+    float ay = tcy - float(y0), ax = tcx - float(x0);
+    int iy0 = clamp(y0, 0, int(ny) - 1), iy1 = clamp(y0 + 1, 0, int(ny) - 1);
+    int ix0 = clamp(x0, 0, int(nx) - 1), ix1 = clamp(x0 + 1, 0, int(nx) - 1);
+    float t = S[uint(iy0) * nx + uint(ix0)] +
+              (S[uint(iy0) * nx + uint(ix1)] - S[uint(iy0) * nx + uint(ix0)]) * ax;
+    float b = S[uint(iy1) * nx + uint(ix0)] +
+              (S[uint(iy1) * nx + uint(ix1)] - S[uint(iy1) * nx + uint(ix0)]) * ax;
+    return t + (b - t) * ay;
+}
+
 inline float rob_catrom_w(float t, int k) {
     float t2 = t * t, t3 = t2 * t;
     if (k == 0) return -0.5f * t3 + t2 - 0.5f * t;
@@ -1956,7 +1976,16 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
     float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
     d_sq_ = d_ms_sq * shrink * shrink;
-    float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
+    float s;
+    if (p.s_bilinear != 0u) {
+        // tile-centre coords: raw position p sits at tile coordinate p/ts - 0.5
+        float sc = (p.bayer != 0u) ? 2.f : 1.f;
+        float tcy = (sc * float(gid.y) + 0.5f * sc) / float(p.tile_size) - 0.5f;
+        float tcx = (sc * float(gid.x) + 0.5f * sc) / float(p.tile_size) - 0.5f;
+        s = rob_sample_s_bilinear(S, p.flow_ny, p.flow_nx, tcy, tcx);
+    } else {
+        s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
+    }
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
     float ratio = (sig > 0.f && isfinite(sig))

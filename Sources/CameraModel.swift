@@ -168,6 +168,9 @@ struct TuningParams: Equatable, Codable {
     /// Evaluate Eq. 5-6 at guide resolution (Wronski's ordering) rather than
     /// per raw pixel from upscaled statistics.
     var rob_R_at_guide_res: Bool = true
+    /// Interpolate Eq. 8's motion prior s between tile centres instead of
+    /// taking the nearest tile's value (removes the visible tile grid).
+    var rob_s_bilinear: Bool = true
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -244,6 +247,7 @@ struct TuningParams: Equatable, Codable {
         case mask_sharp_resample
         case rob_min_raw_radius
         case rob_R_at_guide_res
+        case rob_s_bilinear
         case use_neural_robustness
         case save_nn_rob_mask
         case robustness_shape_check_enabled, shape_use_flow_geometry, save_shape_rob_mask
@@ -321,6 +325,7 @@ struct TuningParams: Equatable, Codable {
         mask_sharp_resample = try c.decodeIfPresent(Bool.self, forKey: .mask_sharp_resample) ?? mask_sharp_resample
         rob_min_raw_radius = try c.decodeIfPresent(Int.self, forKey: .rob_min_raw_radius) ?? rob_min_raw_radius
         rob_R_at_guide_res = try c.decodeIfPresent(Bool.self, forKey: .rob_R_at_guide_res) ?? rob_R_at_guide_res
+        rob_s_bilinear = try c.decodeIfPresent(Bool.self, forKey: .rob_s_bilinear) ?? rob_s_bilinear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         save_nn_rob_mask = try c.decodeIfPresent(Bool.self, forKey: .save_nn_rob_mask) ?? save_nn_rob_mask
@@ -1944,6 +1949,7 @@ final class CameraModel: NSObject, ObservableObject {
             "mask_sharp_resample": NSNumber(value: tuningParams.mask_sharp_resample),
             "rob_min_raw_radius": NSNumber(value: tuningParams.rob_min_raw_radius),
             "rob_R_at_guide_res": NSNumber(value: tuningParams.rob_R_at_guide_res),
+            "rob_s_bilinear": NSNumber(value: tuningParams.rob_s_bilinear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "save_nn_rob_mask": NSNumber(value: tuningParams.save_nn_rob_mask),

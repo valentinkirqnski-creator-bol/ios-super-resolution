@@ -1046,6 +1046,38 @@ static Image local_min_5x5(const Image& R) {
 static Image local_min_5x5_on_guide(const Image& R);
 static Image local_min_raw(const Image& R, int radius, int num_threads);
 
+// Bilinear sample of the per-tile motion prior s (Eq. 8) between tile centres.
+//
+// Eq. 8 is a hard binary switch: s = s1 if M > Mth else s2. With s1 = 2 and
+// s2 = 12 that is a SIX-FOLD jump in R across whatever tile boundary M happens
+// to cross, and the lookup is nearest-tile, so the jump lands exactly on the
+// 16-raw-pixel alignment grid. The result is a visible tile pattern in the
+// mask -- worst under rotation, where M grows smoothly with distance from the
+// rotation centre, so there is a whole arc of tiles sitting on the threshold
+// flipping between the two priors.
+//
+// The flow itself must stay nearest: the mask has to score the correspondence
+// the merge will actually fetch, and the merge fetches per tile. But s is not
+// a correspondence -- it is a scalar confidence prior with no such constraint,
+// and quantising it to the tile grid is what is visible. Interpolating it
+// keeps the same prior in the middle of each tile and blends across the seams.
+//
+// The same defect was already found and fixed on the learned path in 4b8b3d4
+// ("the mask was drawing the tile grid"); this is the analytic twin of it.
+static inline f32 sample_s_bilinear(const std::vector<f32>& S, int ny, int nx,
+                                    f32 tcy, f32 tcx) {
+    const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+    const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+    const int iy0 = cl(y0, ny), iy1 = cl(y0 + 1, ny);
+    const int ix0 = cl(x0, nx), ix1 = cl(x0 + 1, nx);
+    const f32 t = S[(size_t)iy0 * nx + ix0] +
+                  (S[(size_t)iy0 * nx + ix1] - S[(size_t)iy0 * nx + ix0]) * ax;
+    const f32 b = S[(size_t)iy1 * nx + ix0] +
+                  (S[(size_t)iy1 * nx + ix1] - S[(size_t)iy1 * nx + ix0]) * ax;
+    return t + (b - t) * ay;
+}
+
 // 2x upsample of the single-channel mask, guide -> raw. Same half-pixel
 // convention the merge uses to go the other way (rob = (raw - 0.5)/2), so a
 // guide pixel g maps to raw 2g + 0.5 and the two agree on where R sits.
@@ -2009,7 +2041,17 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
             const int new_x = (int)std::lround((f32)x + flow_x);
             const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
-            f32 s = S[pidx];
+            // Tile-centre coordinates: tile t spans raw [t*ts, (t+1)*ts), so a
+            // raw position p sits at tile coordinate p/ts - 0.5.
+            f32 s;
+            if (cfg.rob_s_bilinear) {
+                const f32 scale = (ref_stats.means.c == 3) ? 2.f : 1.f;
+                const f32 tcy = (scale * (f32)y + 0.5f * scale) / (f32)tile_size - 0.5f;
+                const f32 tcx = (scale * (f32)x + 0.5f * scale) / (f32)tile_size - 0.5f;
+                s = sample_s_bilinear(S, flow.ny, flow.nx, tcy, tcx);
+            } else {
+                s = S[pidx];
+            }
             f32 sig = sigma_sq.at(y, x);
             const f32 ratio = (sig > 0.f && std::isfinite(sig))
                 ? d_sq.at(y, x) / sig

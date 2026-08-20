@@ -717,6 +717,12 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Smooth Motion Prior Across Tiles", isOn: $cam.tuningParams.rob_s_bilinear)
+        Text("""
+             Eq. 8 picks the robustness strength s per TILE with a hard switch: s1 if the              local motion span M exceeds Mth, else s2. At s1=2 against s2=12 that is a              SIX-FOLD step in R, and the lookup is nearest-tile, so the step lands exactly              on the 16-raw-pixel alignment grid -- which reads as visible tile squares in              the mask. It is worst under rotation, where M grows smoothly with distance              from the rotation centre and a whole arc of tiles sits on the threshold,              flipping between the two priors.
+             This interpolates s between tile centres instead. Each tile keeps its own              prior at its centre; only the seams blend. The FLOW is deliberately left              nearest -- the mask must score the correspondence the merge will actually              fetch, and the merge fetches per tile -- but s is just a scalar prior, so it              carries no such constraint. A deviation from Eq. 8 as literally written,              which is why it is switchable.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Compute R at Guide Resolution", isOn: $cam.tuningParams.rob_R_at_guide_res)
         Text("""
              Wronski evaluates Eq. 5-6 per pixel of the GUIDE image -- "for every pixel              of the guide image we compute the color mean and spatial standard deviation              in a 3x3 neighborhood", nine samples per Bayer quad. This matches that.

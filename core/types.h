@@ -732,6 +732,24 @@ struct Config {
     // interpolants of the same 3x3 guide means.
     bool rob_R_at_guide_res = true;
 
+    // Interpolate Eq. 8's motion prior s between tile centres instead of
+    // taking the nearest tile's value.
+    //
+    // Eq. 8 is a hard switch -- s = s1 if M > Mth else s2 -- and with s1 = 2
+    // against s2 = 12 that is a SIX-FOLD step in R, landing exactly on the
+    // 16-raw-pixel alignment grid because the lookup is nearest-tile. It shows
+    // up as a visible tile pattern in the mask, worst under rotation, where M
+    // grows smoothly with radius from the rotation centre and a whole arc of
+    // tiles ends up straddling the threshold.
+    //
+    // The FLOW must stay nearest -- the mask has to score the correspondence
+    // the merge will fetch, and the merge fetches per tile. s is not a
+    // correspondence, just a scalar prior, so interpolating it is free of that
+    // constraint: it keeps each tile's prior at the tile centre and blends
+    // across the seams. Deviation from Eq. 8 as literally written, kept
+    // switchable for that reason.
+    bool rob_s_bilinear = true;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

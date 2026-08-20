@@ -1135,8 +1135,13 @@ struct RobMaskParamsCPU {
     // comparison side is resampled, so bilinear's low-pass biased d downward
     // on fine structure; see sample_catrom_or_inf in robustness.cpp.
     uint32_t sharp_resample = 0;
+    // 1 = interpolate Eq. 8's per-tile prior s between tile centres instead of
+    // taking the nearest tile. The nearest lookup puts a six-fold s1/s2 step on
+    // the alignment grid, which reads as a visible tile pattern in the mask.
+    uint32_t s_bilinear = 0;
+    uint32_t _pad2 = 0;   // keep 16-byte alignment for setBytes
 };
-static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1902,6 +1907,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.sharp_resample = cfg.mask_sharp_resample ? 1u : 0u;
+    mp.s_bilinear = cfg.rob_s_bilinear ? 1u : 0u;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;
