@@ -52,16 +52,16 @@ SC = os.path.dirname(os.path.abspath(__file__))
 PREFIX = os.environ.get("ROB_DATA") or (
     sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "robset"))
 
-IN_CH = 18          # see build_robustness_nn_features in core/stages.h
-NCH = 25            # 18 inputs + 7 analysis channels
-CH_HARM, CH_IDEAL_R, CH_FERR, CH_W, CH_REP = 18, 19, 20, 21, 22
+IN_CH = 20          # see build_robustness_nn_features in core/stages.h
+NCH = 27            # 20 inputs + 7 analysis channels
+CH_HARM, CH_IDEAL_R, CH_FERR, CH_W, CH_REP = 20, 21, 22, 23, 24
 # The scene-motion label component, kept separate from the corruption harm so
 # evaluation can report occlusion and disocclusion on their own. CH_OCC is
 # "this frame disagrees with the others here" (background hidden behind a
 # moving object in THIS frame); CH_DIS is "every frame disagrees with the
 # reference here" (the reference is the odd view -- the moving object was
 # there and has since left), which is the one that ghosts a moving subject.
-CH_OCC, CH_DIS = 23, 24
+CH_OCC, CH_DIS = 25, 26
 CH_ANALYTIC_R = 14  # the classical mask's answer, an INPUT, never a target
 
 PATTERNS = ["none", "single", "neighbours", "group_same", "smooth", "abrupt",

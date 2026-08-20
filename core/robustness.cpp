@@ -1291,6 +1291,110 @@ f32 robustness_analytic_R(const f32* ref_mean, const f32* ref_var,
     return std::isfinite(r) ? clampf(r, 0.f, 1.f) : 0.f;
 }
 
+// See stages.h. Two scale-free statistics from the block-matching cost surface
+// around the offset the mask is being asked to judge.
+//
+// A first attempt measured the cost at the chosen offset against a ring 2-3 px
+// away and called that ratio "uniqueness". It was wrong, and the measurement
+// said so immediately: uncorrupted tiles scored 0.09 and corrupted ones 0.78,
+// the opposite of the intent. It was measuring the local STEEPNESS of the cost
+// surface, which is just as large at a wrong offset sitting on a gradient as at
+// a right one, and its exclusion ring hid the true optimum whenever the error
+// was smaller than the ring. Both statistics below are anchored on the MINIMUM
+// over a real search window instead, which is the question that matters.
+//
+//   [0]  log(cost at the chosen offset / best cost anywhere in the window).
+//        0 when the offset being judged IS the best correspondence available,
+//        positive in proportion to how much better something nearby would have
+//        been. This is what detects a misaligned tile.
+//
+//   [1]  log(best rival outside the winner's basin / best cost). How UNIQUE
+//        that best match is: large when the minimum is sharp and isolated,
+//        near 0 when several candidates tie. This is the evidence that does
+//        NOT confuse aliasing with misalignment -- aliasing changes the
+//        residual at the bottom of the cost surface without flattening it, so
+//        a correctly aligned aliased tile keeps a sharp isolated minimum,
+//        while a tile matched onto similar-looking content elsewhere does not.
+//
+// Both are ratios of two costs measured on the same tile, so tile contrast and
+// brightness cancel and no contrast-dependent statistic is reintroduced. Both
+// are floored at the sensor noise, because two costs that are both within the
+// noise are not meaningfully different and without the floor a flat tile
+// manufactures enormous ratios out of nothing.
+std::vector<f32> measure_match_quality(const Image& ref_grey, const Image& comp_grey,
+                                       const FlowField& flow, int tile_size,
+                                       const Config& cfg) {
+    std::vector<f32> out((size_t)flow.ny * flow.nx * 2, 0.f);
+    if (ref_grey.h <= 0 || comp_grey.h <= 0 || tile_size <= 0) return out;
+    // The flow is on a RAW tile grid carrying RAW displacements; the grey is
+    // half resolution under the Bayer quad average.
+    const float g_per_raw = 0.5f;
+    const int tg = std::max(2, (int)std::lround(tile_size * g_per_raw));
+    const int RS = 4;                       // search radius, grey px
+    const int W = 2 * RS + 1;
+    const f32 alpha = cfg.noise_alpha_robustness(), beta = cfg.noise_beta_robustness();
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        std::vector<double> c((size_t)W * W, 1e30);
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const int oy = (int)std::lround(ty * tile_size * g_per_raw);
+            const int ox = (int)std::lround(tx * tile_size * g_per_raw);
+            const float fx = flow.dx(ty, tx) * g_per_raw;
+            const float fy = flow.dy(ty, tx) * g_per_raw;
+            double sr = 0; int nref = 0;
+            std::fill(c.begin(), c.end(), 1e30);
+            for (int ddy = -RS; ddy <= RS; ++ddy)
+                for (int ddx = -RS; ddx <= RS; ++ddx) {
+                    double acc = 0; int n = 0;
+                    for (int i = 0; i < tg; ++i)
+                        for (int j = 0; j < tg; ++j) {
+                            const int ry = oy + i, rx = ox + j;
+                            if (ry < 0 || rx < 0 || ry >= ref_grey.h || rx >= ref_grey.w) continue;
+                            const int my = (int)std::lround(ry + fy) + ddy;
+                            const int mx = (int)std::lround(rx + fx) + ddx;
+                            if (my < 0 || mx < 0 || my >= comp_grey.h || mx >= comp_grey.w) continue;
+                            const f32 r = ref_grey.at(ry, rx);
+                            acc += std::fabs(r - comp_grey.at(my, mx));
+                            if (ddy == 0 && ddx == 0) { sr += r; ++nref; }
+                            ++n;
+                        }
+                    if (n >= 8) c[(size_t)(ddy + RS) * W + (ddx + RS)] = acc / (double)n;
+                }
+            if (nref < 8) continue;
+            const double mean_ref = sr / nref;
+            const double c0 = c[(size_t)RS * W + RS];
+            if (c0 > 1e29) continue;
+            double cmin = 1e30; int by = 0, bx = 0;
+            for (int ddy = -RS; ddy <= RS; ++ddy)
+                for (int ddx = -RS; ddx <= RS; ++ddx) {
+                    const double v = c[(size_t)(ddy + RS) * W + (ddx + RS)];
+                    if (v < cmin) { cmin = v; by = ddy; bx = ddx; }
+                }
+            // Best rival OUTSIDE the winner's basin, so the runner-up is a
+            // genuinely different correspondence rather than the same one a
+            // pixel over.
+            double crival = 1e30;
+            for (int ddy = -RS; ddy <= RS; ++ddy)
+                for (int ddx = -RS; ddx <= RS; ++ddx) {
+                    const int dy2 = ddy - by, dx2 = ddx - bx;
+                    if (dy2 * dy2 + dx2 * dx2 < 4) continue;      // >= 2 px away
+                    crival = std::min(crival, c[(size_t)(ddy + RS) * W + (ddx + RS)]);
+                }
+            const f32 nsig = std::sqrt(std::max(
+                alpha * (f32)std::min(std::max(mean_ref, 0.0), 1.0) + beta, 0.f));
+            const double floor_c = std::max((double)nsig, 1e-7);
+            const double den = std::max(cmin, floor_c);
+            const f32 offby = (f32)std::log(std::max(std::max(c0, floor_c) / den, 1.0));
+            const f32 uniq = (crival < 1e29)
+                ? (f32)std::log(std::max(std::max(crival, floor_c) / den, 1.0)) : 0.f;
+            out[((size_t)ty * flow.nx + tx) * 2 + 0] =
+                std::isfinite(offby) ? std::min(offby, 8.f) : 0.f;
+            out[((size_t)ty * flow.nx + tx) * 2 + 1] =
+                std::isfinite(uniq) ? std::min(uniq, 8.f) : 0.f;
+        }
+    });
+    return out;
+}
+
 void ensure_robustness_nn_ref_hf(RefStats& rs, const Config& cfg) {
     const Image& rm = rs.means;
     if (rs.nn_hf.h == rm.h && rs.nn_hf.w == rm.w && !rs.nn_hf.data.empty()) return;
@@ -1330,7 +1434,8 @@ void ensure_robustness_nn_ref_hf(RefStats& rs, const Config& cfg) {
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0, bool raw_res,
-                                   int rows, bool planar) {
+                                   int rows, bool planar,
+                                   const std::vector<f32>* match_q) {
     const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
     const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
     if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
@@ -1350,6 +1455,8 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     // Channel 17's cache. Built once per burst by ensure_robustness_nn_ref_hf;
     // at raw resolution there is no cached plane, so the channel is zero there
     // (the raw-res path is off by default and was never trained with it).
+    const bool have_mq = match_q &&
+                         match_q->size() >= (size_t)flow.ny * flow.nx * 2;
     const Image* hf_plane = &ref_stats.nn_hf;
     const bool have_hf = !raw_res && hf_plane->h == rm.h && hf_plane->w == rm.w &&
                          hf_plane->data.size() >= (size_t)rm.h * rm.w;
@@ -1568,6 +1675,22 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
             // only on the reference, and a 5x5 box over 3 channels inside this
             // loop would cost 75 reads/px on every comparison frame.
             o[17 * oc] = have_hf ? hf_plane->at(y, x) : 0.f;
+
+            // Channels 18-19: was this tile's match UNIQUE. Bilinear across
+            // tile centres like the other per-tile quantities, so the mask
+            // does not draw the tile grid.
+            if (have_mq) {
+                auto mq = [&](int t, int x2, int k) {
+                    return (*match_q)[((size_t)t * tnx + x2) * 2 + k];
+                };
+                o[18 * oc] = bilerp(mq(iy0, ix0, 0), mq(iy0, ix1, 0),
+                                    mq(iy1, ix0, 0), mq(iy1, ix1, 0));
+                o[19 * oc] = bilerp(mq(iy0, ix0, 1), mq(iy0, ix1, 1),
+                                    mq(iy1, ix0, 1), mq(iy1, ix1, 1));
+            } else {
+                o[18 * oc] = 0.f;
+                o[19 * oc] = 0.f;
+            }
         }
     });
     return feat;

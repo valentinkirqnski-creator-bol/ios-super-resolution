@@ -418,9 +418,9 @@ int main(int argc, char** argv) {
     const float band_bias[3] = {0.0f, 0.35f, -0.30f};   // toward larger/smaller errors
     const float density[3]   = {0.28f, 0.16f, 0.42f};   // fraction of tiles hit
 
-    const int NCH = 25;   // 18 inputs + 7 analysis channels
-    const int CH_HARM = 18, CH_RIDEAL = 19, CH_FERR = 20, CH_W = 21, CH_REP = 22;
-    const int CH_OCC = 23, CH_DIS = 24;
+    const int NCH = 27;   // 20 inputs + 7 analysis channels
+    const int CH_HARM = 20, CH_RIDEAL = 21, CH_FERR = 22, CH_W = 23, CH_REP = 24;
+    const int CH_OCC = 25, CH_DIS = 26;
 
     const std::string bin_path = out_prefix + ".f32";
     FILE* fout = std::fopen(bin_path.c_str(), append ? "ab" : "wb");
@@ -871,6 +871,16 @@ int main(int argc, char** argv) {
             Image comp_means, comp_vars;
             local_stats(comp_guide, comp_means, comp_vars, work.num_threads);
 
+            // Match quality for channels 18-19, measured on the greys at THIS
+            // exposure. It is a property of how well the correspondence was
+            // determined, so it is measured against the frames the mask will
+            // actually see, not against the native-exposure pair the flow was
+            // established from.
+            Image refg_x = compute_grey(ref, work.bayer_mode, work.grey_method);
+            Image compg_x = compute_grey(comp, work.bayer_mode, work.grey_method);
+            const std::vector<float> match_q_base =
+                measure_match_quality(refg_x, compg_x, flow0, ts, work);
+
             for (int vi = 0; vi < variants; ++vi) {
                 const uint32_t seed = seed0 + (uint32_t)(burst_id * 1000003 + refi * 10007
                                                        + ci * 101 + vi) * 2654435761u;
@@ -1147,9 +1157,18 @@ int main(int argc, char** argv) {
                 // Built once per VARIANT. It depends only on the corrupted flow,
                 // so building it inside the crop loop (as this first did)
                 // recomputed a whole 3 MP plane once per crop.
+                // Measured against the CORRUPTED flow, not the baseline. Match
+                // quality is a statement about the offset the mask is being
+                // asked to judge; measuring it at the true offset would hand
+                // the network the answer and it would score wonderfully here
+                // and be useless in the app.
+                const std::vector<float> mq =
+                    (pat == P_NONE) ? match_q_base
+                                    : measure_match_quality(refg_x, compg_x, fest, ts, work);
                 Image feat = build_robustness_nn_features(rs, comp_means, fest, ts,
                                                           work, 0, /*raw_res=*/false,
-                                                          /*rows=*/gh);
+                                                          /*rows=*/gh, /*planar=*/false,
+                                                          &mq);
                 if (feat.h != gh || feat.c != kRobustnessNnChannels) {
                     std::printf("  feature builder returned %dx%dx%d, expected %dx%dx%d\n",
                                 feat.h, feat.w, feat.c, gh, gw, kRobustnessNnChannels);

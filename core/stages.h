@@ -163,6 +163,19 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 //   16    the neighbourhood max of channel 15 -- the local roughness scale to
 //         judge 15 against, so a big residual amid real parallax reads
 //         differently from the same residual in a smoothly-flowing region.
+//   18    log(cost at the chosen offset / best cost in the search window).
+//         0 when the offset being judged IS the best correspondence
+//         available, positive in proportion to how much better something
+//         nearby would have been. This is what detects a misaligned tile.
+//   19    log(best rival outside the winner's basin / best cost) -- how
+//         UNIQUE that match is. This is the evidence that does not confuse
+//         aliasing with misalignment: aliasing changes the residual at the
+//         bottom of the cost surface without flattening it, so a correctly
+//         aligned aliased tile keeps a sharp isolated minimum, while a tile
+//         matched onto similar-looking content elsewhere does not.
+//         Both are ratios of two costs on the same tile, so contrast and
+//         brightness cancel; both are floored at the sensor noise, since two
+//         costs within the noise are not meaningfully different.
 //   17    reference local high-frequency energy (3x3 means against their own
 //         5x5 box average). Says how FINE the structure is, which is what
 //         decides whether a subpixel error costs anything; neither the mean
@@ -225,11 +238,31 @@ void ensure_robustness_nn_ref_hf(RefStats& ref_stats, const Config& cfg);
 // per frame at guide resolution, comparable to building the features at all.
 // A planar result is a flat buffer of c*h*w floats; Image::at() does NOT
 // address it correctly and must not be used on it.
+// match_q: optional per-tile match quality, 2 floats per tile (uniqueness,
+// normalised cost) laid out [ny][nx][2] on the SAME grid as `flow`. Channels
+// 18-19 are zero when it is null, which is what the analytic path and any
+// caller that has not measured it will pass.
 Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
                                    const FlowField& flow, int tile_size,
                                    const Config& cfg, int y0,
                                    bool raw_res = false, int rows = 0,
-                                   bool planar = false);
+                                   bool planar = false,
+                                   const std::vector<f32>* match_q = nullptr);
+
+// Per-tile match quality for the learned mask's channels 18-19, measured on
+// the same grey images the aligner searched. Returns 2 floats per tile on
+// `flow`'s grid: log(best competing cost / chosen cost), and the chosen cost
+// normalised by tile contrast and noise.
+//
+// Recomputed here rather than carried out of align.cpp: the aligner tracks
+// second_dist at every pyramid level and in two different search routines,
+// and threading a continuous value through all of their upsample and
+// fallback paths is a large change to make before knowing the statistic
+// helps. Same information, one place, and it can be moved into the search
+// later if it earns its keep.
+std::vector<f32> measure_match_quality(const Image& ref_grey, const Image& comp_grey,
+                                       const FlowField& flow, int tile_size,
+                                       const Config& cfg);
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,

@@ -31,7 +31,7 @@ using f32 = float;
 // the pipeline silently uses the analytic mask, so a rebuild after changing
 // this number looks like "the learned mask changed nothing". Changing it
 // means re-running train_rob.py AND export_coreml.py.
-inline constexpr int kRobustnessNnChannels = 18;
+inline constexpr int kRobustnessNnChannels = 20;
 
 // The learned mask runs in horizontal strips to bound peak memory (see
 // build_robustness_nn_features). kRobustnessNnHalo is the network's exact
