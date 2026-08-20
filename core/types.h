@@ -717,6 +717,21 @@ struct Config {
     // its native 5x5, which is already Wronski's own lattice.
     int rob_min_raw_radius = 4;
 
+    // Where Eq. 5-6 are EVALUATED when the raw-resolution mask is on.
+    // true  - at guide resolution, as Wronski does ("for every pixel of the
+    //         guide image ... 3x3 neighborhood"), then the mask is upsampled
+    //         and Eq. 9's minimum is applied on the raw grid.
+    // false - the statistics are Dodgson-upscaled first and Eq. 5-6 are
+    //         evaluated per raw pixel.
+    // These differ because Eq. 5-6 are nonlinear, so upsample-then-evaluate is
+    // not evaluate-then-upsample. Evaluating at raw resolution costs 4x the
+    // noise-curve lookups, max, shrinkage and exp, and buys a sharper
+    // transition -- sharper only because a steep nonlinearity applied after
+    // interpolation rises faster, not because anything new was measured. No
+    // measurement exists between guide and raw: the upscaled statistics are
+    // interpolants of the same 3x3 guide means.
+    bool rob_R_at_guide_res = true;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

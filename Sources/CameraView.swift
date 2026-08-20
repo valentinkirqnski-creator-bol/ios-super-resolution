@@ -717,6 +717,13 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Compute R at Guide Resolution", isOn: $cam.tuningParams.rob_R_at_guide_res)
+        Text("""
+             Wronski evaluates Eq. 5-6 per pixel of the GUIDE image -- "for every pixel              of the guide image we compute the color mean and spatial standard deviation              in a 3x3 neighborhood", nine samples per Bayer quad. This matches that.
+             Off instead Dodgson-upscales the statistics to raw and evaluates Eq. 5-6 per              raw pixel. The two differ because Eq. 5-6 are nonlinear, so upsample-then-             evaluate is not evaluate-then-upsample. Evaluating at raw costs 4x the              noise-curve lookups, max, Wiener shrinkage and exp per frame, and buys only a              sharper transition -- sharper because a steep nonlinearity applied after              interpolation rises faster, not because anything new was measured. No              measurement exists between guide and raw: the upscaled statistics are              interpolants of the same 3x3 guide means.
+             On the Metal path this makes the full-resolution mask setting fall through to              the guide-resolution kernel, which is where R belongs.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         HStack {
             Text("Eq. 9 Min Radius (raw px)")
             Spacer()

@@ -1747,7 +1747,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // guide-resolution maps, mirroring compute_robustness_raw_res); only the
     // aperture/tile-residual rejection is not, so that flag alone still
     // falls back to the guide-resolution path below.
+    // rob_R_at_guide_res also disqualifies the raw-res GPU path: that kernel's
+    // whole purpose is to evaluate Eq. 5-6 per raw pixel from upscaled
+    // statistics, which is the ordering being switched away from. Falling
+    // through evaluates R at guide resolution, where Wronski evaluates it.
     if (cfg.robustness_raw_resolution_active() &&
+        !cfg.rob_R_at_guide_res &&
         !cfg.flow_reject_1d_enabled) {
         Image raw_res = compute_robustness_metal_raw_res_impl(comp_raw, flow, tile_size,
                                                                cfg, s_select_out);

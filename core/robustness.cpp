@@ -1046,6 +1046,32 @@ static Image local_min_5x5(const Image& R) {
 static Image local_min_5x5_on_guide(const Image& R);
 static Image local_min_raw(const Image& R, int radius, int num_threads);
 
+// 2x upsample of the single-channel mask, guide -> raw. Same half-pixel
+// convention the merge uses to go the other way (rob = (raw - 0.5)/2), so a
+// guide pixel g maps to raw 2g + 0.5 and the two agree on where R sits.
+static Image upscale_R_2x(const Image& R, int num_threads) {
+    if (R.h <= 0 || R.w <= 0) return R;
+    Image out(R.h * 2, R.w * 2, 1);
+    parallel_rows(out.h, num_threads, [&](int y) {
+        const f32 sy = ((f32)y + 0.5f) * 0.5f - 0.5f;
+        const int y0 = (int)std::floor(sy);
+        const f32 ay = sy - (f32)y0;
+        const int yy0 = std::min(std::max(y0, 0), R.h - 1);
+        const int yy1 = std::min(std::max(y0 + 1, 0), R.h - 1);
+        for (int x = 0; x < out.w; ++x) {
+            const f32 sx = ((f32)x + 0.5f) * 0.5f - 0.5f;
+            const int x0 = (int)std::floor(sx);
+            const f32 ax = sx - (f32)x0;
+            const int xx0 = std::min(std::max(x0, 0), R.w - 1);
+            const int xx1 = std::min(std::max(x0 + 1, 0), R.w - 1);
+            const f32 t = R.at(yy0, xx0) + (R.at(yy0, xx1) - R.at(yy0, xx0)) * ax;
+            const f32 b = R.at(yy1, xx0) + (R.at(yy1, xx1) - R.at(yy1, xx0)) * ax;
+            out.at(y, x) = t + (b - t) * ay;
+        }
+    });
+    return out;
+}
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
     // The learned correction AND the deterministic shape check both need the
@@ -1107,6 +1133,36 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // guide pixel for that one lookup. Neither that nor motion_edge_rejection_
 // enabled are the common case this toggle is meant for; both stay correct,
 // just at their existing granularity rather than the new one.
+// R at GUIDE resolution, then upsampled -- Wronski's ordering.
+//
+// Eq. 5-6 are nonlinear in the statistics, so upsample-then-evaluate is not
+// the same as evaluate-then-upsample. The paper computes R per guide pixel
+// ("for every pixel of the guide image... 3x3 neighborhood", nine samples per
+// Bayer quad) and never evaluates it anywhere else. Evaluating at raw
+// resolution instead costs 4x the noise-curve lookups, max, Wiener shrinkage
+// and exp, and buys only a sharper transition -- sharper because a steep
+// nonlinearity applied after interpolation rises faster, not because any new
+// measurement entered. Nothing is measured between guide and raw; the
+// statistics are Dodgson interpolants of the same 3x3 means.
+//
+// Eq. 9 still runs at raw resolution, so the rejection boundary keeps
+// raw-pixel placement. That part is real: the min window slides one raw pixel
+// per output instead of two.
+static Image compute_robustness_R_at_guide(const Image& comp_raw, const RefStats& ref_stats,
+                                           const FlowField& flow, int tile_size,
+                                           const Config& cfg, Image* s_select_out) {
+    Image s_guide;
+    Image Rg = compute_robustness_analytic(comp_raw, ref_stats, flow, tile_size, cfg,
+                                           s_select_out ? &s_guide : nullptr,
+                                           /*skip_final_min=*/true);
+    if (Rg.h <= 0 || Rg.w <= 0) return Image();
+    Image Rr = upscale_R_2x(Rg, cfg.num_threads);
+    const int r = cfg.rob_min_raw_radius > 0 ? cfg.rob_min_raw_radius : 4;
+    Rr = local_min_raw(Rr, r, cfg.num_threads);
+    if (s_select_out && s_guide.h > 0) *s_select_out = upscale_R_2x(s_guide, cfg.num_threads);
+    return Rr;
+}
+
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
                                         const FlowField& flow, int tile_size,
                                         const Config& cfg, Image* s_select_out) {
@@ -1825,7 +1881,7 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
 
 Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_stats,
                                   const FlowField& flow, int tile_size, const Config& cfg,
-                                  Image* s_select_out) {
+                                  Image* s_select_out, bool skip_final_min) {
     if (!cfg.robustness_enabled) {
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
@@ -1854,8 +1910,11 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
     return Image();
 #else
     if (cfg.robustness_raw_resolution_active()) {
-        Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
-                                                    cfg, s_select_out);
+        Image raw_res = cfg.rob_R_at_guide_res
+            ? compute_robustness_R_at_guide(comp_raw, ref_stats, flow, tile_size,
+                                            cfg, s_select_out)
+            : compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
+                                         cfg, s_select_out);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
         // Falls through to the guide-resolution path below if the hires ref
         // stats weren't populated (e.g. robustness was off when the burst

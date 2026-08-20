@@ -318,9 +318,12 @@ Image guide_luma(const Image& guide);
 // so the learned correction multiplies a value it cannot alter, and so
 // tools/rob_nn can write the same R_normal into the training set that the app
 // multiplies at inference.
+// skip_final_min returns R before Eq. 9's 5x5 minimum, so a caller that wants
+// to apply the morphology at a different resolution can do so itself.
 Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_stats,
                                   const FlowField& flow, int tile_size,
-                                  const Config& cfg, Image* s_select_out = nullptr);
+                                  const Config& cfg, Image* s_select_out = nullptr,
+                                  bool skip_final_min = false);
 
 // R_final. The analytic mask above, optionally multiplied by deterministic
 // shape confidence C_shape and/or learned C_nn (both in [0,1], multiply-only).

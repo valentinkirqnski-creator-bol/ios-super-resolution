@@ -419,6 +419,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.mask_sharp_resample = tuning[@"mask_sharp_resample"].boolValue;
     if (tuning[@"rob_min_raw_radius"])
         cfg.rob_min_raw_radius = tuning[@"rob_min_raw_radius"].intValue;
+    if (tuning[@"rob_R_at_guide_res"])
+        cfg.rob_R_at_guide_res = tuning[@"rob_R_at_guide_res"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])
