@@ -379,6 +379,20 @@ int main(int argc, char** argv) {
     if (const char* v = std::getenv("ROB_REFS")) n_refs = std::atoi(v);
     if (const char* v = std::getenv("ROB_SEED")) seed0 = (uint32_t)std::atoi(v);
     if (const char* v = std::getenv("ROB_APPEND")) append = std::atoi(v) != 0;
+    // A STATIC burst is a source of hard POSITIVES that cannot be synthesised
+    // convincingly: real hand tremor means each frame samples the scene on a
+    // slightly different lattice, so perfectly aligned frames still differ --
+    // and those differences are the super-resolution signal, not a defect.
+    // Measured, the mask rejects 17-50% of DETAILED pixels on such a burst
+    // where nothing whatever is misaligned, because it decides with
+    // log(d^2/sigma^2) (channel 13), which cannot tell aliasing from
+    // misalignment. Feeding it real aliasing labelled R = 1.0, concentrated
+    // where aliasing is strongest, is the direct counter-example.
+    //
+    // ROB_STATIC leaves the flow completely alone and aims every crop at the
+    // most detailed tiles instead of at corrupted ones.
+    bool static_mode = false;
+    if (const char* v = std::getenv("ROB_STATIC")) static_mode = std::atoi(v) != 0;
 
     // Hard-example mining feeds a pattern histogram back in: the ids listed are
     // drawn far more often than the rest, so a retrain concentrates on the
@@ -422,7 +436,23 @@ int main(int argc, char** argv) {
     cfg.num_threads = 0;
     cfg.alignment_tile_size = 16;
 
+    // Record ids must be GLOBAL, not per-invocation. They restarted at 0 on
+    // every append, so with six bursts appended in turn the same id appeared
+    // six times, several index rows pointed at one data row, and the trainer
+    // -- which reshapes the blob and indexes it by this id -- paired features
+    // from one record with metadata from another. That silently scrambled the
+    // per-burst and per-pattern breakouts AND leaked data across the
+    // train/eval split, since one data row could be reached from both sides.
     size_t total_records = 0;
+    if (append) {
+        if (FILE* xf = std::fopen((out_prefix + ".idx").c_str(), "r")) {
+            int ch;
+            while ((ch = std::fgetc(xf)) != EOF)
+                if (ch == 10) ++total_records;
+            std::fclose(xf);
+            std::printf("appending after %zu existing records\n", total_records);
+        }
+    }
     int gh_all = 0, gw_all = 0;
 
     const int nf = (int)files.size();
@@ -849,7 +879,11 @@ int main(int argc, char** argv) {
                 std::uniform_real_distribution<float> u11(-1.f, 1.f);
 
                 int pat;
-                if (vi == 0 || (vi % 4) == 2) {
+                if (static_mode) {
+                    // Every variant uncorrupted: the whole point is that the
+                    // flow here is RIGHT and the frames still differ.
+                    pat = P_NONE;
+                } else if (vi == 0 || (vi % 4) == 2) {
                     // Every (ref, comp) pair contributes one completely
                     // uncorrupted variant. This is the whole point of the new
                     // strategy: real imagery, real handheld motion including
@@ -1136,6 +1170,37 @@ int main(int argc, char** argv) {
                 // then centred there. This changes only WHICH pixels are
                 // looked at, never what they are labelled.
                 std::vector<int> hit_tiles;
+                if (static_mode) {
+                    // Aim at the tiles with the most structure relative to the
+                    // noise floor. Those carry the largest aliasing differences
+                    // and are exactly where the model is currently wrong; a
+                    // uniformly-placed crop would spend most of its area on
+                    // flat sky, which the model already handles.
+                    for (int t = 0; t < TNY; ++t)
+                        for (int s = 0; s < TNX; ++s) {
+                            if (tile_valid[(size_t)t * TNX + s] <= 0.f) continue;
+                            const int gy0 = (t * ts) / 2, gx0 = (s * ts) / 2;
+                            double sacc = 0, nacc = 0; int cnt = 0;
+                            for (int i = 1; i < ts / 2; i += 2)
+                                for (int j = 1; j < ts / 2; j += 2) {
+                                    const int y = std::min(gy0 + i, gh - 1);
+                                    const int x = std::min(gx0 + j, gw - 1);
+                                    double sv = 0;
+                                    for (int cc = 0; cc < 3; ++cc)
+                                        sv += std::sqrt(std::max(rs.stds.at(y, x, cc), 0.f));
+                                    sacc += sv / 3.0;
+                                    double br = 0;
+                                    for (int cc = 0; cc < 3; ++cc) br += ref_means.at(y, x, cc);
+                                    br = std::min(std::max(br / 3.0, 0.0), 1.0);
+                                    const double nv2 = (double)work.noise_alpha_robustness() * br
+                                                     + (double)work.noise_beta_robustness();
+                                    nacc += std::sqrt(nv2 > 0.0 ? nv2 : 0.0);
+                                    ++cnt;
+                                }
+                            if (cnt && nacc > 0 && (sacc / nacc) >= 2.0)
+                                hit_tiles.push_back(t * TNX + s);
+                        }
+                } else
                 for (int t = 0; t < TNY; ++t)
                     for (int s = 0; s < TNX; ++s) {
                         if (tile_valid[(size_t)t * TNX + s] <= 0.f) continue;
