@@ -717,6 +717,13 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Eq. 9 Local Minimum (5x5)", isOn: $cam.tuningParams.rob_eq9_min_enabled)
+        Text("""
+             Off. Wronski takes a minimum confidence over a 5x5 window "to improve the              robustness estimation in the case of misalignment in regions with high signal              variance (like an edge on top of another one)": if any pixel in the              neighbourhood fires, the minimum propagates that rejection across the region.
+             That only helps when something fires. Measured here on a coherently shifted              fine texture -- 4 raw pixels of misalignment, pixels differing by 8x the noise              floor -- 0% of pixels fell below R = 0.1, so the minimum had nothing to              spread and R stayed at 0.99.
+             The cost is unconditional: a 5x5 window on the guide grid is a 10x10-RAW              footprint, so every rejection is dilated over about 100 raw pixels and drags              surrounding good pixels down with it. That is the blockiness in the mask, and              the discarded pixels return as noise, being frames not averaged. Turn on to              restore the paper's behaviour.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Smooth Motion Prior Across Tiles", isOn: $cam.tuningParams.rob_s_bilinear)
         Text("""
              Eq. 8 picks the robustness strength s per TILE with a hard switch: s1 if the              local motion span M exceeds Mth, else s2. At s1=2 against s2=12 that is a              SIX-FOLD step in R, and the lookup is nearest-tile, so the step lands exactly              on the 16-raw-pixel alignment grid -- which reads as visible tile squares in              the mask. It is worst under rotation, where M grows smoothly with distance              from the rotation centre and a whole arc of tiles sits on the threshold,              flipping between the two priors.

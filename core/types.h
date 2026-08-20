@@ -750,6 +750,25 @@ struct Config {
     // switchable for that reason.
     bool rob_s_bilinear = true;
 
+    // Eq. 9, the 5x5 local minimum. OFF.
+    //
+    // Its stated purpose is to catch "misalignment in regions with high signal
+    // variance (like an edge on top of another one)": if any pixel in the
+    // neighbourhood fires, the minimum propagates that rejection across the
+    // region. That only works when SOMETHING fires. Measured on a coherently
+    // shifted fine texture -- a 4 raw-pixel misalignment, pixels differing by
+    // 8x the noise floor -- 0% of pixels fell below R = 0.1, so the minimum had
+    // nothing to spread and R stayed at 0.99.
+    //
+    // What it does cost is unconditional: it is a morphological erosion with a
+    // 10x10-raw footprint, so every rejection is dilated over ~100 raw pixels
+    // and takes surrounding good pixels with it. That is the blockiness in the
+    // mask, and those discarded pixels come back as noise because they are
+    // frames not averaged.
+    //
+    // Removed rather than deleted: set true to restore Wronski's behaviour.
+    bool rob_eq9_min_enabled = false;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

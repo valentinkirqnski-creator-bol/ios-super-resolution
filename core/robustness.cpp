@@ -1189,8 +1189,10 @@ static Image compute_robustness_R_at_guide(const Image& comp_raw, const RefStats
                                            /*skip_final_min=*/true);
     if (Rg.h <= 0 || Rg.w <= 0) return Image();
     Image Rr = upscale_R_2x(Rg, cfg.num_threads);
-    const int r = cfg.rob_min_raw_radius > 0 ? cfg.rob_min_raw_radius : 4;
-    Rr = local_min_raw(Rr, r, cfg.num_threads);
+    if (cfg.rob_eq9_min_enabled) {
+        const int r = cfg.rob_min_raw_radius > 0 ? cfg.rob_min_raw_radius : 4;
+        Rr = local_min_raw(Rr, r, cfg.num_threads);
+    }
     if (s_select_out && s_guide.h > 0) *s_select_out = upscale_R_2x(s_guide, cfg.num_threads);
     return Rr;
 }
@@ -1336,6 +1338,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // keeps the paper's physical support without quantising the boundary back
     // to the guide lattice; otherwise Wronski's own lattice (2x2 min-reduce to
     // guide, 5x5 min there, nearest-upsample back).
+    if (!cfg.rob_eq9_min_enabled) return R;
     if (cfg.rob_min_raw_radius > 0)
         return local_min_raw(R, cfg.rob_min_raw_radius, cfg.num_threads);
     return local_min_5x5_on_guide(R);
@@ -2120,6 +2123,7 @@ Image compute_robustness_analytic(const Image& comp_raw, const RefStats& ref_sta
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
+    if (!cfg.rob_eq9_min_enabled) return R;
     return local_min_5x5(R);
 #endif
 }

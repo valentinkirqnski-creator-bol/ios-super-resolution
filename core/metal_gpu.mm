@@ -1952,13 +1952,19 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     sp.h = (uint32_t)gh;
     sp.w = (uint32_t)gw;
     sp.nch = 1u;
-    enc = [cmd computeCommandEncoder];
-    if (!enc) return Image();
-    [enc setBuffer:b_out offset:0 atIndex:0];
-    [enc setBuffer:b_R offset:0 atIndex:1];
-    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
-    dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
-    [enc endEncoding];
+    // Eq. 9 is off by default -- see Config::rob_eq9_min_enabled. When it is,
+    // the erosion pass is skipped entirely and the mask is read straight from
+    // rob_make_mask's buffer rather than round-tripping through b_out.
+    id<MTLBuffer> b_mask = cfg.rob_eq9_min_enabled ? b_out : b_R;
+    if (cfg.rob_eq9_min_enabled) {
+        enc = [cmd computeCommandEncoder];
+        if (!enc) return Image();
+        [enc setBuffer:b_out offset:0 atIndex:0];
+        [enc setBuffer:b_R offset:0 atIndex:1];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+        dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
+        [enc endEncoding];
+    }
 
     prof_tag_gpu(cmd, "robustness:all");
     [cmd commit];
@@ -1966,7 +1972,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
     Image r(gh, gw, 1);
-    memcpy(r.data.data(), [b_out contents], mask_b);
+    memcpy(r.data.data(), [b_mask contents], mask_b);
     // Taken from rob_make_mask's output, not rob_local_min_5x5's: the selector
     // is a per-pixel record of which prior was applied, and eroding it would
     // smear the boundary between the two regions.
