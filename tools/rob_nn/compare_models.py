@@ -22,7 +22,7 @@ mis = [r for r in ev if r["burst"] != 7]
 sta = [r for r in ev if r["burst"] == 7]
 print(f"eval: {len(mis)} records from bursts 1-6, {len(sta)} from burst7 (static)\n")
 
-def gather(rs, model, mu, sd):
+def gather(rs, model, mu, sd, drop=()):
     L, I, D = [], [], []
     for r in rs:
         a = np.asarray(data[r["rec"]], dtype=np.float32)
@@ -30,7 +30,10 @@ def gather(rs, model, mu, sd):
         if not w.any():
             continue
         with torch.no_grad():
-            x = torch.from_numpy(((a[..., :IN_CH] - mu) / sd)).permute(2, 0, 1)[None]
+            xn = ((a[..., :IN_CH] - mu) / sd)
+            for c in drop:
+                xn[..., c] = 0.0
+            x = torch.from_numpy(xn).permute(2, 0, 1)[None]
             p = model(x)[0, 0].numpy()
         L.append(p[w]); I.append(a[..., CH_IDEAL_R][w])
         D.append((a[..., 3:6].mean(-1) / np.maximum(a[..., 12], 1e-9))[w])
@@ -46,7 +49,8 @@ for name, path in (("symmetric", "robnet_symmetric.pt"),
     ck = torch.load(p, weights_only=False, map_location="cpu")
     m = RobNet(); m.load_state_dict(ck["state"]); m.eval()
     mu, sd = ck["mu"], ck["sd"]
-    L, I, _ = gather(mis, m, mu, sd)
+    drop = ck.get("drop_ch", [])
+    L, I, _ = gather(mis, m, mu, sd, drop)
     vis = I < 0.1
     safe = I > 0.999
     fa_at_gate = (L[vis] >= 0.989).mean() * 100
@@ -55,7 +59,7 @@ for name, path in (("symmetric", "robnet_symmetric.pt"),
     for t in np.linspace(0.0, 0.99999, 5000):
         if (L[vis] >= t).mean() * 100 <= 0.1:
             t_hit = t; keep = (L[safe] >= t).mean() * 100; break
-    SL, SI, SD = gather(sta, m, mu, sd)
+    SL, SI, SD = gather(sta, m, mu, sd, drop)
     b = {}
     for nm, msk in (("flat", SD < 1.0), ("moderate", (SD >= 1.0) & (SD < 2.5)),
                     ("detailed", SD >= 2.5)):

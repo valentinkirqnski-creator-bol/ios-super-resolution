@@ -10,14 +10,17 @@ _, ev, _ = split_records(recs)
 ev = ev[:: max(1, len(ev) // 260)]
 mis = [r for r in ev if r["burst"] != 7]
 sta = [r for r in ev if r["burst"] == 7]
-def gather(rs, m, mu, sd):
+def gather(rs, m, mu, sd, drop=()):
     L, I, D = [], [], []
     for r in rs:
         a = np.asarray(data[r["rec"]], dtype=np.float32)
         w = a[..., CH_W] > 0
         if not w.any(): continue
         with torch.no_grad():
-            x = torch.from_numpy(((a[..., :IN_CH] - mu) / sd)).permute(2, 0, 1)[None]
+            xn = ((a[..., :IN_CH] - mu) / sd)
+            for c in drop:
+                xn[..., c] = 0.0
+            x = torch.from_numpy(xn).permute(2, 0, 1)[None]
             p = m(x)[0, 0].numpy()
         L.append(p[w]); I.append(a[..., CH_IDEAL_R][w])
         D.append((a[..., 3:6].mean(-1) / np.maximum(a[..., 12], 1e-9))[w])
@@ -25,7 +28,7 @@ def gather(rs, m, mu, sd):
 def load(p):
     ck = torch.load(p, weights_only=False, map_location="cpu")
     m = RobNet(); m.load_state_dict(ck["state"]); m.eval()
-    return m, ck["mu"], ck["sd"]
+    return m, ck["mu"], ck["sd"], ck.get("drop_ch", [])
 here = os.path.dirname(os.path.abspath(__file__))
 sym = load(os.path.join(here, "robnet_symmetric.pt"))
 new = load(os.environ["ROB_NEW"])

@@ -1,0 +1,37 @@
+Removing channels 13-14 does not lift the curve. It collapses the model.
+
+Matched to the symmetric baseline's own misalignment rate, corrected index:
+
+                              safe kept   burst7 static kept
+                              bursts1-6   flat  moderate detailed  ALL
+  symmetric @0.989               58.5%   69.4%    39.1%     8.3%  52.7%
+  no ch13/14 @0.99890             7.2%   12.4%     2.9%     0.1%   7.6%
+
+Every column falls, and by a lot. Detailed-static retention -- the aliasing
+case this was aimed at -- goes to 0.1%, i.e. essentially everything is
+rejected.
+
+So the ablation was read the wrong way round, and it is worth being explicit
+about the mistake. Zeroing channel 13 collapsed detailed R from 0.731 to
+0.325, which I took as "the model leans on a blind statistic". The correct
+reading is that channel 13 carries most of the usable signal there is: remove
+it and almost nothing is left to decide with. A large ablation delta means a
+channel is LOAD-BEARING; it does not say whether what it bears is right.
+
+The prior is not a harmful shortcut. It is the evidence.
+
+What this does establish is where the real constraint sits. Channel 15, the
+flow residual against the local 3x3 median, was supposed to be the geometric
+evidence that separates aliasing from misalignment, and ablating it changes
+nothing (+0.0075). That is not because the model ignores good evidence out of
+laziness -- it is because on these bursts the flow field is genuinely rough:
+measured earlier, the local flow span M has a median of 11-27 RAW PIXELS and
+deviation from a global affine model runs to 5-20 px and is CORRECT, being
+real parallax from handheld translation over a scene with depth. A residual
+that large and that legitimate carries little signal about whether any
+particular tile is wrong.
+
+So the binding constraint is the geometric FEATURES, not the photometric prior
+and not parameter count. Separating aliasing from misalignment needs evidence
+that says where the flow is wrong, and the current flow-consistency channels
+cannot say it on a scene with real parallax.

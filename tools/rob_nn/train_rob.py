@@ -223,6 +223,33 @@ def main():
     nparam = sum(p.numel() for p in model.parameters())
     print(f"model: {nparam} parameters")
 
+    # ROB_DROP_CH removes input channels by zeroing them AFTER normalisation,
+    # which is exactly equivalent to deleting them: the first 1x1 conv then
+    # receives a constant 0 on those lanes and their weights cannot influence
+    # anything. Done this way so the experiment needs no dataset regeneration
+    # and no change to the port's channel contract until something is decided.
+    #
+    # The channels under suspicion are 13 (log d^2/sigma^2) and 14 (the
+    # analytic R). Both are built from a colour difference between 3x3 local
+    # means, which carries NO geometric information, so neither can separate
+    # aliasing -- the signal this pipeline exploits -- from misalignment. The
+    # ablation showed the model leaning on exactly those and ignoring the flow
+    # residual in channel 15 that could tell them apart.
+    #
+    # ROB_NOISE_CH keeps them but corrupts them during training, which
+    # distinguishes "the prior is harmful" from "the prior is a shortcut the
+    # optimiser takes because it is cheap and available".
+    def _chlist(name):
+        v = os.environ.get(name, "")
+        return [int(t) for t in v.split(",") if t.strip() != ""]
+    drop_ch = _chlist("ROB_DROP_CH")
+    noise_ch = _chlist("ROB_NOISE_CH")
+    noise_sd = float(os.environ.get("ROB_NOISE_SD", 1.0))
+    if drop_ch:
+        print(f"dropping input channels {drop_ch}")
+    if noise_ch:
+        print(f"noising input channels {noise_ch} with sd {noise_sd}")
+
     ps = int(os.environ.get("ROB_PATCH", min(96, gh, gw)))
     bs = int(os.environ.get("ROB_BATCH", 24))
     steps = int(os.environ.get("ROB_STEPS", 3000))
@@ -242,7 +269,12 @@ def main():
             ys.append(p[..., CH_IDEAL_R:CH_IDEAL_R + 1])
             ws.append(p[..., CH_W:CH_W + 1])
         t = lambda a: torch.from_numpy(np.stack(a)).permute(0, 3, 1, 2)
-        return t(xs), t(ys), t(ws)
+        x, y, w = t(xs), t(ys), t(ws)
+        for c in drop_ch:
+            x[:, c] = 0.0
+        for c in noise_ch:
+            x[:, c] = x[:, c] + torch.randn_like(x[:, c]) * noise_sd
+        return x, y, w
 
     bce = nn.BCEWithLogitsLoss(reduction="none")
 
@@ -313,8 +345,12 @@ def main():
             print(f"  step {it:5d}  loss {loss.item():.5f}")
 
     ckpt_path = os.environ.get("ROB_OUT", os.path.join(SC, "robnet.pt"))
+    # drop_ch travels WITH the weights. If evaluation forgot to apply it the
+    # model would be fed a channel it never trained on, which looks like a
+    # mysterious accuracy collapse rather than a harness mistake.
     torch.save({"state": model.state_dict(), "mu": mu, "sd": sd,
-                "in_ch": IN_CH, "holdout_burst": holdout_burst}, ckpt_path)
+                "in_ch": IN_CH, "holdout_burst": holdout_burst,
+                "drop_ch": drop_ch}, ckpt_path)
     with open(os.path.splitext(ckpt_path)[0] + "_norm.json", "w") as f:
         json.dump({"mu": mu.tolist(), "sd": sd.tolist(), "in_ch": IN_CH}, f)
     print("\nsaved", ckpt_path)
