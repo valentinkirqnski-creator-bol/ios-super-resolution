@@ -95,6 +95,49 @@ struct FlowField {
     inline f32& dy(int ty, int tx) { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
     inline f32 dx(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 0]; }
     inline f32 dy(int ty, int tx) const { return flow[((size_t)ty * nx + tx) * 2 + 1]; }
+
+    // Bilinear sample of the displacement at a RAW pixel position.
+    //
+    // Block matching yields ONE vector per tile, so consuming it nearest makes
+    // the warp piecewise constant: v(x,y) = v_ij across each tile, jumping at
+    // every boundary. For pure translation that is exact -- every tile carries
+    // the same vector, so there is nothing to jump. For ROTATION it is not:
+    // the true field varies continuously with position, and a per-tile
+    // constant is a staircase approximation to it, with a step of about
+    // theta * tile_size at every seam.
+    //
+    // Those steps are sub-pixel for modest rotation (0.28 raw px at 1 degree
+    // on a 16-px tile) and therefore nearly invisible to Eq. 6, whose 3x3
+    // guide means average over 6x6 raw pixels. But the eye detects
+    // DISCONTINUITY far more readily than magnitude, so a sub-pixel error that
+    // flips at every 16-pixel boundary reads as a grid while the same error
+    // spread smoothly would not be seen at all. That asymmetry is why the
+    // artifact is simultaneously below the mask's threshold and above the
+    // viewer's.
+    //
+    // Tile t spans raw [t*ts, (t+1)*ts) so its CENTRE is at (t + 0.5)*ts;
+    // hence a raw position p sits at tile coordinate p/ts - 0.5.
+    //
+    // Every consumer must use this or none of them: the mask has to score the
+    // correspondence the merge actually fetches, so an interpolated merge with
+    // a nearest mask would grade a fetch nobody performs.
+    inline void sample_bilinear(f32 raw_y, f32 raw_x, int tile_size,
+                                f32& out_dx, f32& out_dy) const {
+        if (ny <= 0 || nx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
+        const f32 tcy = raw_y / (f32)tile_size - 0.5f;
+        const f32 tcx = raw_x / (f32)tile_size - 0.5f;
+        const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+        const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+        const int iy0 = cl(y0, ny), iy1 = cl(y0 + 1, ny);
+        const int ix0 = cl(x0, nx), ix1 = cl(x0 + 1, nx);
+        const f32 tx0 = dx(iy0, ix0) + (dx(iy0, ix1) - dx(iy0, ix0)) * ax;
+        const f32 bx0 = dx(iy1, ix0) + (dx(iy1, ix1) - dx(iy1, ix0)) * ax;
+        const f32 ty0 = dy(iy0, ix0) + (dy(iy0, ix1) - dy(iy0, ix0)) * ax;
+        const f32 by0 = dy(iy1, ix0) + (dy(iy1, ix1) - dy(iy1, ix0)) * ax;
+        out_dx = tx0 + (bx0 - tx0) * ay;
+        out_dy = ty0 + (by0 - ty0) * ay;
+    }
     inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t& ambiguous(int ty, int tx) { return match_ambiguous[(size_t)ty * nx + tx]; }
@@ -652,6 +695,15 @@ struct Config {
     // Off by default: changes which flow gets computed for every ambiguous
     // tile at every level, on CPU and Metal -- A/B against the default
     // before adopting.
+    // Sample the per-tile flow BILINEARLY between tile centres wherever it is
+    // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
+    // mask -- instead of taking the containing tile's vector. Removes the
+    // piecewise-constant staircase that rotation turns into a visible tile
+    // grid. See FlowField::sample_bilinear for why rotation and not
+    // translation. All consumers switch together or the mask would grade a
+    // correspondence the merge never fetches.
+    bool  flow_bilinear_sampling = true;
+
     bool  align_ambiguous_fallback_enabled = false;
 
     // Test switch from the aperture experiments: force merge robustness to zero

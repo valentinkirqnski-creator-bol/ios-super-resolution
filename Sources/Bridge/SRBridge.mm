@@ -415,6 +415,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
         cfg.debug_noise_model_disabled = tuning[@"debug_noise_model_disabled"].boolValue;
+    if (tuning[@"flow_bilinear_sampling"])
+        cfg.flow_bilinear_sampling = tuning[@"flow_bilinear_sampling"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])

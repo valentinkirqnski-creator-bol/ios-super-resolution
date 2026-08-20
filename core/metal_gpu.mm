@@ -1131,7 +1131,10 @@ struct RobMaskParamsCPU {
     float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
     uint32_t save_s_select = 0;  // 1 = also emit the per-pixel s1/s2 selector
     uint32_t ambiguous_enabled = 0;  // 1 = demote tiles with an ambiguous match
-    uint32_t _pad1 = 0;
+    // 1 = sample the per-tile flow bilinearly between tile centres (was
+    // _pad1). Must match the merge's setting: the mask has to score the
+    // correspondence the merge actually fetches.
+    uint32_t flow_bilinear = 0;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
@@ -1674,6 +1677,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
+    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
@@ -1893,6 +1897,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
+    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;
@@ -2968,7 +2973,8 @@ struct MergeCompParamsCPU {
     // 1 = robustness is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
-    uint32_t _pad1 = 0, _pad2 = 0, _pad3 = 0;
+    uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
+    uint32_t _pad2 = 0, _pad3 = 0;
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -3643,6 +3649,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // not from the config flag -- the raw-res path can silently fall back to
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
+    p.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

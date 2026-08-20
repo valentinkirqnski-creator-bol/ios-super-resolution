@@ -703,7 +703,7 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
 
 static Image upscale_warp_stats(const Image& guide_stats,
                                 bool is_ref, const FlowField* flow, int tile_size,
-                                int num_threads) {
+                                int num_threads, bool bilinear_flow) {
     const int nc = guide_stats.c;
     // Match Python upscale_warp_stats sizing: 3ch -> 2x, else same size
     const int out_h = (nc == 3) ? guide_stats.h * 2 : guide_stats.h;
@@ -717,13 +717,18 @@ static Image upscale_warp_stats(const Image& guide_stats,
             f32 flow_x = 0.f, flow_y = 0.f;
             if (!is_ref && flow && tile_size > 0 && flow->ny > 0 && flow->nx > 0 &&
                 !flow->flow.empty()) {
-                // Python: patch_idy = int(y // tile_size)  (no clamp)
-                int patch_idy = y / tile_size;
-                int patch_idx = x / tile_size;
-                if (patch_idy >= 0 && patch_idy < flow->ny &&
-                    patch_idx >= 0 && patch_idx < flow->nx) {
-                    flow_x = flow->dx(patch_idy, patch_idx);
-                    flow_y = flow->dy(patch_idy, patch_idx);
+                // y, x are RAW here, so sample_bilinear takes them directly.
+                if (bilinear_flow) {
+                    flow->sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
+                } else {
+                    // Python: patch_idy = int(y // tile_size)  (no clamp)
+                    int patch_idy = y / tile_size;
+                    int patch_idx = x / tile_size;
+                    if (patch_idy >= 0 && patch_idy < flow->ny &&
+                        patch_idx >= 0 && patch_idx < flow->nx) {
+                        flow_x = flow->dx(patch_idy, patch_idx);
+                        flow_y = flow->dy(patch_idy, patch_idx);
+                    }
                 }
             }
             f32 LR_y = (y + flow_y + 0.5f) / s - 0.5f;
@@ -990,9 +995,11 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // never warps the reference's own stats -- only Gn's). Once per
         // burst here, not once per comparison frame.
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
-                                            0, cfg.num_threads);
+                                            0, cfg.num_threads,
+                                            cfg.flow_bilinear_sampling);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
-                                           0, cfg.num_threads);
+                                           0, cfg.num_threads,
+                                           cfg.flow_bilinear_sampling);
     }
     return st;
 #endif
@@ -1055,7 +1062,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
-                                        tile_size, cfg.num_threads);
+                                        tile_size, cfg.num_threads,
+                                        cfg.flow_bilinear_sampling);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -1373,7 +1381,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 // Dodgson upscale + flow warp into the reference frame, the
                 // same transform the analytic raw-res path applies.
                 Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
-                                                 tile_size, cfg.num_threads);
+                                                 tile_size, cfg.num_threads,
+                                                 cfg.flow_bilinear_sampling);
                 cm_nn = std::move(hires);
             }
         }
@@ -1450,16 +1459,30 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
             int patch_idy = 0, patch_idx = 0;
+            // Same sampling as the merge, deliberately: the mask must score
+            // the correspondence the merge will actually fetch.
             if (d_p.c == 1) {
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
-                flow_x = flow.dx(patch_idy, patch_idx);
-                flow_y = flow.dy(patch_idy, patch_idx);
+                if (cfg.flow_bilinear_sampling)
+                    flow.sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
+                else {
+                    flow_x = flow.dx(patch_idy, patch_idx);
+                    flow_y = flow.dy(patch_idy, patch_idx);
+                }
             } else {
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
-                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                if (cfg.flow_bilinear_sampling) {
+                    // guide pixel -> its raw centre, then raw px -> guide px
+                    f32 rdx, rdy;
+                    flow.sample_bilinear(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
+                                         tile_size, rdx, rdy);
+                    flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+                } else {
+                    flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                    flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                }
             }
 
             const f32 sample_x = (f32)x + flow_x;
@@ -1504,8 +1527,16 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
             }
+            // Same sampling as the merge and Eq. 6's d.
             f32 flow_x = 0.f, flow_y = 0.f;
-            if (ref_stats.means.c == 3) {
+            if (cfg.flow_bilinear_sampling) {
+                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
+                f32 rdx, rdy;
+                flow.sample_bilinear(sc * (f32)y + 0.5f * (sc - 1.f),
+                                     sc * (f32)x + 0.5f * (sc - 1.f),
+                                     tile_size, rdx, rdy);
+                flow_x = rdx / sc; flow_y = rdy / sc;
+            } else if (ref_stats.means.c == 3) {
                 flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
                 flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
             } else {

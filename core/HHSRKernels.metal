@@ -857,7 +857,7 @@ struct MergeCompParams {
     // robustness_raw_resolution_active), not guide -- skip the guide-scale
     // conversion below (was _pad0).
     uint raw_res_robustness;
-    uint _pad1;
+    uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint _pad2;
     uint _pad3;
 };
@@ -994,6 +994,30 @@ inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
     return int(p.cfa11);
 }
 
+// Bilinear sample of the per-tile flow at a RAW position. Twin of
+// FlowField::sample_bilinear in core/types.h -- keep them in step. Block
+// matching gives one vector per tile; consuming it nearest makes the warp
+// piecewise constant, which rotation turns into a visible tile grid because
+// the true field varies continuously with position. Tile t spans raw
+// [t*ts,(t+1)*ts) so its centre is (t+0.5)*ts, hence tile coord = p/ts - 0.5.
+inline void flow_sample_bilinear(device const float* flow, uint fny, uint fnx,
+                                 float raw_y, float raw_x, float ts,
+                                 thread float& odx, thread float& ody) {
+    float tcy = raw_y / ts - 0.5f, tcx = raw_x / ts - 0.5f;
+    int y0 = int(floor(tcy)), x0 = int(floor(tcx));
+    float ay = tcy - float(y0), ax = tcx - float(x0);
+    int iy0 = clamp(y0, 0, int(fny) - 1), iy1 = clamp(y0 + 1, 0, int(fny) - 1);
+    int ix0 = clamp(x0, 0, int(fnx) - 1), ix1 = clamp(x0 + 1, 0, int(fnx) - 1);
+    uint i00 = (uint(iy0) * fnx + uint(ix0)) * 2u, i01 = (uint(iy0) * fnx + uint(ix1)) * 2u;
+    uint i10 = (uint(iy1) * fnx + uint(ix0)) * 2u, i11 = (uint(iy1) * fnx + uint(ix1)) * 2u;
+    float tx = flow[i00 + 0u] + (flow[i01 + 0u] - flow[i00 + 0u]) * ax;
+    float bx = flow[i10 + 0u] + (flow[i11 + 0u] - flow[i10 + 0u]) * ax;
+    float ty = flow[i00 + 1u] + (flow[i01 + 1u] - flow[i00 + 1u]) * ax;
+    float by = flow[i10 + 1u] + (flow[i11 + 1u] - flow[i10 + 1u]) * ax;
+    odx = tx + (bx - tx) * ay;
+    ody = ty + (by - ty) * ay;
+}
+
 inline float sample_robustness_bilinear(device const float* robustness,
                                         uint h, uint w,
                                         float y, float x) {
@@ -1040,8 +1064,14 @@ static inline void merge_comp_contrib(device const float* img,
     // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
     int px = int(lr_x / float(p.tile_size));
     int py = int(lr_y / float(p.tile_size));
-    float flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
-    float flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
+    float flowx, flowy;
+    if (p.flow_bilinear != 0u) {
+        flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
+                             float(p.tile_size), flowx, flowy);
+    } else {
+        flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
+        flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
+    }
 
     // p.raw_res_robustness: robustness is raw resolution this run (Config::
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
@@ -1512,7 +1542,7 @@ struct RobMaskParams {
     float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
-    uint _pad1;
+    uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
 };
 
 inline float dogson_quadratic(float x) {
@@ -1853,18 +1883,34 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     int patch_idx;
     float flow_x;
     float flow_y;
+    // Same sampling as the merge kernel: the mask must score the
+    // correspondence the merge will actually fetch.
     if (p.nch == 1u) {
         patch_idy = int(gid.y) / int(p.tile_size);
         patch_idx = int(gid.x) / int(p.tile_size);
-        uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
-        flow_x = flow[fi + 0u];
-        flow_y = flow[fi + 1u];
+        if (p.flow_bilinear != 0u) {
+            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(gid.y),
+                                 float(gid.x), float(p.tile_size), flow_x, flow_y);
+        } else {
+            uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
+            flow_x = flow[fi + 0u];
+            flow_y = flow[fi + 1u];
+        }
     } else {
         patch_idy = int((2.f * float(gid.y) + 0.5f) / float(p.tile_size));
         patch_idx = int((2.f * float(gid.x) + 0.5f) / float(p.tile_size));
-        uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
-        flow_x = 0.5f * flow[fi + 0u];
-        flow_y = 0.5f * flow[fi + 1u];
+        if (p.flow_bilinear != 0u) {
+            float rdx, rdy;
+            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx,
+                                 2.f * float(gid.y) + 0.5f,
+                                 2.f * float(gid.x) + 0.5f,
+                                 float(p.tile_size), rdx, rdy);
+            flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+        } else {
+            uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
+            flow_x = 0.5f * flow[fi + 0u];
+            flow_y = 0.5f * flow[fi + 1u];
+        }
     }
     float sample_x = float(gid.x) + flow_x;
     float sample_y = float(gid.y) + flow_y;
