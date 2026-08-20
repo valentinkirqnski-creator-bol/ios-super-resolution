@@ -30,11 +30,11 @@ def load(p):
     m = RobNet(); m.load_state_dict(ck["state"]); m.eval()
     return m, ck["mu"], ck["sd"], ck.get("drop_ch", [])
 here = os.path.dirname(os.path.abspath(__file__))
-sym = load(os.path.join(here, "robnet_symmetric.pt"))
+sym = load(os.environ.get("ROB_BASE", os.path.join(here, "robnet_symmetric.pt")))
 new = load(os.environ["ROB_NEW"])
 Ls, Is, _ = gather(mis, *sym)
 TARGET = (Ls[Is < 0.1] >= 0.989).mean() * 100
-print(f"symmetric model's visible false-acceptance at gate 0.989: {TARGET:.3f}%")
+print(f"BASELINE visible false-acceptance at gate 0.989: {TARGET:.3f}%")
 Ln, In, _ = gather(mis, *new)
 vis = In < 0.1; safe = In > 0.999
 g = None
@@ -44,11 +44,11 @@ for t in np.linspace(0.0, 0.999999, 20000):
 print(f"gate on the new model that matches it:               {g:.5f}")
 print(f"  new model visible FA there:  {(Ln[vis] >= g).mean()*100:.3f}%")
 print(f"  safe pixels kept (bursts1-6): {(Ln[safe] >= g).mean()*100:.1f}%  "
-      f"(symmetric at 0.989: {(Ls[Is>0.999] >= 0.989).mean()*100:.1f}%)")
+      f"(baseline at 0.989: {(Ls[Is>0.999] >= 0.989).mean()*100:.1f}%)")
 SLn, _, SDn = gather(sta, *new)
 SLs, _, SDs = gather(sta, *sym)
 print(f"\nburst7 STATIC retention (all pixels safe), fraction clearing the gate:")
-print(f"  {'region':>10} {'symmetric@0.989':>16} {'new@%.5f' % g:>16}")
+print(f"  {'region':>10} {'baseline@0.989':>16} {'new@%.5f' % g:>16}")
 for nm, lo, hi in (("flat", 0, 1.0), ("moderate", 1.0, 2.5), ("detailed", 2.5, 1e9)):
     ms, mn = (SDs >= lo) & (SDs < hi), (SDn >= lo) & (SDn < hi)
     if ms.sum() < 500: continue

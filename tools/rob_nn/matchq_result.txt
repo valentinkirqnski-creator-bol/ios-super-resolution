@@ -1,0 +1,49 @@
+Match quality LIFTS the curve. First genuine lift in this effort.
+
+Controlled comparison: same 4270-record dataset, same asymmetric margin loss,
+same architecture, same training schedule. The ONLY difference is whether
+channels 18-19 are visible (the control has them zeroed via ROB_DROP_CH, which
+is exactly equivalent to their not existing). Both models swept to the SAME
+visible-false-acceptance budget, so neither is judged at an operating point
+that flatters it.
+
+ budget            model     gate  safe kept  b7 flat  b7 mod  b7 detail  b7 ALL
+  1.00%  no match-quality  0.98450     85.0%    97.6%   90.5%      36.3%   89.6%
+  1.00%      with ch18-19  0.40345     94.7%    99.4%   97.9%      72.2%   96.6%
+
+  0.50%  no match-quality  0.99708     80.8%    95.8%   83.2%      19.5%   84.2%
+  0.50%      with ch18-19  0.94899     92.8%    99.0%   96.3%      64.3%   95.0%
+
+  0.25%  no match-quality  0.99850     74.2%    92.0%   66.4%       5.7%   74.1%
+  0.25%      with ch18-19  0.99125     91.1%    98.6%   94.8%      57.8%   93.7%
+
+  0.10%  no match-quality  0.99917     56.5%    66.1%   26.8%       0.8%   44.1%
+  0.10%      with ch18-19  0.99825     86.3%    97.2%   88.3%      28.3%   87.8%
+
+Every column, at every budget. Not a re-parameterisation.
+
+THE COLUMN THAT WAS STUCK. Detailed-static retention read 8.3 / 10.3 / 8.9 /
+0.1 across a symmetric loss, an asymmetric margin loss, 1728 records of real
+static aliasing, a degraded prior and no prior at all -- invariant to
+everything tried. With match quality it reads 28.3% at the strictest budget
+and 57.8-72.2% at the looser ones. The elimination was right: the constraint
+was the FEATURES, and this is the missing evidence.
+
+WHY IT WORKS, which is the part worth keeping. Aliasing changes the residual
+at the BOTTOM of the block-matching cost surface without flattening it, so a
+correctly aligned but heavily aliased tile still has a sharp, isolated
+minimum. A tile matched onto similar-looking content elsewhere does not. The
+photometric channels see only the residual and therefore cannot separate those
+two cases at all; the cost-surface SHAPE separates them directly. That is why
+this succeeded where more data, a different prior and a different loss all
+failed.
+
+Note also the gate values. The match-quality model reaches the 1% budget at a
+gate of 0.40 rather than 0.98, i.e. it is no longer relying on the extreme top
+of its range to be safe. That is a healthier operating point and it means the
+mask's mid-range is now carrying real information.
+
+CAVEAT ON ABSOLUTE NUMBERS. This dataset is 4270 records with burst7 at 27% of
+it, against the earlier 9148 with burst7 at 19%, so the absolute figures are
+not comparable with anything reported before the index fix. The controlled
+comparison above is, because both arms share the dataset exactly.
