@@ -745,7 +745,7 @@ struct CameraView: View {
             .font(.caption2).foregroundColor(.secondary)
         if cam.tuningParams.robustness_shape_check_enabled {
             Toggle("Shape: Use Flow Geometry", isOn: $cam.tuningParams.shape_use_flow_geometry)
-            Text("Also require disagreement with the local 3x3-median flow (rotation-safe). Off keeps the structural check alone.")
+            Text("Also require disagreement with the local 3x3-median flow (rotation-safe). On by default.")
                 .font(.caption2).foregroundColor(.secondary)
             Toggle("Save Shape Confidence Mask", isOn: $cam.tuningParams.save_shape_rob_mask)
         }
