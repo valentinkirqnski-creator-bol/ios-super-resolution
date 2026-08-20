@@ -35,3 +35,42 @@ So the binding constraint is the geometric FEATURES, not the photometric prior
 and not parameter count. Separating aliasing from misalignment needs evidence
 that says where the flow is wrong, and the current flow-consistency channels
 cannot say it on a scene with real parallax.
+
+THE INTERMEDIATE, which distinguishes "harmful prior" from "shortcut the
+optimiser takes because it is cheap": keep channels 13-14 but corrupt them
+with Gaussian noise (sd 1.5 in normalised units) during training, forcing the
+model to build a decision that cannot rely on them.
+
+  all matched to the symmetric baseline's misalignment rate (~0.25% visible FA)
+
+                            safe kept   burst7 static kept
+                            bursts1-6   flat  moderate detailed   ALL
+  symmetric      @0.98900     58.5%    69.4%    39.1%     8.3%   52.7%
+  asym+burst7    @0.99820     61.5%    61.4%    29.5%    10.3%   44.7%
+  noisy ch13/14  @0.99815     37.7%    37.3%    14.2%     8.9%   25.8%
+  no ch13/14     @0.99890      7.2%    12.4%     2.9%     0.1%    7.6%
+
+Degrading the prior degrades the model smoothly and monotonically: full prior
+> noised prior > no prior. If it were a shortcut, denying it would have pushed
+the model onto better evidence and recovered; instead there is no better
+evidence to be pushed onto. That settles it -- the prior is load-bearing, not
+a crutch.
+
+THE COLUMN THAT MATTERS MOST is detailed-static retention, the aliasing case:
+8.3%, 10.3%, 8.9%, 0.1%. Across a symmetric loss, an asymmetric margin loss,
+1728 records of real static aliasing, a corrupted prior and no prior at all,
+it does not move above ~10%. Nine of ten provably-safe detailed pixels are
+discarded no matter what is changed about the prior, the objective or the
+data.
+
+That is the signature of a FEATURE limitation, and it is consistent with the
+one measurement that explains it: the geometric channels cannot indicate which
+tile is wrong on a scene with real parallax, because the honest flow field is
+itself rough to 11-27 raw px locally and 5-20 px against a global model.
+
+To move that column, the mask needs geometric evidence it does not currently
+have -- a residual measured against a LOCAL motion model rather than a median,
+or a match-quality statistic carried out of the aligner (the block-matching
+cost of the chosen offset against the runner-up, which is already computed and
+thrown away, and which says directly whether a tile's match was unique).
+Nothing about the loss or the prior will substitute for it.
