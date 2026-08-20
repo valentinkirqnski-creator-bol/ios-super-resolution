@@ -174,6 +174,9 @@ struct TuningParams: Equatable, Codable {
     /// Eq. 9's 5x5 local minimum. Off: it dilates every rejection over a
     /// 10x10-raw footprint and cannot spread a detection that never fired.
     var rob_eq9_min_enabled: Bool = false
+    /// Drive the merge kernel's anisotropy continuously from the structure
+    /// tensor, as the paper describes, instead of a hard switch at 0.9025.
+    var kernel_anisotropy_continuous: Bool = true
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -252,6 +255,7 @@ struct TuningParams: Equatable, Codable {
         case rob_R_at_guide_res
         case rob_s_bilinear
         case rob_eq9_min_enabled
+        case kernel_anisotropy_continuous
         case use_neural_robustness
         case save_nn_rob_mask
         case robustness_shape_check_enabled, shape_use_flow_geometry, save_shape_rob_mask
@@ -331,6 +335,7 @@ struct TuningParams: Equatable, Codable {
         rob_R_at_guide_res = try c.decodeIfPresent(Bool.self, forKey: .rob_R_at_guide_res) ?? rob_R_at_guide_res
         rob_s_bilinear = try c.decodeIfPresent(Bool.self, forKey: .rob_s_bilinear) ?? rob_s_bilinear
         rob_eq9_min_enabled = try c.decodeIfPresent(Bool.self, forKey: .rob_eq9_min_enabled) ?? rob_eq9_min_enabled
+        kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         save_nn_rob_mask = try c.decodeIfPresent(Bool.self, forKey: .save_nn_rob_mask) ?? save_nn_rob_mask
@@ -1956,6 +1961,7 @@ final class CameraModel: NSObject, ObservableObject {
             "rob_R_at_guide_res": NSNumber(value: tuningParams.rob_R_at_guide_res),
             "rob_s_bilinear": NSNumber(value: tuningParams.rob_s_bilinear),
             "rob_eq9_min_enabled": NSNumber(value: tuningParams.rob_eq9_min_enabled),
+            "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "save_nn_rob_mask": NSNumber(value: tuningParams.save_nn_rob_mask),

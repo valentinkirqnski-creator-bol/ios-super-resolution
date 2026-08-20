@@ -717,6 +717,13 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Continuous Kernel Anisotropy", isOn: $cam.tuningParams.kernel_anisotropy_continuous)
+        Text("""
+             The paper drives the merge kernel's shape continuously from the structure              tensor -- "(L1-L2)/(L1+L2) is used to drive the desired anisotropy of the              kernels" -- and Figure 8 samples that axis at 0.1, 0.5 and 0.9, which only              makes sense if the shape varies across the whole range.
+             The reference implementation instead switched at anisotropy 0.9025 and was              perfectly round below it, so all three of Figure 8's edge strengths gave an              identical isotropic kernel and the stretch appeared as an 8:1 jump at one              threshold. That matters because Section 5.1.1 gives the anisotropic kernel a              job: "they increase the algorithm's tolerance for small misalignments and              uneven coverage around edges". With the switch, that tolerance existed only              on near-perfect edges -- a pole or wire at anisotropy 0.6-0.8 got a round              kernel and none of it. The threshold also put a discontinuity in the              reconstruction, neighbouring pixels being rebuilt with 1:1 and 8:1 kernels.
+             Both endpoints are unchanged: fully isotropic content stays round, a perfect              edge gets the same full stretch. Only the middle is filled in.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Eq. 9 Local Minimum (5x5)", isOn: $cam.tuningParams.rob_eq9_min_enabled)
         Text("""
              Off. Wronski takes a minimum confidence over a 5x5 window "to improve the              robustness estimation in the case of misalignment in regions with high signal              variance (like an edge on top of another one)": if any pixel in the              neighbourhood fires, the minimum propagates that rejection across the region.

@@ -425,6 +425,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.rob_s_bilinear = tuning[@"rob_s_bilinear"].boolValue;
     if (tuning[@"rob_eq9_min_enabled"])
         cfg.rob_eq9_min_enabled = tuning[@"rob_eq9_min_enabled"].boolValue;
+    if (tuning[@"kernel_anisotropy_continuous"])
+        cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])
