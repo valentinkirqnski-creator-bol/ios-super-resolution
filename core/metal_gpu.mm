@@ -1108,7 +1108,11 @@ struct RobDogsonParamsCPU {
     uint32_t in_h, in_w, out_h, out_w, nch;
     uint32_t is_ref, tile_size, flow_ny, flow_nx;
     float s;
-    uint32_t _pad0 = 0, _pad1 = 0;
+    // 1 = interpolate the tile flow between tile centres (was _pad0). This is
+    // the GPU twin of upscale_warp_stats, so it must match the CPU setting or
+    // the two paths warp the comparison statistics differently.
+    uint32_t flow_bilinear = 0;
+    uint32_t _pad1 = 0;
 };
 static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 
@@ -1331,7 +1335,8 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
 static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
-                       int& out_h, int& out_w, id<MTLCommandBuffer> cmd) {
+                       int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
+                       bool flow_bilinear) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1350,6 +1355,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_ny = (!is_ref && flow) ? (uint32_t)flow->ny : 0u;
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
+    dp.flow_bilinear = flow_bilinear ? 1u : 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {
@@ -1454,9 +1460,9 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd) ||
+                        nullptr, 0, mh, mw, cmd, cfg.flow_bilinear_sampling) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd) ||
+                       nullptr, 0, vh, vw, cmd, cfg.flow_bilinear_sampling) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -1588,7 +1594,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     id<MTLBuffer> b_comp_means_hires = nil;
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
-                    &flow, tile_size, ch_h, ch_w, cmd))
+                    &flow, tile_size, ch_h, ch_w, cmd,
+                    cfg.flow_bilinear_sampling))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
@@ -1677,7 +1684,6 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;

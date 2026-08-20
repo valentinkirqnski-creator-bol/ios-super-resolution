@@ -1516,7 +1516,8 @@ struct RobDogsonParams {
     uint tile_size;
     uint flow_ny, flow_nx;
     float s;          // always 2.f (Python CUDA hardcode)
-    uint _pad0, _pad1;
+    uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad0)
+    uint _pad1;
 };
 
 struct RobMaskParams {
@@ -1747,13 +1748,18 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     int y = int(gid.y), x = int(gid.x);
     float flow_x = 0.f, flow_y = 0.f;
     if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
-        int patch_idy = y / int(p.tile_size);
-        int patch_idx = x / int(p.tile_size);
-        if (patch_idy >= 0 && patch_idy < int(p.flow_ny) &&
-            patch_idx >= 0 && patch_idx < int(p.flow_nx)) {
-            uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
-            flow_x = flow[fi + 0u];
-            flow_y = flow[fi + 1u];
+        if (p.flow_bilinear != 0u) {
+            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(y), float(x),
+                                 float(p.tile_size), flow_x, flow_y);
+        } else {
+            int patch_idy = y / int(p.tile_size);
+            int patch_idx = x / int(p.tile_size);
+            if (patch_idy >= 0 && patch_idy < int(p.flow_ny) &&
+                patch_idx >= 0 && patch_idx < int(p.flow_nx)) {
+                uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
+                flow_x = flow[fi + 0u];
+                flow_y = flow[fi + 1u];
+            }
         }
     }
     float LR_y = (float(y) + flow_y + 0.5f) / p.s - 0.5f;
