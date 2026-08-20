@@ -81,8 +81,15 @@ int main(int argc, char** argv) {
         Image an = compute_robustness(comp, rs, flow, ts, w2, nullptr);
 
         RefStats cs = init_robustness(comp, work);
+        // Channels 18-19. Must be measured here too: leaving them zero would
+        // feed the network a constant on two inputs it was trained to use, and
+        // the failure would look like a mysteriously bad mask rather than a
+        // missing feature.
+        const std::vector<f32> mq =
+            measure_match_quality(ref_grey, comp_grey, flow, ts, work);
         Image feat = build_robustness_nn_features(rs, cs.means, flow, ts, work, 0,
-                                                  /*raw_res=*/false, /*rows=*/gh);
+                                                  /*raw_res=*/false, /*rows=*/gh,
+                                                  /*planar=*/false, &mq);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "_f%02d", a - 3);
         write_f32(out + buf + ".feat", feat);

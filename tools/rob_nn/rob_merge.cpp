@@ -58,6 +58,13 @@ int main(int argc, char** argv) {
     const bool learned = (mode == "learned");
     float scale = 1.f;
     if (const char* v = std::getenv("ROB_SCALE")) scale = (float)std::atof(v);
+    // The gate the app applies. This tool rendered UNGATED until now, so every
+    // image judged by eye showed behaviour the pipeline does not have: the
+    // merge never sees a value below the gate. Defaults to Config's own value
+    // so the picture and the app cannot drift apart.
+    Config gate_cfg;
+    float gate = gate_cfg.rob_nn_gate;
+    if (const char* v = std::getenv("ROB_GATE")) gate = (float)std::atof(v);
 
     Config cfg;
     cfg.scale = scale;
@@ -129,14 +136,24 @@ int main(int argc, char** argv) {
             return 1;
         }
         double m = 0;
+        size_t gated = 0;
         for (size_t i = 0; i < rob.data.size(); ++i) {
             f32 r = rob.data[i];
             if (!std::isfinite(r)) r = 0.f;         // see README: the CPU
             r = std::min(std::max(r, 0.f), 1.f);    // analytic path emits inf
+            // Below the gate the pixel is not merged at all; at or above it
+            // the mask's own value is kept, so the rolloff survives inside the
+            // trusted band. Exactly what compute_robustness does. Applied to
+            // the LEARNED mask only -- the analytic mask has no such gate in
+            // the pipeline, and adding one here would flatter it.
+            if (learned && gate > 0.f && r < gate) { r = 0.f; ++gated; }
             rob.data[i] = r;
             acc[i] += r;
             m += r;
         }
+        if (learned && gate > 0.f)
+            std::printf("    gate %.4f rejected %.1f%% of this frame\n",
+                        gate, 100.0 * (double)gated / (double)rob.data.size());
         std::printf("  frame %d: mask mean %.3f\n", k, m / (double)acc.size());
         CovField covs = estimate_kernels(burst[k], work);
         merge_comp(burst[k], flow, covs, rob, ts, num, den, work);
@@ -163,8 +180,13 @@ int main(int argc, char** argv) {
     }
     double am = 0;
     for (float v : acc) am += v;
-    std::printf("%s mask, %d comparison frames merged, accumulated mask mean %.3f\n",
-                learned ? "LEARNED" : "ANALYTIC", merged, am / (double)acc.size());
+    size_t rej = 0;
+    for (float v : acc) if (v < 0.5f) ++rej;
+    std::printf("%s mask%s, %d comparison frames merged, accumulated mask mean "
+                "%.3f, rejected (acc R < 0.5) %.1f%%\n",
+                learned ? "LEARNED" : "ANALYTIC",
+                (learned && gate > 0.f) ? " (gated)" : "", merged,
+                am / (double)acc.size(), 100.0 * (double)rej / (double)acc.size());
     std::printf("wrote %s_merged.f32 (%dx%dx%d) and %s_accmask.f32 (%dx%d)\n",
                 out.c_str(), Ws, Hs, nch, out.c_str(), gw, gh);
     return 0;

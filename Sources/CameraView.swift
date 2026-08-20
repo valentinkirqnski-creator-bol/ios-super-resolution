@@ -727,9 +727,12 @@ struct CameraView: View {
                 + "trained network. The analytic mask decides from a colour difference "
                 + "between 3x3 local means, which cannot see a misalignment that lands on "
                 + "similar-looking content or one finer than that window. The network sees "
-                + "the same statistics plus the estimated flow, its local spread and a wider "
-                + "neighbourhood. Measured against ground truth on synthetic bursts built "
-                + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
+                + "the same statistics plus the estimated flow, its local spread, a wider "
+                + "neighbourhood, plus how well the block match was determined -- whether "
+                + "this tile's correspondence was unique or a coin flip, which is what "
+                + "separates real misalignment from the sub-pixel aliasing that "
+                + "super-resolution exists to exploit. Trained and measured on real "
+                + "bursts with only the flow corrupted. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
         HStack {
             Text("Learned Mask Gate")
@@ -737,13 +740,13 @@ struct CameraView: View {
             Text(String(format: "%.3f", cam.tuningParams.rob_nn_gate))
                 .font(.caption).monospacedDigit().foregroundColor(.secondary)
         }
-        Slider(value: $cam.tuningParams.rob_nn_gate, in: 0.90...0.999, step: 0.001)
+        Slider(value: $cam.tuningParams.rob_nn_gate, in: 0.50...0.9995, step: 0.0005)
             .disabled(!cam.tuningParams.use_neural_robustness)
         Text("""
-             Below this the pixel is not merged at all. Measured on held-out data              (2.44M px, 9.17% harmful), the tradeoff is visible misalignment against how              much of the burst still contributes: 0.900 admits 3.63% of visible              misalignments and merges 82.6% of pixels; 0.950 -> 1.79% / 76.0%;              0.980 -> 0.49% / 63.4%; 0.989 -> 0.10% / 52.8%; 0.999 -> 0.00% / 5.3%.
-             0.989 is the default because strict zero is not worth buying -- it collapses              to 6% merged, essentially just the reference frame with no multi-frame              benefit. The curve is very steep just below it, so one-in-a-thousand visible              misalignment still keeps half the burst. For scale the analytic mask admits              41.4% of visible misalignments at its own R>=0.5 cut. Raise it toward 0.999              for fewer misalignments and more noise; lower it toward 0.95 for more noise              reduction and more risk.
+             Below this the pixel is not merged at all. Re-measured for the current              model on held-out data (2.69M misalignment pixels, 0.99M static): the              tradeoff is visible misalignment admitted against how much genuinely safe              content still merges. 0.950 admits 0.50% of visible misalignments and keeps              64% of detailed static content; 0.980 -> 0.34% / 61%; 0.995 -> 0.20% / 53%;              0.999 -> 0.06% / 12%.
+             0.995 is the default because the curve turns over hard just past it: going              on to 0.999 buys 0.14 points of visible misalignment and costs 42 points of              detailed-static retention, which is exactly the aliasing-rich content the              mask should be keeping. Strict zero is not worth buying -- it collapses to              essentially the reference frame alone. For scale the analytic mask admits              41.4% of visible misalignments at its own R>=0.5 cut. Raise it for fewer              misalignments and more noise; lower it for more noise reduction and more risk.
              """)
-            .font(.caption2).foregroundColor(.secondary)
+        .font(.caption2).foregroundColor(.secondary)
         Toggle("Save Learned Robustness Mask", isOn: $cam.tuningParams.save_nn_rob_mask)
             .disabled(!cam.tuningParams.use_neural_robustness)
         Text("""

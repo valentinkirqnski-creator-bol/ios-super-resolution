@@ -631,32 +631,35 @@ struct Config {
     // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
     bool use_neural_robustness = false;
 
-    // Decision gate on the learned mask: R below this is forced to 0, so the
-    // pixel is not merged at all. Measured on held-out data (2.44M px, 9.17%
-    // harmful), sweeping this threshold trades visible misalignment against
-    // how much of the burst still contributes:
+    // Below this the pixel is not merged at all.
     //
-    //   gate    visible misalignment admitted    pixels merged
-    //   0.900                          3.63%            82.6%
-    //   0.950                          1.79%            76.0%
-    //   0.980                          0.49%            63.4%
-    //   0.989                          0.10%            52.8%   <- default
-    //   0.999                          0.00%             5.3%
+    // DERIVED FROM THIS MODEL'S OWN CALIBRATION. The previous default, 0.989,
+    // came from a different network whose output distribution was nothing like
+    // this one's, and a threshold is only meaningful against the model it was
+    // measured on. Re-measured on held-out data for the shipped checkpoint
+    // (robnet_matchq.pt, 2.69M misalignment px and 0.99M static px):
     //
-    // 0.989 is chosen deliberately. Strict zero is not worth buying: it
-    // collapses to 6% merged, which is essentially just the reference frame
-    // with no multi-frame benefit. The curve is very steep just below it, so
-    // one-in-a-thousand visible misalignment still keeps half the burst. For
-    // scale, the analytic mask at its own R>=0.5 cut admits 41.4% of visible
-    // misalignments while merging 92.2%, so this is roughly a 400x reduction
-    // in visible misalignment for about half the merged pixels.
+    //   gate   visible FA   safe kept   static detail   static all
+    //   0.900      0.588%       93.3%           66.3%        95.4%
+    //   0.950      0.497%       92.8%           64.3%        95.0%
+    //   0.980      0.337%       92.0%           61.4%        94.4%
+    //   0.990      0.260%       91.2%           58.6%        93.8%
+    //   0.995      0.196%       90.2%           53.3%        92.7%
+    //   0.999      0.059%       80.6%           11.5%        80.0%
+    //
+    // 0.995 sits just before the cliff. Past it the curve turns over hard:
+    // 0.995 -> 0.999 buys 0.14 percentage points of visible misalignment and
+    // costs 42 points of detailed-static retention, which is the aliasing-rich
+    // content the mask was over-rejecting in the first place. Strict zero is
+    // not worth buying at all -- it collapses to essentially the reference
+    // frame with no multi-frame benefit.
     //
     // "Visible" is the operative word. Two photometrically indistinguishable
     // regions merged together produce no artefact anyone can see, so driving
     // VISIBLE acceptance to near zero is far cheaper than driving all harm to
-    // zero: 0.10% visible costs 52.8% merged, while 0.01% of all harm costs
-    // 5.3%. Ten times the retained benefit for a difference you cannot see.
-    f32 rob_nn_gate = 0.989f;
+    // zero. For scale, the analytic mask at its own R>=0.5 cut admits 41.4% of
+    // visible misalignments.
+    f32 rob_nn_gate = 0.995f;
 
     // Write the learned mask alongside the output for inspection. Off by
     // default: it is a full extra plane per comparison frame.
