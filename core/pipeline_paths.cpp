@@ -1260,7 +1260,61 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     Image num_sink, den_sink;
     std::vector<int> online_pending;   // frames queued but not yet committed
     int online_skip_rejected = 0, online_skip_nodata = 0, online_skip_gpu = 0;
-    const int online_fuse = kOnlineFuse;
+    // Resident frames = fuse * in-flight, and each one holds its GPU uploads
+    // (raw + covs + rob) until its command buffer retires. At 12 MP that is
+    // ~146 MB per frame with the raw-resolution mask, ~110 MB without.
+    //
+    // These were fixed at 2 x 2 and it killed the app. The justification was
+    // that ~440 MB of extra resident frames is affordable once the
+    // raw-resolution mask stops costing 439 MB -- but that is a SETTING, and
+    // when it is left on the two costs stack instead of trading off. Measured
+    // consequence: peak went 2247 MB -> 2750 MB against 824 MB of headroom,
+    // and jetsam took the process during frame 1-2.
+    //
+    // So the depth is measured, not assumed. Budget the extra frames against
+    // real headroom and fall back to 1 x 1 -- the original behaviour, one
+    // frame resident -- whenever the room is not demonstrably there. Speed is
+    // worth having; it is not worth a kill, and a constant cannot know which
+    // settings are on.
+    int online_fuse = 1, online_inflight = 1;
+    {
+        const size_t f = sizeof(f32);
+        const size_t raw_b = (size_t)ref.h * (size_t)ref.w * f;
+        const size_t half = (size_t)(ref.h / 2) * (size_t)(ref.w / 2);
+        const size_t covs_b = half * 4 * f;
+        const size_t rob_b = work.robustness_raw_resolution_active()
+                                 ? raw_b : half * f;
+        const size_t per_frame = raw_b + covs_b + rob_b;
+        const uint64_t avail = prof_available_bytes();
+        // Two gates, both required.
+        //
+        // First, availability read HERE is measured before the accumulator and
+        // the hires reference statistics are allocated, so it overstates what
+        // will be free at the peak -- which arrives later, during
+        // merge:online-frame. Hence a large reserve rather than a snug one:
+        // the measured run peaked at 2247 MB with only 824 MB left, and that
+        // minimum is what the extra frames have to fit inside, not the roomier
+        // figure visible at this point.
+        constexpr uint64_t kKeepFree = 1400ull * 1024ull * 1024ull;
+        //
+        // Second, and deterministically: the raw-resolution mask already costs
+        // ~439 MB in upscaled statistics and makes every resident frame 139 MB
+        // instead of 104. Those two costs stacking is exactly what produced the
+        // 2750 MB kill. When it is on, stay at one resident frame -- the
+        // behaviour that was shipping before this optimisation.
+        const bool roomy_config = !work.robustness_raw_resolution_active();
+        int extra = 0;
+        if (roomy_config && avail > kKeepFree && per_frame > 0)
+            extra = (int)((avail - kKeepFree) / per_frame);
+        const int budget = std::max(1, std::min(4, 1 + extra));
+        // Prefer overlap first (it removes the CPU stall), then fusion (it
+        // halves accumulator traffic). Both cost one resident frame each.
+        online_inflight = std::min(kOnlineInFlight, budget);
+        online_fuse = std::max(1, std::min(kOnlineFuse, budget / online_inflight));
+        prof_add_cpu("merge#resident-frames", (double)(online_fuse * online_inflight));
+        prof_add_cpu("merge#frame-cost-mb", (double)(per_frame >> 20));
+        prof_add_cpu("merge#avail-mb", (double)(avail >> 20));
+    }
 
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
@@ -1533,7 +1587,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     // frame's decode/align/robustness/kernels overlap this
                     // frame's merge instead of waiting for it.
                     merged = metal_merge_flush_online_pipelined(online_pending,
-                                                                kOnlineInFlight);
+                                                                online_inflight);
                     online_pending.clear();
                 }
             }
