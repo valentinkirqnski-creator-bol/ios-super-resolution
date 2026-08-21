@@ -104,6 +104,9 @@ struct TuningParams: Equatable, Codable {
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
+    /// Drive the merge kernel's anisotropy continuously from the structure
+    /// tensor rather than switching to the full stretch only above 0.9025.
+    var kernel_anisotropy_continuous: Bool = true
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
     var debug_pixel4a_noise_profile: Bool = false
@@ -218,6 +221,7 @@ struct TuningParams: Equatable, Codable {
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
+        case kernel_anisotropy_continuous
         case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -264,6 +268,7 @@ struct TuningParams: Equatable, Codable {
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
+        kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         debug_pixel4a_noise_profile = try c.decodeIfPresent(
             Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
@@ -1883,6 +1888,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
+            "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),

@@ -1011,7 +1011,8 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t bayer, selection;
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-        uint32_t _pad0 = 0, _pad1 = 0;
+        uint32_t aniso_continuous = 0;  // 1 = continuous Eq. 4 shape (was _pad0)
+        uint32_t _pad1 = 0;
     };
     static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
 
@@ -1035,6 +1036,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.D_tr = cfg.D_tr;
     p.k_stretch = cfg.k_stretch;
     p.k_shrink = cfg.k_shrink;
+    p.aniso_continuous = cfg.kernel_anisotropy_continuous ? 1u : 0u;
 
     const size_t raw_b = raw.data.size() * sizeof(float);
     const size_t grey_b = (size_t)grey_h * (size_t)grey_w * sizeof(float);

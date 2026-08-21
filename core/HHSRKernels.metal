@@ -1353,7 +1353,8 @@ struct KernelEstParams {
     uint selection; // retained for CPU layout; 460-main always hard-thresholds
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-    uint _pad0, _pad1; // 64 bytes total for setBytes
+    uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
+    uint _pad1; // 64 bytes total for setBytes
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1403,14 +1404,32 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
     }
 }
 
-// 460-main kernels.py compute_k
+// Eq. 4's k1/k2. Twin of compute_k in core/kernels.cpp -- keep them in step.
+// The paper drives anisotropy continuously from (l1-l2)/(l1+l2); 460-main
+// switched at A > 1.95 (anisotropy > 0.9025) and was round below it, which
+// denied the misalignment tolerance of Section 5.1.1 to every moderately
+// anisotropic feature. The flat-patch guard is deliberate: the old 0/0 gave
+// NaN, and NaN > 1.95 being false fell to isotropic by accident, whereas a
+// continuous blend would propagate the NaN into k1/k2.
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
-    float A = 1.f + sqrt((l1 - l2) / (l1 + l2));
+    float tr = l1 + l2;
+    float ratio = (tr > 1e-12f) ? max(0.f, (l1 - l2) / tr) : 0.f;
+    if (!isfinite(ratio)) ratio = 0.f;
+    float a = sqrt(ratio);   // only the legacy threshold uses this
     float D = min(1.f, max(0.f, 1.f - sqrt(l1) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (A > 1.95f) { kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch; }
-    else           { kk1 = 1.f; kk2 = 1.f; }
+    if (p.aniso_continuous != 0u) {
+        // Blend on the RATIO, not sqrt(ratio): at low anisotropy the dominant
+        // eigenvector is noise-dominated, and stretching along it smears in an
+        // arbitrary direction. Matches compute_k in kernels.cpp.
+        kk1 = 1.f + ratio * (1.f / p.k_shrink - 1.f);
+        kk2 = 1.f + ratio * (p.k_stretch - 1.f);
+    } else if (1.f + a > 1.95f) {
+        kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch;
+    } else {
+        kk1 = 1.f; kk2 = 1.f;
+    }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
 }

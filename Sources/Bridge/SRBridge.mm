@@ -350,6 +350,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
+    if (tuning[@"kernel_anisotropy_continuous"])
+        cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"debug_pixel4a_noise_profile"])

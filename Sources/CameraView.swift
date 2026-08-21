@@ -730,6 +730,13 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Continuous Kernel Anisotropy", isOn: $cam.tuningParams.kernel_anisotropy_continuous)
+        Text("""
+             Merge kernels are stretched ALONG edges so that a sample slightly off the              ideal position still lands inside the kernel -- Section 5.1.1 gives this the              job of increasing "tolerance for small misalignments and uneven coverage              around edges". Wronski drives the amount of stretch continuously from the              structure tensor; the reference implementation instead switched to the full              8:1 stretch only above anisotropy 0.9025 and used a perfectly ROUND kernel              below it.
+             That penalises text most. A letter puts strokes at several orientations              inside one 3x3 window, so its structure tensor measures as nearly isotropic              -- around 0.6 -- even though it is all edges. Under the switch it fell below              the threshold and got a round 0.177 px kernel, while a long straight edge              beside it got 8:1. At 2x output that round kernel only accepts samples              within about a third of a raw pixel, so coverage along the strokes is sparse              and uneven, which reads as smeared letters.
+             Continuous gives anisotropy 0.6 a 4.8:1 kernel instead of 1:1: still sharp              ACROSS the stroke, but covering along it. Both endpoints are unchanged --              isotropic content stays round, a perfect edge still gets the full 8:1 --              only the middle is filled in, and the middle is where text lives.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
             .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
                 + "trained network. The analytic mask decides from a colour difference "
