@@ -827,7 +827,37 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 //
 // Memory wins: the ceiling is what does not move with burst length, and the
 // traffic cost is spread across a burst already running for seconds.
-static constexpr int kOnlineFuse = 1;
+static constexpr int kOnlineFuse = 2;
+
+// Why this moved from 1 to 2.
+//
+// merge_accumulate_comp_x4 already accumulates up to kMergeFuseMax (4) frames
+// in ONE dispatch, so a fused group shares a single read-modify-write of the
+// accumulator instead of performing one each. At 12 MP the accumulator is
+// 292.6 MB, so each frame previously cost 585 MB of traffic just to add its
+// contribution -- 80% of the merge's total memory traffic, and none of it
+// image data. Measured merge:online-cb was 97.4 ms/frame at an effective
+// 7.5 GB/s, far under what the hardware sustains, so this traffic is the thing
+// worth removing.
+//
+//   per 4 frames      accumulator     image data      total
+//     fuse 1          4 x 585 MB      4 x 146 MB     2924 MB
+//     fuse 2          2 x 585 MB      4 x 146 MB     1754 MB
+//     fuse 4          1 x 585 MB      4 x 146 MB     1169 MB
+//
+// Banding the merge per frame does NOT help here, which is worth recording:
+// within one frame each accumulator element is read once and written once, so
+// there is no reuse for a cache to exploit. Only sharing the read-modify-write
+// across frames reduces it.
+//
+// Not 4, because the resident-frame cost is kOnlineFuse * kOnlineInFlight, and
+// each frame's GPU uploads are raw + covs + rob = about 110 MB at 12 MP with
+// the guide-resolution mask. 2 x 2 keeps four frames alive (~440 MB) and buys
+// both halves: overlap from the in-flight depth, halved accumulator traffic
+// from the fusion. 4 x 2 would be eight frames and ~880 MB, which is the kind
+// of peak that produced the jetsam kills in the first place.
+//
+// Still flat in burst length -- both constants, so 8 frames costs what 6 does.
 
 // Online merges allowed in flight at once.
 //
