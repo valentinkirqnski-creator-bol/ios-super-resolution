@@ -2210,6 +2210,56 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
 }
 
+// Eq. 9 on the guide lattice, evaluated per RAW pixel -- the GPU twin of
+// local_min_5x5_on_guide in robustness.cpp, which was: 2x2 min-reduce raw to
+// guide, 5x5 min there, nearest-replicate back.
+//
+// BIT-IDENTICAL to that three-pass form, and provably so rather than by
+// approximation: min is associative, commutative and exact in floating point,
+// so a minimum over a SET of values does not depend on how the set is grouped.
+// The set here is exactly the raw pixels covered by the 5x5 guide window --
+// guide cell (gy,gx) owning raw (2gy,2gx), (2gy,2gx+1), (2gy+1,2gx),
+// (2gy+1,2gx+1) -- so reducing then mining then replicating, or mining the
+// union directly, give the same float. The guide indices are clamped exactly
+// as the CPU clamps them, which is what keeps the edges identical too.
+//
+// Doing it here removes a 48 MB readback and the host-side pass per frame.
+kernel void rob_local_min_on_guide_raw(device float* out [[buffer(0)]],
+                                       device const float* R [[buffer(1)]],
+                                       constant RobStatsParams& p [[buffer(2)]],
+                                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    int gh = int(p.h) / 2, gw = int(p.w) / 2;
+    if (gh <= 0 || gw <= 0) {                    // CPU falls back to a plain 5x5
+        float mn = INFINITY;
+        for (int i = -2; i <= 2; ++i) {
+            int yy = clamp(int(gid.y) + i, 0, int(p.h) - 1);
+            for (int j = -2; j <= 2; ++j) {
+                int xx = clamp(int(gid.x) + j, 0, int(p.w) - 1);
+                mn = min(mn, R[uint(yy) * p.w + uint(xx)]);
+            }
+        }
+        out[gid.y * p.w + gid.x] = mn;
+        return;
+    }
+    int gy0 = min(gh - 1, int(gid.y) / 2);
+    int gx0 = min(gw - 1, int(gid.x) / 2);
+    float mn = INFINITY;
+    for (int i = -2; i <= 2; ++i) {
+        int gy = clamp(gy0 + i, 0, gh - 1);
+        for (int j = -2; j <= 2; ++j) {
+            int gx = clamp(gx0 + j, 0, gw - 1);
+            uint r0 = uint(2 * gy) * p.w, r1 = uint(2 * gy + 1) * p.w;
+            uint c0 = uint(2 * gx), c1 = uint(2 * gx + 1);
+            mn = min(mn, R[r0 + c0]);
+            mn = min(mn, R[r0 + c1]);
+            mn = min(mn, R[r1 + c0]);
+            mn = min(mn, R[r1 + c1]);
+        }
+    }
+    out[gid.y * p.w + gid.x] = mn;
+}
+
 kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
                               device const float* R [[buffer(1)]],
                               constant RobStatsParams& p [[buffer(2)]],

@@ -163,6 +163,7 @@ static MetalCtx& ctx() {
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
+            "rob_local_min_on_guide_raw",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
@@ -1723,18 +1724,34 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     // Eq. 9 runs on the CPU after readback (robustness_local_min_on_guide:
     // 2x2 min-reduce to the guide lattice, 5x5 min there = Wronski's
-    // 10x10-raw footprint on Wronski's own grid, nearest-upsample back).
-    // Kept off the GPU so the stage is one shared implementation with the
-    // CPU path -- no new shader, bit-identical results.
-    (void)b_out;
+    // Eq. 9 now runs HERE rather than on the host after a readback. It is the
+    // same computation: min is associative, commutative and exact in floating
+    // point, so a minimum over a set does not depend on how the set is
+    // grouped, and rob_local_min_on_guide_raw takes the min over exactly the
+    // raw pixels the 5x5 guide window covers. Bit-identical, and it removes a
+    // 48 MB readback plus a host pass per frame -- comp:robustness measured
+    // 206.5 ms/frame against only 33.6 ms in the GPU kernel, and this is most
+    // of that difference.
+    {
+        RobStatsParamsCPU mp2{};
+        mp2.h = (uint32_t)ch_h;
+        mp2.w = (uint32_t)ch_w;
+        mp2.nch = 1u;
+        id<MTLComputeCommandEncoder> e2 = [cmd computeCommandEncoder];
+        if (!e2) return Image();
+        [e2 setBuffer:b_out offset:0 atIndex:0];
+        [e2 setBuffer:b_R offset:0 atIndex:1];
+        [e2 setBytes:&mp2 length:sizeof(mp2) atIndex:2];
+        dispatch2(e2, c.pipe("rob_local_min_on_guide_raw"), mp2.w, mp2.h);
+        [e2 endEncoding];
+    }
     prof_tag_gpu(cmd, "robustness:raw-res");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    Image R_pre(ch_h, ch_w, 1);
-    memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    Image r = robustness_local_min_on_guide(R_pre);
+    Image r(ch_h, ch_w, 1);
+    memcpy(r.data.data(), [b_out contents], mask_b);
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
