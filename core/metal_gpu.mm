@@ -3579,17 +3579,22 @@ bool metal_merge_flush_online() {
 // All state is touched on the calling thread only -- the completion is
 // observed by waiting on the OLDEST buffer rather than from a completion
 // handler -- so no locking is needed around g_merge_frames.
+// Named g_online_inflight, NOT g_merge_inflight: this file already has a
+// file-scope `static MergeInflight g_merge_inflight` for the banded path --
+// note the lowercase 'f' in the TYPE. Two objects differing only by that
+// would leave every unqualified use after this point ambiguous between the
+// global and this anonymous-namespace one, which breaks the build.
 namespace {
-struct MergeInFlight {
+struct OnlineInFlight {
     __strong id<MTLCommandBuffer> cmd = nil;
     std::vector<int> frames;
 };
-std::vector<MergeInFlight> g_merge_inflight;
+std::vector<OnlineInFlight> g_online_inflight;
 
 bool retire_oldest_inflight() {
-    if (g_merge_inflight.empty()) return true;
-    MergeInFlight f = std::move(g_merge_inflight.front());
-    g_merge_inflight.erase(g_merge_inflight.begin());
+    if (g_online_inflight.empty()) return true;
+    OnlineInFlight f = std::move(g_online_inflight.front());
+    g_online_inflight.erase(g_online_inflight.begin());
     [f.cmd waitUntilCompleted];
     const bool ok = (f.cmd.status == MTLCommandBufferStatusCompleted);
     for (int k : f.frames) metal_merge_release_frame(k);
@@ -3602,21 +3607,21 @@ bool metal_merge_flush_online_pipelined(const std::vector<int>& frame_ids, int d
     if (!g_merge_band_cmd) return true;
     if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
     prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
-    MergeInFlight f;
+    OnlineInFlight f;
     f.cmd = g_merge_band_cmd;
     f.frames = frame_ids;
     [f.cmd commit];
     merge_band_cmd_reset();
-    g_merge_inflight.push_back(std::move(f));
+    g_online_inflight.push_back(std::move(f));
     bool ok = true;
-    while ((int)g_merge_inflight.size() > std::max(1, depth))
+    while ((int)g_online_inflight.size() > std::max(1, depth))
         ok = retire_oldest_inflight() && ok;
     return ok;
 }
 
 bool metal_merge_drain_online() {
     bool ok = true;
-    while (!g_merge_inflight.empty()) ok = retire_oldest_inflight() && ok;
+    while (!g_online_inflight.empty()) ok = retire_oldest_inflight() && ok;
     return ok;
 }
 
