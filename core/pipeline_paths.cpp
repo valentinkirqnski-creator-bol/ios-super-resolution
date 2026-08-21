@@ -829,6 +829,21 @@ static void encode_band_rows(const Image& num_band, const Image& den_band, int y
 // traffic cost is spread across a burst already running for seconds.
 static constexpr int kOnlineFuse = 1;
 
+// Online merges allowed in flight at once.
+//
+// One means the CPU commits a frame's merge and immediately waits for it, so
+// analysis and merge never overlap and a frame costs CPU + GPU rather than
+// max(CPU, GPU). Measured on device at 12 MP: ~270 ms of CPU analysis and
+// ~97 ms of GPU merge, with each side idle while the other runs.
+//
+// Two lets the next frame's decode/align/robustness/kernels proceed while this
+// frame's merge is still on the GPU, and costs one extra frame's uploads held
+// until its command buffer retires. That is the same trade kOnlineFuse
+// documents, except it buys overlap rather than kernel fusion, and it does not
+// grow with burst length -- the depth is a constant, so peak memory stays flat
+// in frame count, which is the property online mode exists to provide.
+static constexpr int kOnlineInFlight = 2;
+
 
 // Burst length at or above which the merge goes online.
 static constexpr int kOnlineMinFrames = 6;
@@ -1482,8 +1497,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 // several frames queued together, and a frame's GPU buffers
                 // cannot be released until its work has run.
                 if ((int)online_pending.size() >= online_fuse) {
-                    merged = metal_merge_flush_online();
-                    for (int fk : online_pending) metal_merge_release_frame(fk);
+                    // Pipelined: commit and carry on. The frame's uploads are
+                    // released when its command buffer retires, which happens
+                    // once kOnlineInFlight buffers are queued -- so the next
+                    // frame's decode/align/robustness/kernels overlap this
+                    // frame's merge instead of waiting for it.
+                    merged = metal_merge_flush_online_pipelined(online_pending,
+                                                                kOnlineInFlight);
                     online_pending.clear();
                 }
             }
@@ -1778,6 +1798,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (int fk : online_pending) metal_merge_release_frame(fk);
             online_pending.clear();
         }
+        // Everything committed by the pipelined path is still in flight; the
+        // accumulator cannot be read until it lands.
+        metal_merge_drain_online();
         merge_ref_band(ref, ref_covs, num_sink, den_sink, 0, work, acc_rob_ptr);
         const f32* nump = nullptr;
         const f32* denp = nullptr;

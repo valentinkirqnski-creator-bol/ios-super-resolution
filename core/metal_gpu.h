@@ -178,4 +178,15 @@ bool metal_merge_map_online(const float** num, const float** den, size_t* nelem)
 void metal_merge_end_online();
 bool metal_merge_flush_online();
 
+// Commit the queued online merge WITHOUT stalling, retiring older command
+// buffers once `depth` are in flight. Releases each retired buffer's frame
+// uploads, so the GPU working set is bounded by depth, not by burst length.
+// Lets the next frame's CPU analysis overlap this frame's merge -- without
+// it, a frame costs CPU + GPU instead of max(CPU, GPU).
+bool metal_merge_flush_online_pipelined(const std::vector<int>& frame_ids, int depth);
+
+// Wait for every in-flight online merge and release its frames. Call before
+// reading the accumulator.
+bool metal_merge_drain_online();
+
 } // namespace hhsr

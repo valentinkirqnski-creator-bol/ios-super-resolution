@@ -3536,11 +3536,70 @@ bool metal_merge_flush_online() {
     prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
     id<MTLCommandBuffer> cmd = g_merge_band_cmd;
     [cmd commit];
-    // Wait rather than pipeline: the point of committing per frame is to free
-    // that frame's GPU buffers, which cannot happen while its work is queued.
+    // Blocking here serialises the whole pipeline. The CPU spends roughly
+    // 270 ms per frame on decode, align, robustness and kernels while the GPU
+    // sits idle, then hands over and idles itself for the ~97 ms the merge
+    // takes. Neither ever overlaps the other, so a frame costs the SUM rather
+    // than the maximum.
+    //
+    // The original reason for waiting is real -- a frame's GPU uploads cannot
+    // be released while its work is still queued -- but a full stall is a
+    // heavier remedy than that requires. metal_merge_flush_online_pipelined
+    // keeps a bounded number of command buffers in flight and retires the
+    // oldest only when the depth is exceeded, which frees the buffers just as
+    // reliably while letting the next frame's CPU work proceed. This entry
+    // point stays for the end-of-burst drain, where waiting is what is wanted.
     [cmd waitUntilCompleted];
     const bool ok = (cmd.status == MTLCommandBufferStatusCompleted);
     merge_band_cmd_reset();
+    return ok;
+}
+
+// Commit without stalling, retiring older work once `depth` buffers are in
+// flight. Frame ids are released when their command buffer is retired, so the
+// GPU working set stays bounded by depth rather than by burst length.
+//
+// All state is touched on the calling thread only -- the completion is
+// observed by waiting on the OLDEST buffer rather than from a completion
+// handler -- so no locking is needed around g_merge_frames.
+namespace {
+struct MergeInFlight {
+    __strong id<MTLCommandBuffer> cmd = nil;
+    std::vector<int> frames;
+};
+std::vector<MergeInFlight> g_merge_inflight;
+
+bool retire_oldest_inflight() {
+    if (g_merge_inflight.empty()) return true;
+    MergeInFlight f = std::move(g_merge_inflight.front());
+    g_merge_inflight.erase(g_merge_inflight.begin());
+    [f.cmd waitUntilCompleted];
+    const bool ok = (f.cmd.status == MTLCommandBufferStatusCompleted);
+    for (int k : f.frames) metal_merge_release_frame(k);
+    return ok;
+}
+}  // namespace
+
+bool metal_merge_flush_online_pipelined(const std::vector<int>& frame_ids, int depth) {
+    if (!g_merge_online) return false;
+    if (!g_merge_band_cmd) return true;
+    if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
+    prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
+    MergeInFlight f;
+    f.cmd = g_merge_band_cmd;
+    f.frames = frame_ids;
+    [f.cmd commit];
+    merge_band_cmd_reset();
+    g_merge_inflight.push_back(std::move(f));
+    bool ok = true;
+    while ((int)g_merge_inflight.size() > std::max(1, depth))
+        ok = retire_oldest_inflight() && ok;
+    return ok;
+}
+
+bool metal_merge_drain_online() {
+    bool ok = true;
+    while (!g_merge_inflight.empty()) ok = retire_oldest_inflight() && ok;
     return ok;
 }
 
