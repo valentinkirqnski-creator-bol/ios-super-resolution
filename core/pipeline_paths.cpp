@@ -894,9 +894,37 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
 
     // Hard fallback: if the peak will not fit at all, banding is the only thing
     // that runs. 0 means the query is unavailable, i.e. no known constraint.
+    // Reaching here means online_peak < banded_peak: the check above already
+    // rejected online whenever banded was the smaller of the two. So if online
+    // does not fit in the available memory, BANDED FITS EVEN LESS -- returning
+    // false here selected the strictly larger option under exactly the
+    // condition that made memory scarce.
+    //
+    // The gap widens with burst length, which is why this presented as
+    // "crashes sometimes with 8 or more frames". banded_peak carries
+    // (n-1) * (raw + covs + rob) -- 109.8 MB per frame at 12 MP -- while
+    // online_peak has no frame term at all:
+    //
+    //   frames    banded holds    online holds
+    //     6          549 MB          110 MB
+    //     8          769 MB          110 MB
+    //    10          988 MB          110 MB
+    //
+    // More frames raised the peak, which lowered availability, which tripped
+    // this test, which then chose the path needing ~770 MB of retained frames.
+    // Self-reinforcing, hence intermittent.
+    //
+    // Online stays selected. When it does not fit either, that is a burst the
+    // device cannot process at this size, and the honest response is to say so
+    // rather than to pick the heavier path and hope. The measurement is kept
+    // and reported so the condition is visible instead of silent.
     const uint64_t avail = prof_available_bytes();
     constexpr uint64_t kOnlineHeadroom = 400ull * 1024ull * 1024ull;
-    if (avail != 0 && (uint64_t)online_peak + kOnlineHeadroom > avail) return false;
+    if (avail != 0 && (uint64_t)online_peak + kOnlineHeadroom > avail) {
+        prof_add_cpu("merge#online-tight-mb",
+                     (double)((uint64_t)online_peak >> 20));
+        prof_add_cpu("merge#avail-mb", (double)(avail >> 20));
+    }
     return true;
 }
 
