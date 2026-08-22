@@ -698,8 +698,14 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
                                  int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
     // Same num/den → RGB16 math as before; pointer loops + sparse preview only.
     auto to_srgb = [](f32 v) {
+        if (!std::isfinite(v)) return 0.f;
         v = clampf(v, 0.f, 1.f);
         return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+    };
+    auto safe_div = [](f32 n, f32 d) {
+        if (!(d > 0.f) || !std::isfinite(n) || !std::isfinite(d)) return 0.f;
+        const f32 v = n / d;
+        return std::isfinite(v) ? v : 0.f;
     };
     const int x_step = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
     // Preview is UI-only; sample a bit more sparsely (DNG pixels unchanged).
@@ -734,16 +740,13 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
             if (gpu_rgb && !need_prev) continue;
 
             const size_t pi = row_off + (size_t)x * (size_t)nch;
-            f32 d0 = denp[pi];
-            f32 cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
+            f32 cn0 = safe_div(nump[pi], denp[pi]);
             f32 cn1 = 0.f, cn2 = 0.f;
             if (nch >= 2) {
-                f32 d1 = denp[pi + 1];
-                cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
+                cn1 = safe_div(nump[pi + 1], denp[pi + 1]);
             }
             if (nch >= 3) {
-                f32 d2 = denp[pi + 2];
-                cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
+                cn2 = safe_div(nump[pi + 2], denp[pi + 2]);
             }
             f32 lin0, lin1, lin2;
             if (bake) {

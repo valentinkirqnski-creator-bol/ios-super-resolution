@@ -159,7 +159,7 @@ static MetalCtx& ctx() {
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
-            "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
+            "kernel_gat", "kernel_gat_raw", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
@@ -1027,7 +1027,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_h = (uint32_t)grey_h;
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
-    p.selection = 0u; // 460-main kernels.py always uses hard thresholding.
+    p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -1044,11 +1044,11 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
 
     id<MTLBuffer> b_raw = c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
-    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, grey_b);
+    id<MTLBuffer> b_vst_raw = c.scratch(c.kern_vst, c.kern_vst_b, raw_b);
     id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
     id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
     id<MTLBuffer> b_cov = c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
-    if (!b_raw || !b_vst || !b_grey || !b_grad || !b_cov) return CovField();
+    if (!b_raw || !b_vst_raw || !b_grey || !b_grad || !b_cov) return CovField();
     memcpy([b_raw contents], raw.data.data(), raw_b);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1058,18 +1058,18 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
 
-    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst_raw offset:0 atIndex:0];
     [enc setBuffer:b_raw offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat_raw"), p.raw_w, p.raw_h);
+
+    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst_raw offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
-    [enc setBuffer:b_vst offset:0 atIndex:0];
-    [enc setBuffer:b_grey offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("kernel_gat"), p.grey_w, p.grey_h);
-
     [enc setBuffer:b_grad offset:0 atIndex:0];
-    [enc setBuffer:b_vst offset:0 atIndex:1];
+    [enc setBuffer:b_grey offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
 

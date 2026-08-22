@@ -831,7 +831,7 @@ struct Config {
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
-    SelectionLaw selection = SelectionLaw::HardThreshold;
+    SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune

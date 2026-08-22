@@ -1349,8 +1349,8 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
 
 struct KernelEstParams {
     uint raw_h, raw_w, grey_h, grey_w;
-    uint bayer;     // 1 = decimate 2x2 raw to grey before GAT
-    uint selection; // retained for CPU layout; 460-main always hard-thresholds
+    uint bayer;     // 1 = decimate 2x2 Bayer VST to grey
+    uint selection; // 1 = python-z linear selection law, 0 = hard threshold
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
@@ -1405,27 +1405,20 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
 }
 
 // Eq. 4's k1/k2. Twin of compute_k in core/kernels.cpp -- keep them in step.
-// The paper drives anisotropy continuously from (l1-l2)/(l1+l2); 460-main
-// switched at A > 1.95 (anisotropy > 0.9025) and was round below it, which
-// denied the misalignment tolerance of Section 5.1.1 to every moderately
-// anisotropic feature. The flat-patch guard is deliberate: the old 0/0 gave
-// NaN, and NaN > 1.95 being false fell to isotropic by accident, whereas a
-// continuous blend would propagate the NaN into k1/k2.
+// This follows python-z kernels.py: A = 1 + sqrt(aniso), then either the
+// linear A/2 interpolation or the hard A > 1.95 branch.
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
     float tr = l1 + l2;
     float ratio = (tr > 1e-12f) ? max(0.f, (l1 - l2) / tr) : 0.f;
     if (!isfinite(ratio)) ratio = 0.f;
-    float a = sqrt(ratio);   // only the legacy threshold uses this
-    float D = min(1.f, max(0.f, 1.f - sqrt(l1) / p.D_tr + p.D_th));
+    float A = 1.f + sqrt(ratio);
+    float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.aniso_continuous != 0u) {
-        // Blend on the RATIO, not sqrt(ratio): at low anisotropy the dominant
-        // eigenvector is noise-dominated, and stretching along it smears in an
-        // arbitrary direction. Matches compute_k in kernels.cpp.
-        kk1 = 1.f + ratio * (1.f / p.k_shrink - 1.f);
-        kk2 = 1.f + ratio * (p.k_stretch - 1.f);
-    } else if (1.f + a > 1.95f) {
+    if (p.selection != 0u || p.aniso_continuous != 0u) {
+        kk1 = 1.f + 0.5f * A * (1.f / p.k_shrink - 1.f);
+        kk2 = 1.f + 0.5f * A * (p.k_stretch - 1.f);
+    } else if (A > 1.95f) {
         kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch;
     } else {
         kk1 = 1.f; kk2 = 1.f;
@@ -1441,6 +1434,15 @@ kernel void kernel_gat(device float* out [[buffer(0)]],
     if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
     uint i = gid.y * p.grey_w + gid.x;
     out[i] = gat_sample(grey[i], p.alpha, p.beta);
+}
+
+kernel void kernel_gat_raw(device float* out [[buffer(0)]],
+                           device const float* raw [[buffer(1)]],
+                           constant KernelEstParams& p [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
+    uint i = gid.y * p.raw_w + gid.x;
+    out[i] = gat_sample(raw[i], p.alpha, p.beta);
 }
 
 kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],
@@ -2994,8 +2996,15 @@ struct MergeNormParams {
 };
 
 inline float norm_to_srgb(float v) {
+    if (!isfinite(v)) return 0.f;
     v = clamp(v, 0.f, 1.f);
     return v <= 0.0031308f ? 12.92f * v : 1.055f * pow(v, 1.f / 2.4f) - 0.055f;
+}
+
+inline float safe_norm_div(float n, float d) {
+    if (!(d > 0.f) || !isfinite(n) || !isfinite(d)) return 0.f;
+    float v = n / d;
+    return isfinite(v) ? v : 0.f;
 }
 
 kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
@@ -3005,16 +3014,13 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
                                   uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.Ws || gid.y >= p.bh) return;
     uint pi = (gid.y * p.Ws + gid.x) * p.nch;
-    float d0 = den[pi];
-    float cn0 = (d0 > 0.f) ? num[pi] / d0 : 0.f;
+    float cn0 = safe_norm_div(num[pi], den[pi]);
     float cn1 = 0.f, cn2 = 0.f;
     if (p.nch >= 2u) {
-        float d1 = den[pi + 1u];
-        cn1 = (d1 > 0.f) ? num[pi + 1u] / d1 : 0.f;
+        cn1 = safe_norm_div(num[pi + 1u], den[pi + 1u]);
     }
     if (p.nch >= 3u) {
-        float d2 = den[pi + 2u];
-        cn2 = (d2 > 0.f) ? num[pi + 2u] / d2 : 0.f;
+        cn2 = safe_norm_div(num[pi + 2u], den[pi + 2u]);
     }
     float lin0, lin1, lin2;
     if (p.bake != 0u && p.nch >= 3u) {
