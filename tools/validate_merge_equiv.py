@@ -50,13 +50,33 @@ def round_half_away(x: float) -> int:
 
 def soften_inv_cov(ixx: float, ixy: float, iyy: float) -> Tuple[float, float, float]:
     k_max_abs = f32(32.0)
-    m = max(fabs_f(ixx), max(fabs_f(iyy), fabs_f(ixy)))
-    if not (m > k_max_abs) or not isfinite_f(m):
-        if not isfinite_f(ixx) or not isfinite_f(ixy) or not isfinite_f(iyy):
-            return f32(2.0), f32(0.0), f32(2.0)
+    if not isfinite_f(ixx) or not isfinite_f(ixy) or not isfinite_f(iyy):
+        return f32(2.0), f32(0.0), f32(2.0)
+    # Eigenvalue clamp -- mirror of the C++/Metal twins, same op order.
+    mean = f32(f32(0.5) * f32(ixx + iyy))
+    half_diff = f32(f32(0.5) * f32(ixx - iyy))
+    disc = f32(np.sqrt(np.float32(f32(half_diff * half_diff) + f32(ixy * ixy))))
+    l1 = f32(mean + disc)
+    if not (l1 > k_max_abs):
         return ixx, ixy, iyy
-    s = f32(k_max_abs / m)
-    return f32(ixx * s), f32(ixy * s), f32(iyy * s)
+    l2 = f32(mean - disc)
+    c1 = k_max_abs
+    c2 = f32(min(l2, k_max_abs))
+    vx = ixy
+    vy = f32(l1 - ixx)
+    n2 = f32(f32(vx * vx) + f32(vy * vy))
+    if not (n2 > f32(0.0)):
+        vx = f32(l1 - iyy)
+        vy = ixy
+        n2 = f32(f32(vx * vx) + f32(vy * vy))
+    if not (n2 > f32(0.0)):
+        return f32(min(ixx, k_max_abs)), ixy, f32(min(iyy, k_max_abs))
+    inv_n2 = f32(f32(1.0) / n2)
+    d = f32(c1 - c2)
+    oxx = f32(c2 + f32(d * f32(f32(vx * vx) * inv_n2)))
+    oxy = f32(d * f32(f32(vx * vy) * inv_n2))
+    oyy = f32(c2 + f32(d * f32(f32(vy * vy) * inv_n2)))
+    return oxx, oxy, oyy
 
 
 def invert_sym_2x2(xx: float, xy: float, yy: float) -> Tuple[float, float, float]:

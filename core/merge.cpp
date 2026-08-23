@@ -80,19 +80,49 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 // tools/validate_merge_equiv.py: all three are compared against each other.
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
     constexpr f32 k_max_abs = 32.f;
-    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
-    if (!(m > k_max_abs) || !std::isfinite(m)) {
-        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-            ixx = 2.f;
-            ixy = 0.f;
-            iyy = 2.f;
-        }
+    if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+        ixx = 2.f;
+        ixy = 0.f;
+        iyy = 2.f;
         return;
     }
-    f32 s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
+    // Clamp EIGENVALUES, not the whole matrix. The previous form rescaled all
+    // three entries by one factor, which bounds the sharp axis (what the
+    // speckle fix needs) but widens the already-wide axis by the same factor
+    // -- pure blur with no coverage benefit. Measured on an edge kernel with
+    // the continuous-anisotropy defaults: sigma 0.085 x 0.68 px became
+    // 0.177 x 1.41 px, doubling the along-edge width for nothing, which is
+    // the reported over-smoothing. Bounding each eigenvalue independently
+    // gives 0.177 x 0.68: the across-edge axis widened exactly to the
+    // coverage floor, the along-edge axis untouched.
+    const f32 mean = 0.5f * (ixx + iyy);
+    const f32 half_diff = 0.5f * (ixx - iyy);
+    const f32 disc = std::sqrt(half_diff * half_diff + ixy * ixy);
+    const f32 l1 = mean + disc;                    // largest eigenvalue
+    if (!(l1 > k_max_abs)) return;                 // nothing too sharp
+    const f32 l2 = mean - disc;
+    const f32 c1 = k_max_abs;
+    const f32 c2 = std::min(l2, k_max_abs);
+    // Eigenvector of l1. Both constructions degenerate only when the matrix
+    // is (near-)isotropic diagonal, where a plain per-entry clamp is exact.
+    f32 vx = ixy;
+    f32 vy = l1 - ixx;
+    f32 n2 = vx * vx + vy * vy;
+    if (!(n2 > 0.f)) {
+        vx = l1 - iyy;
+        vy = ixy;
+        n2 = vx * vx + vy * vy;
+    }
+    if (!(n2 > 0.f)) {
+        ixx = std::min(ixx, k_max_abs);
+        iyy = std::min(iyy, k_max_abs);
+        return;
+    }
+    const f32 inv_n2 = 1.f / n2;
+    const f32 d = c1 - c2;
+    ixx = c2 + d * (vx * vx * inv_n2);
+    ixy = d * (vx * vy * inv_n2);
+    iyy = c2 + d * (vy * vy * inv_n2);
 }
 
 static inline int cuda_round_to_int(f32 x) {
