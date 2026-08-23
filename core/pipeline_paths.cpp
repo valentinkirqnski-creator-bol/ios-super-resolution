@@ -1307,6 +1307,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // widens just this band into reused staging -- so the encoder below
         // and the diagnostics never know which storage the accumulator used.
         bool got = true;
+        const double t_encode = prof_now_ms();
         for (int y0 = 0; y0 < Hs; y0 += band_rows) {
             const int bh = std::min(band_rows, Hs - y0);
             const f32* nump = nullptr;
@@ -1323,6 +1324,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             writer.write_rows(row16.data(), bh);
             report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
         }
+        // The 48 MP divide + ISP + 16-bit pack + DNG write was invisible in
+        // every profile so far -- roughly 2 s of wall with no bucket. Named so
+        // the next profile shows it instead of leaving it as unexplained wall.
+        prof_add_cpu("out:encode-bands", prof_now_ms() - t_encode);
         if (!got) {
             report("Error: GPU merge failed (memory?)", 1.f);
             metal_merge_end_online();

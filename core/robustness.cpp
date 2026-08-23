@@ -322,8 +322,13 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
     if (try_load_python_noise_curves(alpha, beta, nc))
         return nc;
-    if (noise_cache_load(alpha, beta, nc))
+    if (noise_cache_load(alpha, beta, nc)) {
+        std::printf("[noise] MC curve cache HIT (a=%g b=%g)\n", alpha, beta);
         return nc;
+    }
+    std::printf("[noise] MC curve cache MISS (a=%g b=%g)%s -- building, ~2-3 s\n",
+                alpha, beta,
+                g_noise_cache_dir.empty() ? " [cache dir NOT SET]" : "");
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
