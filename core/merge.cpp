@@ -65,13 +65,34 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
     return std::min(std::max(r, 1), std::max(1, rad_max));
 }
 
-// Impossible-data guard only. Valid python-z covariance math is left unchanged.
+// Guard against singular/near-singular covariance inversions producing
+// infinitely sharp kernels. That can leave R/B denominators at zero while G
+// receives weight, showing up as green or black speckles.
+//
+// A kernel this sharp contributes weight to essentially one raw sample. Under
+// a Bayer CFA that sample belongs to one channel, so the other two accumulate
+// nothing at that output pixel and their denominators stay at zero -- hence
+// the speckle rather than a general softness. Clamping the largest magnitude
+// to k_max_abs bounds the kernel's minimum width instead of rejecting the
+// tile, so the sample still contributes, just over more than one pixel.
+//
+// Keep in step with the Metal twin in HHSRKernels.metal and the mirror in
+// tools/validate_merge_equiv.py: all three are compared against each other.
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
-    if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-        ixx = 1.f;
-        ixy = 0.f;
-        iyy = 1.f;
+    constexpr f32 k_max_abs = 32.f;
+    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
+    if (!(m > k_max_abs) || !std::isfinite(m)) {
+        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
+        return;
     }
+    f32 s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
 }
 
 static inline int cuda_round_to_int(f32 x) {
