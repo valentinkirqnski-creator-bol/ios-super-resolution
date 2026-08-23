@@ -1862,8 +1862,10 @@ final class CameraModel: NSObject, ObservableObject {
     /// Capped at maxFrameCount; the pipeline holds every frame through the merge.
     @Published var importedDNGs: [URL] = []
 
-    /// Process a set of DNGs the user picked. Always at 2x, since importing is
-    /// a deliberate act and the extra resolution is the reason to do it.
+    /// Process a set of DNGs the user picked, at the resolution selected in
+    /// Export settings. This used to force 48MP (and silently overwrote the
+    /// saved resolution preference doing it), which made the 12MP setting
+    /// appear broken: switch to 12MP, import a burst, get a 48MP file.
     func processImportedDNGs(_ urls: [URL]) {
         guard !isBusy else { return }
         let dngs = urls.filter { $0.pathExtension.lowercased() == "dng" }
@@ -1872,7 +1874,6 @@ final class CameraModel: NSObject, ObservableObject {
             return
         }
         importedDNGs = Array(dngs.prefix(Self.maxFrameCount))
-        outputResolutionMode = .super48mp
         isBusy = true
         isCapturing = false
         isProcessing = true
@@ -1906,7 +1907,9 @@ final class CameraModel: NSObject, ObservableObject {
         // The output-resolution choice only means anything when nothing is
         // cropped away; any zoom is realised as crop-then-2x, which is what the
         // 2x lens button always did and is now what every magnification does.
-        let useSelectedOutputScale = !usingDocDNGs && cropZoomForCapture <= 1.0001
+        // Imported DNGs never crop (cropZoomForCapture forced to 1 above), so
+        // the selection applies to them like any uncropped capture.
+        let useSelectedOutputScale = cropZoomForCapture <= 1.0001
         let algorithmScale: Float = useSelectedOutputScale
             ? outputResolutionMode.algorithmScale
             : 2.0
