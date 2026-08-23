@@ -65,24 +65,13 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
     return std::min(std::max(r, 1), std::max(1, rad_max));
 }
 
-// Guard against singular/near-singular covariance inversions producing
-// infinitely sharp kernels. That can leave R/B denominators at zero while G
-// receives weight, showing up as green or black speckles.
+// Impossible-data guard only. Valid python-z covariance math is left unchanged.
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
-    constexpr f32 k_max_abs = 32.f;
-    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
-    if (!(m > k_max_abs) || !std::isfinite(m)) {
-        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-            ixx = 2.f;
-            ixy = 0.f;
-            iyy = 2.f;
-        }
-        return;
+    if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+        ixx = 1.f;
+        ixy = 0.f;
+        iyy = 1.f;
     }
-    f32 s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
 }
 
 static inline int cuda_round_to_int(f32 x) {
@@ -169,9 +158,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // Python accumulate(): coarse_ref_sub_pos = output_pixel / scale.
-            const f32 lr_x = (f32)hr_j / scale;
-            const f32 lr_y = (f32)hr_i / scale;
+            // Python accumulate(): lr = (output_pixel + 0.5) / scale.
+            const f32 lr_x = ((f32)hr_j + 0.5f) / scale;
+            const f32 lr_y = ((f32)hr_i + 0.5f) / scale;
 
             // Python: px = int(lr_x // tile_size); no clamp on flow tile index
             const int px = (int)(lr_x / (f32)tile_size);

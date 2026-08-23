@@ -126,7 +126,7 @@ struct TuningParams: Equatable, Codable {
     /// accumulated mask by which motion prior scored each pixel. Costs one extra
     /// full-resolution buffer per comparison frame while the mask is built.
     var robustness_save_s_masks: Bool = false
-    var accumulated_robustness_denoiser_enabled: Bool = true
+    var accumulated_robustness_denoiser_enabled: Bool = false
     /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
     /// band, 2 = always merge online. Online keeps memory flat in frame count
     /// but its accumulator scales with output pixels, so it is not always the
@@ -413,30 +413,63 @@ final class CameraModel: NSObject, ObservableObject {
     // slider positions are still persisted, so turning manual back on restores
     // the last values.
     @Published var shutterIsAuto = true
-    @Published var shutterSlider: Double = CameraModel.persistedShutterSlider()
+    /// Both sliders serve double duty: under manual they are the input, and
+    /// under Auto the poll keeps them mirroring the metering, so the controls
+    /// always show where the camera actually is and switching to manual starts
+    /// from there rather than jumping.
+    ///
+    /// The manual guard in each didSet is what makes that safe -- without it,
+    /// the poll's own writes would be echoed straight back at the device every
+    /// 200ms. Its absence here was also the reason dragging the shutter did
+    /// nothing once the control was already manual: applyShutter was only ever
+    /// called from the view's "leaving Auto" branch, which by definition does
+    /// not fire when the control is already off Auto, so the value moved, the
+    /// label moved, and the device was never told.
+    @Published var shutterSlider: Double = CameraModel.persistedShutterSlider() {
+        didSet {
+            guard !exposureBatch, !shutterIsAuto else { return }
+            UserDefaults.standard.set(min(1.0, max(0.0, shutterSlider)),
+                                      forKey: Self.shutterSliderDefaultsKey)
+            applyShutter()
+        }
+    }
     /// Manual ISO. Auto by default; when off, isoSlider maps linearly onto the
     /// active format's supported range, which varies per lens and per device.
-    /// Manual ISO. Starts on auto every launch, for the same reason as the
-    /// shutter above.
+    /// Starts on auto every launch, for the same reason as the shutter above.
     @Published var isoIsAuto: Bool = true {
-        didSet { applyShutter() }
+        didSet { if !exposureBatch { applyShutter() } }
     }
     @Published var isoSlider: Double = CameraModel.persistedIsoSlider() {
         didSet {
-            UserDefaults.standard.set(isoSlider, forKey: "IsoSlider")
-            if !isoIsAuto { applyShutter() }
+            guard !exposureBatch, !isoIsAuto else { return }
+            UserDefaults.standard.set(isoSlider, forKey: Self.isoSliderDefaultsKey)
+            applyShutter()
         }
     }
+    /// True while setExposureAuto is moving several of the properties above at
+    /// once. Their didSets each call applyShutter, so without this a single
+    /// mode change would reconfigure the device three times, twice of them
+    /// through a half-updated state.
+    private var exposureBatch = false
+    /// Last ISO the metering settled on, sampled by the auto-exposure poll.
+    /// Reported directly rather than derived from isoSlider, which is only a
+    /// position on a range that changes with the lens and format.
+    @Published private(set) var meteredIso: Float = 0
     @Published var isoMin: Float = 30
     @Published var isoMax: Float = 3000
 
+    private static let isoSliderDefaultsKey = "IsoSlider"
+
     private static func persistedIsoSlider() -> Double {
-        guard UserDefaults.standard.object(forKey: "IsoSlider") != nil else { return 0.0 }
-        return min(1.0, max(0.0, UserDefaults.standard.double(forKey: "IsoSlider")))
+        guard UserDefaults.standard.object(forKey: isoSliderDefaultsKey) != nil else { return 0.0 }
+        return min(1.0, max(0.0, UserDefaults.standard.double(forKey: isoSliderDefaultsKey)))
     }
 
+    /// Numeric in both modes: under Auto it reports what the metering picked,
+    /// which is more use than the word "Auto" next to a control whose own
+    /// button already says whether it is on.
     var isoLabel: String {
-        if isoIsAuto { return "Auto" }
+        if isoIsAuto { return meteredIso > 0 ? "\(Int(meteredIso.rounded()))" : "--" }
         return "\(Int(isoValue.rounded()))"
     }
 
@@ -627,8 +660,10 @@ final class CameraModel: NSObject, ObservableObject {
     /// Session-queue flag: true while a shutter→process cycle owns the camera.
     private var pipelineBusy = false
 
+    /// Numeric in both modes, for the same reason as isoLabel: under Auto the
+    /// poll keeps shutterSlider tracking the metered duration, so formatting it
+    /// reports what the camera is doing.
     var shutterLabel: String {
-        if shutterIsAuto { return "Auto" }
         let sec = durationFromSlider(shutterSlider)
         if sec >= 1.0 { return "\(Int(sec.rounded()))s" }
         let denom = max(1, Int((1.0 / sec).rounded()))
@@ -702,12 +737,29 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    func toggleShutterAuto() {
-        setShutterAuto(!shutterIsAuto)
-    }
+    /// True when the camera is metering for itself. Shutter and ISO share one
+    /// state deliberately -- see setExposureAuto.
+    var exposureIsAuto: Bool { shutterIsAuto && isoIsAuto }
 
-    func setShutterAuto(_ auto: Bool) {
+    /// Hand exposure to the metering, or take it away.
+    ///
+    /// Shutter and ISO move together because AVFoundation gives us exactly two
+    /// usable modes: continuousAutoExposure meters both, and custom sets both.
+    /// There is no ISO-priority mode. The previous code kept two independent
+    /// flags and, for "manual ISO with auto shutter", took the custom branch
+    /// with the duration pinned to whatever the metering had last produced --
+    /// so auto-exposure silently stopped adapting while the UI went on
+    /// reporting "Auto", and the poll below kept reading that frozen value back
+    /// into the slider.
+    func setExposureAuto(_ auto: Bool) {
+        guard !isBusy else { return }
+        // Both flags in one batch: their didSets each call applyShutter, and in
+        // between the two assignments the state is half manual.
+        exposureBatch = true
         shutterIsAuto = auto
+        isoIsAuto = auto
+        exposureBatch = false
+
         persistShutterState()
         applyShutter()
         if auto {
@@ -721,16 +773,18 @@ final class CameraModel: NSObject, ObservableObject {
     /// Apply the persisted shutter UI state when the camera screen appears.
     func ensureShutterAutoOnLaunch() {
         applyShutter()
-        if shutterIsAuto { startAutoExposureSyncIfNeeded() }
+        if exposureIsAuto { startAutoExposureSyncIfNeeded() }
     }
 
-    func applyManualShutterFromSlider() {
-        guard !isBusy else { return }
-        if shutterIsAuto { shutterIsAuto = false }
-        persistShutterState()
-        applyShutter()
-        exposureSyncTimer?.invalidate()
-        exposureSyncTimer = nil
+    /// Called as a drag on the exposure track begins, before any value is
+    /// written. Stopping the poll here rather than after the first value change
+    /// is what keeps the metering from overwriting the position mid-drag; the
+    /// old ordering wrote the value first and only then asked to leave Auto,
+    /// and its isBusy guard could reject that request outright, leaving the
+    /// control in Auto with the timer still running -- the "works sometimes".
+    func beginManualExposureDrag() {
+        guard exposureIsAuto else { return }
+        setExposureAuto(false)
     }
 
     private func persistShutterState() {
@@ -1049,7 +1103,7 @@ final class CameraModel: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
             self.applyShutter()
-            if self.shutterIsAuto {
+            if self.exposureIsAuto {
                 self.startAutoExposureSyncIfNeeded()
             } else {
                 self.exposureSyncTimer?.invalidate()
@@ -1089,7 +1143,7 @@ final class CameraModel: NSObject, ObservableObject {
         ensureReadyBurstDir()
         DispatchQueue.main.async {
             self.applyShutter()
-            if self.shutterIsAuto {
+            if self.exposureIsAuto {
                 self.startAutoExposureSyncIfNeeded()
             } else {
                 self.exposureSyncTimer?.invalidate()
@@ -1130,42 +1184,85 @@ final class CameraModel: NSObject, ObservableObject {
         return min(1.0, max(0.0, (log(clamped) - logMin) / (logMax - logMin)))
     }
 
+    /// Everything applyShutterOnSessionQueue needs, snapshotted where the
+    /// properties live. It used to read isoIsAuto and isoValue straight off the
+    /// session queue while the UI was writing them from main.
+    private struct ExposureRequest {
+        var isAuto: Bool
+        var slider: Double
+        var minSec: Double
+        var maxSec: Double
+        var isoAuto: Bool
+        var isoValue: Float
+    }
+
+    private func currentExposureRequest() -> ExposureRequest {
+        ExposureRequest(isAuto: shutterIsAuto,
+                        slider: shutterSlider,
+                        minSec: exposureMinSec,
+                        maxSec: exposureMaxSec,
+                        isoAuto: isoIsAuto,
+                        isoValue: isoValue)
+    }
+
+    /// Latest requested exposure, and whether a session-queue block is already
+    /// on its way to consume it.
+    private let exposureLock = NSLock()
+    private var pendingExposure: ExposureRequest?
+    private var exposureApplyQueued = false
+
+    /// A drag produces a value change per touch sample, and each one lands here.
+    /// Enqueuing a separate setExposureModeCustom for every sample backs the
+    /// session queue up behind settings that are already stale, which shows up
+    /// as the control lagging the finger and settling somewhere it was not
+    /// released. Only the newest request survives to reach the device.
     private func applyShutter() {
-        let isAuto = shutterIsAuto
-        let slider = shutterSlider
-        let minSec = exposureMinSec
-        let maxSec = exposureMaxSec
+        let req = currentExposureRequest()
+        exposureLock.lock()
+        pendingExposure = req
+        let alreadyQueued = exposureApplyQueued
+        exposureApplyQueued = true
+        exposureLock.unlock()
+        guard !alreadyQueued else { return }
+
         sessionQueue.async {
-            self.applyShutterOnSessionQueue(isAuto: isAuto, slider: slider, minSec: minSec, maxSec: maxSec)
+            self.exposureLock.lock()
+            let latest = self.pendingExposure
+            self.pendingExposure = nil
+            self.exposureApplyQueued = false
+            self.exposureLock.unlock()
+            if let latest = latest { self.applyShutterOnSessionQueue(latest) }
         }
     }
 
-    private func applyShutterOnSessionQueue(isAuto: Bool, slider: Double, minSec: Double, maxSec: Double) {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
-        if isAuto && isoIsAuto {
+    /// `alreadyLocked` for the two burst-teardown callers, which hold the
+    /// configuration lock across a group of changes. They used to call in
+    /// unconditionally, so the device was locked once and unlocked twice.
+    private func applyShutterOnSessionQueue(_ req: ExposureRequest,
+                                            alreadyLocked: Bool = false) {
+        guard let d = device else { return }
+        if !alreadyLocked, (try? d.lockForConfiguration()) == nil { return }
+        defer { if !alreadyLocked { d.unlockForConfiguration() } }
+
+        if req.isAuto && req.isoAuto {
             if d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
         } else if d.isExposureModeSupported(.custom) {
             let minD = d.activeFormat.minExposureDuration
             let maxD = d.activeFormat.maxExposureDuration
-            var t = isAuto
-                ? d.exposureDuration
-                : CMTimeMakeWithSeconds(durationFromSlider(slider, minSec: minSec, maxSec: maxSec),
-                                        preferredTimescale: 1_000_000_000)
+            var t = CMTimeMakeWithSeconds(
+                durationFromSlider(req.slider, minSec: req.minSec, maxSec: req.maxSec),
+                preferredTimescale: 1_000_000_000)
             if CMTimeCompare(t, minD) < 0 { t = minD }
             if CMTimeCompare(t, maxD) > 0 { t = maxD }
-            // Manual ISO when the user has taken it off auto; otherwise hold
-            // whatever the metering had settled on, as before.
-            let wanted = isoIsAuto ? d.iso : isoValue
-            let iso = min(max(d.activeFormat.minISO, wanted), d.activeFormat.maxISO)
+            let iso = min(max(d.activeFormat.minISO, req.isoValue), d.activeFormat.maxISO)
             d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
         } else {
             DispatchQueue.main.async {
-                self.statusText = "Manual shutter not supported on this camera"
+                self.statusText = "Manual exposure not supported on this camera"
             }
         }
-        d.unlockForConfiguration()
     }
 
     private func device(for selection: CameraSelection) -> AVCaptureDevice? {
@@ -1213,7 +1310,7 @@ final class CameraModel: NSObject, ObservableObject {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
         }
         // Persisted Auto path: continuous AE only when the UI state says Auto.
-        if shutterIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
+        if exposureIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
             d.exposureMode = .continuousAutoExposure
         }
         d.isSubjectAreaChangeMonitoringEnabled = false
@@ -1223,21 +1320,35 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func startAutoExposureSyncIfNeeded() {
         exposureSyncTimer?.invalidate()
-        guard shutterIsAuto else { return }
+        exposureSyncTimer = nil
+        guard exposureIsAuto else { return }
         guard isAppActive, !previewSuspended else { return }
         exposureSyncTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             self?.pollAutoExposureForSlider()
         }
     }
 
+    /// Mirrors the metering into both sliders while it owns exposure, so the
+    /// readouts show what the camera is actually doing and taking over hands
+    /// control across at the exposure already on screen instead of jumping to
+    /// wherever the sliders were last left.
     private func pollAutoExposureForSlider() {
-        guard shutterIsAuto, !isBusy else { return }
+        guard exposureIsAuto, !isBusy else { return }
         sessionQueue.async {
             guard let d = self.device else { return }
             let sec = CMTimeGetSeconds(d.exposureDuration)
-            guard sec.isFinite, sec > 0 else { return }
+            let iso = d.iso
             DispatchQueue.main.async {
-                self.shutterSlider = self.sliderFromDuration(sec)
+                // Re-checked on the main thread: the hop off and back gives the
+                // user time to have started a drag, and writing the metered
+                // value then would yank the control out from under them.
+                guard self.exposureIsAuto else { return }
+                if sec.isFinite, sec > 0 { self.shutterSlider = self.sliderFromDuration(sec) }
+                if iso.isFinite, iso > 0, self.isoMax > self.isoMin {
+                    self.meteredIso = iso
+                    self.isoSlider = Double(min(1, max(0, (iso - self.isoMin)
+                                                        / (self.isoMax - self.isoMin))))
+                }
             }
         }
     }
@@ -1260,15 +1371,13 @@ final class CameraModel: NSObject, ObservableObject {
         let p = CGPoint(x: min(1, max(0, devicePoint.x)),
                         y: min(1, max(0, devicePoint.y)))
 
-        // A tap says "work the exposure out for me, here", so it also takes the
-        // sliders back to Auto. Setting isoIsAuto runs its didSet, which
-        // re-applies the exposure mode; the block below then points it at the
-        // tap.
-        if !shutterIsAuto || !isoIsAuto {
-            shutterIsAuto = true
-            isoIsAuto = true
-            persistShutterState()
-        }
+        // Manual exposure deliberately survives a tap now. It used to be reset
+        // to Auto here on the reading that a tap means "work it out for me",
+        // but the preview fills the screen and doubles as the focus target, so
+        // any stray tap silently discarded a manually set exposure -- and from
+        // the outside that is indistinguishable from the controls not working.
+        // A tap sets focus, and exposure point when the metering owns it.
+        let meteringOwnsExposure = exposureIsAuto
 
         sessionQueue.async {
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
@@ -1293,7 +1402,11 @@ final class CameraModel: NSObject, ObservableObject {
             // responding to light entirely. The point of interest persists under
             // continuous metering anyway, and the metering stays weighted to it,
             // so nothing is lost by not locking.
-            if d.isExposureModeSupported(.continuousAutoExposure) {
+            //
+            // Skipped entirely under manual exposure: the point of interest is
+            // still worth setting for when metering resumes, but switching the
+            // mode here would undo the custom duration and ISO.
+            if meteringOwnsExposure, d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
 
@@ -1301,8 +1414,7 @@ final class CameraModel: NSObject, ObservableObject {
             d.unlockForConfiguration()
         }
 
-        // Back on Auto, so the shutter readout has to start tracking again.
-        startAutoExposureSyncIfNeeded()
+        if meteringOwnsExposure { startAutoExposureSyncIfNeeded() }
     }
 
     /// The scene changed enough that the tapped subject is probably gone.
@@ -1321,7 +1433,7 @@ final class CameraModel: NSObject, ObservableObject {
             if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
             if d.isExposurePointOfInterestSupported { d.exposurePointOfInterest = centre }
             // Only reclaim exposure if the user has not since gone manual.
-            if self.shutterIsAuto, self.isoIsAuto,
+            if self.exposureIsAuto,
                d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
@@ -1645,12 +1757,8 @@ final class CameraModel: NSObject, ObservableObject {
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                     d.whiteBalanceMode = .continuousAutoWhiteBalance
                 }
-                self.applyShutterOnSessionQueue(
-                    isAuto: self.shutterIsAuto,
-                    slider: self.shutterSlider,
-                    minSec: self.exposureMinSec,
-                    maxSec: self.exposureMaxSec
-                )
+                self.applyShutterOnSessionQueue(self.currentExposureRequest(),
+                                                alreadyLocked: true)
                 d.unlockForConfiguration()
             }
             if self.isAppActive && !self.previewSuspended {
@@ -1670,7 +1778,9 @@ final class CameraModel: NSObject, ObservableObject {
         guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-        if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+        // Only worth locking when the metering owns exposure; under manual the
+        // device is already on a fixed custom duration and ISO.
+        if exposureIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
         d.unlockForConfiguration()
     }
 
@@ -1682,12 +1792,8 @@ final class CameraModel: NSObject, ObservableObject {
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 d.whiteBalanceMode = .continuousAutoWhiteBalance
             }
-            self.applyShutterOnSessionQueue(
-                isAuto: self.shutterIsAuto,
-                slider: self.shutterSlider,
-                minSec: self.exposureMinSec,
-                maxSec: self.exposureMaxSec
-            )
+            self.applyShutterOnSessionQueue(self.currentExposureRequest(),
+                                            alreadyLocked: true)
             d.unlockForConfiguration()
         }
     }

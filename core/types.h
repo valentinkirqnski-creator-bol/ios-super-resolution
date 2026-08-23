@@ -419,12 +419,16 @@ struct Config {
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
     std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
-    // Finest level raised from 1 to 2.
+    // Finest level back to the reference's 1 (python-z default.yaml has
+    // search_radii: [1, 4, 4, 4]); the coarse levels keep 4.
     //
     // The align_ica_per_level comment below works out the budget: with factors
     // {1,2,4,4} the flow arriving at a level carries up to 0.5*factor of
     // residual, so levels 2 and 1 receive 2px against a radius of 4 and have
-    // slack, while level 0 received 1px against a radius of 1 and had none.
+    // slack, while level 0 receives 1px against a radius of 1 and has none.
+    // Per-level ICA is what buys that margin back, by making what arrives
+    // sub-pixel instead of integer -- so this value and align_ica_per_level
+    // have to be reasoned about together.
     //
     // Measured on the ok/ burst -- repetitive straight-line structure, the
     // adverse case for this parameter -- comparing 0728 against 0727:
@@ -442,9 +446,14 @@ struct Config {
     // coarser levels agreed on. Content with genuine fine-scale motion and no
     // repetition was never tested and may prefer the wider window.
     //
+    // In RAW pixels, like bm_tile_sizes; grey_search_radius converts to grey
+    // pixels at the point of use, so a configured 4 reaches the same physical
+    // distance on both greys. The decimate finest level is the one place the
+    // two cannot be equalised -- see grey_search_radius.
+    //
     // Also sets the ICA step clamp, which bounds one iteration to the level's
-    // search radius -- so this is 3px at the finest level.
-    std::vector<int> bm_search_radii = {3, 4, 4, 4};
+    // search radius, over ica_n_iter iterations.
+    std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
 
     // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
@@ -551,6 +560,27 @@ struct Config {
     int grey_tile_size(int raw_tile_size) const {
         const int s = alignment_grey_scale();
         return (s <= 1) ? raw_tile_size : std::max(8, raw_tile_size / s);
+    }
+    // bm_search_radii[lvl] converted from raw pixels into alignment-grey
+    // pixels, mirroring grey_tile_size so that both quantities denote the same
+    // physical distance whichever grey the alignment runs on. Before this
+    // existed the radii were consumed as grey pixels while the tile sizes were
+    // converted, so the same configured number reached twice as far on the
+    // decimate path -- 256 raw pixels at the coarsest level against FFT's 128,
+    // and a finest window of +/-2 raw against FFT's +/-1.
+    //
+    // Floored at 1: the search is an integer grid on the grey, so half a grey
+    // pixel is not expressible, and a zero-radius level would evaluate only the
+    // seed it was handed.
+    //
+    // That floor has a consequence worth stating plainly. On the decimate grey
+    // the finest level cannot reach a single RAW pixel: 1/2 floors back to 1
+    // grey pixel, which spans 2 raw. Closing that last factor of two would
+    // require the search itself to run at raw resolution, not a change of
+    // units here.
+    int grey_search_radius(int raw_radius) const {
+        const int s = alignment_grey_scale();
+        return (s <= 1) ? raw_radius : std::max(1, raw_radius / s);
     }
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
     // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
@@ -802,7 +832,7 @@ struct Config {
     int   motion_edge_neighborhood_radius = 1;
 
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
-    bool  accumulated_robustness_denoiser_enabled = true;
+    bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
     // How the burst is merged. 0 = pick by working-set size, 1 = force banded

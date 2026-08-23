@@ -1207,8 +1207,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         // is built on the alignment grey. See Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = (lvl < (int)cfg.bm_search_radii.size())
-                     ? cfg.bm_search_radii[lvl] : 2;
+        // Grey-domain search radius -- bm_search_radii is in RAW pixels, same
+        // as bm_tile_sizes. See Config::grey_search_radius.
+        int radius = cfg.grey_search_radius(
+            (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2);
 
         // Tile grid from padded ref level (Python: h // tile_size)
         int ny = r.h / ts;
@@ -1265,8 +1267,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         finest_hess = compute_hessian(gx, gy, cfg.grey_tile_size(tile_size));
         debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
         debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
-        const int finest_radius = cfg.bm_search_radii.empty() ? 1
-                                                              : cfg.bm_search_radii[0];
+        const int finest_radius = cfg.grey_search_radius(
+            cfg.bm_search_radii.empty() ? 1 : cfg.bm_search_radii[0]);
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow,
                          cfg.grey_tile_size(tile_size),
                          cfg.ica_n_iter, cfg.num_threads,

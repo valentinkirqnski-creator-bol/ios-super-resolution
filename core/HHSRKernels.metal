@@ -902,20 +902,11 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
 }
 
 inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
-    const float k_max_abs = 32.f;
-    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
-    if (!(m > k_max_abs) || !isfinite(m)) {
-        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
-            ixx = 2.f;
-            ixy = 0.f;
-            iyy = 2.f;
-        }
-        return;
+    if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+        ixx = 1.f;
+        ixy = 0.f;
+        iyy = 1.f;
     }
-    float s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
 }
 
 inline float cov_lerp2(device const float* covs, uint cov_w,
@@ -1058,8 +1049,8 @@ static inline void merge_comp_contrib(device const float* img,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
     int hr_i = int(p.y0 + local_i);
-    float lr_x = float(hr_j) / p.scale;
-    float lr_y = float(hr_i) / p.scale;
+    float lr_x = (float(hr_j) + 0.5f) / p.scale;
+    float lr_y = (float(hr_i) + 0.5f) / p.scale;
 
     // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
     int px = int(lr_x / float(p.tile_size));

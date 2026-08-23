@@ -9,16 +9,28 @@ struct CameraView: View {
     @State private var pinchBaseZoom: CGFloat?
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
-    /// True only while the user is actively dragging the shutter slider.
+    /// Guards the one-time exposure setup in onAppear, which runs again on
+    /// every scene change otherwise.
     @State private var didApplyLaunchShutter = false
-    /// Manual capture controls (burst length, shutter) shown above the
-    /// viewfinder. Collapsible so the preview can fill the screen.
     @State private var showImporter = false
     @State private var showGallery = false
+    @State private var exposureParam: ExposureParam = .shutter
+
+    /// Warm amber, used for every active/selected state. The chrome was built
+    /// around a cyan close to the one Google Camera uses; keeping the layout
+    /// but moving the accent and squaring off the chips is what separates this
+    /// from looking like a clone of it.
+    static let accent = Color(red: 0.98, green: 0.72, blue: 0.28)
+    /// Squircle rather than a circle or a capsule, for the same reason.
+    static var chipShape: RoundedRectangle { RoundedRectangle(cornerRadius: 9, style: .continuous) }
 
     var body: some View {
         GeometryReader { geo in
-            let topBarH: CGFloat = 88
+            // Three rows now: utilities and readouts, the exposure control, the
+            // frame count. Sized to leave the same slack around the content as
+            // the two-row version did, so the viewfinder gives up only what the
+            // extra row costs.
+            let topBarH: CGFloat = 126
             let bottomH: CGFloat = 96
             let vfWidth = geo.size.width
             // One value for the space below the controls, used both to reserve
@@ -92,8 +104,8 @@ struct CameraView: View {
             // match the framing that will actually be saved. The zoom is applied
             // to the preview layer inside CameraPreview, not with .scaleEffect
             // here: .clipped() clips rendering but not hit testing, so scaling
-            // the view made the magnified preview swallow taps on the settings
-            // button and the exposure sliders.
+            // the view made the magnified preview swallow taps on the chrome
+            // around it.
             CameraPreview(
                 session: cam.session,
                 mirrorFront: cam.cameraSelection == .front,
@@ -122,26 +134,6 @@ struct CameraView: View {
             thirdsGrid
                 .frame(width: width, height: height)
                 .allowsHitTesting(false)
-
-            // Exposure controls sit on the frame edges rather than in a bar
-            // above it, so the preview keeps the full height.
-            HStack {
-                edgeSlider(value: $cam.isoSlider,
-                           symbol: "circle.lefthalf.fill",   // .filled variant is iOS 16+
-                           active: !cam.isoIsAuto,
-                           height: height * 0.42,
-                           toggle: { cam.isoIsAuto.toggle() },
-                           goManual: { cam.isoIsAuto = false })
-                Spacer()
-                edgeSlider(value: $cam.shutterSlider,
-                           symbol: "sun.max",
-                           active: !cam.shutterIsAuto,
-                           height: height * 0.42,
-                           toggle: { cam.setShutterAuto(!cam.shutterIsAuto) },
-                           goManual: { cam.applyManualShutterFromSlider() })
-            }
-            .padding(.horizontal, 14)
-            .frame(width: width, height: height)
 
             VStack {
                 Spacer()
@@ -196,67 +188,6 @@ struct CameraView: View {
         }
     }
 
-    /// Vertical track with a round icon handle that rides it. Tapping the
-    /// handle toggles the control between auto and manual; dragging anywhere on
-    /// the track sets the value, so the handle is not a small hit target.
-    private func edgeSlider(value: Binding<Double>,
-                            symbol: String,
-                            active: Bool,
-                            height: CGFloat,
-                            toggle: @escaping () -> Void,
-                            goManual: @escaping () -> Void) -> some View {
-        GeometryReader { g in
-            let h = g.size.height
-            let knob: CGFloat = 34
-            let travel = max(1, h - knob)
-            // Top of the track is the high value, as on a physical fader.
-            let y = knob / 2 + travel * CGFloat(1 - value.wrappedValue)
-            ZStack(alignment: .top) {
-                Capsule()
-                    .fill(Color.white.opacity(active ? 0.85 : 0.35))
-                    .frame(width: 2, height: h)
-                    .frame(maxWidth: .infinity)
-                ZStack {
-                    Circle().fill(Color.black.opacity(0.55)).frame(width: knob, height: knob)
-                    Circle().strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
-                        .frame(width: knob, height: knob)
-                    Image(systemName: symbol)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundColor(active ? .white : .white.opacity(0.55))
-                }
-                .position(x: g.size.width / 2, y: y)
-            }
-            .contentShape(Rectangle())
-            // One gesture handles both roles. The knob used to be a Button,
-            // which swallowed any drag beginning on it -- and the knob is
-            // exactly where a slider gets grabbed, so dragging did nothing.
-            // minimumDistance 0 also means the value tracks the very first
-            // touch instead of only after 4pt of travel.
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { v in
-                        guard !cam.isBusy else { return }
-                        // Below the tap threshold this may still turn out to be
-                        // a tap, so do not move the value yet.
-                        guard hypot(v.translation.width, v.translation.height) > 4 else { return }
-                        let t = 1 - (v.location.y - knob / 2) / travel
-                        value.wrappedValue = min(1, max(0, Double(t)))
-                        // Dragging leaves Auto, as the previous slider did --
-                        // otherwise the handle has to be tapped first and the
-                        // drag silently does nothing.
-                        if !active { goManual() }
-                    }
-                    .onEnded { v in
-                        guard !cam.isBusy else { return }
-                        if hypot(v.translation.width, v.translation.height) <= 4 {
-                            toggle()
-                        }
-                    }
-            )
-        }
-        .frame(width: 44, height: height)
-    }
-
     private func showFocusIndicator(at point: CGPoint) {
         focusPoint = point
         withAnimation(.easeOut(duration: 0.12)) { focusVisible = true }
@@ -268,7 +199,7 @@ struct CameraView: View {
     // MARK: - Top strip
 
     private var topStrip: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             HStack(spacing: 14) {
                 roundIconButton("gearshape.fill") { showSettings = true }
                 // A stack of frames collapsing into one output is the closest
@@ -276,21 +207,123 @@ struct CameraView: View {
                 roundIconButton("square.stack.3d.down.right.fill") { showImporter = true }
                 formatButton
                 Spacer()
+                readout("ISO", cam.isoLabel, highlighted: exposureParam == .iso)
+                readout("SEC", cam.shutterLabel, highlighted: exposureParam == .shutter)
             }
+
+            exposureBar
 
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
-                Text("ISO " + cam.isoLabel)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.6))
-                Text(cam.shutterLabel)
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.85))
-                    .frame(minWidth: 44, alignment: .trailing)
             }
         }
         .padding(.horizontal, 20)
+    }
+
+    /// Which parameter the exposure track is driving. Only one is editable at a
+    /// time, so the track can be full width and the readouts stay legible --
+    /// the arrangement most camera apps settle on.
+    private enum ExposureParam { case shutter, iso }
+
+    private func readout(_ caption: String, _ value: String, highlighted: Bool) -> some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            Text(caption)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(highlighted ? 0.55 : 0.3))
+            Text(value)
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                .foregroundColor(highlighted ? Self.accent : .white.opacity(0.7))
+        }
+        .frame(minWidth: 46, alignment: .trailing)
+    }
+
+    /// Parameter button, track, auto button. Tapping the parameter button
+    /// swaps which of the two the track drives; Auto is deliberately its own
+    /// button rather than a third position, so leaving Auto never costs you the
+    /// parameter you had selected.
+    private var exposureBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                exposureParam = (exposureParam == .shutter) ? .iso : .shutter
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: exposureParam == .shutter ? "stopwatch" : "speedometer")
+                        .font(.system(size: 13, weight: .medium))
+                    Text(exposureParam == .shutter ? "SHUT" : "ISO")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                }
+                .foregroundColor(cam.exposureIsAuto ? .white.opacity(0.5) : Self.accent)
+                .frame(width: 68, height: 30)
+                .background(Self.chipShape.fill(Color.white.opacity(0.07)))
+                .overlay(Self.chipShape.strokeBorder(
+                    (cam.exposureIsAuto ? Color.white.opacity(0.14) : Self.accent.opacity(0.55)),
+                    lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+
+            exposureTrack
+
+            Button {
+                cam.setExposureAuto(!cam.exposureIsAuto)
+            } label: {
+                Text("A")
+                    .font(.system(size: 13, weight: .heavy, design: .rounded))
+                    .foregroundColor(cam.exposureIsAuto ? .black : .white.opacity(0.55))
+                    .frame(width: 34, height: 30)
+                    .background(Self.chipShape.fill(cam.exposureIsAuto
+                                                    ? Self.accent
+                                                    : Color.white.opacity(0.07)))
+                    .overlay(Self.chipShape.strokeBorder(
+                        cam.exposureIsAuto ? Color.clear : Color.white.opacity(0.14),
+                        lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .disabled(cam.isBusy)
+        }
+    }
+
+    /// Horizontal fader. The whole track is the hit target, and the very first
+    /// touch moves the value -- the old vertical control needed 4pt of travel
+    /// before it responded, and its handle was a Button that swallowed drags
+    /// starting on it, which is exactly where a slider gets grabbed.
+    private var exposureTrack: some View {
+        let binding = exposureParam == .shutter ? $cam.shutterSlider : $cam.isoSlider
+        return GeometryReader { g in
+            let w = g.size.width
+            let cap: CGFloat = 14
+            let travel = max(1, w - cap)
+            let x = cap / 2 + travel * CGFloat(binding.wrappedValue)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.14))
+                    .frame(height: 3)
+                Capsule()
+                    .fill(cam.exposureIsAuto ? Color.white.opacity(0.3) : Self.accent.opacity(0.8))
+                    .frame(width: max(0, x - cap / 2), height: 3)
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .fill(cam.exposureIsAuto ? Color.white.opacity(0.6) : Self.accent)
+                    .frame(width: cap, height: 22)
+                    .position(x: x, y: g.size.height / 2)
+            }
+            .frame(height: g.size.height)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        guard !cam.isBusy else { return }
+                        // Leave Auto before writing anything: the metering poll
+                        // rewrites these values every 200ms while Auto is on, so
+                        // a value written first can be overwritten before the
+                        // mode change lands.
+                        if cam.exposureIsAuto { cam.beginManualExposureDrag() }
+                        guard !cam.exposureIsAuto else { return }
+                        let t = (v.location.x - cap / 2) / travel
+                        binding.wrappedValue = min(1, max(0, Double(t)))
+                    }
+            )
+        }
+        .frame(height: 30)
     }
 
     private var frameCountControl: some View {
@@ -363,13 +396,13 @@ struct CameraView: View {
     private func zoomSlider(width: CGFloat) -> some View {
         let trackW = max(120, width - 96)
         let ticks = 29
-        let accent = Color(red: 0.62, green: 0.85, blue: 0.88)
+        let accent = Self.accent
         return VStack(spacing: 6) {
             Text(Self.zoomLabel(cam.zoomFactor))
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
                 .foregroundColor(.black)
-                .frame(width: 52, height: 34)
-                .background(Circle().fill(accent))
+                .frame(width: 52, height: 30)
+                .background(Self.chipShape.fill(accent))
                 .offset(x: (zoomPosition(cam.zoomFactor) - 0.5) * trackW)
 
             ZStack {
@@ -443,21 +476,20 @@ struct CameraView: View {
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 5)
-            .background(Capsule().fill(Color.black.opacity(0.45)))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.black.opacity(0.45)))
         }
     }
 
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 12, weight: selected ? .bold : .medium))
+                .font(.system(size: 12, weight: selected ? .bold : .medium, design: .monospaced))
                 .foregroundColor(selected ? .black : .white.opacity(0.92))
-                .frame(width: 38, height: 38)
-                .background(
-                    Circle().fill(selected
-                                  ? Color(red: 0.86, green: 0.78, blue: 0.60)
-                                  : Color.white.opacity(0.14))
-                )
+                .frame(width: 38, height: 34)
+                .background(Self.chipShape.fill(selected
+                                                ? Self.accent
+                                                : Color.white.opacity(0.12)))
         }
         .disabled(cam.isBusy)
     }

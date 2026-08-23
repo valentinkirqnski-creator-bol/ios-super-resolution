@@ -2693,7 +2693,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
-        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
+        int radius = cfg.grey_search_radius(
+            (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2);
         if (metric != "L1" && metric != "L2") return false;
         if (radius < 0) return false;
     }
@@ -2748,7 +2749,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // align() in align.cpp; see Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
+        // Grey-domain search radius -- bm_search_radii is in RAW pixels, same
+        // as bm_tile_sizes. See Config::grey_search_radius.
+        int radius = cfg.grey_search_radius(
+            (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2);
 
         id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
         if (!b_ref) return false;
@@ -2857,7 +2861,15 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!ica_all || cfg.ica_per_level_coarse_only()) {
     id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
     int ica_ny = 0, ica_nx = 0;
-    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
+    // Grey-domain tile size, as everywhere else in this file and as align.cpp's
+    // matching CPU pass does. Passing the RAW tile size here built the Hessian
+    // on a grid of grey_h/16 rather than grey_h/8 on the decimate path, which
+    // the flow-grid check below then rejected -- so this branch could only ever
+    // fail there, taking the whole frame's alignment with it. Unreachable at
+    // the shipped defaults because decimate runs per-level ICA and never enters
+    // this block, but it made align_ica_per_level a switch that broke decimate.
+    const int ica_ts = cfg.grey_tile_size(tile_size);
+    if (!prep_level_ica_gpu(ref_grey, ica_ts, b_ref_native, b_gx, b_gy, b_hess,
                             ica_ny, ica_nx))
         return false;
     if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
@@ -2877,10 +2889,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!b_mov_native) return false;
     if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
-                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter,
+                  flow_ny, flow_nx, ica_ts, cfg.ica_n_iter,
                   ica_damp_ratio_metal(cfg),
-                  ica_max_step_metal(cfg, cfg.bm_search_radii.empty()
-                                              ? 1 : cfg.bm_search_radii[0])))
+                  ica_max_step_metal(cfg, cfg.grey_search_radius(
+                      cfg.bm_search_radii.empty() ? 1 : cfg.bm_search_radii[0]))))
         return false;
     }
 
