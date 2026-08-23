@@ -736,17 +736,9 @@ struct CameraView: View {
              the extra reference gradients to about a quarter of a frame.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
-        Text("""
-             Replaces the block-matching pyramid with a PWCNet model run on-device via \
-             Core ML, feeding the same robustness/merge math either way. Falls back to the \
-             classical path per-frame if the bundled model is missing or fails to load. \
-             Experimental -- not yet validated against real bursts on-device.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Ambiguous-Match Fallback", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
         Text("""
-             ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
+             ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
@@ -769,15 +761,6 @@ struct CameraView: View {
              Continuous gives anisotropy 0.6 a 4.8:1 kernel instead of 1:1: still sharp              ACROSS the stroke, but covering along it. Both endpoints are unchanged --              isotropic content stays round, a perfect edge still gets the full 8:1 --              only the middle is filled in, and the middle is where text lives.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
-            .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
-                + "trained network. The analytic mask decides from a colour difference "
-                + "between 3x3 local means, which cannot see a misalignment that lands on "
-                + "similar-looking content or one finer than that window. The network sees "
-                + "the same statistics plus the estimated flow, its local spread and a wider "
-                + "neighbourhood. Measured against ground truth on synthetic bursts built "
-                + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
-                + "analytic mask automatically if the model is missing.")
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
@@ -789,15 +772,6 @@ struct CameraView: View {
     // was one 343-line expression and the Swift type checker gave up on it
     // ("unable to type-check this expression in reasonable time"); these are
     // the two largest, and moving them lets each be checked on its own.
-    // Out of the ViewBuilder deliberately: an inline ternary in a Text is the
-    // shape that has previously pushed this file past the type-checker limit.
-    private var chooseReferenceHelp: String {
-        if cam.tuningParams.global_prealignment_choose_reference {
-            return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
-        }
-        return "Frame 0 is the merge base, so pre-alignment runs inside the alignment pass at roughly the cost of one thumbnail per frame."
-    }
-
     @ViewBuilder
     private var robustnessSection: some View {
                 Section(header: Text("Robustness (Motion Rejection)")) {
@@ -834,81 +808,6 @@ struct CameraView: View {
                          ? "Full-res FFT low-pass. Slower."
                          : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
                         .font(.caption2).foregroundColor(.secondary)
-                    Toggle("HF Artifact Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
-                    Text("Rejects repetitive fine texture that block matching cannot align (aperture problem). Needs high-frequency content AND unstable flow, so hair and noise are spared.")
-                        .font(.caption2).foregroundColor(.secondary)
-
-                    if cam.tuningParams.hf_artifact_removal_enabled {
-                        HStack {
-                            Text("Variance Loss")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_loss_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.hf_variance_loss_threshold, in: 0.50...0.99, step: 0.01)
-
-                        HStack {
-                            Text("Min Texture SNR")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))
-                        }
-                        Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
-                    }
-
-                    Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
-                    Text("Rejects one-dimensional tiles only when their aligned residual is high.")
-                        .font(.caption2).foregroundColor(.secondary)
-
-                    if cam.tuningParams.flow_reject_1d_enabled {
-                        HStack {
-                            Text("1D Residual")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.flow_reject_1d_residual_threshold))
-                                .monospacedDigit()
-                        }
-                        Slider(value: $cam.tuningParams.flow_reject_1d_residual_threshold,
-                               in: 0.0...8.0,
-                               step: 0.05)
-                    }
-
-                    Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
-
-                    if cam.tuningParams.motion_edge_rejection_enabled {
-                        HStack {
-                            Text("Edge Threshold")
-                            Spacer()
-                            Text(String(format: "%.3f", cam.tuningParams.motion_edge_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.motion_edge_threshold,
-                               in: 0.0...0.12,
-                               step: 0.001)
-
-                        HStack {
-                            Text("Residual Threshold")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.motion_edge_residual_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.motion_edge_residual_threshold,
-                               in: 0.0...8.0,
-                               step: 0.05)
-
-                        HStack {
-                            Text("Edge Noise Floor")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.motion_edge_noise_floor_multiplier))
-                        }
-                        Slider(value: $cam.tuningParams.motion_edge_noise_floor_multiplier,
-                               in: 0.0...2.0,
-                               step: 0.1)
-
-                        Stepper(value: $cam.tuningParams.motion_edge_neighborhood_radius,
-                                in: 0...2) {
-                            HStack {
-                                Text("Edge Neighborhood")
-                                Spacer()
-                                Text("\(cam.tuningParams.motion_edge_neighborhood_radius)")
-                            }
-                        }
-                    }
                 }
     }
 
@@ -916,47 +815,6 @@ struct CameraView: View {
     private var kernelsSection: some View {
                 Section(header: Text("Steerable Kernels (Merging)")) {
                     Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
-                    Toggle("Debug Pixel 4a Noise", isOn: $cam.tuningParams.debug_pixel4a_noise_profile)
-                    Text("Ignores the captured DNG NoiseProfile and uses bundled Pixel 4a correction curves at the rounded ISO. For Python parity/debugging only.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
-
-                    if cam.tuningParams.global_prealignment_enabled {
-                        Toggle("Choose Reference Frame", isOn: $cam.tuningParams.global_prealignment_choose_reference)
-                        Text(chooseReferenceHelp)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        HStack {
-                            Text("Rotation Search")
-                            Spacer()
-                            Text(String(format: "%.1f deg", cam.tuningParams.global_prealignment_rotation_range_deg))
-                        }
-                        Slider(value: $cam.tuningParams.global_prealignment_rotation_range_deg,
-                               in: 0.0...2.0,
-                               step: 0.1)
-
-                        HStack {
-                            Text("Rotation Step")
-                            Spacer()
-                            Text(String(format: "%.2f deg", cam.tuningParams.global_prealignment_rotation_step_deg))
-                        }
-                        Slider(value: $cam.tuningParams.global_prealignment_rotation_step_deg,
-                               in: 0.05...1.0,
-                               step: 0.05)
-
-                        Stepper(value: $cam.tuningParams.global_prealignment_max_shift,
-                                in: 0...64,
-                                step: 4) {
-                            HStack {
-                                Text("Global Shift")
-                                Spacer()
-                                Text("\(cam.tuningParams.global_prealignment_max_shift)")
-                            }
-                        }
-                    }
 
                     Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
                         Text("Auto").tag(0)
@@ -1121,13 +979,6 @@ struct CameraView: View {
                     Text("When on, also saves a grayscale robustness mask to Photos after processing.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
-
-                    if cam.tuningParams.robustness_save_mask {
-                        Toggle("Save s1/s2 Split Masks", isOn: $cam.tuningParams.robustness_save_s_masks)
-                        Text("Also writes _robustness_s1.pgm and _robustness_s2.pgm next to the DNG. s1 is the strict motion prior, applied where the flow field varies sharply or the tile is aperture-limited; s2 is the permissive default. A pixel is bright in exactly one of the two, at the value it contributed to the combined mask, so the pair shows precisely which regions used which.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                    }
                 }
 
                 Section(header: Text("Fallback Denoiser")) {

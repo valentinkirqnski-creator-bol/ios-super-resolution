@@ -67,9 +67,7 @@ bool downsample_by_metal(const Image& src, int factor, Image& out);
 // compute_grey_fft_metal when dims match. Downloads final flow only.
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out,
-                 f32 initial_dx = 0.f, f32 initial_dy = 0.f,
-                 f32 initial_rotation_rad = 0.f);
+                 const Config& cfg, int tile_size, FlowField& flow_out);
 
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
@@ -94,23 +92,8 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
 RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg);
 void metal_release_host_ref_stats(RefStats& ref_stats); // free host pixels; keep dims
 
-// Copies the pinned reference means/variances back from their Metal buffers
-// into ref_stats.means/.stds on the host.
-//
-// init_robustness_metal deliberately returns a RefStats carrying only
-// DIMENSIONS -- the pixels live in GPU buffers, because every consumer on
-// this path is itself a kernel and a readback would be a pure waste. Anything
-// that needs to touch those statistics from C++ (the learned robustness mask
-// builds its feature planes from them) must call this first, or it will index
-// an Image whose h/w/c look valid and whose data vector is empty.
-//
-// Returns false if the buffers are missing or the dimensions disagree.
-bool metal_fetch_host_ref_stats(RefStats& ref_stats);
-// s_select_out, when non-null, also receives a per-pixel record of which motion
-// prior was applied: 1 where the strict s1 was used, 0 where s2 was.
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg,
-                               Image* s_select_out = nullptr);
+                               const FlowField& flow, int tile_size, const Config& cfg);
 
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).

@@ -20,22 +20,6 @@ namespace hhsr {
 using f32 = float;
 
 // Row-major image / tensor with an arbitrary number of interleaved channels.
-// Number of feature planes the learned robustness mask consumes
-// (robustness_nn.h). Fixed by the trained weights --
-// tools/rob_nn/rob_dataset.cpp writes them in this order and
-// tools/rob_nn/train_rob.py trains on that layout, so changing it means
-// retraining, not just editing a constant.
-inline constexpr int kRobustnessNnChannels = 13;
-
-// The learned mask runs in horizontal strips to bound peak memory (see
-// build_robustness_nn_features). kRobustnessNnHalo is the network's exact
-// receptive-field radius in guide pixels -- conv3x3 (1) + dilation-2 3x3 (2)
-// + dilation-4 3x3 (4) + conv3x3 (1) -- so outputs inside the strip are
-// bit-identical to whole-plane inference. Changing the architecture changes
-// this number.
-inline constexpr int kRobustnessNnHalo = 8;
-inline constexpr int kRobustnessNnStripRows = 192;
-
 struct Image {
     int h = 0;
     int w = 0;
@@ -57,7 +41,6 @@ struct FlowField {
     int ny = 0;
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
-    std::vector<uint32_t> aperture_limited; // ny*nx, 1 = Hessian says 1D/aperture-limited
     std::vector<uint32_t> match_ambiguous;  // ny*nx, 1 = best BM match is not clearly unique
 
     // Wronski's motion prior M: 1 where the flow field varies sharply across the
@@ -72,7 +55,7 @@ struct FlowField {
     // but for alignment jitter the doubling wins and the test over-fires --
     // measured at roughly 6x the flagged area near the threshold.
     //
-    // Deliberately NOT allocated by the constructor, unlike the two above: an
+    // Deliberately NOT allocated by the constructor, unlike match_ambiguous: an
     // all-zero vector of the right length is indistinguishable from "measured,
     // nothing irregular". Empty means not measured, and compute_s falls back to
     // deriving it, which is what the full-resolution FFT path relies on.
@@ -81,7 +64,6 @@ struct FlowField {
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
-        aperture_limited((size_t)ny_ * nx_, 0u),
         match_ambiguous((size_t)ny_ * nx_, 0u) {}
 
     // True when motion_irregular carries a measurement for this grid.
@@ -138,8 +120,6 @@ struct FlowField {
         out_dx = tx0 + (bx0 - tx0) * ay;
         out_dy = ty0 + (by0 - ty0) * ay;
     }
-    inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
-    inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t& ambiguous(int ty, int tx) { return match_ambiguous[(size_t)ty * nx + tx]; }
     inline uint32_t ambiguous(int ty, int tx) const { return match_ambiguous[(size_t)ty * nx + tx]; }
 };
@@ -409,12 +389,6 @@ struct Config {
     float noise_beta_ch_robustness(int c) const {
         return debug_noise_model_disabled ? 0.f : noise_beta_ch(c);
     }
-    // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
-    // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
-    // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.
-    bool  debug_pixel4a_noise_profile = false;
-    int   debug_pixel4a_noise_curve_iso = 0;
-
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
@@ -455,16 +429,6 @@ struct Config {
     // search radius, over ica_n_iter iterations.
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
-
-    // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
-    // alignment through the bundled PWCNet Core ML model (neural_flow.h)
-    // instead of align()'s block-matching pyramid, then re-uses the exact
-    // same flow_to_raw_tile_grid-derived path into compute_robustness/merge
-    // -- only the source of the flow field changes, not anything downstream
-    // of it. Falls back to the classical path per-frame if neural_flow_
-    // available() is false (model missing/failed to load) or the guide
-    // image isn't the fixed size the bundled model was converted for.
-    bool use_neural_flow = false;
 
     int  ica_n_iter = 3;
     // Run ICA after block matching on EVERY pyramid level, not only the finest.
@@ -583,66 +547,10 @@ struct Config {
         return (s <= 1) ? raw_radius : std::max(1, raw_radius / s);
     }
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
-    // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
-    // With this false the plan stays empty, so every frame enters align() with a
-    // zero initial transform and frame 0 stays the reference.
-    bool global_prealignment_enabled = false;
-    // Off by default: it is the only thing that forces the pre-alignment pass
-    // to decode every frame up front, and with it off the transform is computed
-    // in the analysis loop from the buffer already decoded there -- the stage
-    // goes from a separate decode pass to roughly the cost of one thumbnail per
-    // frame. See prealign_use_decoded_frames.
-    //
-    // What it gives up: the merge base is frame 0 rather than the frame nearest
-    // the midpoint of the burst's travel. The global transforms, the rotation,
-    // the flow initialisation and the aperture-problem benefit are all
-    // unaffected -- with frame 0 as reference from_reference[k] reduces to
-    // to_first[k] identically, so the prior is the same value, measured
-    // directly instead of composed.
-    bool global_prealignment_choose_reference = false;
-    float global_prealignment_rotation_range_deg = 0.0f;
-    float global_prealignment_rotation_step_deg = 0.25f;
-    int   global_prealignment_max_shift = 24;       // thumbnail pixels
-    int   global_prealignment_thumb_max_dim = 320;
-    // How many frames the pre-alignment pass decodes concurrently.
-    //
-    // That pass is a decode loop and nothing else: measured at 12MP the decode
-    // is 750ms per frame, the thumbnail 7ms, and the NCC search itself is below
-    // the timer's resolution. Overlapping the decodes is the only lever, and it
-    // cannot change the result -- the iterations share nothing and the estimate
-    // is deterministic.
-    //
-    // A decoded 12MP frame is 48MB, so 3 in flight is ~150MB. Raise it only if
-    // the device has headroom; 1 restores the serial loop exactly.
-    int   prealign_decode_concurrency = 3;
-    // Take the pre-alignment transform from the frame the analysis loop has
-    // already decoded, instead of running a separate pass that decodes every
-    // frame again purely to build a 320px thumbnail.
-    //
-    // Measured at 12MP: that pass is 750ms of decode per frame against 7ms of
-    // thumbnail and an NCC search below the timer's resolution, so it is a
-    // decode loop and nothing else. Integrated, an 8-frame burst spends ~52ms
-    // instead of ~3900ms and the stage stops existing as a separate step.
-    //
-    // Requires global_prealignment_choose_reference to be off, because picking
-    // the reference needs every frame's transform before the loop starts. With
-    // it off the reference is frame 0, and from_reference[k] reduces to
-    // to_first[k] exactly, so the inline result is identical to the pass it
-    // replaces -- same two thumbnails, same search, only computed later.
-    bool  prealign_use_decoded_frames = true;
 
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    // Debug: split the accumulated mask by which motion prior each pixel used,
-    // writing _robustness_s1.pgm and _robustness_s2.pgm alongside the combined
-    // one. s1 is the strict prior, applied where the flow field varies sharply
-    // (the r_Mt test) or the tile is aperture-limited; s2 is the permissive
-    // default. The two split masks sum exactly to the combined mask.
-    //
-    // Off by default: it costs one extra full-resolution float buffer per
-    // comparison frame while the mask is being built.
-    bool  robustness_save_s_masks = false;
 
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
@@ -684,19 +592,6 @@ struct Config {
     // own dimensions rather than trusting this flag, because this path
     // silently falls back to guide resolution when the hires ref stats
     // are missing).
-    // Replace the analytic robustness mask (Wronski Eq. 5-9) with the learned
-    // one in robustness_nn.h. Off by default: the analytic mask is the
-    // reference behaviour and the network is only as good as the bursts it
-    // was trained on. Falls back automatically when the model is missing or
-    // fails to load, so enabling it can never leave the pipeline without a
-    // mask.
-    //
-    // Motivation, measured (tools/rob_nn, synthetic bursts with ground-truth
-    // motion built from real raws): the analytic mask separates harmful from
-    // harmless pixels with AUC 0.638 and cannot exceed ~26% detection at any
-    // threshold, because it pins most pixels at exactly R = 1. The network
-    // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
-    bool use_neural_robustness = false;
 
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
@@ -706,6 +601,15 @@ struct Config {
     bool robustness_raw_resolution_active() const {
         return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
     }
+    // Sample the per-tile flow BILINEARLY between tile centres wherever it is
+    // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
+    // mask -- instead of taking the containing tile's vector. Removes the
+    // piecewise-constant staircase that rotation turns into a visible tile
+    // grid. See FlowField::sample_bilinear for why rotation and not
+    // translation. All consumers switch together or the mask would grade a
+    // correspondence the merge never fetches.
+    bool  flow_bilinear_sampling = true;
+
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
     // missing feature (or aperture) then no shift is applied at all." When a
@@ -713,7 +617,7 @@ struct Config {
     // second-best cost within flow_reject_1d_ambiguity_ratio, the same test
     // that already feeds the match_ambiguous flag -- the found offset is
     // DISCARDED and the tile keeps its seed: the upsampled previous-level
-    // flow, or the global initial estimate at the coarsest level.
+    // flow, or zero at the coarsest level.
     //
     // This acts on the flow itself, unlike flow_reject_ambiguous_enabled's
     // soft demotion to s1 downstream -- which is inert under rotation, where
@@ -725,24 +629,12 @@ struct Config {
     // Off by default: changes which flow gets computed for every ambiguous
     // tile at every level, on CPU and Metal -- A/B against the default
     // before adopting.
-    // Sample the per-tile flow BILINEARLY between tile centres wherever it is
-    // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
-    // mask -- instead of taking the containing tile's vector. Removes the
-    // piecewise-constant staircase that rotation turns into a visible tile
-    // grid. See FlowField::sample_bilinear for why rotation and not
-    // translation. All consumers switch together or the mask would grade a
-    // correspondence the merge never fetches.
-    bool  flow_bilinear_sampling = true;
-
     bool  align_ambiguous_fallback_enabled = false;
 
-    // Test switch from the aperture experiments: force merge robustness to zero
-    // only when a tile is one-dimensional and its aligned guide residual is
-    // high. This does not repair flow; it rejects unsafe 1D tiles.
-    bool  flow_reject_1d_enabled = false;
-    // A tile is considered one-dimensional when lambda2/lambda1 is below this
-    // ratio. Higher catches more edge-like tiles; lower limits rejection to
-    // very purely one-dimensional tiles.
+    // Eigenvalue ratio (lambda2/lambda1) below which a tile counts as
+    // one-dimensional. Read by the ICA damping guard below -- higher treats
+    // more edge-like tiles as aperture-limited, lower restricts it to very
+    // purely one-dimensional tiles.
     float flow_regularize_aperture_ratio = 0.15f;
     // Regularize the ICA solve. Two independent guards, both on by default:
     //
@@ -764,8 +656,9 @@ struct Config {
     //     residual/gradient. Measured at 5.1px for a 30x residual. The clamp
     //     bounds ICA to what the search that preceded it could have reached.
     bool  ica_regularize_enabled = true;
-    // Legacy setting kept for old saved app preferences. The current 1D reject
-    // gate uses flow_reject_1d_residual_threshold instead.
+    // Cost ratio that defines an ambiguous block match: a tile is flagged when
+    // its second-best match costs less than this times the best. Read by both
+    // the match_ambiguous flag and align_ambiguous_fallback_enabled.
     float flow_reject_1d_ambiguity_ratio = 1.10f;
     // Produce and consume the block-matching ambiguity flag: a tile is marked
     // when its second-best match costs less than ambiguity_ratio times the best,
@@ -788,48 +681,6 @@ struct Config {
     // so the flag has to survive from where the mistake is made to where the
     // mask is applied. upscale_flow_460 already propagates it.
     bool  flow_reject_ambiguous_enabled = true;
-    // A 1D tile is rejected only when enough pixels in that tile have
-    // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
-    // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.
-    float flow_reject_1d_residual_threshold = 2.5f;
-    // Scales the estimated sensor noise variance subtracted before the HF
-    // loss ratio. >1 assumes more noise, so less of the local variance counts
-    // as signal and fewer areas are flagged as high-frequency detail; <1 is
-    // more aggressive. 1.0 leaves the estimate as measured.
-    // Minimum texture SNR: signal variance must exceed this multiple of the
-    // noise floor before a pixel is treated as real high-frequency detail.
-    // loss landed, then a hardcoded kMinTextureSnr = 4; configurable again.
-    // High-frequency artifact rejection (Wronski et al., "High Frequency
-    // Artifacts Removal"). Block matching cannot resolve repetitive fine
-    // texture -- the aperture problem -- so it locks onto the wrong period and
-    // produces blocky artifacts. Rejected only where BOTH hold:
-    //
-    //   1. the patch is almost entirely high-frequency: most of its local
-    //      variance disappears under a low-pass filter, and
-    //   2. the alignment vector field varies a lot locally -- the same r_Mt
-    //      test that drives the motion prior, as the paper specifies.
-    //
-    // Both are needed. Hair and fur are high-frequency but track cleanly, so
-    // condition 2 spares them. A flat noisy wall has unstable flow but no real
-    // high-frequency signal, so condition 1 spares it.
-    //
-    // Off by default: it changes which pixels merge, so enable it deliberately.
-    bool  hf_artifact_removal_enabled = false;
-    // loss = 1 - variance_lowpass / variance_original, both noise-corrected.
-    // Above this the patch counts as high-frequency. Reference points measured
-    // on typical content: flat wall ~0.04, face ~0.19, brick ~0.83,
-    // checkerboard ~0.92.
-    float hf_variance_loss_threshold = 0.75f;
-    // The patch is skipped unless its signal variance exceeds this multiple of
-    // the estimated sensor noise variance. This is what stops ISO 6400 noise
-    // reading as high-frequency detail, and it scales with brightness through
-    // the noise model rather than being a fixed number.
-    float hf_min_texture_snr = 4.0f;
-    bool  motion_edge_rejection_enabled = true;
-    float motion_edge_threshold = 0.025f;
-    float motion_edge_residual_threshold = 2.5f;
-    float motion_edge_noise_floor_multiplier = 1.0f;
-    int   motion_edge_neighborhood_radius = 1;
 
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
     bool  accumulated_robustness_denoiser_enabled = false;
@@ -914,33 +765,6 @@ struct Config {
 };
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-inline int round_pixel4a_noise_curve_iso(f32 iso) {
-    if (!std::isfinite(iso) || iso <= 0.f)
-        iso = 100.f;
-    const double n = std::round(std::log2((double)iso / 100.0));
-    int rounded = (int)std::lround(100.0 * std::pow(2.0, n));
-    if (rounded < 50) rounded = 50;
-    if (rounded > 3200) rounded = 3200;
-    return rounded;
-}
-
-inline void apply_pixel4a_noise_profile(Config& cfg, f32 iso) {
-    constexpr f32 kPixel4aAlphaIso100 = 1.80710882e-4f;
-    constexpr f32 kPixel4aBetaIso100  = 3.1937599182128e-6f;
-    if (!std::isfinite(iso) || iso <= 0.f)
-        iso = 100.f;
-    const f32 scale = iso / 100.f;
-    // Pixel 4a uses the same profile for all channels (no per-channel differentiation).
-    const f32 a = kPixel4aAlphaIso100 * scale;
-    const f32 b = kPixel4aBetaIso100 * scale * scale;
-    for (int c = 0; c < 3; ++c) {
-        cfg.alpha_dng[c] = a;
-        cfg.beta_dng[c] = b;
-    }
-    cfg.has_noise_profile = true;
-    cfg.debug_pixel4a_noise_curve_iso = round_pixel4a_noise_curve_iso(iso);
-}
 
 inline f32 smoothstepf(f32 edge0, f32 edge1, f32 x) {
     if (edge1 <= edge0) return x >= edge1 ? 1.f : 0.f;

@@ -318,35 +318,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"alignment_grey_fft"])
         cfg.grey_method = tuning[@"alignment_grey_fft"].boolValue
                               ? GreyMethod::FFT : GreyMethod::Decimate;
-    if (tuning[@"hf_artifact_removal_enabled"])
-        cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
-    if (tuning[@"hf_variance_loss_threshold"])
-        cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
-    if (tuning[@"hf_min_texture_snr"])
-        cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
-    if (tuning[@"flow_reject_1d_enabled"])
-        cfg.flow_reject_1d_enabled = tuning[@"flow_reject_1d_enabled"].boolValue;
     if (tuning[@"flow_regularize_aperture_ratio"])
         cfg.flow_regularize_aperture_ratio =
             std::max(0.f, std::min(1.f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
     if (tuning[@"flow_reject_1d_ambiguity_ratio"])
         cfg.flow_reject_1d_ambiguity_ratio =
             std::max(1.f, tuning[@"flow_reject_1d_ambiguity_ratio"].floatValue);
-    if (tuning[@"flow_reject_1d_residual_threshold"])
-        cfg.flow_reject_1d_residual_threshold =
-            std::max(0.f, tuning[@"flow_reject_1d_residual_threshold"].floatValue);
-    if (tuning[@"motion_edge_rejection_enabled"])
-        cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
-    if (tuning[@"motion_edge_threshold"])
-        cfg.motion_edge_threshold = tuning[@"motion_edge_threshold"].floatValue;
-    if (tuning[@"motion_edge_residual_threshold"])
-        cfg.motion_edge_residual_threshold = tuning[@"motion_edge_residual_threshold"].floatValue;
-    if (tuning[@"motion_edge_noise_floor_multiplier"])
-        cfg.motion_edge_noise_floor_multiplier =
-            tuning[@"motion_edge_noise_floor_multiplier"].floatValue;
-    if (tuning[@"motion_edge_neighborhood_radius"])
-        cfg.motion_edge_neighborhood_radius =
-            std::max(0, std::min(2, tuning[@"motion_edge_neighborhood_radius"].intValue));
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
@@ -354,35 +331,15 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
-    if (tuning[@"debug_pixel4a_noise_profile"])
-        cfg.debug_pixel4a_noise_profile = tuning[@"debug_pixel4a_noise_profile"].boolValue;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;
         cfg.alignment_tile_size =
             (ts == 8 || ts == 16 || ts == 32 || ts == 64) ? ts : 0;
     }
-    if (tuning[@"global_prealignment_enabled"])
-        cfg.global_prealignment_enabled = tuning[@"global_prealignment_enabled"].boolValue;
-    if (tuning[@"global_prealignment_choose_reference"])
-        cfg.global_prealignment_choose_reference =
-            tuning[@"global_prealignment_choose_reference"].boolValue;
-    if (tuning[@"global_prealignment_rotation_range_deg"])
-        cfg.global_prealignment_rotation_range_deg =
-            std::max(0.f, std::min(2.f,
-                tuning[@"global_prealignment_rotation_range_deg"].floatValue));
-    if (tuning[@"global_prealignment_rotation_step_deg"])
-        cfg.global_prealignment_rotation_step_deg =
-            std::max(0.05f, std::min(1.f,
-                tuning[@"global_prealignment_rotation_step_deg"].floatValue));
-    if (tuning[@"global_prealignment_max_shift"])
-        cfg.global_prealignment_max_shift =
-            std::max(0, std::min(64, tuning[@"global_prealignment_max_shift"].intValue));
     if (tuning[@"robustness_enabled"])
         cfg.robustness_enabled = tuning[@"robustness_enabled"].boolValue;
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
-    if (tuning[@"robustness_save_s_masks"])
-        cfg.robustness_save_s_masks = tuning[@"robustness_save_s_masks"].boolValue;
     if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
         cfg.accumulated_robustness_denoiser_enabled =
             tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
@@ -411,8 +368,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
     if (tuning[@"align_ica_per_level_fft"])
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
-    if (tuning[@"use_neural_flow"])
-        cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
@@ -421,8 +376,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_bilinear_sampling = tuning[@"flow_bilinear_sampling"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
-    if (tuning[@"use_neural_robustness"])
-        cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
@@ -479,18 +432,10 @@ static NSDictionary *TIFFMetadata(NSDictionary *metadata) {
     return DictValue(metadata, @"{TIFF}");
 }
 
-static NSDictionary *EXIFMetadata(NSDictionary *metadata) {
-    if (!metadata) return nil;
-    NSDictionary *exif = DictValue(metadata, (__bridge NSString *)kCGImagePropertyExifDictionary);
-    if (exif) return exif;
-    return DictValue(metadata, @"{Exif}");
-}
-
 static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) {
     NSDictionary *metadata = DictValue(frame, @"metadata");
     NSDictionary *dng = DNGMetadata(metadata);
     NSDictionary *tiff = TIFFMetadata(metadata);
-    NSDictionary *exif = EXIFMetadata(metadata);
 
     cfg.camera_make = NSStringToStd(FirstValueForKeys(tiff, @[
         (__bridge NSString *)kCGImagePropertyTIFFMake, @"Make"
@@ -610,13 +555,6 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
                  cfg.black_levels[0], cfg.black_levels[1], cfg.black_levels[2],
                  cfg.white_level);
     cfg.debug_string_capture = full_log;
-    if (cfg.debug_pixel4a_noise_profile) {
-        const float iso = FirstNumber(FirstValueForKeys(exif, @[
-            (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings,
-            @"ISOSpeedRatings", @"PhotographicSensitivity", @"ISO"
-        ]), 100.f);
-        apply_pixel4a_noise_profile(cfg, iso);
-    }
 
     std::vector<double> color;
     CollectNumbers(FirstValueForKeys(dng, @[@"ColorMatrix1", @"ColorMatrix2"]), color);

@@ -89,18 +89,8 @@ struct TuningParams: Equatable, Codable {
     var r_Mt: Float = 0.8
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
-    var hf_artifact_removal_enabled: Bool = false
-    var hf_variance_loss_threshold: Float = 0.75
-    var hf_min_texture_snr: Float = 4.0
-    var flow_reject_1d_enabled: Bool = false
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
-    var flow_reject_1d_residual_threshold: Float = 2.5
-    var motion_edge_rejection_enabled: Bool = true
-    var motion_edge_threshold: Float = 0.025
-    var motion_edge_residual_threshold: Float = 2.5
-    var motion_edge_noise_floor_multiplier: Float = 1.0
-    var motion_edge_neighborhood_radius: Int = 1
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
@@ -109,23 +99,11 @@ struct TuningParams: Equatable, Codable {
     var kernel_anisotropy_continuous: Bool = true
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
-    var debug_pixel4a_noise_profile: Bool = false
     var alignment_tile_size: Int = 0
-    var global_prealignment_enabled: Bool = true
-    /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
-    /// inside the analysis loop instead of as a separate decode pass.
-    var global_prealignment_choose_reference: Bool = false
-    var global_prealignment_rotation_range_deg: Float = 0.0
-    var global_prealignment_rotation_step_deg: Float = 0.25
-    var global_prealignment_max_shift: Int = 24
     /// Off merges every frame at full weight everywhere. Diagnostic: it shows
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
     var robustness_save_mask: Bool = true
-    /// Also write _robustness_s1.pgm and _robustness_s2.pgm, splitting the
-    /// accumulated mask by which motion prior scored each pixel. Costs one extra
-    /// full-resolution buffer per comparison frame while the mask is built.
-    var robustness_save_s_masks: Bool = false
     var accumulated_robustness_denoiser_enabled: Bool = false
     /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
     /// band, 2 = always merge online. Online keeps memory flat in frame count
@@ -143,15 +121,10 @@ struct TuningParams: Equatable, Codable {
     /// correction budget is already spent when level 0 starts. Costs roughly
     /// +120MB at 12MP, because the reference gradient cache goes resident.
     var align_ica_per_level_fft: Bool = false
-    /// Route alignment through the bundled PWCNet Core ML model instead of
-    /// the classical block-matching pyramid, feeding the result into the
-    /// same robustness/merge math either way. Falls back to the classical
-    /// path per-frame if the model isn't bundled or fails to load.
-    var use_neural_flow: Bool = false
     /// ImageStackAlignator's rule for unreliable block matches: when a
     /// tile's best and second-best costs are near-tied (flat patch, aperture,
     /// repetition -- no precise shift determinable), apply NO shift and keep
-    /// the seed from the coarser level / global estimate, instead of
+    /// the seed from the coarser level, instead of
     /// trusting a match indistinguishable from noise. Acts on the flow
     /// itself, unlike the s1 demotion, which is inert under rotation where
     /// every tile is on s1 already. Off by default -- A/B before adopting.
@@ -175,7 +148,6 @@ struct TuningParams: Equatable, Codable {
     /// FFT" below is OFF (Decimate) -- that path's flow is already coarser
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
-    var use_neural_robustness: Bool = false
     var robustness_raw_resolution_enabled: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -214,27 +186,19 @@ struct TuningParams: Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
         case alignment_grey_fft
-        case hf_artifact_removal_enabled, hf_variance_loss_threshold
-        case hf_min_texture_snr
-        case flow_reject_1d_enabled, flow_regularize_aperture_ratio
-        case flow_reject_1d_ambiguity_ratio, flow_reject_1d_residual_threshold
-        case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
-        case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
+        case flow_regularize_aperture_ratio
+        case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
         case kernel_anisotropy_continuous
-        case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
-        case global_prealignment_enabled, global_prealignment_choose_reference
-        case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
-        case global_prealignment_max_shift
-        case robustness_enabled, robustness_save_mask, robustness_save_s_masks
+        case snr_auto_tune, alignment_tile_size
+        case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, use_neural_flow
+        case align_ica_per_level_fft
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
-        case use_neural_robustness
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -252,35 +216,17 @@ struct TuningParams: Equatable, Codable {
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
-        hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
-        hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
-        hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
-        flow_reject_1d_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_reject_1d_enabled) ?? flow_reject_1d_enabled
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
         flow_reject_1d_ambiguity_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_ambiguity_ratio) ?? flow_reject_1d_ambiguity_ratio
-        flow_reject_1d_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_residual_threshold) ?? flow_reject_1d_residual_threshold
-        motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
-        motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
-        motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
-        motion_edge_noise_floor_multiplier = try c.decodeIfPresent(Float.self, forKey: .motion_edge_noise_floor_multiplier) ?? motion_edge_noise_floor_multiplier
-        motion_edge_neighborhood_radius = try c.decodeIfPresent(Int.self, forKey: .motion_edge_neighborhood_radius) ?? motion_edge_neighborhood_radius
         k_detail = try c.decodeIfPresent(Float.self, forKey: .k_detail) ?? k_detail
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
-        debug_pixel4a_noise_profile = try c.decodeIfPresent(
-            Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
-        global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
-        global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
-        global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
-        global_prealignment_rotation_step_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_step_deg) ?? global_prealignment_rotation_step_deg
-        global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
-        robustness_save_s_masks = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_s_masks) ?? robustness_save_s_masks
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
@@ -304,12 +250,10 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
-        use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
-        use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -1979,34 +1923,17 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
-            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
-            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
-            "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
-            "flow_reject_1d_enabled": NSNumber(value: tuningParams.flow_reject_1d_enabled),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
             "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
-            "flow_reject_1d_residual_threshold": NSNumber(value: tuningParams.flow_reject_1d_residual_threshold),
-            "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
-            "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
-            "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
-            "motion_edge_noise_floor_multiplier": NSNumber(value: tuningParams.motion_edge_noise_floor_multiplier),
-            "motion_edge_neighborhood_radius": NSNumber(value: tuningParams.motion_edge_neighborhood_radius),
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
-            "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
-            "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
-            "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
-            "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
-            "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
-            "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
-            "robustness_save_s_masks": NSNumber(value: tuningParams.robustness_save_s_masks),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
@@ -2028,12 +1955,10 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
-            "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
-            "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)
@@ -2095,10 +2020,6 @@ final class CameraModel: NSObject, ObservableObject {
             var maskSuffixes: [String] = []
             if tuningParams.robustness_save_mask {
                 maskSuffixes.append("_robustness.pgm")
-                if tuningParams.robustness_save_s_masks {
-                    maskSuffixes.append("_robustness_s1.pgm")
-                    maskSuffixes.append("_robustness_s2.pgm")
-                }
             }
             let base = outURL.deletingPathExtension().path
             let robURLs = maskSuffixes
