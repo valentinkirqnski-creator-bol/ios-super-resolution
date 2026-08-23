@@ -264,9 +264,66 @@ static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
 
 // Pure builder, no caching -- shared by the single-slot and per-channel
 // cache wrappers below so the ~1e5-patch Monte Carlo logic exists once.
+// Disk cache for the Monte Carlo curves, keyed on the EXACT float bits of
+// (alpha, beta). unitary_MC is fully deterministic -- the RNG seed is a fixed
+// function of the brightness bin -- so a cached table is bit-identical to a
+// rebuild; the cache changes when the answer arrives, never what it is.
+//
+// Why it exists: the build is ~1.8M gaussian draws per non-linear bin and was
+// measured at 2.0-2.8 s PER CHANNEL cold, i.e. up to ~7.5 s hiding inside the
+// first frame's comp:robustness. In-process statics already amortise repeat
+// bursts; this amortises across app launches. The directory is provided by
+// the app (Caches/); when unset -- host tools, tests -- behaviour is exactly
+// as before.
+static std::string g_noise_cache_dir;
+void robustness_set_noise_cache_dir(const std::string& dir) { g_noise_cache_dir = dir; }
+
+static std::string noise_cache_file(f32 alpha, f32 beta) {
+    uint32_t ab, bb;
+    std::memcpy(&ab, &alpha, 4);
+    std::memcpy(&bb, &beta, 4);
+    char name[96];
+    std::snprintf(name, sizeof(name), "/mccurve_v1_%08x_%08x_%d.bin", ab, bb,
+                  k_n_patches);
+    return g_noise_cache_dir + name;
+}
+
+static bool noise_cache_load(f32 alpha, f32 beta, NoiseCurves& nc) {
+    if (g_noise_cache_dir.empty()) return false;
+    FILE* f = std::fopen(noise_cache_file(alpha, beta).c_str(), "rb");
+    if (!f) return false;
+    const size_t n = (size_t)k_n_brightness + 1;
+    nc.std_curve.resize(n);
+    nc.diff_curve.resize(n);
+    const bool ok = std::fread(nc.std_curve.data(), sizeof(f32), n, f) == n &&
+                    std::fread(nc.diff_curve.data(), sizeof(f32), n, f) == n &&
+                    std::fgetc(f) == EOF;   // reject truncated/oversized files
+    std::fclose(f);
+    if (!ok) { nc.std_curve.clear(); nc.diff_curve.clear(); }
+    return ok;
+}
+
+static void noise_cache_store(f32 alpha, f32 beta, const NoiseCurves& nc) {
+    if (g_noise_cache_dir.empty()) return;
+    // Write-to-temp + rename so a mid-write kill can never leave a short file
+    // that a later launch would half-trust.
+    const std::string path = noise_cache_file(alpha, beta);
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const size_t n = (size_t)k_n_brightness + 1;
+    const bool ok = std::fwrite(nc.std_curve.data(), sizeof(f32), n, f) == n &&
+                    std::fwrite(nc.diff_curve.data(), sizeof(f32), n, f) == n;
+    std::fclose(f);
+    if (ok) std::rename(tmp.c_str(), path.c_str());
+    else std::remove(tmp.c_str());
+}
+
 static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
     if (try_load_python_noise_curves(alpha, beta, nc))
+        return nc;
+    if (noise_cache_load(alpha, beta, nc))
         return nc;
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
@@ -298,6 +355,7 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
         interp_MC_range(nc, imin, imax);
     }
 
+    noise_cache_store(alpha, beta, nc);
     return nc;
 }
 

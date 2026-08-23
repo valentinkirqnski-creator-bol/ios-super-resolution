@@ -432,6 +432,17 @@ static NSDictionary *TIFFMetadata(NSDictionary *metadata) {
     return DictValue(metadata, @"{TIFF}");
 }
 
+// One-time: hand the Caches directory to the noise-curve disk cache. Both
+// burst entry points call this, so whichever runs first arms it.
+static void SetupNoiseCurveCacheDirOnce(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *dir = NSSearchPathForDirectoriesInDomains(
+                            NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        if (dir) hhsr::robustness_set_noise_cache_dir(dir.UTF8String);
+    });
+}
+
 static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) {
     NSDictionary *metadata = DictValue(frame, @"metadata");
     NSDictionary *dng = DNGMetadata(metadata);
@@ -689,6 +700,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     // Grey-FFT + L2 BM + merge accumulate require Metal (no CPU fallback).
     if (!metal_gpu_init()) return NO;
+    SetupNoiseCurveCacheDirOnce();
 
     std::vector<std::string> vpaths;
     vpaths.reserve(paths.count);
@@ -745,6 +757,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     if (previewOut) *previewOut = nil;
 
     if (!metal_gpu_init()) return NO;
+    SetupNoiseCurveCacheDirOnce();
 
     Config cfg;
     cfg.scale = scale;

@@ -79,6 +79,12 @@ struct RefStats {
     Image stds_hires;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
+
+// Directory for the Monte Carlo noise-curve disk cache. Bit-identical to a
+// rebuild -- unitary_MC is deterministic, seeded per brightness bin -- so this
+// only saves the measured 2-2.8 s/channel cold build across app launches.
+// Unset (host tools, tests) = no disk cache, prior behaviour exactly.
+void robustness_set_noise_cache_dir(const std::string& dir);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
 // lattice, 5x5 min there (Wronski's 10x10-raw footprint on Wronski's grid),
 // nearest-upsample back to raw. Shared by the CPU path and the Metal host
