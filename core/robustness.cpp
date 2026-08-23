@@ -1,5 +1,7 @@
 #include "stages.h"
 #include "parallel.h"
+#include "prof.h"
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -329,6 +331,10 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     std::printf("[noise] MC curve cache MISS (a=%g b=%g)%s -- building, ~2-3 s\n",
                 alpha, beta,
                 g_noise_cache_dir.empty() ? " [cache dir NOT SET]" : "");
+    // Bucketed so a profile shows the Monte-Carlo build as its own line
+    // instead of hiding inside whichever caller (SNR tuning or the first
+    // robustness call) happened to trigger it.
+    const double t_build = prof_now_ms();
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
@@ -360,11 +366,23 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     }
 
     noise_cache_store(alpha, beta, nc);
+    prof_add_cpu("rob:noise-mc-build", prof_now_ms() - t_build);
     return nc;
 }
 
+// Guards the two lazy curve caches below. Needed since the burst prewarms the
+// curves on a worker thread (see robustness_prewarm_noise_curves) while the
+// main thread may request the same curves for frame analysis. The lock covers
+// the lookup AND the build, so a concurrent request for a key being built
+// blocks until it is cached rather than building it twice. Returned
+// references stay valid after unlock because within one burst every caller
+// asks for the same keys, so the slots are never rebuilt underneath them --
+// the same invariant the unlocked single-thread version relied on.
+static std::mutex g_noise_curves_mu;
+
 static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
     // Cache like Python (curves built once per alpha/beta, reused every frame).
+    std::lock_guard<std::mutex> lock(g_noise_curves_mu);
     static NoiseCurves cached;
     static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
     static f32 cached_beta  = std::numeric_limits<f32>::quiet_NaN();
@@ -386,6 +404,7 @@ static const NoiseCurves& make_noise_curves(const Config& cfg) {
 // 1-slot cache would evict and rebuild the Monte Carlo curve on every call --
 // 3x the cost every frame instead of once per burst.
 static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch) {
+    std::lock_guard<std::mutex> lock(g_noise_curves_mu);
     static NoiseCurves cached[3];
     static f32 cached_alpha[3] = {std::numeric_limits<f32>::quiet_NaN(),
                                   std::numeric_limits<f32>::quiet_NaN(),
@@ -436,6 +455,24 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
 // Anonymous-namespace members stay visible unqualified from the enclosing
 // namespace in the same TU, so the assignment still reaches g_noise_cache_dir.
 void robustness_set_noise_cache_dir(const std::string& dir) { g_noise_cache_dir = dir; }
+
+// Builds (or cache-loads) every noise curve the burst's robustness calls will
+// request, through the exact same accessors they use -- same keys, same
+// debug_noise_model_disabled gating, same values. Meant to run on a worker
+// thread right after SNR tuning has fixed the noise model: on a curve-cache
+// MISS (any new ISO changes alpha/beta and with them the cache key) the
+// Monte-Carlo builds otherwise run synchronously inside the FIRST comparison
+// frame's robustness call, which is the "analyzing frame 2" freeze. The
+// g_noise_curves_mu lock inside the accessors makes the concurrent warm safe:
+// if the frame catches up it waits for the in-flight build, never duplicates
+// it. Also outside the anonymous namespace: pipeline callers link against
+// hhsr::robustness_prewarm_noise_curves.
+void robustness_prewarm_noise_curves(const Config& cfg) {
+    (void)make_noise_curves(cfg);
+    (void)mask_noise_curves(cfg);
+    for (int ch = 0; ch < 3; ++ch)
+        (void)mask_noise_curves_channel(cfg, ch);
+}
 
 
 // Python indexes std_curve[round(1000*brightness)] with no clamp, which is safe

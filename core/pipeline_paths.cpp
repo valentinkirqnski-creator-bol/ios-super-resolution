@@ -711,6 +711,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     snr_fut.get();
     prof_add_cpu("setup:snr-join(residual)", prof_now_ms() - t_snr_join);
 
+    // Prewarm the robustness noise curves on a worker. On a curve-cache MISS
+    // (every new ISO changes alpha/beta and with them the cache key) the
+    // Monte-Carlo builds otherwise run synchronously inside the FIRST
+    // comparison frame's robustness call -- the "analyzing frame 2" freeze.
+    // The curves' cache is mutex-guarded, so if the frame catches up it waits
+    // for the in-flight build rather than duplicating it. Same keys, same
+    // values; only where the build runs changes. After snr_fut.get() because
+    // the accessors and tune_config_snr share the noise model.
+    std::future<void> noise_warm = std::async(std::launch::async, [&]() {
+        worker_qos();
+        robustness_prewarm_noise_curves(work);
+    });
+
     // Seed the decode queue now, up to its full depth. These used to run
     // synchronously at the top of the comparison loop (comp:decode(sync),
     // ~187ms with nothing overlapping it); the pyramid build plus robustness
@@ -1150,6 +1163,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     drain_spill();
     if (mps_warm.valid()) mps_warm.get();
+    if (noise_warm.valid()) noise_warm.get();
     for (auto& p : pref_q)                      // drain unused prefetches
         if (p.fut.valid()) (void)p.fut.get();
     pref_q.clear();

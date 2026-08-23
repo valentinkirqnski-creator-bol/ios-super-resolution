@@ -2105,6 +2105,10 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
         let format = exportFormat
+        // The JPEG render / preview embed below re-reads and re-encodes the
+        // full-size DNG -- seconds of real work after the pipeline's "Done".
+        // Without this the UI freezes on "Done" with no explanation.
+        DispatchQueue.main.async { self.statusText = "Saving to Photos…" }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {

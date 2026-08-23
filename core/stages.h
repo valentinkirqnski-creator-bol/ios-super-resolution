@@ -85,6 +85,12 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // only saves the measured 2-2.8 s/channel cold build across app launches.
 // Unset (host tools, tests) = no disk cache, prior behaviour exactly.
 void robustness_set_noise_cache_dir(const std::string& dir);
+// Build/cache-load every noise curve the burst's robustness calls will use,
+// through the same accessors (same keys, same values). Thread-safe against
+// concurrent curve requests; run it on a worker right after SNR tuning so a
+// curve-cache MISS builds during ref analysis instead of stalling the first
+// comparison frame.
+void robustness_prewarm_noise_curves(const Config& cfg);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
 // lattice, 5x5 min there (Wronski's 10x10-raw footprint on Wronski's grid),
 // nearest-upsample back to raw. Shared by the CPU path and the Metal host
