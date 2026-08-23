@@ -331,6 +331,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
+    if (tuning[@"bm_subpixel_quadratic"])
+        cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
+    if (tuning[@"flow_boundary_selection"])
+        cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"alignment_tile_size"]) {

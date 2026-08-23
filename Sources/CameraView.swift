@@ -741,6 +741,16 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Subpixel Block Matching", isOn: $cam.tuningParams.bm_subpixel_quadratic)
+        Text("""
+             Fits a bivariate quadratic to the 3x3 cost neighbourhood around each              block-matching winner and adds its sub-cell minimum -- the sub-pixel              estimator Wronski's alignment specifies, which this port previously skipped:              block matching emitted integer flow at every level and ICA alone carried the              sub-pixel burden. The costs already exist, so the fit is nearly free. Applies              on both CPU and GPU search paths; matters most on the decimate grey, where              every residual ICA cannot recover is twice as large in raw pixels. The fit is              rejected (integer result stands) at window edges, on ridge-shaped cost              surfaces, and whenever it points more than half a cell away.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Boundary Flow Selection", isOn: $cam.tuningParams.flow_boundary_selection)
+        Text("""
+             Bilinear flow sampling is right where motion is smooth but wrong at object              boundaries: it blends two different motions into flow that belongs to neither              side, exactly where robustness then rejects and detail is lost. This builds a              half-tile-pitch refinement after alignment: cells whose four surrounding tile              vectors agree keep the bilinear blend (smooth regions reproduce the coarse              sampling to within the flow field's own curvature -- exact for locally linear              motion, error far below the tile staircase this fixes), while cells at              a disagreement over 1 raw px get whichever single tile vector best explains              the alignment guide there. Mask and merge consume the same refined field, so              they stay in lockstep. Requires Smooth Tile Flow.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
         Text("""
              Block matching produces ONE displacement per 16-pixel tile, and consuming it              nearest makes the warp piecewise constant -- v(x,y) = v_ij across each tile,              jumping at every boundary.

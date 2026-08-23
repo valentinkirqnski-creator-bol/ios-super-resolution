@@ -100,6 +100,12 @@ struct TuningParams: Equatable, Codable {
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
+    /// Quadratic sub-cell fit at each block-matching winner (Wronski's
+    /// sub-pixel estimator). Integer flow becomes ~0.1-0.25px flow per level.
+    var bm_subpixel_quadratic: Bool = true
+    /// At motion boundaries, pick the best single tile vector instead of
+    /// blending two different motions. Smooth regions stay bilinear.
+    var flow_boundary_selection: Bool = true
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
     var alignment_tile_size: Int = 0
@@ -194,6 +200,8 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case kernel_anisotropy_continuous
         case merge_fp16_accumulator
+        case bm_subpixel_quadratic
+        case flow_boundary_selection
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
@@ -228,6 +236,8 @@ struct TuningParams: Equatable, Codable {
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
+        bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
+        flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
@@ -1938,6 +1948,8 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
+            "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
+            "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
