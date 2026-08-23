@@ -276,7 +276,6 @@ static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
 // the app (Caches/); when unset -- host tools, tests -- behaviour is exactly
 // as before.
 static std::string g_noise_cache_dir;
-void robustness_set_noise_cache_dir(const std::string& dir) { g_noise_cache_dir = dir; }
 
 static std::string noise_cache_file(f32 alpha, f32 beta) {
     uint32_t ab, bb;
@@ -423,6 +422,16 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
 }
 
 } // namespace
+
+// Defined OUTSIDE the anonymous namespace above, deliberately. Inside it the
+// symbol gets internal linkage -- hhsr::(anonymous)::robustness_set_noise_...
+// -- and the app links against hhsr::robustness_set_noise_cache_dir, which is
+// exactly the undefined-symbol failure CI produced. Host -fsyntax-only cannot
+// catch linkage, so this class of slip only surfaces at the device link.
+// Anonymous-namespace members stay visible unqualified from the enclosing
+// namespace in the same TU, so the assignment still reaches g_noise_cache_dir.
+void robustness_set_noise_cache_dir(const std::string& dir) { g_noise_cache_dir = dir; }
+
 
 // Python indexes std_curve[round(1000*brightness)] with no clamp, which is safe
 // there only because the loader clipped every sample to [0,1]. Now that white
