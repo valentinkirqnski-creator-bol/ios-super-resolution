@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cmath>
 #include <future>
+#include <deque>
 #include <mutex>
 #include <memory>
 #include <limits>
@@ -621,10 +622,38 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             listing += std::to_string(i) + " provider_frame\n";
         debug_dump_text("cpp_burst_paths", listing);
     }
-    // Prefetch state for the comparison decodes. The first one is launched
-    // below, once SNR tuning has been joined.
-    int pref_k = -1;
-    std::future<Image> pref_fut;
+    // Prefetch state for the comparison decodes: an in-order queue of decode
+    // futures, seeded below once SNR tuning has been joined and topped back up
+    // each loop iteration. Depth 1 was not enough once the per-frame pipeline
+    // work dropped to ~130ms: a DNG decode takes ~390ms, so a single prefetch
+    // launched one frame ahead left comp:decode-wait stalling ~265ms/frame --
+    // the consumer outran the producer. Depth 3 keeps three decodes in flight
+    // (390 / 130 rounds to 3), which is enough for the queue's front to be
+    // ready when the loop reaches it. Scheduling only: the same frames are
+    // decoded in the same comp_indices order and produce the same values;
+    // decode-order independence holds because a comparison decode's only
+    // Config write is re-storing raw_prewhitened = true (all metadata writes
+    // are is_reference-gated, and the reference decoded long ago).
+    //
+    // Costs up to two more resident Bayer frames (~49MB each) than depth 1.
+    // Peak footprint is at merge:band, not during analyze; headroom to jetsam
+    // was 1527MB on the profiled run.
+    struct PrefetchedDecode {
+        int k = -1;
+        std::future<Image> fut;
+    };
+    std::deque<PrefetchedDecode> pref_q;
+    const int kDecodePrefetchDepth = 3;
+    // Crop dims by value: the decode thread may still be running after the
+    // reference image's pixels have been stashed and freed.
+    const int pref_ref_h = ref.h, pref_ref_w = ref.w;
+    auto launch_prefetch = [&, pref_ref_h, pref_ref_w](int frame) {
+        pref_q.push_back({frame, std::async(std::launch::async,
+                                            [&, frame, pref_ref_h, pref_ref_w]() {
+            worker_qos();
+            return loader(frame, work, false, pref_ref_h, pref_ref_w);
+        })});
+    };
 
     // Accumulated robustness. Summed inside the loop on the streamed path so
     // each frame's mask can be released as soon as it is on the GPU, rather
@@ -668,10 +697,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     snr_fut.get();
     prof_add_cpu("setup:snr-join(residual)", prof_now_ms() - t_snr_join);
 
-    // Start the first comparison decode now. It used to run synchronously at
-    // the top of the comparison loop (comp:decode(sync), ~187ms with nothing
-    // overlapping it); the pyramid build plus robustness and kernel estimation
-    // now cover it.
+    // Seed the decode queue now, up to its full depth. These used to run
+    // synchronously at the top of the comparison loop (comp:decode(sync),
+    // ~187ms with nothing overlapping it); the pyramid build plus robustness
+    // and kernel estimation now cover the first, and by the time the loop
+    // consumes frame 1 the queue is refilling behind it.
     //
     // Deliberately after snr_fut.get() rather than before the reference stage:
     // the loader takes Config by non-const reference and may write to it, while
@@ -679,17 +709,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // race on the noise model, changing the SNR and therefore the alignment
     // tile size -- an algorithm change, not an optimization.
     //
-    // Costs one extra resident Bayer frame (~49MB) during the reference stage.
-    // Peak footprint is at merge:band (1861MB), not here, so the peak is
-    // unchanged; headroom to jetsam was 1211MB.
-    for (int i = 0; i < frame_count; ++i) {
-        if (i == ref_index) continue;
-        pref_k = i;
-        pref_fut = std::async(std::launch::async, [&, i]() {
-            worker_qos();
-            return loader(i, work, false, ref.h, ref.w);
-        });
-        break;
+    // Same enumeration as comp_indices below (every frame but the reference,
+    // in order), so the queue's front always matches the loop's next k.
+    {
+        int seeded = 0;
+        for (int i = 0; i < frame_count && seeded < kDecodePrefetchDepth; ++i) {
+            if (i == ref_index) continue;
+            launch_prefetch(i);
+            ++seeded;
+        }
     }
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
@@ -808,8 +836,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
 
-    // pref_k / pref_fut are declared above: the first comparison decode is
-    // already in flight, launched before the reference analysis began.
+    // pref_q is declared above: the first kDecodePrefetchDepth comparison
+    // decodes are already in flight, launched before the reference analysis.
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
@@ -852,9 +880,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
         Image comp;
         const double t_decode = prof_now_ms();
-        if (pref_k == k && pref_fut.valid()) {
-            comp = pref_fut.get();
-            pref_k = -1;
+        if (!pref_q.empty() && pref_q.front().k == k && pref_q.front().fut.valid()) {
+            comp = pref_q.front().fut.get();
+            pref_q.pop_front();
             // Stall only. Near-zero here means the prefetch fully hid the decode.
             prof_add_cpu("comp:decode-wait(prefetched)", prof_now_ms() - t_decode);
         } else {
@@ -869,26 +897,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, raw_name.c_str(), comp);
         }
 
-        // Launch the next decode here on both paths, immediately after this
-        // frame's decode, so it overlaps grey + align + robustness + kernels
-        // (~440ms) instead of only robustness + kernels (~55ms). The full-res
-        // path used to defer until after align to hold peak RAM down, and the
-        // cost was comp:decode-wait sitting at 460ms per burst: a ~190ms decode
-        // with ~55ms of cover.
-        //
-        // The extra resident frame is ~49MB of normalized Bayer held across
-        // grey. Peak footprint is reached at merge:band (1861MB), not during
-        // analyze, so this does not move the peak; headroom to jetsam was
-        // 1211MB. Scheduling only -- the same frames are decoded in the same
-        // order and produce the same values.
-        if (pos + 1 < (int)comp_indices.size()) {
+        // Top the decode queue back up here on both paths, immediately after
+        // this frame's decode is consumed, so the new decode overlaps grey +
+        // align + robustness + kernels of this frame AND the queued decodes
+        // ahead of it. After popping the front, the queue holds positions
+        // pos+1 .. pos+size, so the next frame to launch is comp_indices at
+        // pos + 1 + size. Scheduling only -- the same frames are decoded in
+        // the same order and produce the same values.
+        {
             const double t_pf = prof_now_ms();
-            const int nk = comp_indices[(size_t)pos + 1u];
-            pref_k = nk;
-            pref_fut = std::async(std::launch::async, [&, nk]() {
-                worker_qos();
-                return loader(nk, work, false, ref_h, ref_w);
-            });
+            while ((int)pref_q.size() < kDecodePrefetchDepth &&
+                   pos + 1 + (int)pref_q.size() < (int)comp_indices.size()) {
+                launch_prefetch(comp_indices[(size_t)(pos + 1 + (int)pref_q.size())]);
+            }
             prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
         }
 
@@ -1115,7 +1136,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     drain_spill();
     if (mps_warm.valid()) mps_warm.get();
-    if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
+    for (auto& p : pref_q)                      // drain unused prefetches
+        if (p.fut.valid()) (void)p.fut.get();
+    pref_q.clear();
 
     if (n_comp_ok < 1) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
@@ -1308,6 +1331,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // and the diagnostics never know which storage the accumulator used.
         bool got = true;
         const double t_encode = prof_now_ms();
+        // Ping-pong row16_async so the serial Deflate + fwrite of band N runs
+        // on a worker while the CPU encodes band N+1. Exactly one write is in
+        // flight at a time (the writer's z_stream is stateful and rows must
+        // land in order); the join before each launch enforces that and keeps
+        // the buffer being written untouched, since the encoder only ever
+        // fills the OTHER buffer. Same rows, same order, same bytes -- only
+        // the overlap is new.
+        std::future<void> write_fut;
+        int enc_cur = 0;
         for (int y0 = 0; y0 < Hs; y0 += band_rows) {
             const int bh = std::min(band_rows, Hs - y0);
             const f32* nump = nullptr;
@@ -1317,13 +1349,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 break;
             }
             accumulate_diag_ptr(nump, denp, (size_t)bh * (size_t)Ws, nch, diag);
-            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
-                row16.resize((size_t)bh * (size_t)Ws * 3u);
+            std::vector<uint16_t>& r16 = row16_async[enc_cur];
+            if (r16.size() < (size_t)bh * (size_t)Ws * 3u)
+                r16.resize((size_t)bh * (size_t)Ws * 3u);
             encode_band_rows_ptr(nump, denp, y0, bh, work, nch, preview, pscale,
-                                 ph, pw, Ws, row16);
-            writer.write_rows(row16.data(), bh);
+                                 ph, pw, Ws, r16);
+            if (write_fut.valid()) write_fut.get();
+            write_fut = std::async(std::launch::async, [&writer, &r16, bh]() {
+                worker_qos();
+                writer.write_rows(r16.data(), bh);
+            });
+            enc_cur ^= 1;
             report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
         }
+        if (write_fut.valid()) write_fut.get();
         // The 48 MP divide + ISP + 16-bit pack + DNG write was invisible in
         // every profile so far -- roughly 2 s of wall with no bucket. Named so
         // the next profile shows it instead of leaving it as unexplained wall.
