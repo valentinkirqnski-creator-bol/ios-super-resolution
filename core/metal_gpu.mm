@@ -159,6 +159,8 @@ static MetalCtx& ctx() {
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
+            "merge_accumulate_comp_x4_h", "merge_accumulate_ref_h",
+            "merge_acc_half_to_float",
             "kernel_gat", "kernel_gat_raw", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
@@ -2756,6 +2758,21 @@ struct MergeRefGpu {
 static MergeAccSlot g_merge_acc[2];
 static int g_merge_write_slot = 0;
 static bool g_merge_need_zero = false;
+// Online accumulator stored as half instead of float. Arithmetic stays fp32 in
+// the kernels; only what lands in memory narrows. Chosen because at 48 MP the
+// fp32 num+den pair is 1116 MB -- the single largest allocation in the
+// pipeline and the dominant traffic of the bandwidth-bound merge (585 MB of
+// read-modify-write per frame). half halves both. Cost: ~0.05% relative
+// storage quantisation per store, i.e. output changes at the level of 1-2
+// LSB of the 16-bit result. Applies to the ONLINE accumulator only; the
+// banded path keeps fp32 untouched.
+static bool g_merge_acc_half = false;
+// Reused per-band staging for handing the half accumulator to the host
+// encoder as float. Band-sized, not image-sized, so the fp16 saving is not
+// given straight back at readback time.
+static id<MTLBuffer> g_acc_stage_num = nil;
+static id<MTLBuffer> g_acc_stage_den = nil;
+static size_t g_acc_stage_cap = 0;
 static bool g_merge_single_slot = false;
 // Online merge: one accumulator that outlives its command buffer, so each frame
 // can be committed and its GPU inputs released instead of every frame staying
@@ -2858,7 +2875,11 @@ static bool merge_flush_pending() {
         [enc setBuffer:e.cov  offset:0 atIndex:12u + i];
         [enc setBuffer:e.rob  offset:0 atIndex:16u + i];
     }
-    dispatch2(enc, c.pipe("merge_accumulate_comp_x4"), ps[0].Ws, ps[0].band_h);
+    dispatch2(enc,
+              c.pipe((g_merge_online && g_merge_acc_half)
+                         ? "merge_accumulate_comp_x4_h"
+                         : "merge_accumulate_comp_x4"),
+              ps[0].Ws, ps[0].band_h);
     g_merge_pending.clear();
     return true;
 }
@@ -3080,7 +3101,9 @@ static bool metal_merge_wait_inflight_impl();
 
 // Grow-only per-slot GPU accumulators. Zero via blit when the band CB opens.
 static bool ensure_acc_buffers(size_t nelem, bool start_band) {
-    const size_t bytes = nelem * sizeof(float);
+    const size_t elem = (g_merge_online && g_merge_acc_half) ? sizeof(uint16_t)
+                                                             : sizeof(float);
+    const size_t bytes = nelem * elem;
     if (bytes == 0) return false;
     auto& c = ctx();
     if (start_band) {
@@ -3178,10 +3201,11 @@ void metal_merge_release_frame(int frame_id) {
     }
 }
 
-void metal_merge_begin_online(int out_h, int out_w, int nch) {
+void metal_merge_begin_online(int out_h, int out_w, int nch, bool half_acc) {
     g_online_h = out_h;
     g_online_w = out_w;
     g_online_nch = nch;
+    g_merge_acc_half = half_acc;
     // Resolve anything banded still in flight before the accumulator changes
     // meaning, or its readback would land in a band image that has gone.
     (void)metal_merge_wait_inflight_impl();
@@ -3216,6 +3240,10 @@ void metal_merge_end_online() {
     // and reset mirror begin_burst, which frees the same slots, and cover the
     // error paths that arrive with a band command buffer still open.
     (void)metal_merge_retire_online();     // pipelined commit, if one is live
+    g_merge_acc_half = false;
+    g_acc_stage_num = nil;
+    g_acc_stage_den = nil;
+    g_acc_stage_cap = 0;
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
     merge_release_acc_slots();
@@ -3224,8 +3252,62 @@ void metal_merge_end_online() {
     g_online_h = g_online_w = g_online_nch = 0;
 }
 
+// Hand the host one horizontal band of the finished accumulator as float.
+// fp32 mode: a zero-copy pointer into the mapped buffer, exactly what
+// metal_merge_map_online + offset used to give. fp16 mode: a small GPU pass
+// widens the band into reused float staging (band-sized, ~50-100 MB, not the
+// 1.1 GB a whole-image conversion would cost). The host encoder is untouched
+// either way.
+bool metal_merge_read_band_float(int y0, int rows, const float** num,
+                                 const float** den) {
+  @autoreleasepool {
+    if (!g_merge_online || !num || !den || rows <= 0) return false;
+    if (!metal_merge_flush_online()) return false;   // acc stable before read
+    if (!g_merge_online_zeroed) return false;
+    MergeAccSlot& slot = g_merge_acc[0];
+    if (!slot.num || !slot.den) return false;
+    const size_t stride = (size_t)g_online_w * (size_t)g_online_nch;
+    const size_t base = (size_t)y0 * stride;
+    const size_t count = (size_t)rows * stride;
+    if (!g_merge_acc_half) {
+        *num = (const float*)[slot.num contents] + base;
+        *den = (const float*)[slot.den contents] + base;
+        return *num != nullptr && *den != nullptr;
+    }
+    auto& c = ctx();
+    const size_t need = count * sizeof(float);
+    if (g_acc_stage_cap < need) {
+        g_acc_stage_num = buf(nullptr, need);
+        g_acc_stage_den = buf(nullptr, need);
+        g_acc_stage_cap = (g_acc_stage_num && g_acc_stage_den) ? need : 0;
+        if (!g_acc_stage_cap) return false;
+    }
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    const uint32_t cb[2] = {(uint32_t)count, (uint32_t)base};
+    [enc setBuffer:slot.num offset:0 atIndex:0];
+    [enc setBuffer:slot.den offset:0 atIndex:1];
+    [enc setBuffer:g_acc_stage_num offset:0 atIndex:2];
+    [enc setBuffer:g_acc_stage_den offset:0 atIndex:3];
+    [enc setBytes:cb length:sizeof(cb) atIndex:4];
+    dispatch1(enc, c.pipe("merge_acc_half_to_float"), count);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    *num = (const float*)[g_acc_stage_num contents];
+    *den = (const float*)[g_acc_stage_den contents];
+    return *num != nullptr && *den != nullptr;
+  }
+}
+
 bool metal_merge_map_online(const float** num, const float** den, size_t* nelem) {
     if (!g_merge_online || !num || !den) return false;
+    // In half mode the mapped bytes are not floats; handing them out as
+    // float* would be silently-wrong data, the worst failure mode this
+    // codebase has. Readers go through metal_merge_read_band_float instead.
+    if (g_merge_acc_half) return false;
     if (!metal_merge_flush_online()) return false;
     if (!g_merge_online_zeroed) return false;      // nothing ever accumulated
     MergeAccSlot& slot = g_merge_acc[0];
@@ -3531,7 +3613,11 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     [enc setBuffer:b_cov offset:0 atIndex:3];
     [enc setBuffer:b_acc offset:0 atIndex:4];
     [enc setBytes:&p length:sizeof(p) atIndex:5];
-    dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
+    dispatch2(enc,
+              c.pipe((g_merge_online && g_merge_acc_half)
+                         ? "merge_accumulate_ref_h"
+                         : "merge_accumulate_ref"),
+              p.Ws, p.band_h);
     merge_enc_close();
 
     // Online: the reference is just the last contribution to a long-lived

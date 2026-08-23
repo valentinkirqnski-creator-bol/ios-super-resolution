@@ -824,7 +824,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
     // After begin_burst, which clears online state along with the rest of the
     // merge globals.
-    if (use_online) metal_merge_begin_online(out_h, out_w, out_nch);
+    if (use_online)
+        metal_merge_begin_online(out_h, out_w, out_nch,
+                                 work.merge_fp16_accumulator);
     prof_mark_memory(use_online ? "merge:online-armed" : "merge:banded-armed");
 #endif
 
@@ -1296,11 +1298,31 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             online_pending.clear();
         }
         merge_ref_band(ref, ref_covs, num_sink, den_sink, 0, work, acc_rob_ptr);
-        const f32* nump = nullptr;
-        const f32* denp = nullptr;
-        const bool got = metal_merge_map_online(&nump, &denp, nullptr);
         prof_add_cpu("merge:online-ref+readback", prof_now_ms() - t_ref_online);
         prof_mark_memory("merge:online");
+        // Rows come out of one finished accumulator, so encoding is a plain
+        // top-to-bottom sweep. Every band is fetched through
+        // metal_merge_read_band_float: in fp32 mode that is the same zero-copy
+        // pointer the old whole-image map handed out, in fp16 mode a GPU pass
+        // widens just this band into reused staging -- so the encoder below
+        // and the diagnostics never know which storage the accumulator used.
+        bool got = true;
+        for (int y0 = 0; y0 < Hs; y0 += band_rows) {
+            const int bh = std::min(band_rows, Hs - y0);
+            const f32* nump = nullptr;
+            const f32* denp = nullptr;
+            if (!metal_merge_read_band_float(y0, bh, &nump, &denp)) {
+                got = false;
+                break;
+            }
+            accumulate_diag_ptr(nump, denp, (size_t)bh * (size_t)Ws, nch, diag);
+            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
+                row16.resize((size_t)bh * (size_t)Ws * 3u);
+            encode_band_rows_ptr(nump, denp, y0, bh, work, nch, preview, pscale,
+                                 ph, pw, Ws, row16);
+            writer.write_rows(row16.data(), bh);
+            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
+        }
         if (!got) {
             report("Error: GPU merge failed (memory?)", 1.f);
             metal_merge_end_online();
@@ -1308,23 +1330,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
             return Image();
         }
-        accumulate_diag_ptr(nump, denp, (size_t)Hs * (size_t)Ws, nch, diag);
-        // Rows come out of one finished accumulator, so encoding is a plain
-        // top-to-bottom sweep. Nothing to overlap it with -- the GPU is idle by
-        // now -- which is the cost of not banding.
-        const size_t stride = (size_t)Ws * (size_t)nch;
-        for (int y0 = 0; y0 < Hs; y0 += band_rows) {
-            const int bh = std::min(band_rows, Hs - y0);
-            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
-                row16.resize((size_t)bh * (size_t)Ws * 3u);
-            encode_band_rows_ptr(nump + (size_t)y0 * stride,
-                                 denp + (size_t)y0 * stride,
-                                 y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
-            writer.write_rows(row16.data(), bh);
-            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
-        }
-        // Accumulator released with the burst, not before: nump/denp point
-        // into it and are used above.
+        // Accumulator released with the burst, not before: the band pointers
+        // above aliased it (fp32 mode) until the loop finished.
         metal_merge_end_online();
     } else {
     int cur = 0;

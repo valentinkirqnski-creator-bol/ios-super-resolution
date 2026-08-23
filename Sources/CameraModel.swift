@@ -97,6 +97,9 @@ struct TuningParams: Equatable, Codable {
     /// Drive the merge kernel's anisotropy continuously from the structure
     /// tensor rather than switching to the full stretch only above 0.9025.
     var kernel_anisotropy_continuous: Bool = true
+    /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
+    /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
+    var merge_fp16_accumulator: Bool = true
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
     var alignment_tile_size: Int = 0
@@ -190,6 +193,7 @@ struct TuningParams: Equatable, Codable {
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
         case kernel_anisotropy_continuous
+        case merge_fp16_accumulator
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
@@ -223,6 +227,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
+        merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
@@ -1929,6 +1934,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
+            "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),

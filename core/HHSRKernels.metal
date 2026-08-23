@@ -1207,27 +1207,36 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
 //
 // Frames beyond a group boundary simply store and reload, which is why any
 // group size stays exact and the tail group can be short.
-kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
-                                     device float* den [[buffer(1)]],
-                                     constant MergeCompParams* ps [[buffer(2)]],
-                                     constant uint& nframes [[buffer(3)]],
-                                     device const float* img0 [[buffer(4)]],
-                                     device const float* img1 [[buffer(5)]],
-                                     device const float* img2 [[buffer(6)]],
-                                     device const float* img3 [[buffer(7)]],
-                                     device const float* flow0 [[buffer(8)]],
-                                     device const float* flow1 [[buffer(9)]],
-                                     device const float* flow2 [[buffer(10)]],
-                                     device const float* flow3 [[buffer(11)]],
-                                     device const float* cov0 [[buffer(12)]],
-                                     device const float* cov1 [[buffer(13)]],
-                                     device const float* cov2 [[buffer(14)]],
-                                     device const float* cov3 [[buffer(15)]],
-                                     device const float* rob0 [[buffer(16)]],
-                                     device const float* rob1 [[buffer(17)]],
-                                     device const float* rob2 [[buffer(18)]],
-                                     device const float* rob3 [[buffer(19)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
+// Templated over the ACCUMULATOR STORAGE type only. All arithmetic stays
+// float32 -- values are widened on load and narrowed on store -- so the float
+// instantiation is bit-identical to the untemplated kernel, and the half one
+// differs only by the storage quantisation of num/den. half's dynamic range
+// is ample here (den <= taps * frames, num <= den * ~4 after WB, both far
+// under 65504); what fp16 costs is the 10-bit mantissa, ~0.05% relative per
+// store, in exchange for HALF the accumulator's footprint and half the
+// merge's dominant memory traffic.
+template <typename AccT>
+inline void merge_accumulate_comp_x4_body(device AccT* num,
+                                     device AccT* den,
+                                     constant MergeCompParams* ps,
+                                     constant uint& nframes,
+                                     device const float* img0,
+                                     device const float* img1,
+                                     device const float* img2,
+                                     device const float* img3,
+                                     device const float* flow0,
+                                     device const float* flow1,
+                                     device const float* flow2,
+                                     device const float* flow3,
+                                     device const float* cov0,
+                                     device const float* cov1,
+                                     device const float* cov2,
+                                     device const float* cov3,
+                                     device const float* rob0,
+                                     device const float* rob1,
+                                     device const float* rob2,
+                                     device const float* rob3,
+                                     uint2 gid) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= ps[0].Ws || local_i >= ps[0].band_h) return;
@@ -1241,27 +1250,59 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     uint base = (local_i * ps[0].Ws + hr_j) * nch;
 
     float n0 = 0.f, n1 = 0.f, n2 = 0.f, e0 = 0.f, e1 = 0.f, e2 = 0.f;
-    if (nch >= 1) { n0 = num[base + 0]; e0 = den[base + 0]; }
-    if (nch >= 2) { n1 = num[base + 1]; e1 = den[base + 1]; }
-    if (nch >= 3) { n2 = num[base + 2]; e2 = den[base + 2]; }
+    if (nch >= 1) { n0 = float(num[base + 0]); e0 = float(den[base + 0]); }
+    if (nch >= 2) { n1 = float(num[base + 1]); e1 = float(den[base + 1]); }
+    if (nch >= 3) { n2 = float(num[base + 2]); e2 = float(den[base + 2]); }
 
     for (uint g = 0; g < nframes && g < 4u; ++g) {
         merge_comp_contrib(imgs[g], flows[g], covss[g], robs[g], ps[g],
                            hr_j, local_i, n0, n1, n2, e0, e1, e2);
     }
 
-    if (nch >= 1) { num[base + 0] = n0; den[base + 0] = e0; }
-    if (nch >= 2) { num[base + 1] = n1; den[base + 1] = e1; }
-    if (nch >= 3) { num[base + 2] = n2; den[base + 2] = e2; }
+    if (nch >= 1) { num[base + 0] = AccT(n0); den[base + 0] = AccT(e0); }
+    if (nch >= 2) { num[base + 1] = AccT(n1); den[base + 1] = AccT(e1); }
+    if (nch >= 3) { num[base + 2] = AccT(n2); den[base + 2] = AccT(e2); }
 }
 
-kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
-                                 device float* den [[buffer(1)]],
-                                 device const float* img [[buffer(2)]],
-                                 device const float* covs [[buffer(3)]],
-                                 device const float* acc_rob [[buffer(4)]],
-                                 constant MergeRefParams& p [[buffer(5)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
+#define MERGE_X4_KERNEL(NAME, ACC_T) \
+kernel void NAME(device ACC_T* num [[buffer(0)]], \
+                 device ACC_T* den [[buffer(1)]], \
+                 constant MergeCompParams* ps [[buffer(2)]], \
+                 constant uint& nframes [[buffer(3)]], \
+                 device const float* img0 [[buffer(4)]], \
+                 device const float* img1 [[buffer(5)]], \
+                 device const float* img2 [[buffer(6)]], \
+                 device const float* img3 [[buffer(7)]], \
+                 device const float* flow0 [[buffer(8)]], \
+                 device const float* flow1 [[buffer(9)]], \
+                 device const float* flow2 [[buffer(10)]], \
+                 device const float* flow3 [[buffer(11)]], \
+                 device const float* cov0 [[buffer(12)]], \
+                 device const float* cov1 [[buffer(13)]], \
+                 device const float* cov2 [[buffer(14)]], \
+                 device const float* cov3 [[buffer(15)]], \
+                 device const float* rob0 [[buffer(16)]], \
+                 device const float* rob1 [[buffer(17)]], \
+                 device const float* rob2 [[buffer(18)]], \
+                 device const float* rob3 [[buffer(19)]], \
+                 uint2 gid [[thread_position_in_grid]]) { \
+    merge_accumulate_comp_x4_body<ACC_T>(num, den, ps, nframes, \
+        img0, img1, img2, img3, flow0, flow1, flow2, flow3, \
+        cov0, cov1, cov2, cov3, rob0, rob1, rob2, rob3, gid); \
+}
+
+MERGE_X4_KERNEL(merge_accumulate_comp_x4, float)
+MERGE_X4_KERNEL(merge_accumulate_comp_x4_h, half)
+#undef MERGE_X4_KERNEL
+
+template <typename AccT>
+inline void merge_accumulate_ref_body(device AccT* num,
+                                 device AccT* den,
+                                 device const float* img,
+                                 device const float* covs,
+                                 device const float* acc_rob,
+                                 constant MergeRefParams& p,
+                                 uint2 gid) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= p.Ws || local_i >= p.band_h) return;
@@ -1358,14 +1399,44 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
                      (local_acc_r < p.max_frame_count);
     uint base = (local_i * p.Ws + hr_j) * p.nch;
     if (overwrite) {
-        if (p.nch >= 1) { num[base + 0] = val0; den[base + 0] = acc0; }
-        if (p.nch >= 2) { num[base + 1] = val1; den[base + 1] = acc1; }
-        if (p.nch >= 3) { num[base + 2] = val2; den[base + 2] = acc2; }
+        if (p.nch >= 1) { num[base + 0] = AccT(val0); den[base + 0] = AccT(acc0); }
+        if (p.nch >= 2) { num[base + 1] = AccT(val1); den[base + 1] = AccT(acc1); }
+        if (p.nch >= 3) { num[base + 2] = AccT(val2); den[base + 2] = AccT(acc2); }
     } else {
-        if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
-        if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
-        if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
+        if (p.nch >= 1) { num[base + 0] = AccT(float(num[base + 0]) + val0); den[base + 0] = AccT(float(den[base + 0]) + acc0); }
+        if (p.nch >= 2) { num[base + 1] = AccT(float(num[base + 1]) + val1); den[base + 1] = AccT(float(den[base + 1]) + acc1); }
+        if (p.nch >= 3) { num[base + 2] = AccT(float(num[base + 2]) + val2); den[base + 2] = AccT(float(den[base + 2]) + acc2); }
     }
+}
+
+#define MERGE_REF_KERNEL(NAME, ACC_T) \
+kernel void NAME(device ACC_T* num [[buffer(0)]], \
+                 device ACC_T* den [[buffer(1)]], \
+                 device const float* img [[buffer(2)]], \
+                 device const float* covs [[buffer(3)]], \
+                 device const float* acc_rob [[buffer(4)]], \
+                 constant MergeRefParams& p [[buffer(5)]], \
+                 uint2 gid [[thread_position_in_grid]]) { \
+    merge_accumulate_ref_body<ACC_T>(num, den, img, covs, acc_rob, p, gid); \
+}
+
+MERGE_REF_KERNEL(merge_accumulate_ref, float)
+MERGE_REF_KERNEL(merge_accumulate_ref_h, half)
+#undef MERGE_REF_KERNEL
+
+// Stage one band of the half accumulator out to float for the host encoder,
+// which stays byte-for-byte unchanged. cb.x = element count, cb.y = element
+// offset of the band's first entry -- an offset PARAMETER rather than a
+// buffer-binding offset, so no alignment constraint applies to odd bands.
+kernel void merge_acc_half_to_float(device const half* num_h [[buffer(0)]],
+                                    device const half* den_h [[buffer(1)]],
+                                    device float* num_f [[buffer(2)]],
+                                    device float* den_f [[buffer(3)]],
+                                    constant uint2& cb [[buffer(4)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cb.x) return;
+    num_f[gid] = float(num_h[cb.y + gid]);
+    den_f[gid] = float(den_h[cb.y + gid]);
 }
 
 // =============================================================================
