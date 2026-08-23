@@ -53,6 +53,20 @@ static inline void worker_qos() {
 #endif
 }
 
+// Prefetch decoders run a tier LOWER still. At USER_INITIATED, three
+// concurrent LibRaw decodes competed with parallel_rows (same QoS) for the
+// P-cores and the whole analyze stage inflated: align 42->111ms, robustness
+// 37->380ms per frame -- the decode stall was eliminated but re-exported as
+// compute contention, and the burst got slower overall. UTILITY steers the
+// decoders to spare E-core cycles (it is not the throttled BACKGROUND tier),
+// leaving the P-cores to the pipeline that consumes their output. A decode
+// takes longer on an E-core, which is exactly what the depth-3 queue is for.
+static inline void decode_qos() {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+}
+
 
 namespace {
 
@@ -650,7 +664,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     auto launch_prefetch = [&, pref_ref_h, pref_ref_w](int frame) {
         pref_q.push_back({frame, std::async(std::launch::async,
                                             [&, frame, pref_ref_h, pref_ref_w]() {
-            worker_qos();
+            decode_qos();
             return loader(frame, work, false, pref_ref_h, pref_ref_w);
         })});
     };
