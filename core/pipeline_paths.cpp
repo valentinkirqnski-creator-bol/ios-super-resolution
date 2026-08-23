@@ -993,8 +993,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 // several frames queued together, and a frame's GPU buffers
                 // cannot be released until its work has run.
                 if ((int)online_pending.size() >= online_fuse) {
-                    merged = metal_merge_flush_online();
-                    for (int fk : online_pending) metal_merge_release_frame(fk);
+                    // Non-blocking: commit and continue into the next frame's
+                    // analysis while this merge runs. The frame's uploads are
+                    // released when the NEXT commit (or the final blocking
+                    // flush) retires this one -- so at most one extra frame
+                    // (~110-146 MB) is ever resident, independent of burst
+                    // length. The old blocking wait here cost ~160 ms/frame of
+                    // pure CPU idle against a ~90 ms GPU merge.
+                    merged = metal_merge_commit_online(online_pending);
                     online_pending.clear();
                 }
             }

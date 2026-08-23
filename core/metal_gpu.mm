@@ -3215,6 +3215,7 @@ void metal_merge_end_online() {
     // encode loop, the rest are error exits that return immediately. The wait
     // and reset mirror begin_burst, which frees the same slots, and cover the
     // error paths that arrive with a band command buffer still open.
+    (void)metal_merge_retire_online();     // pipelined commit, if one is live
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
     merge_release_acc_slots();
@@ -3238,18 +3239,74 @@ bool metal_merge_map_online(const float** num, const float** den, size_t* nelem)
     return *num != nullptr && *den != nullptr;
 }
 
-bool metal_merge_flush_online() {
+// One committed-but-unretired online merge, plus the frame ids whose GPU
+// uploads it still references. Depth is deliberately EXACTLY ONE:
+//
+//   depth 0 (the old blocking wait) serialises the pipeline -- measured, the
+//   CPU spent ~160 ms/frame inside comp:stash+free-raw doing nothing but
+//   waiting for the ~90 ms merge:online-cb, while the GPU was idle for all of
+//   the CPU's analysis. A frame cost CPU + GPU instead of max(CPU, GPU).
+//
+//   depth 1 already buys the whole overlap: while frame k's merge runs on the
+//   GPU, frame k+1's decode/align/robustness/kernels proceed on the CPU, and
+//   the wait at the NEXT flush lands after the GPU has long finished.
+//
+//   deeper would hold several frames' uploads (~110-146 MB each) at a peak
+//   that measured only 305 MB from jetsam. One extra frame is the largest
+//   depth that budget can ever afford, so it is a constant, not a knob.
+//
+// All state is touched from the pipeline thread only; retirement waits on the
+// stored buffer rather than using a completion handler, so no locks appear
+// anywhere near g_merge_frames.
+static __strong id<MTLCommandBuffer> g_online_inflight_cmd = nil;
+static std::vector<int> g_online_inflight_frames;
+
+bool metal_merge_retire_online() {
+  @autoreleasepool {
+    if (!g_online_inflight_cmd) return true;
+    [g_online_inflight_cmd waitUntilCompleted];
+    const bool ok =
+        (g_online_inflight_cmd.status == MTLCommandBufferStatusCompleted);
+    g_online_inflight_cmd = nil;
+    for (int k : g_online_inflight_frames) metal_merge_release_frame(k);
+    g_online_inflight_frames.clear();
+    return ok;
+  }
+}
+
+bool metal_merge_commit_online(const std::vector<int>& frame_ids) {
+  @autoreleasepool {
     if (!g_merge_online) return false;
     if (!g_merge_band_cmd) return true;
     if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
     merge_enc_close();
     prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
+    // Retire the previous frame's merge first (usually already finished, so
+    // this wait is ~0), then hand the slot to this one and return without
+    // blocking. The frame's uploads stay alive exactly until retirement.
+    const bool prev_ok = metal_merge_retire_online();
+    g_online_inflight_cmd = g_merge_band_cmd;
+    g_online_inflight_frames = frame_ids;
+    [g_online_inflight_cmd commit];
+    merge_band_cmd_reset();
+    return prev_ok;
+  }
+}
+
+bool metal_merge_flush_online() {
+    if (!g_merge_online) return false;
+    // Drain anything committed by the pipelined path before (or instead of)
+    // this blocking flush -- the accumulator must not be read while a prior
+    // frame's adds are still queued.
+    bool ok = metal_merge_retire_online();
+    if (!g_merge_band_cmd) return ok;
+    if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
+    merge_enc_close();
+    prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
     id<MTLCommandBuffer> cmd = g_merge_band_cmd;
     [cmd commit];
-    // Wait rather than pipeline: the point of committing per frame is to free
-    // that frame's GPU buffers, which cannot happen while its work is queued.
     [cmd waitUntilCompleted];
-    const bool ok = (cmd.status == MTLCommandBufferStatusCompleted);
+    ok = (cmd.status == MTLCommandBufferStatusCompleted) && ok;
     merge_band_cmd_reset();
     return ok;
 }
@@ -3325,7 +3382,7 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
                              b_img, b_flow, b_cov, b_rob);
 }
 
-bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
+static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& flow,
                            const CovField& covs, const Image& robustness,
                            int tile_size, Image& num_band, Image& den_band,
                            int y0, const Config& cfg, int frame_id) {
@@ -3411,7 +3468,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     return true;
 }
 
-bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
+static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs,
                           Image& num_band, Image& den_band, int y0,
                           const Config& cfg, const Image* acc_rob) {
     // Comps first, then ref -- same order the separate dispatches ran in.
@@ -3540,6 +3597,38 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out) {
     @autoreleasepool {
         return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_out);
+    }
+}
+
+// The MERGE path was the one entry left unpooled, and it leaked the most:
+// each frame's command buffer comes back autoreleased and retains that
+// frame's uploads -- raw 48.8 MB + covs 48.8 MB + rob mask -- so even after
+// metal_merge_release_frame dropped the strong references, the autoreleased
+// command buffer kept ~130 MB/frame alive until the thread's pool drained at
+// burst end. Measured: footprint grew +909 MB across a 7-frame analyze loop
+// and only fell at burst teardown, leaving 305 MB of jetsam headroom at peak.
+//
+// Draining per call is safe for the SAME reason it is safe above: the open
+// band command buffer is held by a __strong file-scope static
+// (g_merge_band_cmd / g_online_inflight_cmd), which survives the pool drain;
+// only the surplus autoreleased references go.
+bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
+                           const CovField& covs, const Image& robustness,
+                           int tile_size, Image& num_band, Image& den_band,
+                           int y0, const Config& cfg, int frame_id) {
+    @autoreleasepool {
+        return merge_comp_band_metal_impl(comp_raw, flow, covs, robustness,
+                                          tile_size, num_band, den_band, y0,
+                                          cfg, frame_id);
+    }
+}
+
+bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
+                          Image& num_band, Image& den_band, int y0,
+                          const Config& cfg, const Image* acc_rob) {
+    @autoreleasepool {
+        return merge_ref_band_metal_impl(ref_raw, covs, num_band, den_band, y0,
+                                         cfg, acc_rob);
     }
 }
 

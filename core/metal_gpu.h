@@ -161,4 +161,17 @@ bool metal_merge_map_online(const float** num, const float** den, size_t* nelem)
 void metal_merge_end_online();
 bool metal_merge_flush_online();
 
+// Commit the queued online merge WITHOUT blocking, retiring the previous
+// frame's committed merge first (normally already finished, so that wait is
+// ~0). Exactly one merge is in flight at a time; its frames' uploads are
+// released at retirement, so the extra GPU working set is bounded by ONE
+// frame (~110-146 MB) regardless of burst length. Lets frame k+1's analysis
+// overlap frame k's merge instead of paying CPU + GPU per frame.
+bool metal_merge_commit_online(const std::vector<int>& frame_ids);
+
+// Wait for the in-flight online merge (if any) and release its frames. Called
+// by metal_merge_flush_online automatically; call directly before reading the
+// accumulator by any other route.
+bool metal_merge_retire_online();
+
 } // namespace hhsr
