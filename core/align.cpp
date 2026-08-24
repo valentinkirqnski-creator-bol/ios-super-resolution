@@ -1321,6 +1321,39 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
 //    grey-integer measurement (2 raw px of quantisation on decimate).
 //    Ties keep the lowest candidate index; a warp that leaves either image
 //    scores infinite; if nothing can be scored the blend stands.
+// Full-resolution ICA polish (Config::align_fullres_polish): one final ICA
+// refinement of the RAW-grid flow at raw resolution, on the band-limited
+// full-res FFT grey both frames were converted to -- the same image the FFT
+// path measures on. Run after flow_to_raw_tile_grid and before the boundary
+// densify, while the seed is the finished decimate estimate. On device the
+// Metal path (prep_level_ica_gpu + ica_bufs, ref side cached per burst) does
+// the work; the CPU body below exists for host tools and forced-CPU debug,
+// built from the same Sobel/Hessian/ica_refine_level pieces the CPU align
+// driver uses at its own finest level.
+bool flow_fullres_ica_polish(const Image& ref_grey_full, const Image& mov_grey_full,
+                             FlowField& flow, int tile_size, const Config& cfg) {
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0 ||
+        ref_grey_full.h <= 0 || ref_grey_full.w <= 0 ||
+        mov_grey_full.h <= 0 || mov_grey_full.w <= 0)
+        return false;
+#ifdef __APPLE__
+    if (!env_flag_on("HHSR_ALIGN_CPU"))
+        return ica_fullres_polish_metal(ref_grey_full, mov_grey_full, flow,
+                                        tile_size, cfg);
+#endif
+    const int ny = (ref_grey_full.h + tile_size - 1) / tile_size;
+    const int nx = (ref_grey_full.w + tile_size - 1) / tile_size;
+    if (ny != flow.ny || nx != flow.nx) return false;
+    Image gx = compute_sobel_gradx(ref_grey_full);
+    Image gy = compute_sobel_grady(ref_grey_full);
+    HessianField hess = compute_hessian(gx, gy, tile_size);
+    if (hess.ny != flow.ny || hess.nx != flow.nx) return false;
+    ica_refine_level(ref_grey_full, gx, gy, mov_grey_full, hess, flow,
+                     tile_size, cfg.ica_n_iter, cfg.num_threads,
+                     ica_damp_ratio(cfg), ica_max_step(cfg, 1));
+    return true;
+}
+
 void flow_densify_boundary_select(FlowField& flow,
                                   const Image& ref_grey, const Image& mov_grey,
                                   int raw_h, int raw_w, int tile_size,

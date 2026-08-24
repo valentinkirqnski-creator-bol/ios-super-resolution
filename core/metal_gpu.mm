@@ -3783,6 +3783,50 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
     }
 }
 
+// Full-resolution ICA polish of a RAW-grid flow field on the band-limited
+// full-res grey (see Config::align_fullres_polish). Reuses the FFT path's
+// finest-level machinery unchanged: prep_level_ica_gpu builds (and caches by
+// the reference grey's data pointer, so the ref side is prepped once per
+// burst) the Sobel gradients and per-tile Hessians at full resolution, and
+// ica_bufs runs the same refinement kernel with the same step clamp the FFT
+// finest level uses (search radius 1). flow's vectors are raw px and the grey
+// IS raw resolution, so no unit conversion exists to get wrong. Returns false
+// without touching flow when anything cannot run -- the caller keeps the
+// unpolished estimate, mirroring the per-level-ICA "losing precision beats
+// losing the frame" rule.
+bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_full,
+                              FlowField& flow, int tile_size, const Config& cfg) {
+    @autoreleasepool {
+        if (!metal_gpu_init()) return false;
+        if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return false;
+        if (ref_grey_full.h <= 0 || ref_grey_full.w <= 0 ||
+            mov_grey_full.h <= 0 || mov_grey_full.w <= 0)
+            return false;
+        (void)align_drain();
+        id<MTLBuffer> b_mov = buf(mov_grey_full.data.data(),
+                                  mov_grey_full.data.size() * sizeof(float));
+        id<MTLBuffer> b_flow = buf(flow.flow.data(),
+                                   flow.flow.size() * sizeof(float));
+        if (!b_mov || !b_flow) return false;
+        id<MTLBuffer> l_ref = nil, l_gx = nil, l_gy = nil, l_hess = nil;
+        int l_ny = 0, l_nx = 0;
+        if (!prep_level_ica_gpu(ref_grey_full, tile_size, l_ref, l_gx, l_gy,
+                                l_hess, l_ny, l_nx))
+            return false;
+        if (l_ny != flow.ny || l_nx != flow.nx) return false;
+        if (!ica_bufs(l_ref, l_gx, l_gy, l_hess, b_mov, b_flow,
+                      ref_grey_full.h, ref_grey_full.w,
+                      mov_grey_full.h, mov_grey_full.w,
+                      flow.ny, flow.nx, tile_size, cfg.ica_n_iter,
+                      ica_damp_ratio_metal(cfg), ica_max_step_metal(cfg, 1)))
+            return false;
+        if (!align_drain()) return false;
+        memcpy(flow.flow.data(), [b_flow contents],
+               flow.flow.size() * sizeof(float));
+        return true;
+    }
+}
+
 // The MERGE path was the one entry left unpooled, and it leaked the most:
 // each frame's command buffer comes back autoreleased and retains that
 // frame's uploads -- raw 48.8 MB + covs 48.8 MB + rob mask -- so even after

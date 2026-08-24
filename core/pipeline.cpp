@@ -113,8 +113,17 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
-        flow_densify_boundary_select(flow, ref_grey, comp_grey,
-                                     comp.h, comp.w, tile_size, work);
+        if (work.align_fullres_polish && work.bayer_mode &&
+            work.grey_method == GreyMethod::Decimate) {
+            Image rp = pad_image_circular(compute_grey_fft(ref), tile_size);
+            Image cp = pad_image_circular(compute_grey_fft(comp), tile_size);
+            flow_fullres_ica_polish(rp, cp, flow, tile_size, work);
+            flow_densify_boundary_select(flow, rp, cp, comp.h, comp.w,
+                                         tile_size, work);
+        } else {
+            flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                         comp.h, comp.w, tile_size, work);
+        }
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -195,8 +204,17 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                                         comp_grey.h, comp_grey.w, tile_size,
                                         work.r_Mt, work.num_threads,
                                         work.grey_tile_size(tile_size));
-        flow_densify_boundary_select(fd.flow, ref_grey, comp_grey,
-                                     burst[k].h, burst[k].w, tile_size, work);
+        if (work.align_fullres_polish && work.bayer_mode &&
+            work.grey_method == GreyMethod::Decimate) {
+            Image rp = pad_image_circular(compute_grey_fft(burst[0]), tile_size);
+            Image cp = pad_image_circular(compute_grey_fft(burst[k]), tile_size);
+            flow_fullres_ica_polish(rp, cp, fd.flow, tile_size, work);
+            flow_densify_boundary_select(fd.flow, rp, cp, burst[k].h,
+                                         burst[k].w, tile_size, work);
+        } else {
+            flow_densify_boundary_select(fd.flow, ref_grey, comp_grey,
+                                         burst[k].h, burst[k].w, tile_size, work);
+        }
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {

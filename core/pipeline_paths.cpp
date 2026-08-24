@@ -750,6 +750,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
     }
 
+    // Band-limited full-res grey of the reference for the full-res ICA
+    // polish; built lazily at the first comparison frame, held for the burst
+    // (~48MB). Empty when the polish is off or failed to build.
+    Image ref_grey_polish;
+
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
     {
         // Same value tune_config_snr just computed. It used to be summed again
@@ -961,10 +966,39 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
-        // Boundary-selected half-pitch refinement (fine grid); must run here,
-        // while both greys are still alive. No-op when the toggle is off.
-        flow_densify_boundary_select(flow, ref_grey, comp_grey,
-                                     comp.h, comp.w, tile_size, work);
+        // Full-res ICA polish (decimate only): re-measure the finished flow's
+        // sub-pixel part at RAW resolution on the band-limited FFT grey --
+        // the image the FFT path measures on. The half-res estimate seeds it,
+        // already sub-pixel, so this is last-mile refinement inside ICA's
+        // basin. The boundary densify below then measures on the SAME
+        // full-res greys, doubling its precision too.
+        const bool polish = work.align_fullres_polish &&
+                            work.bayer_mode &&
+                            work.grey_method == GreyMethod::Decimate;
+        if (polish) {
+            const double t_pol = prof_now_ms();
+            if (ref_grey_polish.h <= 0)   // once per burst, first comp frame
+                ref_grey_polish =
+                    pad_image_circular(compute_grey_fft(ref), tile_size);
+            Image comp_grey_polish =
+                pad_image_circular(compute_grey_fft(comp), tile_size);
+            if (ref_grey_polish.h > 0 && comp_grey_polish.h > 0) {
+                flow_fullres_ica_polish(ref_grey_polish, comp_grey_polish,
+                                        flow, tile_size, work);
+                flow_densify_boundary_select(flow, ref_grey_polish,
+                                             comp_grey_polish,
+                                             comp.h, comp.w, tile_size, work);
+            } else {
+                flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                             comp.h, comp.w, tile_size, work);
+            }
+            prof_add_cpu("comp:fullres-polish", prof_now_ms() - t_pol);
+        } else {
+            // Boundary-selected half-pitch refinement (fine grid); must run
+            // here, while both greys are still alive. No-op when off.
+            flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                         comp.h, comp.w, tile_size, work);
+        }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),

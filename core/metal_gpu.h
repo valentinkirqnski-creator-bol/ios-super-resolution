@@ -67,6 +67,10 @@ bool downsample_by_metal(const Image& src, int factor, Image& out);
 // (same math as align()). Sobel/Hess are computed one pyramid level at a time
 // (no all-level sticky cache — that jetsams at 1×). Uses sticky grey from
 // compute_grey_fft_metal when dims match. Downloads final flow only.
+// Full-res ICA polish of a raw-grid flow on the band-limited full-res grey
+// (Config::align_fullres_polish). False = could not run; flow untouched.
+bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_full,
+                              FlowField& flow, int tile_size, const Config& cfg);
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out);

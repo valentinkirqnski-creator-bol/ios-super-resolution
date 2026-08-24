@@ -368,6 +368,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
     if (tuning[@"grey_decimate_lowpass"])
         cfg.grey_decimate_lowpass = tuning[@"grey_decimate_lowpass"].boolValue;
+    if (tuning[@"align_fullres_polish"])
+        cfg.align_fullres_polish = tuning[@"align_fullres_polish"].boolValue;
     if (tuning[@"flow_boundary_selection"])
         cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;

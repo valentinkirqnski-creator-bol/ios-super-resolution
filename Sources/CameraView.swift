@@ -741,6 +741,11 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Full-Res Flow Polish", isOn: $cam.tuningParams.align_fullres_polish)
+        Text("""
+             The decimate path measures every alignment stage, the final ICA included, on              the half-resolution grey -- so every residual error doubles in raw pixels.              This adds one last ICA refinement at FULL raw resolution on the band-limited              FFT grey (the exact image the full-res FFT mode measures on), seeded by the              finished decimate flow. The seed is already sub-pixel, so the pass can only              sharpen, not wander. Closes the decimate mode's sub-pixel accuracy gap to              full-res FFT at a fraction of its cost (~40ms GPU per frame, currently              hidden behind the CPU). Decimate mode only.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Anti-Aliased Decimation", isOn: $cam.tuningParams.grey_decimate_lowpass)
         Text("""
              The half-res alignment grey was a plain 2x2 quad average -- a weak low-pass              that lets fine texture between the half-res and full-res Nyquist fold back              into the image as aliasing, which contaminates block matching and ICA: flow              that wobbles with content instead of following motion (the wavy artifact).              This decimates through a proper anti-aliasing filter instead (half-phase              binomial 1-3-3-1, effective Gaussian sigma ~0.87 raw px): same lattice, same              channel balance, ~10x stronger alias suppression. Alignment grey only; the              robustness guide and the merge are untouched. Decimate mode only.

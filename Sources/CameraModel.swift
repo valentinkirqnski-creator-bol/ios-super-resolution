@@ -106,6 +106,9 @@ struct TuningParams: Equatable, Codable {
     /// Anti-aliased decimation for the alignment grey: half-phase binomial
     /// [1 3 3 1]/8 instead of the 2x2 box. Same lattice, less alias wobble.
     var grey_decimate_lowpass: Bool = true
+    /// Final ICA refinement at full raw resolution on the FFT grey, seeded by
+    /// the decimate flow. Closes the decimate path's sub-pixel gap to FFT.
+    var align_fullres_polish: Bool = true
     /// At motion boundaries, pick the best single tile vector instead of
     /// blending two different motions. Smooth regions stay bilinear.
     var flow_boundary_selection: Bool = true
@@ -205,6 +208,7 @@ struct TuningParams: Equatable, Codable {
         case merge_fp16_accumulator
         case bm_subpixel_quadratic
         case grey_decimate_lowpass
+        case align_fullres_polish
         case flow_boundary_selection
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
@@ -242,6 +246,7 @@ struct TuningParams: Equatable, Codable {
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
         grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
+        align_fullres_polish = try c.decodeIfPresent(Bool.self, forKey: .align_fullres_polish) ?? align_fullres_polish
         flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
@@ -1962,6 +1967,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
             "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),
+            "align_fullres_polish": NSNumber(value: tuningParams.align_fullres_polish),
             "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),

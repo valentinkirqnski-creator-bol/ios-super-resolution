@@ -687,6 +687,21 @@ struct Config {
     // robustness guide and merge are untouched.
     bool  grey_decimate_lowpass = true;
 
+    // Full-resolution ICA polish for the decimate path's flow -- the last
+    // remaining accuracy gap to the full-res FFT grey. Every decimate stage,
+    // the final ICA included, measures on the half-res grey, so every
+    // residual is committed in grey units and doubles in raw pixels. When
+    // enabled, the finished flow (post flow_to_raw_tile_grid) gets one final
+    // ICA refinement at RAW resolution on the band-limited full-res FFT grey
+    // -- the very image the FFT path measures on -- seeded by the decimate
+    // estimate. The seed is already sub-pixel (quadratic BM fit + per-level
+    // ICA + boundary measurement), so the pass operates deep inside ICA's
+    // convergence basin: it can only sharpen, not wander. After it the two
+    // grey methods differ only in coarse-level tile decisions on pathological
+    // content, not in sub-pixel accuracy. Decimate + Bayer only; the FFT path
+    // already ends with exactly this pass.
+    bool  align_fullres_polish = true;
+
     // At motion boundaries, MEASURE the cell's own motion instead of
     // blending neighbour vectors.
     // Bilinear sampling between tile centres is correct where the field is
