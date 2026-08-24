@@ -687,7 +687,8 @@ struct Config {
     // robustness guide and merge are untouched.
     bool  grey_decimate_lowpass = true;
 
-    // At motion boundaries, SELECT a tile vector instead of blending.
+    // At motion boundaries, MEASURE the cell's own motion instead of
+    // blending neighbour vectors.
     // Bilinear sampling between tile centres is correct where the field is
     // smooth but blends two different motions across an object boundary,
     // producing flow that belongs to neither side -- exactly where robustness
@@ -696,8 +697,13 @@ struct Config {
     // the field: cells whose four surrounding tile vectors agree within
     // flow_select_threshold keep the bilinear blend (first-order faithful to
     // the smooth behaviour -- see FlowField::fine_flow for the measured
-    // bounds); cells at a disagreement get whichever single tile vector
-    // best explains the alignment guide there (L1 over the cell footprint).
+    // bounds); cells at a disagreement get an HDR+-style overlapping-tile
+    // measurement -- a full tile-sized window at half-tile stride, seeded by
+    // the best neighbour vector, refined by a 3x3 search plus the quadratic
+    // sub-cell fit. Flow is only piecewise smooth; interpolation is the
+    // wrong model exactly at motion edges, and measuring there is the fix
+    // the IPOL reference's author recommends (HDR+ used overlapping tiles;
+    // the Google paper dropped the mention).
     // Every warping consumer samples the refined grid through the same
     // sample_bilinear entry point, so mask and merge stay in lockstep.
     bool  flow_boundary_selection = true;

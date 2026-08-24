@@ -46,11 +46,12 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 f32 r_Mt, int num_threads,
                                 int guide_tile_size = 0);
 
-// Boundary-selected half-pitch refinement of a raw-grid flow field: fine cells
-// whose four surrounding tile vectors agree keep the bilinear blend
-// (first-order faithful smooth-region behaviour -- see FlowField::fine_flow
-// for bounds); cells at a motion disagreement get whichever
-// single tile vector best explains the alignment grey there. Fills
+// Boundary half-pitch refinement of a raw-grid flow field: fine cells whose
+// four surrounding tile vectors agree keep the bilinear blend (first-order
+// faithful smooth-region behaviour -- see FlowField::fine_flow for bounds);
+// cells at a motion disagreement get an overlapping-tile measurement
+// (full-tile window at half-tile stride, HDR+ style) seeded by the best
+// neighbour vector. Fills
 // FlowField::fine_*; sample_bilinear and the GPU hosts consume it
 // transparently. Run after flow_to_raw_tile_grid, while the greys are alive.
 void flow_densify_boundary_select(FlowField& flow,
