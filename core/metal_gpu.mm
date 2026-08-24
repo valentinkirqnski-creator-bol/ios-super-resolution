@@ -7,6 +7,8 @@
 #include "debug_utils.h"
 #include "prof.h"
 #include "mps_fft.h"
+// dng_unwhiten_gains for merge_normalize_rgb16's store gains.
+#include "dng_writer.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
