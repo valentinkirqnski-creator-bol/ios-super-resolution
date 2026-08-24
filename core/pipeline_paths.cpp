@@ -420,9 +420,15 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
     parallel_rows(bh, work.num_threads, [&](int i) {
         const int gy = y0 + i;
         const bool do_prev_row = ((gy % y_step) == 0);
+        // When the GPU produced the dense rows, this loop exists ONLY for the
+        // sparse preview -- stride straight to the sampled positions instead
+        // of iterating all 48M pixels to skip them (measured: a large slice
+        // of the encode tail doing nothing).
+        if (gpu_rgb && !do_prev_row) return;
+        const int px_step = gpu_rgb ? x_step : 1;
         const int py = std::min(ph - 1, (int)(gy * pscale));
         const size_t row_off = (size_t)i * (size_t)Ws * (size_t)nch;
-        for (int x = 0; x < Ws; ++x) {
+        for (int x = 0; x < Ws; x += px_step) {
             const bool need_prev = do_prev_row && (x % x_step) == 0;
             if (gpu_rgb && !need_prev) continue;
 

@@ -515,7 +515,35 @@ void merge_ref(const Image& ref_raw, const CovField& covs,
 
 void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
                          int c, AccumDiag& d) {
-    const int nch = std::min(3, c);
+    // Chunked parallel scan. Every field is an additive integer count, so
+    // per-chunk partials summed in chunk order are bit-identical to the
+    // serial scan -- this was a SERIAL walk over 144M values at 48MP,
+    // costing a few hundred ms of the encode tail for one status line.
+    const int nch_par = std::min(3, c);
+    const size_t kChunk = 1u << 20;
+    if (n > 2 * kChunk) {
+        const size_t nchunks = (n + kChunk - 1) / kChunk;
+        std::vector<AccumDiag> parts(nchunks);
+        parallel_rows((int)nchunks, 0, [&](int ci) {
+            const size_t p0 = (size_t)ci * kChunk;
+            const size_t p1 = std::min(n, p0 + kChunk);
+            accumulate_diag_ptr(nump + p0 * (size_t)c, denp + p0 * (size_t)c,
+                                p1 - p0, c, parts[(size_t)ci]);
+        });
+        for (const AccumDiag& q : parts) {
+            d.pixels += q.pixels;
+            for (int ch = 0; ch < 3; ++ch) {
+                d.den_zero[ch] += q.den_zero[ch];
+                d.den_tiny[ch] += q.den_tiny[ch];
+                d.den_nonfinite[ch] += q.den_nonfinite[ch];
+                d.num_nonfinite[ch] += q.num_nonfinite[ch];
+            }
+            d.only_green += q.only_green;
+            d.rgb_all_zero += q.rgb_all_zero;
+        }
+        return;
+    }
+    const int nch = nch_par;
     for (size_t p = 0; p < n; ++p) {
         ++d.pixels;
         f32 dens[3] = {0, 0, 0};
