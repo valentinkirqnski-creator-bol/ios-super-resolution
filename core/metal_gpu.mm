@@ -2718,8 +2718,9 @@ bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
         uint32_t bh, Ws, nch, bake;
         float wb0, wb1, wb2;
         float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+        float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
     };
-    static_assert(sizeof(MergeNormParamsCPU) == 64, "MergeNormParamsCPU");
+    static_assert(sizeof(MergeNormParamsCPU) == 76, "MergeNormParamsCPU");
     MergeNormParamsCPU p{};
     p.bh = (uint32_t)bh;
     p.Ws = (uint32_t)Ws;
@@ -2732,6 +2733,11 @@ bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
     p.m00 = m[0]; p.m01 = m[1]; p.m02 = m[2];
     p.m10 = m[3]; p.m11 = m[4]; p.m12 = m[5];
     p.m20 = m[6]; p.m21 = m[7]; p.m22 = m[8];
+    {
+        float sg[3];
+        dng_unwhiten_gains(cfg, nch, sg);
+        p.sg0 = sg[0]; p.sg1 = sg[1]; p.sg2 = sg[2];
+    }
 
     id<MTLBuffer> b_num = buf(num_p, n * sizeof(float));
     id<MTLBuffer> b_den = buf(den_p, n * sizeof(float));

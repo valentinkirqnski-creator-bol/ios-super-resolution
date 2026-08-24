@@ -2804,6 +2804,7 @@ struct MergeNormParams {
     uint bh, Ws, nch, bake;
     float wb0, wb1, wb2;
     float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+    float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
 };
 
 inline float norm_to_srgb(float v) {
@@ -2844,9 +2845,9 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
     } else {
         lin0 = lin1 = lin2 = cn0;
     }
-    float v0 = (p.bake != 0u) ? norm_to_srgb(lin0) : clamp(lin0, 0.f, 1.f);
-    float v1 = (p.bake != 0u) ? norm_to_srgb(lin1) : clamp(lin1, 0.f, 1.f);
-    float v2 = (p.bake != 0u) ? norm_to_srgb(lin2) : clamp(lin2, 0.f, 1.f);
+    float v0 = (p.bake != 0u) ? norm_to_srgb(lin0) : clamp(lin0 * p.sg0, 0.f, 1.f);
+    float v1 = (p.bake != 0u) ? norm_to_srgb(lin1) : clamp(lin1 * p.sg1, 0.f, 1.f);
+    float v2 = (p.bake != 0u) ? norm_to_srgb(lin2) : clamp(lin2 * p.sg2, 0.f, 1.f);
     uint o = (gid.y * p.Ws + gid.x) * 3u;
     out[o + 0u] = ushort(v0 * 65535.f + 0.5f);
     out[o + 1u] = ushort(v1 * 65535.f + 0.5f);

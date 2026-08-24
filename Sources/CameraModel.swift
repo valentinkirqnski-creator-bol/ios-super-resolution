@@ -100,6 +100,9 @@ struct TuningParams: Equatable, Codable {
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
+    /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
+    /// keep the sensor's full highlight headroom (~1 stop of R/B).
+    var dng_store_unwhitened: Bool = true
     /// Quadratic sub-cell fit at each block-matching winner (Wronski's
     /// sub-pixel estimator). Integer flow becomes ~0.1-0.25px flow per level.
     var bm_subpixel_quadratic: Bool = true
@@ -206,6 +209,7 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case kernel_anisotropy_continuous
         case merge_fp16_accumulator
+        case dng_store_unwhitened
         case bm_subpixel_quadratic
         case grey_decimate_lowpass
         case align_fullres_polish
@@ -244,6 +248,7 @@ struct TuningParams: Equatable, Codable {
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
+        dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
         grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
         align_fullres_polish = try c.decodeIfPresent(Bool.self, forKey: .align_fullres_polish) ?? align_fullres_polish
@@ -1965,6 +1970,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
+            "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
             "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),
             "align_fullres_polish": NSNumber(value: tuningParams.align_fullres_polish),

@@ -400,6 +400,10 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
     const f32 wb1 = work.raw_prewhitened ? 1.f : work.white_balance[1];
     const f32 wb2 = work.raw_prewhitened ? 1.f : work.white_balance[2];
     const bool prev_color = !bake && nch >= 3 && work.has_cam_to_srgb;
+    // Un-white-balance the STORED rows only (see Config::dng_store_unwhitened);
+    // the preview keeps the white-balanced values it always showed.
+    float sg[3];
+    dng_unwhiten_gains(work, nch, sg);
 
 #if defined(__APPLE__)
     // Dense DNG band on GPU (1:1); sparse preview stays on CPU below.
@@ -443,9 +447,9 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
                 lin0 = lin1 = lin2 = cn0;
             }
             if (!gpu_rgb) {
-                const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0, 0.f, 1.f);
-                const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1, 0.f, 1.f);
-                const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2, 0.f, 1.f);
+                const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0 * sg[0], 0.f, 1.f);
+                const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1 * sg[1], 0.f, 1.f);
+                const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2 * sg[2], 0.f, 1.f);
                 const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
                 outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
                 outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
@@ -1272,7 +1276,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                      work.white_balance,
                      work.bake_srgb, make,
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
-                     work.raw_prewhitened)) {
+                     // Unwhitened rows are true camera-space raw again: the
+                     // writer then emits AsShotNeutral = 1/gain and stores
+                     // the real gains in the private tag for the app render.
+                     work.raw_prewhitened && !dng_unwhiten_active(work, nch))) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
 #if defined(__APPLE__)

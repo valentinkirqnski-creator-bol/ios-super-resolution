@@ -702,6 +702,22 @@ struct Config {
     // already ends with exactly this pass.
     bool  align_fullres_polish = true;
 
+    // Store the output DNG UN-white-balanced (real AsShotNeutral) instead of
+    // baking the WB gains into the pixels. The pipeline merges in
+    // pre-white-balanced space (Python utils_dng order), so gains of R~2.06 /
+    // B~1.84 were applied BEFORE the 16-bit ceiling: any red highlight above
+    // ~0.49 of raw full scale clipped at the DNG write even though the sensor
+    // never clipped it -- about 1.05 stops of red and 0.9 of blue headroom
+    // lost relative to the input DNGs, and the clipped areas skewed magenta
+    // (R/B pinned, G below). With this on, the encoder divides each channel
+    // by its gain before the clamp and the writer emits AsShotNeutral=1/gain
+    // (its existing non-prewhitened branch), so editors apply WB in float and
+    // their highlight recovery sees everything the sensor saw. The merge is
+    // untouched -- only the container representation changes -- and the app's
+    // own JPEG/preview render re-multiplies the gains on load (self-describing
+    // via the private WB tag), so it renders bit-identically.
+    bool  dng_store_unwhitened = true;
+
     // At motion boundaries, SELECT a tile vector instead of blending.
     // Bilinear sampling between tile centres is correct where the field is
     // smooth but blends two different motions across an object boundary,

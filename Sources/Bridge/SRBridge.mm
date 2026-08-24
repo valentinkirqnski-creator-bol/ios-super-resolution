@@ -254,8 +254,34 @@ static bool AcquireRenderPixels(const std::string& path, std::vector<uint16_t>& 
         g_render_sink_path.clear();
         return true;
     }
-    return load_linear_dng_rgb16_color(path, rgb, W, H, wb, m, has_color) &&
-           W > 0 && H > 0;
+    if (!(load_linear_dng_rgb16_color(path, rgb, W, H, wb, m, has_color) &&
+          W > 0 && H > 0))
+        return false;
+    return true;
+}
+
+// An un-white-balanced DNG (Config::dng_store_unwhitened) stores true
+// camera-space raw with the real gains in the private tag. The render chain
+// -- preset LUT included -- was calibrated for PRE-white-balanced input, so
+// re-apply the gains here and hand it neutral wb: the rendered JPEG/preview
+// is then bit-identical to what the old prewhitened container produced.
+// Old prewhitened DNGs carry wb = {1,1,1} and pass through untouched.
+static void ReapplyWhiteBalanceIfStored(std::vector<uint16_t>& rgb, int W, int H,
+                                        float wb[3]) {
+    if (rgb.empty() || W <= 0 || H <= 0) return;
+    if (!(wb[1] > 1e-6f)) return;
+    const float g0 = wb[0] / wb[1], g2 = wb[2] / wb[1];
+    if (std::fabs(g0 - 1.f) < 1e-4f && std::fabs(g2 - 1.f) < 1e-4f) return;
+    hhsr::parallel_rows(H, 0, [&](int y) {
+        uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
+        for (int x = 0; x < W; ++x) {
+            const float r = row[x * 3 + 0] * g0;
+            const float b = row[x * 3 + 2] * g2;
+            row[x * 3 + 0] = (uint16_t)std::min(65535.f, r + 0.5f);
+            row[x * 3 + 2] = (uint16_t)std::min(65535.f, b + 0.5f);
+        }
+    });
+    wb[0] = wb[1] = wb[2] = 1.f;
 }
 
 static inline bool render_wb_is_neutral(const float wb[3]) {
@@ -364,6 +390,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
+    if (tuning[@"dng_store_unwhitened"])
+        cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
     if (tuning[@"bm_subpixel_quadratic"])
         cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
     if (tuning[@"grey_decimate_lowpass"])
@@ -869,6 +897,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
@@ -955,6 +984,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)

@@ -774,6 +774,11 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("DNG Highlight Headroom", isOn: $cam.tuningParams.dng_store_unwhitened)
+        Text("""
+             The merge runs with white balance baked into the pixels (R x2.06, B x1.84 on              this sensor), so the 16-bit DNG used to clip any red highlight above ~49% of              raw full scale -- about a stop of highlight headroom the sensor captured but              the file threw away, with a magenta cast where it clipped. This stores the              DNG un-white-balanced with a real AsShotNeutral instead: Lightroom and other              editors then apply WB in floating point and their highlight recovery sees              everything the sensor saw. The in-app JPEG and preview re-apply the gains on              load and render identically. Only the file's representation changes.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("fp16 Merge Accumulator", isOn: $cam.tuningParams.merge_fp16_accumulator)
         Text("""
              Stores the online merge accumulator as 16-bit floats instead of 32-bit.              All arithmetic stays float32 in the kernels; only what lands in memory              narrows. At 2x output this halves the pipeline's single largest allocation              (1116 -> 558 MB) and the merge's dominant memory traffic, which it is              bandwidth-bound on. The cost is storage quantisation of about 0.05%              relative per store -- roughly 1-2 LSB of the 16-bit output. Turn off to              restore bit-exact fp32 accumulation at the old memory and speed.
