@@ -782,6 +782,16 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        HStack {
+            Text("Min Kernel Width")
+            Slider(value: $cam.tuningParams.kernel_min_sigma, in: 0.05...0.30, step: 0.005)
+            Text(String(format: "%.3f", cam.tuningParams.kernel_min_sigma))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+        }
+        Text("The floor on how narrow a merge kernel may get (sigma in raw px, sharp axis) -- this port's speckle guard, absent from Google's paper. It was hard-coded at 0.177, which silently made any k_detail below ~0.18 a no-op: that is why sharpening k_detail to 0.17 changed nothing on distant text. Google demonstrates kernels down to 0.05 px; try 0.10-0.12 with an 8-frame burst. Too low shows green/black speckle where coverage is sparse -- raise it back if that appears. NOTE: with SNR Auto-Tune ON, k_detail / k_denoise / D_th / D_tr are chosen per burst and manual values are ignored; disable it to hand-tune.")
+            .font(.footnote)
+            .foregroundColor(.secondary)
         Toggle("Fast Merge Weights", isOn: $cam.tuningParams.merge_fast_weights)
         Text("Skips merge taps whose kernel weight is below 0.03% of the centre tap and overlapped-merge hypotheses carrying under 5% window weight. The normalisation absorbs both, so the output changes far below one 16-bit step; the merge kernel -- the largest GPU cost -- drops a measurable share of its exp() work.")
             .font(.footnote)

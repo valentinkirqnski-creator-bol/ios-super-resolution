@@ -2829,7 +2829,7 @@ struct MergeCompParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
-    uint32_t _pad3 = 0;
+    float soften_max_inv = 32.f;  // 1 / kernel_min_sigma^2 (was _pad3)
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -2846,8 +2846,9 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
+    float soften_max_inv = 32.f;  // 1 / kernel_min_sigma^2
 };
-static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3653,6 +3654,10 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.raw_res_robustness = 0u;
     p.flow_bilinear = flow_sample_mode(cfg);
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
+    {
+        const float ms = std::max(0.02f, cfg.kernel_min_sigma);
+        p.soften_max_inv = 1.f / (ms * ms);
+    }
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3759,6 +3764,10 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     // accumulate_ref in merge.cpp.
     p.raw_res_robustness =
         (denoise && p.acc_h == p.lr_h && p.acc_w == p.lr_w) ? 1u : 0u;
+    {
+        const float ms = std::max(0.02f, cfg.kernel_min_sigma);
+        p.soften_max_inv = 1.f / (ms * ms);
+    }
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {

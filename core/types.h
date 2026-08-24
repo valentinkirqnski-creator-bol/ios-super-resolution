@@ -911,6 +911,20 @@ struct Config {
     // far below one 16-bit LSB after normalisation.
     bool merge_fast_weights = true;
 
+    // The port's minimum merge-kernel width (sigma, raw px) on the SHARP
+    // axis -- a speckle guard Google's paper does not have. The inverse
+    // covariance is clamped so no kernel is narrower than this; the guard
+    // exists because a near-delta kernel under a Bayer CFA weights
+    // essentially one raw sample, leaving the other two channels' den at
+    // zero (green/black speckle). The old hard-coded value (0.177 px,
+    // inv-cov 32) silently made k_detail below ~0.18 a NO-OP on detail:
+    // sharpening k_detail to 0.17 changed nothing, exactly the measured
+    // symptom on distant text. Google demonstrates kernels down to 0.05 px
+    // (Fig. 6); lowering this cap is what makes those regimes reachable.
+    // Speckle risk returns as it approaches sample spacing -- lower it with
+    // frames to spare (8-frame bursts have the coverage).
+    f32  kernel_min_sigma = 0.177f;
+
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
