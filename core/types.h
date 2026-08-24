@@ -668,6 +668,19 @@ struct Config {
     // recover is twice as large in raw pixels.
     bool  bm_subpixel_quadratic = true;
 
+    // Anti-aliased decimation for the ALIGNMENT grey (decimate path only).
+    // The quad average is a 2x2 box -- a real but weak low-pass (transfer
+    // cos(pi f)) that lets energy between the grey Nyquist and the raw
+    // Nyquist fold back into the half-res image as aliasing, which is what
+    // makes block-matching/ICA flow wobble with fine texture instead of
+    // following motion. This swaps it for a half-phase separable binomial
+    // [1 3 3 1]/8 on the raw mosaic (cos^3(pi f), effective Gaussian sigma
+    // ~0.87 raw px): same lattice phase (centred at 2g+0.5, so no coordinate
+    // conversion changes), same exact R:G:G:B channel balance, ~10x stronger
+    // alias suppression near raw Nyquist. Alignment grey only -- the
+    // robustness guide and merge are untouched.
+    bool  grey_decimate_lowpass = true;
+
     // At motion boundaries, SELECT a tile vector instead of blending.
     // Bilinear sampling between tile centres is correct where the field is
     // smooth but blends two different motions across an object boundary,

@@ -333,6 +333,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
     if (tuning[@"bm_subpixel_quadratic"])
         cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
+    if (tuning[@"grey_decimate_lowpass"])
+        cfg.grey_decimate_lowpass = tuning[@"grey_decimate_lowpass"].boolValue;
     if (tuning[@"flow_boundary_selection"])
         cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;

@@ -74,7 +74,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: grey + pyramid", 0.02f);
     // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method,
+                                  work.grey_decimate_lowpass);
     Image ref_grey_padded = pad_image_circular(ref_grey, work.grey_tile_size(tile_size));
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
 
@@ -96,7 +97,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         float base = 0.05f + 0.85f * (float)(k - 1) / std::max(1, n - 1);
         report("Frame " + std::to_string(k + 1) + ": align", base);
         const Image& comp = burst[k];
-        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method,
+                                      work.grey_decimate_lowpass);
 
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         // Alignment ran on the grey. With the Bayer quad average that is half
@@ -167,7 +169,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: grey + pyramid", 0.02f);
     // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method,
+                                  work.grey_decimate_lowpass);
     Image ref_grey_padded = pad_image_circular(ref_grey, work.grey_tile_size(tile_size));
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
     RefStats ref_stats = init_robustness(ref, work);
@@ -184,7 +187,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     for (int k = 1; k < n; ++k) {
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.03f + 0.50f * (float)(k - 1) / std::max(1, n - 1));
-        Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method);
+        Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method,
+                                      work.grey_decimate_lowpass);
         FrameData& fd = frames[k - 1];
         fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
