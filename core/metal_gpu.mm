@@ -240,6 +240,35 @@ static std::vector<T> dup_tile_aux_to_fine(const std::vector<T>& src,
     return out;
 }
 
+// Covariance GPU residency (see CovField::gpu_tag): the kernel-estimate
+// output lives in a shared scratch buffer; only the most recent estimate's
+// bytes are current. The online loop merges frame k before frame k+1's
+// estimate runs, so binding the scratch is safe by queue order; any consumer
+// arriving later (banded path) sees a stale tag and falls back to uploading
+// its CPU copy.
+static std::mutex g_cov_live_mu;
+static uint64_t g_cov_tag_next = 0;
+static uint64_t g_cov_live_tag = 0;
+static size_t g_cov_live_bytes = 0;
+static id<MTLBuffer> g_cov_live_buf = nil;
+
+// SAFETY: valid only while the frame's merge command buffer COMMITS before
+// the next frame's estimate dispatch (true at kOnlineFuse == 1, the shipped
+// config: commit happens in the same loop iteration). If fusing ever holds a
+// frame's encode across the next frame's analysis again, the tag check here
+// passes at ACQUIRE time but the scratch is overwritten before execution --
+// gate residency off in that world.
+static id<MTLBuffer> cov_gpu_or_upload(const CovField& covs, const f32* cp,
+                                       size_t cov_b) {
+    {
+        std::lock_guard<std::mutex> lk(g_cov_live_mu);
+        if (covs.gpu_tag != 0 && covs.gpu_tag == g_cov_live_tag &&
+            g_cov_live_buf && g_cov_live_bytes == cov_b)
+            return g_cov_live_buf;
+    }
+    return cp ? buf(cp, cov_b) : nil;
+}
+
 static void dispatch2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p,
                       NSUInteger w, NSUInteger h) {
     if (w == 0 || h == 0 || !p) return;
@@ -2893,34 +2922,6 @@ static bool g_merge_online_zeroed = false;
 // full-size host image just to describe the accumulator's shape.
 static int g_online_h = 0, g_online_w = 0, g_online_nch = 0;
 static MergeInflight g_merge_inflight;
-// Covariance GPU residency (see CovField::gpu_tag): the kernel-estimate
-// output lives in a shared scratch buffer; only the most recent estimate's
-// bytes are current. The online loop merges frame k before frame k+1's
-// estimate runs, so binding the scratch is safe by queue order; any consumer
-// arriving later (banded path) sees a stale tag and falls back to uploading
-// its CPU copy.
-static std::mutex g_cov_live_mu;
-static uint64_t g_cov_tag_next = 0;
-static uint64_t g_cov_live_tag = 0;
-static size_t g_cov_live_bytes = 0;
-static id<MTLBuffer> g_cov_live_buf = nil;
-
-// SAFETY: valid only while the frame's merge command buffer COMMITS before
-// the next frame's estimate dispatch (true at kOnlineFuse == 1, the shipped
-// config: commit happens in the same loop iteration). If fusing ever holds a
-// frame's encode across the next frame's analysis again, the tag check here
-// passes at ACQUIRE time but the scratch is overwritten before execution --
-// gate residency off in that world.
-static id<MTLBuffer> cov_gpu_or_upload(const CovField& covs, const f32* cp,
-                                       size_t cov_b) {
-    {
-        std::lock_guard<std::mutex> lk(g_cov_live_mu);
-        if (covs.gpu_tag != 0 && covs.gpu_tag == g_cov_live_tag &&
-            g_cov_live_buf && g_cov_live_bytes == cov_b)
-            return g_cov_live_buf;
-    }
-    return cp ? buf(cp, cov_b) : nil;
-}
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
 static __strong id<MTLCommandBuffer> g_merge_band_cmd = nil;
