@@ -1142,6 +1142,15 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
 
     CovField covs(grey_h, grey_w);
     memcpy(covs.cov.data(), [b_cov contents], cov_b);
+    {
+        // Publish this buffer for the merge host (CovField::gpu_tag); the
+        // next estimate call retires it by bumping the live tag.
+        std::lock_guard<std::mutex> lk(g_cov_live_mu);
+        covs.gpu_tag = ++g_cov_tag_next;
+        g_cov_live_tag = covs.gpu_tag;
+        g_cov_live_bytes = cov_b;
+        g_cov_live_buf = b_cov;
+    }
     return covs;
 }
 
@@ -2790,7 +2799,8 @@ struct MergeCompParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
-    uint32_t _pad2 = 0, _pad3 = 0;
+    uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
+    uint32_t _pad3 = 0;
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -2883,6 +2893,34 @@ static bool g_merge_online_zeroed = false;
 // full-size host image just to describe the accumulator's shape.
 static int g_online_h = 0, g_online_w = 0, g_online_nch = 0;
 static MergeInflight g_merge_inflight;
+// Covariance GPU residency (see CovField::gpu_tag): the kernel-estimate
+// output lives in a shared scratch buffer; only the most recent estimate's
+// bytes are current. The online loop merges frame k before frame k+1's
+// estimate runs, so binding the scratch is safe by queue order; any consumer
+// arriving later (banded path) sees a stale tag and falls back to uploading
+// its CPU copy.
+static std::mutex g_cov_live_mu;
+static uint64_t g_cov_tag_next = 0;
+static uint64_t g_cov_live_tag = 0;
+static size_t g_cov_live_bytes = 0;
+static id<MTLBuffer> g_cov_live_buf = nil;
+
+// SAFETY: valid only while the frame's merge command buffer COMMITS before
+// the next frame's estimate dispatch (true at kOnlineFuse == 1, the shipped
+// config: commit happens in the same loop iteration). If fusing ever holds a
+// frame's encode across the next frame's analysis again, the tag check here
+// passes at ACQUIRE time but the scratch is overwritten before execution --
+// gate residency off in that world.
+static id<MTLBuffer> cov_gpu_or_upload(const CovField& covs, const f32* cp,
+                                       size_t cov_b) {
+    {
+        std::lock_guard<std::mutex> lk(g_cov_live_mu);
+        if (covs.gpu_tag != 0 && covs.gpu_tag == g_cov_live_tag &&
+            g_cov_live_buf && g_cov_live_bytes == cov_b)
+            return g_cov_live_buf;
+    }
+    return cp ? buf(cp, cov_b) : nil;
+}
 static std::vector<MergeFrameGpu> g_merge_frames;
 static MergeRefGpu g_merge_ref;
 static __strong id<MTLCommandBuffer> g_merge_band_cmd = nil;
@@ -3070,7 +3108,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.rob_b = rob_b;
             e.b_img = buf(ip, img_b);
             e.b_flow = buf(fp, flow_b);
-            e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+            e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
             e.b_rob = buf(rp, rob_b);
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
             if (!e.b_cov) {
@@ -3100,7 +3138,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         // Same img allocation, new contents/aux (legacy streamed path).
         if (!ensure_sized(e.b_img, img_b) || !copy_into(e.b_img, ip, img_b)) return false;
         e.b_flow = buf(fp, flow_b);
-        e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+        e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
         e.b_rob = buf(rp, rob_b);
         e.rob_h = rob.h;
         e.rob_w = rob.w;
@@ -3141,7 +3179,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.rob_b = rob_b;
     e.b_img = buf(ip, img_b);
     e.b_flow = buf(fp, flow_b);
-    e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+    e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
     e.b_rob = buf(rp, rob_b);
     if (!e.b_img || !e.b_flow || !e.b_rob) return false;
     if (!e.b_cov) {
@@ -3613,6 +3651,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
     p.flow_bilinear = flow_sample_mode(cfg);
+    p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

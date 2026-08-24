@@ -212,6 +212,11 @@ struct FlowField {
 struct CovField {
     int h = 0;
     int w = 0;
+    // Set by estimate_kernels_metal when this field's bytes still live in a
+    // GPU buffer: the merge host binds that buffer instead of re-uploading
+    // 48MB, valid until the NEXT estimate overwrites the shared scratch
+    // (which bumps the live tag). 0 = no GPU copy known.
+    uint64_t gpu_tag = 0;
     std::vector<f32> cov;
 
     CovField() = default;
@@ -895,6 +900,16 @@ struct Config {
     // about 1-2 LSB of the 16-bit result -- the accepted trade. The banded
     // path and the host reference stay fp32 regardless.
     bool merge_fp16_accumulator = true;
+
+    // Skip merge work whose contribution is numerically negligible:
+    //  - taps whose kernel exponent z > 16 (weight < 3.4e-4 of the centre
+    //    tap; the anisotropic kernels put several of the 9 taps out here);
+    //  - overlapped-merge hypotheses carrying < 5% window weight (corner
+    //    hypotheses near cell centres cost a full gather for ~nothing; the
+    //    den normalisation absorbs the removal).
+    // Output changes at the ~1e-3 relative level of individual weights --
+    // far below one 16-bit LSB after normalisation.
+    bool merge_fast_weights = true;
 
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;

@@ -911,7 +911,7 @@ struct MergeCompParams {
     // conversion below (was _pad0).
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint _pad2;
+    uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
     uint _pad3;
 };
 
@@ -1240,6 +1240,9 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
             z = max(0.f, z);
+            // Negligible-tap cutoff: z > 16 means w < 3.4e-4 of the centre
+            // tap -- skip the exp and the accumulate entirely.
+            if (p.fast_weights != 0u && z > 16.f) continue;
             // fast::exp maps to the hardware exp2 unit (a few ULP) instead of
             // precise range reduction. Called 9x per output pixel per frame, so
             // it is a measurable share of this kernel. The relative error is
@@ -1315,11 +1318,15 @@ static inline void merge_comp_contrib(device const float* img,
                     hw[a] = 0.f;
                     break;
                 }
-        for (int a = 0; a < 4; ++a)
-            if (hw[a] > 0.f)
-                merge_comp_contrib_flowed(img, covs, robustness, p, lr_x, lr_y,
-                                          hx[a], hy[a], hw[a],
-                                          n0, n1, n2, d0, d1, d2);
+        for (int a = 0; a < 4; ++a) {
+            if (hw[a] <= 0.f) continue;
+            // Sub-5% hypotheses cost a full gather for a contribution the
+            // den normalisation renders invisible.
+            if (p.fast_weights != 0u && hw[a] < 0.05f) continue;
+            merge_comp_contrib_flowed(img, covs, robustness, p, lr_x, lr_y,
+                                      hx[a], hy[a], hw[a],
+                                      n0, n1, n2, d0, d1, d2);
+        }
         return;
     }
 

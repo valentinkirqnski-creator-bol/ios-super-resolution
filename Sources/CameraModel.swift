@@ -106,6 +106,9 @@ struct TuningParams: Equatable, Codable {
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
+    /// Skip merge taps and overlap hypotheses whose weight is numerically
+    /// negligible (< 3.4e-4 of the centre tap / < 5% window weight).
+    var merge_fast_weights: Bool = true
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
@@ -222,6 +225,7 @@ struct TuningParams: Equatable, Codable {
         case kernel_anisotropy_zero_floor
         case kernel_stretch_gamma
         case merge_fp16_accumulator
+        case merge_fast_weights
         case dng_store_unwhitened
         case bm_subpixel_quadratic
         case grey_decimate_lowpass
@@ -265,6 +269,7 @@ struct TuningParams: Equatable, Codable {
         kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
         kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
+        merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
         grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
@@ -1991,6 +1996,7 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
             "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
+            "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
             "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),

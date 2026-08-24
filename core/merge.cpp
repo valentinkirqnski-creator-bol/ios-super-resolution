@@ -205,6 +205,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     const int nch = cfg.bayer_mode ? 3 : 1;
     const bool iso = (cfg.kernel == KernelShape::Iso);
     const f32 scale = cfg.scale;
+    const bool fastw = cfg.merge_fast_weights;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -296,6 +297,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int h = 0; h < nhyp; ++h) {
             if (hw[h] <= 0.f) continue;
+            if (fastw && nhyp > 1 && hw[h] < 0.05f) continue;
             const f32 flowx = hx[h], flowy = hy[h];
             const f32 wsc = hw[h];
             const f32 lr_mov_x = lr_x + flowx;
@@ -335,6 +337,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
                     z = std::max(0.f, z);
+                    if (fastw && z > 16.f) continue;
                     const f32 w = std::exp(-0.5f * z);
 
                     val[channel] += w * local_r * wsc * c;

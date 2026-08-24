@@ -419,6 +419,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.kernel_stretch_gamma = tuning[@"kernel_stretch_gamma"].floatValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
+    if (tuning[@"merge_fast_weights"])
+        cfg.merge_fast_weights = tuning[@"merge_fast_weights"].boolValue;
     if (tuning[@"dng_store_unwhitened"])
         cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
     if (tuning[@"bm_subpixel_quadratic"])

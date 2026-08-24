@@ -673,10 +673,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // Crop dims by value: the decode thread may still be running after the
     // reference image's pixels have been stashed and freed.
     const int pref_ref_h = ref.h, pref_ref_w = ref.w;
+    int pref_seq = 0;
     auto launch_prefetch = [&, pref_ref_h, pref_ref_w](int frame) {
+        // The first two decodes get the responsive tier: their only cover is
+        // the brief reference stage, and UTILITY there was the measured 1-2s
+        // "analyzing frame 2" stall variant. Later decodes stay on the
+        // efficiency tier so they cannot steal P-cores from the analyze loop.
+        const bool eager = pref_seq++ < 2;
         pref_q.push_back({frame, std::async(std::launch::async,
-                                            [&, frame, pref_ref_h, pref_ref_w]() {
-            decode_qos();
+                                            [&, frame, pref_ref_h, pref_ref_w, eager]() {
+            if (eager) worker_qos(); else decode_qos();
             return loader(frame, work, false, pref_ref_h, pref_ref_w);
         })});
     };

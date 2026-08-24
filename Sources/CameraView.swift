@@ -782,6 +782,10 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Fast Merge Weights", isOn: $cam.tuningParams.merge_fast_weights)
+        Text("Skips merge taps whose kernel weight is below 0.03% of the centre tap and overlapped-merge hypotheses carrying under 5% window weight. The normalisation absorbs both, so the output changes far below one 16-bit step; the merge kernel -- the largest GPU cost -- drops a measurable share of its exp() work.")
+            .font(.footnote)
+            .foregroundColor(.secondary)
         Toggle("DNG Highlight Headroom", isOn: $cam.tuningParams.dng_store_unwhitened)
         Text("""
              The merge runs with white balance baked into the pixels (R x2.06, B x1.84 on              this sensor), so the 16-bit DNG used to clip any red highlight above ~49% of              raw full scale -- about a stop of highlight headroom the sensor captured but              the file threw away, with a magenta cast where it clipped. This stores the              DNG un-white-balanced with a real AsShotNeutral instead: Lightroom and other              editors then apply WB in floating point and their highlight recovery sees              everything the sensor saw. The in-app JPEG and preview re-apply the gains on              load and render identically. Only the file's representation changes.
