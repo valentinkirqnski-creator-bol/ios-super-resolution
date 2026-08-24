@@ -23,6 +23,11 @@ bool embed_dng_jpeg_preview(const std::string& path,
 
 // Same as load_linear_dng_rgb16, plus WB gains (green-normalized) and cam→sRGB 3×3
 // when written by DngStreamWriter (private tags). Falls back to identity / 1,1,1.
+// Color-rendering metadata only (wb, matrix) from a linear DNG we wrote --
+// no pixel inflate, reads a small file prefix. For when the pixels are
+// already in memory (Rgb16Sink).
+bool load_linear_dng_color_meta(const std::string& path, float wb[3],
+                                float cam_to_srgb[9], bool& has_color);
 bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
                                  int& W, int& H, float wb[3], float cam_to_srgb[9],
                                  bool& has_color);

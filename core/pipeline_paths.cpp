@@ -590,7 +590,9 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
 
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
                                   const Config& cfg, const std::string& dng_path,
-                                  const ProgressFn& progress, int maxPreviewDim) {
+                                  const ProgressFn& progress, int maxPreviewDim,
+                                  Rgb16Sink* rgb16_sink) {
+    if (rgb16_sink) { rgb16_sink->w = 0; rgb16_sink->h = 0; rgb16_sink->rgb.clear(); }
     if (frame_count < 2 || !loader) return Image();
 
     prof_reset();
@@ -1388,6 +1390,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 r16.resize((size_t)bh * (size_t)Ws * 3u);
             encode_band_rows_ptr(nump, denp, y0, bh, work, nch, preview, pscale,
                                  ph, pw, Ws, r16);
+            // Keep the finished rows for the in-memory export (see Rgb16Sink).
+            // Plain copy of bytes the encoder just produced -- the DNG on disk
+            // and this buffer are the same values by construction.
+            if (rgb16_sink) {
+                if (rgb16_sink->rgb.empty()) {
+                    rgb16_sink->w = Ws;
+                    rgb16_sink->h = Hs;
+                    rgb16_sink->rgb.assign((size_t)Hs * (size_t)Ws * 3u, 0);
+                }
+                std::copy(r16.begin(),
+                          r16.begin() + (size_t)bh * (size_t)Ws * 3u,
+                          rgb16_sink->rgb.begin() + (size_t)y0 * (size_t)Ws * 3u);
+            }
             if (write_fut.valid()) write_fut.get();
             write_fut = std::async(std::launch::async, [&writer, &r16, bh]() {
                 worker_qos();
@@ -1656,14 +1671,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
 Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
                                  const std::string& dng_path, const ProgressFn& progress,
-                                 int maxPreviewDim) {
+                                 int maxPreviewDim, Rgb16Sink* rgb16_sink) {
     return process_burst_loader_to_dng(
         (int)paths.size(),
         [&](int index, Config& work, bool is_reference, int crop_h, int crop_w) {
             if (index < 0 || index >= (int)paths.size()) return Image();
             return load_raw_frame(paths[(size_t)index], work, is_reference, crop_h, crop_w);
         },
-        cfg, dng_path, progress, maxPreviewDim);
+        cfg, dng_path, progress, maxPreviewDim, rgb16_sink);
 }
 
 } // namespace hhsr

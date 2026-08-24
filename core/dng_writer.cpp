@@ -912,28 +912,17 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
     return true;
 }
 
-bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
-                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
-                                 bool& has_color) {
-    has_color = false;
-    wb[0] = wb[1] = wb[2] = 1.f;
-    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
-
-    if (!load_linear_dng_rgb16(path, rgb, W, H)) return false;
-
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return true;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return true; }
-    long fsz = ftell(f);
-    if (fsz < 16) { fclose(f); return true; }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return true; }
-    std::vector<uint8_t> file((size_t)fsz);
-    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return true; }
-    fclose(f);
-
-    if (file[0] != 'I' || file[1] != 'I') return true;
+// Color-rendering tags only (private WB+matrix tag 65000, ColorMatrix1,
+// AnalogBalance), parsed from an in-memory prefix of the file. Split out of
+// load_linear_dng_rgb16_color so the render path can get wb/matrix WITHOUT
+// inflating the pixel strips -- our writer lays every tag and small value
+// block ahead of the pixel data, so a modest prefix always contains them.
+static void parse_linear_dng_color_tags(const std::vector<uint8_t>& file,
+                                        float wb[3], float cam_to_srgb[9],
+                                        bool& has_color) {
+    if (file.size() < 16 || file[0] != 'I' || file[1] != 'I') return;
     uint32_t ifd = r32(file.data() + 4);
-    if (ifd + 2 > file.size()) return true;
+    if (ifd + 2 > file.size()) return;
     uint16_t nent = r16(file.data() + ifd);
     bool private_color = false;
     bool has_color_matrix = false;
@@ -1004,6 +993,48 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
             has_color = true;
         }
     }
+}
+
+static void reset_color_out(float wb[3], float cam_to_srgb[9], bool& has_color) {
+    has_color = false;
+    wb[0] = wb[1] = wb[2] = 1.f;
+    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
+}
+
+bool load_linear_dng_color_meta(const std::string& path, float wb[3],
+                                float cam_to_srgb[9], bool& has_color) {
+    reset_color_out(wb, cam_to_srgb, has_color);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    // 4MB prefix: our writer keeps the IFD and every referenced value block
+    // ahead of the pixel strips, orders of magnitude inside this. A tag whose
+    // data lay beyond the prefix simply fails its bounds check and is skipped
+    // -- the same silent fallback the full parse used for a truncated file.
+    std::vector<uint8_t> file(4u << 20);
+    const size_t got = fread(file.data(), 1, file.size(), f);
+    fclose(f);
+    file.resize(got);
+    parse_linear_dng_color_tags(file, wb, cam_to_srgb, has_color);
+    return got >= 16;
+}
+
+bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
+                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
+                                 bool& has_color) {
+    reset_color_out(wb, cam_to_srgb, has_color);
+    if (!load_linear_dng_rgb16(path, rgb, W, H)) return false;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return true;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return true; }
+    long fsz = ftell(f);
+    if (fsz < 16) { fclose(f); return true; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return true; }
+    std::vector<uint8_t> file((size_t)fsz);
+    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return true; }
+    fclose(f);
+
+    parse_linear_dng_color_tags(file, wb, cam_to_srgb, has_color);
     return true;
 }
 

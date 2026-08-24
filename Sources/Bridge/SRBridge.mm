@@ -225,6 +225,39 @@ static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
 // parked here when the tuning dictionary is parsed.
 static hhsr::IspParams g_isp;
 
+// The final RGB16 rows of the last successful burst, captured as the DNG was
+// encoded (see Rgb16Sink in pipeline.h), plus the path they belong to. The
+// JPEG export and the DNG preview embed used to re-open that file and inflate
+// ~290MB of Deflate to recover pixels that existed in memory moments earlier
+// -- seconds of the "Saving to Photos" stall. Consumed (moved out) by the
+// first export that matches the path; cleared at the start of every burst.
+static hhsr::Rgb16Sink g_render_sink;
+static std::string g_render_sink_path;
+
+// Pixels + colour metadata for rendering `path`. Memory fast path: when the
+// sink matches, take the rows without touching the pixel strips and parse
+// only the DNG header for wb/matrix (load_linear_dng_color_meta) -- the tags
+// were written from the same Config that produced these rows, so the render
+// is identical to the re-read path. Falls back to the full DNG read.
+static bool AcquireRenderPixels(const std::string& path, std::vector<uint16_t>& rgb,
+                                int& W, int& H, float wb[3], float m[9],
+                                bool& has_color) {
+    if (!g_render_sink_path.empty() && g_render_sink_path == path &&
+        g_render_sink.w > 0 && g_render_sink.h > 0 &&
+        g_render_sink.rgb.size() ==
+            (size_t)g_render_sink.w * (size_t)g_render_sink.h * 3u &&
+        load_linear_dng_color_meta(path, wb, m, has_color)) {
+        W = g_render_sink.w;
+        H = g_render_sink.h;
+        rgb = std::move(g_render_sink.rgb);
+        g_render_sink = hhsr::Rgb16Sink();
+        g_render_sink_path.clear();
+        return true;
+    }
+    return load_linear_dng_rgb16_color(path, rgb, W, H, wb, m, has_color) &&
+           W > 0 && H > 0;
+}
+
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
            std::fabs(wb[1] - 1.f) < 1e-4f &&
@@ -742,13 +775,17 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         };
     }
 
+    g_render_sink = hhsr::Rgb16Sink();
+    g_render_sink_path.clear();
     Image preview;
     @autoreleasepool {
         preview = process_burst_paths_to_dng(
-            vpaths, cfg, std::string(outPath.UTF8String), cb, 256);
+            vpaths, cfg, std::string(outPath.UTF8String), cb, 256,
+            &g_render_sink);
     }
 
-    if (preview.w <= 0) return NO;
+    if (preview.w <= 0) { g_render_sink = hhsr::Rgb16Sink(); return NO; }
+    if (g_render_sink.w > 0) g_render_sink_path = outPath.UTF8String;
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
@@ -795,13 +832,17 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
             return DecodeRawFrameDictionary(frame, work, is_reference, crop_h, crop_w);
         };
 
+    g_render_sink = hhsr::Rgb16Sink();
+    g_render_sink_path.clear();
     Image preview;
     @autoreleasepool {
         preview = process_burst_loader_to_dng(
-            (int)frames.count, loader, cfg, std::string(outPath.UTF8String), cb, 256);
+            (int)frames.count, loader, cfg, std::string(outPath.UTF8String), cb, 256,
+            &g_render_sink);
     }
 
-    if (preview.w <= 0) return NO;
+    if (preview.w <= 0) { g_render_sink = hhsr::Rgb16Sink(); return NO; }
+    if (g_render_sink.w > 0) g_render_sink_path = outPath.UTF8String;
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
@@ -819,7 +860,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     float wb[3] = {1.f, 1.f, 1.f};
     float m[9] = {1,0,0, 0,1,0, 0,0,1};
     bool has_color = false;
-    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+    if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
 
@@ -883,11 +924,12 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         CGImageRelease(cgOut);
         return NO;
     }
-    // 0.92 keeps 4:4:4 chroma and produced ~15MB at 48MP. Measured against that
-    // output, 0.82 lands at 46% of the size for 2.8 LSB RMS -- ImageIO drops to
-    // 4:2:0 below ~0.90, which is where most of the saving comes from, and
-    // chroma subsampling is not visible on a photograph at this resolution.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.82};
+    // 0.92: keeps 4:4:4 chroma (ImageIO drops to 4:2:0 below ~0.90) at ~15MB
+    // for 48MP. This was 0.82 to halve the file, but the 4:2:0 chroma plus the
+    // quantisation read as visibly soft on fine colour detail once the user
+    // actually pixel-peeped the export -- the deliverable is the photograph,
+    // so it gets the quality and the megabytes.
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.92};
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
@@ -904,7 +946,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     float wb[3] = {1.f, 1.f, 1.f};
     float m[9] = {1,0,0, 0,1,0, 0,0,1};
     bool has_color = false;
-    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+    if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
 
@@ -976,8 +1018,11 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         CGImageRelease(cgOut);
         return NO;
     }
-    // Embedded DNG preview: a thumbnail source, so it can be leaner still.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.80};
+    // The embedded preview is what Photos actually DISPLAYS for these DNGs
+    // (ImageIO cannot decode the Deflate LinearRaw IFD0), so it is not just a
+    // thumbnail source -- at full size it is the picture the user sees when
+    // they zoom. 0.85 with the full-resolution maxSide the app now passes.
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.85};
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL enc_ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);

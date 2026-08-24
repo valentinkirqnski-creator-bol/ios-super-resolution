@@ -2145,9 +2145,12 @@ final class CameraModel: NSObject, ObservableObject {
             var saveURL = url
             var tempJPEG: URL?
             if format == .dng {
-                // DNG-only asset: embed tone-mapped JPEG SubIFD so Photos can
-                // thumbnail (ImageIO cannot decode Deflate LinearRaw IFD0).
-                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 4096)
+                // DNG-only asset: embed a tone-mapped JPEG SubIFD. Photos does
+                // not merely thumbnail from it -- it cannot decode our Deflate
+                // LinearRaw IFD0 at all, so this preview IS the image the user
+                // sees at every zoom level. It therefore gets full resolution;
+                // 4096 here was why a 48MP capture looked soft in Photos.
+                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 32768)
             } else if format == .jpg {
                 if let jpg = Self.renderExportJPEG(fromDNG: url) {
                     saveURL = jpg
