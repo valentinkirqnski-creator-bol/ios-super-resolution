@@ -1405,13 +1405,17 @@ void flow_densify_boundary_select(FlowField& flow,
             const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
             f32 out_x = tx0 + (bx0 - tx0) * ay;
             f32 out_y = ty0 + (by0 - ty0) * ay;
-            if (overlap_all) {
-                // Overlapped-tile measurement for EVERY lattice cell
-                // (Config::flow_overlap_merge): the merge will consume these
-                // vectors nearest, one per covering tile, so each must be the
-                // cell's own measurement on its FULL tile-sized window
-                // (Ts = tile_size at stride Ts/2 -- HDR+'s layout), not an
-                // interpolated value.
+            if (overlap_all && spread > thr) {
+                // Overlapped-tile measurement (Config::flow_overlap_merge),
+                // for cells whose four neighbour vectors DISAGREE: the merge
+                // consumes these nearest, one per covering tile, so each must
+                // be the cell's own measurement on its FULL tile-sized window
+                // (Ts = tile_size at stride Ts/2 -- HDR+'s layout). Cells
+                // whose neighbours agree keep the blend: measuring a motion
+                // all four tiles already agree on adds only measurement noise
+                // and, being never bit-equal, defeated the merge's hypothesis
+                // clustering -- every pixel paid 4 gathers and the merge
+                // stopped hiding behind the CPU (measured: 'much slower').
                 const int win = std::max(2, (int)std::lround((f32)tile_size * gsy));
                 const int gy0 = (int)std::lround(((f32)fy + 0.5f) * ts2 * gsy) - win / 2;
                 const int gx0 = (int)std::lround(((f32)fx + 0.5f) * ts2 * gsx) - win / 2;
