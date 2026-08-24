@@ -1,10 +1,9 @@
 #include "render_isp.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <vector>
-
-#include "parallel.h"
 
 namespace hhsr {
 namespace {
@@ -27,19 +26,6 @@ constexpr f32 kAutoKey = 0.2824f;
 
 inline f32 luma_of(f32 r, f32 g, f32 b) {
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
-}
-
-// Pull a near-clipped pixel toward neutral at its own peak. Smoothstep rather
-// than a linear ramp so there is no visible edge where recovery begins.
-inline void recover_highlight(f32& r, f32& g, f32& b, f32 knee) {
-    if (knee >= 1.f) return;
-    const f32 mx = std::max(r, std::max(g, b));
-    if (mx <= knee) return;
-    const f32 t = clampf((mx - knee) / std::max(1.f - knee, kEps), 0.f, 1.f);
-    const f32 w = t * t * (3.f - 2.f * t);
-    r += (mx - r) * w;
-    g += (mx - g) * w;
-    b += (mx - b) * w;
 }
 
 // Camera linear -> sRGB linear, measured from a HandheldSR linear DNG and its
@@ -119,25 +105,9 @@ inline f32 tone_curve(f32 x, f32 white) {
     return x * (1.f + x / w2) / (1.f + x);
 }
 
-inline f32 srgb_oetf_exact(f32 v) {
+inline f32 srgb_oetf(f32 v) {
     v = clampf(v, 0.f, 1.f);
     return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
-}
-
-// Table sizes chosen so linear interpolation stays well under a quantisation
-// step: the OETF's worst curvature is near v=0.003, where the interpolation
-// error works out around 0.02 of a 255-level step.
-constexpr int kOetfN = 2048;
-constexpr int kLcN = 2048;
-constexpr f32 kLcMax = 20.f;     // matches the clamp on the detail ratio
-
-inline f32 lut_sample(const std::vector<f32>& t, f32 x, f32 scale) {
-    const f32 p = x * scale;
-    const int i = (int)p;
-    if (i < 0) return t.front();
-    if (i >= (int)t.size() - 1) return t.back();
-    const f32 f = p - (f32)i;
-    return t[i] + (t[i + 1] - t[i]) * f;
 }
 
 // Contrast as an S-curve about mid display grey. Applied to luminance and then
@@ -184,36 +154,6 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
     for (int i = 0; i < 9; ++i)
         st.m[i] = cam_to_srgb ? cam_to_srgb[i] : kDefaultCamToSrgb[i];
 
-    // Blend toward identity, then rescale each row back to its original sum so
-    // the neutral response -- and therefore the exposure -- does not move.
-    // Baked in here so it costs nothing per pixel.
-    const f32 cs = clampf(p.colour_strength, 0.f, 1.f);
-    if (cs < 1.f) {
-        for (int r = 0; r < 3; ++r) {
-            const f32 want = st.m[r * 3 + 0] + st.m[r * 3 + 1] + st.m[r * 3 + 2];
-            f32 got = 0.f;
-            for (int c = 0; c < 3; ++c) {
-                const f32 ident = (r == c) ? 1.f : 0.f;
-                st.m[r * 3 + c] = ident * (1.f - cs) + st.m[r * 3 + c] * cs;
-                got += st.m[r * 3 + c];
-            }
-            if (std::fabs(got) > 1e-6f) {
-                const f32 k = want / got;
-                for (int c = 0; c < 3; ++c) st.m[r * 3 + c] *= k;
-            }
-        }
-    }
-
-    st.oetf.resize(kOetfN);
-    for (int i = 0; i < kOetfN; ++i)
-        st.oetf[i] = srgb_oetf_exact((f32)i / (f32)(kOetfN - 1));
-    st.lcurve.resize(kLcN);
-    const f32 lc = std::max(p.local_contrast, 0.f);
-    for (int i = 0; i < kLcN; ++i) {
-        const f32 ratio = (f32)i / (f32)(kLcN - 1) * kLcMax;
-        st.lcurve[i] = (lc > 0.f) ? std::pow(std::max(ratio, 1e-4f), lc) : 1.f;
-    }
-
     // Downsample so the short side keeps ~128 samples: enough for the base layer
     // to follow real scene structure, small enough that the whole analysis is a
     // few MB and a few milliseconds at 48MP.
@@ -228,43 +168,21 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 
     // Box-average luminance into the low-res grid. Averaging rather than
     // point-sampling keeps the base layer free of the input's own noise.
-    // One task per OUTPUT row, so no two tasks touch the same accumulator and
-    // the reduction needs no locking. Iterating input rows instead would have
-    // several tasks writing the same gy.
-    // Two grids. The mean drives exposure and the base layer; the MAX exists
-    // only to find the white point. Taking the white point from the mean grid
-    // was hiding highlights: box-averaging an 8x8 block buries any bright
-    // feature smaller than the block, so a specular or a bright window read far
-    // dimmer than it is, the shoulder was set below it, and it clipped. Measured
-    // on a mild scene the mean grid lost 14% of the true peak; on one with small
-    // highlights it loses far more.
     std::vector<f32> Y((size_t)gw * gh, 0.f);
-    std::vector<f32> Ymax((size_t)gw * gh, 0.f);
-    parallel_rows(gh, 0, [&](int gy) {
-        f32* out = &Y[(size_t)gy * gw];
-        f32* omax = &Ymax[(size_t)gy * gw];
-        std::vector<f32> cnt((size_t)gw, 0.f);
-        const int y0 = gy * f;
-        const int y1 = (gy == gh - 1) ? H : std::min(H, y0 + f);
-        for (int y = y0; y < y1; ++y) {
-            const uint16_t* row = rgb16 + (size_t)y * W * 3;
-            for (int x = 0; x < W; ++x) {
-                const int gx = std::min(gw - 1, x / f);
-                f32 rr = row[x * 3 + 0] * (1.f / 65535.f);
-                f32 gg = row[x * 3 + 1] * (1.f / 65535.f);
-                f32 bb = row[x * 3 + 2] * (1.f / 65535.f);
-                // Same recovery the render applies, or the base layer would read
-                // a blown magenta highlight as ~30% darker than it renders and
-                // under-compress it.
-                recover_highlight(rr, gg, bb, p.highlight_knee);
-                const f32 l = luma_of(rr, gg, bb);
-                out[gx] += l;
-                if (l > omax[gx]) omax[gx] = l;
-                cnt[gx] += 1.f;
-            }
+    std::vector<f32> cnt((size_t)gw * gh, 0.f);
+    for (int y = 0; y < H; ++y) {
+        const int gy = std::min(gh - 1, y / f);
+        const uint16_t* row = rgb16 + (size_t)y * W * 3;
+        for (int x = 0; x < W; ++x) {
+            const int gx = std::min(gw - 1, x / f);
+            const f32 l = luma_of(row[x * 3 + 0] * (1.f / 65535.f),
+                                  row[x * 3 + 1] * (1.f / 65535.f),
+                                  row[x * 3 + 2] * (1.f / 65535.f));
+            Y[(size_t)gy * gw + gx] += l;
+            cnt[(size_t)gy * gw + gx] += 1.f;
         }
-        for (int gx = 0; gx < gw; ++gx) out[gx] /= std::max(cnt[gx], 1.f);
-    });
+    }
+    for (size_t i = 0; i < Y.size(); ++i) Y[i] /= std::max(cnt[i], 1.f);
 
     // Automatic exposure from the log-average, which tracks what the scene
     // actually contains rather than its extremes: a small bright window does not
@@ -279,25 +197,13 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 
     // Everything from here on is in exposed linear.
     for (f32& v : Y) v *= exposure;
-    for (f32& v : Ymax) v *= exposure;
 
-    // White point: where the shoulder reaches display white. Taken from the MAX
-    // grid, high up, so real highlights land just under it instead of past it.
-    // On the reference frame this drops the share of pixels driven past white
-    // from 0.125% to 0.001%.
-    //
-    // The ceiling used to be 24, which is not high enough to be inert: a dark
-    // room with a bright window pushes automatic exposure to ~166 and the peak
-    // to ~46, so the clamp itself was clipping the window. Raising it costs
-    // nothing -- white only positions the shoulder, and moving it from 24 to 46
-    // shifts middle grey by under 0.01% -- so it is now high enough never to be
-    // the binding constraint.
-    std::vector<f32> sorted(Ymax);
+    // White point for the output curve: the brightest content present, so the
+    // shoulder rolls off to exactly that instead of clipping it or wasting range.
+    std::vector<f32> sorted(Y);
     std::sort(sorted.begin(), sorted.end());
-    // Named peak, not hi: `hi` is already the highlight-compression factor
-    // further down this same function.
-    const f32 peak = sorted[(size_t)((sorted.size() - 1) * 0.9999)];
-    st.white = clampf(peak, 1.2f, 512.f);
+    const f32 p999 = sorted[(size_t)((sorted.size() - 1) * 0.999)];
+    st.white = clampf(p999, 1.2f, 24.f);
 
     // Base layer in log2: tone mapping is a ratio operation, and doing it in log
     // makes the compression uniform across stops instead of biased toward the
@@ -356,19 +262,121 @@ inline f32 sample_map(const std::vector<f32>& map, int gw, int gh,
 
 }  // namespace
 
-// ------------------------------------------------------------ chroma denoise
-// Luma is left bit-exact; only the colour difference from luma is filtered, so
-// this removes blotching without touching a single edge of detail.
-//
-// The filter runs on a decimated grid (kCShift) because chroma is inherently
-// low-frequency -- the same reason JPEG subsamples it -- and because holding
-// two full-resolution float planes at 48MP would cost ~380MB on a device that
-// has already been jetsammed once on this pipeline. At 1/8 it is ~6MB.
-//
-// Only two of the three colour differences are independent: luma is a weighted
-// sum, so 0.2126*dr + 0.7152*dg + 0.0722*db == 0 identically. dg is recovered
-// from the other two rather than carried, which is a third less memory and a
-// third less filtering for free.
+void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
+                f32& sr, f32& sg, f32& sb) {
+    r = std::max(r, 0.f) * st.exposure;
+    g = std::max(g, 0.f) * st.exposure;
+    b = std::max(b, 0.f) * st.exposure;
+
+    if (st.valid && st.p.local_strength > 0.f) {
+        f32 gain = sample_map(st.gain, st.gw, st.gh, x, y, st.shift);
+        if (st.p.local_contrast > 0.f) {
+            // Y/base is the detail layer. Raising it above unity is local
+            // micro-contrast: no high-pass, so no halo and no noise gained.
+            const f32 base = sample_map(st.base, st.gw, st.gh, x, y, st.shift);
+            const f32 ratio = luma_of(r, g, b) / std::max(base, kEps);
+            gain *= std::pow(clampf(ratio, 0.05f, 20.f), st.p.local_contrast);
+        }
+        // One factor for all three channels: hue survives.
+        r *= gain;
+        g *= gain;
+        b *= gain;
+    }
+
+    // Warmth trim, before the matrix so it acts on camera RGB.
+    if (st.p.warmth != 0.f) r *= (1.f + st.p.warmth);
+
+    // Camera linear -> sRGB linear. Negatives are real here (the matrix can take
+    // a saturated channel below zero) and must be clipped before the curve, or
+    // they come back as green speckle in deep shadow.
+    f32 lr = st.m[0] * r + st.m[1] * g + st.m[2] * b;
+    f32 lg = st.m[3] * r + st.m[4] * g + st.m[5] * b;
+    f32 lb = st.m[6] * r + st.m[7] * g + st.m[8] * b;
+    lr = std::max(lr, 0.f);
+    lg = std::max(lg, 0.f);
+    lb = std::max(lb, 0.f);
+
+    // Output curve on each channel, then gamma. The curve is monotone and shared
+    // across channels, so neutrals stay neutral.
+    lr = tone_curve(lr, st.white);
+    lg = tone_curve(lg, st.white);
+    lb = tone_curve(lb, st.white);
+
+    sr = srgb_oetf(lr);
+    sg = srgb_oetf(lg);
+    sb = srgb_oetf(lb);
+
+    // Black point. Without it the shadow lift leaves the darkest pixels grey,
+    // and the image reads flat however much contrast is applied afterwards.
+    if (st.p.black_point > 0.f) {
+        const f32 bp = clampf(st.p.black_point, 0.f, 0.5f);
+        const f32 inv = 1.f / (1.f - bp);
+        sr = clampf((sr - bp) * inv, 0.f, 1.f);
+        sg = clampf((sg - bp) * inv, 0.f, 1.f);
+        sb = clampf((sb - bp) * inv, 0.f, 1.f);
+    }
+
+    // Contrast, in display space, via a luminance ratio so hue is preserved.
+    if (st.p.contrast > 0.f) {
+        const f32 yl = luma_of(sr, sg, sb);
+        if (yl > kEps) {
+            const f32 k = s_curve(yl, st.p.contrast) / yl;
+            sr = clampf(sr * k, 0.f, 1.f);
+            sg = clampf(sg * k, 0.f, 1.f);
+            sb = clampf(sb * k, 0.f, 1.f);
+        }
+    }
+
+    // Vibrance: the boost falls away as a colour approaches saturation, so muted
+    // material lifts and already-vivid material barely moves. Skin is held back
+    // further, which is what stops strong tone mapping turning faces orange.
+    const f32 yl = luma_of(sr, sg, sb);
+    f32 amount = st.p.saturation - 1.f;
+    if (st.p.vibrance > 0.f) {
+        const f32 mx = std::max(sr, std::max(sg, sb));
+        const f32 mn = std::min(sr, std::min(sg, sb));
+        const f32 sat = (mx > kEps) ? (mx - mn) / mx : 0.f;
+        const f32 head = (1.f - sat) * (1.f - sat);
+        amount += st.p.vibrance * head;
+    }
+    if (st.p.skin_protect) {
+        const f32 w = skin_weight(sr, sg, sb);
+        amount *= (1.f - 0.75f * w);
+    }
+    if (std::fabs(amount) > 1e-4f) {
+        const f32 k = 1.f + amount;
+        sr = yl + (sr - yl) * k;
+        sg = yl + (sg - yl) * k;
+        sb = yl + (sb - yl) * k;
+    }
+
+    // Gamut: pull an out-of-range colour toward its own luminance rather than
+    // clipping each channel, which would shift hue and flatten bright saturated
+    // areas into flat patches.
+    const f32 mx = std::max(sr, std::max(sg, sb));
+    if (mx > 1.f) {
+        const f32 t = clampf((mx - 1.f) / std::max(mx, kEps), 0.f, 1.f);
+        sr += (yl - sr) * t;
+        sg += (yl - sg) * t;
+        sb += (yl - sb) * t;
+        const f32 mx2 = std::max(sr, std::max(sg, sb));
+        if (mx2 > 1.f) {
+            const f32 s = 1.f / mx2;
+            sr *= s;
+            sg *= s;
+            sb *= s;
+        }
+    }
+    sr = clampf(sr, 0.f, 1.f);
+    sg = clampf(sg, 0.f, 1.f);
+    sb = clampf(sb, 0.f, 1.f);
+}
+
+
+// Chroma noise reduction, detail-gated -- carried forward from the later
+// render so the bridge and the Settings slider keep working. INERT at the
+// shipped default (chroma_denoise = 0), which keeps this file's output
+// byte-identical to commit c7f3dda's render.
 void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p) {
     if (!rgb16 || W <= 0 || H <= 0) return;
     const f32 amount = clampf(p.chroma_denoise, 0.f, 1.f);
@@ -483,154 +491,6 @@ void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p) {
             rgb16[i + 2] = (uint16_t)clampf(std::lround(ob  * 65535.f), 0.f, 65535.f);
         }
     });
-}
-
-void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
-                f32& sr, f32& sg, f32& sb) {
-    r = std::max(r, 0.f);
-    g = std::max(g, 0.f);
-    b = std::max(b, 0.f);
-    // Before exposure: the knee is a property of where the stored value sits
-    // against full scale, not of how bright it is rendered.
-    recover_highlight(r, g, b, st.p.highlight_knee);
-    r *= st.exposure;
-    g *= st.exposure;
-    b *= st.exposure;
-
-    if (st.valid && st.p.local_strength > 0.f) {
-        f32 gain = sample_map(st.gain, st.gw, st.gh, x, y, st.shift);
-        if (st.p.local_contrast > 0.f) {
-            // Y/base is the detail layer. Raising it above unity is local
-            // micro-contrast: no high-pass, so no halo and no noise gained.
-            const f32 base = sample_map(st.base, st.gw, st.gh, x, y, st.shift);
-            const f32 ratio = luma_of(r, g, b) / std::max(base, kEps);
-            gain *= lut_sample(st.lcurve, clampf(ratio, 0.05f, kLcMax),
-                               (f32)(kLcN - 1) / kLcMax);
-        }
-        // One factor for all three channels: hue survives.
-        r *= gain;
-        g *= gain;
-        b *= gain;
-    }
-
-    // Warmth trim, before the matrix so it acts on camera RGB.
-    if (st.p.warmth != 0.f) r *= (1.f + st.p.warmth);
-
-    // Camera linear -> sRGB linear. Negatives are real here (the matrix can take
-    // a saturated channel below zero) and must be clipped before the curve, or
-    // they come back as green speckle in deep shadow.
-    f32 lr = st.m[0] * r + st.m[1] * g + st.m[2] * b;
-    f32 lg = st.m[3] * r + st.m[4] * g + st.m[5] * b;
-    f32 lb = st.m[6] * r + st.m[7] * g + st.m[8] * b;
-    lr = std::max(lr, 0.f);
-    lg = std::max(lg, 0.f);
-    lb = std::max(lb, 0.f);
-
-    // Output curve on LUMINANCE, with RGB scaled by the resulting ratio.
-    //
-    // Running it on each channel independently -- which is what this did first,
-    // and what most naive tone mappers do -- compresses whichever channel is
-    // largest the hardest. That drains saturation and rotates hue: measured, a
-    // red at value 0.750 came out at 0.562, and a sky blue rotated from hue 214
-    // to 210. Dark and slightly desaturated red reads as brown; blue rotated
-    // toward cyan reads as teal. Neither can be tuned out downstream with the
-    // matrix or vibrance, because the curve itself is doing the damage.
-    const f32 y_lin = luma_of(lr, lg, lb);
-    f32 y_out = 0.f;
-    if (y_lin > kEps) {
-        y_out = tone_curve(y_lin, st.white);
-        const f32 k = y_out / y_lin;
-        lr *= k;
-        lg *= k;
-        lb *= k;
-    } else {
-        lr = lg = lb = 0.f;
-    }
-
-    // Holding luminance lets a saturated channel land above 1. Roll it back
-    // toward the neutral of that same luminance rather than clipping: a bright
-    // saturated colour then desaturates toward white the way it does optically,
-    // and clipping per channel here would reintroduce exactly the hue shift the
-    // luminance curve just removed.
-    {
-        const f32 mx = std::max(lr, std::max(lg, lb));
-        if (mx > 1.f) {
-            const f32 t = clampf((mx - 1.f) / std::max(mx - y_out, kEps), 0.f, 1.f);
-            lr += (y_out - lr) * t;
-            lg += (y_out - lg) * t;
-            lb += (y_out - lb) * t;
-        }
-    }
-
-    const f32 osc = (f32)(kOetfN - 1);
-    sr = lut_sample(st.oetf, clampf(lr, 0.f, 1.f), osc);
-    sg = lut_sample(st.oetf, clampf(lg, 0.f, 1.f), osc);
-    sb = lut_sample(st.oetf, clampf(lb, 0.f, 1.f), osc);
-
-    // Black point. Without it the shadow lift leaves the darkest pixels grey,
-    // and the image reads flat however much contrast is applied afterwards.
-    if (st.p.black_point > 0.f) {
-        const f32 bp = clampf(st.p.black_point, 0.f, 0.5f);
-        const f32 inv = 1.f / (1.f - bp);
-        sr = clampf((sr - bp) * inv, 0.f, 1.f);
-        sg = clampf((sg - bp) * inv, 0.f, 1.f);
-        sb = clampf((sb - bp) * inv, 0.f, 1.f);
-    }
-
-    // Contrast, in display space, via a luminance ratio so hue is preserved.
-    if (st.p.contrast > 0.f) {
-        const f32 yl = luma_of(sr, sg, sb);
-        if (yl > kEps) {
-            const f32 k = s_curve(yl, st.p.contrast) / yl;
-            sr = clampf(sr * k, 0.f, 1.f);
-            sg = clampf(sg * k, 0.f, 1.f);
-            sb = clampf(sb * k, 0.f, 1.f);
-        }
-    }
-
-    // Vibrance: the boost falls away as a colour approaches saturation, so muted
-    // material lifts and already-vivid material barely moves. Skin is held back
-    // further, which is what stops strong tone mapping turning faces orange.
-    const f32 yl = luma_of(sr, sg, sb);
-    f32 amount = st.p.saturation - 1.f;
-    if (st.p.vibrance > 0.f) {
-        const f32 mx = std::max(sr, std::max(sg, sb));
-        const f32 mn = std::min(sr, std::min(sg, sb));
-        const f32 sat = (mx > kEps) ? (mx - mn) / mx : 0.f;
-        const f32 head = (1.f - sat) * (1.f - sat);
-        amount += st.p.vibrance * head;
-    }
-    if (st.p.skin_protect) {
-        const f32 w = skin_weight(sr, sg, sb);
-        amount *= (1.f - 0.75f * w);
-    }
-    if (std::fabs(amount) > 1e-4f) {
-        const f32 k = 1.f + amount;
-        sr = yl + (sr - yl) * k;
-        sg = yl + (sg - yl) * k;
-        sb = yl + (sb - yl) * k;
-    }
-
-    // Gamut: pull an out-of-range colour toward its own luminance rather than
-    // clipping each channel, which would shift hue and flatten bright saturated
-    // areas into flat patches.
-    const f32 mx = std::max(sr, std::max(sg, sb));
-    if (mx > 1.f) {
-        const f32 t = clampf((mx - 1.f) / std::max(mx, kEps), 0.f, 1.f);
-        sr += (yl - sr) * t;
-        sg += (yl - sg) * t;
-        sb += (yl - sb) * t;
-        const f32 mx2 = std::max(sr, std::max(sg, sb));
-        if (mx2 > 1.f) {
-            const f32 s = 1.f / mx2;
-            sr *= s;
-            sg *= s;
-            sb *= s;
-        }
-    }
-    sr = clampf(sr, 0.f, 1.f);
-    sg = clampf(sg, 0.f, 1.f);
-    sb = clampf(sb, 0.f, 1.f);
 }
 
 }  // namespace hhsr

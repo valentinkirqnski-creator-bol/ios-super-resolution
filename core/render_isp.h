@@ -44,13 +44,7 @@ struct IspState {
     std::vector<f32> base;           // exposed linear luminance, blurred
     f32 exposure = 1.f;              // linear multiplier applied before anything
     f32 white = 4.f;                 // output curve maps this to display 1.0
-    f32 m[9] = {1,0,0, 0,1,0, 0,0,1};// camera linear -> sRGB linear, already
-                                     // blended by colour_strength
-    // std::pow dominated the render: srgb_oetf called it three times per pixel
-    // and the local-contrast term once more, about 190M calls at 48MP on one
-    // thread. Both are fixed-shape curves, so they are tabulated once here.
-    std::vector<f32> oetf;           // [0,1] -> display, kOetfN entries
-    std::vector<f32> lcurve;         // detail ratio ^ local_contrast, kLcN entries
+    f32 m[9] = {1,0,0, 0,1,0, 0,0,1};// camera linear -> sRGB linear
     IspParams p;
     bool valid = false;
 };
@@ -59,11 +53,8 @@ struct IspState {
 // scene-referred and already white balanced (what this pipeline writes to the
 // linear DNG). cam_to_srgb may be null, in which case a measured default for
 // this sensor is used.
-// Chroma noise reduction, in place, on the same scene-referred linear buffer
-// isp_analyse reads. Must run BEFORE isp_analyse so the exposure and gain map
-// are derived from the cleaned image. Luminance is untouched per pixel: only
-// the colour difference from luma is filtered, so no detail is lost, only fine
-// colour variation. No-op when p.chroma_denoise <= 0.
+// Optional chroma NR over the linear merge, before analysis. Detail-gated;
+// inert at chroma_denoise = 0 (the default for this render).
 void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p);
 
 bool isp_analyse(const uint16_t* rgb16, int W, int H,

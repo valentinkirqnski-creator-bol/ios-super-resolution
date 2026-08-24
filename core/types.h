@@ -265,7 +265,7 @@ struct IspParams {
     // auto exposure up to ~x5.7) was exposing exactly the chroma blotch this
     // stage exists to remove. The gate's sigma is measured per image, so a
     // clean 8-frame merge gets a tight gate and a noisy one gets a wider one.
-    float chroma_denoise = 0.6f;
+    float chroma_denoise = 0.0f;
     // Radius of the chroma filter in FULL-RESOLUTION pixels.
     float chroma_denoise_radius = 12.f;
     // Hold saturation and hue in the skin band. Without a face detector this is
