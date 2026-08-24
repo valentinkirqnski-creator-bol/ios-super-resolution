@@ -970,6 +970,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
+        flow.sample_bicubic = work.flow_bicubic_sampling &&
+                              work.flow_bilinear_sampling;
         // Full-res ICA polish (decimate only): re-measure the finished flow's
         // sub-pixel part at RAW resolution on the band-limited FFT grey --
         // the image the FFT path measures on. The half-res estimate seeds it,

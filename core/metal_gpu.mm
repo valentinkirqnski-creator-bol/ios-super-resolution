@@ -180,6 +180,13 @@ static MetalCtx& ctx() {
     return c;
 }
 
+// Flow sampling mode for the kernels' flow_bilinear field:
+// 0 = nearest, 1 = bilinear, 2 = Catmull-Rom bicubic.
+static inline uint32_t flow_sample_mode(const Config& cfg) {
+    if (!cfg.flow_bilinear_sampling) return 0u;
+    return cfg.flow_bicubic_sampling ? 2u : 1u;
+}
+
 static id<MTLBuffer> buf(const void* data, size_t bytes) {
     auto& c = ctx();
     if (bytes == 0) return nil;
@@ -1300,7 +1307,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       bool flow_bilinear) {
+                       uint32_t flow_mode) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1324,7 +1331,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_ny = (!is_ref && flow) ? (uint32_t)fg_ny : 0u;
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)fg_nx : 0u;
     dp.s = 2.f;
-    dp.flow_bilinear = flow_bilinear ? 1u : 0u;
+    dp.flow_bilinear = flow_mode;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && fg_dat && fg_bytes) {
@@ -1412,9 +1419,9 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd, cfg.flow_bilinear_sampling) ||
+                        nullptr, 0, mh, mw, cmd, flow_sample_mode(cfg)) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, cfg.flow_bilinear_sampling) ||
+                       nullptr, 0, vh, vw, cmd, flow_sample_mode(cfg)) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -1493,7 +1500,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    cfg.flow_bilinear_sampling))
+                    flow_sample_mode(cfg)))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
@@ -1713,7 +1720,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.r_t = cfg.r_t;
     mp.r_s1 = cfg.r_s1;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    mp.flow_bilinear = flow_sample_mode(cfg);
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -3605,7 +3612,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     // not from the config flag -- the raw-res path can silently fall back to
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
-    p.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    p.flow_bilinear = flow_sample_mode(cfg);
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

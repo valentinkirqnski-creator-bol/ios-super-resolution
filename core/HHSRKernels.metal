@@ -1096,6 +1096,47 @@ inline void flow_sample_bilinear(device const float* flow, uint fny, uint fnx,
     ody = ty + (by - ty) * ay;
 }
 
+inline float flow_catmull1(float p0, float p1, float p2, float p3, float t) {
+    return 0.5f * (2.f * p1 + (-p0 + p2) * t +
+                   (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t +
+                   (-p0 + 3.f * p1 - 3.f * p2 + p3) * t * t * t);
+}
+
+// Catmull-Rom twin of flow_sample_bilinear -- and of
+// FlowField::sample_grid_bicubic in types.h; keep the three in step.
+inline void flow_sample_bicubic(device const float* flow, uint fny, uint fnx,
+                                float raw_y, float raw_x, float ts,
+                                thread float& odx, thread float& ody) {
+    float tcy = raw_y / ts - 0.5f, tcx = raw_x / ts - 0.5f;
+    int y0 = int(floor(tcy)), x0 = int(floor(tcx));
+    float ay = tcy - float(y0), ax = tcx - float(x0);
+    float rx[4], ry[4];
+    for (int i = -1; i <= 2; ++i) {
+        int iy = clamp(y0 + i, 0, int(fny) - 1);
+        float px[4], py[4];
+        for (int j = -1; j <= 2; ++j) {
+            int ix = clamp(x0 + j, 0, int(fnx) - 1);
+            uint o = (uint(iy) * fnx + uint(ix)) * 2u;
+            px[j + 1] = flow[o + 0u];
+            py[j + 1] = flow[o + 1u];
+        }
+        rx[i + 1] = flow_catmull1(px[0], px[1], px[2], px[3], ax);
+        ry[i + 1] = flow_catmull1(py[0], py[1], py[2], py[3], ax);
+    }
+    odx = flow_catmull1(rx[0], rx[1], rx[2], rx[3], ay);
+    ody = flow_catmull1(ry[0], ry[1], ry[2], ry[3], ay);
+}
+
+// mode: 1 = bilinear, 2 = bicubic (0/nearest stays in the callers' else).
+inline void flow_sample(device const float* flow, uint fny, uint fnx,
+                        float raw_y, float raw_x, float ts, uint mode,
+                        thread float& odx, thread float& ody) {
+    if (mode == 2u)
+        flow_sample_bicubic(flow, fny, fnx, raw_y, raw_x, ts, odx, ody);
+    else
+        flow_sample_bilinear(flow, fny, fnx, raw_y, raw_x, ts, odx, ody);
+}
+
 inline float sample_robustness_bilinear(device const float* robustness,
                                         uint h, uint w,
                                         float y, float x) {
@@ -1144,8 +1185,8 @@ static inline void merge_comp_contrib(device const float* img,
     int py = int(lr_y / float(p.tile_size));
     float flowx, flowy;
     if (p.flow_bilinear != 0u) {
-        flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
-                             float(p.tile_size), flowx, flowy);
+        flow_sample(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
+                    float(p.tile_size), p.flow_bilinear, flowx, flowy);
     } else {
         flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
         flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
@@ -1811,8 +1852,8 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     float flow_x = 0.f, flow_y = 0.f;
     if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
         if (p.flow_bilinear != 0u) {
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(y), float(x),
-                                 float(p.tile_size), flow_x, flow_y);
+            flow_sample(flow, p.flow_ny, p.flow_nx, float(y), float(x),
+                        float(p.tile_size), p.flow_bilinear, flow_x, flow_y);
         } else {
             int patch_idy = y / int(p.tile_size);
             int patch_idx = x / int(p.tile_size);
@@ -1876,8 +1917,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         patch_idy = int(gid.y) / int(p.tile_size);
         patch_idx = int(gid.x) / int(p.tile_size);
         if (p.flow_bilinear != 0u) {
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(gid.y),
-                                 float(gid.x), float(p.tile_size), flow_x, flow_y);
+            flow_sample(flow, p.flow_ny, p.flow_nx, float(gid.y),
+                        float(gid.x), float(p.tile_size), p.flow_bilinear,
+                        flow_x, flow_y);
         } else {
             uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
             flow_x = flow[fi + 0u];
@@ -1888,10 +1930,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         patch_idx = int((2.f * float(gid.x) + 0.5f) / float(p.tile_size));
         if (p.flow_bilinear != 0u) {
             float rdx, rdy;
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx,
-                                 2.f * float(gid.y) + 0.5f,
-                                 2.f * float(gid.x) + 0.5f,
-                                 float(p.tile_size), rdx, rdy);
+            flow_sample(flow, p.flow_ny, p.flow_nx,
+                        2.f * float(gid.y) + 0.5f,
+                        2.f * float(gid.x) + 0.5f,
+                        float(p.tile_size), p.flow_bilinear, rdx, rdy);
             flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
         } else {
             uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;

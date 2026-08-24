@@ -113,6 +113,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
+        flow.sample_bicubic = work.flow_bicubic_sampling &&
+                              work.flow_bilinear_sampling;
         if (work.align_fullres_polish && work.bayer_mode &&
             work.grey_method == GreyMethod::Decimate) {
             Image rp = pad_image_circular(compute_grey_fft(ref), tile_size);
@@ -204,6 +206,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                                         comp_grey.h, comp_grey.w, tile_size,
                                         work.r_Mt, work.num_threads,
                                         work.grey_tile_size(tile_size));
+        fd.flow.sample_bicubic = work.flow_bicubic_sampling &&
+                                 work.flow_bilinear_sampling;
         if (work.align_fullres_polish && work.bayer_mode &&
             work.grey_method == GreyMethod::Decimate) {
             Image rp = pad_image_circular(compute_grey_fft(burst[0]), tile_size);

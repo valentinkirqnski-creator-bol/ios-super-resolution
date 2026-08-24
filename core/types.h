@@ -103,16 +103,57 @@ struct FlowField {
     // Every consumer must use this or none of them: the mask has to score the
     // correspondence the merge actually fetches, so an interpolated merge with
     // a nearest mask would grade a fetch nobody performs.
+    // Interpolation order for sample_bilinear: false = bilinear (default),
+    // true = Catmull-Rom bicubic. Set from Config::flow_bicubic_sampling by
+    // the pipeline once the field is final, so every CPU consumer switches
+    // together without threading a Config through each call site.
+    bool sample_bicubic = false;
+
     inline void sample_bilinear(f32 raw_y, f32 raw_x, int tile_size,
                                 f32& out_dx, f32& out_dy) const {
-        if (has_fine()) {
-            sample_grid(fine_flow.data(), fine_ny, fine_nx,
-                        0.5f * (f32)tile_size, raw_y, raw_x, out_dx, out_dy);
-            return;
+        const f32* g = has_fine() ? fine_flow.data() : flow.data();
+        const int gny = has_fine() ? fine_ny : ny;
+        const int gnx = has_fine() ? fine_nx : nx;
+        const f32 ts = has_fine() ? 0.5f * (f32)tile_size : (f32)tile_size;
+        if (gny <= 0 || gnx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
+        if (sample_bicubic)
+            sample_grid_bicubic(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
+        else
+            sample_grid(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
+    }
+
+    static inline f32 catmull1(f32 p0, f32 p1, f32 p2, f32 p3, f32 t) {
+        return 0.5f * (2.f * p1 + (-p0 + p2) * t +
+                       (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t +
+                       (-p0 + 3.f * p1 - 3.f * p2 + p3) * t * t * t);
+    }
+    // Catmull-Rom twin of sample_grid: same lattice convention, 4x4 clamped
+    // taps. Interpolates the lattice values exactly (passes through them), so
+    // at tile centres it agrees with bilinear to the float.
+    static inline void sample_grid_bicubic(const f32* grid, int gny, int gnx,
+                                           f32 ts, f32 raw_y, f32 raw_x,
+                                           f32& out_dx, f32& out_dy) {
+        if (gny <= 0 || gnx <= 0 || !(ts > 0.f)) { out_dx = 0.f; out_dy = 0.f; return; }
+        const f32 tcy = raw_y / ts - 0.5f;
+        const f32 tcx = raw_x / ts - 0.5f;
+        const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+        const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+        f32 rx[4], ry[4];
+        for (int i = -1; i <= 2; ++i) {
+            const int iy = cl(y0 + i, gny);
+            f32 px[4], py[4];
+            for (int j = -1; j <= 2; ++j) {
+                const int ix = cl(x0 + j, gnx);
+                const f32* v = grid + ((size_t)iy * gnx + ix) * 2;
+                px[j + 1] = v[0];
+                py[j + 1] = v[1];
+            }
+            rx[i + 1] = catmull1(px[0], px[1], px[2], px[3], ax);
+            ry[i + 1] = catmull1(py[0], py[1], py[2], py[3], ax);
         }
-        if (ny <= 0 || nx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
-        sample_grid(flow.data(), ny, nx, (f32)tile_size, raw_y, raw_x,
-                    out_dx, out_dy);
+        out_dx = catmull1(rx[0], rx[1], rx[2], rx[3], ay);
+        out_dy = catmull1(ry[0], ry[1], ry[2], ry[3], ay);
     }
     // The shared bilinear-lattice math, parameterised over which grid it
     // reads. `ts` is the grid's tile pitch in raw pixels (fractional for the
@@ -658,6 +699,17 @@ struct Config {
     // translation. All consumers switch together or the mask would grade a
     // correspondence the merge never fetches.
     bool  flow_bilinear_sampling = true;
+
+    // Sample the tile flow BICUBICALLY (Catmull-Rom over the 4x4 tile
+    // neighbourhood) instead of bilinearly. C1-smooth field instead of C0;
+    // the reference's author expects it NOT to fix boundary artifacts (flow
+    // is only piecewise smooth, and a smoother interpolant just blends the
+    // wrong model more smoothly there -- boundary selection handles that
+    // case), but it removes the bilinear field's derivative kinks at tile
+    // centres in smooth regions. Catmull-Rom can overshoot near sharp flow
+    // changes by up to ~12% of the local step. Requires flow_bilinear_sampling;
+    // every consumer switches together, as always.
+    bool  flow_bicubic_sampling = false;
 
     // Sub-pixel refinement of every block-matching result: fit a bivariate
     // quadratic to the 3x3 cost neighbourhood around the winning integer

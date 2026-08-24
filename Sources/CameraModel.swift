@@ -121,6 +121,8 @@ struct TuningParams: Equatable, Codable {
     /// At motion boundaries, pick the best single tile vector instead of
     /// blending two different motions. Smooth regions stay bilinear.
     var flow_boundary_selection: Bool = true
+    /// Catmull-Rom bicubic tile-flow sampling (C1) instead of bilinear (C0).
+    var flow_bicubic_sampling: Bool = false
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
     var alignment_tile_size: Int = 0
@@ -222,6 +224,7 @@ struct TuningParams: Equatable, Codable {
         case grey_decimate_lowpass
         case align_fullres_polish
         case flow_boundary_selection
+        case flow_bicubic_sampling
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
@@ -263,6 +266,7 @@ struct TuningParams: Equatable, Codable {
         grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
         align_fullres_polish = try c.decodeIfPresent(Bool.self, forKey: .align_fullres_polish) ?? align_fullres_polish
         flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
+        flow_bicubic_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bicubic_sampling) ?? flow_bicubic_sampling
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
@@ -1987,6 +1991,7 @@ final class CameraModel: NSObject, ObservableObject {
             "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),
             "align_fullres_polish": NSNumber(value: tuningParams.align_fullres_polish),
             "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
+            "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
