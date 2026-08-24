@@ -250,16 +250,22 @@ struct IspParams {
     // vibrance is literally a chroma multiplier, so it amplifies it again,
     // hardest in the flat desaturated areas where it shows most.
     //
-    // Filtering chroma is close to free perceptually: chroma carries very little
-    // detail, which is why every JPEG subsamples it. Luminance is preserved
-    // exactly here -- only the colour difference from luma is smoothed -- so
-    // this cannot soften the image, only desaturate fine colour detail.
-    // 0 = off, and off is the shipped default: it makes the JPEG bit-identical
-    // to the render before this stage existed, since isp_denoise_chroma
-    // early-returns and never touches the buffer. Raise it to trade fine
-    // colour detail for less chroma blotching; measured -73% chroma sigma at
-    // 0.75 with luma unchanged to six decimal places.
-    float chroma_denoise = 0.0f;
+    // Filtering chroma is close to free perceptually: chroma carries very
+    // little detail, which is why every JPEG subsamples it. Luminance is
+    // preserved exactly here -- only the colour difference from luma is
+    // smoothed.
+    //
+    // ON by default since the filter became detail-gated (isp_denoise_chroma
+    // soft-cores by the measured noise scale: deviations within ~2 sigma of
+    // the local chroma are noise and get smoothed, beyond ~6 sigma they are a
+    // pink flower or a red jacket and are left alone). The ungated version
+    // pulled EVERY deviation toward the local mean, which drained small
+    // saturated objects toward grey at useful strengths -- that is why this
+    // shipped at 0 for so long while the HDR render's shadow lift (measured
+    // auto exposure up to ~x5.7) was exposing exactly the chroma blotch this
+    // stage exists to remove. The gate's sigma is measured per image, so a
+    // clean 8-frame merge gets a tight gate and a noisy one gets a wider one.
+    float chroma_denoise = 0.6f;
     // Radius of the chroma filter in FULL-RESOLUTION pixels.
     float chroma_denoise_radius = 12.f;
     // Hold saturation and hue in the skin band. Without a face detector this is

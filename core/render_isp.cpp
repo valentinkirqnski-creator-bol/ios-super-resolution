@@ -413,9 +413,49 @@ void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p) {
     box_filter(dr, br, cw, ch, rad);
     box_filter(db, bb, cw, ch, rad);
 
+    // Noise scale for the detail gate below: the median per-pixel deviation of
+    // chroma from its local smoothed value, measured on a strided sample.
+    // Chroma NOISE deviates from the local mean by about sigma everywhere;
+    // a genuinely coloured object (a flower against grass, a red jacket)
+    // deviates by many sigma. The median is dominated by the former.
+    f32 sigma = 0.f;
+    {
+        std::vector<f32> devs;
+        devs.reserve((size_t)((H + 7) / 8) * (size_t)((W + 7) / 8));
+        for (int y = 0; y < H; y += 8) {
+            for (int x = 0; x < W; x += 8) {
+                const size_t i = ((size_t)y * (size_t)W + (size_t)x) * 3;
+                const f32 r = rgb16[i + 0] * inv;
+                const f32 g = rgb16[i + 1] * inv;
+                const f32 b = rgb16[i + 2] * inv;
+                const f32 Y = luma_of(r, g, b);
+                const f32 nr = sample_map(br, cw, ch, x, y, kCShift);
+                const f32 nb = sample_map(bb, cw, ch, x, y, kCShift);
+                devs.push_back(std::fabs((r - Y) - nr) + std::fabs((b - Y) - nb));
+            }
+        }
+        if (!devs.empty()) {
+            std::nth_element(devs.begin(), devs.begin() + devs.size() / 2, devs.end());
+            sigma = devs[devs.size() / 2];
+        }
+        sigma = std::max(sigma, 1e-5f);
+    }
+    const f32 gate_lo = 2.f * sigma;   // <= this: noise, smooth fully
+    const f32 gate_hi = 6.f * sigma;   // >= this: real colour, leave alone
+
     // Recombine. The filtered difference is sampled bilinearly so no block
     // structure from the decimated grid can print through, and blended by
     // `amount` so the control is continuous rather than on/off.
+    //
+    // The blend is GATED per pixel by how far the pixel's chroma sits from
+    // the local smoothed chroma, in units of the measured noise scale.
+    // Without the gate this stage pulled every chroma deviation toward the
+    // local mean -- which is a fine model of noise on a grey mountainside and
+    // a terrible one of a pink flower in green grass: at amount 0.75 small
+    // saturated objects visibly drained toward grey (measured on burst7).
+    // Soft-coring keeps them: deviations within ~2 sigma are treated as noise
+    // and fully smoothed, beyond ~6 sigma as signal and left untouched, with
+    // a smooth ramp between.
     parallel_rows(H, 0, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const f32 nr = sample_map(br, cw, ch, x, y, kCShift);
@@ -425,8 +465,13 @@ void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p) {
             const f32 g = rgb16[i + 1] * inv;
             const f32 b = rgb16[i + 2] * inv;
             const f32 Y = luma_of(r, g, b);
-            f32 cr = (r - Y) + ((nr - (r - Y)) * amount);
-            f32 cb = (b - Y) + ((nb - (b - Y)) * amount);
+            const f32 d = std::fabs((r - Y) - nr) + std::fabs((b - Y) - nb);
+            f32 t = (d - gate_lo) / std::max(gate_hi - gate_lo, kEps);
+            t = clampf(t, 0.f, 1.f);
+            const f32 keep = t * t * (3.f - 2.f * t);   // smoothstep
+            const f32 k = amount * (1.f - keep);
+            f32 cr = (r - Y) + ((nr - (r - Y)) * k);
+            f32 cb = (b - Y) + ((nb - (b - Y)) * k);
             // dg from the identity, so luma is preserved exactly rather than
             // approximately: Y == luma_of(Y+cr, Y+cg, Y+cb) holds by construction.
             const f32 cg = -(0.2126f * cr + 0.0722f * cb) / 0.7152f;
