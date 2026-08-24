@@ -695,15 +695,14 @@ struct Config {
     // ICA refinement at RAW resolution on the band-limited full-res FFT grey
     // -- the very image the FFT path measures on -- seeded by the decimate
     // estimate. The seed is already sub-pixel (quadratic BM fit + per-level
-    // ICA + boundary measurement), so the pass operates deep inside ICA's
+    // ICA + boundary selection), so the pass operates deep inside ICA's
     // convergence basin: it can only sharpen, not wander. After it the two
     // grey methods differ only in coarse-level tile decisions on pathological
     // content, not in sub-pixel accuracy. Decimate + Bayer only; the FFT path
     // already ends with exactly this pass.
     bool  align_fullres_polish = true;
 
-    // At motion boundaries, MEASURE the cell's own motion instead of
-    // blending neighbour vectors.
+    // At motion boundaries, SELECT a tile vector instead of blending.
     // Bilinear sampling between tile centres is correct where the field is
     // smooth but blends two different motions across an object boundary,
     // producing flow that belongs to neither side -- exactly where robustness
@@ -712,13 +711,8 @@ struct Config {
     // the field: cells whose four surrounding tile vectors agree within
     // flow_select_threshold keep the bilinear blend (first-order faithful to
     // the smooth behaviour -- see FlowField::fine_flow for the measured
-    // bounds); cells at a disagreement get an HDR+-style overlapping-tile
-    // measurement -- a full tile-sized window at half-tile stride, seeded by
-    // the best neighbour vector, refined by a 3x3 search plus the quadratic
-    // sub-cell fit. Flow is only piecewise smooth; interpolation is the
-    // wrong model exactly at motion edges, and measuring there is the fix
-    // the IPOL reference's author recommends (HDR+ used overlapping tiles;
-    // the Google paper dropped the mention).
+    // bounds); cells at a disagreement get whichever single tile vector
+    // best explains the alignment guide there (L1 over the cell footprint).
     // Every warping consumer samples the refined grid through the same
     // sample_bilinear entry point, so mask and merge stay in lockstep.
     bool  flow_boundary_selection = true;

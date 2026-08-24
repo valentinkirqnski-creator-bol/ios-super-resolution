@@ -1295,32 +1295,6 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     return out;
 }
 
-// Build the boundary-selected half-pitch refinement of a RAW-grid flow field
-// (FlowField::fine_*, consumed transparently by sample_bilinear and the GPU
-// hosts). Runs after flow_to_raw_tile_grid, on the same greys alignment used.
-//
-// Each fine cell (pitch tile_size/2) looks at the four tile vectors its
-// centre sits between -- the exact four bilinear sampling reads there:
-//  - If they agree within cfg.flow_select_threshold raw px (Chebyshev), the
-//    cell stores their bilinear blend at its centre, and consumers sampling
-//    the fine grid reproduce the coarse sampling to first order: the fine
-//    lattice is quarter-shifted from the coarse one, so the match is exact
-//    for a locally linear field away from image borders (measured 6e-8) and
-//    bounded by ~1/8 of the flow's per-tile second difference elsewhere --
-//    far below the staircase this machinery removes. Sub-tile gradients
-//    (rotation) survive by construction.
-//  - Otherwise the cell sits on a motion boundary, where a blend produces
-//    flow belonging to NEITHER side. The cell gets an OVERLAPPING-TILE
-//    measurement (HDR+'s Ts=16 / offset 8, suggested for exactly this by the
-//    IPOL reference's author): the four neighbour vectors are scored by L1
-//    over a FULL tile-sized window centred on the cell (so it overlaps half
-//    of each neighbour cell), the best seeds a 3x3 integer refinement plus
-//    the quadratic sub-cell fit, and the measured vector replaces the
-//    candidate only when the refinement actually moves -- a confirmed
-//    candidate keeps its ICA-refined fraction, which beats a fresh
-//    grey-integer measurement (2 raw px of quantisation on decimate).
-//    Ties keep the lowest candidate index; a warp that leaves either image
-//    scores infinite; if nothing can be scored the blend stands.
 // Full-resolution ICA polish (Config::align_fullres_polish): one final ICA
 // refinement of the RAW-grid flow at raw resolution, on the band-limited
 // full-res FFT grey both frames were converted to -- the same image the FFT
@@ -1353,7 +1327,28 @@ bool flow_fullres_ica_polish(const Image& ref_grey_full, const Image& mov_grey_f
                      ica_damp_ratio(cfg), ica_max_step(cfg, 1));
     return true;
 }
-
+// Build the boundary-selected half-pitch refinement of a RAW-grid flow field
+// (FlowField::fine_*, consumed transparently by sample_bilinear and the GPU
+// hosts). Runs after flow_to_raw_tile_grid, on the same greys alignment used.
+//
+// Each fine cell (pitch tile_size/2) looks at the four tile vectors its
+// centre sits between -- the exact four bilinear sampling reads there:
+//  - If they agree within cfg.flow_select_threshold raw px (Chebyshev), the
+//    cell stores their bilinear blend at its centre, and consumers sampling
+//    the fine grid reproduce the coarse sampling to first order: the fine
+//    lattice is quarter-shifted from the coarse one, so the match is exact
+//    for a locally linear field away from image borders (measured 6e-8) and
+//    bounded by ~1/8 of the flow's per-tile second difference elsewhere --
+//    far below the staircase this machinery removes. Sub-tile gradients
+//    (rotation) survive by construction.
+//  - Otherwise the cell sits on a motion boundary, where a blend produces
+//    flow belonging to NEITHER side. Each of the four vectors is scored by L1
+//    residual over the cell's footprint on the alignment grey (rounded
+//    integer warp -- this selects between motions pixels apart, it does not
+//    re-estimate sub-pixel), and the best single vector is stored verbatim,
+//    fractional part included. Ties keep the lowest candidate index; a
+//    candidate whose warp leaves the moving grey is skipped; if none can be
+//    scored the blend stands, which is today's behaviour.
 void flow_densify_boundary_select(FlowField& flow,
                                   const Image& ref_grey, const Image& mov_grey,
                                   int raw_h, int raw_w, int tile_size,
@@ -1408,97 +1403,36 @@ void flow_densify_boundary_select(FlowField& flow,
             f32 out_x = tx0 + (bx0 - tx0) * ay;
             f32 out_y = ty0 + (by0 - ty0) * ay;
             if (spread > thr) {
-                // OVERLAPPING-TILE measurement, HDR+ style (tile size ts,
-                // stride ts/2), suggested for this exact problem by the IPOL
-                // reference's author: flow is only piecewise smooth, so
-                // interpolation is awkward next to motion edges -- what helps
-                // is measuring a vector for every HALF-pitch position on a
-                // FULL-tile window. Selection among the four neighbour vectors
-                // (the previous version of this branch) picks the best wrong
-                // answer when neither side's motion fits the straddling cell;
-                // measuring finds the cell's own motion. Smooth cells keep the
-                // interpolated field: ICA-refined bilinear there is more
-                // accurate than a fresh small-window measurement would be.
-                //
-                // The window is tile_size RAW px centred on the cell -- the
-                // overlap: it spans half of each neighbouring cell, exactly
-                // Ts=16 / offset 8 from the HDR+ paper.
-                const int win = std::max(2, (int)std::lround((f32)tile_size * gsy));
-                const int gy0 = (int)std::lround(((f32)fy + 0.5f) * ts2 * gsy) - win / 2;
-                const int gx0 = (int)std::lround(((f32)fx + 0.5f) * ts2 * gsx) - win / 2;
-                // L1 over the window at an integer grey offset; infinity when
-                // the warp leaves either image (border cells keep the blend).
-                auto cost_at = [&](int idy, int idx) -> f32 {
+                // Cell footprint on the grey.
+                const int gy0 = (int)std::floor((f32)fy * ts2 * gsy);
+                const int gx0 = (int)std::floor((f32)fx * ts2 * gsx);
+                const int gh = std::max(1, (int)std::lround(ts2 * gsy));
+                const int gw = std::max(1, (int)std::lround(ts2 * gsx));
+                f32 best_cost = std::numeric_limits<f32>::infinity();
+                for (int c = 0; c < 4; ++c) {
+                    const int idx = (int)std::lround(vx[c] * gsx);
+                    const int idy = (int)std::lround(vy[c] * gsy);
                     f32 dist = 0.f;
-                    for (int i = 0; i < win; ++i) {
-                        for (int j = 0; j < win; ++j) {
+                    bool valid = true;
+                    for (int i = 0; i < gh && valid; ++i) {
+                        for (int j = 0; j < gw; ++j) {
                             const int ry = gy0 + i, rx = gx0 + j;
                             const int my = ry + idy, mx = rx + idx;
                             if (!(ry >= 0 && ry < ref_grey.h &&
                                   rx >= 0 && rx < ref_grey.w &&
                                   my >= 0 && my < mov_grey.h &&
-                                  mx >= 0 && mx < mov_grey.w))
-                                return std::numeric_limits<f32>::infinity();
+                                  mx >= 0 && mx < mov_grey.w)) {
+                                valid = false;
+                                break;
+                            }
                             dist += std::fabs(ref_grey.at(ry, rx) -
                                               mov_grey.at(my, mx));
                         }
                     }
-                    return dist;
-                };
-                // 1) Seed: best of the four neighbour vectors on this window.
-                f32 best_cost = std::numeric_limits<f32>::infinity();
-                int seed_y = 0, seed_x = 0;
-                bool have_seed = false;
-                for (int c = 0; c < 4; ++c) {
-                    const int idx = (int)std::lround(vx[c] * gsx);
-                    const int idy = (int)std::lround(vy[c] * gsy);
-                    const f32 d = cost_at(idy, idx);
-                    if (d < best_cost) {
-                        best_cost = d;
-                        seed_y = idy;
-                        seed_x = idx;
-                        have_seed = true;
+                    if (valid && dist < best_cost) {
+                        best_cost = dist;
                         out_x = vx[c];
                         out_y = vy[c];
-                    }
-                }
-                // 2) Measure: one 3x3 integer refinement around the seed,
-                // then the same quadratic sub-cell fit block matching uses.
-                //
-                // The measurement REPLACES the candidate only when it moves:
-                // a grey-integer offset is 2 raw px of quantisation on the
-                // decimate grey, so where the candidate is already the local
-                // optimum of this window, its ICA-refined fractional vector
-                // is the more accurate estimate of the same motion and is
-                // kept verbatim. The measurement wins exactly in the
-                // straddling-cell case it exists for -- when the cell's own
-                // motion is not what any neighbour tile offered.
-                if (have_seed) {
-                    f32 surf[9];
-                    int bo = 4;   // centre
-                    f32 bo_cost = best_cost;
-                    for (int oy = -1; oy <= 1; ++oy)
-                        for (int ox = -1; ox <= 1; ++ox) {
-                            const int s = (oy + 1) * 3 + (ox + 1);
-                            surf[s] = (ox == 0 && oy == 0)
-                                          ? best_cost
-                                          : cost_at(seed_y + oy, seed_x + ox);
-                            if (surf[s] < bo_cost) { bo_cost = surf[s]; bo = s; }
-                        }
-                    if (bo != 4) {
-                        // Winner moved: re-centre once so the fit brackets it.
-                        seed_y += bo / 3 - 1;
-                        seed_x += bo % 3 - 1;
-                        for (int oy = -1; oy <= 1; ++oy)
-                            for (int ox = -1; ox <= 1; ++ox)
-                                surf[(oy + 1) * 3 + (ox + 1)] =
-                                    cost_at(seed_y + oy, seed_x + ox);
-                        if (std::isfinite(surf[4])) {
-                            f32 sub_x = 0.f, sub_y = 0.f;
-                            (void)quadratic_subpixel_3x3(surf, sub_x, sub_y);
-                            out_x = ((f32)seed_x + sub_x) / gsx;
-                            out_y = ((f32)seed_y + sub_y) / gsy;
-                        }
                     }
                 }
             }
