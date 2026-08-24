@@ -931,6 +931,18 @@ struct CameraView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    if cam.exportFormat == .jpg {
+                        HStack {
+                            Text("JPEG Quality")
+                            Slider(value: $cam.jpegExportQuality, in: 0.5...1.0, step: 0.01)
+                            Text(String(format: "%.2f", cam.jpegExportQuality))
+                                .font(.caption.monospacedDigit())
+                                .foregroundColor(.secondary)
+                        }
+                        Text("0.92+ keeps full-resolution colour (4:4:4). Below 0.90 iOS halves the colour resolution (4:2:0), which reads as soft, smeared fine detail -- the old default of 0.82 was why exports looked low quality.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                     Text(cam.exportFormat == .dng
                          ? "LinearRaw DNG with embedded tone-mapped JPEG preview (Photos thumbnail; Lightroom reads the raw)."
                          : "JPEG rendered by the ISP: auto exposure, local tone mapping, contrast and vibrance. No sharpening.")

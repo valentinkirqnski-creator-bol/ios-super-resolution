@@ -306,6 +306,13 @@ final class CameraModel: NSObject, ObservableObject {
     }() {
         didSet { UserDefaults.standard.set(outputResolutionMode.rawValue, forKey: "OutputResolutionMode") }
     }
+    /// JPEG export quality (JPG format only). 0.92 default keeps 4:4:4 chroma.
+    @Published var jpegExportQuality: Double = {
+        let v = UserDefaults.standard.double(forKey: "JPEGExportQuality")
+        return v > 0 ? min(1.0, max(0.5, v)) : 0.92
+    }() {
+        didSet { UserDefaults.standard.set(jpegExportQuality, forKey: "JPEGExportQuality") }
+    }
     @Published var exportFormat: ExportFormat = {
         if let raw = UserDefaults.standard.string(forKey: "ExportFormat"),
            let fmt = ExportFormat(rawValue: raw) {
@@ -2115,10 +2122,11 @@ final class CameraModel: NSObject, ObservableObject {
     /// Lightroom-like finish from the SR DNG: Highlights −70, stronger contrast
     /// + vibrance (no sharpen / NR). Uses our own Deflate LinearRaw decoder
     /// (ImageIO cannot read these DNGs).
-    private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
+    private static func renderExportJPEG(fromDNG dngURL: URL, quality: Double) -> URL? {
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
-        let ok = SRBridge.exportJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path)
+        let ok = SRBridge.exportJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path,
+                                     quality: Float(quality))
         if ok { return outURL }
         try? FileManager.default.removeItem(at: outURL)
         return nil
@@ -2126,6 +2134,7 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
         let format = exportFormat
+        let quality = jpegExportQuality
         // The JPEG render / preview embed below re-reads and re-encodes the
         // full-size DNG -- seconds of real work after the pipeline's "Done".
         // Without this the UI freezes on "Done" with no explanation.
@@ -2152,7 +2161,7 @@ final class CameraModel: NSObject, ObservableObject {
                 // 4096 here was why a 48MP capture looked soft in Photos.
                 _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 32768)
             } else if format == .jpg {
-                if let jpg = Self.renderExportJPEG(fromDNG: url) {
+                if let jpg = Self.renderExportJPEG(fromDNG: url, quality: quality) {
                     saveURL = jpg
                     tempJPEG = jpg
                 } else {

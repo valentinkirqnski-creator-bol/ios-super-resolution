@@ -852,8 +852,12 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     hhsr::mps_fft_prewarm((int)height, (int)width);
 }
 
-+ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
++ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
+                         toPath:(NSString *)jpgPath
+                        quality:(float)quality {
     if (dngPath.length == 0 || jpgPath.length == 0) return NO;
+    if (!(quality > 0.f) || quality > 1.f) quality = 0.92f;
+    quality = std::max(0.5f, quality);
 
     std::vector<uint16_t> rgb;
     int W = 0, H = 0;
@@ -924,12 +928,12 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         CGImageRelease(cgOut);
         return NO;
     }
-    // 0.92: keeps 4:4:4 chroma (ImageIO drops to 4:2:0 below ~0.90) at ~15MB
-    // for 48MP. This was 0.82 to halve the file, but the 4:2:0 chroma plus the
-    // quantisation read as visibly soft on fine colour detail once the user
-    // actually pixel-peeped the export -- the deliverable is the photograph,
-    // so it gets the quality and the megabytes.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.92};
+    // Default 0.92: keeps 4:4:4 chroma (ImageIO drops to 4:2:0 below ~0.90)
+    // at ~15MB for 48MP. This was a hard-coded 0.82 to halve the file, but the
+    // 4:2:0 chroma plus the quantisation read as visibly soft on fine colour
+    // detail -- the deliverable is the photograph, so it gets the quality and
+    // the megabytes, and the setting is now the user's.
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @(quality)};
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
