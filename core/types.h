@@ -879,6 +879,15 @@ struct Config {
     // coherent single-orientation edges. Clean edges keep their elongation;
     // junk orientations stop being amplified.
     bool kernel_anisotropy_zero_floor = true;
+    // Exponent on the zero-floored stretch weight: w = 0.975 * t^gamma with
+    // t = clamp((A-1)/0.95). 1 = the plain zero-floor law. The default 2 was
+    // fitted to a measurement, not a guess: distant text (coherence ~0.36)
+    // was only readable with a manual global k_stretch of 2.0, and gamma = 2
+    // reproduces exactly that stretch (2.2:1) AT text's coherence while a
+    // clean single-orientation edge (coherence ~0.9) keeps 95% of the full
+    // k_stretch = 4 elongation the manual override was giving up. Raising
+    // gamma concentrates stretch onto ever-more-coherent structure.
+    f32  kernel_stretch_gamma = 2.0f;
 
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;

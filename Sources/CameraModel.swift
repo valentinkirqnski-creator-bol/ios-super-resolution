@@ -100,6 +100,9 @@ struct TuningParams: Equatable, Codable {
     /// Zero-floor the anisotropy law: isotropic detail gets round kernels
     /// instead of a minimum 2.5:0.75 stretch along a noise orientation.
     var kernel_anisotropy_zero_floor: Bool = true
+    /// Exponent on the stretch weight: higher concentrates elongation onto
+    /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
+    var kernel_stretch_gamma: Float = 2.0
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
@@ -212,6 +215,7 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
+        case kernel_stretch_gamma
         case merge_fp16_accumulator
         case dng_store_unwhitened
         case bm_subpixel_quadratic
@@ -252,6 +256,7 @@ struct TuningParams: Equatable, Codable {
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
+        kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
@@ -1975,6 +1980,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
+            "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),

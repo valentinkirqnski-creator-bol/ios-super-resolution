@@ -390,6 +390,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
     if (tuning[@"kernel_anisotropy_zero_floor"])
         cfg.kernel_anisotropy_zero_floor = tuning[@"kernel_anisotropy_zero_floor"].boolValue;
+    if (tuning[@"kernel_stretch_gamma"])
+        cfg.kernel_stretch_gamma = tuning[@"kernel_stretch_gamma"].floatValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
     if (tuning[@"dng_store_unwhitened"])
