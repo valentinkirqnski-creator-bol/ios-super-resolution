@@ -221,12 +221,50 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // constant, which rotation turns into a visible tile grid. The
             // mask samples the SAME way, so it still grades the fetch that
             // actually happens. See FlowField::sample_bilinear.
-            f32 flowx, flowy;
-            if (cfg.flow_bilinear_sampling) {
-                flow.sample_bilinear(lr_y, lr_x, tile_size, flowx, flowy);
+            // Flow hypotheses. Normally one (sampled); in overlapped-tile
+            // merge mode (Config::flow_overlap_merge) up to four -- the
+            // covering half-pitch tiles' OWN vectors, Hann-crossfaded
+            // (cos^2/sin^2 per axis == the 50%-overlap raised cosine,
+            // partition of unity). Duplicates are merged so smooth regions
+            // cost a single gather.
+            f32 hx[4], hy[4], hw[4] = {1.f, 0.f, 0.f, 0.f};
+            int nhyp = 1;
+            if (cfg.overlap_merge_active() && flow.has_fine()) {
+                const f32 P = 0.5f * (f32)tile_size;
+                const f32 tcy = lr_y / P - 0.5f;
+                const f32 tcx = lr_x / P - 0.5f;
+                const int cy0i = (int)std::floor(tcy), cx0i = (int)std::floor(tcx);
+                const f32 ay = tcy - (f32)cy0i, ax = tcx - (f32)cx0i;
+                auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+                const int iy0 = cl(cy0i, flow.fine_ny), iy1 = cl(cy0i + 1, flow.fine_ny);
+                const int ix0 = cl(cx0i, flow.fine_nx), ix1 = cl(cx0i + 1, flow.fine_nx);
+                const f32 sy = std::sin(1.57079632679f * ay);
+                const f32 sx = std::sin(1.57079632679f * ax);
+                const f32 wy1 = sy * sy, wy0 = 1.f - wy1;
+                const f32 wx1 = sx * sx, wx0 = 1.f - wx1;
+                const int idx4[4][2] = {{iy0, ix0}, {iy0, ix1}, {iy1, ix0}, {iy1, ix1}};
+                const f32 w4[4] = {wy0 * wx0, wy0 * wx1, wy1 * wx0, wy1 * wx1};
+                for (int a = 0; a < 4; ++a) {
+                    const size_t o = ((size_t)idx4[a][0] * flow.fine_nx + idx4[a][1]) * 2u;
+                    hx[a] = flow.fine_flow[o + 0];
+                    hy[a] = flow.fine_flow[o + 1];
+                    hw[a] = w4[a];
+                }
+                for (int a = 1; a < 4; ++a)
+                    for (int b = 0; b < a; ++b)
+                        if (hw[a] > 0.f && hw[b] > 0.f &&
+                            std::fabs(hx[a] - hx[b]) < 1e-3f &&
+                            std::fabs(hy[a] - hy[b]) < 1e-3f) {
+                            hw[b] += hw[a];
+                            hw[a] = 0.f;
+                            break;
+                        }
+                nhyp = 4;
+            } else if (cfg.flow_bilinear_sampling) {
+                flow.sample_bilinear(lr_y, lr_x, tile_size, hx[0], hy[0]);
             } else {
-                flowx = flow.dx(py, px);
-                flowy = flow.dy(py, px);
+                hx[0] = flow.dx(py, px);
+                hy[0] = flow.dy(py, px);
             }
 
             // Which coordinate space R lives in is decided by R's ACTUAL
@@ -244,6 +282,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             }
             const f32 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
 
+            f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
+            for (int h = 0; h < nhyp; ++h) {
+            if (hw[h] <= 0.f) continue;
+            const f32 flowx = hx[h], flowy = hy[h];
+            const f32 wsc = hw[h];
             const f32 lr_mov_x = lr_x + flowx;
             const f32 lr_mov_y = lr_y + flowy;
             if (!(lr_mov_x >= 0.f && lr_mov_x < (f32)lr_w &&
@@ -266,7 +309,6 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const int center_j = cuda_round_to_int(lr_mov_x);
             const int center_i = cuda_round_to_int(lr_mov_y);
 
-            f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
                 for (int dj = -1; dj <= 1; ++dj) {
                     const int j = center_j + dj;
@@ -284,9 +326,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     z = std::max(0.f, z);
                     const f32 w = std::exp(-0.5f * z);
 
-                    val[channel] += w * local_r * c;
-                    acc[channel] += w * local_r;
+                    val[channel] += w * local_r * wsc * c;
+                    acc[channel] += w * local_r * wsc;
                 }
+            }
             }
             for (int ch = 0; ch < nch; ++ch) {
                 num.at(local_i, hr_j, ch) += val[ch];

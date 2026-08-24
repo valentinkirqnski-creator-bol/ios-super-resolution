@@ -1168,29 +1168,18 @@ inline float sample_robustness_bilinear(device const float* robustness,
 // totals once, at the end. That ordering is what makes fusion exact: the
 // caller sees the same per-frame val/acc it would have added had this frame
 // been its own dispatch.
-static inline void merge_comp_contrib(device const float* img,
-                                      device const float* flow,
+// The post-flow half of merge_comp_contrib: one hypothesis' contribution,
+// scaled by wscale (1 outside overlapped-tile mode; the raised-cosine window
+// weight inside it). Split so the hypothesis loop below shares this single
+// copy of the math with the ordinary single-flow path.
+static inline void merge_comp_contrib_flowed(device const float* img,
                                       device const float* covs,
                                       device const float* robustness,
                                       constant MergeCompParams& p,
-                                      uint hr_j, uint local_i,
+                                      float lr_x, float lr_y,
+                                      float flowx, float flowy, float wscale,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
-    int hr_i = int(p.y0 + local_i);
-    float lr_x = (float(hr_j) + 0.5f) / p.scale;
-    float lr_y = (float(hr_i) + 0.5f) / p.scale;
-
-    // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
-    int px = int(lr_x / float(p.tile_size));
-    int py = int(lr_y / float(p.tile_size));
-    float flowx, flowy;
-    if (p.flow_bilinear != 0u) {
-        flow_sample(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
-                    float(p.tile_size), p.flow_bilinear, flowx, flowy);
-    } else {
-        flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
-        flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
-    }
 
     // p.raw_res_robustness: robustness is raw resolution this run (Config::
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
@@ -1265,8 +1254,83 @@ static inline void merge_comp_contrib(device const float* img,
         }
     }
 
-    n0 += val0; n1 += val1; n2 += val2;
-    d0 += acc0; d1 += acc1; d2 += acc2;
+    n0 += wscale * val0; n1 += wscale * val1; n2 += wscale * val2;
+    d0 += wscale * acc0; d1 += wscale * acc1; d2 += wscale * acc2;
+}
+
+// Alg. 4 dispatcher: computes lr coords and the flow hypothesis set, then
+// hands each hypothesis to merge_comp_contrib_flowed.
+// p.flow_bilinear: 0 nearest / 1 bilinear / 2 bicubic -- one hypothesis;
+// 3 = overlapped-tile merge (Config::flow_overlap_merge): the flow buffer is
+// the half-pitch measured lattice (pitch p.tile_size, tile span 2x that),
+// and each output pixel crossfades its <=4 covering tiles' OWN vectors with
+// the 50%-overlap raised cosine == Hann on the lattice fraction (cos^2 /
+// sin^2 per axis, sums to one). Identical vectors are deduplicated, so
+// smooth regions cost one gather exactly as before.
+static inline void merge_comp_contrib(device const float* img,
+                                      device const float* flow,
+                                      device const float* covs,
+                                      device const float* robustness,
+                                      constant MergeCompParams& p,
+                                      uint hr_j, uint local_i,
+                                      thread float& n0, thread float& n1, thread float& n2,
+                                      thread float& d0, thread float& d1, thread float& d2) {
+    int hr_i = int(p.y0 + local_i);
+    float lr_x = (float(hr_j) + 0.5f) / p.scale;
+    float lr_y = (float(hr_i) + 0.5f) / p.scale;
+
+    if (p.flow_bilinear == 3u) {
+        float P = float(p.tile_size);
+        float tcy = lr_y / P - 0.5f, tcx = lr_x / P - 0.5f;
+        int cy0i = int(floor(tcy)), cx0i = int(floor(tcx));
+        float ay = tcy - float(cy0i), ax = tcx - float(cx0i);
+        int iy0 = clamp(cy0i, 0, int(p.flow_ny) - 1);
+        int iy1 = clamp(cy0i + 1, 0, int(p.flow_ny) - 1);
+        int ix0 = clamp(cx0i, 0, int(p.flow_nx) - 1);
+        int ix1 = clamp(cx0i + 1, 0, int(p.flow_nx) - 1);
+        float sy = sin(1.57079632679f * ay);
+        float sx = sin(1.57079632679f * ax);
+        float wy1 = sy * sy, wy0 = 1.f - wy1;
+        float wx1 = sx * sx, wx0 = 1.f - wx1;
+        float hx[4], hy[4], hw[4];
+        const int iy[4] = {iy0, iy0, iy1, iy1};
+        const int ix[4] = {ix0, ix1, ix0, ix1};
+        const float w4[4] = {wy0 * wx0, wy0 * wx1, wy1 * wx0, wy1 * wx1};
+        for (int a = 0; a < 4; ++a) {
+            uint o = (uint(iy[a]) * p.flow_nx + uint(ix[a])) * 2u;
+            hx[a] = flow[o + 0u];
+            hy[a] = flow[o + 1u];
+            hw[a] = w4[a];
+        }
+        for (int a = 1; a < 4; ++a)
+            for (int b = 0; b < a; ++b)
+                if (hw[a] > 0.f && hw[b] > 0.f &&
+                    fabs(hx[a] - hx[b]) < 1e-3f && fabs(hy[a] - hy[b]) < 1e-3f) {
+                    hw[b] += hw[a];
+                    hw[a] = 0.f;
+                    break;
+                }
+        for (int a = 0; a < 4; ++a)
+            if (hw[a] > 0.f)
+                merge_comp_contrib_flowed(img, covs, robustness, p, lr_x, lr_y,
+                                          hx[a], hy[a], hw[a],
+                                          n0, n1, n2, d0, d1, d2);
+        return;
+    }
+
+    // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
+    int px = int(lr_x / float(p.tile_size));
+    int py = int(lr_y / float(p.tile_size));
+    float flowx, flowy;
+    if (p.flow_bilinear != 0u) {
+        flow_sample(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
+                    float(p.tile_size), p.flow_bilinear, flowx, flowy);
+    } else {
+        flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
+        flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
+    }
+    merge_comp_contrib_flowed(img, covs, robustness, p, lr_x, lr_y,
+                              flowx, flowy, 1.f, n0, n1, n2, d0, d1, d2);
 }
 
 kernel void merge_accumulate_comp(device float* num [[buffer(0)]],

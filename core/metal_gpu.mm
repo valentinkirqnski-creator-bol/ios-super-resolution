@@ -3625,6 +3625,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
             p.flow_ny = (uint32_t)flow.fine_ny;
             p.flow_nx = (uint32_t)flow.fine_nx;
             p.tile_size = (uint32_t)(tile_size / 2);
+            if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
         } else {
             p.flow_ny = (uint32_t)flow.ny;
             p.flow_nx = (uint32_t)flow.nx;
@@ -3643,8 +3644,10 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
-        if (hit->flow_fine && tile_size >= 2 && (tile_size % 2) == 0)
+        if (hit->flow_fine && tile_size >= 2 && (tile_size % 2) == 0) {
             p.tile_size = (uint32_t)(tile_size / 2);
+            if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
+        }
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
         p.cov_w = hit->cov_w > 0 ? (uint32_t)hit->cov_w : 1u;
     }

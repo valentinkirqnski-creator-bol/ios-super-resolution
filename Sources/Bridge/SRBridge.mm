@@ -431,6 +431,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
     if (tuning[@"flow_bicubic_sampling"])
         cfg.flow_bicubic_sampling = tuning[@"flow_bicubic_sampling"].boolValue;
+    if (tuning[@"flow_overlap_merge"])
+        cfg.flow_overlap_merge = tuning[@"flow_overlap_merge"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"alignment_tile_size"]) {

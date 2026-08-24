@@ -711,6 +711,30 @@ struct Config {
     // every consumer switches together, as always.
     bool  flow_bicubic_sampling = false;
 
+    // HDR+'s merge scheme as an experiment (the IPOL author's suggested first
+    // test): tiles of Ts = tile_size at stride Ts/2, each half-pitch lattice
+    // cell measured on its own FULL-tile overlapping window (no interpolated
+    // vectors), and the MERGE blending each output pixel's <=4 covering-tile
+    // results with the raised-cosine window -- at 50% overlap the modified
+    // raised cosine reduces exactly to a Hann crossfade on the lattice
+    // fraction (cos^2/sin^2 per axis, partition of unity). So instead of
+    // interpolating the FLOW and warping once, the merge warps up to four
+    // times with each tile's own vector and crossfades the RESULTS.
+    // Identical hypotheses are deduplicated, so smooth regions cost one
+    // gather as before; only disagreement regions pay extra.
+    //
+    // The robustness mask keeps sampling the same lattice bilinearly -- with
+    // multiple correspondences per pixel there is no single fetch to score,
+    // so it grades their expectation (documented approximation).
+    // Decimate only, requires flow_bilinear_sampling. Off by default.
+    bool  flow_overlap_merge = false;
+
+    // True when the overlapped-tile merge should actually run.
+    bool overlap_merge_active() const {
+        return flow_overlap_merge && flow_bilinear_sampling &&
+               grey_method == GreyMethod::Decimate;
+    }
+
     // Sub-pixel refinement of every block-matching result: fit a bivariate
     // quadratic to the 3x3 cost neighbourhood around the winning integer
     // offset and add its sub-cell minimum (mu = -H^-1 g), the piece of
