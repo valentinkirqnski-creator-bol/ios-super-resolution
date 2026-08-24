@@ -38,8 +38,14 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
         if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
-            kk1 = 1.f + 0.5f * A * (1.f / cfg.k_shrink - 1.f);
-            kk2 = 1.f + 0.5f * A * (cfg.k_stretch - 1.f);
+            // 0.5*A floors at 0.5; the zero-floor remap keeps the A=1.95
+            // endpoint and sends isotropic content to round kernels. See
+            // Config::kernel_anisotropy_zero_floor.
+            f32 w = 0.5f * A;
+            if (cfg.kernel_anisotropy_zero_floor)
+                w = 0.975f * clampf((A - 1.f) / 0.95f, 0.f, 1.f);
+            kk1 = 1.f + w * (1.f / cfg.k_shrink - 1.f);
+            kk2 = 1.f + w * (cfg.k_stretch - 1.f);
         } else if (A > 1.95f) {
             kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch;
         } else {

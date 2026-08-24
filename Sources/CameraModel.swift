@@ -97,6 +97,9 @@ struct TuningParams: Equatable, Codable {
     /// Drive the merge kernel's anisotropy continuously from the structure
     /// tensor rather than switching to the full stretch only above 0.9025.
     var kernel_anisotropy_continuous: Bool = true
+    /// Zero-floor the anisotropy law: isotropic detail gets round kernels
+    /// instead of a minimum 2.5:0.75 stretch along a noise orientation.
+    var kernel_anisotropy_zero_floor: Bool = true
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
@@ -208,6 +211,7 @@ struct TuningParams: Equatable, Codable {
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
         case kernel_anisotropy_continuous
+        case kernel_anisotropy_zero_floor
         case merge_fp16_accumulator
         case dng_store_unwhitened
         case bm_subpixel_quadratic
@@ -247,6 +251,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
+        kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
@@ -1969,6 +1974,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
+            "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),

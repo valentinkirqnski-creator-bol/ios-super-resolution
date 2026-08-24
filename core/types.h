@@ -863,6 +863,23 @@ struct Config {
     // Section 5.1.1 designs the anisotropic kernel to provide.
     bool kernel_anisotropy_continuous = true;
 
+    // Zero-floor the linear anisotropy law. The reference's linear selection
+    // (and the continuous mode above) interpolates the kernel shape with
+    // weight 0.5*A, and A = 1 + sqrt(coherence) never goes below 1 -- so the
+    // stretch weight never drops below 0.5: even NEAR-ISOTROPIC detail in
+    // high-contrast areas (D ~ 0) is elongated 2.5:0.75 along whichever
+    // eigenvector the 2x2-gradient tensor happened to prefer. Distant text is
+    // the worst case: multi-oriented strokes of 1-2 raw px produce moderate
+    // coherence (~0.3-0.6) with an orientation that is mostly aliasing noise
+    // at the half-res tensor's scale, and the resulting 3-6:1 kernels smear
+    // glyphs into unreadability (or double their strokes, which reads as
+    // misalignment). This remaps the weight to w = 0.975 * (A - 1) / 0.95,
+    // clamped: zero at A = 1 (isotropic -> round kernel), the SAME value at
+    // the old hard threshold A = 1.95, full stretch only for genuinely
+    // coherent single-orientation edges. Clean edges keep their elongation;
+    // junk orientations stop being amplified.
+    bool kernel_anisotropy_zero_floor = true;
+
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
 

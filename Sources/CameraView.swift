@@ -784,6 +784,11 @@ struct CameraView: View {
              Stores the online merge accumulator as 16-bit floats instead of 32-bit.              All arithmetic stays float32 in the kernels; only what lands in memory              narrows. At 2x output this halves the pipeline's single largest allocation              (1116 -> 558 MB) and the merge's dominant memory traffic, which it is              bandwidth-bound on. The cost is storage quantisation of about 0.05%              relative per store -- roughly 1-2 LSB of the 16-bit output. Turn off to              restore bit-exact fp32 accumulation at the old memory and speed.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Zero-Floor Kernel Stretch", isOn: $cam.tuningParams.kernel_anisotropy_zero_floor)
+        Text("""
+             The merge kernel's stretch weight was 0.5*A with A never below 1 -- so even              near-isotropic detail in high-contrast areas was elongated at least              2.5:0.75 along whichever direction the tiny 2x2 structure-tensor window              happened to prefer. Distant text is the worst case: 1-2px multi-oriented              strokes give moderate coherence with a noise orientation, and the resulting              3-6:1 kernels smear glyphs unreadable or double their strokes (which looks              like misalignment). This remaps the weight to reach ZERO for isotropic              content while keeping the exact same stretch at the old A=1.95 threshold --              clean single-orientation edges keep their full elongation.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Continuous Kernel Anisotropy", isOn: $cam.tuningParams.kernel_anisotropy_continuous)
         Text("""
              Merge kernels are stretched ALONG edges so that a sample slightly off the              ideal position still lands inside the kernel -- Section 5.1.1 gives this the              job of increasing "tolerance for small misalignments and uneven coverage              around edges". Wronski drives the amount of stretch continuously from the              structure tensor; the reference implementation instead switched to the full              8:1 stretch only above anisotropy 0.9025 and used a perfectly ROUND kernel              below it.

@@ -1503,7 +1503,7 @@ struct KernelEstParams {
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
-    uint _pad1; // 64 bytes total for setBytes
+    uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1565,8 +1565,12 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
     if (p.selection != 0u || p.aniso_continuous != 0u) {
-        kk1 = 1.f + 0.5f * A * (1.f / p.k_shrink - 1.f);
-        kk2 = 1.f + 0.5f * A * (p.k_stretch - 1.f);
+        // Twin of the zero-floor remap in kernels.cpp compute_k.
+        float w = 0.5f * A;
+        if (p.aniso_zero_floor != 0u)
+            w = 0.975f * clamp((A - 1.f) / 0.95f, 0.f, 1.f);
+        kk1 = 1.f + w * (1.f / p.k_shrink - 1.f);
+        kk2 = 1.f + w * (p.k_stretch - 1.f);
     } else if (A > 1.95f) {
         kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch;
     } else {
