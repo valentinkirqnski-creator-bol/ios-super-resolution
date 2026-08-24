@@ -262,25 +262,50 @@ static bool AcquireRenderPixels(const std::string& path, std::vector<uint16_t>& 
 
 // An un-white-balanced DNG (Config::dng_store_unwhitened) stores true
 // camera-space raw with the real gains in the private tag. The render chain
-// -- preset LUT included -- was calibrated for PRE-white-balanced input, so
-// re-apply the gains here and hand it neutral wb: the rendered JPEG/preview
-// is then bit-identical to what the old prewhitened container produced.
-// Old prewhitened DNGs carry wb = {1,1,1} and pass through untouched.
+// was calibrated for PRE-white-balanced input, so the gains are re-applied
+// here and downstream sees neutral wb. Old prewhitened DNGs carry
+// wb = {1,1,1} and pass through untouched.
+//
+// HOW they are re-applied depends on the renderer:
+//  - HDR tone mapping ON: prewhitened / gmax -- a UNIFORM scale (hue
+//    untouched) that fits [0,65535] with ZERO clipping, so the ~1 stop of
+//    R/B highlight the unwhitened container recovered actually reaches the
+//    render. The ISP's automatic exposure is scale-invariant (log-average
+//    keyed), so midtones land exactly where they always did, while the
+//    extended-Reinhard white point now SEES the recovered range and rolls
+//    those highlights off with detail instead of the old hard clip.
+//  - HDR off (preset LUT / calibrated matrix): multiply-and-clamp at the old
+//    ceiling, because those paths were fitted for [0,1]-prewhitened input
+//    and feeding them a rescaled range would break their calibration. This
+//    reproduces the pre-headroom JPEG bit-for-bit.
 static void ReapplyWhiteBalanceIfStored(std::vector<uint16_t>& rgb, int W, int H,
                                         float wb[3]) {
     if (rgb.empty() || W <= 0 || H <= 0) return;
     if (!(wb[1] > 1e-6f)) return;
     const float g0 = wb[0] / wb[1], g2 = wb[2] / wb[1];
     if (std::fabs(g0 - 1.f) < 1e-4f && std::fabs(g2 - 1.f) < 1e-4f) return;
-    hhsr::parallel_rows(H, 0, [&](int y) {
-        uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
-        for (int x = 0; x < W; ++x) {
-            const float r = row[x * 3 + 0] * g0;
-            const float b = row[x * 3 + 2] * g2;
-            row[x * 3 + 0] = (uint16_t)std::min(65535.f, r + 0.5f);
-            row[x * 3 + 2] = (uint16_t)std::min(65535.f, b + 0.5f);
-        }
-    });
+    if (g_isp.enabled) {
+        const float gmax = std::max(1.f, std::max(g0, g2));
+        const float s0 = g0 / gmax, s1 = 1.f / gmax, s2 = g2 / gmax;
+        hhsr::parallel_rows(H, 0, [&](int y) {
+            uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
+            for (int x = 0; x < W; ++x) {
+                row[x * 3 + 0] = (uint16_t)(row[x * 3 + 0] * s0 + 0.5f);
+                row[x * 3 + 1] = (uint16_t)(row[x * 3 + 1] * s1 + 0.5f);
+                row[x * 3 + 2] = (uint16_t)(row[x * 3 + 2] * s2 + 0.5f);
+            }
+        });
+    } else {
+        hhsr::parallel_rows(H, 0, [&](int y) {
+            uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
+            for (int x = 0; x < W; ++x) {
+                const float r = row[x * 3 + 0] * g0;
+                const float b = row[x * 3 + 2] * g2;
+                row[x * 3 + 0] = (uint16_t)std::min(65535.f, r + 0.5f);
+                row[x * 3 + 2] = (uint16_t)std::min(65535.f, b + 0.5f);
+            }
+        });
+    }
     wb[0] = wb[1] = wb[2] = 1.f;
 }
 
