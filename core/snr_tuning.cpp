@@ -60,28 +60,9 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     // params.update_snr_config
     cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.33f, 0.25f);
     cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.0f, 3.0f);
-    if (cfg.kernel_google_s1) {
-        // The paper's k_detail (0.25-0.33) assumes Google's chain: an aligner
-        // with a small residual and output sharpening. The final PSF adds in
-        // quadrature -- sigma_eff ~ sqrt(k_detail^2 + sigma_align^2) -- and
-        // this pipeline carries ~0.14px of residual alignment blur, so their
-        // values land at ~0.29px effective: measured on device as "very soft".
-        // Calibrated against the IPOL reference at matched output detail
-        // (k_detail 0.10 here ~ 0.17 there), the bright end sits at 0.13
-        // (effective ~0.19px, above the fringing regime Lafenetre warns
-        // about); the low-SNR end keeps the paper's 0.30 -- in noise, kernel
-        // width does the averaging and alignment error matters less.
-        cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.30f, 0.13f);
-    }
     if (!cfg.d_thresh_manual) {
-        if (cfg.kernel_google_s1) {
-            // Supplement S.2: units of gradient magnitude of the [0,1] image.
-            cfg.D_th = lerpf(snr, 6.f, 30.f, 0.010f, 0.001f);
-            cfg.D_tr = lerpf(snr, 6.f, 30.f, 0.020f, 0.006f);
-        } else {
-            cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
-            cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
-        }
+        cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
+        cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
     }
 
     int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;

@@ -1559,9 +1559,8 @@ inline void merge_accumulate_ref_body(device AccT* num,
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
             float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
-            // Coverage floor -- twin of accumulate_ref in merge.cpp. Gated on
-            // the mode signal already in the params (>64 = Google-mode
-            // ceiling), so no new field is needed.
+            // Coverage floor -- twin of accumulate_ref in merge.cpp. Keyed
+            // on the ceiling in the params (>64), always active at 128.
             if (p.soften_max_inv > 64.f)
                 w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
                                                 dist_y * dist_y));
@@ -1631,7 +1630,7 @@ struct KernelEstParams {
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
     uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
     float aniso_gamma;      // exponent on the zero-floored weight
-    uint google_s1;         // 1 = paper S.1 law + [0,1]-domain tensor (was _pad2)
+    uint _pad2;             // 72 bytes total for setBytes
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1692,13 +1691,7 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float A = 1.f + sqrt(ratio);
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.google_s1 != 0u) {
-        // Round at A = 1, verbatim S.1 ellipse at A = 2 -- twin of
-        // kernels.cpp (see the defect note there).
-        const float t = clamp(A - 1.f, 0.f, 1.f);
-        kk1 = 1.f / (1.f + t * (2.f * p.k_shrink - 1.f));
-        kk2 = 1.f + t * (2.f * p.k_stretch - 1.f);
-    } else if (p.selection != 0u || p.aniso_continuous != 0u) {
+    if (p.selection != 0u || p.aniso_continuous != 0u) {
         // Twin of the zero-floor remap in kernels.cpp compute_k.
         float w = 0.5f * A;
         if (p.aniso_zero_floor != 0u) {
@@ -1723,7 +1716,7 @@ kernel void kernel_gat(device float* out [[buffer(0)]],
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
     uint i = gid.y * p.grey_w + gid.x;
-    out[i] = (p.google_s1 != 0u) ? grey[i] : gat_sample(grey[i], p.alpha, p.beta);
+    out[i] = gat_sample(grey[i], p.alpha, p.beta);
 }
 
 kernel void kernel_gat_raw(device float* out [[buffer(0)]],
@@ -1732,7 +1725,7 @@ kernel void kernel_gat_raw(device float* out [[buffer(0)]],
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
     uint i = gid.y * p.raw_w + gid.x;
-    out[i] = (p.google_s1 != 0u) ? raw[i] : gat_sample(raw[i], p.alpha, p.beta);
+    out[i] = gat_sample(raw[i], p.alpha, p.beta);
 }
 
 kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],

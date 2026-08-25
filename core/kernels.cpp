@@ -37,22 +37,7 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         const f32 A = 1.f + std::sqrt(ratio);
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.kernel_google_s1) {
-            // S.1's formulas as printed never produce a round kernel: at
-            // A = 1 (isotropic content -- corners, punctual detail, distant
-            // text) they still emit a k_shrink x k_stretch 4:1 ellipse whose
-            // orientation is eigenvector noise, ~1 px of directional smear
-            // that reads as denoising exactly where super-resolution should
-            // be most visible. The paper's own prose says a clean corner
-            // gets an ISOTROPIC kernel of std k_detail, contradicting its
-            // formulas (the IPOL article documents the same defect), so
-            // interpolate between the paper's own endpoints: round at A = 1,
-            // the verbatim S.1 ellipse (1/(k_shrink*A), k_stretch*A at
-            // A = 2) at full coherence. Sharp axis on e1, stretch on e2.
-            const f32 t = clampf(A - 1.f, 0.f, 1.f);
-            kk1 = 1.f / (1.f + t * (2.f * cfg.k_shrink - 1.f));
-            kk2 = 1.f + t * (2.f * cfg.k_stretch - 1.f);
-        } else if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
+        if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
             // 0.5*A floors at 0.5; the zero-floor remap keeps the A=1.95
             // endpoint and sends isotropic content to round kernels. See
             // Config::kernel_anisotropy_zero_floor.
@@ -73,14 +58,8 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };
 
-    // Google S.1 measures the tensor on the [0,1]-normalized image itself
-    // (its D thresholds are in that image's gradient units); the IPOL
-    // reference measures it in the GAT domain, where noise sigma ~ 1.
-    Image vst_raw;
-    if (!cfg.kernel_google_s1)
-        vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
-    Image grey = compute_grey_decimate(cfg.kernel_google_s1 ? raw : vst_raw,
-                                       cfg.bayer_mode);
+    Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
+    Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
     Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
 
     int H = grey.h, W = grey.w;

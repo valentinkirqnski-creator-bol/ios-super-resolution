@@ -381,7 +381,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    // See the coverage-floor comment in the tap loop below.
+    // See the coverage-floor comment in the tap loop below. Always active
+    // now that the ceiling is 128 in every mode.
     const f32 cover_eps = (merge_soften_max_inv(cfg) > 64.f) ? 5e-4f : 0.f;
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
@@ -472,7 +473,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;
                     f32 w = std::exp(-0.5f * y);
-                    // Coverage floor (Google mode): a tiny isotropic sigma=1
+                    // Coverage floor: a tiny isotropic sigma=1
                     // reference contribution guarantees every colour channel
                     // of every output pixel a nonzero denominator, whatever
                     // the sharp kernels and robustness rejection left behind.
