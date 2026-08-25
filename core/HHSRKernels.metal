@@ -1693,9 +1693,11 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
     if (p.google_s1 != 0u) {
-        // Supplement S.1 verbatim -- twin of kernels.cpp.
-        kk1 = 1.f / (p.k_shrink * A);
-        kk2 = p.k_stretch * A;
+        // Round at A = 1, verbatim S.1 ellipse at A = 2 -- twin of
+        // kernels.cpp (see the defect note there).
+        const float t = clamp(A - 1.f, 0.f, 1.f);
+        kk1 = 1.f / (1.f + t * (2.f * p.k_shrink - 1.f));
+        kk2 = 1.f + t * (2.f * p.k_stretch - 1.f);
     } else if (p.selection != 0u || p.aniso_continuous != 0u) {
         // Twin of the zero-floor remap in kernels.cpp compute_k.
         float w = 0.5f * A;

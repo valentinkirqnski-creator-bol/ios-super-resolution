@@ -38,11 +38,20 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
         if (cfg.kernel_google_s1) {
-            // Supplement S.1 verbatim (k_detail factored out; it multiplies
-            // below): sharp axis on e1 (gradient direction), stretched axis
-            // on e2 (edge direction) -- see Config::kernel_google_s1.
-            kk1 = 1.f / (cfg.k_shrink * A);
-            kk2 = cfg.k_stretch * A;
+            // S.1's formulas as printed never produce a round kernel: at
+            // A = 1 (isotropic content -- corners, punctual detail, distant
+            // text) they still emit a k_shrink x k_stretch 4:1 ellipse whose
+            // orientation is eigenvector noise, ~1 px of directional smear
+            // that reads as denoising exactly where super-resolution should
+            // be most visible. The paper's own prose says a clean corner
+            // gets an ISOTROPIC kernel of std k_detail, contradicting its
+            // formulas (the IPOL article documents the same defect), so
+            // interpolate between the paper's own endpoints: round at A = 1,
+            // the verbatim S.1 ellipse (1/(k_shrink*A), k_stretch*A at
+            // A = 2) at full coherence. Sharp axis on e1, stretch on e2.
+            const f32 t = clampf(A - 1.f, 0.f, 1.f);
+            kk1 = 1.f / (1.f + t * (2.f * cfg.k_shrink - 1.f));
+            kk2 = 1.f + t * (2.f * cfg.k_stretch - 1.f);
         } else if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
             // 0.5*A floors at 0.5; the zero-floor remap keeps the A=1.95
             // endpoint and sends isotropic content to round kernels. See
