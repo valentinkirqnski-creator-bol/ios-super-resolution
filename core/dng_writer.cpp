@@ -571,16 +571,18 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
     return true;
 }
 
-// Encode one tile-row band (rows_in_band_ valid rows; short bottom bands are
+// Encode one tile-row band (valid_rows valid rows; short bottom bands are
 // padded by repeating the last row -- decoders discard tile padding) and
 // stream the tiles out in order. Tiles encode in parallel: each is an
-// independent complete lossless-JPEG stream.
-bool DngStreamWriter::flush_band() {
-    if (rows_in_band_ <= 0) return true;
+// independent complete lossless-JPEG stream. Runs on the flush worker, which
+// is the only thread that touches f_ between open's prefix and close's
+// patches, so file position stays coherent without locking.
+bool DngStreamWriter::encode_and_write_band(std::vector<uint16_t>& band,
+                                            int valid_rows) {
     const size_t row_elems = (size_t)W_ * 3u;
-    for (int y = rows_in_band_; y < tile_l_; ++y)
-        std::memcpy(band_buf_.data() + (size_t)y * row_elems,
-                    band_buf_.data() + (size_t)(rows_in_band_ - 1) * row_elems,
+    for (int y = valid_rows; y < tile_l_; ++y)
+        std::memcpy(band.data() + (size_t)y * row_elems,
+                    band.data() + (size_t)(valid_rows - 1) * row_elems,
                     row_elems * sizeof(uint16_t));
 
     std::vector<std::vector<uint8_t>> outs((size_t)ntx_);
@@ -590,7 +592,7 @@ bool DngStreamWriter::flush_band() {
         const int x0 = tx * tile_w_;
         const int nx = std::min(tile_w_, W_ - x0);
         for (int y = 0; y < tile_l_; ++y) {
-            const uint16_t* src = band_buf_.data() + (size_t)y * row_elems +
+            const uint16_t* src = band.data() + (size_t)y * row_elems +
                                   (size_t)x0 * 3u;
             uint16_t* dst = t.data() + (size_t)y * (size_t)tile_w_ * 3u;
             std::memcpy(dst, src, (size_t)nx * 3u * sizeof(uint16_t));
@@ -615,7 +617,22 @@ bool DngStreamWriter::flush_band() {
         tile_offsets_.push_back((uint32_t)posl);
         tile_counts_.push_back((uint32_t)o.size());
     }
+    return true;
+}
+
+// Hand the filled band to the worker and swap in the other buffer. At most
+// one band is in flight; a second flush first collects the previous result.
+bool DngStreamWriter::flush_band() {
+    if (rows_in_band_ <= 0) return true;
+    if (band_fut_.valid() && !band_fut_.get()) return false;
+    if (band_back_.size() != band_buf_.size())
+        band_back_.assign(band_buf_.size(), 0);
+    band_buf_.swap(band_back_);
+    const int valid = rows_in_band_;
     rows_in_band_ = 0;
+    band_fut_ = std::async(std::launch::async, [this, valid]() {
+        return encode_and_write_band(band_back_, valid);
+    });
     return true;
 }
 
@@ -624,8 +641,13 @@ bool DngStreamWriter::close() {
     bool ok = rows_written_ == H_ && deflate_ok_ &&
               (lossless_ || !kDngCompress || z_stream_);
 
+    // The flush worker owns f_ while a band is in flight: join it before
+    // anything below touches or closes the file, on EVERY path.
+    if (lossless_ && band_fut_.valid() && !band_fut_.get()) ok = false;
+
     if (ok && lossless_) {
         if (rows_in_band_ > 0 && !flush_band()) ok = false;
+        if (band_fut_.valid() && !band_fut_.get()) ok = false;
         const size_t want = (size_t)ntx_ * (size_t)nty_;
         if (ok && (tile_offsets_.size() != want || tile_counts_.size() != want))
             ok = false;

@@ -3,6 +3,7 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <future>
 #include <vector>
 
 namespace hhsr {
@@ -97,9 +98,15 @@ private:
     int tile_w_ = 0, tile_l_ = 0, ntx_ = 0, nty_ = 0;
     int rows_in_band_ = 0;
     std::vector<uint16_t> band_buf_;
+    // One band in flight: the filled band encodes + writes on a worker while
+    // the caller fills the other buffer, so tile encoding hides behind the
+    // next band's normalize/readback instead of extending the tail.
+    std::vector<uint16_t> band_back_;
+    std::future<bool> band_fut_;
     std::vector<uint32_t> tile_offsets_, tile_counts_;
     uint32_t tile_off_arr_pos_ = 0, tile_cnt_arr_pos_ = 0;
     bool flush_band();
+    bool encode_and_write_band(std::vector<uint16_t>& band, int valid_rows);
 };
 
 } // namespace hhsr
