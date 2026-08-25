@@ -965,17 +965,6 @@ struct Config {
     // kernel) and denoising (D=1: k_detail*k_denoise wide kernel); the two
     // thresholds are in GAT-domain gradient units where noise has sigma ~ 1.
     bool  d_thresh_manual = false;
-    // Calibration scale on the SNR-tuned D thresholds. The reference values
-    // (0.71-0.81 / 1.0-1.24, GAT units) require sqrt(l1) >= D_tr*(1+D_th) ~
-    // 2.2 sigma of noise for full super-resolution -- MEASURED on real
-    // daylight bursts, that classifies the MEDIAN pixel as full denoise
-    // (D=1), whose kernel is k_detail*k_denoise ~ 0.75px: whole-image
-    // smoothing that no k_detail value can undo, because those pixels never
-    // reach the sharp branch. 0.45 moves full-SR to roughly the 1-sigma
-    // boundary (median kernel sigma measured 0.75 -> 0.18px), which is where
-    // Google's effective thresholds sit. Raise toward 1.0 if flat areas turn
-    // noisy; ignored when d_thresh_manual supplies explicit values.
-    float kernel_detail_bias = 0.45f;
     // Drive Eq. 4's kernel anisotropy continuously from (l1-l2)/(l1+l2), as
     // the paper describes, instead of switching to the full stretch only above
     // 0.9025. See compute_k in kernels.cpp for why the switch mattered: it

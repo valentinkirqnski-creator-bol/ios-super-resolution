@@ -460,8 +460,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"d_thresh_manual"])
         cfg.d_thresh_manual = tuning[@"d_thresh_manual"].boolValue;
-    if (tuning[@"kernel_detail_bias"])
-        cfg.kernel_detail_bias = tuning[@"kernel_detail_bias"].floatValue;
     if (tuning[@"dng_lossless_jpeg"])
         cfg.dng_lossless_jpeg = tuning[@"dng_lossless_jpeg"].boolValue;
     if (tuning[@"D_th"]) cfg.D_th = tuning[@"D_th"].floatValue;

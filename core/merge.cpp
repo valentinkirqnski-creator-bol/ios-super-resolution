@@ -97,16 +97,9 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 // 128 the same k_detail means the same kernel as 460-main down to the
 // coverage bound, and the reference-pass coverage floor (keyed on this
 // value being > 64) guards the denominators in both modes.
-// The bound also scales with burst size: nearest same-colour sample spacing
-// shrinks as 1/sqrt(N), so the sharpness the merge can honestly represent
-// rises linearly in N. 8 frames -> 128 (sigma floor 0.088px); 25 -> 400
-// (sigma 0.05px). The weight at the nearest sample stays ~exp(-8) by
-// construction (both scale together), comfortably fp16-safe, and the
-// reference-pass coverage floor turns any local shortfall into softness --
-// never the per-channel green/black holes.
 static inline f32 merge_soften_max_inv(const Config& cfg) {
-    const f32 n = (f32)std::max(2, cfg.burst_frame_count);
-    return clampf(128.f * (n / 8.f), 128.f, 512.f);
+    (void)cfg;
+    return 128.f;
 }
 
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {

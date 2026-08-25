@@ -917,15 +917,6 @@ struct CameraView: View {
                     Text("Writes the output DNG with lossless-JPEG tiles (Compression 7, the standard DNG codec -- what Apple ProRAW uses). Pixels are bit-identical to the uncompressed file; size drops to roughly a third (varies with scene content) and saving is faster because far fewer bytes hit storage. Off = uncompressed strips as before.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
-                    HStack {
-                        Text("Detail Priority (D bias)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.kernel_detail_bias))
-                    }
-                    Slider(value: $cam.tuningParams.kernel_detail_bias, in: 0.2...1.0)
-                    Text("Scales the auto-tuned D thresholds that route each pixel between super-resolution and denoising. At 1.0 (the reference calibration) the median daylight pixel is classified as noise and merged with a ~0.75px kernel no matter what k_detail says; 0.45 (measured) puts the boundary at ~1 sigma of noise so ordinary texture is actually resolved. Raise it if flat areas turn gritty. Ignored while Manual D Thresholds is on.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
                     Toggle("Manual D Thresholds", isOn: $cam.tuningParams.d_thresh_manual)
                     Text("D_th/D_tr decide super-resolution vs denoising per pixel: gradients below roughly D_tr*(1+D_th) sigmas of noise are denoised with a wide kernel instead of resolved. SNR Auto-Tune normally sets them per burst (0.71-0.81 / 1.0-1.24, GAT units); this override keeps your values while auto-tune still drives k_detail and tile size. Lower both (e.g. scale by 0.45: D_th 0.34, D_tr 0.50) to push daylight texture into the super-resolution branch; raise them if flat areas turn noisy.")
                         .font(.footnote)

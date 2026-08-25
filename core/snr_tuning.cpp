@@ -61,10 +61,8 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.33f, 0.25f);
     cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.0f, 3.0f);
     if (!cfg.d_thresh_manual) {
-        // See Config::kernel_detail_bias for the measurement behind the scale.
-        const f32 db = clampf(cfg.kernel_detail_bias, 0.1f, 1.5f);
-        cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f) * db;
-        cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f) * db;
+        cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
+        cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
     }
 
     int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;
