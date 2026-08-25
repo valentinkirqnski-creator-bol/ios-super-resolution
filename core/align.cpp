@@ -1087,6 +1087,7 @@ void clear_align_ref_ica_cache() {
     g_ref_ica_cache = {};
 #ifdef __APPLE__
     metal_clear_ref_ica_cache();
+    metal_clear_densify_ref_cache();
 #endif
 }
 

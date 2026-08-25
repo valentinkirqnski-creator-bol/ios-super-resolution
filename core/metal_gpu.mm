@@ -270,6 +270,29 @@ static id<MTLBuffer> cov_gpu_or_upload(const CovField& covs, const f32* cp,
     return cp ? buf(cp, cov_b) : nil;
 }
 
+// Robustness-mask GPU residency (Image::gpu_tag), same shape as the cov
+// handshake above but SIMPLER in one way: each robustness run creates a fresh
+// output buffer (no shared scratch), so the published buffer is immutable
+// until replaced by the next frame's publish -- no queue-order safety clause
+// needed. Holding one mask buffer alive between frames replaces the upload
+// copy the merge would otherwise allocate, so peak memory does not grow.
+static std::mutex g_rob_live_mu;
+static uint64_t g_rob_tag_next = 0;
+static uint64_t g_rob_live_tag = 0;
+static size_t g_rob_live_bytes = 0;
+static id<MTLBuffer> g_rob_live_buf = nil;
+
+static id<MTLBuffer> rob_gpu_or_upload(const Image& rob, const f32* rp,
+                                       size_t rob_b) {
+    {
+        std::lock_guard<std::mutex> lk(g_rob_live_mu);
+        if (rob.gpu_tag != 0 && rob.gpu_tag == g_rob_live_tag &&
+            g_rob_live_buf && g_rob_live_bytes == rob_b)
+            return g_rob_live_buf;
+    }
+    return rp ? buf(rp, rob_b) : nil;
+}
+
 static void dispatch2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p,
                       NSUInteger w, NSUInteger h) {
     if (w == 0 || h == 0 || !p) return;
@@ -1796,6 +1819,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     Image r(gh, gw, 1);
     memcpy(r.data.data(), [b_out contents], mask_b);
+    {
+        // Publish for the merge host (Image::gpu_tag): the merge binds this
+        // buffer instead of re-uploading the bytes it was just copied from.
+        std::lock_guard<std::mutex> lk(g_rob_live_mu);
+        r.gpu_tag = ++g_rob_tag_next;
+        g_rob_live_tag = r.gpu_tag;
+        g_rob_live_bytes = mask_b;
+        g_rob_live_buf = b_out;
+    }
     return r;
 }
 
@@ -3113,7 +3145,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.b_img = buf(ip, img_b);
             e.b_flow = buf(fp, flow_b);
             e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
-            e.b_rob = buf(rp, rob_b);
+            e.b_rob = rob_gpu_or_upload(rob, rp, rob_b);
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
             if (!e.b_cov) {
                 static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
@@ -3143,7 +3175,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         if (!ensure_sized(e.b_img, img_b) || !copy_into(e.b_img, ip, img_b)) return false;
         e.b_flow = buf(fp, flow_b);
         e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
-        e.b_rob = buf(rp, rob_b);
+        e.b_rob = rob_gpu_or_upload(rob, rp, rob_b);
         e.rob_h = rob.h;
         e.rob_w = rob.w;
         e.flow = fp;
@@ -3184,7 +3216,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.b_img = buf(ip, img_b);
     e.b_flow = buf(fp, flow_b);
     e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
-    e.b_rob = buf(rp, rob_b);
+    e.b_rob = rob_gpu_or_upload(rob, rp, rob_b);
     if (!e.b_img || !e.b_flow || !e.b_rob) return false;
     if (!e.b_cov) {
         static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
@@ -3927,6 +3959,19 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     }
 }
 
+// Densify reference-grey upload cache; see flow_densify_select_metal.
+static std::mutex g_densify_ref_mu;
+static id<MTLBuffer> g_densify_ref_buf = nil;
+static const void* g_densify_ref_ptr = nullptr;
+static size_t g_densify_ref_bytes = 0;
+
+void metal_clear_densify_ref_cache() {
+    std::lock_guard<std::mutex> lk(g_densify_ref_mu);
+    g_densify_ref_buf = nil;
+    g_densify_ref_ptr = nullptr;
+    g_densify_ref_bytes = 0;
+}
+
 namespace {
 // Twin of DensifyParams in HHSRKernels.metal.
 struct DensifyParamsCPU {
@@ -3975,8 +4020,23 @@ bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
     id<MTLBuffer> b_fine = buf(nullptr, fine_b);
     id<MTLBuffer> b_flow = buf(flow.flow.data(),
                                flow.flow.size() * sizeof(float));
-    id<MTLBuffer> b_ref = buf(ref_grey.data.data(),
-                              ref_grey.data.size() * sizeof(float));
+    // The reference grey is identical for every comparison frame of a burst;
+    // cache its upload keyed on pointer + size (cleared with the ref ICA
+    // cache at burst start, so allocator address reuse cannot alias).
+    const size_t ref_b = ref_grey.data.size() * sizeof(float);
+    id<MTLBuffer> b_ref = nil;
+    {
+        std::lock_guard<std::mutex> lk(g_densify_ref_mu);
+        if (g_densify_ref_buf && g_densify_ref_ptr == ref_grey.data.data() &&
+            g_densify_ref_bytes == ref_b) {
+            b_ref = g_densify_ref_buf;
+        } else {
+            b_ref = buf(ref_grey.data.data(), ref_b);
+            g_densify_ref_buf = b_ref;
+            g_densify_ref_ptr = ref_grey.data.data();
+            g_densify_ref_bytes = ref_b;
+        }
+    }
     id<MTLBuffer> b_mov = buf(mov_grey.data.data(),
                               mov_grey.data.size() * sizeof(float));
     if (!b_fine || !b_flow || !b_ref || !b_mov) return false;

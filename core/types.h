@@ -21,6 +21,12 @@ using f32 = float;
 
 // Row-major image / tensor with an arbitrary number of interleaved channels.
 struct Image {
+    // GPU residency handshake (same design as CovField::gpu_tag): nonzero
+    // means "at the time this was produced, a GPU buffer with these exact
+    // bytes was published under this tag". Only the robustness path sets it
+    // today. Any code that MUTATES pixel data after production must zero it,
+    // or a consumer could bind the stale GPU copy.
+    uint64_t gpu_tag = 0;  // see comment above
     int h = 0;
     int w = 0;
     int c = 1;

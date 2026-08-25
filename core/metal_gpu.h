@@ -81,6 +81,8 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out);
 
+// Clear the densify reference-grey upload cache (burst start).
+void metal_clear_densify_ref_cache();
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
 
