@@ -78,13 +78,18 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 //
 // Keep in step with the Metal twin in HHSRKernels.metal and the mirror in
 // tools/validate_merge_equiv.py: all three are compared against each other.
-// The ceiling is mode-dependent: Google's S.1 shapes legitimately reach
-// sigma = k_detail/(k_shrink*A) ~ 0.06 px across edges, and 32 (a sigma
-// floor of 0.177 px) erases that entire regime. 512 keeps the guard against
-// degenerate covariances while letting the paper's sharpest kernels through
-// (floor sigma ~ 0.044 px).
+// The ceiling is mode-dependent, and its upper bound is set by COVERAGE, not
+// by taste: the fast-weights tap cutoff (z > 16 = beyond 4 sigma) and the
+// fp16 accumulator both need the sharpest kernel to still reach the nearest
+// same-color sample, which sits at ~0.2-0.4 px across an 8-frame Bayer
+// merge. 512 (sigma floor 0.044 px) violated that -- every off-site colour
+// channel lost all its taps and the denominator zeroed, which is exactly the
+// green/black per-channel speckle the guard exists to prevent. 128 floors
+// sigma at 0.088 px: z at 0.35 px is ~15.8 (inside the cutoff), the weight
+// ~4e-4 (fp16-safe), and the resolution cost vs 0.044 px is 97% vs 98%
+// contrast at 1 px strokes -- nothing, for artifact-free coverage.
 static inline f32 merge_soften_max_inv(const Config& cfg) {
-    return cfg.kernel_google_s1 ? 512.f : 32.f;
+    return cfg.kernel_google_s1 ? 128.f : 32.f;
 }
 
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
