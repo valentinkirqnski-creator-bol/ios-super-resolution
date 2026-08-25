@@ -3689,7 +3689,9 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
     // Same mode split as merge_soften_max_inv in merge.cpp (128 = coverage
     // bound: sharper floors zero the off-site colour channels -> speckle).
-    p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    // Twin of merge_soften_max_inv in merge.cpp: burst-size-scaled bound.
+    p.soften_max_inv = clampf(128.f * ((f32)std::max(2, cfg.burst_frame_count) / 8.f),
+                              128.f, 512.f);
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3788,7 +3790,9 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
-    p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    // Twin of merge_soften_max_inv in merge.cpp: burst-size-scaled bound.
+    p.soften_max_inv = clampf(128.f * ((f32)std::max(2, cfg.burst_frame_count) / 8.f),
+                              128.f, 512.f);
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];
