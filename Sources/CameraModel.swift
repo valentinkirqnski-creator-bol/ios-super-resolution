@@ -135,6 +135,11 @@ struct TuningParams: Equatable, Codable {
     /// when d_thresh_manual is on; otherwise SNR auto-tune sets them per
     /// burst (0.71-0.81 / 1.0-1.24).
     var d_thresh_manual: Bool = false
+    /// Burst-only: halve the auto-metered exposure duration (2x shutter
+    /// speed) and raise ISO to compensate, so each frame carries half the
+    /// motion blur. The merge averages the extra noise back out; blur it
+    /// cannot undo. Manual exposure mode is unaffected.
+    var burst_fast_shutter: Bool = false
     /// Lossless-JPEG (Compression 7) tiled DNG: bit-identical pixels, 2-3x
     /// smaller and faster to save than uncompressed. Standard DNG codec.
     var dng_lossless_jpeg: Bool = true
@@ -232,6 +237,7 @@ struct TuningParams: Equatable, Codable {
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
         case d_thresh_manual, d_th, d_tr
+        case burst_fast_shutter
         case dng_lossless_jpeg
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
@@ -278,6 +284,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
+        burst_fast_shutter = try c.decodeIfPresent(Bool.self, forKey: .burst_fast_shutter) ?? burst_fast_shutter
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
@@ -1778,8 +1785,9 @@ final class CameraModel: NSObject, ObservableObject {
             self.captureKind = .burst
             self.zslCapturing = false
 
-            self.lockForBurst()
-            self.captureNextRaw(isZSL: false)
+            self.lockForBurst {
+                self.captureNextRaw(isZSL: false)
+            }
             self.ensureReadyBurstDir()
         }
     }
@@ -1819,14 +1827,37 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func lockForBurst() {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+    private func lockForBurst(_ then: @escaping () -> Void) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { then(); return }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
         // Only worth locking when the metering owns exposure; under manual the
         // device is already on a fixed custom duration and ISO.
-        if exposureIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+        if exposureIsAuto {
+            if tuningParams.burst_fast_shutter {
+                // Fast-shutter burst: half the metered duration, ISO raised by
+                // the same ratio (clamped to the sensor limit) so overall
+                // exposure holds. Waits for the custom exposure to actually
+                // take before the first frame, or frame 1 would still carry
+                // the metered duration.
+                let f = d.activeFormat
+                let dur = CMTimeGetSeconds(d.exposureDuration)
+                let minDur = CMTimeGetSeconds(f.minExposureDuration)
+                let newDur = max(minDur, dur * 0.5)
+                let ratio = Float(dur / max(newDur, 1e-9))
+                let newIso = min(f.maxISO, max(f.minISO, d.iso * ratio))
+                d.setExposureModeCustom(
+                    duration: CMTimeMakeWithSeconds(newDur, preferredTimescale: 1_000_000_000),
+                    iso: newIso) { [weak self] _ in
+                    self?.sessionQueue.async(execute: then)
+                }
+                d.unlockForConfiguration()
+                return
+            }
+            if d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+        }
         d.unlockForConfiguration()
+        then()
     }
 
     private func unlockAfterBurst() {

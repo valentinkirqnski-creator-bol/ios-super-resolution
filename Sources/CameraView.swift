@@ -961,6 +961,10 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
+                    Toggle("Fast Burst Shutter (2x)", isOn: $cam.tuningParams.burst_fast_shutter)
+                    Text("Burst frames expose at half the auto-metered duration with ISO raised to compensate: half the per-frame motion blur at the same brightness. The merge averages the extra noise back out across the burst -- blur it cannot undo. No effect in manual exposure mode.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     Toggle("Zero Shutter Lag (ZSL)", isOn: $cam.zslEnabled)
                     Text(cam.zslEnabled
                          ? "Buffers \(cam.frameCount) RAW frames continuously. Tap shutter to grab them without holding still afterward. Ready: \(cam.zslBufferReady)/\(cam.frameCount)."
