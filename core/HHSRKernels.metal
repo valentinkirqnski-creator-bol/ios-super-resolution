@@ -1625,7 +1625,7 @@ struct KernelEstParams {
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
     uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
     float aniso_gamma;      // exponent on the zero-floored weight
-    uint _pad2;             // 72 bytes total for setBytes
+    uint paper_law;         // 1 = Wronski supplement S.1 heuristic (was _pad2)
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1686,7 +1686,11 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float A = 1.f + sqrt(ratio);
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.selection != 0u || p.aniso_continuous != 0u) {
+    if (p.paper_law != 0u) {
+        // Wronski supplement S.1, verbatim -- twin of kernels.cpp.
+        kk1 = 1.f / (p.k_shrink * A);
+        kk2 = p.k_stretch * A;
+    } else if (p.selection != 0u || p.aniso_continuous != 0u) {
         // Twin of the zero-floor remap in kernels.cpp compute_k.
         float w = 0.5f * A;
         if (p.aniso_zero_floor != 0u) {

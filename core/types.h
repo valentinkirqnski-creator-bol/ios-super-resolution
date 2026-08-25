@@ -938,6 +938,25 @@ struct Config {
     // 1.0 = the IPOL reference's behaviour, kept reachable for validation.
     f32  kernel_detail_bias = 0.45f;
 
+    // Use Wronski's PUBLISHED kernel SHAPE heuristic (supplement S.1)
+    // instead of the IPOL reference's linear selection law:
+    //   k1_hat = k_detail * (k_stretch * A),  k2_hat = k_detail / (k_shrink * A)
+    // -- multiplicative in A (up to 8x stretch, sigma down to k_detail/(2A)
+    // ~ 0.06 px across edges), where the linear law tops out near 4x / 0.5x.
+    // Squared into Omega, as both implementations do.
+    //
+    // The D (detail/denoise) gate stays on GAT-domain thresholds with
+    // kernel_detail_bias in BOTH laws: the supplement's absolute
+    // [0,1]-gradient thresholds (0.001..0.020) were implemented and
+    // MEASURED -- at real exposure levels (midtones at ~0.05-0.15 of full
+    // scale) they still left the median pixel at D ~ 0.7, because absolute
+    // gradient units do not survive exposure differences; the GAT is the
+    // reference's exposure/noise-invariant answer and the bias calibrates
+    // it. Zero-floor and gamma apply only to the legacy shape law. Lower
+    // kernel_min_sigma toward 0.06-0.10 to let the paper shapes through the
+    // speckle floor.
+    bool kernel_paper_law = true;
+
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;

@@ -782,6 +782,10 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Paper Kernel Law (Wronski)", isOn: $cam.tuningParams.kernel_paper_law)
+        Text("Uses Wronski's PUBLISHED kernel shape heuristic instead of the IPOL reference's: multiplicative anisotropy -- k_detail*k_stretch*A along edges, k_detail/(k_shrink*A) across (down to ~0.06px at full coherence), squared into the covariance. The detail/denoise gate keeps the GAT-domain thresholds scaled by Detail Priority in both laws (the supplement's absolute thresholds were implemented and measured: they misclassify at real exposure levels). Zero-Floor and Stretch Selectivity apply only when this is OFF. Lower Min Kernel Width to ~0.06-0.10 to let the paper shapes through the speckle floor.")
+            .font(.footnote)
+            .foregroundColor(.secondary)
         HStack {
             Text("Detail Priority")
             Slider(value: $cam.tuningParams.kernel_detail_bias, in: 0.2...1.0, step: 0.05)
