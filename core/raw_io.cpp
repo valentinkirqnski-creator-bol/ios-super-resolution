@@ -280,6 +280,35 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             for (int i = 0; i < 3; ++i)
                 for (int j = 0; j < 3; ++j)
                     cfg.color_matrix[i * 3 + j] = C.cam_xyz[i][j];
+        } else {
+            // cam_xyz can come back empty for DNGs LibRaw reads via the DNG
+            // color blocks. Prefer the D65 calibration (illuminant 21) --
+            // same reasoning as the bridge's ColorMatrix2-first read; the
+            // written ColorMatrix1 tag otherwise degrades to identity and
+            // third-party renders of our DNG lose the camera character.
+            int pick = -1;
+            for (int s = 0; s < 2 && pick < 0; ++s)
+                if (C.dng_color[s].illuminant == 21) pick = s;
+            for (int s = 1; s >= 0 && pick < 0; --s) {
+                bool nz = false;
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        if (C.dng_color[s].colormatrix[i][j] != 0.f) nz = true;
+                if (nz) pick = s;
+            }
+            if (pick >= 0) {
+                bool nz = false;
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        if (C.dng_color[pick].colormatrix[i][j] != 0.f) nz = true;
+                if (nz) {
+                    cfg.has_color_matrix = true;
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j)
+                            cfg.color_matrix[i * 3 + j] =
+                                C.dng_color[pick].colormatrix[i][j];
+                }
+            }
         }
         bool any_rc = false;
         for (int i = 0; i < 3; ++i)
