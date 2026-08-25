@@ -256,11 +256,17 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              uint32_t* tile_cnt_arr_pos = nullptr) {
     float derived_cam_to_srgb[9];
     const float* jpeg_cam_to_srgb = cam_to_srgb;
-    // When the pixels are pre-white-balanced the gains go out as AnalogBalance
-    // below, so the derivation has to undo them here too -- otherwise the matrix
-    // cached in the private tag disagrees with the one the loader reconstructs
-    // from the file, and the two render paths drift apart.
-    const float* ab = (pixels_prewhitened && wb) ? wb : nullptr;
+    // The matrix cached in the private tag must ALWAYS be the whitened-input
+    // matrix (divide its columns by the gains): the render re-applies the
+    // stored WB gains before the ISP for un-whitened files
+    // (ReapplyWhiteBalanceIfStored), and pre-whitened files arrive whitened by
+    // definition -- either way the ISP sees whitened pixels. The previous
+    // condition (pixels_prewhitened && wb) left the un-whitened files with a
+    // native-input matrix, so WB was applied twice through it: a global
+    // magenta cast, and clipped highlights that the neutralizer pushed to
+    // EQUAL channels rendered pink, because a native-input matrix maps
+    // neutral input to a non-neutral colour.
+    const float* ab = wb;
     if (!jpeg_cam_to_srgb && cm &&
         derive_cam_to_srgb_from_color_matrix(cm, ab, derived_cam_to_srgb)) {
         jpeg_cam_to_srgb = derived_cam_to_srgb;
