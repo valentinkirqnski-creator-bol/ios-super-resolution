@@ -1559,6 +1559,12 @@ inline void merge_accumulate_ref_body(device AccT* num,
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
             float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
+            // Coverage floor -- twin of accumulate_ref in merge.cpp. Gated on
+            // the mode signal already in the params (>64 = Google-mode
+            // ceiling), so no new field is needed.
+            if (p.soften_max_inv > 64.f)
+                w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
+                                                dist_y * dist_y));
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }
