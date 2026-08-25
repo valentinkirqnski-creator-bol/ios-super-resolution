@@ -88,8 +88,18 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 // sigma at 0.088 px: z at 0.35 px is ~15.8 (inside the cutoff), the weight
 // ~4e-4 (fp16-safe), and the resolution cost vs 0.044 px is 97% vs 98%
 // contrast at 1 px strokes -- nothing, for artifact-free coverage.
+//
+// BOTH modes use 128 now. The legacy value 32 (sigma floor 0.177 px) was a
+// silent divergence from the 460-main reference, which has NO width floor:
+// at k_detail 0.17 its across-edge kernels run at 0.085 px and ours were
+// doubled to 0.177 -- every edge ~2x softer than the reference at identical
+// settings, which is why matching its detail took k_detail ~0.10 here. At
+// 128 the same k_detail means the same kernel as 460-main down to the
+// coverage bound, and the reference-pass coverage floor (keyed on this
+// value being > 64) guards the denominators in both modes.
 static inline f32 merge_soften_max_inv(const Config& cfg) {
-    return cfg.kernel_google_s1 ? 128.f : 32.f;
+    (void)cfg;
+    return 128.f;
 }
 
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
