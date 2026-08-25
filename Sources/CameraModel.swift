@@ -502,6 +502,12 @@ final class CameraModel: NSObject, ObservableObject {
     /// comparison frame at 12MP; past a point the early upload backs off to
     /// spilling rather than risking jetsam (see pipeline_paths.cpp).
     static let maxFrameCount = 15
+    /// Import-from-storage cap when the merge architecture is forced Online:
+    /// the online path decodes, merges, and releases one frame at a time, so
+    /// its peak memory does not grow with the burst (pipeline_paths.cpp's
+    /// online_peak carries a single in-flight frame). 25 keeps the run time
+    /// bounded; there is no memory reason for the number.
+    static let maxImportFrameCountOnline = 25
     private static let frameCountDefaultsKey = "FrameCount"
     private static let shutterSliderDefaultsKey = "ShutterSlider"
 
@@ -1926,7 +1932,8 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     /// DNGs chosen through the import picker, processed instead of a capture.
-    /// Capped at maxFrameCount; the pipeline holds every frame through the merge.
+    /// Capped at maxFrameCount, or maxImportFrameCountOnline when the merge
+    /// architecture is forced Online (constant-memory path).
     @Published var importedDNGs: [URL] = []
 
     /// Process a set of DNGs the user picked, at the resolution selected in
@@ -1940,7 +1947,13 @@ final class CameraModel: NSObject, ObservableObject {
             finish(success: false, message: "Pick at least 2 DNG files")
             return
         }
-        importedDNGs = Array(dngs.prefix(Self.maxFrameCount))
+        // Online merge (forced via Merge Architecture) keeps one frame in
+        // flight regardless of burst length, so imports may exceed the
+        // capture cap: memory stays flat in frame count. Banded/Auto keep 15
+        // because banding holds every frame resident through the merge.
+        let cap = tuningParams.merge_arch == 2
+            ? Self.maxImportFrameCountOnline : Self.maxFrameCount
+        importedDNGs = Array(dngs.prefix(cap))
         isBusy = true
         isCapturing = false
         isProcessing = true
