@@ -1117,8 +1117,12 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
     p.k_denoise = cfg.k_denoise;
-    p.D_th = cfg.D_th;
-    p.D_tr = cfg.D_tr;
+    {
+        // Same scale compute_k applies on the CPU -- keep the twins in step.
+        const float db = clampf(cfg.kernel_detail_bias, 0.1f, 1.5f);
+        p.D_th = cfg.D_th * db;
+        p.D_tr = cfg.D_tr * db;
+    }
     p.k_stretch = cfg.k_stretch;
     p.k_shrink = cfg.k_shrink;
     p.aniso_continuous = cfg.kernel_anisotropy_continuous ? 1u : 0u;

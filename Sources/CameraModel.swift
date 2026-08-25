@@ -114,6 +114,10 @@ struct TuningParams: Equatable, Codable {
     /// a no-op. Lower toward 0.05 (Google's demonstrated regime) for more
     /// resolved detail; speckle risk returns near the sample spacing.
     var kernel_min_sigma: Float = 0.177
+    /// Scale on the detail/denoise thresholds. 1.0 = reference behaviour,
+    /// which measured as FULL DENOISE (blurry kernels) over the median of a
+    /// daylight scene; 0.45 restores the paper's intended detail regime.
+    var kernel_detail_bias: Float = 0.45
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
@@ -232,6 +236,7 @@ struct TuningParams: Equatable, Codable {
         case merge_fp16_accumulator
         case merge_fast_weights
         case kernel_min_sigma
+        case kernel_detail_bias
         case dng_store_unwhitened
         case bm_subpixel_quadratic
         case grey_decimate_lowpass
@@ -277,6 +282,7 @@ struct TuningParams: Equatable, Codable {
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
         kernel_min_sigma = try c.decodeIfPresent(Float.self, forKey: .kernel_min_sigma) ?? kernel_min_sigma
+        kernel_detail_bias = try c.decodeIfPresent(Float.self, forKey: .kernel_detail_bias) ?? kernel_detail_bias
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
         grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
@@ -2005,6 +2011,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
             "kernel_min_sigma": NSNumber(value: tuningParams.kernel_min_sigma),
+            "kernel_detail_bias": NSNumber(value: tuningParams.kernel_detail_bias),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
             "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),

@@ -423,6 +423,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.merge_fast_weights = tuning[@"merge_fast_weights"].boolValue;
     if (tuning[@"kernel_min_sigma"])
         cfg.kernel_min_sigma = tuning[@"kernel_min_sigma"].floatValue;
+    if (tuning[@"kernel_detail_bias"])
+        cfg.kernel_detail_bias = tuning[@"kernel_detail_bias"].floatValue;
     if (tuning[@"dng_store_unwhitened"])
         cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
     if (tuning[@"bm_subpixel_quadratic"])

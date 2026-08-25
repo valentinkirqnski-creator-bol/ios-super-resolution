@@ -783,6 +783,16 @@ struct CameraView: View {
              """)
             .font(.caption2).foregroundColor(.secondary)
         HStack {
+            Text("Detail Priority")
+            Slider(value: $cam.tuningParams.kernel_detail_bias, in: 0.2...1.0, step: 0.05)
+            Text(String(format: "%.2f", cam.tuningParams.kernel_detail_bias))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+        }
+        Text("Scales the detail-vs-denoise thresholds (D_th, D_tr). MEASURED with the reference values (1.0): on a detailed daylight burst the MEDIAN pixel merged in full-denoise mode with 0.75px kernels at k_detail 0.25 -- the whole image blurred no matter what k_detail said, in both alignment modes. That is the smeared-text / over-smoothing root cause. At 0.45 (default) the same scene measures median kernel 0.18px with denoising confined to genuinely flat areas. 1.0 restores reference behaviour for validation. Works with SNR Auto-Tune on (it scales the auto-tuned thresholds too).")
+            .font(.footnote)
+            .foregroundColor(.secondary)
+        HStack {
             Text("Min Kernel Width")
             Slider(value: $cam.tuningParams.kernel_min_sigma, in: 0.05...0.30, step: 0.005)
             Text(String(format: "%.3f", cam.tuningParams.kernel_min_sigma))

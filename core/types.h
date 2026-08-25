@@ -925,6 +925,19 @@ struct Config {
     // frames to spare (8-frame bursts have the coverage).
     f32  kernel_min_sigma = 0.177f;
 
+    // Scale on the detail/denoise thresholds D_th and D_tr, applied wherever
+    // compute_k evaluates D = 1 - sqrt(l1)/D_tr + D_th. MEASURED on burst7
+    // (daylight, detailed) with the reference's thresholds (auto-tune 0.71 /
+    // 1.0 at high SNR): the MEDIAN merge site sat at D = 1 -- full denoise
+    // mode -- so the median kernel was k_detail*k_denoise = 0.75 px at
+    // Google's k_detail 0.25 (and 1.65 px at low-SNR tuning): the whole
+    // image merged blurry regardless of k_detail, which is why sharpening it
+    // did nothing. At 0.45 the same scene measures sharp-axis sigma
+    // p50 = 0.18 px, p90 = 0.44 px: detail regime almost everywhere, denoise
+    // reserved for genuinely flat areas -- the paper's Fig. 8 intent.
+    // 1.0 = the IPOL reference's behaviour, kept reachable for validation.
+    f32  kernel_detail_bias = 0.45f;
+
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;

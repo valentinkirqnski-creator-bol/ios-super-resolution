@@ -35,7 +35,11 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         f32 ratio = (tr > 1e-12f) ? std::max(0.f, (l1 - l2) / tr) : 0.f;
         if (!std::isfinite(ratio)) ratio = 0.f;
         const f32 A = 1.f + std::sqrt(ratio);
-        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
+        // kernel_detail_bias scales both thresholds -- see Config for the
+        // measurement that motivated it. The Metal twin gets the same scale
+        // applied host-side to p.D_th / p.D_tr, so the two stay identical.
+        const f32 db = clampf(cfg.kernel_detail_bias, 0.1f, 1.5f);
+        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / (cfg.D_tr * db) + cfg.D_th * db));
         f32 kk1, kk2;
         if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
             // 0.5*A floors at 0.5; the zero-floor remap keeps the A=1.95
