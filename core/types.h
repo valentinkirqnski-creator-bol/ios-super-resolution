@@ -955,7 +955,15 @@ struct Config {
     // it. Zero-floor and gamma apply only to the legacy shape law. Lower
     // kernel_min_sigma toward 0.06-0.10 to let the paper shapes through the
     // speckle floor.
-    bool kernel_paper_law = true;
+    //
+    // DEFAULT OFF after the on-device A/B: with orientations coming from the
+    // half-res tensor (noisy at stroke scale), the paper law's ~1.7px
+    // along-axis smeared distant text WORSE than the legacy law -- the
+    // across-axis sharpening lost to along-axis orientation error. The
+    // measured-good default is the legacy law with kernel_detail_bias (the
+    // actual root-cause fix), zero-floor and gamma. Revisit ON once the
+    // structure tensor moves to raw resolution.
+    bool kernel_paper_law = false;
 
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;

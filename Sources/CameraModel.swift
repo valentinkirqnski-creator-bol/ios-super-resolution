@@ -118,9 +118,10 @@ struct TuningParams: Equatable, Codable {
     /// which measured as FULL DENOISE (blurry kernels) over the median of a
     /// daylight scene; 0.45 restores the paper's intended detail regime.
     var kernel_detail_bias: Float = 0.45
-    /// Wronski's published kernel heuristic (supplement S.1): multiplicative
-    /// anisotropy and noise-floor D thresholds on the [0,1] image (no GAT).
-    var kernel_paper_law: Bool = true
+    /// Wronski's published kernel shape heuristic (supplement S.1). OFF by
+    /// default: measured to smear text on the half-res tensor's noisy
+    /// stroke-scale orientations; needs the raw-res tensor first.
+    var kernel_paper_law: Bool = false
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
