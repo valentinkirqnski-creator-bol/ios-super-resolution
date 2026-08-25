@@ -462,6 +462,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.d_thresh_manual = tuning[@"d_thresh_manual"].boolValue;
     if (tuning[@"kernel_google_s1"])
         cfg.kernel_google_s1 = tuning[@"kernel_google_s1"].boolValue;
+    if (tuning[@"dng_lossless_jpeg"])
+        cfg.dng_lossless_jpeg = tuning[@"dng_lossless_jpeg"].boolValue;
     if (tuning[@"D_th"]) cfg.D_th = tuning[@"D_th"].floatValue;
     if (tuning[@"D_tr"]) cfg.D_tr = std::max(0.001f, tuning[@"D_tr"].floatValue);
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;

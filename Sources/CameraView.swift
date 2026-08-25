@@ -913,6 +913,10 @@ struct CameraView: View {
                     }
                     Slider(value: $cam.tuningParams.k_shrink, in: 1.0...5.0)
 
+                    Toggle("Lossless DNG (smaller, faster)", isOn: $cam.tuningParams.dng_lossless_jpeg)
+                    Text("Writes the output DNG with lossless-JPEG tiles (Compression 7, the standard DNG codec -- what Apple ProRAW uses). Pixels are bit-identical to the uncompressed file; size drops to roughly a third (varies with scene content) and saving is faster because far fewer bytes hit storage. Off = uncompressed strips as before.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     Toggle("Google Paper Kernels (S.1)", isOn: $cam.tuningParams.kernel_google_s1)
                     Text("Kernel computation exactly as Google published it: structure tensor on the [0,1] image (no variance-stabilising transform), multiplicative anisotropy (k_detail*k_stretch*A along edges, k_detail/(k_shrink*A) across), and D thresholds in the paper's units, SNR-tuned 0.001-0.010 / 0.006-0.020. The merge's speckle guard is relaxed to pass the paper's sharpest kernels. Off = the IPOL reference law (GAT-domain thresholds ~0.7-1.2).")
                         .font(.footnote)

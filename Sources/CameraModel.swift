@@ -139,6 +139,9 @@ struct TuningParams: Equatable, Codable {
     /// anisotropy and D thresholds in [0,1]-image gradient units (no GAT).
     /// Off = the IPOL reference's GAT-domain linear law.
     var kernel_google_s1: Bool = true
+    /// Lossless-JPEG (Compression 7) tiled DNG: bit-identical pixels, 2-3x
+    /// smaller and faster to save than uncompressed. Standard DNG codec.
+    var dng_lossless_jpeg: Bool = true
     var d_th: Float = 0.76
     var d_tr: Float = 1.12
     var snr_auto_tune: Bool = true
@@ -234,6 +237,7 @@ struct TuningParams: Equatable, Codable {
         case k_detail, k_denoise, k_stretch, k_shrink
         case d_thresh_manual, d_th, d_tr
         case kernel_google_s1
+        case dng_lossless_jpeg
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
         case kernel_stretch_gamma
@@ -280,6 +284,7 @@ struct TuningParams: Equatable, Codable {
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
         kernel_google_s1 = try c.decodeIfPresent(Bool.self, forKey: .kernel_google_s1) ?? kernel_google_s1
+        dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
@@ -2037,6 +2042,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
             "kernel_google_s1": NSNumber(value: tuningParams.kernel_google_s1),
+            "dng_lossless_jpeg": NSNumber(value: tuningParams.dng_lossless_jpeg),
             "D_th": NSNumber(value: tuningParams.d_th),
             "D_tr": NSNumber(value: tuningParams.d_tr),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),

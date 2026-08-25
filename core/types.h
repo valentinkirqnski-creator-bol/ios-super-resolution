@@ -804,6 +804,13 @@ struct Config {
     // own JPEG/preview render re-multiplies the gains on load (self-describing
     // via the private WB tag), so it renders bit-identically.
     bool  dng_store_unwhitened = true;
+    // Write the output DNG with lossless-JPEG tiles (Compression=7, the
+    // standard DNG codec every reader ships -- Apple ProRAW's own LinearRaw
+    // DNGs use it) instead of uncompressed strips. Bit-identical pixels;
+    // typically 2-3x smaller (size depends on scene content -- entropy
+    // coding), and the save gets faster because ~100MB of encoded tiles
+    // beats pushing ~293MB uncached to NAND; tiles encode in parallel.
+    bool  dng_lossless_jpeg = true;
 
     // At motion boundaries, SELECT a tile vector instead of blending.
     // Bilinear sampling between tile centres is correct where the field is

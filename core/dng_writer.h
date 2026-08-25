@@ -73,7 +73,8 @@ public:
               bool bakedSrgb = false,
               const std::string& camera_make = "HandheldSR",
               const float* camToSrgb = nullptr,
-              bool pixelsPrewhitened = false);
+              bool pixelsPrewhitened = false,
+              bool losslessJpeg = false);
 
     bool write_rows(const uint16_t* rgb16, int nrows);
     bool close();
@@ -88,6 +89,17 @@ private:
     void* z_stream_ = nullptr;             // z_stream*
     std::vector<uint8_t> z_out_;
     bool deflate_ok_ = false;
+
+    // Lossless-JPEG tiled mode (Config::dng_lossless_jpeg): rows accumulate
+    // into one tile-row band; full bands encode their tiles in parallel and
+    // stream out. Tile offset/count arrays are patched at close.
+    bool lossless_ = false;
+    int tile_w_ = 0, tile_l_ = 0, ntx_ = 0, nty_ = 0;
+    int rows_in_band_ = 0;
+    std::vector<uint16_t> band_buf_;
+    std::vector<uint32_t> tile_offsets_, tile_counts_;
+    uint32_t tile_off_arr_pos_ = 0, tile_cnt_arr_pos_ = 0;
+    bool flush_band();
 };
 
 } // namespace hhsr
