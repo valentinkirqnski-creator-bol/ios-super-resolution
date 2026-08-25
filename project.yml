@@ -48,6 +48,7 @@ targets:
           - "pipeline_paths.cpp"
           - "raw_io.cpp"
           - "dng_writer.cpp"
+          - "lj92_enc.cpp"
           - "snr_tuning.cpp"
           - "preset_lut.cpp"
           - "render_isp.cpp"
