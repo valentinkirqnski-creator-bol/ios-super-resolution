@@ -135,6 +135,11 @@ struct TuningParams: Equatable, Codable {
     /// when d_thresh_manual is on; otherwise SNR auto-tune sets them per
     /// burst (0.71-0.81 / 1.0-1.24).
     var d_thresh_manual: Bool = false
+    /// Scale on the auto-tuned D thresholds. At 1.0 (the reference values)
+    /// the median daylight pixel measures as full denoise and gets a 0.75px
+    /// kernel regardless of k_detail; 0.45 puts full super-resolution at the
+    /// 1-sigma noise boundary. Raise if flat areas turn noisy.
+    var kernel_detail_bias: Float = 0.45
     /// Lossless-JPEG (Compression 7) tiled DNG: bit-identical pixels, 2-3x
     /// smaller and faster to save than uncompressed. Standard DNG codec.
     var dng_lossless_jpeg: Bool = true
@@ -232,6 +237,7 @@ struct TuningParams: Equatable, Codable {
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
         case d_thresh_manual, d_th, d_tr
+        case kernel_detail_bias
         case dng_lossless_jpeg
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
@@ -278,6 +284,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
+        kernel_detail_bias = try c.decodeIfPresent(Float.self, forKey: .kernel_detail_bias) ?? kernel_detail_bias
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
@@ -2053,6 +2060,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
+            "kernel_detail_bias": NSNumber(value: tuningParams.kernel_detail_bias),
             "dng_lossless_jpeg": NSNumber(value: tuningParams.dng_lossless_jpeg),
             "D_th": NSNumber(value: tuningParams.d_th),
             "D_tr": NSNumber(value: tuningParams.d_tr),
