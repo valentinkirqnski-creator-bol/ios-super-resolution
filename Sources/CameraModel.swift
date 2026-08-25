@@ -937,12 +937,30 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    /// Steady-state ZSL capture pacing. Unpaced, the ring recaptured the
+    /// moment the sensor was free: full 12MP RAW readouts back to back, ~24MB
+    /// written and deleted per frame, sensor + ISP + NAND at 100% duty cycle
+    /// for as long as the toggle was on — which is what heated the SoC until
+    /// iOS throttled the whole device (the reported lag). At 5 captures/s the
+    /// newest ring frame is at most ~0.2s old (well inside what zero shutter
+    /// lag needs; the sub-pixel diversity the merge wants actually improves
+    /// with a gap) while capture, ISP, memory, and disk load drop ~5-10x.
+    /// The initial fill after enabling stays unpaced so the buffer reads
+    /// ready quickly.
+    private static let zslPaceInterval: TimeInterval = 0.20
+
     private func scheduleNextZSL() {
-        guard zslWanted, !pipelineBusy, !zslPausedForPipeline else { return }
-        // No artificial pacing — fire as soon as the session queue can run.
         sessionQueue.async { [weak self] in
             guard let self, self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
-            self.pumpZSL()
+            let filled = max(self.zslRawRing.count, self.zslRing.count) >= self.activeFrameCount
+            if filled {
+                self.sessionQueue.asyncAfter(deadline: .now() + Self.zslPaceInterval) { [weak self] in
+                    guard let self, self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
+                    self.pumpZSL()
+                }
+            } else {
+                self.pumpZSL()
+            }
         }
     }
 
