@@ -275,7 +275,7 @@ struct IspParams {
     // which is what made the render look flat. Back to the full measured matrix.
     float colour_strength = 1.0f;
     // S-curve in display space, applied to luminance so hue is preserved.
-    float contrast = 0.55f;
+    float contrast = 0.62f;
     // Saturation-dependent boost: muted colours gain, already-saturated ones
     // barely move. This is what separates vibrance from RGB *= k.
     float vibrance = 0.50f;
@@ -283,7 +283,7 @@ struct IspParams {
     float saturation = 1.0f;
     // Re-adds the detail layer above unity for local micro-contrast. Distinct
     // from sharpening: no high-pass, no halos, no noise amplification.
-    float local_contrast = 0.20f;
+    float local_contrast = 0.30f;
     // Chroma noise reduction, applied to the linear merge before anything else
     // in the render. 0 disables it.
     //
@@ -952,6 +952,22 @@ struct Config {
     // kernel) and denoising (D=1: k_detail*k_denoise wide kernel); the two
     // thresholds are in GAT-domain gradient units where noise has sigma ~ 1.
     bool  d_thresh_manual = false;
+    // Google's kernel computation exactly as published (paper 1905.03277,
+    // supplement S.1 -- implemented from the paper text):
+    //   A  = 1 + sqrt((l1 - l2)/(l1 + l2))
+    //   D  = clamp(1 - sqrt(l1)/D_tr + D_th, 0, 1)
+    //   k1_hat = k_detail * (k_stretch * A)      (stretched, along the edge)
+    //   k2_hat = k_detail / (k_shrink * A)       (sharp, across the edge)
+    //   k = ((1-D) * k_hat + D * k_detail * k_denoise)^2   into Omega (Eq. 4)
+    // with the structure tensor measured on the image normalized to [0,1]
+    // (S.2: D_th/D_tr are "in units of gradient magnitude of the image
+    // normalized to [0,1]", SNR-lerped 0.010->0.001 / 0.020->0.006), NOT on
+    // the GAT image the IPOL reference uses. Eq. 4 names k1 for e1 (the
+    // dominant eigenvector = the gradient, across-edge direction) while the
+    // text calls k_stretch "stretching along the edges" (Fig. 7): the sharp
+    // axis therefore goes on e1 and the stretched axis on e2.
+    // Off = the IPOL reference's GAT-domain tensor and linear selection law.
+    bool  kernel_google_s1 = true;
     // Drive Eq. 4's kernel anisotropy continuously from (l1-l2)/(l1+l2), as
     // the paper describes, instead of switching to the full stretch only above
     // 0.9025. See compute_k in kernels.cpp for why the switch mattered: it

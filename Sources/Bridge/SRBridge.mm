@@ -290,9 +290,31 @@ static void ReapplyWhiteBalanceIfStored(std::vector<uint16_t>& rgb, int W, int H
         hhsr::parallel_rows(H, 0, [&](int y) {
             uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
             for (int x = 0; x < W; ++x) {
-                row[x * 3 + 0] = (uint16_t)(row[x * 3 + 0] * s0 + 0.5f);
-                row[x * 3 + 1] = (uint16_t)(row[x * 3 + 1] * s1 + 0.5f);
-                row[x * 3 + 2] = (uint16_t)(row[x * 3 + 2] * s2 + 0.5f);
+                float r = row[x * 3 + 0] * s0;
+                float g = row[x * 3 + 1] * s1;
+                float b = row[x * 3 + 2] * s2;
+                // Sensor-clipped pixels are channel-equal at the container
+                // ceiling in the un-whitened DNG; scaling them per-channel
+                // repaints them with the WB gain ratios themselves (R kept,
+                // G and B dropped) -- the pink cast on blown highlights.
+                // Their true colour is unknown-bright, so pull near-clip
+                // pixels to neutral at their brightest channel and let the
+                // tone curve roll them off to white. The ramp starts at 90%
+                // so the sensor's soft clip region blends smoothly.
+                const uint16_t mi = std::max(row[x * 3 + 0],
+                                             std::max(row[x * 3 + 1],
+                                                      row[x * 3 + 2]));
+                const float t = hhsr::smoothstepf(0.90f * 65535.f,
+                                                  0.995f * 65535.f, (float)mi);
+                if (t > 0.f) {
+                    const float m = std::max(r, std::max(g, b));
+                    r += (m - r) * t;
+                    g += (m - g) * t;
+                    b += (m - b) * t;
+                }
+                row[x * 3 + 0] = (uint16_t)(r + 0.5f);
+                row[x * 3 + 1] = (uint16_t)(g + 0.5f);
+                row[x * 3 + 2] = (uint16_t)(b + 0.5f);
             }
         });
     } else {
@@ -438,8 +460,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"d_thresh_manual"])
         cfg.d_thresh_manual = tuning[@"d_thresh_manual"].boolValue;
+    if (tuning[@"kernel_google_s1"])
+        cfg.kernel_google_s1 = tuning[@"kernel_google_s1"].boolValue;
     if (tuning[@"D_th"]) cfg.D_th = tuning[@"D_th"].floatValue;
-    if (tuning[@"D_tr"]) cfg.D_tr = std::max(0.05f, tuning[@"D_tr"].floatValue);
+    if (tuning[@"D_tr"]) cfg.D_tr = std::max(0.001f, tuning[@"D_tr"].floatValue);
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;

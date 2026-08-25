@@ -135,6 +135,10 @@ struct TuningParams: Equatable, Codable {
     /// when d_thresh_manual is on; otherwise SNR auto-tune sets them per
     /// burst (0.71-0.81 / 1.0-1.24).
     var d_thresh_manual: Bool = false
+    /// Google's published kernel computation (supplement S.1): multiplicative
+    /// anisotropy and D thresholds in [0,1]-image gradient units (no GAT).
+    /// Off = the IPOL reference's GAT-domain linear law.
+    var kernel_google_s1: Bool = true
     var d_th: Float = 0.76
     var d_tr: Float = 1.12
     var snr_auto_tune: Bool = true
@@ -200,14 +204,14 @@ struct TuningParams: Equatable, Codable {
     var isp_black_point: Float = 0.065
     var isp_warmth: Float = 0.05
     var isp_colour_strength: Float = 1.0
-    var isp_contrast: Float = 0.55
+    var isp_contrast: Float = 0.62
     var isp_vibrance: Float = 0.50
     /// Chroma noise reduction, detail-gated (noise-sized deviations smoothed,
     /// saturated small objects preserved). Luma is preserved exactly.
     var isp_chroma_denoise: Float = 0.0
     var isp_chroma_radius: Float = 12.0
     var isp_saturation: Float = 1.0
-    var isp_local_contrast: Float = 0.20
+    var isp_local_contrast: Float = 0.30
     var isp_skin_protect: Bool = true
 
     var acc_rob_adaptive: Bool = true
@@ -229,6 +233,7 @@ struct TuningParams: Equatable, Codable {
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
         case d_thresh_manual, d_th, d_tr
+        case kernel_google_s1
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
         case kernel_stretch_gamma
@@ -274,6 +279,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
+        kernel_google_s1 = try c.decodeIfPresent(Bool.self, forKey: .kernel_google_s1) ?? kernel_google_s1
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
@@ -2030,6 +2036,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
+            "kernel_google_s1": NSNumber(value: tuningParams.kernel_google_s1),
             "D_th": NSNumber(value: tuningParams.d_th),
             "D_tr": NSNumber(value: tuningParams.d_tr),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),

@@ -78,8 +78,16 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 //
 // Keep in step with the Metal twin in HHSRKernels.metal and the mirror in
 // tools/validate_merge_equiv.py: all three are compared against each other.
-static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
-    constexpr f32 k_max_abs = 32.f;
+// The ceiling is mode-dependent: Google's S.1 shapes legitimately reach
+// sigma = k_detail/(k_shrink*A) ~ 0.06 px across edges, and 32 (a sigma
+// floor of 0.177 px) erases that entire regime. 512 keeps the guard against
+// degenerate covariances while letting the paper's sharpest kernels through
+// (floor sigma ~ 0.044 px).
+static inline f32 merge_soften_max_inv(const Config& cfg) {
+    return cfg.kernel_google_s1 ? 512.f : 32.f;
+}
+
+static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
     if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
         ixx = 2.f;
         ixy = 0.f;
@@ -150,7 +158,8 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det,
+                                  f32 soften_max) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -192,7 +201,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    soften_inv_cov(ixx, ixy, iyy);
+    soften_inv_cov(ixx, ixy, iyy, soften_max);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -316,7 +325,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x - 0.5f;
                     kmap_i = lr_mov_y - 0.5f;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
+                               merge_soften_max_inv(cfg));
             }
 
             const int center_j = cuda_round_to_int(lr_mov_x);
@@ -419,7 +429,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
+                               merge_soften_max_inv(cfg));
             }
 
             // Python: center = round(coarse)

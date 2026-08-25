@@ -1096,7 +1096,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t aniso_continuous = 0;  // 1 = continuous Eq. 4 shape (was _pad0)
         uint32_t aniso_zero_floor = 0;  // 1 = zero-floor linear law (was _pad1)
         float aniso_gamma = 1.f;        // exponent on the zero-floored weight
-        uint32_t _pad2 = 0;
+        uint32_t google_s1 = 0;         // 1 = paper S.1 law (was _pad2)
     };
     static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
 
@@ -1114,6 +1114,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.aniso_zero_floor = cfg.kernel_anisotropy_zero_floor ? 1u : 0u;
     p.aniso_gamma = cfg.kernel_stretch_gamma;
+    p.google_s1 = cfg.kernel_google_s1 ? 1u : 0u;
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -2830,7 +2831,7 @@ struct MergeCompParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
-    uint32_t _pad3 = 0;
+    float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling (was _pad3)
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -2847,8 +2848,9 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
+    float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling
 };
-static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3654,6 +3656,8 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.raw_res_robustness = 0u;
     p.flow_bilinear = flow_sample_mode(cfg);
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
+    // Same mode split as merge_soften_max_inv in merge.cpp.
+    p.soften_max_inv = cfg.kernel_google_s1 ? 512.f : 32.f;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3752,6 +3756,7 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
+    p.soften_max_inv = cfg.kernel_google_s1 ? 512.f : 32.f;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];

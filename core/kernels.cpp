@@ -37,7 +37,13 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         const f32 A = 1.f + std::sqrt(ratio);
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
+        if (cfg.kernel_google_s1) {
+            // Supplement S.1 verbatim (k_detail factored out; it multiplies
+            // below): sharp axis on e1 (gradient direction), stretched axis
+            // on e2 (edge direction) -- see Config::kernel_google_s1.
+            kk1 = 1.f / (cfg.k_shrink * A);
+            kk2 = cfg.k_stretch * A;
+        } else if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
             // 0.5*A floors at 0.5; the zero-floor remap keeps the A=1.95
             // endpoint and sends isotropic content to round kernels. See
             // Config::kernel_anisotropy_zero_floor.
@@ -58,8 +64,14 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };
 
-    Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
-    Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
+    // Google S.1 measures the tensor on the [0,1]-normalized image itself
+    // (its D thresholds are in that image's gradient units); the IPOL
+    // reference measures it in the GAT domain, where noise sigma ~ 1.
+    Image vst_raw;
+    if (!cfg.kernel_google_s1)
+        vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
+    Image grey = compute_grey_decimate(cfg.kernel_google_s1 ? raw : vst_raw,
+                                       cfg.bayer_mode);
     Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
 
     int H = grey.h, W = grey.w;
