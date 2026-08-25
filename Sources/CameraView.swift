@@ -782,30 +782,6 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Paper Kernel Law (Wronski)", isOn: $cam.tuningParams.kernel_paper_law)
-        Text("Uses Wronski's PUBLISHED kernel shape heuristic instead of the IPOL reference's: multiplicative anisotropy -- k_detail*k_stretch*A along edges, k_detail/(k_shrink*A) across (down to ~0.06px at full coherence), squared into the covariance. The detail/denoise gate keeps the GAT-domain thresholds scaled by Detail Priority in both laws (the supplement's absolute thresholds were implemented and measured: they misclassify at real exposure levels). Zero-Floor and Stretch Selectivity apply only when this is OFF. Lower Min Kernel Width to ~0.06-0.10 to let the paper shapes through the speckle floor.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
-        HStack {
-            Text("Detail Priority")
-            Slider(value: $cam.tuningParams.kernel_detail_bias, in: 0.2...1.0, step: 0.05)
-            Text(String(format: "%.2f", cam.tuningParams.kernel_detail_bias))
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.secondary)
-        }
-        Text("Scales the detail-vs-denoise thresholds (D_th, D_tr). MEASURED with the reference values (1.0): on a detailed daylight burst the MEDIAN pixel merged in full-denoise mode with 0.75px kernels at k_detail 0.25 -- the whole image blurred no matter what k_detail said, in both alignment modes. That is the smeared-text / over-smoothing root cause. At 0.45 (default) the same scene measures median kernel 0.18px with denoising confined to genuinely flat areas. 1.0 restores reference behaviour for validation. Works with SNR Auto-Tune on (it scales the auto-tuned thresholds too).")
-            .font(.footnote)
-            .foregroundColor(.secondary)
-        HStack {
-            Text("Min Kernel Width")
-            Slider(value: $cam.tuningParams.kernel_min_sigma, in: 0.05...0.30, step: 0.005)
-            Text(String(format: "%.3f", cam.tuningParams.kernel_min_sigma))
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.secondary)
-        }
-        Text("The floor on how narrow a merge kernel may get (sigma in raw px, sharp axis) -- this port's speckle guard, absent from Google's paper. It was hard-coded at 0.177, which silently made any k_detail below ~0.18 a no-op: that is why sharpening k_detail to 0.17 changed nothing on distant text. Google demonstrates kernels down to 0.05 px; try 0.10-0.12 with an 8-frame burst. Too low shows green/black speckle where coverage is sparse -- raise it back if that appears. NOTE: with SNR Auto-Tune ON, k_detail / k_denoise / D_th / D_tr are chosen per burst and manual values are ignored; disable it to hand-tune.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
         Toggle("Fast Merge Weights", isOn: $cam.tuningParams.merge_fast_weights)
         Text("Skips merge taps whose kernel weight is below 0.03% of the centre tap and overlapped-merge hypotheses carrying under 5% window weight. The normalisation absorbs both, so the output changes far below one 16-bit step; the merge kernel -- the largest GPU cost -- drops a measurable share of its exp() work.")
             .font(.footnote)

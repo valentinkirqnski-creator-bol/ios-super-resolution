@@ -35,24 +35,9 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         f32 ratio = (tr > 1e-12f) ? std::max(0.f, (l1 - l2) / tr) : 0.f;
         if (!std::isfinite(ratio)) ratio = 0.f;
         const f32 A = 1.f + std::sqrt(ratio);
-        // kernel_detail_bias scales both thresholds -- see Config for the
-        // measurement that motivated it. The Metal twin gets the same scale
-        // applied host-side to p.D_th / p.D_tr, so the two stay identical.
-        // GAT-domain thresholds with the measured detail bias, for BOTH
-        // laws. The supplement's absolute [0,1]-gradient thresholds were
-        // tried and measured: at real exposure levels (midtones ~0.05-0.15
-        // of full scale) they still left the median pixel at D ~ 0.7 --
-        // absolute units do not survive exposure differences, which is
-        // exactly why the reference introduced the GAT.
-        const f32 db = clampf(cfg.kernel_detail_bias, 0.1f, 1.5f);
-        const f32 dth = cfg.D_th * db, dtr = cfg.D_tr * db;
-        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / dtr + dth));
+        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.kernel_paper_law) {
-            // Wronski supplement S.1, verbatim: multiplicative anisotropy.
-            kk1 = 1.f / (cfg.k_shrink * A);
-            kk2 = cfg.k_stretch * A;
-        } else if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
+        if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
             // 0.5*A floors at 0.5; the zero-floor remap keeps the A=1.95
             // endpoint and sends isotropic content to round kernels. See
             // Config::kernel_anisotropy_zero_floor.

@@ -78,12 +78,8 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 //
 // Keep in step with the Metal twin in HHSRKernels.metal and the mirror in
 // tools/validate_merge_equiv.py: all three are compared against each other.
-// Set from Config::kernel_min_sigma at each accumulate entry (before the
-// parallel loops start; read-only inside them).
-static f32 g_soften_max_inv = 32.f;
-
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
-    const f32 k_max_abs = g_soften_max_inv;
+    constexpr f32 k_max_abs = 32.f;
     if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
         ixx = 2.f;
         ixy = 0.f;
@@ -210,8 +206,6 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     const bool iso = (cfg.kernel == KernelShape::Iso);
     const f32 scale = cfg.scale;
     const bool fastw = cfg.merge_fast_weights;
-    const f32 ms = std::max(0.02f, cfg.kernel_min_sigma);
-    g_soften_max_inv = 1.f / (ms * ms);
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -362,10 +356,6 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    {
-        const f32 ms = std::max(0.02f, cfg.kernel_min_sigma);
-        g_soften_max_inv = 1.f / (ms * ms);
-    }
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
     const int nch = cfg.bayer_mode ? 3 : 1;

@@ -911,60 +911,6 @@ struct Config {
     // far below one 16-bit LSB after normalisation.
     bool merge_fast_weights = true;
 
-    // The port's minimum merge-kernel width (sigma, raw px) on the SHARP
-    // axis -- a speckle guard Google's paper does not have. The inverse
-    // covariance is clamped so no kernel is narrower than this; the guard
-    // exists because a near-delta kernel under a Bayer CFA weights
-    // essentially one raw sample, leaving the other two channels' den at
-    // zero (green/black speckle). The old hard-coded value (0.177 px,
-    // inv-cov 32) silently made k_detail below ~0.18 a NO-OP on detail:
-    // sharpening k_detail to 0.17 changed nothing, exactly the measured
-    // symptom on distant text. Google demonstrates kernels down to 0.05 px
-    // (Fig. 6); lowering this cap is what makes those regimes reachable.
-    // Speckle risk returns as it approaches sample spacing -- lower it with
-    // frames to spare (8-frame bursts have the coverage).
-    f32  kernel_min_sigma = 0.177f;
-
-    // Scale on the detail/denoise thresholds D_th and D_tr, applied wherever
-    // compute_k evaluates D = 1 - sqrt(l1)/D_tr + D_th. MEASURED on burst7
-    // (daylight, detailed) with the reference's thresholds (auto-tune 0.71 /
-    // 1.0 at high SNR): the MEDIAN merge site sat at D = 1 -- full denoise
-    // mode -- so the median kernel was k_detail*k_denoise = 0.75 px at
-    // Google's k_detail 0.25 (and 1.65 px at low-SNR tuning): the whole
-    // image merged blurry regardless of k_detail, which is why sharpening it
-    // did nothing. At 0.45 the same scene measures sharp-axis sigma
-    // p50 = 0.18 px, p90 = 0.44 px: detail regime almost everywhere, denoise
-    // reserved for genuinely flat areas -- the paper's Fig. 8 intent.
-    // 1.0 = the IPOL reference's behaviour, kept reachable for validation.
-    f32  kernel_detail_bias = 0.45f;
-
-    // Use Wronski's PUBLISHED kernel SHAPE heuristic (supplement S.1)
-    // instead of the IPOL reference's linear selection law:
-    //   k1_hat = k_detail * (k_stretch * A),  k2_hat = k_detail / (k_shrink * A)
-    // -- multiplicative in A (up to 8x stretch, sigma down to k_detail/(2A)
-    // ~ 0.06 px across edges), where the linear law tops out near 4x / 0.5x.
-    // Squared into Omega, as both implementations do.
-    //
-    // The D (detail/denoise) gate stays on GAT-domain thresholds with
-    // kernel_detail_bias in BOTH laws: the supplement's absolute
-    // [0,1]-gradient thresholds (0.001..0.020) were implemented and
-    // MEASURED -- at real exposure levels (midtones at ~0.05-0.15 of full
-    // scale) they still left the median pixel at D ~ 0.7, because absolute
-    // gradient units do not survive exposure differences; the GAT is the
-    // reference's exposure/noise-invariant answer and the bias calibrates
-    // it. Zero-floor and gamma apply only to the legacy shape law. Lower
-    // kernel_min_sigma toward 0.06-0.10 to let the paper shapes through the
-    // speckle floor.
-    //
-    // DEFAULT OFF after the on-device A/B: with orientations coming from the
-    // half-res tensor (noisy at stroke scale), the paper law's ~1.7px
-    // along-axis smeared distant text WORSE than the legacy law -- the
-    // across-axis sharpening lost to along-axis orientation error. The
-    // measured-good default is the legacy law with kernel_detail_bias (the
-    // actual root-cause fix), zero-floor and gamma. Revisit ON once the
-    // structure tensor moves to raw resolution.
-    bool kernel_paper_law = false;
-
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;

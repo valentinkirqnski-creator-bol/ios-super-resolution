@@ -912,7 +912,7 @@ struct MergeCompParams {
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
-    float soften_max_inv; // 1 / kernel_min_sigma^2 (was _pad3)
+    uint _pad3;
 };
 
 struct MergeRefParams {
@@ -943,7 +943,6 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
-    float soften_max_inv;  // 1 / kernel_min_sigma^2
 };
 
 // std::lround half-away-from-zero.
@@ -958,9 +957,8 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
 // Twin of soften_inv_cov in core/merge.cpp -- keep them in step. See there for
 // why an unclamped inverse covariance shows up as green or black speckles
 // rather than as general softness.
-inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy,
-                           float k_max_abs_in) {
-    const float k_max_abs = (k_max_abs_in > 0.f) ? k_max_abs_in : 32.f;
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
+    const float k_max_abs = 32.f;
     if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
         ixx = 2.f;
         ixy = 0.f;
@@ -1012,7 +1010,6 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
 
 // raw_det=true -> accumulate (comp); false -> accumulate_ref
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
-                           float soften_max_inv,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
                            bool raw_det) {
@@ -1054,7 +1051,7 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
-    soften_inv_cov(ixx, ixy, iyy, soften_max_inv);
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -1221,7 +1218,7 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             kmap_j = lr_mov_x - 0.5f;
             kmap_i = lr_mov_y - 0.5f;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, p.soften_max_inv, kmap_i, kmap_j, ixx, ixy, iyy, true);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
     int center_j = lround_away(lr_mov_x);
@@ -1535,7 +1532,7 @@ inline void merge_accumulate_ref_body(device AccT* num,
             kmap_j = coarse_x;
             kmap_i = coarse_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, p.soften_max_inv, kmap_i, kmap_j, ixx, ixy, iyy, false);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false);
     }
 
     int center_j = int(round(coarse_x));
@@ -1625,7 +1622,7 @@ struct KernelEstParams {
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
     uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
     float aniso_gamma;      // exponent on the zero-floored weight
-    uint paper_law;         // 1 = Wronski supplement S.1 heuristic (was _pad2)
+    uint _pad2;             // 72 bytes total for setBytes
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1686,11 +1683,7 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float A = 1.f + sqrt(ratio);
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.paper_law != 0u) {
-        // Wronski supplement S.1, verbatim -- twin of kernels.cpp.
-        kk1 = 1.f / (p.k_shrink * A);
-        kk2 = p.k_stretch * A;
-    } else if (p.selection != 0u || p.aniso_continuous != 0u) {
+    if (p.selection != 0u || p.aniso_continuous != 0u) {
         // Twin of the zero-floor remap in kernels.cpp compute_k.
         float w = 0.5f * A;
         if (p.aniso_zero_floor != 0u) {

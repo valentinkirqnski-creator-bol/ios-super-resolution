@@ -109,19 +109,6 @@ struct TuningParams: Equatable, Codable {
     /// Skip merge taps and overlap hypotheses whose weight is numerically
     /// negligible (< 3.4e-4 of the centre tap / < 5% window weight).
     var merge_fast_weights: Bool = true
-    /// Minimum merge-kernel width (sigma, raw px) on the sharp axis -- the
-    /// port's speckle guard. 0.177 was hard-coded; below ~0.18 k_detail was
-    /// a no-op. Lower toward 0.05 (Google's demonstrated regime) for more
-    /// resolved detail; speckle risk returns near the sample spacing.
-    var kernel_min_sigma: Float = 0.177
-    /// Scale on the detail/denoise thresholds. 1.0 = reference behaviour,
-    /// which measured as FULL DENOISE (blurry kernels) over the median of a
-    /// daylight scene; 0.45 restores the paper's intended detail regime.
-    var kernel_detail_bias: Float = 0.45
-    /// Wronski's published kernel shape heuristic (supplement S.1). OFF by
-    /// default: measured to smear text on the half-res tensor's noisy
-    /// stroke-scale orientations; needs the raw-res tensor first.
-    var kernel_paper_law: Bool = false
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
@@ -239,9 +226,6 @@ struct TuningParams: Equatable, Codable {
         case kernel_stretch_gamma
         case merge_fp16_accumulator
         case merge_fast_weights
-        case kernel_min_sigma
-        case kernel_detail_bias
-        case kernel_paper_law
         case dng_store_unwhitened
         case bm_subpixel_quadratic
         case grey_decimate_lowpass
@@ -286,9 +270,6 @@ struct TuningParams: Equatable, Codable {
         kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
-        kernel_min_sigma = try c.decodeIfPresent(Float.self, forKey: .kernel_min_sigma) ?? kernel_min_sigma
-        kernel_detail_bias = try c.decodeIfPresent(Float.self, forKey: .kernel_detail_bias) ?? kernel_detail_bias
-        kernel_paper_law = try c.decodeIfPresent(Bool.self, forKey: .kernel_paper_law) ?? kernel_paper_law
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
         grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
@@ -2016,9 +1997,6 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
-            "kernel_min_sigma": NSNumber(value: tuningParams.kernel_min_sigma),
-            "kernel_detail_bias": NSNumber(value: tuningParams.kernel_detail_bias),
-            "kernel_paper_law": NSNumber(value: tuningParams.kernel_paper_law),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
             "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),
