@@ -436,6 +436,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"flow_overlap_merge"])
         cfg.flow_overlap_merge = tuning[@"flow_overlap_merge"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
+    if (tuning[@"d_thresh_manual"])
+        cfg.d_thresh_manual = tuning[@"d_thresh_manual"].boolValue;
+    if (tuning[@"D_th"]) cfg.D_th = tuning[@"D_th"].floatValue;
+    if (tuning[@"D_tr"]) cfg.D_tr = std::max(0.05f, tuning[@"D_tr"].floatValue);
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;

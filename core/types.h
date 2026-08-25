@@ -946,6 +946,12 @@ struct Config {
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
     float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
     float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]
+    // Keep the manually-set D_th/D_tr above even when snr_auto_tune is on
+    // (auto-tune still drives k_detail/k_denoise/tile size). The D gate
+    // routes each pixel between super-resolution (D=0: sharp anisotropic
+    // kernel) and denoising (D=1: k_detail*k_denoise wide kernel); the two
+    // thresholds are in GAT-domain gradient units where noise has sigma ~ 1.
+    bool  d_thresh_manual = false;
     // Drive Eq. 4's kernel anisotropy continuously from (l1-l2)/(l1+l2), as
     // the paper describes, instead of switching to the full stretch only above
     // 0.9025. See compute_k in kernels.cpp for why the switch mattered: it

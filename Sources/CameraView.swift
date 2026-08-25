@@ -912,6 +912,25 @@ struct CameraView: View {
                         Text(String(format: "%.1f", cam.tuningParams.k_shrink))
                     }
                     Slider(value: $cam.tuningParams.k_shrink, in: 1.0...5.0)
+
+                    Toggle("Manual D Thresholds", isOn: $cam.tuningParams.d_thresh_manual)
+                    Text("D_th/D_tr decide super-resolution vs denoising per pixel: gradients below roughly D_tr*(1+D_th) sigmas of noise are denoised with a wide kernel instead of resolved. SNR Auto-Tune normally sets them per burst (0.71-0.81 / 1.0-1.24, GAT units); this override keeps your values while auto-tune still drives k_detail and tile size. Lower both (e.g. scale by 0.45: D_th 0.34, D_tr 0.50) to push daylight texture into the super-resolution branch; raise them if flat areas turn noisy.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Text("Denoise Threshold (D_th)")
+                        Spacer()
+                        Text(String(format: "%.2f", cam.tuningParams.d_th))
+                    }
+                    Slider(value: $cam.tuningParams.d_th, in: 0.05...1.5)
+                        .disabled(!cam.tuningParams.d_thresh_manual)
+                    HStack {
+                        Text("Denoise Transition (D_tr)")
+                        Spacer()
+                        Text(String(format: "%.2f", cam.tuningParams.d_tr))
+                    }
+                    Slider(value: $cam.tuningParams.d_tr, in: 0.05...2.0)
+                        .disabled(!cam.tuningParams.d_thresh_manual)
                     Text("Higher shrink sharpens across edges (helps small text). Default 2.")
                         .font(.footnote)
                         .foregroundColor(.secondary)

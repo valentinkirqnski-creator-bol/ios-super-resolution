@@ -130,6 +130,13 @@ struct TuningParams: Equatable, Codable {
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
     var k_shrink: Float = 2.0
+    /// D gate: below-threshold gradients are routed to denoising instead of
+    /// super-resolution. GAT-domain units (noise sigma ~ 1). Only applied
+    /// when d_thresh_manual is on; otherwise SNR auto-tune sets them per
+    /// burst (0.71-0.81 / 1.0-1.24).
+    var d_thresh_manual: Bool = false
+    var d_th: Float = 0.76
+    var d_tr: Float = 1.12
     var snr_auto_tune: Bool = true
     var alignment_tile_size: Int = 0
     /// Off merges every frame at full weight everywhere. Diagnostic: it shows
@@ -221,6 +228,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
+        case d_thresh_manual, d_th, d_tr
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
         case kernel_stretch_gamma
@@ -265,6 +273,9 @@ struct TuningParams: Equatable, Codable {
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
+        d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
+        d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
+        d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
         kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
@@ -2005,6 +2016,9 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
+            "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
+            "D_th": NSNumber(value: tuningParams.d_th),
+            "D_tr": NSNumber(value: tuningParams.d_tr),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
