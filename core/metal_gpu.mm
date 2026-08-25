@@ -171,6 +171,7 @@ static MetalCtx& ctx() {
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460",
             "merge_normalize_rgb16",
+            "flow_densify_select",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -3919,6 +3920,84 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
         return merge_ref_band_metal_impl(ref_raw, covs, num_band, den_band, y0,
                                          cfg, acc_rob);
     }
+}
+
+namespace {
+// Twin of DensifyParams in HHSRKernels.metal.
+struct DensifyParamsCPU {
+    uint32_t fny = 0, fnx = 0;
+    uint32_t flow_ny = 0, flow_nx = 0;
+    uint32_t ref_h = 0, ref_w = 0;
+    uint32_t mov_h = 0, mov_w = 0;
+    uint32_t tile_size = 0;
+    uint32_t overlap_all = 0;
+    float gsy = 1.f, gsx = 1.f;
+    float thr = 0.f;
+    uint32_t _pad0 = 0;
+};
+static_assert(sizeof(DensifyParamsCPU) == 56, "DensifyParamsCPU size");
+} // namespace
+
+bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
+                               const Image& mov_grey, int raw_h, int raw_w,
+                               int tile_size, const Config& cfg) {
+  @autoreleasepool {
+    if (!metal_gpu_init()) return false;
+    if (flow.ny <= 0 || flow.nx <= 0 ||
+        flow.flow.size() != (size_t)flow.ny * (size_t)flow.nx * 2u)
+        return false;
+    auto& c = ctx();
+    const f32 ts2 = 0.5f * (f32)tile_size;
+    const int fny = std::max(1, (int)std::ceil((f32)raw_h / ts2));
+    const int fnx = std::max(1, (int)std::ceil((f32)raw_w / ts2));
+
+    DensifyParamsCPU p{};
+    p.fny = (uint32_t)fny;
+    p.fnx = (uint32_t)fnx;
+    p.flow_ny = (uint32_t)flow.ny;
+    p.flow_nx = (uint32_t)flow.nx;
+    p.ref_h = (uint32_t)ref_grey.h;
+    p.ref_w = (uint32_t)ref_grey.w;
+    p.mov_h = (uint32_t)mov_grey.h;
+    p.mov_w = (uint32_t)mov_grey.w;
+    p.tile_size = (uint32_t)tile_size;
+    p.overlap_all = cfg.overlap_merge_active() ? 1u : 0u;
+    p.gsy = (f32)mov_grey.h / (f32)raw_h;
+    p.gsx = (f32)mov_grey.w / (f32)raw_w;
+    p.thr = std::max(0.f, cfg.flow_select_threshold);
+
+    const size_t fine_b = (size_t)fny * (size_t)fnx * 2u * sizeof(float);
+    id<MTLBuffer> b_fine = buf(nullptr, fine_b);
+    id<MTLBuffer> b_flow = buf(flow.flow.data(),
+                               flow.flow.size() * sizeof(float));
+    id<MTLBuffer> b_ref = buf(ref_grey.data.data(),
+                              ref_grey.data.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(mov_grey.data.data(),
+                              mov_grey.data.size() * sizeof(float));
+    if (!b_fine || !b_flow || !b_ref || !b_mov) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_fine offset:0 atIndex:0];
+    [enc setBuffer:b_flow offset:0 atIndex:1];
+    [enc setBuffer:b_ref offset:0 atIndex:2];
+    [enc setBuffer:b_mov offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    dispatch2(enc, c.pipe("flow_densify_select"), fnx, fny);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "align:densify-select");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    flow.fine_flow.resize((size_t)fny * (size_t)fnx * 2u);
+    memcpy(flow.fine_flow.data(), [b_fine contents], fine_b);
+    flow.fine_ny = fny;
+    flow.fine_nx = fnx;
+    return true;
+  }
 }
 
 } // namespace hhsr

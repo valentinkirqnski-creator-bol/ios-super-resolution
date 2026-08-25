@@ -71,6 +71,12 @@ bool downsample_by_metal(const Image& src, int factor, Image& out);
 // (Config::align_fullres_polish). False = could not run; flow untouched.
 bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_full,
                               FlowField& flow, int tile_size, const Config& cfg);
+// GPU twin of flow_densify_boundary_select's per-cell loops (align.cpp): the
+// bilinear blend plus both measurement branches. Fills flow.fine_* and
+// returns true; false = flow untouched, caller falls back to the CPU body.
+bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
+                               const Image& mov_grey, int raw_h, int raw_w,
+                               int tile_size, const Config& cfg);
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
                  const Config& cfg, int tile_size, FlowField& flow_out);

@@ -1367,6 +1367,16 @@ void flow_densify_boundary_select(FlowField& flow,
         mov_grey.h <= 0 || mov_grey.w <= 0 || mov_grey.c != 1 ||
         raw_h <= 0 || raw_w <= 0)
         return;
+#ifdef __APPLE__
+    // The measurement branches below are the last CPU hotspot of the align
+    // stage (~200ms/frame on violent bursts with the overlap merge on); the
+    // GPU twin runs one thread per fine cell with identical math. The CPU
+    // body remains for host tools and HHSR_ALIGN_CPU debugging.
+    if (!env_flag_on("HHSR_ALIGN_CPU") &&
+        flow_densify_select_metal(flow, ref_grey, mov_grey, raw_h, raw_w,
+                                  tile_size, cfg))
+        return;
+#endif
     const f32 ts2 = 0.5f * (f32)tile_size;
     const int fny = std::max(1, (int)std::ceil((f32)raw_h / ts2));
     const int fnx = std::max(1, (int)std::ceil((f32)raw_w / ts2));

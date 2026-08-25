@@ -2980,3 +2980,170 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
     out[o + 1u] = ushort(v1 * 65535.f + 0.5f);
     out[o + 2u] = ushort(v2 * 65535.f + 0.5f);
 }
+
+// ---------------------------------------------------------------------------
+// flow_densify_boundary_select twin (align.cpp): one thread per half-pitch
+// fine cell. Covers both measurement branches -- the overlapped-tile
+// full-window measurement (Config::flow_overlap_merge) and the cell-footprint
+// selection -- plus the bilinear blend for agreeing cells, so the host does
+// no per-cell work at all. All rounding matches the CPU (round = lround).
+struct DensifyParams {
+    uint fny, fnx;          // fine grid
+    uint flow_ny, flow_nx;  // tile grid
+    uint ref_h, ref_w;
+    uint mov_h, mov_w;
+    uint tile_size;
+    uint overlap_all;       // 1 = overlap measurement branch
+    float gsy, gsx;         // raw -> grey scale
+    float thr;              // flow_select_threshold
+    uint _pad0;             // 56 bytes total for setBytes
+};
+
+static inline float densify_cost_win(device const float* ref,
+                                     device const float* mov,
+                                     constant DensifyParams& p,
+                                     int gy0, int gx0, int win,
+                                     int idy, int idx) {
+    float dist = 0.f;
+    for (int i = 0; i < win; ++i) {
+        for (int j = 0; j < win; ++j) {
+            const int ry = gy0 + i, rx = gx0 + j;
+            const int my = ry + idy, mx = rx + idx;
+            if (!(ry >= 0 && ry < (int)p.ref_h && rx >= 0 && rx < (int)p.ref_w &&
+                  my >= 0 && my < (int)p.mov_h && mx >= 0 && mx < (int)p.mov_w))
+                return INFINITY;
+            dist += fabs(ref[ry * (int)p.ref_w + rx] - mov[my * (int)p.mov_w + mx]);
+        }
+    }
+    return dist;
+}
+
+kernel void flow_densify_select(device float* fine [[buffer(0)]],
+                                device const float* flowv [[buffer(1)]],
+                                device const float* ref [[buffer(2)]],
+                                device const float* mov [[buffer(3)]],
+                                constant DensifyParams& p [[buffer(4)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.fnx || gid.y >= p.fny) return;
+    const int fy = (int)gid.y, fx = (int)gid.x;
+    const float ts2 = 0.5f * (float)p.tile_size;
+    // Same lattice mapping as FlowField::sample_grid at the cell centre.
+    const float cy = ((float)fy + 0.5f) * ts2;
+    const float cx = ((float)fx + 0.5f) * ts2;
+    const float tcy = cy / (float)p.tile_size - 0.5f;
+    const float tcx = cx / (float)p.tile_size - 0.5f;
+    const int y0 = (int)floor(tcy), x0 = (int)floor(tcx);
+    const float ay = tcy - (float)y0, ax = tcx - (float)x0;
+    const int ny = (int)p.flow_ny, nx = (int)p.flow_nx;
+    const int iy0 = clamp(y0, 0, ny - 1), iy1 = clamp(y0 + 1, 0, ny - 1);
+    const int ix0 = clamp(x0, 0, nx - 1), ix1 = clamp(x0 + 1, 0, nx - 1);
+    float vx[4], vy[4];
+    vx[0] = flowv[(iy0 * nx + ix0) * 2 + 0];
+    vy[0] = flowv[(iy0 * nx + ix0) * 2 + 1];
+    vx[1] = flowv[(iy0 * nx + ix1) * 2 + 0];
+    vy[1] = flowv[(iy0 * nx + ix1) * 2 + 1];
+    vx[2] = flowv[(iy1 * nx + ix0) * 2 + 0];
+    vy[2] = flowv[(iy1 * nx + ix0) * 2 + 1];
+    vx[3] = flowv[(iy1 * nx + ix1) * 2 + 0];
+    vy[3] = flowv[(iy1 * nx + ix1) * 2 + 1];
+    float spread = 0.f;
+    for (int a = 0; a < 4; ++a)
+        for (int b = a + 1; b < 4; ++b)
+            spread = max(spread, max(fabs(vx[a] - vx[b]), fabs(vy[a] - vy[b])));
+    const float tx0 = vx[0] + (vx[1] - vx[0]) * ax;
+    const float bx0 = vx[2] + (vx[3] - vx[2]) * ax;
+    const float ty0 = vy[0] + (vy[1] - vy[0]) * ax;
+    const float by0 = vy[2] + (vy[3] - vy[2]) * ax;
+    float out_x = tx0 + (bx0 - tx0) * ay;
+    float out_y = ty0 + (by0 - ty0) * ay;
+    if (p.overlap_all != 0u && spread > p.thr) {
+        // Full tile-sized window at the fine cell centre (HDR+ layout).
+        const int win = max(2, (int)round((float)p.tile_size * p.gsy));
+        const int gy0 = (int)round(((float)fy + 0.5f) * ts2 * p.gsy) - win / 2;
+        const int gx0 = (int)round(((float)fx + 0.5f) * ts2 * p.gsx) - win / 2;
+        float best_cost = INFINITY;
+        int seed_y = 0, seed_x = 0;
+        bool have_seed = false;
+        for (int c4 = 0; c4 < 4; ++c4) {
+            const int idx = (int)round(vx[c4] * p.gsx);
+            const int idy = (int)round(vy[c4] * p.gsy);
+            const float d = densify_cost_win(ref, mov, p, gy0, gx0, win, idy, idx);
+            if (d < best_cost) {
+                best_cost = d;
+                seed_y = idy;
+                seed_x = idx;
+                have_seed = true;
+                out_x = vx[c4];
+                out_y = vy[c4];
+            }
+        }
+        // 3x3 integer refinement + quadratic sub-cell fit; the measurement
+        // replaces the seed only when it MOVES (see the CPU twin's comment).
+        if (have_seed) {
+            float surf[9];
+            int bo = 4;
+            float bo_cost = best_cost;
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox) {
+                    const int sidx = (oy + 1) * 3 + (ox + 1);
+                    surf[sidx] = (ox == 0 && oy == 0)
+                                     ? best_cost
+                                     : densify_cost_win(ref, mov, p, gy0, gx0,
+                                                        win, seed_y + oy,
+                                                        seed_x + ox);
+                    if (surf[sidx] < bo_cost) { bo_cost = surf[sidx]; bo = sidx; }
+                }
+            if (bo != 4) {
+                seed_y += bo / 3 - 1;
+                seed_x += bo % 3 - 1;
+                for (int oy = -1; oy <= 1; ++oy)
+                    for (int ox = -1; ox <= 1; ++ox)
+                        surf[(oy + 1) * 3 + (ox + 1)] =
+                            densify_cost_win(ref, mov, p, gy0, gx0, win,
+                                             seed_y + oy, seed_x + ox);
+                if (isfinite(surf[4])) {
+                    float sub_x = 0.f, sub_y = 0.f;
+                    (void)bm_quadratic_subpixel_3x3(surf, sub_x, sub_y);
+                    out_x = ((float)seed_x + sub_x) / p.gsx;
+                    out_y = ((float)seed_y + sub_y) / p.gsy;
+                }
+            }
+        }
+    } else if (spread > p.thr) {
+        // Selection over the cell footprint.
+        const int gy0 = (int)floor((float)fy * ts2 * p.gsy);
+        const int gx0 = (int)floor((float)fx * ts2 * p.gsx);
+        const int gh = max(1, (int)round(ts2 * p.gsy));
+        const int gw = max(1, (int)round(ts2 * p.gsx));
+        float best_cost = INFINITY;
+        for (int c4 = 0; c4 < 4; ++c4) {
+            const int idx = (int)round(vx[c4] * p.gsx);
+            const int idy = (int)round(vy[c4] * p.gsy);
+            float dist = 0.f;
+            bool valid = true;
+            for (int i = 0; i < gh && valid; ++i) {
+                for (int j = 0; j < gw; ++j) {
+                    const int ry = gy0 + i, rx = gx0 + j;
+                    const int my = ry + idy, mx = rx + idx;
+                    if (!(ry >= 0 && ry < (int)p.ref_h &&
+                          rx >= 0 && rx < (int)p.ref_w &&
+                          my >= 0 && my < (int)p.mov_h &&
+                          mx >= 0 && mx < (int)p.mov_w)) {
+                        valid = false;
+                        break;
+                    }
+                    dist += fabs(ref[ry * (int)p.ref_w + rx] -
+                                 mov[my * (int)p.mov_w + mx]);
+                }
+            }
+            if (valid && dist < best_cost) {
+                best_cost = dist;
+                out_x = vx[c4];
+                out_y = vy[c4];
+            }
+        }
+    }
+    const int o = (fy * (int)p.fnx + fx) * 2;
+    fine[o + 0] = out_x;
+    fine[o + 1] = out_y;
+}
