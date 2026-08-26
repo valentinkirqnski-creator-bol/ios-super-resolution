@@ -1630,7 +1630,7 @@ struct KernelEstParams {
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
     uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
     float aniso_gamma;      // exponent on the zero-floored weight
-    uint _pad2;             // 72 bytes total for setBytes
+    uint isa_law;           // 1 = ImageStackAlignator's kernel.cu law (was _pad2)
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1688,10 +1688,18 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float tr = l1 + l2;
     float ratio = (tr > 1e-12f) ? max(0.f, (l1 - l2) / tr) : 0.f;
     if (!isfinite(ratio)) ratio = 0.f;
-    float A = 1.f + sqrt(ratio);
+    // ImageStackAlignator's kernel.cu uses the ratio directly, not its sqrt --
+    // twin of the same branch in kernels.cpp compute_k.
+    float A = (p.isa_law != 0u) ? (1.f + ratio) : (1.f + sqrt(ratio));
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.selection != 0u || p.aniso_continuous != 0u) {
+    if (p.isa_law != 0u) {
+        // Verbatim kernel.cu ComputeKernelParam: sharp-on-dominant-eigenvector,
+        // stretch-on-perpendicular -- same pairing our e1/e2 assignment below
+        // already uses. No zero-floor: never round at A=1, by design.
+        kk1 = A / p.k_shrink;
+        kk2 = p.k_stretch * A;
+    } else if (p.selection != 0u || p.aniso_continuous != 0u) {
         // Twin of the zero-floor remap in kernels.cpp compute_k. Reaches full
         // stretch (w=1) at A=1.95 instead of stopping short at 0.975 of it.
         float w = 0.5f * A;

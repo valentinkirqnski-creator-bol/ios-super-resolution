@@ -1119,7 +1119,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t aniso_continuous = 0;  // 1 = continuous Eq. 4 shape (was _pad0)
         uint32_t aniso_zero_floor = 0;  // 1 = zero-floor linear law (was _pad1)
         float aniso_gamma = 1.f;        // exponent on the zero-floored weight
-        uint32_t _pad2 = 0;
+        uint32_t isa_law = 0;           // 1 = ImageStackAlignator's law (was _pad2)
     };
     static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
 
@@ -1137,6 +1137,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.aniso_zero_floor = cfg.kernel_anisotropy_zero_floor ? 1u : 0u;
     p.aniso_gamma = cfg.kernel_stretch_gamma;
+    p.isa_law = cfg.kernel_isa_law ? 1u : 0u;
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;

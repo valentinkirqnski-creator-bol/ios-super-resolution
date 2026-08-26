@@ -34,10 +34,31 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         // degenerate case is now handled on purpose.
         f32 ratio = (tr > 1e-12f) ? std::max(0.f, (l1 - l2) / tr) : 0.f;
         if (!std::isfinite(ratio)) ratio = 0.f;
-        const f32 A = 1.f + std::sqrt(ratio);
+        // ImageStackAlignator's ComputeKernelParam (Kernels/kernel.cu) uses the
+        // ratio directly, not its sqrt: ratio 0.5 reads A=1.5 there against
+        // A=1.71 here -- their anisotropy response is measurably less
+        // aggressive at partial coherence. Confirmed by reading their CUDA
+        // source, not inferred from the paper (which specifies the sqrt form
+        // we use elsewhere): this is a real deviation on their part, not just
+        // a naming difference.
+        const f32 A = cfg.kernel_isa_law ? (1.f + ratio) : (1.f + std::sqrt(ratio));
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
+        if (cfg.kernel_isa_law) {
+            // Verbatim kernel.cu: k1h = kDetail*kStretch*A (paired with the
+            // MINOR/along-edge eigenvector, x1/y1 = perpendicular to their
+            // dominant-eigenvector cos/sin), k2h = kDetail/kShrink*A (paired
+            // with the dominant/across-edge eigenvector). Same sharp-on-
+            // dominant, stretch-on-perpendicular pairing our e1/e2 assignment
+            // below already uses -- kk1 here is the SHARP one (matches k1's
+            // role at the k1s*e1 term below), kk2 the stretched one, exactly
+            // like every other law in this function; only the naming in
+            // their source is swapped from ours. No zero-floor: never round
+            // at A=1, by design of the verbatim formula (same defect their
+            // own upstream, the Google paper, has printed).
+            kk1 = A / cfg.k_shrink;
+            kk2 = cfg.k_stretch * A;
+        } else if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
             // 0.5*A floors at 0.5; the zero-floor remap sends isotropic
             // content to round kernels and reaches full stretch (w=1) at
             // A=1.95, instead of stopping short at 0.975 of it -- the earlier

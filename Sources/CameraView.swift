@@ -807,6 +807,10 @@ struct CameraView: View {
         Text("Exponent on the stretch weight. 1.0 = plain zero-floor law. 2.0 (default) reproduces the readable-text stretch (~2:1 at text-like coherence) measured by hand-tuning k_stretch to 2, while clean single-orientation edges keep ~95% of full k_stretch. Raise further to confine elongation to only the most coherent edges.")
             .font(.footnote)
             .foregroundColor(.secondary)
+        Toggle("ImageStackAlignator Kernel Law", isOn: $cam.tuningParams.kernel_isa_law)
+        Text("Reproduces ImageStackAlignator's kernel.cu ComputeKernelParam exactly: A = 1 + (l1-l2)/(l1+l2) (the coherence ratio directly, not its sqrt -- a measurably less aggressive anisotropy response than every other law here), and the raw multiplicative shape k_detail*k_stretch*A / k_detail/(k_shrink*A) with no zero-floor, so it never goes round at A=1 -- isotropic content still gets stretched. Overrides Zero-Floor Kernel Stretch, Stretch Selectivity and the selection law while on.")
+            .font(.footnote)
+            .foregroundColor(.secondary)
         Text("""
              The merge kernel's stretch weight was 0.5*A with A never below 1 -- so even              near-isotropic detail in high-contrast areas was elongated at least              2.5:0.75 along whichever direction the tiny 2x2 structure-tensor window              happened to prefer. Distant text is the worst case: 1-2px multi-oriented              strokes give moderate coherence with a noise orientation, and the resulting              3-6:1 kernels smear glyphs unreadable or double their strokes (which looks              like misalignment). This remaps the weight to reach ZERO for isotropic              content while keeping the exact same stretch at the old A=1.95 threshold --              clean single-orientation edges keep their full elongation.
              """)

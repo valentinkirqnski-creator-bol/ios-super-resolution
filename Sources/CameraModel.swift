@@ -103,6 +103,11 @@ struct TuningParams: Equatable, Codable {
     /// Exponent on the stretch weight: higher concentrates elongation onto
     /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
     var kernel_stretch_gamma: Float = 1.0
+    /// ImageStackAlignator's kernel.cu ComputeKernelParam, verbatim: A uses
+    /// the coherence ratio directly (not its sqrt), and the shape law is the
+    /// raw multiplicative form with no zero-floor -- overrides the other
+    /// anisotropy settings while on.
+    var kernel_isa_law: Bool = false
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
@@ -242,6 +247,7 @@ struct TuningParams: Equatable, Codable {
         case kernel_anisotropy_continuous
         case kernel_anisotropy_zero_floor
         case kernel_stretch_gamma
+        case kernel_isa_law
         case merge_fp16_accumulator
         case merge_fast_weights
         case dng_store_unwhitened
@@ -291,6 +297,7 @@ struct TuningParams: Equatable, Codable {
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
         kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
+        kernel_isa_law = try c.decodeIfPresent(Bool.self, forKey: .kernel_isa_law) ?? kernel_isa_law
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
@@ -2073,6 +2080,7 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
             "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
+            "kernel_isa_law": NSNumber(value: tuningParams.kernel_isa_law),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),

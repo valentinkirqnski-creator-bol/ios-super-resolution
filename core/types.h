@@ -978,6 +978,13 @@ struct Config {
     // kernel) and denoising (D=1: k_detail*k_denoise wide kernel); the two
     // thresholds are in GAT-domain gradient units where noise has sigma ~ 1.
     bool  d_thresh_manual = false;
+    // ImageStackAlignator's kernel.cu ComputeKernelParam, verbatim (read from
+    // their CUDA source, not inferred): A = 1 + (l1-l2)/(l1+l2) -- the ratio
+    // directly, not its sqrt, unlike every other law here -- and the raw
+    // multiplicative shape (k_detail*k_stretch*A / k_detail/(k_shrink*A), no
+    // zero-floor, so it never goes round at A=1). Overrides selection /
+    // kernel_anisotropy_continuous / kernel_anisotropy_zero_floor while on.
+    bool kernel_isa_law = false;
     // Drive Eq. 4's kernel anisotropy continuously from (l1-l2)/(l1+l2), as
     // the paper describes, instead of switching to the full stretch only above
     // 0.9025. See compute_k in kernels.cpp for why the switch mattered: it
