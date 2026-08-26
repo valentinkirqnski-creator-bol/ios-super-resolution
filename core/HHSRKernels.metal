@@ -461,7 +461,39 @@ struct AlignLocalSearch460Params {
     float ambiguity_ratio;
     uint write_ambiguity;
     uint fallback_on_ambiguous;  // kunzmi: ambiguous -> keep seed, no shift
+    uint subpixel;               // quadratic sub-cell fit at the winner
 };
+
+// Least-squares bivariate quadratic over the 3x3 cost neighbourhood of the
+// winning offset; minimum at mu = -H^-1 g. Twin of quadratic_subpixel_3x3 in
+// align.cpp -- same closed forms, same guards (finite costs, positive-definite
+// Hessian, |mu| <= 0.5 per axis), so CPU and GPU block matching stay in step.
+static inline bool bm_quadratic_subpixel_3x3(thread const float* D,
+                                             thread float& mu_x,
+                                             thread float& mu_y) {
+    for (int i = 0; i < 9; ++i)
+        if (!isfinite(D[i])) return false;
+    const float P   = D[0] + D[1] + D[2] + D[3] + D[4] + D[5] + D[6] + D[7] + D[8];
+    const float Sx  = (D[2] + D[5] + D[8]) - (D[0] + D[3] + D[6]);
+    const float Sy  = (D[6] + D[7] + D[8]) - (D[0] + D[1] + D[2]);
+    const float Sxx = D[0] + D[2] + D[3] + D[5] + D[6] + D[8];
+    const float Syy = D[0] + D[1] + D[2] + D[6] + D[7] + D[8];
+    const float Sxy = (D[0] + D[8]) - (D[2] + D[6]);
+    const float d = Sx / 6.f;
+    const float e = Sy / 6.f;
+    const float c = Sxy / 4.f;
+    const float a = 0.5f * Sxx - P / 3.f;
+    const float b = 0.5f * Syy - P / 3.f;
+    const float h11 = 2.f * a, h22 = 2.f * b;
+    const float det = h11 * h22 - c * c;
+    if (!(h11 > 0.f) || !(h22 > 0.f) || !(det > 1e-12f)) return false;
+    const float mx = -(h22 * d - c * e) / det;
+    const float my = -(h11 * e - c * d) / det;
+    if (!(fabs(mx) <= 0.5f) || !(fabs(my) <= 0.5f)) return false;
+    mu_x = mx;
+    mu_y = my;
+    return true;
+}
 
 // One threadgroup per tile; threads split the candidate shifts.
 //
@@ -474,9 +506,10 @@ struct AlignLocalSearch460Params {
 // which reproduces the original sdy-outer / sdx-inner first-minimum-wins scan.
 //
 // Threadgroup memory is supplied by the host: [0] = ts*ts floats for the tile,
-// [1]/[2] = best float/int per lane, [3]/[4] = second-best float/int per lane.
-// `lanes` must be a power of two (the host enforces this) for the tree
-// reduction to cover every element.
+// [1]/[2] = best float/int per lane, [3]/[4] = second-best float/int per lane,
+// [5] = (2R+1)^2 floats holding every candidate's cost, kept for the sub-pixel
+// quadratic fit at the winner. `lanes` must be a power of two (the host
+// enforces this) for the tree reduction to cover every element.
 kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    device const float* mov [[buffer(1)]],
                                    device float* flow [[buffer(2)]],
@@ -487,6 +520,7 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                                    threadgroup int* red_cand [[threadgroup(2)]],
                                    threadgroup float* red_second_dist [[threadgroup(3)]],
                                    threadgroup int* red_second_cand [[threadgroup(4)]],
+                                   threadgroup float* cand_cost [[threadgroup(5)]],
                                    uint tile_id [[threadgroup_position_in_grid]],
                                    uint lane [[thread_position_in_threadgroup]],
                                    uint lanes [[threads_per_threadgroup]]) {
@@ -538,6 +572,9 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
             const int sdx = (c - row * span) - R;
             const int mx0 = ox + ifx + sdx;
             const int my0 = oy + ify + sdy;
+            // Every candidate slot is written exactly once (each c belongs to
+            // one lane), so the surface is complete before the barrier below.
+            cand_cost[c] = INFINITY;
             // Out-of-bounds candidates scored INFINITY and could never win a
             // strict `<`, so skipping them is equivalent.
             if (!(mx0 >= 0 && my0 >= 0 &&
@@ -553,6 +590,7 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
                     dist += (p.l1 != 0u) ? fabs(diff) : diff * diff;
                 }
             }
+            cand_cost[c] = dist;
             if (dist < best_dist) {
                 second_dist = best_dist;
                 second_cand = best_cand;
@@ -628,14 +666,29 @@ kernel void align_local_search_460(device const float* ref [[buffer(0)]],
         const float denom = max(b, 1.0e-12f);
         const bool ambiguous =
             isfinite(b) && isfinite(sec) && (sec / denom) < p.ambiguity_ratio;
+        float sub_x = 0.f, sub_y = 0.f;
         if (p.fallback_on_ambiguous != 0u && ambiguous) {
             // ImageStackAlignator's rule: no precise shift determinable ->
             // apply NO shift; keep the upsampled previous-level seed.
             sdx = 0;
             sdy = 0;
+        } else if (p.subpixel != 0u && c != kNone &&
+                   sdx > -R && sdx < R && sdy > -R && sdy < R) {
+            // Winner interior to the window: the full 3x3 cost neighbourhood
+            // exists in cand_cost (every slot written before the reduction's
+            // barriers, which also order it for this lane). The fit's own
+            // guards reject non-finite neighbours, ridges and out-of-cell
+            // minima, in which case the integer result stands -- identical to
+            // the CPU path in align.cpp.
+            float D[9];
+            for (int yy = -1; yy <= 1; ++yy)
+                for (int xx = -1; xx <= 1; ++xx)
+                    D[(yy + 1) * 3 + (xx + 1)] =
+                        cand_cost[(sdy + yy + R) * span + (sdx + xx + R)];
+            (void)bm_quadratic_subpixel_3x3(D, sub_x, sub_y);
         }
-        flow[tile_id * 2u + 0u] = local_fx + float(sdx);
-        flow[tile_id * 2u + 1u] = local_fy + float(sdy);
+        flow[tile_id * 2u + 0u] = local_fx + float(sdx) + sub_x;
+        flow[tile_id * 2u + 1u] = local_fy + float(sdy) + sub_y;
         if (p.write_ambiguity != 0u)
             ambiguity[tile_id] |= ambiguous ? 1u : 0u;
     }

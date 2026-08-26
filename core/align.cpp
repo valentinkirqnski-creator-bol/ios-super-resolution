@@ -162,6 +162,44 @@ static f32 clamped_ambiguity_ratio(const Config& cfg) {
     return std::max(ambiguity_ratio, 1.f);
 }
 
+// Least-squares bivariate quadratic over the 3x3 cost neighbourhood of a
+// block-matching winner: f(x,y) = a x^2 + b y^2 + c xy + d x + e y + g fitted
+// to the nine costs D[(y+1)*3+(x+1)], x,y in {-1,0,1}, minimum at
+// mu = -H^-1 g with H = [[2a, c],[c, 2b]], g = [d, e]. This is the sub-pixel
+// estimator Wronski's alignment specifies (ImageStackAlignator kernel.cu
+// carries the same fit); the closed forms below are the normal equations of
+// that least-squares problem on the 3x3 lattice.
+//
+// Returns false -- leave the integer result alone -- unless every cost is
+// finite, the fitted Hessian is positive definite (a true 2-D minimum, not a
+// ridge or saddle), and the sub-cell minimum lies within half a cell of the
+// winner on both axes (the winner IS the integer argmin, so a fit that says
+// otherwise is noise, not signal).
+static bool quadratic_subpixel_3x3(const f32* D, f32& mu_x, f32& mu_y) {
+    for (int i = 0; i < 9; ++i)
+        if (!std::isfinite(D[i])) return false;
+    const f32 P   = D[0] + D[1] + D[2] + D[3] + D[4] + D[5] + D[6] + D[7] + D[8];
+    const f32 Sx  = (D[2] + D[5] + D[8]) - (D[0] + D[3] + D[6]);
+    const f32 Sy  = (D[6] + D[7] + D[8]) - (D[0] + D[1] + D[2]);
+    const f32 Sxx = D[0] + D[2] + D[3] + D[5] + D[6] + D[8];
+    const f32 Syy = D[0] + D[1] + D[2] + D[6] + D[7] + D[8];
+    const f32 Sxy = (D[0] + D[8]) - (D[2] + D[6]);
+    const f32 d = Sx / 6.f;
+    const f32 e = Sy / 6.f;
+    const f32 c = Sxy / 4.f;
+    const f32 a = 0.5f * Sxx - P / 3.f;
+    const f32 b = 0.5f * Syy - P / 3.f;
+    const f32 h11 = 2.f * a, h22 = 2.f * b;
+    const f32 det = h11 * h22 - c * c;
+    if (!(h11 > 0.f) || !(h22 > 0.f) || !(det > 1e-12f)) return false;
+    const f32 mx = -(h22 * d - c * e) / det;
+    const f32 my = -(h11 * e - c * d) / det;
+    if (!(std::fabs(mx) <= 0.5f) || !(std::fabs(my) <= 0.5f)) return false;
+    mu_x = mx;
+    mu_y = my;
+    return true;
+}
+
 static uint32_t match_is_ambiguous(f32 best_cost, f32 second_cost,
                                    f32 ambiguity_ratio) {
     if (!std::isfinite(best_cost) || !std::isfinite(second_cost)) return 0u;
@@ -522,10 +560,14 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                                          FlowField& flow, bool l1,
                                          f32 ambiguity_ratio, bool write_ambiguity,
                                          bool fallback_on_ambiguous,
-                                         int num_threads) {
+                                         int num_threads, bool subpixel) {
     const int ny = flow.ny, nx = flow.nx;
     const int ts = tile_size;
     const int R = search_radius;
+    // 13x13 covers every shipped radius (<= 4 raw -> <= 4 grey); a larger
+    // radius just skips the sub-pixel fit rather than overrunning the buffer.
+    const int span = 2 * R + 1;
+    const bool want_fit = subpixel && span >= 3 && span <= 13;
     // Size it if this is the first level, but do NOT clear it otherwise: the
     // value already there was propagated down from the coarser level by
     // upscale_flow_460, and a wrong match up there is what produces the large
@@ -559,6 +601,7 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
             f32 min_dist = std::numeric_limits<f32>::infinity();
             f32 second_dist = std::numeric_limits<f32>::infinity();
             int min_shift_x = 0, min_shift_y = 0;
+            f32 cost_surf[13 * 13];
             for (int sdy = -R; sdy <= R; ++sdy) {
                 for (int sdx = -R; sdx <= R; ++sdx) {
                     f32 dist = 0.f;
@@ -579,6 +622,8 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                         }
                     }
                     if (!valid) dist = std::numeric_limits<f32>::infinity();
+                    if (want_fit)
+                        cost_surf[(sdy + R) * span + (sdx + R)] = dist;
                     if (dist < min_dist) {
                         second_dist = min_dist;
                         min_dist = dist;
@@ -602,8 +647,20 @@ static void block_match_level_direct_460(const Image& ref, const Image& moving,
                 flow.dx(ty, tx) = local_fx;
                 flow.dy(ty, tx) = local_fy;
             } else {
-                flow.dx(ty, tx) = local_fx + (f32)min_shift_x;
-                flow.dy(ty, tx) = local_fy + (f32)min_shift_y;
+                f32 sub_x = 0.f, sub_y = 0.f;
+                if (want_fit &&
+                    min_shift_x > -R && min_shift_x < R &&
+                    min_shift_y > -R && min_shift_y < R) {
+                    f32 D[9];
+                    for (int yy = -1; yy <= 1; ++yy)
+                        for (int xx = -1; xx <= 1; ++xx)
+                            D[(yy + 1) * 3 + (xx + 1)] =
+                                cost_surf[(min_shift_y + yy + R) * span +
+                                          (min_shift_x + xx + R)];
+                    (void)quadratic_subpixel_3x3(D, sub_x, sub_y);
+                }
+                flow.dx(ty, tx) = local_fx + (f32)min_shift_x + sub_x;
+                flow.dy(ty, tx) = local_fy + (f32)min_shift_y + sub_y;
             }
             if (write_ambiguity)
                 flow.ambiguous(ty, tx) |= ambiguous;
@@ -622,13 +679,14 @@ static void block_match_level_L2(const Image& ref, const Image& moving,
     // 460-main direct local L2 search. HHSR_L2_CPU=1 forces CPU direct path.
     if (!env_flag_on("HHSR_L2_CPU") && !env_flag_on("HHSR_ALIGN_CPU")) {
         if (block_match_level_L2_metal(ref, moving, tile_size, search_radius, flow,
-                                       ambiguity_ratio, write_ambiguity, fallback))
+                                       ambiguity_ratio, write_ambiguity, fallback,
+                                       cfg.bm_subpixel_quadratic))
             return;
     }
 #endif
     block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
                                  false, ambiguity_ratio, write_ambiguity, fallback,
-                                 num_threads);
+                                 num_threads, cfg.bm_subpixel_quadratic);
 }
 
 // ============================================================================
@@ -644,12 +702,13 @@ static void block_match_level_L1(const Image& ref, const Image& moving,
 #ifdef __APPLE__
     if (!env_flag_on("HHSR_L1_CPU") && !env_flag_on("HHSR_ALIGN_CPU") &&
         block_match_level_L1_metal(ref, moving, tile_size, search_radius, flow,
-                                   ambiguity_ratio, write_ambiguity, fallback))
+                                   ambiguity_ratio, write_ambiguity, fallback,
+                                   cfg.bm_subpixel_quadratic))
         return;
 #endif
     block_match_level_direct_460(ref, moving, tile_size, search_radius, flow,
                                  true, ambiguity_ratio, write_ambiguity, fallback,
-                                 num_threads);
+                                 num_threads, cfg.bm_subpixel_quadratic);
     return;
     int ny = flow.ny, nx = flow.nx;
     int ts = tile_size;
@@ -1414,6 +1473,124 @@ FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
 
     return flow_to_raw_tile_grid(flow_guide, raw_h, raw_w, guide_h, guide_w,
                                  tile_size, r_Mt, num_threads, tile_size);
+}
+
+// Build the boundary-selected half-pitch refinement of a RAW-grid flow field
+// (FlowField::fine_*, consumed transparently by sample_bilinear and the GPU
+// hosts). Runs after flow_to_raw_tile_grid, on the same greys alignment used.
+//
+// Each fine cell (pitch tile_size/2) looks at the four tile vectors its
+// centre sits between -- the exact four bilinear sampling reads there:
+//  - If they agree within cfg.flow_select_threshold raw px (Chebyshev), the
+//    cell stores their bilinear blend at its centre, and consumers sampling
+//    the fine grid reproduce the coarse sampling to first order: the fine
+//    lattice is quarter-shifted from the coarse one, so the match is exact
+//    for a locally linear field away from image borders (measured 6e-8) and
+//    bounded by ~1/8 of the flow's per-tile second difference elsewhere --
+//    far below the staircase this machinery removes. Sub-tile gradients
+//    (rotation) survive by construction.
+//  - Otherwise the cell sits on a motion boundary, where a blend produces
+//    flow belonging to NEITHER side. Each of the four vectors is scored by L1
+//    residual over the cell's footprint on the alignment grey (rounded
+//    integer warp -- this selects between motions pixels apart, it does not
+//    re-estimate sub-pixel), and the best single vector is stored verbatim,
+//    fractional part included. Ties keep the lowest candidate index; a
+//    candidate whose warp leaves the moving grey is skipped; if none can be
+//    scored the blend stands, which is today's behaviour.
+void flow_densify_boundary_select(FlowField& flow,
+                                  const Image& ref_grey, const Image& mov_grey,
+                                  int raw_h, int raw_w, int tile_size,
+                                  const Config& cfg) {
+    flow.fine_ny = 0;
+    flow.fine_nx = 0;
+    flow.fine_flow.clear();
+    if (!cfg.flow_boundary_selection || !cfg.flow_bilinear_sampling) return;
+    // Even pitch only: the fine grid's pitch is tile_size/2 and the GPU hosts
+    // pass it as an integer. Every shipped tile size (16/32/64) is even.
+    if (flow.ny <= 0 || flow.nx <= 0 || tile_size < 2 || (tile_size % 2) != 0 ||
+        ref_grey.h <= 0 || ref_grey.w <= 0 || ref_grey.c != 1 ||
+        mov_grey.h <= 0 || mov_grey.w <= 0 || mov_grey.c != 1 ||
+        raw_h <= 0 || raw_w <= 0)
+        return;
+    const f32 ts2 = 0.5f * (f32)tile_size;
+    const int fny = std::max(1, (int)std::ceil((f32)raw_h / ts2));
+    const int fnx = std::max(1, (int)std::ceil((f32)raw_w / ts2));
+    // Raw -> grey scale (0.5 on the decimate grey, 1 on the FFT grey). The
+    // flow's displacements are raw px (flow_to_raw_tile_grid scaled them), so
+    // the residual test converts both positions and displacements.
+    const f32 gsy = (f32)mov_grey.h / (f32)raw_h;
+    const f32 gsx = (f32)mov_grey.w / (f32)raw_w;
+    const f32 thr = std::max(0.f, cfg.flow_select_threshold);
+    std::vector<f32> fine((size_t)fny * (size_t)fnx * 2u, 0.f);
+    parallel_rows(fny, cfg.num_threads, [&](int fy) {
+        for (int fx = 0; fx < fnx; ++fx) {
+            // Same lattice mapping as FlowField::sample_grid at the cell centre.
+            const f32 cy = ((f32)fy + 0.5f) * ts2;
+            const f32 cx = ((f32)fx + 0.5f) * ts2;
+            const f32 tcy = cy / (f32)tile_size - 0.5f;
+            const f32 tcx = cx / (f32)tile_size - 0.5f;
+            const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+            const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+            auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+            const int iy0 = cl(y0, flow.ny), iy1 = cl(y0 + 1, flow.ny);
+            const int ix0 = cl(x0, flow.nx), ix1 = cl(x0 + 1, flow.nx);
+            const f32 vx[4] = {flow.dx(iy0, ix0), flow.dx(iy0, ix1),
+                               flow.dx(iy1, ix0), flow.dx(iy1, ix1)};
+            const f32 vy[4] = {flow.dy(iy0, ix0), flow.dy(iy0, ix1),
+                               flow.dy(iy1, ix0), flow.dy(iy1, ix1)};
+            f32 spread = 0.f;
+            for (int a = 0; a < 4; ++a)
+                for (int b = a + 1; b < 4; ++b)
+                    spread = std::max(spread,
+                                      std::max(std::fabs(vx[a] - vx[b]),
+                                               std::fabs(vy[a] - vy[b])));
+            const f32 tx0 = vx[0] + (vx[1] - vx[0]) * ax;
+            const f32 bx0 = vx[2] + (vx[3] - vx[2]) * ax;
+            const f32 ty0 = vy[0] + (vy[1] - vy[0]) * ax;
+            const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
+            f32 out_x = tx0 + (bx0 - tx0) * ay;
+            f32 out_y = ty0 + (by0 - ty0) * ay;
+            if (spread > thr) {
+                // Cell footprint on the grey.
+                const int gy0 = (int)std::floor((f32)fy * ts2 * gsy);
+                const int gx0 = (int)std::floor((f32)fx * ts2 * gsx);
+                const int gh = std::max(1, (int)std::lround(ts2 * gsy));
+                const int gw = std::max(1, (int)std::lround(ts2 * gsx));
+                f32 best_cost = std::numeric_limits<f32>::infinity();
+                for (int c = 0; c < 4; ++c) {
+                    const int idx = (int)std::lround(vx[c] * gsx);
+                    const int idy = (int)std::lround(vy[c] * gsy);
+                    f32 dist = 0.f;
+                    bool valid = true;
+                    for (int i = 0; i < gh && valid; ++i) {
+                        for (int j = 0; j < gw; ++j) {
+                            const int ry = gy0 + i, rx = gx0 + j;
+                            const int my = ry + idy, mx = rx + idx;
+                            if (!(ry >= 0 && ry < ref_grey.h &&
+                                  rx >= 0 && rx < ref_grey.w &&
+                                  my >= 0 && my < mov_grey.h &&
+                                  mx >= 0 && mx < mov_grey.w)) {
+                                valid = false;
+                                break;
+                            }
+                            dist += std::fabs(ref_grey.at(ry, rx) -
+                                              mov_grey.at(my, mx));
+                        }
+                    }
+                    if (valid && dist < best_cost) {
+                        best_cost = dist;
+                        out_x = vx[c];
+                        out_y = vy[c];
+                    }
+                }
+            }
+            fine[((size_t)fy * fnx + fx) * 2 + 0] = out_x;
+            fine[((size_t)fy * fnx + fx) * 2 + 1] = out_y;
+        }
+    });
+    flow.fine_flow = std::move(fine);
+    flow.fine_ny = fny;
+    flow.fine_nx = fnx;
 }
 
 } // namespace hhsr

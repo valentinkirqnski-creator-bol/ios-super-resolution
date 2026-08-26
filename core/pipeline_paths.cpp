@@ -1356,6 +1356,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                          work.r_Mt, work.num_threads,
                                          work.grey_tile_size(tile_size));
         }
+        // Boundary-selected half-pitch refinement (fine grid); must run here,
+        // while both greys are still alive. No-op when the toggle is off.
+        flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                     comp.h, comp.w, tile_size, work);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),

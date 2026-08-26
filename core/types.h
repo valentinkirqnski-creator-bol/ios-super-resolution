@@ -123,23 +123,66 @@ struct FlowField {
     // a nearest mask would grade a fetch nobody performs.
     inline void sample_bilinear(f32 raw_y, f32 raw_x, int tile_size,
                                 f32& out_dx, f32& out_dy) const {
+        if (has_fine()) {
+            sample_grid(fine_flow.data(), fine_ny, fine_nx,
+                        0.5f * (f32)tile_size, raw_y, raw_x, out_dx, out_dy);
+            return;
+        }
         if (ny <= 0 || nx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
-        const f32 tcy = raw_y / (f32)tile_size - 0.5f;
-        const f32 tcx = raw_x / (f32)tile_size - 0.5f;
+        sample_grid(flow.data(), ny, nx, (f32)tile_size, raw_y, raw_x,
+                    out_dx, out_dy);
+    }
+    // The shared bilinear-lattice math, parameterised over which grid it
+    // reads. `ts` is the grid's tile pitch in raw pixels (fractional for the
+    // fine grid so the coarse pitch stays the single configured quantity).
+    static inline void sample_grid(const f32* grid, int gny, int gnx, f32 ts,
+                                   f32 raw_y, f32 raw_x,
+                                   f32& out_dx, f32& out_dy) {
+        if (gny <= 0 || gnx <= 0 || !(ts > 0.f)) { out_dx = 0.f; out_dy = 0.f; return; }
+        const f32 tcy = raw_y / ts - 0.5f;
+        const f32 tcx = raw_x / ts - 0.5f;
         const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
         const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
         auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
-        const int iy0 = cl(y0, ny), iy1 = cl(y0 + 1, ny);
-        const int ix0 = cl(x0, nx), ix1 = cl(x0 + 1, nx);
-        const f32 tx0 = dx(iy0, ix0) + (dx(iy0, ix1) - dx(iy0, ix0)) * ax;
-        const f32 bx0 = dx(iy1, ix0) + (dx(iy1, ix1) - dx(iy1, ix0)) * ax;
-        const f32 ty0 = dy(iy0, ix0) + (dy(iy0, ix1) - dy(iy0, ix0)) * ax;
-        const f32 by0 = dy(iy1, ix0) + (dy(iy1, ix1) - dy(iy1, ix0)) * ax;
+        const int iy0 = cl(y0, gny), iy1 = cl(y0 + 1, gny);
+        const int ix0 = cl(x0, gnx), ix1 = cl(x0 + 1, gnx);
+        auto gx = [&](int ty, int tx) { return grid[((size_t)ty * gnx + tx) * 2 + 0]; };
+        auto gy = [&](int ty, int tx) { return grid[((size_t)ty * gnx + tx) * 2 + 1]; };
+        const f32 tx0 = gx(iy0, ix0) + (gx(iy0, ix1) - gx(iy0, ix0)) * ax;
+        const f32 bx0 = gx(iy1, ix0) + (gx(iy1, ix1) - gx(iy1, ix0)) * ax;
+        const f32 ty0 = gy(iy0, ix0) + (gy(iy0, ix1) - gy(iy0, ix0)) * ax;
+        const f32 by0 = gy(iy1, ix0) + (gy(iy1, ix1) - gy(iy1, ix0)) * ax;
         out_dx = tx0 + (bx0 - tx0) * ay;
         out_dy = ty0 + (by0 - ty0) * ay;
     }
     inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
+
+    // Optional boundary-selected refinement at HALF the tile pitch, built by
+    // flow_densify_boundary_select. Where the four surrounding tile vectors
+    // agree the fine cell holds their bilinear blend. The fine lattice is
+    // quarter-shifted from the coarse one ((j+0.5)*ts/2 never lands on
+    // (t+0.5)*ts), so smooth-region reproduction is first-order, not
+    // bit-exact: measured float-exact (6e-8) for a locally linear field away
+    // from image borders, with error bounded by ~1/8 of the flow's per-tile
+    // second difference at curvature and ~0.004 px inside the border clamp
+    // margin -- orders of magnitude below the 0.28 px staircase this
+    // machinery exists to remove. Where the four vectors disagree (a motion
+    // boundary) the cell holds whichever single tile vector best explains the
+    // guide there, instead of a blend that belongs to neither side. Consumers that warp
+    // (merge, Eq. 6, the raw-res mask) automatically sample this grid via
+    // sample_bilinear; per-tile metadata (match_ambiguous, motion_irregular,
+    // the Eq. 8 motion prior) stays on the coarse grid it was measured on.
+    // Empty means not built: sampling falls through to the coarse grid.
+    int fine_ny = 0, fine_nx = 0;
+    std::vector<f32> fine_flow;   // fine_ny * fine_nx * 2, raw-px displacements
+    inline bool has_fine() const {
+        return fine_ny > 0 && fine_nx > 0 &&
+               fine_flow.size() == (size_t)fine_ny * (size_t)fine_nx * 2u;
+    }
+    inline f32& fdx(int ty, int tx) { return fine_flow[((size_t)ty * fine_nx + tx) * 2 + 0]; }
+    inline f32& fdy(int ty, int tx) { return fine_flow[((size_t)ty * fine_nx + tx) * 2 + 1]; }
+
     inline uint32_t& ambiguous(int ty, int tx) { return match_ambiguous[(size_t)ty * nx + tx]; }
     inline uint32_t ambiguous(int ty, int tx) const { return match_ambiguous[(size_t)ty * nx + tx]; }
 };
@@ -676,6 +719,41 @@ struct Config {
     bool robustness_raw_resolution_active() const {
         return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
     }
+    // Sub-pixel refinement of every block-matching result: fit a bivariate
+    // quadratic to the 3x3 cost neighbourhood around the winning integer
+    // offset and add its sub-cell minimum (mu = -H^-1 g), the piece of
+    // Wronski's alignment (present in ImageStackAlignator's kernel.cu) this
+    // port previously skipped -- block matching emitted integer flow at every
+    // level and ICA alone carried the sub-pixel burden. The costs are already
+    // computed by the search; the fit reuses them, so it is nearly free. The
+    // correction applies only when the winner is interior to the search
+    // window, its 3x3 costs are all finite, the fitted Hessian is positive
+    // definite, and |mu| <= 0.5 per axis -- otherwise the integer result
+    // stands, and the ambiguity fallback (keep the seed) is never refined.
+    // Matters most on the decimate grey, where every residual ICA cannot
+    // recover is twice as large in raw pixels.
+    bool  bm_subpixel_quadratic = true;
+
+    // At motion boundaries, SELECT a tile vector instead of blending.
+    // Bilinear sampling between tile centres is correct where the field is
+    // smooth but blends two different motions across an object boundary,
+    // producing flow that belongs to neither side -- exactly where robustness
+    // then rejects and detail is lost. When enabled, a post-alignment pass
+    // (flow_densify_boundary_select) builds a half-tile-pitch refinement of
+    // the field: cells whose four surrounding tile vectors agree within
+    // flow_select_threshold keep the bilinear blend (first-order faithful to
+    // the smooth behaviour -- see FlowField::fine_flow for the measured
+    // bounds); cells at a disagreement get whichever single tile vector
+    // best explains the alignment guide there (L1 over the cell footprint).
+    // Every warping consumer samples the refined grid through the same
+    // sample_bilinear entry point, so mask and merge stay in lockstep.
+    bool  flow_boundary_selection = true;
+    // Raw-pixel disagreement (Chebyshev, across the four corner vectors)
+    // above which a cell is treated as a motion boundary. Below it, blending
+    // is not just harmless but preferable -- it carries sub-tile gradients
+    // (rotation) that selection would discard.
+    f32   flow_select_threshold = 1.0f;
+
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
     // missing feature (or aperture) then no shift is applied at all." When a

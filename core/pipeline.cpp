@@ -111,6 +111,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
+        flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                     comp.h, comp.w, tile_size, work);
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -189,6 +191,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                                         comp_grey.h, comp_grey.w, tile_size,
                                         work.r_Mt, work.num_threads,
                                         work.grey_tile_size(tile_size));
+        flow_densify_boundary_select(fd.flow, ref_grey, comp_grey,
+                                     burst[k].h, burst[k].w, tile_size, work);
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {
