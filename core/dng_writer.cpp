@@ -1,4 +1,6 @@
 #include "dng_writer.h"
+#include "lj92_enc.h"
+#include "parallel.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -247,14 +249,24 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const float* cam_to_srgb,
                                              bool pixels_prewhitened,
                                              uint32_t& strip_offset_out,
-                                             uint32_t& strip_byte_counts_offset_out) {
+                                             uint32_t& strip_byte_counts_offset_out,
+                                             bool lossless = false,
+                                             int tile_w = 0, int tile_l = 0,
+                                             uint32_t* tile_off_arr_pos = nullptr,
+                                             uint32_t* tile_cnt_arr_pos = nullptr) {
     float derived_cam_to_srgb[9];
     const float* jpeg_cam_to_srgb = cam_to_srgb;
-    // When the pixels are pre-white-balanced the gains go out as AnalogBalance
-    // below, so the derivation has to undo them here too -- otherwise the matrix
-    // cached in the private tag disagrees with the one the loader reconstructs
-    // from the file, and the two render paths drift apart.
-    const float* ab = (pixels_prewhitened && wb) ? wb : nullptr;
+    // The matrix cached in the private tag must ALWAYS be the whitened-input
+    // matrix (divide its columns by the gains): the render re-applies the
+    // stored WB gains before the ISP for un-whitened files
+    // (ReapplyWhiteBalanceIfStored), and pre-whitened files arrive whitened by
+    // definition -- either way the ISP sees whitened pixels. The previous
+    // condition (pixels_prewhitened && wb) left the un-whitened files with a
+    // native-input matrix, so WB was applied twice through it: a global
+    // magenta cast, and clipped highlights that the neutralizer pushed to
+    // EQUAL channels rendered pink, because a native-input matrix maps
+    // neutral input to a non-neutral colour.
+    const float* ab = wb;
     if (!jpeg_cam_to_srgb && cm &&
         derive_cam_to_srgb_from_color_matrix(cm, ab, derived_cam_to_srgb)) {
         jpeg_cam_to_srgb = derived_cam_to_srgb;
@@ -267,13 +279,18 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(256, (uint32_t)W);
     ifd.longv(257, (uint32_t)H);
     ifd.shorts(258, {16, 16, 16});
-    // 8 = Adobe Deflate (lossless ZIP), 1 = uncompressed. Same decoded pixels.
-    ifd.shortv(259, kDngCompress ? 8 : 1);
+    // 7 = lossless JPEG tiles, 8 = Adobe Deflate, 1 = uncompressed. Same
+    // decoded pixels in every case.
+    ifd.shortv(259, lossless ? 7 : (kDngCompress ? 8 : 1));
     if (baked_srgb)
         ifd.shortv(262, 2);            // RGB
     else
         ifd.shortv(262, 34892);        // LinearRaw
-    ifd.longv(273, 0);                 // StripOffsets (patched)
+    const int ntx = (lossless && tile_w > 0) ? (W + tile_w - 1) / tile_w : 0;
+    const int nty = (lossless && tile_l > 0) ? (H + tile_l - 1) / tile_l : 0;
+    const uint32_t ntiles = (uint32_t)ntx * (uint32_t)nty;
+    if (!lossless)
+        ifd.longv(273, 0);             // StripOffsets (patched)
     // SubIFDs, reserved empty. Adding this tag later would grow IFD0 by 12
     // bytes and push the image strip along with it, which is why embedding a
     // preview used to rebuild the entire file -- a 292MB read plus a 292MB
@@ -283,12 +300,20 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     if (orientation >= 1 && orientation <= 8)
         ifd.shortv(274, (uint16_t)orientation);
     ifd.shortv(277, 3);                // SamplesPerPixel
-    ifd.longv(278, (uint32_t)H);       // RowsPerStrip
-    ifd.longv(279, 0);                 // StripByteCounts (patched after compress)
+    if (!lossless) {
+        ifd.longv(278, (uint32_t)H);   // RowsPerStrip
+        ifd.longv(279, 0);             // StripByteCounts (patched after compress)
+    } else {
+        ifd.longv(322, (uint32_t)tile_w);
+        ifd.longv(323, (uint32_t)tile_l);
+        ifd.longs(324, std::vector<uint32_t>(ntiles, 0)); // TileOffsets (patched)
+        ifd.longs(325, std::vector<uint32_t>(ntiles, 0)); // TileByteCounts (patched)
+    }
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
     ifd.ascii(306, now_tiff_datetime()); // DateTime
-    ifd.shortv(317, 1);                // Predictor = none (faster write; same pixels)
+    if (!lossless)
+        ifd.shortv(317, 1);            // Predictor = none (unused by lossless JPEG)
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
 
     ifd.longs(50719, {0, 0});
@@ -369,6 +394,8 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
             if (heap.size() & 1) heap.push_back(0);
             e.inlineval = heap_base + (uint32_t)heap.size();
             heap.insert(heap.end(), e.payload.begin(), e.payload.end());
+            if (e.tag == 324 && tile_off_arr_pos) *tile_off_arr_pos = e.inlineval;
+            if (e.tag == 325 && tile_cnt_arr_pos) *tile_cnt_arr_pos = e.inlineval;
         }
     }
     uint32_t strip_offset = heap_base + (uint32_t)heap.size();
@@ -385,6 +412,11 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
         if (e.tag == 279) {
             strip_byte_counts_offset_out = (uint32_t)out.size() + 8;
         }
+        // Single-tile images store the one-element arrays inline in the IFD.
+        if (e.tag == 324 && e.payload.empty() && tile_off_arr_pos)
+            *tile_off_arr_pos = (uint32_t)out.size() + 8;
+        if (e.tag == 325 && e.payload.empty() && tile_cnt_arr_pos)
+            *tile_cnt_arr_pos = (uint32_t)out.size() + 8;
         w16(out, e.tag);
         w16(out, e.type);
         w32(out, e.count);
@@ -419,18 +451,37 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
                            const std::string& camera_make, const float* camToSrgb,
-                           bool pixelsPrewhitened) {
+                           bool pixelsPrewhitened, bool losslessJpeg) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
     compressed_bytes_ = 0;
     strip_byte_counts_offset_ = 0;
     deflate_ok_ = false;
+    lossless_ = losslessJpeg;
+    tile_off_arr_pos_ = tile_cnt_arr_pos_ = 0;
+    tile_offsets_.clear();
+    tile_counts_.clear();
+    rows_in_band_ = 0;
+    if (lossless_) {
+        // Tile dims must be multiples of 16 (TIFF); 256x256 balances
+        // parallelism (one task per tile) against per-tile header overhead.
+        tile_w_ = std::min(256, ((W + 15) / 16) * 16);
+        tile_l_ = 256;
+        ntx_ = (W + tile_w_ - 1) / tile_w_;
+        nty_ = (H + tile_l_ - 1) / tile_l_;
+        band_buf_.assign((size_t)tile_l_ * (size_t)W * 3u, 0);
+        tile_offsets_.reserve((size_t)ntx_ * (size_t)nty_);
+        tile_counts_.reserve((size_t)ntx_ * (size_t)nty_);
+    }
 
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
                                                    bakedSrgb, camToSrgb, pixelsPrewhitened,
-                                                   strip_offset, strip_byte_counts_offset_);
+                                                   strip_offset, strip_byte_counts_offset_,
+                                                   lossless_, tile_w_, tile_l_,
+                                                   &tile_off_arr_pos_, &tile_cnt_arr_pos_);
+    if (lossless_ && (!tile_off_arr_pos_ || !tile_cnt_arr_pos_)) return false;
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
     // Large stdio buffer — fewer syscalls during streaming writes.
@@ -447,8 +498,8 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
         return false;
     }
 
-    if (!kDngCompress) {
-        // Uncompressed: rows go straight to disk, no zlib state at all.
+    if (lossless_ || !kDngCompress) {
+        // Lossless-JPEG tiles or uncompressed: no zlib state at all.
         deflate_ok_ = true;
         return true;
     }
@@ -471,6 +522,22 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
     if (!f_ || !deflate_ok_ || !rgb16 || nrows <= 0) return false;
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
+
+    if (lossless_) {
+        const size_t row_elems = (size_t)W_ * 3u;
+        int done = 0;
+        while (done < nrows) {
+            const int take = std::min(nrows - done, tile_l_ - rows_in_band_);
+            std::memcpy(band_buf_.data() + (size_t)rows_in_band_ * row_elems,
+                        rgb16 + (size_t)done * row_elems,
+                        (size_t)take * row_elems * sizeof(uint16_t));
+            rows_in_band_ += take;
+            done += take;
+            rows_written_ += take;
+            if (rows_in_band_ == tile_l_ && !flush_band()) return false;
+        }
+        return true;
+    }
 
     if (!kDngCompress) {
         const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
@@ -510,11 +577,105 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
     return true;
 }
 
+// Encode one tile-row band (valid_rows valid rows; short bottom bands are
+// padded by repeating the last row -- decoders discard tile padding) and
+// stream the tiles out in order. Tiles encode in parallel: each is an
+// independent complete lossless-JPEG stream. Runs on the flush worker, which
+// is the only thread that touches f_ between open's prefix and close's
+// patches, so file position stays coherent without locking.
+bool DngStreamWriter::encode_and_write_band(std::vector<uint16_t>& band,
+                                            int valid_rows) {
+    const size_t row_elems = (size_t)W_ * 3u;
+    for (int y = valid_rows; y < tile_l_; ++y)
+        std::memcpy(band.data() + (size_t)y * row_elems,
+                    band.data() + (size_t)(valid_rows - 1) * row_elems,
+                    row_elems * sizeof(uint16_t));
+
+    std::vector<std::vector<uint8_t>> outs((size_t)ntx_);
+    std::vector<uint8_t> okf((size_t)ntx_, 1);
+    parallel_rows(ntx_, 0, [&](int tx) {
+        std::vector<uint16_t> t((size_t)tile_w_ * (size_t)tile_l_ * 3u);
+        const int x0 = tx * tile_w_;
+        const int nx = std::min(tile_w_, W_ - x0);
+        for (int y = 0; y < tile_l_; ++y) {
+            const uint16_t* src = band.data() + (size_t)y * row_elems +
+                                  (size_t)x0 * 3u;
+            uint16_t* dst = t.data() + (size_t)y * (size_t)tile_w_ * 3u;
+            std::memcpy(dst, src, (size_t)nx * 3u * sizeof(uint16_t));
+            for (int x = nx; x < tile_w_; ++x)
+                std::memcpy(dst + (size_t)x * 3u, dst + (size_t)(nx - 1) * 3u,
+                            3u * sizeof(uint16_t));
+        }
+        if (!lj92_encode_strip(t.data(), tile_w_, tile_l_, 3, outs[(size_t)tx]))
+            okf[(size_t)tx] = 0;
+    });
+    for (int tx = 0; tx < ntx_; ++tx) {
+        if (!okf[(size_t)tx]) return false;
+        long posl = ftell(f_);
+        if (posl < 0) return false;
+        if (posl & 1) {  // keep tile offsets word-aligned
+            const uint8_t pad = 0;
+            if (fwrite(&pad, 1, 1, f_) != 1) return false;
+            ++posl;
+        }
+        const auto& o = outs[(size_t)tx];
+        if (fwrite(o.data(), 1, o.size(), f_) != o.size()) return false;
+        tile_offsets_.push_back((uint32_t)posl);
+        tile_counts_.push_back((uint32_t)o.size());
+    }
+    return true;
+}
+
+// Hand the filled band to the worker and swap in the other buffer. At most
+// one band is in flight; a second flush first collects the previous result.
+bool DngStreamWriter::flush_band() {
+    if (rows_in_band_ <= 0) return true;
+    if (band_fut_.valid() && !band_fut_.get()) return false;
+    if (band_back_.size() != band_buf_.size())
+        band_back_.assign(band_buf_.size(), 0);
+    band_buf_.swap(band_back_);
+    const int valid = rows_in_band_;
+    rows_in_band_ = 0;
+    band_fut_ = std::async(std::launch::async, [this, valid]() {
+        return encode_and_write_band(band_back_, valid);
+    });
+    return true;
+}
+
 bool DngStreamWriter::close() {
     if (!f_) return false;
-    bool ok = rows_written_ == H_ && deflate_ok_ && (!kDngCompress || z_stream_);
+    bool ok = rows_written_ == H_ && deflate_ok_ &&
+              (lossless_ || !kDngCompress || z_stream_);
 
-    if (ok && kDngCompress) {
+    // The flush worker owns f_ while a band is in flight: join it before
+    // anything below touches or closes the file, on EVERY path.
+    if (lossless_ && band_fut_.valid() && !band_fut_.get()) ok = false;
+
+    if (ok && lossless_) {
+        if (rows_in_band_ > 0 && !flush_band()) ok = false;
+        if (band_fut_.valid() && !band_fut_.get()) ok = false;
+        const size_t want = (size_t)ntx_ * (size_t)nty_;
+        if (ok && (tile_offsets_.size() != want || tile_counts_.size() != want))
+            ok = false;
+        if (ok) {
+            auto patch_longs = [&](uint32_t at, const std::vector<uint32_t>& v) -> bool {
+                if (fseek(f_, (long)at, SEEK_SET) != 0) return false;
+                std::vector<uint8_t> le(v.size() * 4u);
+                for (size_t i = 0; i < v.size(); ++i) {
+                    le[i * 4 + 0] = (uint8_t)(v[i] & 0xFF);
+                    le[i * 4 + 1] = (uint8_t)((v[i] >> 8) & 0xFF);
+                    le[i * 4 + 2] = (uint8_t)((v[i] >> 16) & 0xFF);
+                    le[i * 4 + 3] = (uint8_t)((v[i] >> 24) & 0xFF);
+                }
+                return fwrite(le.data(), 1, le.size(), f_) == le.size();
+            };
+            if (!patch_longs(tile_off_arr_pos_, tile_offsets_) ||
+                !patch_longs(tile_cnt_arr_pos_, tile_counts_))
+                ok = false;
+        }
+    }
+
+    if (ok && !lossless_ && kDngCompress) {
         auto* zs = static_cast<z_stream*>(z_stream_);
         int ret;
         do {
@@ -530,9 +691,9 @@ bool DngStreamWriter::close() {
         } while (ret != Z_STREAM_END);
     }
 
-    // Patch StripByteCounts for both paths: Deflate accumulates the compressed
-    // size above, uncompressed accumulates the raw size in write_rows.
-    if (ok && strip_byte_counts_offset_ > 0) {
+    // Patch StripByteCounts for both strip paths: Deflate accumulates the
+    // compressed size above, uncompressed the raw size in write_rows.
+    if (ok && !lossless_ && strip_byte_counts_offset_ > 0) {
         if (fseek(f_, (long)strip_byte_counts_offset_, SEEK_SET) == 0) {
             uint8_t le[4] = {
                 (uint8_t)(compressed_bytes_ & 0xFF),
@@ -856,6 +1017,7 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
     if (ifd + 2u + (uint32_t)nent * 12u + 4u > file.size()) return false;
 
     uint32_t width = 0, height = 0, strip_off = 0, strip_bc = 0, rows_per_strip = 0;
+    uint32_t tile_w = 0, tile_l = 0, tile_off_at = 0, tile_cnt_at = 0, ntiles = 0;
     uint16_t compression = 1, predictor = 1, spp = 0;
     for (uint16_t i = 0; i < nent; ++i) {
         const uint8_t* e = file.data() + ifd + 2 + i * 12;
@@ -875,11 +1037,52 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
             case 278: rows_per_strip = as_long(rows_per_strip); break;
             case 279: strip_bc = as_long(strip_bc); break;
             case 317: predictor = (uint16_t)as_long(predictor); break;
+            case 322: tile_w = as_long(tile_w); break;
+            case 323: tile_l = as_long(tile_l); break;
+            // count 1 = inline value; else offset of the LONG array. The
+            // entry's file offset of the value slot works for both reads.
+            case 324: ntiles = count; tile_off_at = (count == 1) ? (uint32_t)(ifd + 2 + i * 12 + 8) : val; break;
+            case 325: tile_cnt_at = (count == 1) ? (uint32_t)(ifd + 2 + i * 12 + 8) : val; break;
             default: break;
         }
     }
-    if (width == 0 || height == 0 || spp != 3 || strip_off == 0) return false;
+    if (width == 0 || height == 0 || spp != 3) return false;
     if (rows_per_strip == 0) rows_per_strip = height;
+    if (compression == 7) {
+        if (tile_w == 0 || tile_l == 0 || ntiles == 0 ||
+            !tile_off_at || !tile_cnt_at)
+            return false;
+        const uint32_t ntx = (width + tile_w - 1) / tile_w;
+        const uint32_t nty = (height + tile_l - 1) / tile_l;
+        if (ntiles != ntx * nty) return false;
+        if ((size_t)tile_off_at + 4u * ntiles > file.size() ||
+            (size_t)tile_cnt_at + 4u * ntiles > file.size())
+            return false;
+        rgb.resize((size_t)width * height * 3);
+        std::vector<uint16_t> tbuf((size_t)tile_w * tile_l * 3);
+        for (uint32_t t = 0; t < ntiles; ++t) {
+            const uint32_t off = r32(file.data() + tile_off_at + 4u * t);
+            const uint32_t len = r32(file.data() + tile_cnt_at + 4u * t);
+            if (!len || (size_t)off + len > file.size()) { rgb.clear(); return false; }
+            if (!lj92_decode_strip(file.data() + off, len,
+                                   (int)tile_w, (int)tile_l, 3, tbuf.data())) {
+                rgb.clear();
+                return false;
+            }
+            const uint32_t ty = t / ntx, tx = t % ntx;
+            const uint32_t y0 = ty * tile_l, x0 = tx * tile_w;
+            const uint32_t ny = std::min(tile_l, height - y0);
+            const uint32_t nx = std::min(tile_w, width - x0);
+            for (uint32_t y = 0; y < ny; ++y)
+                std::memcpy(rgb.data() + ((size_t)(y0 + y) * width + x0) * 3u,
+                            tbuf.data() + (size_t)y * tile_w * 3u,
+                            (size_t)nx * 3u * sizeof(uint16_t));
+        }
+        W = (int)width;
+        H = (int)height;
+        return true;
+    }
+    if (strip_off == 0) return false;
     if (compression != 8 && compression != 1) return false;
     if (strip_off >= file.size()) return false;
 
@@ -912,28 +1115,17 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
     return true;
 }
 
-bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
-                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
-                                 bool& has_color) {
-    has_color = false;
-    wb[0] = wb[1] = wb[2] = 1.f;
-    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
-
-    if (!load_linear_dng_rgb16(path, rgb, W, H)) return false;
-
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return true;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return true; }
-    long fsz = ftell(f);
-    if (fsz < 16) { fclose(f); return true; }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return true; }
-    std::vector<uint8_t> file((size_t)fsz);
-    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return true; }
-    fclose(f);
-
-    if (file[0] != 'I' || file[1] != 'I') return true;
+// Color-rendering tags only (private WB+matrix tag 65000, ColorMatrix1,
+// AnalogBalance), parsed from an in-memory prefix of the file. Split out of
+// load_linear_dng_rgb16_color so the render path can get wb/matrix WITHOUT
+// inflating the pixel strips -- our writer lays every tag and small value
+// block ahead of the pixel data, so a modest prefix always contains them.
+static void parse_linear_dng_color_tags(const std::vector<uint8_t>& file,
+                                        float wb[3], float cam_to_srgb[9],
+                                        bool& has_color) {
+    if (file.size() < 16 || file[0] != 'I' || file[1] != 'I') return;
     uint32_t ifd = r32(file.data() + 4);
-    if (ifd + 2 > file.size()) return true;
+    if (ifd + 2 > file.size()) return;
     uint16_t nent = r16(file.data() + ifd);
     bool private_color = false;
     bool has_color_matrix = false;
@@ -1004,6 +1196,48 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
             has_color = true;
         }
     }
+}
+
+static void reset_color_out(float wb[3], float cam_to_srgb[9], bool& has_color) {
+    has_color = false;
+    wb[0] = wb[1] = wb[2] = 1.f;
+    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
+}
+
+bool load_linear_dng_color_meta(const std::string& path, float wb[3],
+                                float cam_to_srgb[9], bool& has_color) {
+    reset_color_out(wb, cam_to_srgb, has_color);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    // 4MB prefix: our writer keeps the IFD and every referenced value block
+    // ahead of the pixel strips, orders of magnitude inside this. A tag whose
+    // data lay beyond the prefix simply fails its bounds check and is skipped
+    // -- the same silent fallback the full parse used for a truncated file.
+    std::vector<uint8_t> file(4u << 20);
+    const size_t got = fread(file.data(), 1, file.size(), f);
+    fclose(f);
+    file.resize(got);
+    parse_linear_dng_color_tags(file, wb, cam_to_srgb, has_color);
+    return got >= 16;
+}
+
+bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
+                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
+                                 bool& has_color) {
+    reset_color_out(wb, cam_to_srgb, has_color);
+    if (!load_linear_dng_rgb16(path, rgb, W, H)) return false;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return true;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return true; }
+    long fsz = ftell(f);
+    if (fsz < 16) { fclose(f); return true; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return true; }
+    std::vector<uint8_t> file((size_t)fsz);
+    if (fread(file.data(), 1, file.size(), f) != file.size()) { fclose(f); return true; }
+    fclose(f);
+
+    parse_linear_dng_color_tags(file, wb, cam_to_srgb, has_color);
     return true;
 }
 

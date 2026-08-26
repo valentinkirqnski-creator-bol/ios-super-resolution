@@ -20,23 +20,13 @@ namespace hhsr {
 using f32 = float;
 
 // Row-major image / tensor with an arbitrary number of interleaved channels.
-// Number of feature planes the learned robustness mask consumes
-// (robustness_nn.h). Fixed by the trained weights --
-// tools/rob_nn/rob_dataset.cpp writes them in this order and
-// tools/rob_nn/train_rob.py trains on that layout, so changing it means
-// retraining, not just editing a constant.
-inline constexpr int kRobustnessNnChannels = 13;
-
-// The learned mask runs in horizontal strips to bound peak memory (see
-// build_robustness_nn_features). kRobustnessNnHalo is the network's exact
-// receptive-field radius in guide pixels -- conv3x3 (1) + dilation-2 3x3 (2)
-// + dilation-4 3x3 (4) + conv3x3 (1) -- so outputs inside the strip are
-// bit-identical to whole-plane inference. Changing the architecture changes
-// this number.
-inline constexpr int kRobustnessNnHalo = 8;
-inline constexpr int kRobustnessNnStripRows = 192;
-
 struct Image {
+    // GPU residency handshake (same design as CovField::gpu_tag): nonzero
+    // means "at the time this was produced, a GPU buffer with these exact
+    // bytes was published under this tag". Only the robustness path sets it
+    // today. Any code that MUTATES pixel data after production must zero it,
+    // or a consumer could bind the stale GPU copy.
+    uint64_t gpu_tag = 0;  // see comment above
     int h = 0;
     int w = 0;
     int c = 1;
@@ -57,7 +47,6 @@ struct FlowField {
     int ny = 0;
     int nx = 0;
     std::vector<f32> flow; // ny*nx*2
-    std::vector<uint32_t> aperture_limited; // ny*nx, 1 = Hessian says 1D/aperture-limited
     std::vector<uint32_t> match_ambiguous;  // ny*nx, 1 = best BM match is not clearly unique
 
     // Wronski's motion prior M: 1 where the flow field varies sharply across the
@@ -72,7 +61,7 @@ struct FlowField {
     // but for alignment jitter the doubling wins and the test over-fires --
     // measured at roughly 6x the flagged area near the threshold.
     //
-    // Deliberately NOT allocated by the constructor, unlike the two above: an
+    // Deliberately NOT allocated by the constructor, unlike match_ambiguous: an
     // all-zero vector of the right length is indistinguishable from "measured,
     // nothing irregular". Empty means not measured, and compute_s falls back to
     // deriving it, which is what the full-resolution FFT path relies on.
@@ -81,7 +70,6 @@ struct FlowField {
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
-        aperture_limited((size_t)ny_ * nx_, 0u),
         match_ambiguous((size_t)ny_ * nx_, 0u) {}
 
     // True when motion_irregular carries a measurement for this grid.
@@ -121,16 +109,57 @@ struct FlowField {
     // Every consumer must use this or none of them: the mask has to score the
     // correspondence the merge actually fetches, so an interpolated merge with
     // a nearest mask would grade a fetch nobody performs.
+    // Interpolation order for sample_bilinear: false = bilinear (default),
+    // true = Catmull-Rom bicubic. Set from Config::flow_bicubic_sampling by
+    // the pipeline once the field is final, so every CPU consumer switches
+    // together without threading a Config through each call site.
+    bool sample_bicubic = false;
+
     inline void sample_bilinear(f32 raw_y, f32 raw_x, int tile_size,
                                 f32& out_dx, f32& out_dy) const {
-        if (has_fine()) {
-            sample_grid(fine_flow.data(), fine_ny, fine_nx,
-                        0.5f * (f32)tile_size, raw_y, raw_x, out_dx, out_dy);
-            return;
+        const f32* g = has_fine() ? fine_flow.data() : flow.data();
+        const int gny = has_fine() ? fine_ny : ny;
+        const int gnx = has_fine() ? fine_nx : nx;
+        const f32 ts = has_fine() ? 0.5f * (f32)tile_size : (f32)tile_size;
+        if (gny <= 0 || gnx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
+        if (sample_bicubic)
+            sample_grid_bicubic(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
+        else
+            sample_grid(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
+    }
+
+    static inline f32 catmull1(f32 p0, f32 p1, f32 p2, f32 p3, f32 t) {
+        return 0.5f * (2.f * p1 + (-p0 + p2) * t +
+                       (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t +
+                       (-p0 + 3.f * p1 - 3.f * p2 + p3) * t * t * t);
+    }
+    // Catmull-Rom twin of sample_grid: same lattice convention, 4x4 clamped
+    // taps. Interpolates the lattice values exactly (passes through them), so
+    // at tile centres it agrees with bilinear to the float.
+    static inline void sample_grid_bicubic(const f32* grid, int gny, int gnx,
+                                           f32 ts, f32 raw_y, f32 raw_x,
+                                           f32& out_dx, f32& out_dy) {
+        if (gny <= 0 || gnx <= 0 || !(ts > 0.f)) { out_dx = 0.f; out_dy = 0.f; return; }
+        const f32 tcy = raw_y / ts - 0.5f;
+        const f32 tcx = raw_x / ts - 0.5f;
+        const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+        const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+        f32 rx[4], ry[4];
+        for (int i = -1; i <= 2; ++i) {
+            const int iy = cl(y0 + i, gny);
+            f32 px[4], py[4];
+            for (int j = -1; j <= 2; ++j) {
+                const int ix = cl(x0 + j, gnx);
+                const f32* v = grid + ((size_t)iy * gnx + ix) * 2;
+                px[j + 1] = v[0];
+                py[j + 1] = v[1];
+            }
+            rx[i + 1] = catmull1(px[0], px[1], px[2], px[3], ax);
+            ry[i + 1] = catmull1(py[0], py[1], py[2], py[3], ax);
         }
-        if (ny <= 0 || nx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
-        sample_grid(flow.data(), ny, nx, (f32)tile_size, raw_y, raw_x,
-                    out_dx, out_dy);
+        out_dx = catmull1(rx[0], rx[1], rx[2], rx[3], ay);
+        out_dy = catmull1(ry[0], ry[1], ry[2], ry[3], ay);
     }
     // The shared bilinear-lattice math, parameterised over which grid it
     // reads. `ts` is the grid's tile pitch in raw pixels (fractional for the
@@ -155,8 +184,6 @@ struct FlowField {
         out_dx = tx0 + (bx0 - tx0) * ay;
         out_dy = ty0 + (by0 - ty0) * ay;
     }
-    inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
-    inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
 
     // Optional boundary-selected refinement at HALF the tile pitch, built by
     // flow_densify_boundary_select. Where the four surrounding tile vectors
@@ -191,6 +218,11 @@ struct FlowField {
 struct CovField {
     int h = 0;
     int w = 0;
+    // Set by estimate_kernels_metal when this field's bytes still live in a
+    // GPU buffer: the merge host binds that buffer instead of re-uploading
+    // 48MB, valid until the NEXT estimate overwrites the shared scratch
+    // (which bumps the live tag). 0 = no GPU copy known.
+    uint64_t gpu_tag = 0;
     std::vector<f32> cov;
 
     CovField() = default;
@@ -249,7 +281,7 @@ struct IspParams {
     // which is what made the render look flat. Back to the full measured matrix.
     float colour_strength = 1.0f;
     // S-curve in display space, applied to luminance so hue is preserved.
-    float contrast = 0.55f;
+    float contrast = 0.62f;
     // Saturation-dependent boost: muted colours gain, already-saturated ones
     // barely move. This is what separates vibrance from RGB *= k.
     float vibrance = 0.50f;
@@ -257,7 +289,7 @@ struct IspParams {
     float saturation = 1.0f;
     // Re-adds the detail layer above unity for local micro-contrast. Distinct
     // from sharpening: no high-pass, no halos, no noise amplification.
-    float local_contrast = 0.20f;
+    float local_contrast = 0.30f;
     // Chroma noise reduction, applied to the linear merge before anything else
     // in the render. 0 disables it.
     //
@@ -270,15 +302,21 @@ struct IspParams {
     // vibrance is literally a chroma multiplier, so it amplifies it again,
     // hardest in the flat desaturated areas where it shows most.
     //
-    // Filtering chroma is close to free perceptually: chroma carries very little
-    // detail, which is why every JPEG subsamples it. Luminance is preserved
-    // exactly here -- only the colour difference from luma is smoothed -- so
-    // this cannot soften the image, only desaturate fine colour detail.
-    // 0 = off, and off is the shipped default: it makes the JPEG bit-identical
-    // to the render before this stage existed, since isp_denoise_chroma
-    // early-returns and never touches the buffer. Raise it to trade fine
-    // colour detail for less chroma blotching; measured -73% chroma sigma at
-    // 0.75 with luma unchanged to six decimal places.
+    // Filtering chroma is close to free perceptually: chroma carries very
+    // little detail, which is why every JPEG subsamples it. Luminance is
+    // preserved exactly here -- only the colour difference from luma is
+    // smoothed.
+    //
+    // ON by default since the filter became detail-gated (isp_denoise_chroma
+    // soft-cores by the measured noise scale: deviations within ~2 sigma of
+    // the local chroma are noise and get smoothed, beyond ~6 sigma they are a
+    // pink flower or a red jacket and are left alone). The ungated version
+    // pulled EVERY deviation toward the local mean, which drained small
+    // saturated objects toward grey at useful strengths -- that is why this
+    // shipped at 0 for so long while the HDR render's shadow lift (measured
+    // auto exposure up to ~x5.7) was exposing exactly the chroma blotch this
+    // stage exists to remove. The gate's sigma is measured per image, so a
+    // clean 8-frame merge gets a tight gate and a noisy one gets a wider one.
     float chroma_denoise = 0.0f;
     // Radius of the chroma filter in FULL-RESOLUTION pixels.
     float chroma_denoise_radius = 12.f;
@@ -452,22 +490,20 @@ struct Config {
     float noise_beta_ch_robustness(int c) const {
         return debug_noise_model_disabled ? 0.f : noise_beta_ch(c);
     }
-    // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
-    // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
-    // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.
-    bool  debug_pixel4a_noise_profile = false;
-    int   debug_pixel4a_noise_curve_iso = 0;
-
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
     std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
-    // Finest level raised from 1 to 2.
+    // Finest level back to the reference's 1 (python-z default.yaml has
+    // search_radii: [1, 4, 4, 4]); the coarse levels keep 4.
     //
     // The align_ica_per_level comment below works out the budget: with factors
     // {1,2,4,4} the flow arriving at a level carries up to 0.5*factor of
     // residual, so levels 2 and 1 receive 2px against a radius of 4 and have
-    // slack, while level 0 received 1px against a radius of 1 and had none.
+    // slack, while level 0 receives 1px against a radius of 1 and has none.
+    // Per-level ICA is what buys that margin back, by making what arrives
+    // sub-pixel instead of integer -- so this value and align_ica_per_level
+    // have to be reasoned about together.
     //
     // Measured on the ok/ burst -- repetitive straight-line structure, the
     // adverse case for this parameter -- comparing 0728 against 0727:
@@ -485,20 +521,15 @@ struct Config {
     // coarser levels agreed on. Content with genuine fine-scale motion and no
     // repetition was never tested and may prefer the wider window.
     //
+    // In RAW pixels, like bm_tile_sizes; grey_search_radius converts to grey
+    // pixels at the point of use, so a configured 4 reaches the same physical
+    // distance on both greys. The decimate finest level is the one place the
+    // two cannot be equalised -- see grey_search_radius.
+    //
     // Also sets the ICA step clamp, which bounds one iteration to the level's
-    // search radius -- so this is 3px at the finest level.
-    std::vector<int> bm_search_radii = {3, 4, 4, 4};
+    // search radius, over ica_n_iter iterations.
+    std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
-
-    // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
-    // alignment through the bundled PWCNet Core ML model (neural_flow.h)
-    // instead of align()'s block-matching pyramid, then re-uses the exact
-    // same flow_to_raw_tile_grid-derived path into compute_robustness/merge
-    // -- only the source of the flow field changes, not anything downstream
-    // of it. Falls back to the classical path per-frame if neural_flow_
-    // available() is false (model missing/failed to load) or the guide
-    // image isn't the fixed size the bundled model was converted for.
-    bool use_neural_flow = false;
 
     int  ica_n_iter = 3;
     // Run ICA after block matching on EVERY pyramid level, not only the finest.
@@ -595,67 +626,32 @@ struct Config {
         const int s = alignment_grey_scale();
         return (s <= 1) ? raw_tile_size : std::max(8, raw_tile_size / s);
     }
+    // bm_search_radii[lvl] converted from raw pixels into alignment-grey
+    // pixels, mirroring grey_tile_size so that both quantities denote the same
+    // physical distance whichever grey the alignment runs on. Before this
+    // existed the radii were consumed as grey pixels while the tile sizes were
+    // converted, so the same configured number reached twice as far on the
+    // decimate path -- 256 raw pixels at the coarsest level against FFT's 128,
+    // and a finest window of +/-2 raw against FFT's +/-1.
+    //
+    // Floored at 1: the search is an integer grid on the grey, so half a grey
+    // pixel is not expressible, and a zero-radius level would evaluate only the
+    // seed it was handed.
+    //
+    // That floor has a consequence worth stating plainly. On the decimate grey
+    // the finest level cannot reach a single RAW pixel: 1/2 floors back to 1
+    // grey pixel, which spans 2 raw. Closing that last factor of two would
+    // require the search itself to run at raw resolution, not a change of
+    // units here.
+    int grey_search_radius(int raw_radius) const {
+        const int s = alignment_grey_scale();
+        return (s <= 1) ? raw_radius : std::max(1, raw_radius / s);
+    }
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
-    // Off: alignment matches d5215ec, which had no thumbnail pre-alignment pass.
-    // With this false the plan stays empty, so every frame enters align() with a
-    // zero initial transform and frame 0 stays the reference.
-    bool global_prealignment_enabled = false;
-    // Off by default: it is the only thing that forces the pre-alignment pass
-    // to decode every frame up front, and with it off the transform is computed
-    // in the analysis loop from the buffer already decoded there -- the stage
-    // goes from a separate decode pass to roughly the cost of one thumbnail per
-    // frame. See prealign_use_decoded_frames.
-    //
-    // What it gives up: the merge base is frame 0 rather than the frame nearest
-    // the midpoint of the burst's travel. The global transforms, the rotation,
-    // the flow initialisation and the aperture-problem benefit are all
-    // unaffected -- with frame 0 as reference from_reference[k] reduces to
-    // to_first[k] identically, so the prior is the same value, measured
-    // directly instead of composed.
-    bool global_prealignment_choose_reference = false;
-    float global_prealignment_rotation_range_deg = 0.0f;
-    float global_prealignment_rotation_step_deg = 0.25f;
-    int   global_prealignment_max_shift = 24;       // thumbnail pixels
-    int   global_prealignment_thumb_max_dim = 320;
-    // How many frames the pre-alignment pass decodes concurrently.
-    //
-    // That pass is a decode loop and nothing else: measured at 12MP the decode
-    // is 750ms per frame, the thumbnail 7ms, and the NCC search itself is below
-    // the timer's resolution. Overlapping the decodes is the only lever, and it
-    // cannot change the result -- the iterations share nothing and the estimate
-    // is deterministic.
-    //
-    // A decoded 12MP frame is 48MB, so 3 in flight is ~150MB. Raise it only if
-    // the device has headroom; 1 restores the serial loop exactly.
-    int   prealign_decode_concurrency = 3;
-    // Take the pre-alignment transform from the frame the analysis loop has
-    // already decoded, instead of running a separate pass that decodes every
-    // frame again purely to build a 320px thumbnail.
-    //
-    // Measured at 12MP: that pass is 750ms of decode per frame against 7ms of
-    // thumbnail and an NCC search below the timer's resolution, so it is a
-    // decode loop and nothing else. Integrated, an 8-frame burst spends ~52ms
-    // instead of ~3900ms and the stage stops existing as a separate step.
-    //
-    // Requires global_prealignment_choose_reference to be off, because picking
-    // the reference needs every frame's transform before the loop starts. With
-    // it off the reference is frame 0, and from_reference[k] reduces to
-    // to_first[k] exactly, so the inline result is identical to the pass it
-    // replaces -- same two thumbnails, same search, only computed later.
-    bool  prealign_use_decoded_frames = true;
 
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
-    // Debug: split the accumulated mask by which motion prior each pixel used,
-    // writing _robustness_s1.pgm and _robustness_s2.pgm alongside the combined
-    // one. s1 is the strict prior, applied where the flow field varies sharply
-    // (the r_Mt test) or the tile is aperture-limited; s2 is the permissive
-    // default. The two split masks sum exactly to the combined mask.
-    //
-    // Off by default: it costs one extra full-resolution float buffer per
-    // comparison frame while the mask is being built.
-    bool  robustness_save_s_masks = false;
 
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
@@ -697,19 +693,6 @@ struct Config {
     // own dimensions rather than trusting this flag, because this path
     // silently falls back to guide resolution when the hires ref stats
     // are missing).
-    // Replace the analytic robustness mask (Wronski Eq. 5-9) with the learned
-    // one in robustness_nn.h. Off by default: the analytic mask is the
-    // reference behaviour and the network is only as good as the bursts it
-    // was trained on. Falls back automatically when the model is missing or
-    // fails to load, so enabling it can never leave the pipeline without a
-    // mask.
-    //
-    // Motivation, measured (tools/rob_nn, synthetic bursts with ground-truth
-    // motion built from real raws): the analytic mask separates harmful from
-    // harmless pixels with AUC 0.638 and cannot exceed ~26% detection at any
-    // threshold, because it pins most pixels at exactly R = 1. The network
-    // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
-    bool use_neural_robustness = false;
 
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
@@ -719,6 +702,26 @@ struct Config {
     bool robustness_raw_resolution_active() const {
         return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
     }
+    // Sample the per-tile flow BILINEARLY between tile centres wherever it is
+    // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
+    // mask -- instead of taking the containing tile's vector. Removes the
+    // piecewise-constant staircase that rotation turns into a visible tile
+    // grid. See FlowField::sample_bilinear for why rotation and not
+    // translation. All consumers switch together or the mask would grade a
+    // correspondence the merge never fetches.
+    bool  flow_bilinear_sampling = true;
+
+    // Sample the tile flow BICUBICALLY (Catmull-Rom over the 4x4 tile
+    // neighbourhood) instead of bilinearly. C1-smooth field instead of C0;
+    // the reference's author expects it NOT to fix boundary artifacts (flow
+    // is only piecewise smooth, and a smoother interpolant just blends the
+    // wrong model more smoothly there -- boundary selection handles that
+    // case), but it removes the bilinear field's derivative kinks at tile
+    // centres in smooth regions. Catmull-Rom can overshoot near sharp flow
+    // changes by up to ~12% of the local step. Requires flow_bilinear_sampling;
+    // every consumer switches together, as always.
+    bool  flow_bicubic_sampling = false;
+
     // HDR+'s merge scheme as an experiment (the IPOL author's suggested first
     // test): tiles of Ts = tile_size at stride Ts/2, each half-pitch lattice
     // cell measured on its own FULL-tile overlapping window (no interpolated
@@ -756,15 +759,58 @@ struct Config {
     // stands, and the ambiguity fallback (keep the seed) is never refined.
     // Matters most on the decimate grey, where every residual ICA cannot
     // recover is twice as large in raw pixels.
-    //
-    // OFF by default here, unlike the commit it came from: this branch is the
-    // dc92f15 snapshot plus the overlapped-tile merge and nothing else, and
-    // this feature arrived only as incidental baggage of that merge's
-    // prerequisite (54505f9 bundled two unrelated flow features in one
-    // commit). It changes the alignment every frame, so leaving it on made
-    // the default output differ from dc92f15 for a reason nobody asked for.
-    // The Settings toggle is still there to opt in.
-    bool  bm_subpixel_quadratic = false;
+    bool  bm_subpixel_quadratic = true;
+
+    // Anti-aliased decimation for the ALIGNMENT grey (decimate path only).
+    // The quad average is a 2x2 box -- a real but weak low-pass (transfer
+    // cos(pi f)) that lets energy between the grey Nyquist and the raw
+    // Nyquist fold back into the half-res image as aliasing, which is what
+    // makes block-matching/ICA flow wobble with fine texture instead of
+    // following motion. This swaps it for a half-phase separable binomial
+    // [1 3 3 1]/8 on the raw mosaic (cos^3(pi f), effective Gaussian sigma
+    // ~0.87 raw px): same lattice phase (centred at 2g+0.5, so no coordinate
+    // conversion changes), same exact R:G:G:B channel balance, ~10x stronger
+    // alias suppression near raw Nyquist. Alignment grey only -- the
+    // robustness guide and merge are untouched.
+    bool  grey_decimate_lowpass = true;
+
+    // Full-resolution ICA polish for the decimate path's flow -- the last
+    // remaining accuracy gap to the full-res FFT grey. Every decimate stage,
+    // the final ICA included, measures on the half-res grey, so every
+    // residual is committed in grey units and doubles in raw pixels. When
+    // enabled, the finished flow (post flow_to_raw_tile_grid) gets one final
+    // ICA refinement at RAW resolution on the band-limited full-res FFT grey
+    // -- the very image the FFT path measures on -- seeded by the decimate
+    // estimate. The seed is already sub-pixel (quadratic BM fit + per-level
+    // ICA + boundary selection), so the pass operates deep inside ICA's
+    // convergence basin: it can only sharpen, not wander. After it the two
+    // grey methods differ only in coarse-level tile decisions on pathological
+    // content, not in sub-pixel accuracy. Decimate + Bayer only; the FFT path
+    // already ends with exactly this pass.
+    bool  align_fullres_polish = true;
+
+    // Store the output DNG UN-white-balanced (real AsShotNeutral) instead of
+    // baking the WB gains into the pixels. The pipeline merges in
+    // pre-white-balanced space (Python utils_dng order), so gains of R~2.06 /
+    // B~1.84 were applied BEFORE the 16-bit ceiling: any red highlight above
+    // ~0.49 of raw full scale clipped at the DNG write even though the sensor
+    // never clipped it -- about 1.05 stops of red and 0.9 of blue headroom
+    // lost relative to the input DNGs, and the clipped areas skewed magenta
+    // (R/B pinned, G below). With this on, the encoder divides each channel
+    // by its gain before the clamp and the writer emits AsShotNeutral=1/gain
+    // (its existing non-prewhitened branch), so editors apply WB in float and
+    // their highlight recovery sees everything the sensor saw. The merge is
+    // untouched -- only the container representation changes -- and the app's
+    // own JPEG/preview render re-multiplies the gains on load (self-describing
+    // via the private WB tag), so it renders bit-identically.
+    bool  dng_store_unwhitened = true;
+    // Write the output DNG with lossless-JPEG tiles (Compression=7, the
+    // standard DNG codec every reader ships -- Apple ProRAW's own LinearRaw
+    // DNGs use it) instead of uncompressed strips. Bit-identical pixels;
+    // typically 2-3x smaller (size depends on scene content -- entropy
+    // coding), and the save gets faster because ~100MB of encoded tiles
+    // beats pushing ~293MB uncached to NAND; tiles encode in parallel.
+    bool  dng_lossless_jpeg = true;
 
     // At motion boundaries, SELECT a tile vector instead of blending.
     // Bilinear sampling between tile centres is correct where the field is
@@ -779,23 +825,7 @@ struct Config {
     // best explains the alignment guide there (L1 over the cell footprint).
     // Every warping consumer samples the refined grid through the same
     // sample_bilinear entry point, so mask and merge stay in lockstep.
-    //
-    // OFF by default here, for the reason above (incidental baggage of the
-    // overlap merge's prerequisite) AND for a correctness reason specific to
-    // this branch: "mask and merge stay in lockstep" is NOT currently true on
-    // the GPU path. compute_robustness_metal_impl deliberately stays on the
-    // COARSE grid (see the comment there) while acquire_frame_gpu uploads the
-    // FINE one, so with this on, the mask scores a correspondence the merge
-    // never fetches -- exactly what the sample_bilinear comment above warns
-    // about, and it shows up as unrejected sub-pixel misalignment at motion
-    // boundaries. The coarse-grid choice was made to avoid reconciling this
-    // function's aperture-rejection machinery (flow_reject_1d_enabled, which
-    // dc92f15 has and the upstream commit had already deleted) -- but that
-    // branch is dead by default, so the desync buys nothing. Fixing the GPU
-    // mask to duplicate S/motion_irregular/match_ambiguous onto the fine grid
-    // would let this default back on; until then it stays off, and the fine
-    // grid is built only when the overlap merge explicitly asks for it.
-    bool  flow_boundary_selection = false;
+    bool  flow_boundary_selection = true;
     // Raw-pixel disagreement (Chebyshev, across the four corner vectors)
     // above which a cell is treated as a motion boundary. Below it, blending
     // is not just harmless but preferable -- it carries sub-tile gradients
@@ -809,7 +839,7 @@ struct Config {
     // second-best cost within flow_reject_1d_ambiguity_ratio, the same test
     // that already feeds the match_ambiguous flag -- the found offset is
     // DISCARDED and the tile keeps its seed: the upsampled previous-level
-    // flow, or the global initial estimate at the coarsest level.
+    // flow, or zero at the coarsest level.
     //
     // This acts on the flow itself, unlike flow_reject_ambiguous_enabled's
     // soft demotion to s1 downstream -- which is inert under rotation, where
@@ -821,24 +851,12 @@ struct Config {
     // Off by default: changes which flow gets computed for every ambiguous
     // tile at every level, on CPU and Metal -- A/B against the default
     // before adopting.
-    // Sample the per-tile flow BILINEARLY between tile centres wherever it is
-    // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
-    // mask -- instead of taking the containing tile's vector. Removes the
-    // piecewise-constant staircase that rotation turns into a visible tile
-    // grid. See FlowField::sample_bilinear for why rotation and not
-    // translation. All consumers switch together or the mask would grade a
-    // correspondence the merge never fetches.
-    bool  flow_bilinear_sampling = true;
-
     bool  align_ambiguous_fallback_enabled = false;
 
-    // Test switch from the aperture experiments: force merge robustness to zero
-    // only when a tile is one-dimensional and its aligned guide residual is
-    // high. This does not repair flow; it rejects unsafe 1D tiles.
-    bool  flow_reject_1d_enabled = false;
-    // A tile is considered one-dimensional when lambda2/lambda1 is below this
-    // ratio. Higher catches more edge-like tiles; lower limits rejection to
-    // very purely one-dimensional tiles.
+    // Eigenvalue ratio (lambda2/lambda1) below which a tile counts as
+    // one-dimensional. Read by the ICA damping guard below -- higher treats
+    // more edge-like tiles as aperture-limited, lower restricts it to very
+    // purely one-dimensional tiles.
     float flow_regularize_aperture_ratio = 0.15f;
     // Regularize the ICA solve. Two independent guards, both on by default:
     //
@@ -860,8 +878,9 @@ struct Config {
     //     residual/gradient. Measured at 5.1px for a 30x residual. The clamp
     //     bounds ICA to what the search that preceded it could have reached.
     bool  ica_regularize_enabled = true;
-    // Legacy setting kept for old saved app preferences. The current 1D reject
-    // gate uses flow_reject_1d_residual_threshold instead.
+    // Cost ratio that defines an ambiguous block match: a tile is flagged when
+    // its second-best match costs less than this times the best. Read by both
+    // the match_ambiguous flag and align_ambiguous_fallback_enabled.
     float flow_reject_1d_ambiguity_ratio = 1.10f;
     // Produce and consume the block-matching ambiguity flag: a tile is marked
     // when its second-best match costs less than ambiguity_ratio times the best,
@@ -884,51 +903,28 @@ struct Config {
     // so the flag has to survive from where the mistake is made to where the
     // mask is applied. upscale_flow_460 already propagates it.
     bool  flow_reject_ambiguous_enabled = true;
-    // A 1D tile is rejected only when enough pixels in that tile have
-    // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
-    // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.
-    float flow_reject_1d_residual_threshold = 2.5f;
-    // Scales the estimated sensor noise variance subtracted before the HF
-    // loss ratio. >1 assumes more noise, so less of the local variance counts
-    // as signal and fewer areas are flagged as high-frequency detail; <1 is
-    // more aggressive. 1.0 leaves the estimate as measured.
-    // Minimum texture SNR: signal variance must exceed this multiple of the
-    // noise floor before a pixel is treated as real high-frequency detail.
-    // loss landed, then a hardcoded kMinTextureSnr = 4; configurable again.
-    // High-frequency artifact rejection (Wronski et al., "High Frequency
-    // Artifacts Removal"). Block matching cannot resolve repetitive fine
-    // texture -- the aperture problem -- so it locks onto the wrong period and
-    // produces blocky artifacts. Rejected only where BOTH hold:
-    //
-    //   1. the patch is almost entirely high-frequency: most of its local
-    //      variance disappears under a low-pass filter, and
-    //   2. the alignment vector field varies a lot locally -- the same r_Mt
-    //      test that drives the motion prior, as the paper specifies.
-    //
-    // Both are needed. Hair and fur are high-frequency but track cleanly, so
-    // condition 2 spares them. A flat noisy wall has unstable flow but no real
-    // high-frequency signal, so condition 1 spares it.
-    //
-    // Off by default: it changes which pixels merge, so enable it deliberately.
-    bool  hf_artifact_removal_enabled = false;
-    // loss = 1 - variance_lowpass / variance_original, both noise-corrected.
-    // Above this the patch counts as high-frequency. Reference points measured
-    // on typical content: flat wall ~0.04, face ~0.19, brick ~0.83,
-    // checkerboard ~0.92.
-    float hf_variance_loss_threshold = 0.75f;
-    // The patch is skipped unless its signal variance exceeds this multiple of
-    // the estimated sensor noise variance. This is what stops ISO 6400 noise
-    // reading as high-frequency detail, and it scales with brightness through
-    // the noise model rather than being a fixed number.
-    float hf_min_texture_snr = 4.0f;
-    bool  motion_edge_rejection_enabled = true;
-    float motion_edge_threshold = 0.025f;
-    float motion_edge_residual_threshold = 2.5f;
-    float motion_edge_noise_floor_multiplier = 1.0f;
-    int   motion_edge_neighborhood_radius = 1;
 
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
-    bool  accumulated_robustness_denoiser_enabled = true;
+    // Store the ONLINE merge accumulator as fp16 instead of fp32. Kernel
+    // arithmetic stays float32; only the stored num/den narrow. At 48 MP this
+    // halves the pipeline largest allocation (1116 -> 558 MB) and the
+    // bandwidth-bound merge dominant traffic (585 -> ~292 MB/frame).
+    // OUTPUT CHANGES: storage quantisation is ~0.05% relative per store,
+    // about 1-2 LSB of the 16-bit result -- the accepted trade. The banded
+    // path and the host reference stay fp32 regardless.
+    bool merge_fp16_accumulator = true;
+
+    // Skip merge work whose contribution is numerically negligible:
+    //  - taps whose kernel exponent z > 16 (weight < 3.4e-4 of the centre
+    //    tap; the anisotropic kernels put several of the 9 taps out here);
+    //  - overlapped-merge hypotheses carrying < 5% window weight (corner
+    //    hypotheses near cell centres cost a full gather for ~nothing; the
+    //    den normalisation absorbs the removal).
+    // Output changes at the ~1e-3 relative level of individual weights --
+    // far below one 16-bit LSB after normalisation.
+    bool merge_fast_weights = true;
+
+    bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;
     // How the burst is merged. 0 = pick by working-set size, 1 = force banded
@@ -963,6 +959,12 @@ struct Config {
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
     float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
     float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]
+    // Keep the manually-set D_th/D_tr above even when snr_auto_tune is on
+    // (auto-tune still drives k_detail/k_denoise/tile size). The D gate
+    // routes each pixel between super-resolution (D=0: sharp anisotropic
+    // kernel) and denoising (D=1: k_detail*k_denoise wide kernel); the two
+    // thresholds are in GAT-domain gradient units where noise has sigma ~ 1.
+    bool  d_thresh_manual = false;
     // Drive Eq. 4's kernel anisotropy continuously from (l1-l2)/(l1+l2), as
     // the paper describes, instead of switching to the full stretch only above
     // 0.9025. See compute_k in kernels.cpp for why the switch mattered: it
@@ -970,6 +972,32 @@ struct Config {
     // edges -- with a round kernel and none of the misalignment tolerance
     // Section 5.1.1 designs the anisotropic kernel to provide.
     bool kernel_anisotropy_continuous = true;
+
+    // Zero-floor the linear anisotropy law. The reference's linear selection
+    // (and the continuous mode above) interpolates the kernel shape with
+    // weight 0.5*A, and A = 1 + sqrt(coherence) never goes below 1 -- so the
+    // stretch weight never drops below 0.5: even NEAR-ISOTROPIC detail in
+    // high-contrast areas (D ~ 0) is elongated 2.5:0.75 along whichever
+    // eigenvector the 2x2-gradient tensor happened to prefer. Distant text is
+    // the worst case: multi-oriented strokes of 1-2 raw px produce moderate
+    // coherence (~0.3-0.6) with an orientation that is mostly aliasing noise
+    // at the half-res tensor's scale, and the resulting 3-6:1 kernels smear
+    // glyphs into unreadability (or double their strokes, which reads as
+    // misalignment). This remaps the weight to w = 0.975 * (A - 1) / 0.95,
+    // clamped: zero at A = 1 (isotropic -> round kernel), the SAME value at
+    // the old hard threshold A = 1.95, full stretch only for genuinely
+    // coherent single-orientation edges. Clean edges keep their elongation;
+    // junk orientations stop being amplified.
+    bool kernel_anisotropy_zero_floor = true;
+    // Exponent on the zero-floored stretch weight: w = 0.975 * t^gamma with
+    // t = clamp((A-1)/0.95). 1 = the plain zero-floor law. The default 2 was
+    // fitted to a measurement, not a guess: distant text (coherence ~0.36)
+    // was only readable with a manual global k_stretch of 2.0, and gamma = 2
+    // reproduces exactly that stretch (2.2:1) AT text's coherence while a
+    // clean single-orientation edge (coherence ~0.9) keeps 95% of the full
+    // k_stretch = 4 elongation the manual override was giving up. Raising
+    // gamma concentrates stretch onto ever-more-coherent structure.
+    f32  kernel_stretch_gamma = 1.0f;
 
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
@@ -1010,33 +1038,6 @@ struct Config {
 };
 
 inline f32 clampf(f32 v, f32 lo, f32 hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-inline int round_pixel4a_noise_curve_iso(f32 iso) {
-    if (!std::isfinite(iso) || iso <= 0.f)
-        iso = 100.f;
-    const double n = std::round(std::log2((double)iso / 100.0));
-    int rounded = (int)std::lround(100.0 * std::pow(2.0, n));
-    if (rounded < 50) rounded = 50;
-    if (rounded > 3200) rounded = 3200;
-    return rounded;
-}
-
-inline void apply_pixel4a_noise_profile(Config& cfg, f32 iso) {
-    constexpr f32 kPixel4aAlphaIso100 = 1.80710882e-4f;
-    constexpr f32 kPixel4aBetaIso100  = 3.1937599182128e-6f;
-    if (!std::isfinite(iso) || iso <= 0.f)
-        iso = 100.f;
-    const f32 scale = iso / 100.f;
-    // Pixel 4a uses the same profile for all channels (no per-channel differentiation).
-    const f32 a = kPixel4aAlphaIso100 * scale;
-    const f32 b = kPixel4aBetaIso100 * scale * scale;
-    for (int c = 0; c < 3; ++c) {
-        cfg.alpha_dng[c] = a;
-        cfg.beta_dng[c] = b;
-    }
-    cfg.has_noise_profile = true;
-    cfg.debug_pixel4a_noise_curve_iso = round_pixel4a_noise_curve_iso(iso);
-}
 
 inline f32 smoothstepf(f32 edge0, f32 edge1, f32 x) {
     if (edge1 <= edge0) return x >= edge1 ? 1.f : 0.f;

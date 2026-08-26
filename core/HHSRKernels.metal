@@ -911,8 +911,8 @@ struct MergeCompParams {
     // conversion below (was _pad0).
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint _pad2;
-    uint _pad3;
+    uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
+    float soften_max_inv; // inverse-covariance eigenvalue ceiling (was _pad3)
 };
 
 struct MergeRefParams {
@@ -943,6 +943,7 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
+    float soften_max_inv; // inverse-covariance eigenvalue ceiling (100 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -954,21 +955,46 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
 
-inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
-    const float k_max_abs = 32.f;
-    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
-    if (!(m > k_max_abs) || !isfinite(m)) {
-        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
-            ixx = 2.f;
-            ixy = 0.f;
-            iyy = 2.f;
-        }
+// Twin of soften_inv_cov in core/merge.cpp -- keep them in step. See there for
+// why an unclamped inverse covariance shows up as green or black speckles
+// rather than as general softness.
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy,
+                           float k_max_abs) {
+    if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+        ixx = 2.f;
+        ixy = 0.f;
+        iyy = 2.f;
         return;
     }
-    float s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
+    // Eigenvalue clamp, same op order as the CPU twin: bound only the sharp
+    // axis to the coverage floor; the wide axis is left alone, so edges are
+    // not blurred along themselves the way the whole-matrix rescale did.
+    const float mean = 0.5f * (ixx + iyy);
+    const float half_diff = 0.5f * (ixx - iyy);
+    const float disc = sqrt(half_diff * half_diff + ixy * ixy);
+    const float l1 = mean + disc;
+    if (!(l1 > k_max_abs)) return;
+    const float l2 = mean - disc;
+    const float c1 = k_max_abs;
+    const float c2 = min(l2, k_max_abs);
+    float vx = ixy;
+    float vy = l1 - ixx;
+    float n2 = vx * vx + vy * vy;
+    if (!(n2 > 0.f)) {
+        vx = l1 - iyy;
+        vy = ixy;
+        n2 = vx * vx + vy * vy;
+    }
+    if (!(n2 > 0.f)) {
+        ixx = min(ixx, k_max_abs);
+        iyy = min(iyy, k_max_abs);
+        return;
+    }
+    const float inv_n2 = 1.f / n2;
+    const float d = c1 - c2;
+    ixx = c2 + d * (vx * vx * inv_n2);
+    ixy = d * (vx * vy * inv_n2);
+    iyy = c2 + d * (vy * vy * inv_n2);
 }
 
 inline float cov_lerp2(device const float* covs, uint cov_w,
@@ -987,7 +1013,7 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
-                           bool raw_det) {
+                           bool raw_det, float soften_max) {
     float frac_x = kmap_j - trunc(kmap_j);
     float frac_y = kmap_i - trunc(kmap_i);
     int fx, fy;
@@ -1026,7 +1052,7 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
-    soften_inv_cov(ixx, ixy, iyy);
+    soften_inv_cov(ixx, ixy, iyy, soften_max);
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -1069,6 +1095,47 @@ inline void flow_sample_bilinear(device const float* flow, uint fny, uint fnx,
     float by = flow[i10 + 1u] + (flow[i11 + 1u] - flow[i10 + 1u]) * ax;
     odx = tx + (bx - tx) * ay;
     ody = ty + (by - ty) * ay;
+}
+
+inline float flow_catmull1(float p0, float p1, float p2, float p3, float t) {
+    return 0.5f * (2.f * p1 + (-p0 + p2) * t +
+                   (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t +
+                   (-p0 + 3.f * p1 - 3.f * p2 + p3) * t * t * t);
+}
+
+// Catmull-Rom twin of flow_sample_bilinear -- and of
+// FlowField::sample_grid_bicubic in types.h; keep the three in step.
+inline void flow_sample_bicubic(device const float* flow, uint fny, uint fnx,
+                                float raw_y, float raw_x, float ts,
+                                thread float& odx, thread float& ody) {
+    float tcy = raw_y / ts - 0.5f, tcx = raw_x / ts - 0.5f;
+    int y0 = int(floor(tcy)), x0 = int(floor(tcx));
+    float ay = tcy - float(y0), ax = tcx - float(x0);
+    float rx[4], ry[4];
+    for (int i = -1; i <= 2; ++i) {
+        int iy = clamp(y0 + i, 0, int(fny) - 1);
+        float px[4], py[4];
+        for (int j = -1; j <= 2; ++j) {
+            int ix = clamp(x0 + j, 0, int(fnx) - 1);
+            uint o = (uint(iy) * fnx + uint(ix)) * 2u;
+            px[j + 1] = flow[o + 0u];
+            py[j + 1] = flow[o + 1u];
+        }
+        rx[i + 1] = flow_catmull1(px[0], px[1], px[2], px[3], ax);
+        ry[i + 1] = flow_catmull1(py[0], py[1], py[2], py[3], ax);
+    }
+    odx = flow_catmull1(rx[0], rx[1], rx[2], rx[3], ay);
+    ody = flow_catmull1(ry[0], ry[1], ry[2], ry[3], ay);
+}
+
+// mode: 1 = bilinear, 2 = bicubic (0/nearest stays in the callers' else).
+inline void flow_sample(device const float* flow, uint fny, uint fnx,
+                        float raw_y, float raw_x, float ts, uint mode,
+                        thread float& odx, thread float& ody) {
+    if (mode == 2u)
+        flow_sample_bicubic(flow, fny, fnx, raw_y, raw_x, ts, odx, ody);
+    else
+        flow_sample_bilinear(flow, fny, fnx, raw_y, raw_x, ts, odx, ody);
 }
 
 inline float sample_robustness_bilinear(device const float* robustness,
@@ -1114,6 +1181,7 @@ static inline void merge_comp_contrib_flowed(device const float* img,
                                       float flowx, float flowy, float wscale,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
+
     // p.raw_res_robustness: robustness is raw resolution this run (Config::
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
@@ -1151,7 +1219,8 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             kmap_j = lr_mov_x - 0.5f;
             kmap_i = lr_mov_y - 0.5f;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true,
+                       p.soften_max_inv);
     }
 
     int center_j = lround_away(lr_mov_x);
@@ -1173,6 +1242,9 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
             z = max(0.f, z);
+            // Negligible-tap cutoff: z > 16 means w < 3.4e-4 of the centre
+            // tap -- skip the exp and the accumulate entirely.
+            if (p.fast_weights != 0u && z > 16.f) continue;
             // fast::exp maps to the hardware exp2 unit (a few ULP) instead of
             // precise range reduction. Called 9x per output pixel per frame, so
             // it is a measurable share of this kernel. The relative error is
@@ -1209,15 +1281,8 @@ static inline void merge_comp_contrib(device const float* img,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
     int hr_i = int(p.y0 + local_i);
-    // NO +0.5 half-pixel offset here: that came from b65b51f, which lands
-    // after dc92f15 and is not on this branch. It rode in with the d0f2b89
-    // port because this dispatcher was lifted whole from a version that
-    // already had it. Keep this identical to accumulate_comp in merge.cpp
-    // (the golden CPU reference), which samples at hr / scale -- half an
-    // output pixel of drift here shifts every img fetch AND the robustness
-    // mask lookup below, which reads as sub-pixel misalignment.
-    float lr_x = float(hr_j) / p.scale;
-    float lr_y = float(hr_i) / p.scale;
+    float lr_x = (float(hr_j) + 0.5f) / p.scale;
+    float lr_y = (float(hr_i) + 0.5f) / p.scale;
 
     if (p.flow_bilinear == 3u) {
         float P = float(p.tile_size);
@@ -1255,11 +1320,15 @@ static inline void merge_comp_contrib(device const float* img,
                     hw[a] = 0.f;
                     break;
                 }
-        for (int a = 0; a < 4; ++a)
-            if (hw[a] > 0.f)
-                merge_comp_contrib_flowed(img, covs, robustness, p, lr_x, lr_y,
-                                          hx[a], hy[a], hw[a],
-                                          n0, n1, n2, d0, d1, d2);
+        for (int a = 0; a < 4; ++a) {
+            if (hw[a] <= 0.f) continue;
+            // Sub-5% hypotheses cost a full gather for a contribution the
+            // den normalisation renders invisible.
+            if (p.fast_weights != 0u && hw[a] < 0.05f) continue;
+            merge_comp_contrib_flowed(img, covs, robustness, p, lr_x, lr_y,
+                                      hx[a], hy[a], hw[a],
+                                      n0, n1, n2, d0, d1, d2);
+        }
         return;
     }
 
@@ -1268,8 +1337,8 @@ static inline void merge_comp_contrib(device const float* img,
     int py = int(lr_y / float(p.tile_size));
     float flowx, flowy;
     if (p.flow_bilinear != 0u) {
-        flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
-                             float(p.tile_size), flowx, flowy);
+        flow_sample(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
+                    float(p.tile_size), p.flow_bilinear, flowx, flowy);
     } else {
         flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
         flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
@@ -1310,27 +1379,36 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
 //
 // Frames beyond a group boundary simply store and reload, which is why any
 // group size stays exact and the tail group can be short.
-kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
-                                     device float* den [[buffer(1)]],
-                                     constant MergeCompParams* ps [[buffer(2)]],
-                                     constant uint& nframes [[buffer(3)]],
-                                     device const float* img0 [[buffer(4)]],
-                                     device const float* img1 [[buffer(5)]],
-                                     device const float* img2 [[buffer(6)]],
-                                     device const float* img3 [[buffer(7)]],
-                                     device const float* flow0 [[buffer(8)]],
-                                     device const float* flow1 [[buffer(9)]],
-                                     device const float* flow2 [[buffer(10)]],
-                                     device const float* flow3 [[buffer(11)]],
-                                     device const float* cov0 [[buffer(12)]],
-                                     device const float* cov1 [[buffer(13)]],
-                                     device const float* cov2 [[buffer(14)]],
-                                     device const float* cov3 [[buffer(15)]],
-                                     device const float* rob0 [[buffer(16)]],
-                                     device const float* rob1 [[buffer(17)]],
-                                     device const float* rob2 [[buffer(18)]],
-                                     device const float* rob3 [[buffer(19)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
+// Templated over the ACCUMULATOR STORAGE type only. All arithmetic stays
+// float32 -- values are widened on load and narrowed on store -- so the float
+// instantiation is bit-identical to the untemplated kernel, and the half one
+// differs only by the storage quantisation of num/den. half's dynamic range
+// is ample here (den <= taps * frames, num <= den * ~4 after WB, both far
+// under 65504); what fp16 costs is the 10-bit mantissa, ~0.05% relative per
+// store, in exchange for HALF the accumulator's footprint and half the
+// merge's dominant memory traffic.
+template <typename AccT>
+inline void merge_accumulate_comp_x4_body(device AccT* num,
+                                     device AccT* den,
+                                     constant MergeCompParams* ps,
+                                     constant uint& nframes,
+                                     device const float* img0,
+                                     device const float* img1,
+                                     device const float* img2,
+                                     device const float* img3,
+                                     device const float* flow0,
+                                     device const float* flow1,
+                                     device const float* flow2,
+                                     device const float* flow3,
+                                     device const float* cov0,
+                                     device const float* cov1,
+                                     device const float* cov2,
+                                     device const float* cov3,
+                                     device const float* rob0,
+                                     device const float* rob1,
+                                     device const float* rob2,
+                                     device const float* rob3,
+                                     uint2 gid) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= ps[0].Ws || local_i >= ps[0].band_h) return;
@@ -1344,27 +1422,59 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     uint base = (local_i * ps[0].Ws + hr_j) * nch;
 
     float n0 = 0.f, n1 = 0.f, n2 = 0.f, e0 = 0.f, e1 = 0.f, e2 = 0.f;
-    if (nch >= 1) { n0 = num[base + 0]; e0 = den[base + 0]; }
-    if (nch >= 2) { n1 = num[base + 1]; e1 = den[base + 1]; }
-    if (nch >= 3) { n2 = num[base + 2]; e2 = den[base + 2]; }
+    if (nch >= 1) { n0 = float(num[base + 0]); e0 = float(den[base + 0]); }
+    if (nch >= 2) { n1 = float(num[base + 1]); e1 = float(den[base + 1]); }
+    if (nch >= 3) { n2 = float(num[base + 2]); e2 = float(den[base + 2]); }
 
     for (uint g = 0; g < nframes && g < 4u; ++g) {
         merge_comp_contrib(imgs[g], flows[g], covss[g], robs[g], ps[g],
                            hr_j, local_i, n0, n1, n2, e0, e1, e2);
     }
 
-    if (nch >= 1) { num[base + 0] = n0; den[base + 0] = e0; }
-    if (nch >= 2) { num[base + 1] = n1; den[base + 1] = e1; }
-    if (nch >= 3) { num[base + 2] = n2; den[base + 2] = e2; }
+    if (nch >= 1) { num[base + 0] = AccT(n0); den[base + 0] = AccT(e0); }
+    if (nch >= 2) { num[base + 1] = AccT(n1); den[base + 1] = AccT(e1); }
+    if (nch >= 3) { num[base + 2] = AccT(n2); den[base + 2] = AccT(e2); }
 }
 
-kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
-                                 device float* den [[buffer(1)]],
-                                 device const float* img [[buffer(2)]],
-                                 device const float* covs [[buffer(3)]],
-                                 device const float* acc_rob [[buffer(4)]],
-                                 constant MergeRefParams& p [[buffer(5)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
+#define MERGE_X4_KERNEL(NAME, ACC_T) \
+kernel void NAME(device ACC_T* num [[buffer(0)]], \
+                 device ACC_T* den [[buffer(1)]], \
+                 constant MergeCompParams* ps [[buffer(2)]], \
+                 constant uint& nframes [[buffer(3)]], \
+                 device const float* img0 [[buffer(4)]], \
+                 device const float* img1 [[buffer(5)]], \
+                 device const float* img2 [[buffer(6)]], \
+                 device const float* img3 [[buffer(7)]], \
+                 device const float* flow0 [[buffer(8)]], \
+                 device const float* flow1 [[buffer(9)]], \
+                 device const float* flow2 [[buffer(10)]], \
+                 device const float* flow3 [[buffer(11)]], \
+                 device const float* cov0 [[buffer(12)]], \
+                 device const float* cov1 [[buffer(13)]], \
+                 device const float* cov2 [[buffer(14)]], \
+                 device const float* cov3 [[buffer(15)]], \
+                 device const float* rob0 [[buffer(16)]], \
+                 device const float* rob1 [[buffer(17)]], \
+                 device const float* rob2 [[buffer(18)]], \
+                 device const float* rob3 [[buffer(19)]], \
+                 uint2 gid [[thread_position_in_grid]]) { \
+    merge_accumulate_comp_x4_body<ACC_T>(num, den, ps, nframes, \
+        img0, img1, img2, img3, flow0, flow1, flow2, flow3, \
+        cov0, cov1, cov2, cov3, rob0, rob1, rob2, rob3, gid); \
+}
+
+MERGE_X4_KERNEL(merge_accumulate_comp_x4, float)
+MERGE_X4_KERNEL(merge_accumulate_comp_x4_h, half)
+#undef MERGE_X4_KERNEL
+
+template <typename AccT>
+inline void merge_accumulate_ref_body(device AccT* num,
+                                 device AccT* den,
+                                 device const float* img,
+                                 device const float* covs,
+                                 device const float* acc_rob,
+                                 constant MergeRefParams& p,
+                                 uint2 gid) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= p.Ws || local_i >= p.band_h) return;
@@ -1424,7 +1534,8 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
             kmap_j = coarse_x;
             kmap_i = coarse_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false,
+                       p.soften_max_inv);
     }
 
     int center_j = int(round(coarse_x));
@@ -1448,6 +1559,11 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
             float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
+            // Coverage floor -- twin of accumulate_ref in merge.cpp. Keyed
+            // on the ceiling in the params (>64), always active at 128.
+            if (p.soften_max_inv > 64.f)
+                w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
+                                                dist_y * dist_y));
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }
@@ -1461,14 +1577,44 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
                      (local_acc_r < p.max_frame_count);
     uint base = (local_i * p.Ws + hr_j) * p.nch;
     if (overwrite) {
-        if (p.nch >= 1) { num[base + 0] = val0; den[base + 0] = acc0; }
-        if (p.nch >= 2) { num[base + 1] = val1; den[base + 1] = acc1; }
-        if (p.nch >= 3) { num[base + 2] = val2; den[base + 2] = acc2; }
+        if (p.nch >= 1) { num[base + 0] = AccT(val0); den[base + 0] = AccT(acc0); }
+        if (p.nch >= 2) { num[base + 1] = AccT(val1); den[base + 1] = AccT(acc1); }
+        if (p.nch >= 3) { num[base + 2] = AccT(val2); den[base + 2] = AccT(acc2); }
     } else {
-        if (p.nch >= 1) { num[base + 0] += val0; den[base + 0] += acc0; }
-        if (p.nch >= 2) { num[base + 1] += val1; den[base + 1] += acc1; }
-        if (p.nch >= 3) { num[base + 2] += val2; den[base + 2] += acc2; }
+        if (p.nch >= 1) { num[base + 0] = AccT(float(num[base + 0]) + val0); den[base + 0] = AccT(float(den[base + 0]) + acc0); }
+        if (p.nch >= 2) { num[base + 1] = AccT(float(num[base + 1]) + val1); den[base + 1] = AccT(float(den[base + 1]) + acc1); }
+        if (p.nch >= 3) { num[base + 2] = AccT(float(num[base + 2]) + val2); den[base + 2] = AccT(float(den[base + 2]) + acc2); }
     }
+}
+
+#define MERGE_REF_KERNEL(NAME, ACC_T) \
+kernel void NAME(device ACC_T* num [[buffer(0)]], \
+                 device ACC_T* den [[buffer(1)]], \
+                 device const float* img [[buffer(2)]], \
+                 device const float* covs [[buffer(3)]], \
+                 device const float* acc_rob [[buffer(4)]], \
+                 constant MergeRefParams& p [[buffer(5)]], \
+                 uint2 gid [[thread_position_in_grid]]) { \
+    merge_accumulate_ref_body<ACC_T>(num, den, img, covs, acc_rob, p, gid); \
+}
+
+MERGE_REF_KERNEL(merge_accumulate_ref, float)
+MERGE_REF_KERNEL(merge_accumulate_ref_h, half)
+#undef MERGE_REF_KERNEL
+
+// Stage one band of the half accumulator out to float for the host encoder,
+// which stays byte-for-byte unchanged. cb.x = element count, cb.y = element
+// offset of the band's first entry -- an offset PARAMETER rather than a
+// buffer-binding offset, so no alignment constraint applies to odd bands.
+kernel void merge_acc_half_to_float(device const half* num_h [[buffer(0)]],
+                                    device const half* den_h [[buffer(1)]],
+                                    device float* num_f [[buffer(2)]],
+                                    device float* den_f [[buffer(3)]],
+                                    constant uint2& cb [[buffer(4)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cb.x) return;
+    num_f[gid] = float(num_h[cb.y + gid]);
+    den_f[gid] = float(den_h[cb.y + gid]);
 }
 
 // =============================================================================
@@ -1482,7 +1628,9 @@ struct KernelEstParams {
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
-    uint _pad1; // 64 bytes total for setBytes
+    uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
+    float aniso_gamma;      // exponent on the zero-floored weight
+    uint _pad2;             // 72 bytes total for setBytes
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1544,8 +1692,16 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
     if (p.selection != 0u || p.aniso_continuous != 0u) {
-        kk1 = 1.f + 0.5f * A * (1.f / p.k_shrink - 1.f);
-        kk2 = 1.f + 0.5f * A * (p.k_stretch - 1.f);
+        // Twin of the zero-floor remap in kernels.cpp compute_k. Reaches full
+        // stretch (w=1) at A=1.95 instead of stopping short at 0.975 of it.
+        float w = 0.5f * A;
+        if (p.aniso_zero_floor != 0u) {
+            float t = clamp((A - 1.f) / 0.95f, 0.f, 1.f);
+            float g = max(1.f, p.aniso_gamma);
+            w = (g == 1.f) ? t : pow(t, g);
+        }
+        kk1 = 1.f + w * (1.f / p.k_shrink - 1.f);
+        kk2 = 1.f + w * (p.k_stretch - 1.f);
     } else if (A > 1.95f) {
         kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch;
     } else {
@@ -1677,22 +1833,11 @@ struct RobMaskParams {
     uint curve_n;     // 1001
     uint bayer;
     float r_t;
-    uint hf_enabled;
-    float hf_variance_loss_threshold;
-    uint motion_edge_enabled;
-    float motion_edge_threshold;
-    float motion_edge_residual_threshold;
-    float alpha, beta;
-    float motion_edge_noise_floor_multiplier;
-    uint motion_edge_neighborhood_radius;
+    float r_s1;   // motion prior applied to ambiguous tiles
     // Field order and size must stay in lockstep with RobMaskParamsCPU in
     // metal_gpu.mm, which static_asserts the size.
-    float flow_reject_1d_residual_threshold;
-    uint aperture_reject_enabled;
-    float r_s1;   // motion prior applied to aperture-limited tiles (was _pad0)
-    uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
-    uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
+    uint flow_bilinear;  // 1 = interpolate the tile flow
 };
 
 inline float dogson_quadratic(float x) {
@@ -1705,49 +1850,6 @@ inline float dogson_quadratic(float x) {
 inline int clamp_edge(int v, int hi) {
     float f = clamp(float(v), 0.f, float(hi));
     return int(f);
-}
-
-inline float rob_edge_strength_sq(device const float* means,
-                                  uint h, uint w, uint nch,
-                                  int y, int x) {
-    int xm = clamp_edge(x - 1, int(w) - 1);
-    int xp = clamp_edge(x + 1, int(w) - 1);
-    int ym = clamp_edge(y - 1, int(h) - 1);
-    int yp = clamp_edge(y + 1, int(h) - 1);
-    float edge_sq = 0.f;
-    for (uint ch = 0u; ch < nch; ++ch) {
-        float gx = 0.5f * (means[(uint(y) * w + uint(xp)) * nch + ch] -
-                           means[(uint(y) * w + uint(xm)) * nch + ch]);
-        float gy = 0.5f * (means[(uint(yp) * w + uint(x)) * nch + ch] -
-                           means[(uint(ym) * w + uint(x)) * nch + ch]);
-        edge_sq = max(edge_sq, gx * gx + gy * gy);
-    }
-    return edge_sq;
-}
-
-inline float rob_edge_strength_sq_neighborhood(device const float* means,
-                                               uint h, uint w, uint nch,
-                                               int y, int x, uint radius) {
-    float edge_sq = 0.f;
-    int r = int(min(radius, 2u));
-    for (int dy = -r; dy <= r; ++dy) {
-        int yy = clamp_edge(y + dy, int(h) - 1);
-        for (int dx = -r; dx <= r; ++dx) {
-            int xx = clamp_edge(x + dx, int(w) - 1);
-            edge_sq = max(edge_sq, rob_edge_strength_sq(means, h, w, nch, yy, xx));
-        }
-    }
-    return edge_sq;
-}
-
-inline float rob_brightness(device const float* means,
-                            uint h, uint w, uint nch,
-                            int y, int x) {
-    if (y < 0 || y >= int(h) || x < 0 || x >= int(w) || nch == 0u) return 0.f;
-    float sum = 0.f;
-    for (uint ch = 0u; ch < nch; ++ch)
-        sum += means[(uint(y) * w + uint(x)) * nch + ch];
-    return clamp(sum / float(nch), 0.f, 1.f);
 }
 
 inline float rob_sample_bilinear_or_inf(device const float* img,
@@ -1799,69 +1901,6 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
         guide[o + c] = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
 }
 
-// Parameters for the high-frequency variance-loss map.
-struct RobHfLossParams {
-    uint h, w, nch;
-    uint _pad0;
-    float alpha, beta;
-    float min_texture_snr;
-    float _pad1;
-};
-
-kernel void rob_lowpass_gaussian5x5(device float* out [[buffer(0)]],
-                                    device const float* guide [[buffer(1)]],
-                                    constant RobStatsParams& p [[buffer(2)]],
-                                    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    int y = int(gid.y), x = int(gid.x);
-    int H = int(p.h), W = int(p.w);
-    float k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        float s = 0.f;
-        for (int i = -2; i <= 2; ++i) {
-            int yy = clamp_edge(y + i, H - 1);
-            float wy = k[i + 2];
-            for (int j = -2; j <= 2; ++j) {
-                int xx = clamp_edge(x + j, W - 1);
-                s += wy * k[j + 2] * guide[(uint(yy) * p.w + uint(xx)) * p.nch + ch];
-            }
-        }
-        out[(gid.y * p.w + gid.x) * p.nch + ch] = s / 256.f;
-    }
-}
-
-kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
-                                 device const float* means [[buffer(1)]],
-                                 device const float* vars [[buffer(2)]],
-                                 device const float* lp_vars [[buffer(3)]],
-                                 constant RobHfLossParams& p [[buffer(4)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    constexpr float kLocalVarianceNoiseScale = 8.f / 9.f;
-    constexpr float kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    const float kMinTextureSnr = max(p.min_texture_snr, 0.f);
-    float var_sum = 0.f;
-    float lp_var_sum = 0.f;
-    float noise_var = 0.f;
-    float lp_noise_var = 0.f;
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-        var_sum += max(vars[o], 0.f);
-        lp_var_sum += max(lp_vars[o], 0.f);
-        float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
-        float nv = max(p.alpha * brightness + p.beta, 0.f);
-        if (p.nch == 3u && ch == 1u) nv *= 0.5f;
-        noise_var += kLocalVarianceNoiseScale * nv;
-        lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
-    }
-    float signal_var = max(var_sum - noise_var, 0.f);
-    float signal_lp_var = max(lp_var_sum - lp_noise_var, 0.f);
-    float min_signal_var = kMinTextureSnr * max(noise_var, 1.0e-20f);
-    loss[gid.y * p.w + gid.x] = (signal_var > min_signal_var)
-        ? max((signal_var - signal_lp_var) / signal_var, 0.f)
-        : 0.f;
-}
-
 kernel void rob_local_stats_3x3(device float* means [[buffer(0)]],
                                 device float* vars [[buffer(1)]],
                                 device const float* guide [[buffer(2)]],
@@ -1898,8 +1937,8 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     float flow_x = 0.f, flow_y = 0.f;
     if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
         if (p.flow_bilinear != 0u) {
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(y), float(x),
-                                 float(p.tile_size), flow_x, flow_y);
+            flow_sample(flow, p.flow_ny, p.flow_nx, float(y), float(x),
+                        float(p.tile_size), p.flow_bilinear, flow_x, flow_y);
         } else {
             int patch_idy = y / int(p.tile_size);
             int patch_idx = x / int(p.tile_size);
@@ -1940,97 +1979,16 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     }
 }
 
-kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
-                                   device const float* comp_means [[buffer(1)]],
-                                   device const float* ref_means [[buffer(2)]],
-                                   device const float* ref_vars [[buffer(3)]],
-                                   device const float* std_curve [[buffer(4)]],
-                                   device const float* diff_curve [[buffer(5)]],
-                                   device const float* flow [[buffer(6)]],
-                                   constant RobMaskParams& p [[buffer(7)]],
-                                   uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.flow_nx || gid.y >= p.flow_ny) return;
-    uint pidx = gid.y * p.flow_nx + gid.x;
-    tile_high[pidx] = 0u;
-
-    int y0, y1, x0, x1;
-    float flow_x, flow_y;
-    uint fi = pidx * 2u;
-    if (p.nch == 1u) {
-        y0 = int(gid.y) * int(p.tile_size);
-        y1 = min(y0 + int(p.tile_size), int(p.h));
-        x0 = int(gid.x) * int(p.tile_size);
-        x1 = min(x0 + int(p.tile_size), int(p.w));
-        flow_x = flow[fi + 0u];
-        flow_y = flow[fi + 1u];
-    } else {
-        y0 = (int(gid.y) * int(p.tile_size) + 1) / 2;
-        y1 = min(((int(gid.y) + 1) * int(p.tile_size) + 1) / 2, int(p.h));
-        x0 = (int(gid.x) * int(p.tile_size) + 1) / 2;
-        x1 = min(((int(gid.x) + 1) * int(p.tile_size) + 1) / 2, int(p.w));
-        flow_x = 0.5f * flow[fi + 0u];
-        flow_y = 0.5f * flow[fi + 1u];
-    }
-
-    uint count = 0u;
-    uint high_count = 0u;
-    for (int y = y0; y < y1; ++y) {
-        for (int x = x0; x < x1; ++x) {
-            float sample_x = float(x) + flow_x;
-            float sample_y = float(y) + flow_y;
-            float d_sq_ = 0.f;
-            float sigma_sq_ = 0.f;
-            for (uint ch = 0u; ch < p.nch; ++ch) {
-                uint o = (uint(y) * p.w + uint(x)) * p.nch + ch;
-                float brightness = ref_means[o];
-                int id_noise = lround_away(1000.f * brightness);
-                if (!isfinite(brightness))
-                    id_noise = 0;
-                else if (id_noise < 0)
-                    id_noise = 0;
-                else if (id_noise >= int(p.curve_n))
-                    id_noise = int(p.curve_n) - 1;
-                uint id = uint(id_noise);
-                float sigma_t = std_curve[id];
-                float d_t = diff_curve[id];
-                float sigma_p_sq = ref_vars[o];
-                sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-                float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
-                                                        sample_y, sample_x, ch);
-                float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-                float d_p_sq = d_p_ * d_p_;
-                float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                d_sq_ += d_p_sq * shrink * shrink;
-            }
-            float ratio = (sigma_sq_ > 0.f && isfinite(sigma_sq_))
-                ? d_sq_ / sigma_sq_
-                : (d_sq_ > 0.f ? INFINITY : 0.f);
-            if (!isfinite(ratio)) continue;
-            ++count;
-            if (ratio > p.flow_reject_1d_residual_threshold) ++high_count;
-        }
-    }
-
-    if (count == 0u) return;
-    uint need = max(2u, uint(ceil(float(count) * 0.10f)));
-    tile_high[pidx] = high_count >= need ? 1u : 0u;
-}
-
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
-                          device const float* ref_means [[buffer(3)]],
-                          device const float* ref_vars [[buffer(4)]],
-                          device const float* std_curve [[buffer(6)]],
-                          device const float* diff_curve [[buffer(7)]],
-                          device const float* S [[buffer(8)]],
-                          device const uint* motion_irregular [[buffer(9)]],
-                          device const float* flow [[buffer(10)]],
-                          device const float* ref_hf_loss [[buffer(5)]],
-                          constant RobMaskParams& p [[buffer(11)]],
-                          device const uint* aperture_limited [[buffer(12)]],
-                          device const uint* tile_residual_high [[buffer(13)]],
-                          device float* s_select [[buffer(14)]],
-                          device const uint* match_ambiguous [[buffer(15)]],
+                          device const float* ref_means [[buffer(2)]],
+                          device const float* ref_vars [[buffer(3)]],
+                          device const float* std_curve [[buffer(4)]],
+                          device const float* diff_curve [[buffer(5)]],
+                          device const float* S [[buffer(6)]],
+                          device const float* flow [[buffer(7)]],
+                          constant RobMaskParams& p [[buffer(8)]],
+                          device const uint* match_ambiguous [[buffer(9)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -2044,8 +2002,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         patch_idy = int(gid.y) / int(p.tile_size);
         patch_idx = int(gid.x) / int(p.tile_size);
         if (p.flow_bilinear != 0u) {
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(gid.y),
-                                 float(gid.x), float(p.tile_size), flow_x, flow_y);
+            flow_sample(flow, p.flow_ny, p.flow_nx, float(gid.y),
+                        float(gid.x), float(p.tile_size), p.flow_bilinear,
+                        flow_x, flow_y);
         } else {
             uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
             flow_x = flow[fi + 0u];
@@ -2056,10 +2015,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         patch_idx = int((2.f * float(gid.x) + 0.5f) / float(p.tile_size));
         if (p.flow_bilinear != 0u) {
             float rdx, rdy;
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx,
-                                 2.f * float(gid.y) + 0.5f,
-                                 2.f * float(gid.x) + 0.5f,
-                                 float(p.tile_size), rdx, rdy);
+            flow_sample(flow, p.flow_ny, p.flow_nx,
+                        2.f * float(gid.y) + 0.5f,
+                        2.f * float(gid.x) + 0.5f,
+                        float(p.tile_size), p.flow_bilinear, rdx, rdy);
             flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
         } else {
             uint fi = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 2u;
@@ -2069,10 +2028,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     }
     float sample_x = float(gid.x) + flow_x;
     float sample_y = float(gid.y) + flow_y;
-    int new_idx = lround_away(sample_x);
-    int new_idy = lround_away(sample_y);
-    bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
-                    0 <= new_idy && new_idy < int(p.h));
     // Eq. 6 aggregates each term into ONE scalar across channels first
     // (sigma = sqrt(sum of per-channel variances); d/d_ms/d_md are bare
     // per-pixel scalars, not per-channel), and only then applies max()/
@@ -2117,69 +2072,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
-    float ratio = (sig > 0.f && isfinite(sig))
-        ? d_sq_ / sig
-        : (d_sq_ > 0.f ? INFINITY : 0.f);
-    bool residual_high = isfinite(ratio) && ratio > p.motion_edge_residual_threshold;
-    // High Frequency Artifacts Removal, Wronski et al. Two conditions, both
-    // required: the patch is almost entirely high-frequency (most of its local
-    // variance is destroyed by low-pass filtering), and the alignment vector
-    // field varies a lot locally -- "the same as used in the motion prior",
-    // i.e. the r_Mt test, exactly as the paper specifies.
-    //
-    // Neither alone is sufficient. Hair and fur are high-frequency but track
-    // cleanly, so the flow test spares them. A flat noisy wall has unstable
-    // flow but no real high-frequency signal, and the texture floor inside
-    // rob_hf_loss_adaptive drives its loss to zero, so the variance test
-    // spares it.
-    //
-    // The variance-loss map is the reference frame's. The paper describes one
-    // comparison of local variance before and after low-pass filtering, marking
-    // regions of the scene; the reference is the frame the merge is anchored on.
-    //
-    // No misalignment-residual gate. That is not in the paper, and it would
-    // defeat the purpose: the aperture problem is exactly the case where a
-    // repetitive pattern locks onto the wrong period and still matches itself
-    // well, so the residual stays low.
-    bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
-        hf_reject = ref_hf_loss[gid.y * p.w + gid.x] > p.hf_variance_loss_threshold;
-    }
-
-    bool edge_reject = false;
-    if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
-        if (residual_high) {
-            float edge_sq = rob_edge_strength_sq_neighborhood(
-                ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
-                p.motion_edge_neighborhood_radius);
-            if (inbound) {
-                edge_sq = max(edge_sq,
-                              rob_edge_strength_sq_neighborhood(
-                                  comp_means, p.h, p.w, p.nch, new_idy, new_idx,
-                                  p.motion_edge_neighborhood_radius));
-            }
-            float brightness = rob_brightness(ref_means, p.h, p.w, p.nch,
-                                              int(gid.y), int(gid.x));
-            if (inbound) {
-                brightness = max(brightness,
-                                 rob_brightness(comp_means, p.h, p.w, p.nch,
-                                                new_idy, new_idx));
-            }
-            float noise_var = max(p.alpha * brightness + p.beta, 0.f);
-            float noise_edge_floor = max(p.motion_edge_noise_floor_multiplier, 0.f) *
-                                     sqrt(noise_var);
-            float th = max(max(p.motion_edge_threshold, 0.f), noise_edge_floor);
-            edge_reject = edge_sq > th * th;
-        }
-    }
-    // Aperture-limited tiles are demoted to the irregular-motion prior rather
-    // than discarded -- see compute_robustness in robustness.cpp. min, not
-    // assignment: a tile already flagged motion-irregular must not be promoted.
-    bool aperture_limited_tile =
-        p.aperture_reject_enabled != 0u &&
-        aperture_limited[pidx] != 0u &&
-        tile_residual_high[pidx] != 0u;
-    if (aperture_limited_tile) s = min(s, p.r_s1);
     // Two near-equal minima in the block-matching cost surface: the offset that
     // was picked is not distinguishable from another. See compute_robustness in
     // robustness.cpp -- this is the only mask input that is not derived from the
@@ -2187,16 +2079,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // offset was chosen for producing a small difference.
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
         s = min(s, p.r_s1);
-    bool hard_reject = hf_reject || edge_reject;
-    float r_val = hard_reject
-        ? 0.f
-        : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    float r_val = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
     R[gid.y * p.w + gid.x] = r_val;
-    // Which prior this pixel ended up on. Compared against r_s1 rather than
-    // recomputing the conditions, so the record cannot drift from the value
-    // actually used above.
-    if (p.save_s_select != 0u)
-        s_select[gid.y * p.w + gid.x] = (s <= p.r_s1) ? 1.f : 0.f;
 }
 
 struct RobMaskRawParams {
@@ -2206,21 +2090,10 @@ struct RobMaskRawParams {
     uint curve_n;
     float r_t;
     float r_s1;
-    uint save_s_select;
     uint ambiguous_enabled;
     uint chain_reject_enabled;
     float r_s_chain;
     uint motion_magnitude_veto_enabled;
-    uint hf_enabled;
-    float hf_variance_loss_threshold;
-    uint hf_h, hf_w;                 // guide-resolution dims of ref_hf_loss
-    uint motion_edge_enabled;
-    float motion_edge_threshold;
-    float motion_edge_residual_threshold;
-    float alpha;
-    float beta;
-    float motion_edge_noise_floor_multiplier;
-    uint motion_edge_neighborhood_radius;
     uint _pad0;
 };
 
@@ -2233,15 +2106,6 @@ struct RobMaskRawParams {
 // reference's coordinate frame. See Config::robustness_raw_resolution_
 // enabled and the mirrored, more heavily-commented CPU implementation,
 // compute_robustness_raw_res in robustness.cpp.
-//
-// hf_reject samples the guide-resolution variance-loss map at gid/2 and
-// edge_reject runs the neighbourhood test directly on the raw-resolution
-// means (comp_means is already warped into the reference frame, so the
-// "moved" lookup is the same position) -- both mirror
-// compute_robustness_raw_res. Still narrower than rob_make_mask in one way:
-// no aperture_limited/tile_residual_high support, so
-// compute_robustness_metal_impl only takes this path when
-// flow_reject_1d_enabled is off.
 kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const float* comp_means [[buffer(1)]],
                               device const float* ref_means [[buffer(2)]],
@@ -2250,12 +2114,9 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const float* diff_curve [[buffer(5)]],
                               device const float* S [[buffer(6)]],
                               constant RobMaskRawParams& p [[buffer(7)]],
-                              device float* s_select [[buffer(8)]],
-                              device const uint* match_ambiguous [[buffer(9)]],
-                              device const uint* chain_inconsistent [[buffer(10)]],
-                              device const uint* motion_magnitude_reject [[buffer(11)]],
-                              device const uint* motion_irregular [[buffer(12)]],
-                              device const float* ref_hf_loss [[buffer(13)]],
+                              device const uint* match_ambiguous [[buffer(8)]],
+                              device const uint* chain_inconsistent [[buffer(9)]],
+                              device const uint* motion_magnitude_reject [[buffer(10)]],
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2263,7 +2124,6 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     uint out_o = gid.y * p.w + gid.x;
     if (patch_idy >= p.flow_ny || patch_idx >= p.flow_nx) {
         R[out_o] = 0.f;
-        if (p.save_s_select != 0u) s_select[out_o] = 0.f;
         return;
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
@@ -2307,46 +2167,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         p.motion_magnitude_veto_enabled != 0u &&
         motion_magnitude_reject[pidx] != 0u;
 
-    // High-frequency artifact removal at raw resolution: the variance-loss
-    // map stays at guide resolution (it is the reference's, computed once
-    // per burst), so each raw pixel reads its covering guide pixel --
-    // exactly compute_robustness_raw_res's (y/2, x/2) lookup.
-    bool hf_reject = false;
-    if (p.hf_enabled != 0u && motion_irregular[pidx] != 0u) {
-        uint gy = min(gid.y / 2u, p.hf_h - 1u);
-        uint gx = min(gid.x / 2u, p.hf_w - 1u);
-        hf_reject = ref_hf_loss[gy * p.hf_w + gx] > p.hf_variance_loss_threshold;
-    }
-    // Motion-edge rejection at raw resolution. comp_means is already warped
-    // into the reference's coordinate frame by the Dodgson pass, so the
-    // "moved" neighbourhood is the same (y, x) -- mirror the CPU path.
-    bool edge_reject = false;
-    if (p.motion_edge_enabled != 0u && motion_irregular[pidx] != 0u) {
-        float ratio = (sigma_sq_ > 0.f && isfinite(sigma_sq_))
-            ? d_sq_ / sigma_sq_
-            : (d_sq_ > 0.f ? INFINITY : 0.f);
-        if (isfinite(ratio) && ratio > p.motion_edge_residual_threshold) {
-            float edge_sq = rob_edge_strength_sq_neighborhood(
-                ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
-                p.motion_edge_neighborhood_radius);
-            edge_sq = max(edge_sq,
-                          rob_edge_strength_sq_neighborhood(
-                              comp_means, p.h, p.w, p.nch, int(gid.y), int(gid.x),
-                              p.motion_edge_neighborhood_radius));
-            float brightness = rob_brightness(ref_means, p.h, p.w, p.nch,
-                                              int(gid.y), int(gid.x));
-            brightness = max(brightness,
-                             rob_brightness(comp_means, p.h, p.w, p.nch,
-                                            int(gid.y), int(gid.x)));
-            float noise_var = max(p.alpha * brightness + p.beta, 0.f);
-            float noise_edge_floor =
-                max(p.motion_edge_noise_floor_multiplier, 0.f) * sqrt(noise_var);
-            float th = max(max(p.motion_edge_threshold, 0.f), noise_edge_floor);
-            edge_reject = edge_sq > th * th;
-        }
-    }
-
-    float r_val = (hf_reject || edge_reject || motion_magnitude_reject_tile)
+    float r_val = motion_magnitude_reject_tile
         ? 0.f
         : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
     // An OOB Dodgson sample arrives as +inf in comp_means -> d_sq_ = +inf ->
@@ -2355,8 +2176,6 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     // guard in compute_robustness_raw_res.
     if (!isfinite(r_val)) r_val = 0.f;
     R[out_o] = r_val;
-    if (p.save_s_select != 0u)
-        s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
 }
 
 kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
@@ -3121,6 +2940,7 @@ struct MergeNormParams {
     uint bh, Ws, nch, bake;
     float wb0, wb1, wb2;
     float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+    float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
 };
 
 inline float norm_to_srgb(float v) {
@@ -3161,11 +2981,178 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
     } else {
         lin0 = lin1 = lin2 = cn0;
     }
-    float v0 = (p.bake != 0u) ? norm_to_srgb(lin0) : clamp(lin0, 0.f, 1.f);
-    float v1 = (p.bake != 0u) ? norm_to_srgb(lin1) : clamp(lin1, 0.f, 1.f);
-    float v2 = (p.bake != 0u) ? norm_to_srgb(lin2) : clamp(lin2, 0.f, 1.f);
+    float v0 = (p.bake != 0u) ? norm_to_srgb(lin0) : clamp(lin0 * p.sg0, 0.f, 1.f);
+    float v1 = (p.bake != 0u) ? norm_to_srgb(lin1) : clamp(lin1 * p.sg1, 0.f, 1.f);
+    float v2 = (p.bake != 0u) ? norm_to_srgb(lin2) : clamp(lin2 * p.sg2, 0.f, 1.f);
     uint o = (gid.y * p.Ws + gid.x) * 3u;
     out[o + 0u] = ushort(v0 * 65535.f + 0.5f);
     out[o + 1u] = ushort(v1 * 65535.f + 0.5f);
     out[o + 2u] = ushort(v2 * 65535.f + 0.5f);
+}
+
+// ---------------------------------------------------------------------------
+// flow_densify_boundary_select twin (align.cpp): one thread per half-pitch
+// fine cell. Covers both measurement branches -- the overlapped-tile
+// full-window measurement (Config::flow_overlap_merge) and the cell-footprint
+// selection -- plus the bilinear blend for agreeing cells, so the host does
+// no per-cell work at all. All rounding matches the CPU (round = lround).
+struct DensifyParams {
+    uint fny, fnx;          // fine grid
+    uint flow_ny, flow_nx;  // tile grid
+    uint ref_h, ref_w;
+    uint mov_h, mov_w;
+    uint tile_size;
+    uint overlap_all;       // 1 = overlap measurement branch
+    float gsy, gsx;         // raw -> grey scale
+    float thr;              // flow_select_threshold
+    uint _pad0;             // 56 bytes total for setBytes
+};
+
+static inline float densify_cost_win(device const float* ref,
+                                     device const float* mov,
+                                     constant DensifyParams& p,
+                                     int gy0, int gx0, int win,
+                                     int idy, int idx) {
+    float dist = 0.f;
+    for (int i = 0; i < win; ++i) {
+        for (int j = 0; j < win; ++j) {
+            const int ry = gy0 + i, rx = gx0 + j;
+            const int my = ry + idy, mx = rx + idx;
+            if (!(ry >= 0 && ry < (int)p.ref_h && rx >= 0 && rx < (int)p.ref_w &&
+                  my >= 0 && my < (int)p.mov_h && mx >= 0 && mx < (int)p.mov_w))
+                return INFINITY;
+            dist += fabs(ref[ry * (int)p.ref_w + rx] - mov[my * (int)p.mov_w + mx]);
+        }
+    }
+    return dist;
+}
+
+kernel void flow_densify_select(device float* fine [[buffer(0)]],
+                                device const float* flowv [[buffer(1)]],
+                                device const float* ref [[buffer(2)]],
+                                device const float* mov [[buffer(3)]],
+                                constant DensifyParams& p [[buffer(4)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.fnx || gid.y >= p.fny) return;
+    const int fy = (int)gid.y, fx = (int)gid.x;
+    const float ts2 = 0.5f * (float)p.tile_size;
+    // Same lattice mapping as FlowField::sample_grid at the cell centre.
+    const float cy = ((float)fy + 0.5f) * ts2;
+    const float cx = ((float)fx + 0.5f) * ts2;
+    const float tcy = cy / (float)p.tile_size - 0.5f;
+    const float tcx = cx / (float)p.tile_size - 0.5f;
+    const int y0 = (int)floor(tcy), x0 = (int)floor(tcx);
+    const float ay = tcy - (float)y0, ax = tcx - (float)x0;
+    const int ny = (int)p.flow_ny, nx = (int)p.flow_nx;
+    const int iy0 = clamp(y0, 0, ny - 1), iy1 = clamp(y0 + 1, 0, ny - 1);
+    const int ix0 = clamp(x0, 0, nx - 1), ix1 = clamp(x0 + 1, 0, nx - 1);
+    float vx[4], vy[4];
+    vx[0] = flowv[(iy0 * nx + ix0) * 2 + 0];
+    vy[0] = flowv[(iy0 * nx + ix0) * 2 + 1];
+    vx[1] = flowv[(iy0 * nx + ix1) * 2 + 0];
+    vy[1] = flowv[(iy0 * nx + ix1) * 2 + 1];
+    vx[2] = flowv[(iy1 * nx + ix0) * 2 + 0];
+    vy[2] = flowv[(iy1 * nx + ix0) * 2 + 1];
+    vx[3] = flowv[(iy1 * nx + ix1) * 2 + 0];
+    vy[3] = flowv[(iy1 * nx + ix1) * 2 + 1];
+    float spread = 0.f;
+    for (int a = 0; a < 4; ++a)
+        for (int b = a + 1; b < 4; ++b)
+            spread = max(spread, max(fabs(vx[a] - vx[b]), fabs(vy[a] - vy[b])));
+    const float tx0 = vx[0] + (vx[1] - vx[0]) * ax;
+    const float bx0 = vx[2] + (vx[3] - vx[2]) * ax;
+    const float ty0 = vy[0] + (vy[1] - vy[0]) * ax;
+    const float by0 = vy[2] + (vy[3] - vy[2]) * ax;
+    float out_x = tx0 + (bx0 - tx0) * ay;
+    float out_y = ty0 + (by0 - ty0) * ay;
+    if (p.overlap_all != 0u && spread > p.thr) {
+        // Full tile-sized window at the fine cell centre (HDR+ layout).
+        const int win = max(2, (int)round((float)p.tile_size * p.gsy));
+        const int gy0 = (int)round(((float)fy + 0.5f) * ts2 * p.gsy) - win / 2;
+        const int gx0 = (int)round(((float)fx + 0.5f) * ts2 * p.gsx) - win / 2;
+        float best_cost = INFINITY;
+        int seed_y = 0, seed_x = 0;
+        bool have_seed = false;
+        for (int c4 = 0; c4 < 4; ++c4) {
+            const int idx = (int)round(vx[c4] * p.gsx);
+            const int idy = (int)round(vy[c4] * p.gsy);
+            const float d = densify_cost_win(ref, mov, p, gy0, gx0, win, idy, idx);
+            if (d < best_cost) {
+                best_cost = d;
+                seed_y = idy;
+                seed_x = idx;
+                have_seed = true;
+                out_x = vx[c4];
+                out_y = vy[c4];
+            }
+        }
+        // 3x3 integer refinement + quadratic sub-cell fit; the measurement
+        // replaces the seed only when it MOVES (see the CPU twin's comment).
+        if (have_seed) {
+            float surf[9];
+            int bo = 4;
+            float bo_cost = best_cost;
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox) {
+                    const int sidx = (oy + 1) * 3 + (ox + 1);
+                    surf[sidx] = (ox == 0 && oy == 0)
+                                     ? best_cost
+                                     : densify_cost_win(ref, mov, p, gy0, gx0,
+                                                        win, seed_y + oy,
+                                                        seed_x + ox);
+                    if (surf[sidx] < bo_cost) { bo_cost = surf[sidx]; bo = sidx; }
+                }
+            if (bo != 4) {
+                seed_y += bo / 3 - 1;
+                seed_x += bo % 3 - 1;
+                for (int oy = -1; oy <= 1; ++oy)
+                    for (int ox = -1; ox <= 1; ++ox)
+                        surf[(oy + 1) * 3 + (ox + 1)] =
+                            densify_cost_win(ref, mov, p, gy0, gx0, win,
+                                             seed_y + oy, seed_x + ox);
+                if (isfinite(surf[4])) {
+                    float sub_x = 0.f, sub_y = 0.f;
+                    (void)bm_quadratic_subpixel_3x3(surf, sub_x, sub_y);
+                    out_x = ((float)seed_x + sub_x) / p.gsx;
+                    out_y = ((float)seed_y + sub_y) / p.gsy;
+                }
+            }
+        }
+    } else if (spread > p.thr) {
+        // Selection over the cell footprint.
+        const int gy0 = (int)floor((float)fy * ts2 * p.gsy);
+        const int gx0 = (int)floor((float)fx * ts2 * p.gsx);
+        const int gh = max(1, (int)round(ts2 * p.gsy));
+        const int gw = max(1, (int)round(ts2 * p.gsx));
+        float best_cost = INFINITY;
+        for (int c4 = 0; c4 < 4; ++c4) {
+            const int idx = (int)round(vx[c4] * p.gsx);
+            const int idy = (int)round(vy[c4] * p.gsy);
+            float dist = 0.f;
+            bool valid = true;
+            for (int i = 0; i < gh && valid; ++i) {
+                for (int j = 0; j < gw; ++j) {
+                    const int ry = gy0 + i, rx = gx0 + j;
+                    const int my = ry + idy, mx = rx + idx;
+                    if (!(ry >= 0 && ry < (int)p.ref_h &&
+                          rx >= 0 && rx < (int)p.ref_w &&
+                          my >= 0 && my < (int)p.mov_h &&
+                          mx >= 0 && mx < (int)p.mov_w)) {
+                        valid = false;
+                        break;
+                    }
+                    dist += fabs(ref[ry * (int)p.ref_w + rx] -
+                                 mov[my * (int)p.mov_w + mx]);
+                }
+            }
+            if (valid && dist < best_cost) {
+                best_cost = dist;
+                out_x = vx[c4];
+                out_y = vy[c4];
+            }
+        }
+    }
+    const int o = (fy * (int)p.fnx + fx) * 2;
+    fine[o + 0] = out_x;
+    fine[o + 1] = out_y;
 }

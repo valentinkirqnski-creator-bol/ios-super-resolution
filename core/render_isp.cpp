@@ -231,18 +231,9 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
     // One task per OUTPUT row, so no two tasks touch the same accumulator and
     // the reduction needs no locking. Iterating input rows instead would have
     // several tasks writing the same gy.
-    // Two grids. The mean drives exposure and the base layer; the MAX exists
-    // only to find the white point. Taking the white point from the mean grid
-    // was hiding highlights: box-averaging an 8x8 block buries any bright
-    // feature smaller than the block, so a specular or a bright window read far
-    // dimmer than it is, the shoulder was set below it, and it clipped. Measured
-    // on a mild scene the mean grid lost 14% of the true peak; on one with small
-    // highlights it loses far more.
     std::vector<f32> Y((size_t)gw * gh, 0.f);
-    std::vector<f32> Ymax((size_t)gw * gh, 0.f);
     parallel_rows(gh, 0, [&](int gy) {
         f32* out = &Y[(size_t)gy * gw];
-        f32* omax = &Ymax[(size_t)gy * gw];
         std::vector<f32> cnt((size_t)gw, 0.f);
         const int y0 = gy * f;
         const int y1 = (gy == gh - 1) ? H : std::min(H, y0 + f);
@@ -257,9 +248,7 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
                 // a blown magenta highlight as ~30% darker than it renders and
                 // under-compress it.
                 recover_highlight(rr, gg, bb, p.highlight_knee);
-                const f32 l = luma_of(rr, gg, bb);
-                out[gx] += l;
-                if (l > omax[gx]) omax[gx] = l;
+                out[gx] += luma_of(rr, gg, bb);
                 cnt[gx] += 1.f;
             }
         }
@@ -279,25 +268,13 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 
     // Everything from here on is in exposed linear.
     for (f32& v : Y) v *= exposure;
-    for (f32& v : Ymax) v *= exposure;
 
-    // White point: where the shoulder reaches display white. Taken from the MAX
-    // grid, high up, so real highlights land just under it instead of past it.
-    // On the reference frame this drops the share of pixels driven past white
-    // from 0.125% to 0.001%.
-    //
-    // The ceiling used to be 24, which is not high enough to be inert: a dark
-    // room with a bright window pushes automatic exposure to ~166 and the peak
-    // to ~46, so the clamp itself was clipping the window. Raising it costs
-    // nothing -- white only positions the shoulder, and moving it from 24 to 46
-    // shifts middle grey by under 0.01% -- so it is now high enough never to be
-    // the binding constraint.
-    std::vector<f32> sorted(Ymax);
+    // White point for the output curve: the brightest content present, so the
+    // shoulder rolls off to exactly that instead of clipping it or wasting range.
+    std::vector<f32> sorted(Y);
     std::sort(sorted.begin(), sorted.end());
-    // Named peak, not hi: `hi` is already the highlight-compression factor
-    // further down this same function.
-    const f32 peak = sorted[(size_t)((sorted.size() - 1) * 0.9999)];
-    st.white = clampf(peak, 1.2f, 512.f);
+    const f32 p999 = sorted[(size_t)((sorted.size() - 1) * 0.999)];
+    st.white = clampf(p999, 1.2f, 24.f);
 
     // Base layer in log2: tone mapping is a ratio operation, and doing it in log
     // makes the compression uniform across stops instead of biased toward the
@@ -355,90 +332,6 @@ inline f32 sample_map(const std::vector<f32>& map, int gw, int gh,
 }
 
 }  // namespace
-
-// ------------------------------------------------------------ chroma denoise
-// Luma is left bit-exact; only the colour difference from luma is filtered, so
-// this removes blotching without touching a single edge of detail.
-//
-// The filter runs on a decimated grid (kCShift) because chroma is inherently
-// low-frequency -- the same reason JPEG subsamples it -- and because holding
-// two full-resolution float planes at 48MP would cost ~380MB on a device that
-// has already been jetsammed once on this pipeline. At 1/8 it is ~6MB.
-//
-// Only two of the three colour differences are independent: luma is a weighted
-// sum, so 0.2126*dr + 0.7152*dg + 0.0722*db == 0 identically. dg is recovered
-// from the other two rather than carried, which is a third less memory and a
-// third less filtering for free.
-void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p) {
-    if (!rgb16 || W <= 0 || H <= 0) return;
-    const f32 amount = clampf(p.chroma_denoise, 0.f, 1.f);
-    if (amount <= 0.f) return;
-
-    constexpr int kCShift = 3;                     // 1/8 in each axis
-    const int cw = std::max(1, (W + (1 << kCShift) - 1) >> kCShift);
-    const int ch = std::max(1, (H + (1 << kCShift) - 1) >> kCShift);
-    // Radius is specified in full-resolution pixels so the control means the
-    // same thing regardless of sensor size.
-    const int rad = std::max(1, (int)std::lround(
-        std::max(1.f, p.chroma_denoise_radius) / (f32)(1 << kCShift)));
-
-    std::vector<f32> dr((size_t)cw * ch, 0.f), db((size_t)cw * ch, 0.f);
-    std::vector<f32> wsum((size_t)cw * ch, 0.f);
-
-    // Downsample the colour differences. Accumulating dr/db rather than RGB
-    // keeps the average in the space that gets filtered, so no information
-    // crosses between luma and chroma on the way down.
-    const f32 inv = 1.f / 65535.f;
-    for (int y = 0; y < H; ++y) {
-        const int cy = y >> kCShift;
-        for (int x = 0; x < W; ++x) {
-            const size_t i = ((size_t)y * (size_t)W + (size_t)x) * 3;
-            const f32 r = rgb16[i + 0] * inv;
-            const f32 g = rgb16[i + 1] * inv;
-            const f32 b = rgb16[i + 2] * inv;
-            const f32 Y = luma_of(r, g, b);
-            const size_t c = (size_t)cy * cw + (size_t)(x >> kCShift);
-            dr[c] += r - Y;
-            db[c] += b - Y;
-            wsum[c] += 1.f;
-        }
-    }
-    for (size_t i = 0; i < dr.size(); ++i) {
-        const f32 n = std::max(wsum[i], kEps);
-        dr[i] /= n;
-        db[i] /= n;
-    }
-
-    std::vector<f32> br, bb;
-    box_filter(dr, br, cw, ch, rad);
-    box_filter(db, bb, cw, ch, rad);
-
-    // Recombine. The filtered difference is sampled bilinearly so no block
-    // structure from the decimated grid can print through, and blended by
-    // `amount` so the control is continuous rather than on/off.
-    parallel_rows(H, 0, [&](int y) {
-        for (int x = 0; x < W; ++x) {
-            const f32 nr = sample_map(br, cw, ch, x, y, kCShift);
-            const f32 nb = sample_map(bb, cw, ch, x, y, kCShift);
-            const size_t i = ((size_t)y * (size_t)W + (size_t)x) * 3;
-            const f32 r = rgb16[i + 0] * inv;
-            const f32 g = rgb16[i + 1] * inv;
-            const f32 b = rgb16[i + 2] * inv;
-            const f32 Y = luma_of(r, g, b);
-            f32 cr = (r - Y) + ((nr - (r - Y)) * amount);
-            f32 cb = (b - Y) + ((nb - (b - Y)) * amount);
-            // dg from the identity, so luma is preserved exactly rather than
-            // approximately: Y == luma_of(Y+cr, Y+cg, Y+cb) holds by construction.
-            const f32 cg = -(0.2126f * cr + 0.0722f * cb) / 0.7152f;
-            const f32 orr = std::max(0.f, Y + cr);
-            const f32 og = std::max(0.f, Y + cg);
-            const f32 ob = std::max(0.f, Y + cb);
-            rgb16[i + 0] = (uint16_t)clampf(std::lround(orr * 65535.f), 0.f, 65535.f);
-            rgb16[i + 1] = (uint16_t)clampf(std::lround(og  * 65535.f), 0.f, 65535.f);
-            rgb16[i + 2] = (uint16_t)clampf(std::lround(ob  * 65535.f), 0.f, 65535.f);
-        }
-    });
-}
 
 void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
                 f32& sr, f32& sg, f32& sb) {

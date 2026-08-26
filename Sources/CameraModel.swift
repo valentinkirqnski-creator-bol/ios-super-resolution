@@ -89,53 +89,69 @@ struct TuningParams: Equatable, Codable {
     var r_Mt: Float = 0.8
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
-    var hf_artifact_removal_enabled: Bool = false
-    var hf_variance_loss_threshold: Float = 0.75
-    var hf_min_texture_snr: Float = 4.0
-    var flow_reject_1d_enabled: Bool = false
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
-    var flow_reject_1d_residual_threshold: Float = 2.5
-    var motion_edge_rejection_enabled: Bool = true
-    var motion_edge_threshold: Float = 0.025
-    var motion_edge_residual_threshold: Float = 2.5
-    var motion_edge_noise_floor_multiplier: Float = 1.0
-    var motion_edge_neighborhood_radius: Int = 1
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
     /// Drive the merge kernel's anisotropy continuously from the structure
     /// tensor rather than switching to the full stretch only above 0.9025.
     var kernel_anisotropy_continuous: Bool = true
+    /// Zero-floor the anisotropy law: isotropic detail gets round kernels
+    /// instead of a minimum 2.5:0.75 stretch along a noise orientation.
+    var kernel_anisotropy_zero_floor: Bool = true
+    /// Exponent on the stretch weight: higher concentrates elongation onto
+    /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
+    var kernel_stretch_gamma: Float = 1.0
+    /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
+    /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
+    var merge_fp16_accumulator: Bool = true
+    /// Skip merge taps and overlap hypotheses whose weight is numerically
+    /// negligible (< 3.4e-4 of the centre tap / < 5% window weight).
+    var merge_fast_weights: Bool = true
+    /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
+    /// keep the sensor's full highlight headroom (~1 stop of R/B).
+    var dng_store_unwhitened: Bool = true
     /// Quadratic sub-cell fit at each block-matching winner (Wronski's
     /// sub-pixel estimator). Integer flow becomes ~0.1-0.25px flow per level.
-    var bm_subpixel_quadratic: Bool = false
+    var bm_subpixel_quadratic: Bool = true
+    /// Anti-aliased decimation for the alignment grey: half-phase binomial
+    /// [1 3 3 1]/8 instead of the 2x2 box. Same lattice, less alias wobble.
+    var grey_decimate_lowpass: Bool = true
+    /// Final ICA refinement at full raw resolution on the FFT grey, seeded by
+    /// the decimate flow. Closes the decimate path's sub-pixel gap to FFT.
+    var align_fullres_polish: Bool = true
     /// At motion boundaries, pick the best single tile vector instead of
     /// blending two different motions. Smooth regions stay bilinear.
-    var flow_boundary_selection: Bool = false
+    var flow_boundary_selection: Bool = true
+    /// Catmull-Rom bicubic tile-flow sampling (C1) instead of bilinear (C0).
+    var flow_bicubic_sampling: Bool = false
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
     var k_shrink: Float = 2.0
+    /// D gate: below-threshold gradients are routed to denoising instead of
+    /// super-resolution. GAT-domain units (noise sigma ~ 1). Only applied
+    /// when d_thresh_manual is on; otherwise SNR auto-tune sets them per
+    /// burst (0.71-0.81 / 1.0-1.24).
+    var d_thresh_manual: Bool = false
+    /// Burst-only: halve the auto-metered exposure duration (2x shutter
+    /// speed) and raise ISO to compensate, so each frame carries half the
+    /// motion blur. The merge averages the extra noise back out; blur it
+    /// cannot undo. Manual exposure mode is unaffected.
+    var burst_fast_shutter: Bool = false
+    /// Lossless-JPEG (Compression 7) tiled DNG: bit-identical pixels, 2-3x
+    /// smaller and faster to save than uncompressed. Standard DNG codec.
+    var dng_lossless_jpeg: Bool = true
+    var d_th: Float = 0.76
+    var d_tr: Float = 1.12
     var snr_auto_tune: Bool = true
-    var debug_pixel4a_noise_profile: Bool = false
     var alignment_tile_size: Int = 0
-    var global_prealignment_enabled: Bool = true
-    /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
-    /// inside the analysis loop instead of as a separate decode pass.
-    var global_prealignment_choose_reference: Bool = false
-    var global_prealignment_rotation_range_deg: Float = 0.0
-    var global_prealignment_rotation_step_deg: Float = 0.25
-    var global_prealignment_max_shift: Int = 24
     /// Off merges every frame at full weight everywhere. Diagnostic: it shows
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
     var robustness_save_mask: Bool = true
-    /// Also write _robustness_s1.pgm and _robustness_s2.pgm, splitting the
-    /// accumulated mask by which motion prior scored each pixel. Costs one extra
-    /// full-resolution buffer per comparison frame while the mask is built.
-    var robustness_save_s_masks: Bool = false
-    var accumulated_robustness_denoiser_enabled: Bool = true
+    var accumulated_robustness_denoiser_enabled: Bool = false
     /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
     /// band, 2 = always merge online. Online keeps memory flat in frame count
     /// but its accumulator scales with output pixels, so it is not always the
@@ -152,15 +168,10 @@ struct TuningParams: Equatable, Codable {
     /// correction budget is already spent when level 0 starts. Costs roughly
     /// +120MB at 12MP, because the reference gradient cache goes resident.
     var align_ica_per_level_fft: Bool = false
-    /// Route alignment through the bundled PWCNet Core ML model instead of
-    /// the classical block-matching pyramid, feeding the result into the
-    /// same robustness/merge math either way. Falls back to the classical
-    /// path per-frame if the model isn't bundled or fails to load.
-    var use_neural_flow: Bool = false
     /// ImageStackAlignator's rule for unreliable block matches: when a
     /// tile's best and second-best costs are near-tied (flat patch, aperture,
     /// repetition -- no precise shift determinable), apply NO shift and keep
-    /// the seed from the coarser level / global estimate, instead of
+    /// the seed from the coarser level, instead of
     /// trusting a match indistinguishable from noise. Acts on the flow
     /// itself, unlike the s1 demotion, which is inert under rotation where
     /// every tile is on s1 already. Off by default -- A/B before adopting.
@@ -184,7 +195,6 @@ struct TuningParams: Equatable, Codable {
     /// FFT" below is OFF (Decimate) -- that path's flow is already coarser
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
-    var use_neural_robustness: Bool = false
     var robustness_raw_resolution_enabled: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -198,14 +208,14 @@ struct TuningParams: Equatable, Codable {
     var isp_black_point: Float = 0.065
     var isp_warmth: Float = 0.05
     var isp_colour_strength: Float = 1.0
-    var isp_contrast: Float = 0.55
+    var isp_contrast: Float = 0.62
     var isp_vibrance: Float = 0.50
-    /// Chroma noise reduction. Luma is preserved exactly, so this cannot
-    /// soften detail -- only fine colour variation.
+    /// Chroma noise reduction, detail-gated (noise-sized deviations smoothed,
+    /// saturated small objects preserved). Luma is preserved exactly.
     var isp_chroma_denoise: Float = 0.0
     var isp_chroma_radius: Float = 12.0
     var isp_saturation: Float = 1.0
-    var isp_local_contrast: Float = 0.20
+    var isp_local_contrast: Float = 0.30
     var isp_skin_protect: Bool = true
 
     var acc_rob_adaptive: Bool = true
@@ -223,30 +233,33 @@ struct TuningParams: Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
         case alignment_grey_fft
-        case hf_artifact_removal_enabled, hf_variance_loss_threshold
-        case hf_min_texture_snr
-        case flow_reject_1d_enabled, flow_regularize_aperture_ratio
-        case flow_reject_1d_ambiguity_ratio, flow_reject_1d_residual_threshold
-        case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
-        case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
+        case flow_regularize_aperture_ratio
+        case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
+        case d_thresh_manual, d_th, d_tr
+        case burst_fast_shutter
+        case dng_lossless_jpeg
         case kernel_anisotropy_continuous
+        case kernel_anisotropy_zero_floor
+        case kernel_stretch_gamma
+        case merge_fp16_accumulator
+        case merge_fast_weights
+        case dng_store_unwhitened
         case bm_subpixel_quadratic
+        case grey_decimate_lowpass
+        case align_fullres_polish
         case flow_boundary_selection
+        case flow_bicubic_sampling
         case flow_overlap_merge
-        case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
-        case global_prealignment_enabled, global_prealignment_choose_reference
-        case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
-        case global_prealignment_max_shift
-        case robustness_enabled, robustness_save_mask, robustness_save_s_masks
+        case snr_auto_tune, alignment_tile_size
+        case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, use_neural_flow
+        case align_ica_per_level_fft
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
-        case use_neural_robustness
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -264,38 +277,33 @@ struct TuningParams: Equatable, Codable {
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
-        hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
-        hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
-        hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
-        flow_reject_1d_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_reject_1d_enabled) ?? flow_reject_1d_enabled
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
         flow_reject_1d_ambiguity_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_ambiguity_ratio) ?? flow_reject_1d_ambiguity_ratio
-        flow_reject_1d_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_residual_threshold) ?? flow_reject_1d_residual_threshold
-        motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
-        motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
-        motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
-        motion_edge_noise_floor_multiplier = try c.decodeIfPresent(Float.self, forKey: .motion_edge_noise_floor_multiplier) ?? motion_edge_noise_floor_multiplier
-        motion_edge_neighborhood_radius = try c.decodeIfPresent(Int.self, forKey: .motion_edge_neighborhood_radius) ?? motion_edge_neighborhood_radius
         k_detail = try c.decodeIfPresent(Float.self, forKey: .k_detail) ?? k_detail
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
+        d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
+        burst_fast_shutter = try c.decodeIfPresent(Bool.self, forKey: .burst_fast_shutter) ?? burst_fast_shutter
+        dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
+        d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
+        d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
+        kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
+        kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
+        merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
+        merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
+        dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
+        grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
+        align_fullres_polish = try c.decodeIfPresent(Bool.self, forKey: .align_fullres_polish) ?? align_fullres_polish
         flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
+        flow_bicubic_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bicubic_sampling) ?? flow_bicubic_sampling
         flow_overlap_merge = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_merge) ?? flow_overlap_merge
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
-        debug_pixel4a_noise_profile = try c.decodeIfPresent(
-            Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
-        global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
-        global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
-        global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
-        global_prealignment_rotation_step_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_step_deg) ?? global_prealignment_rotation_step_deg
-        global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
-        robustness_save_s_masks = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_s_masks) ?? robustness_save_s_masks
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
@@ -319,12 +327,10 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
-        use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
-        use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
         acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
@@ -356,6 +362,13 @@ final class CameraModel: NSObject, ObservableObject {
         return .super48mp
     }() {
         didSet { UserDefaults.standard.set(outputResolutionMode.rawValue, forKey: "OutputResolutionMode") }
+    }
+    /// JPEG export quality (JPG format only). 0.92 default keeps 4:4:4 chroma.
+    @Published var jpegExportQuality: Double = {
+        let v = UserDefaults.standard.double(forKey: "JPEGExportQuality")
+        return v > 0 ? min(1.0, max(0.5, v)) : 0.92
+    }() {
+        didSet { UserDefaults.standard.set(jpegExportQuality, forKey: "JPEGExportQuality") }
     }
     @Published var exportFormat: ExportFormat = {
         if let raw = UserDefaults.standard.string(forKey: "ExportFormat"),
@@ -428,30 +441,63 @@ final class CameraModel: NSObject, ObservableObject {
     // slider positions are still persisted, so turning manual back on restores
     // the last values.
     @Published var shutterIsAuto = true
-    @Published var shutterSlider: Double = CameraModel.persistedShutterSlider()
+    /// Both sliders serve double duty: under manual they are the input, and
+    /// under Auto the poll keeps them mirroring the metering, so the controls
+    /// always show where the camera actually is and switching to manual starts
+    /// from there rather than jumping.
+    ///
+    /// The manual guard in each didSet is what makes that safe -- without it,
+    /// the poll's own writes would be echoed straight back at the device every
+    /// 200ms. Its absence here was also the reason dragging the shutter did
+    /// nothing once the control was already manual: applyShutter was only ever
+    /// called from the view's "leaving Auto" branch, which by definition does
+    /// not fire when the control is already off Auto, so the value moved, the
+    /// label moved, and the device was never told.
+    @Published var shutterSlider: Double = CameraModel.persistedShutterSlider() {
+        didSet {
+            guard !exposureBatch, !shutterIsAuto else { return }
+            UserDefaults.standard.set(min(1.0, max(0.0, shutterSlider)),
+                                      forKey: Self.shutterSliderDefaultsKey)
+            applyShutter()
+        }
+    }
     /// Manual ISO. Auto by default; when off, isoSlider maps linearly onto the
     /// active format's supported range, which varies per lens and per device.
-    /// Manual ISO. Starts on auto every launch, for the same reason as the
-    /// shutter above.
+    /// Starts on auto every launch, for the same reason as the shutter above.
     @Published var isoIsAuto: Bool = true {
-        didSet { applyShutter() }
+        didSet { if !exposureBatch { applyShutter() } }
     }
     @Published var isoSlider: Double = CameraModel.persistedIsoSlider() {
         didSet {
-            UserDefaults.standard.set(isoSlider, forKey: "IsoSlider")
-            if !isoIsAuto { applyShutter() }
+            guard !exposureBatch, !isoIsAuto else { return }
+            UserDefaults.standard.set(isoSlider, forKey: Self.isoSliderDefaultsKey)
+            applyShutter()
         }
     }
+    /// True while setExposureAuto is moving several of the properties above at
+    /// once. Their didSets each call applyShutter, so without this a single
+    /// mode change would reconfigure the device three times, twice of them
+    /// through a half-updated state.
+    private var exposureBatch = false
+    /// Last ISO the metering settled on, sampled by the auto-exposure poll.
+    /// Reported directly rather than derived from isoSlider, which is only a
+    /// position on a range that changes with the lens and format.
+    @Published private(set) var meteredIso: Float = 0
     @Published var isoMin: Float = 30
     @Published var isoMax: Float = 3000
 
+    private static let isoSliderDefaultsKey = "IsoSlider"
+
     private static func persistedIsoSlider() -> Double {
-        guard UserDefaults.standard.object(forKey: "IsoSlider") != nil else { return 0.0 }
-        return min(1.0, max(0.0, UserDefaults.standard.double(forKey: "IsoSlider")))
+        guard UserDefaults.standard.object(forKey: isoSliderDefaultsKey) != nil else { return 0.0 }
+        return min(1.0, max(0.0, UserDefaults.standard.double(forKey: isoSliderDefaultsKey)))
     }
 
+    /// Numeric in both modes: under Auto it reports what the metering picked,
+    /// which is more use than the word "Auto" next to a control whose own
+    /// button already says whether it is on.
     var isoLabel: String {
-        if isoIsAuto { return "Auto" }
+        if isoIsAuto { return meteredIso > 0 ? "\(Int(meteredIso.rounded()))" : "--" }
         return "\(Int(isoValue.rounded()))"
     }
 
@@ -468,6 +514,12 @@ final class CameraModel: NSObject, ObservableObject {
     /// comparison frame at 12MP; past a point the early upload backs off to
     /// spilling rather than risking jetsam (see pipeline_paths.cpp).
     static let maxFrameCount = 15
+    /// Import-from-storage cap when the merge architecture is forced Online:
+    /// the online path decodes, merges, and releases one frame at a time, so
+    /// its peak memory does not grow with the burst (pipeline_paths.cpp's
+    /// online_peak carries a single in-flight frame). 25 keeps the run time
+    /// bounded; there is no memory reason for the number.
+    static let maxImportFrameCountOnline = 25
     private static let frameCountDefaultsKey = "FrameCount"
     private static let shutterSliderDefaultsKey = "ShutterSlider"
 
@@ -642,8 +694,10 @@ final class CameraModel: NSObject, ObservableObject {
     /// Session-queue flag: true while a shutter→process cycle owns the camera.
     private var pipelineBusy = false
 
+    /// Numeric in both modes, for the same reason as isoLabel: under Auto the
+    /// poll keeps shutterSlider tracking the metered duration, so formatting it
+    /// reports what the camera is doing.
     var shutterLabel: String {
-        if shutterIsAuto { return "Auto" }
         let sec = durationFromSlider(shutterSlider)
         if sec >= 1.0 { return "\(Int(sec.rounded()))s" }
         let denom = max(1, Int((1.0 / sec).rounded()))
@@ -717,12 +771,29 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    func toggleShutterAuto() {
-        setShutterAuto(!shutterIsAuto)
-    }
+    /// True when the camera is metering for itself. Shutter and ISO share one
+    /// state deliberately -- see setExposureAuto.
+    var exposureIsAuto: Bool { shutterIsAuto && isoIsAuto }
 
-    func setShutterAuto(_ auto: Bool) {
+    /// Hand exposure to the metering, or take it away.
+    ///
+    /// Shutter and ISO move together because AVFoundation gives us exactly two
+    /// usable modes: continuousAutoExposure meters both, and custom sets both.
+    /// There is no ISO-priority mode. The previous code kept two independent
+    /// flags and, for "manual ISO with auto shutter", took the custom branch
+    /// with the duration pinned to whatever the metering had last produced --
+    /// so auto-exposure silently stopped adapting while the UI went on
+    /// reporting "Auto", and the poll below kept reading that frozen value back
+    /// into the slider.
+    func setExposureAuto(_ auto: Bool) {
+        guard !isBusy else { return }
+        // Both flags in one batch: their didSets each call applyShutter, and in
+        // between the two assignments the state is half manual.
+        exposureBatch = true
         shutterIsAuto = auto
+        isoIsAuto = auto
+        exposureBatch = false
+
         persistShutterState()
         applyShutter()
         if auto {
@@ -736,16 +807,18 @@ final class CameraModel: NSObject, ObservableObject {
     /// Apply the persisted shutter UI state when the camera screen appears.
     func ensureShutterAutoOnLaunch() {
         applyShutter()
-        if shutterIsAuto { startAutoExposureSyncIfNeeded() }
+        if exposureIsAuto { startAutoExposureSyncIfNeeded() }
     }
 
-    func applyManualShutterFromSlider() {
-        guard !isBusy else { return }
-        if shutterIsAuto { shutterIsAuto = false }
-        persistShutterState()
-        applyShutter()
-        exposureSyncTimer?.invalidate()
-        exposureSyncTimer = nil
+    /// Called as a drag on the exposure track begins, before any value is
+    /// written. Stopping the poll here rather than after the first value change
+    /// is what keeps the metering from overwriting the position mid-drag; the
+    /// old ordering wrote the value first and only then asked to leave Auto,
+    /// and its isBusy guard could reject that request outright, leaving the
+    /// control in Auto with the timer still running -- the "works sometimes".
+    func beginManualExposureDrag() {
+        guard exposureIsAuto else { return }
+        setExposureAuto(false)
     }
 
     private func persistShutterState() {
@@ -871,12 +944,30 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    /// Steady-state ZSL capture pacing. Unpaced, the ring recaptured the
+    /// moment the sensor was free: full 12MP RAW readouts back to back, ~24MB
+    /// written and deleted per frame, sensor + ISP + NAND at 100% duty cycle
+    /// for as long as the toggle was on — which is what heated the SoC until
+    /// iOS throttled the whole device (the reported lag). At 5 captures/s the
+    /// newest ring frame is at most ~0.2s old (well inside what zero shutter
+    /// lag needs; the sub-pixel diversity the merge wants actually improves
+    /// with a gap) while capture, ISP, memory, and disk load drop ~5-10x.
+    /// The initial fill after enabling stays unpaced so the buffer reads
+    /// ready quickly.
+    private static let zslPaceInterval: TimeInterval = 0.20
+
     private func scheduleNextZSL() {
-        guard zslWanted, !pipelineBusy, !zslPausedForPipeline else { return }
-        // No artificial pacing — fire as soon as the session queue can run.
         sessionQueue.async { [weak self] in
             guard let self, self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
-            self.pumpZSL()
+            let filled = max(self.zslRawRing.count, self.zslRing.count) >= self.activeFrameCount
+            if filled {
+                self.sessionQueue.asyncAfter(deadline: .now() + Self.zslPaceInterval) { [weak self] in
+                    guard let self, self.zslWanted, !self.pipelineBusy, !self.zslPausedForPipeline else { return }
+                    self.pumpZSL()
+                }
+            } else {
+                self.pumpZSL()
+            }
         }
     }
 
@@ -1064,7 +1155,7 @@ final class CameraModel: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
             self.applyShutter()
-            if self.shutterIsAuto {
+            if self.exposureIsAuto {
                 self.startAutoExposureSyncIfNeeded()
             } else {
                 self.exposureSyncTimer?.invalidate()
@@ -1104,7 +1195,7 @@ final class CameraModel: NSObject, ObservableObject {
         ensureReadyBurstDir()
         DispatchQueue.main.async {
             self.applyShutter()
-            if self.shutterIsAuto {
+            if self.exposureIsAuto {
                 self.startAutoExposureSyncIfNeeded()
             } else {
                 self.exposureSyncTimer?.invalidate()
@@ -1145,42 +1236,85 @@ final class CameraModel: NSObject, ObservableObject {
         return min(1.0, max(0.0, (log(clamped) - logMin) / (logMax - logMin)))
     }
 
+    /// Everything applyShutterOnSessionQueue needs, snapshotted where the
+    /// properties live. It used to read isoIsAuto and isoValue straight off the
+    /// session queue while the UI was writing them from main.
+    private struct ExposureRequest {
+        var isAuto: Bool
+        var slider: Double
+        var minSec: Double
+        var maxSec: Double
+        var isoAuto: Bool
+        var isoValue: Float
+    }
+
+    private func currentExposureRequest() -> ExposureRequest {
+        ExposureRequest(isAuto: shutterIsAuto,
+                        slider: shutterSlider,
+                        minSec: exposureMinSec,
+                        maxSec: exposureMaxSec,
+                        isoAuto: isoIsAuto,
+                        isoValue: isoValue)
+    }
+
+    /// Latest requested exposure, and whether a session-queue block is already
+    /// on its way to consume it.
+    private let exposureLock = NSLock()
+    private var pendingExposure: ExposureRequest?
+    private var exposureApplyQueued = false
+
+    /// A drag produces a value change per touch sample, and each one lands here.
+    /// Enqueuing a separate setExposureModeCustom for every sample backs the
+    /// session queue up behind settings that are already stale, which shows up
+    /// as the control lagging the finger and settling somewhere it was not
+    /// released. Only the newest request survives to reach the device.
     private func applyShutter() {
-        let isAuto = shutterIsAuto
-        let slider = shutterSlider
-        let minSec = exposureMinSec
-        let maxSec = exposureMaxSec
+        let req = currentExposureRequest()
+        exposureLock.lock()
+        pendingExposure = req
+        let alreadyQueued = exposureApplyQueued
+        exposureApplyQueued = true
+        exposureLock.unlock()
+        guard !alreadyQueued else { return }
+
         sessionQueue.async {
-            self.applyShutterOnSessionQueue(isAuto: isAuto, slider: slider, minSec: minSec, maxSec: maxSec)
+            self.exposureLock.lock()
+            let latest = self.pendingExposure
+            self.pendingExposure = nil
+            self.exposureApplyQueued = false
+            self.exposureLock.unlock()
+            if let latest = latest { self.applyShutterOnSessionQueue(latest) }
         }
     }
 
-    private func applyShutterOnSessionQueue(isAuto: Bool, slider: Double, minSec: Double, maxSec: Double) {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
-        if isAuto && isoIsAuto {
+    /// `alreadyLocked` for the two burst-teardown callers, which hold the
+    /// configuration lock across a group of changes. They used to call in
+    /// unconditionally, so the device was locked once and unlocked twice.
+    private func applyShutterOnSessionQueue(_ req: ExposureRequest,
+                                            alreadyLocked: Bool = false) {
+        guard let d = device else { return }
+        if !alreadyLocked, (try? d.lockForConfiguration()) == nil { return }
+        defer { if !alreadyLocked { d.unlockForConfiguration() } }
+
+        if req.isAuto && req.isoAuto {
             if d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
         } else if d.isExposureModeSupported(.custom) {
             let minD = d.activeFormat.minExposureDuration
             let maxD = d.activeFormat.maxExposureDuration
-            var t = isAuto
-                ? d.exposureDuration
-                : CMTimeMakeWithSeconds(durationFromSlider(slider, minSec: minSec, maxSec: maxSec),
-                                        preferredTimescale: 1_000_000_000)
+            var t = CMTimeMakeWithSeconds(
+                durationFromSlider(req.slider, minSec: req.minSec, maxSec: req.maxSec),
+                preferredTimescale: 1_000_000_000)
             if CMTimeCompare(t, minD) < 0 { t = minD }
             if CMTimeCompare(t, maxD) > 0 { t = maxD }
-            // Manual ISO when the user has taken it off auto; otherwise hold
-            // whatever the metering had settled on, as before.
-            let wanted = isoIsAuto ? d.iso : isoValue
-            let iso = min(max(d.activeFormat.minISO, wanted), d.activeFormat.maxISO)
+            let iso = min(max(d.activeFormat.minISO, req.isoValue), d.activeFormat.maxISO)
             d.setExposureModeCustom(duration: t, iso: iso, completionHandler: nil)
         } else {
             DispatchQueue.main.async {
-                self.statusText = "Manual shutter not supported on this camera"
+                self.statusText = "Manual exposure not supported on this camera"
             }
         }
-        d.unlockForConfiguration()
     }
 
     private func device(for selection: CameraSelection) -> AVCaptureDevice? {
@@ -1228,7 +1362,7 @@ final class CameraModel: NSObject, ObservableObject {
             d.whiteBalanceMode = .continuousAutoWhiteBalance
         }
         // Persisted Auto path: continuous AE only when the UI state says Auto.
-        if shutterIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
+        if exposureIsAuto, d.isExposureModeSupported(.continuousAutoExposure) {
             d.exposureMode = .continuousAutoExposure
         }
         d.isSubjectAreaChangeMonitoringEnabled = false
@@ -1238,21 +1372,35 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func startAutoExposureSyncIfNeeded() {
         exposureSyncTimer?.invalidate()
-        guard shutterIsAuto else { return }
+        exposureSyncTimer = nil
+        guard exposureIsAuto else { return }
         guard isAppActive, !previewSuspended else { return }
         exposureSyncTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             self?.pollAutoExposureForSlider()
         }
     }
 
+    /// Mirrors the metering into both sliders while it owns exposure, so the
+    /// readouts show what the camera is actually doing and taking over hands
+    /// control across at the exposure already on screen instead of jumping to
+    /// wherever the sliders were last left.
     private func pollAutoExposureForSlider() {
-        guard shutterIsAuto, !isBusy else { return }
+        guard exposureIsAuto, !isBusy else { return }
         sessionQueue.async {
             guard let d = self.device else { return }
             let sec = CMTimeGetSeconds(d.exposureDuration)
-            guard sec.isFinite, sec > 0 else { return }
+            let iso = d.iso
             DispatchQueue.main.async {
-                self.shutterSlider = self.sliderFromDuration(sec)
+                // Re-checked on the main thread: the hop off and back gives the
+                // user time to have started a drag, and writing the metered
+                // value then would yank the control out from under them.
+                guard self.exposureIsAuto else { return }
+                if sec.isFinite, sec > 0 { self.shutterSlider = self.sliderFromDuration(sec) }
+                if iso.isFinite, iso > 0, self.isoMax > self.isoMin {
+                    self.meteredIso = iso
+                    self.isoSlider = Double(min(1, max(0, (iso - self.isoMin)
+                                                        / (self.isoMax - self.isoMin))))
+                }
             }
         }
     }
@@ -1275,15 +1423,13 @@ final class CameraModel: NSObject, ObservableObject {
         let p = CGPoint(x: min(1, max(0, devicePoint.x)),
                         y: min(1, max(0, devicePoint.y)))
 
-        // A tap says "work the exposure out for me, here", so it also takes the
-        // sliders back to Auto. Setting isoIsAuto runs its didSet, which
-        // re-applies the exposure mode; the block below then points it at the
-        // tap.
-        if !shutterIsAuto || !isoIsAuto {
-            shutterIsAuto = true
-            isoIsAuto = true
-            persistShutterState()
-        }
+        // Manual exposure deliberately survives a tap now. It used to be reset
+        // to Auto here on the reading that a tap means "work it out for me",
+        // but the preview fills the screen and doubles as the focus target, so
+        // any stray tap silently discarded a manually set exposure -- and from
+        // the outside that is indistinguishable from the controls not working.
+        // A tap sets focus, and exposure point when the metering owns it.
+        let meteringOwnsExposure = exposureIsAuto
 
         sessionQueue.async {
             guard let d = self.device, (try? d.lockForConfiguration()) != nil else { return }
@@ -1308,7 +1454,11 @@ final class CameraModel: NSObject, ObservableObject {
             // responding to light entirely. The point of interest persists under
             // continuous metering anyway, and the metering stays weighted to it,
             // so nothing is lost by not locking.
-            if d.isExposureModeSupported(.continuousAutoExposure) {
+            //
+            // Skipped entirely under manual exposure: the point of interest is
+            // still worth setting for when metering resumes, but switching the
+            // mode here would undo the custom duration and ISO.
+            if meteringOwnsExposure, d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
 
@@ -1316,8 +1466,7 @@ final class CameraModel: NSObject, ObservableObject {
             d.unlockForConfiguration()
         }
 
-        // Back on Auto, so the shutter readout has to start tracking again.
-        startAutoExposureSyncIfNeeded()
+        if meteringOwnsExposure { startAutoExposureSyncIfNeeded() }
     }
 
     /// The scene changed enough that the tapped subject is probably gone.
@@ -1336,7 +1485,7 @@ final class CameraModel: NSObject, ObservableObject {
             if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
             if d.isExposurePointOfInterestSupported { d.exposurePointOfInterest = centre }
             // Only reclaim exposure if the user has not since gone manual.
-            if self.shutterIsAuto, self.isoIsAuto,
+            if self.exposureIsAuto,
                d.isExposureModeSupported(.continuousAutoExposure) {
                 d.exposureMode = .continuousAutoExposure
             }
@@ -1636,8 +1785,9 @@ final class CameraModel: NSObject, ObservableObject {
             self.captureKind = .burst
             self.zslCapturing = false
 
-            self.lockForBurst()
-            self.captureNextRaw(isZSL: false)
+            self.lockForBurst {
+                self.captureNextRaw(isZSL: false)
+            }
             self.ensureReadyBurstDir()
         }
     }
@@ -1660,12 +1810,8 @@ final class CameraModel: NSObject, ObservableObject {
                 if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                     d.whiteBalanceMode = .continuousAutoWhiteBalance
                 }
-                self.applyShutterOnSessionQueue(
-                    isAuto: self.shutterIsAuto,
-                    slider: self.shutterSlider,
-                    minSec: self.exposureMinSec,
-                    maxSec: self.exposureMaxSec
-                )
+                self.applyShutterOnSessionQueue(self.currentExposureRequest(),
+                                                alreadyLocked: true)
                 d.unlockForConfiguration()
             }
             if self.isAppActive && !self.previewSuspended {
@@ -1681,12 +1827,37 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func lockForBurst() {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+    private func lockForBurst(_ then: @escaping () -> Void) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { then(); return }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-        if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+        // Only worth locking when the metering owns exposure; under manual the
+        // device is already on a fixed custom duration and ISO.
+        if exposureIsAuto {
+            if tuningParams.burst_fast_shutter {
+                // Fast-shutter burst: half the metered duration, ISO raised by
+                // the same ratio (clamped to the sensor limit) so overall
+                // exposure holds. Waits for the custom exposure to actually
+                // take before the first frame, or frame 1 would still carry
+                // the metered duration.
+                let f = d.activeFormat
+                let dur = CMTimeGetSeconds(d.exposureDuration)
+                let minDur = CMTimeGetSeconds(f.minExposureDuration)
+                let newDur = max(minDur, dur * 0.5)
+                let ratio = Float(dur / max(newDur, 1e-9))
+                let newIso = min(f.maxISO, max(f.minISO, d.iso * ratio))
+                d.setExposureModeCustom(
+                    duration: CMTimeMakeWithSeconds(newDur, preferredTimescale: 1_000_000_000),
+                    iso: newIso) { [weak self] _ in
+                    self?.sessionQueue.async(execute: then)
+                }
+                d.unlockForConfiguration()
+                return
+            }
+            if d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+        }
         d.unlockForConfiguration()
+        then()
     }
 
     private func unlockAfterBurst() {
@@ -1697,12 +1868,8 @@ final class CameraModel: NSObject, ObservableObject {
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 d.whiteBalanceMode = .continuousAutoWhiteBalance
             }
-            self.applyShutterOnSessionQueue(
-                isAuto: self.shutterIsAuto,
-                slider: self.shutterSlider,
-                minSec: self.exposureMinSec,
-                maxSec: self.exposureMaxSec
-            )
+            self.applyShutterOnSessionQueue(self.currentExposureRequest(),
+                                            alreadyLocked: true)
             d.unlockForConfiguration()
         }
     }
@@ -1819,11 +1986,14 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     /// DNGs chosen through the import picker, processed instead of a capture.
-    /// Capped at maxFrameCount; the pipeline holds every frame through the merge.
+    /// Capped at maxFrameCount, or maxImportFrameCountOnline when the merge
+    /// architecture is forced Online (constant-memory path).
     @Published var importedDNGs: [URL] = []
 
-    /// Process a set of DNGs the user picked. Always at 2x, since importing is
-    /// a deliberate act and the extra resolution is the reason to do it.
+    /// Process a set of DNGs the user picked, at the resolution selected in
+    /// Export settings. This used to force 48MP (and silently overwrote the
+    /// saved resolution preference doing it), which made the 12MP setting
+    /// appear broken: switch to 12MP, import a burst, get a 48MP file.
     func processImportedDNGs(_ urls: [URL]) {
         guard !isBusy else { return }
         let dngs = urls.filter { $0.pathExtension.lowercased() == "dng" }
@@ -1831,8 +2001,13 @@ final class CameraModel: NSObject, ObservableObject {
             finish(success: false, message: "Pick at least 2 DNG files")
             return
         }
-        importedDNGs = Array(dngs.prefix(Self.maxFrameCount))
-        outputResolutionMode = .super48mp
+        // Online merge (forced via Merge Architecture) keeps one frame in
+        // flight regardless of burst length, so imports may exceed the
+        // capture cap: memory stays flat in frame count. Banded/Auto keep 15
+        // because banding holds every frame resident through the merge.
+        let cap = tuningParams.merge_arch == 2
+            ? Self.maxImportFrameCountOnline : Self.maxFrameCount
+        importedDNGs = Array(dngs.prefix(cap))
         isBusy = true
         isCapturing = false
         isProcessing = true
@@ -1866,7 +2041,9 @@ final class CameraModel: NSObject, ObservableObject {
         // The output-resolution choice only means anything when nothing is
         // cropped away; any zoom is realised as crop-then-2x, which is what the
         // 2x lens button always did and is now what every magnification does.
-        let useSelectedOutputScale = !usingDocDNGs && cropZoomForCapture <= 1.0001
+        // Imported DNGs never crop (cropZoomForCapture forced to 1 above), so
+        // the selection applies to them like any uncropped capture.
+        let useSelectedOutputScale = cropZoomForCapture <= 1.0001
         let algorithmScale: Float = useSelectedOutputScale
             ? outputResolutionMode.algorithmScale
             : 2.0
@@ -1888,37 +2065,32 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
-            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
-            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
-            "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
-            "flow_reject_1d_enabled": NSNumber(value: tuningParams.flow_reject_1d_enabled),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
             "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
-            "flow_reject_1d_residual_threshold": NSNumber(value: tuningParams.flow_reject_1d_residual_threshold),
-            "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
-            "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
-            "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
-            "motion_edge_noise_floor_multiplier": NSNumber(value: tuningParams.motion_edge_noise_floor_multiplier),
-            "motion_edge_neighborhood_radius": NSNumber(value: tuningParams.motion_edge_neighborhood_radius),
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
+            "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
+            "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
+            "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
+            "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
+            "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
+            "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),
+            "align_fullres_polish": NSNumber(value: tuningParams.align_fullres_polish),
             "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
+            "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
+            "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
+            "dng_lossless_jpeg": NSNumber(value: tuningParams.dng_lossless_jpeg),
+            "D_th": NSNumber(value: tuningParams.d_th),
+            "D_tr": NSNumber(value: tuningParams.d_tr),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
-            "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
-            "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
-            "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
-            "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
-            "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
-            "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
-            "robustness_save_s_masks": NSNumber(value: tuningParams.robustness_save_s_masks),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
@@ -1940,12 +2112,10 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
-            "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
-            "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
             "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)
@@ -2007,10 +2177,6 @@ final class CameraModel: NSObject, ObservableObject {
             var maskSuffixes: [String] = []
             if tuningParams.robustness_save_mask {
                 maskSuffixes.append("_robustness.pgm")
-                if tuningParams.robustness_save_s_masks {
-                    maskSuffixes.append("_robustness_s1.pgm")
-                    maskSuffixes.append("_robustness_s2.pgm")
-                }
             }
             let base = outURL.deletingPathExtension().path
             let robURLs = maskSuffixes
@@ -2079,10 +2245,11 @@ final class CameraModel: NSObject, ObservableObject {
     /// Lightroom-like finish from the SR DNG: Highlights −70, stronger contrast
     /// + vibrance (no sharpen / NR). Uses our own Deflate LinearRaw decoder
     /// (ImageIO cannot read these DNGs).
-    private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
+    private static func renderExportJPEG(fromDNG dngURL: URL, quality: Double) -> URL? {
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
-        let ok = SRBridge.exportJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path)
+        let ok = SRBridge.exportJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path,
+                                     quality: Float(quality))
         if ok { return outURL }
         try? FileManager.default.removeItem(at: outURL)
         return nil
@@ -2090,6 +2257,11 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
         let format = exportFormat
+        let quality = jpegExportQuality
+        // The JPEG render / preview embed below re-reads and re-encodes the
+        // full-size DNG -- seconds of real work after the pipeline's "Done".
+        // Without this the UI freezes on "Done" with no explanation.
+        DispatchQueue.main.async { self.statusText = "Saving to Photos…" }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 DispatchQueue.main.async {
@@ -2105,11 +2277,14 @@ final class CameraModel: NSObject, ObservableObject {
             var saveURL = url
             var tempJPEG: URL?
             if format == .dng {
-                // DNG-only asset: embed tone-mapped JPEG SubIFD so Photos can
-                // thumbnail (ImageIO cannot decode Deflate LinearRaw IFD0).
-                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 4096)
+                // DNG-only asset: embed a tone-mapped JPEG SubIFD. Photos does
+                // not merely thumbnail from it -- it cannot decode our Deflate
+                // LinearRaw IFD0 at all, so this preview IS the image the user
+                // sees at every zoom level. It therefore gets full resolution;
+                // 4096 here was why a 48MP capture looked soft in Photos.
+                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 32768)
             } else if format == .jpg {
-                if let jpg = Self.renderExportJPEG(fromDNG: url) {
+                if let jpg = Self.renderExportJPEG(fromDNG: url, quality: quality) {
                     saveURL = jpg
                     tempJPEG = jpg
                 } else {

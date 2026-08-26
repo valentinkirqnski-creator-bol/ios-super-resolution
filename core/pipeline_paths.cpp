@@ -13,7 +13,6 @@
 #include "preset_lut.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
-#include "neural_flow.h"
 #endif
 #include <vector>
 #include <array>
@@ -23,6 +22,7 @@
 #include <cstdio>
 #include <cmath>
 #include <future>
+#include <deque>
 #include <mutex>
 #include <memory>
 #include <limits>
@@ -50,6 +50,20 @@ namespace hhsr {
 static inline void worker_qos() {
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+}
+
+// Prefetch decoders run a tier LOWER still. At USER_INITIATED, three
+// concurrent LibRaw decodes competed with parallel_rows (same QoS) for the
+// P-cores and the whole analyze stage inflated: align 42->111ms, robustness
+// 37->380ms per frame -- the decode stall was eliminated but re-exported as
+// compute contention, and the burst got slower overall. UTILITY steers the
+// decoders to spare E-core cycles (it is not the throttled BACKGROUND tier),
+// leaving the P-cores to the pipeline that consumes their output. A decode
+// takes longer on an E-core, which is exactly what the depth-3 queue is for.
+static inline void decode_qos() {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
 }
 
@@ -125,9 +139,8 @@ static Image compute_robustness_and_activity(const Image& comp,
                                              int tile_size,
                                              const Config& work,
                                              std::vector<uint8_t>& rows,
-                                             bool& has_nonzero,
-                                             Image* s_select_out = nullptr) {
-    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work, s_select_out);
+                                             bool& has_nonzero) {
+    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
     has_nonzero = robustness_row_activity(rob, rows);
     return rob;
 }
@@ -151,318 +164,6 @@ static bool robustness_band_can_contribute(const std::vector<uint8_t>& rows,
         if (rows[(size_t)ry]) return true;
     }
     return false;
-}
-
-struct PrealignTransform {
-    f32 dx = 0.f;      // reference raw/grey coordinate -> moving coordinate
-    f32 dy = 0.f;
-    f32 angle = 0.f;   // radians, positive = counter-clockwise about image center
-    f32 score = -1.f;
-    bool valid = false;
-};
-
-struct PrealignPlan {
-    int reference_index = 0;
-    std::vector<PrealignTransform> to_first;
-    std::vector<PrealignTransform> from_reference;
-};
-
-static inline f32 sample_bilinear_clamped(const Image& im, f32 y, f32 x) {
-    if (im.h <= 0 || im.w <= 0) return 0.f;
-    x = clampf(x, 0.f, (f32)(im.w - 1));
-    y = clampf(y, 0.f, (f32)(im.h - 1));
-    const int fx = (int)std::floor(x);
-    const int fy = (int)std::floor(y);
-    const int cx = std::min(fx + 1, im.w - 1);
-    const int cy = std::min(fy + 1, im.h - 1);
-    const f32 tx = x - (f32)fx;
-    const f32 ty = y - (f32)fy;
-    const f32 top = im.at(fy, fx) + tx * (im.at(fy, cx) - im.at(fy, fx));
-    const f32 bot = im.at(cy, fx) + tx * (im.at(cy, cx) - im.at(cy, fx));
-    return top + ty * (bot - top);
-}
-
-static bool sample_bilinear_inside(const Image& im, f32 y, f32 x, f32& out) {
-    if (im.h <= 1 || im.w <= 1 || x < 0.f || y < 0.f ||
-        x > (f32)(im.w - 1) || y > (f32)(im.h - 1))
-        return false;
-    out = sample_bilinear_clamped(im, y, x);
-    return true;
-}
-
-static Image make_prealign_thumbnail(const Image& raw, const Config& cfg) {
-    if (raw.h <= 0 || raw.w <= 0) return Image();
-    const int max_dim = std::max(96, std::min(512, cfg.global_prealignment_thumb_max_dim));
-    int tw = max_dim;
-    int th = max_dim;
-    if (raw.w >= raw.h) {
-        tw = max_dim;
-        th = std::max(64, (int)std::lround((double)raw.h * (double)max_dim / (double)raw.w));
-    } else {
-        th = max_dim;
-        tw = std::max(64, (int)std::lround((double)raw.w * (double)max_dim / (double)raw.h));
-    }
-    tw = std::min(tw, raw.w);
-    th = std::min(th, raw.h);
-    Image thumb(th, tw, 1);
-    const f32 sx = (f32)raw.w / (f32)tw;
-    const f32 sy = (f32)raw.h / (f32)th;
-    constexpr int S = 4;
-    parallel_rows(th, 0, [&](int y) {
-        for (int x = 0; x < tw; ++x) {
-            f32 sum = 0.f;
-            for (int yy = 0; yy < S; ++yy) {
-                for (int xx = 0; xx < S; ++xx) {
-                    const f32 rx = ((f32)x + ((f32)xx + 0.5f) / (f32)S) * sx - 0.5f;
-                    const f32 ry = ((f32)y + ((f32)yy + 0.5f) / (f32)S) * sy - 0.5f;
-                    sum += sample_bilinear_clamped(raw, ry, rx);
-                }
-            }
-            thumb.at(y, x) = sum * (1.f / (f32)(S * S));
-        }
-    });
-    return gaussian_blur(thumb, 0.6f);
-}
-
-static f32 prealign_ncc_score(const Image& ref, const Image& mov,
-                              f32 dx, f32 dy, f32 angle, int stride) {
-    if (ref.h != mov.h || ref.w != mov.w || ref.h <= 8 || ref.w <= 8)
-        return -std::numeric_limits<f32>::infinity();
-    const f32 ca = std::cos(angle);
-    const f32 sa = std::sin(angle);
-    const f32 cx = 0.5f * (f32)(ref.w - 1);
-    const f32 cy = 0.5f * (f32)(ref.h - 1);
-    const int mx = std::max(4, ref.w / 12);
-    const int my = std::max(4, ref.h / 12);
-    double sr = 0.0, sm = 0.0, srr = 0.0, smm = 0.0, srm = 0.0;
-    int count = 0;
-    for (int y = my; y < ref.h - my; y += stride) {
-        for (int x = mx; x < ref.w - mx; x += stride) {
-            const f32 rx = (f32)x - cx;
-            const f32 ry = (f32)y - cy;
-            const f32 qx = cx + ca * rx - sa * ry + dx;
-            const f32 qy = cy + sa * rx + ca * ry + dy;
-            f32 mv = 0.f;
-            if (!sample_bilinear_inside(mov, qy, qx, mv)) continue;
-            const f32 rv = ref.at(y, x);
-            sr += rv;
-            sm += mv;
-            srr += (double)rv * (double)rv;
-            smm += (double)mv * (double)mv;
-            srm += (double)rv * (double)mv;
-            ++count;
-        }
-    }
-    if (count < 64) return -std::numeric_limits<f32>::infinity();
-    const double n = (double)count;
-    const double cov = srm - (sr * sm) / n;
-    const double vr = srr - (sr * sr) / n;
-    const double vm = smm - (sm * sm) / n;
-    const double denom = std::sqrt(std::max(0.0, vr) * std::max(0.0, vm));
-    if (!(denom > 1e-12) || !std::isfinite(denom))
-        return -std::numeric_limits<f32>::infinity();
-    return (f32)(cov / denom);
-}
-
-static PrealignTransform estimate_prealign_transform(const Image& ref_thumb,
-                                                     const Image& mov_thumb,
-                                                     const Config& cfg) {
-    PrealignTransform best;
-    const int max_shift = std::max(0, std::min(64, cfg.global_prealignment_max_shift));
-    const f32 range_deg = std::max(0.f, std::min(2.f, cfg.global_prealignment_rotation_range_deg));
-    const f32 step_deg = std::max(0.05f, std::min(1.f, cfg.global_prealignment_rotation_step_deg));
-    const int stride = std::max(1, (int)std::ceil(std::sqrt(
-        (double)std::max(1, ref_thumb.h * ref_thumb.w) / 7000.0)));
-    const f32 deg_to_rad = 3.14159265358979323846f / 180.f;
-    auto consider = [&](f32 dx, f32 dy, f32 angle) {
-        const f32 score = prealign_ncc_score(ref_thumb, mov_thumb, dx, dy, angle, stride);
-        if (score > best.score) {
-            best.dx = dx;
-            best.dy = dy;
-            best.angle = angle;
-            best.score = score;
-        }
-    };
-
-    std::vector<f32> angles;
-    if (range_deg <= 0.0001f) {
-        angles.push_back(0.f);
-    } else {
-        for (f32 deg = -range_deg; deg <= range_deg + 0.5f * step_deg; deg += step_deg)
-            angles.push_back(deg * deg_to_rad);
-        angles.push_back(0.f);
-    }
-
-    const int coarse_step = max_shift >= 8 ? 2 : 1;
-    for (f32 a : angles) {
-        for (int sy = -max_shift; sy <= max_shift; sy += coarse_step) {
-            for (int sx = -max_shift; sx <= max_shift; sx += coarse_step) {
-                consider((f32)sx, (f32)sy, a);
-            }
-        }
-    }
-
-    const PrealignTransform coarse = best;
-    const f32 fine_angle_step = range_deg > 0.f ? 0.5f * step_deg * deg_to_rad : 1.f;
-    const int fine_shift = std::max(1, coarse_step);
-    for (f32 da = -fine_angle_step; da <= fine_angle_step + 0.25f * fine_angle_step;
-         da += fine_angle_step) {
-        const f32 a = (range_deg > 0.f)
-            ? std::max(-range_deg * deg_to_rad,
-                       std::min(range_deg * deg_to_rad, coarse.angle + da))
-            : 0.f;
-        for (int sy = (int)std::floor(coarse.dy) - fine_shift;
-             sy <= (int)std::ceil(coarse.dy) + fine_shift; ++sy) {
-            for (int sx = (int)std::floor(coarse.dx) - fine_shift;
-                 sx <= (int)std::ceil(coarse.dx) + fine_shift; ++sx) {
-                if (std::abs(sx) <= max_shift && std::abs(sy) <= max_shift)
-                    consider((f32)sx, (f32)sy, a);
-            }
-        }
-    }
-
-    best.valid = std::isfinite(best.score) && best.score > 0.03f;
-    if (!best.valid) best = PrealignTransform{};
-    return best;
-}
-
-static PrealignPlan build_prealign_plan_from_first(
-    int frame_count, const RawFrameLoaderFn& loader, Config& work,
-    const Image& first_ref, const ProgressFn& progress) {
-    PrealignPlan plan;
-    plan.to_first.assign((size_t)frame_count, PrealignTransform{});
-    plan.from_reference.assign((size_t)frame_count, PrealignTransform{});
-    if (!work.global_prealignment_enabled || frame_count < 2 ||
-        !loader || first_ref.h <= 0 || first_ref.w <= 0)
-        return plan;
-    // Integrated mode: the transform for a frame is computed in the analysis
-    // loop, from the buffer that loop has already decoded, so this pass has
-    // nothing to do and its decodes -- the entire cost of pre-alignment --
-    // disappear. Only reference selection needs every transform up front, so
-    // this is available exactly when that is off.
-    if (work.prealign_use_decoded_frames && !work.global_prealignment_choose_reference)
-        return plan;
-
-    Image ref_thumb = make_prealign_thumbnail(first_ref, work);
-    if (ref_thumb.h <= 0 || ref_thumb.w <= 0)
-        return plan;
-
-    plan.to_first[0].valid = true;
-    plan.to_first[0].score = 1.f;
-    const f32 thumb_to_raw_x = (f32)first_ref.w / (f32)ref_thumb.w;
-    const f32 thumb_to_raw_y = (f32)first_ref.h / (f32)ref_thumb.h;
-
-    // Measured on an 8-frame 12MP burst: the decode is 750ms per frame, the
-    // thumbnail 7ms, and the 625-evaluation NCC search below the timer's
-    // resolution. So this loop is entirely a decode loop, and the only thing
-    // worth doing to it is overlapping the decodes.
-    //
-    // Each iteration is independent -- it reads only ref_thumb and writes only
-    // its own slot -- and estimate_prealign_transform is deterministic, so the
-    // result does not depend on execution order. Bit-identical to the serial
-    // loop this replaces.
-    //
-    // Concurrency is bounded because a decoded 12MP frame is 48MB and this runs
-    // before the merge accumulators are allocated but not before everything
-    // else; 3 in flight is ~150MB, which is the most this can take without
-    // moving the peak. Frames are freed the moment their thumbnail exists.
-    const int conc = std::max(1, std::min(work.prealign_decode_concurrency,
-                                          frame_count - 1));
-    std::mutex progress_mu;
-    int done = 0;
-    auto do_frame = [&](int k) {
-        Image comp = loader(k, work, false, first_ref.h, first_ref.w);
-        if (comp.h <= 0 || comp.w <= 0) return;
-        Image thumb = make_prealign_thumbnail(comp, work);
-        comp = Image();
-        if (thumb.h != ref_thumb.h || thumb.w != ref_thumb.w) return;
-        PrealignTransform t = estimate_prealign_transform(ref_thumb, thumb, work);
-        if (t.valid) {
-            t.dx *= thumb_to_raw_x;
-            t.dy *= thumb_to_raw_y;
-        }
-        plan.to_first[(size_t)k] = t;
-        if (progress) {
-            std::lock_guard<std::mutex> lk(progress_mu);
-            ++done;
-            progress("Pre-aligning frame " + std::to_string(done + 1),
-                     0.025f + 0.035f * (float)done / std::max(1, frame_count - 1));
-        }
-    };
-    if (conc <= 1) {
-        for (int k = 1; k < frame_count; ++k) do_frame(k);
-    } else {
-        for (int k0 = 1; k0 < frame_count; k0 += conc) {
-            const int k1 = std::min(frame_count, k0 + conc);
-            std::vector<std::future<void>> batch;
-            batch.reserve((size_t)(k1 - k0 - 1));
-            for (int k = k0 + 1; k < k1; ++k)
-                batch.push_back(std::async(std::launch::async, do_frame, k));
-            do_frame(k0);                       // this thread takes one too
-            for (auto& f : batch) f.get();
-        }
-    }
-
-    if (work.global_prealignment_choose_reference) {
-        std::vector<PrealignTransform> basic((size_t)std::max(0, frame_count - 1));
-        bool all_adjacent_valid = true;
-        for (int i = 1; i < frame_count; ++i) {
-            const PrealignTransform a = plan.to_first[(size_t)i];
-            const PrealignTransform b = plan.to_first[(size_t)i - 1u];
-            all_adjacent_valid = all_adjacent_valid && a.valid && b.valid;
-            if (a.valid && b.valid) {
-                basic[(size_t)i - 1u].dx = a.dx - b.dx;
-                basic[(size_t)i - 1u].dy = a.dy - b.dy;
-                basic[(size_t)i - 1u].angle = a.angle - b.angle;
-                basic[(size_t)i - 1u].valid = true;
-            }
-        }
-
-        if (all_adjacent_valid && frame_count > 1) {
-            f32 best_len = std::numeric_limits<f32>::infinity();
-            int best_ref = 0;
-            for (int i = 0; i < frame_count - 1; ++i) {
-                f32 ax = 0.f, ay = 0.f;
-                for (int j = 0; j < i; ++j) {
-                    ax -= basic[(size_t)j].dx;
-                    ay -= basic[(size_t)j].dy;
-                }
-                f32 bx = 0.f, by = 0.f;
-                for (int j = i; j < frame_count - 1; ++j) {
-                    bx += basic[(size_t)j].dx;
-                    by += basic[(size_t)j].dy;
-                }
-                const f32 tx = ax + bx;
-                const f32 ty = ay + by;
-                const f32 len = std::sqrt(tx * tx + ty * ty);
-                if (len < best_len) {
-                    best_len = len;
-                    best_ref = i;
-                }
-            }
-            plan.reference_index = best_ref;
-        }
-    }
-
-    const PrealignTransform ref_t = plan.to_first[(size_t)plan.reference_index];
-    for (int k = 0; k < frame_count; ++k) {
-        PrealignTransform rel;
-        if (plan.to_first[(size_t)k].valid && ref_t.valid) {
-            const PrealignTransform tk = plan.to_first[(size_t)k];
-            rel.angle = tk.angle - ref_t.angle;
-            const f32 ca = std::cos(rel.angle);
-            const f32 sa = std::sin(rel.angle);
-            rel.dx = tk.dx - (ca * ref_t.dx - sa * ref_t.dy);
-            rel.dy = tk.dy - (sa * ref_t.dx + ca * ref_t.dy);
-            rel.score = tk.score;
-            rel.valid = true;
-        }
-        plan.from_reference[(size_t)k] = rel;
-    }
-    plan.from_reference[(size_t)plan.reference_index] = PrealignTransform{};
-    plan.from_reference[(size_t)plan.reference_index].valid = true;
-    plan.from_reference[(size_t)plan.reference_index].score = 1.f;
-    return plan;
 }
 
 struct DebugImageStats {
@@ -662,24 +363,6 @@ static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) 
         acc_rob.data[i] += rob.data[i];
 }
 
-// Split the same sum by which motion prior scored each pixel. sel is 1 where
-// the strict s1 applied and 0 where s2 did, so the two accumulators partition
-// the robustness exactly: acc_s1 + acc_s2 == acc_rob, pixel for pixel.
-static void absorb_robustness_split(Image& acc_s1, Image& acc_s2,
-                                    const Image& rob, const Image& sel, bool& have) {
-    if (sel.data.size() != rob.data.size()) return;
-    if (!have) {
-        acc_s1 = Image(rob.h, rob.w, 1);
-        acc_s2 = Image(rob.h, rob.w, 1);
-        have = true;
-    }
-    for (size_t i = 0; i < rob.data.size(); ++i) {
-        const f32 on_s1 = sel.data[i];
-        acc_s1.data[i] += rob.data[i] * on_s1;
-        acc_s2.data[i] += rob.data[i] * (1.f - on_s1);
-    }
-}
-
 static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
                                  const std::vector<CachedCompMeta>& cached_meta,
                                  bool stream_comp_raw,
@@ -717,6 +400,10 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
     const f32 wb1 = work.raw_prewhitened ? 1.f : work.white_balance[1];
     const f32 wb2 = work.raw_prewhitened ? 1.f : work.white_balance[2];
     const bool prev_color = !bake && nch >= 3 && work.has_cam_to_srgb;
+    // Un-white-balance the STORED rows only (see Config::dng_store_unwhitened);
+    // the preview keeps the white-balanced values it always showed.
+    float sg[3];
+    dng_unwhiten_gains(work, nch, sg);
 
 #if defined(__APPLE__)
     // Dense DNG band on GPU (1:1); sparse preview stays on CPU below.
@@ -733,9 +420,15 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
     parallel_rows(bh, work.num_threads, [&](int i) {
         const int gy = y0 + i;
         const bool do_prev_row = ((gy % y_step) == 0);
+        // When the GPU produced the dense rows, this loop exists ONLY for the
+        // sparse preview -- stride straight to the sampled positions instead
+        // of iterating all 48M pixels to skip them (measured: a large slice
+        // of the encode tail doing nothing).
+        if (gpu_rgb && !do_prev_row) return;
+        const int px_step = gpu_rgb ? x_step : 1;
         const int py = std::min(ph - 1, (int)(gy * pscale));
         const size_t row_off = (size_t)i * (size_t)Ws * (size_t)nch;
-        for (int x = 0; x < Ws; ++x) {
+        for (int x = 0; x < Ws; x += px_step) {
             const bool need_prev = do_prev_row && (x % x_step) == 0;
             if (gpu_rgb && !need_prev) continue;
 
@@ -760,9 +453,9 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
                 lin0 = lin1 = lin2 = cn0;
             }
             if (!gpu_rgb) {
-                const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0, 0.f, 1.f);
-                const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1, 0.f, 1.f);
-                const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2, 0.f, 1.f);
+                const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0 * sg[0], 0.f, 1.f);
+                const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1 * sg[1], 0.f, 1.f);
+                const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2 * sg[2], 0.f, 1.f);
                 const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
                 outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
                 outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
@@ -907,7 +600,9 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
 
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
                                   const Config& cfg, const std::string& dng_path,
-                                  const ProgressFn& progress, int maxPreviewDim) {
+                                  const ProgressFn& progress, int maxPreviewDim,
+                                  Rgb16Sink* rgb16_sink) {
+    if (rgb16_sink) { rgb16_sink->w = 0; rgb16_sink->h = 0; rgb16_sink->rgb.clear(); }
     if (frame_count < 2 || !loader) return Image();
 
     prof_reset();
@@ -928,20 +623,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_add_cpu("ref:decode", prof_now_ms() - t_first);
     if (first_ref.h <= 0 || first_ref.w <= 0) return Image();
 
-    const double t_prealign = prof_now_ms();
-    PrealignPlan prealign = build_prealign_plan_from_first(
-        frame_count, loader, work, first_ref, progress);
-    prof_add_cpu("setup:prealign", prof_now_ms() - t_prealign);
-    const int ref_index = std::max(0, std::min(frame_count - 1, prealign.reference_index));
-    Image ref;
-    if (ref_index == 0) {
-        ref = std::move(first_ref);
-    } else {
-        report("Loading selected reference frame", 0.06f);
-        ref = loader(ref_index, work, true, 0, 0);
-        first_ref = Image();
-    }
+    Image ref = std::move(first_ref);
     if (ref.h <= 0 || ref.w <= 0) return Image();
+
+    const int ref_index = 0;
 
     // MPSGraph compiles its FFT plan on first use (~1100ms at 12MP), and that
     // landed squarely on the reference grey. Start it here, as soon as the
@@ -959,35 +644,54 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (debug) append_image_summary(debug_summary, "raw_ref", ref);
     if (debug) {
         std::string listing = "ref_index=" + std::to_string(ref_index) + "\n";
-        for (int i = 0; i < frame_count; ++i) {
-            listing += std::to_string(i) + " provider_frame";
-            if (i < (int)prealign.from_reference.size()) {
-                const PrealignTransform& t = prealign.from_reference[(size_t)i];
-                listing += " pre_dx=" + std::to_string(t.dx);
-                listing += " pre_dy=" + std::to_string(t.dy);
-                listing += " pre_angle_rad=" + std::to_string(t.angle);
-                listing += " score=" + std::to_string(t.score);
-            }
-            listing += "\n";
-        }
+        for (int i = 0; i < frame_count; ++i)
+            listing += std::to_string(i) + " provider_frame\n";
         debug_dump_text("cpp_burst_paths", listing);
     }
-    // Prefetch state for the comparison decodes. The first one is launched
-    // below, once SNR tuning has been joined.
-    int pref_k = -1;
-    std::future<Image> pref_fut;
+    // Prefetch state for the comparison decodes: an in-order queue of decode
+    // futures, seeded below once SNR tuning has been joined and topped back up
+    // each loop iteration. Depth 1 was not enough once the per-frame pipeline
+    // work dropped to ~130ms: a DNG decode takes ~390ms, so a single prefetch
+    // launched one frame ahead left comp:decode-wait stalling ~265ms/frame --
+    // the consumer outran the producer. Depth 3 keeps three decodes in flight
+    // (390 / 130 rounds to 3), which is enough for the queue's front to be
+    // ready when the loop reaches it. Scheduling only: the same frames are
+    // decoded in the same comp_indices order and produce the same values;
+    // decode-order independence holds because a comparison decode's only
+    // Config write is re-storing raw_prewhitened = true (all metadata writes
+    // are is_reference-gated, and the reference decoded long ago).
+    //
+    // Costs up to two more resident Bayer frames (~49MB each) than depth 1.
+    // Peak footprint is at merge:band, not during analyze; headroom to jetsam
+    // was 1527MB on the profiled run.
+    struct PrefetchedDecode {
+        int k = -1;
+        std::future<Image> fut;
+    };
+    std::deque<PrefetchedDecode> pref_q;
+    const int kDecodePrefetchDepth = 3;
+    // Crop dims by value: the decode thread may still be running after the
+    // reference image's pixels have been stashed and freed.
+    const int pref_ref_h = ref.h, pref_ref_w = ref.w;
+    int pref_seq = 0;
+    auto launch_prefetch = [&, pref_ref_h, pref_ref_w](int frame) {
+        // The first two decodes get the responsive tier: their only cover is
+        // the brief reference stage, and UTILITY there was the measured 1-2s
+        // "analyzing frame 2" stall variant. Later decodes stay on the
+        // efficiency tier so they cannot steal P-cores from the analyze loop.
+        const bool eager = pref_seq++ < 2;
+        pref_q.push_back({frame, std::async(std::launch::async,
+                                            [&, frame, pref_ref_h, pref_ref_w, eager]() {
+            if (eager) worker_qos(); else decode_qos();
+            return loader(frame, work, false, pref_ref_h, pref_ref_w);
+        })});
+    };
 
     // Accumulated robustness. Summed inside the loop on the streamed path so
     // each frame's mask can be released as soon as it is on the GPU, rather
     // than every mask being held until after the loop.
     Image acc_rob;
     bool have_acc_rob = false;
-    // Same sum, partitioned by which motion prior scored each pixel. Debug only,
-    // and only meaningful alongside the combined mask, so it follows the same
-    // save flag. Accumulated in the loop for the same reason acc_rob is.
-    const bool want_s_masks = work.robustness_save_mask && work.robustness_save_s_masks;
-    Image acc_rob_s1, acc_rob_s2;
-    bool have_acc_rob_split = false;
 
     const double t_snr = prof_now_ms();
     f32 ref_brightness = 0.f;
@@ -1012,7 +716,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_mark_memory("ref:start");
     const double t_ref_grey = prof_now_ms();
     // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method,
+                                  work.grey_decimate_lowpass);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
 
     prof_add_cpu("ref:grey(gpu)", prof_now_ms() - t_ref_grey);
@@ -1025,10 +730,24 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     snr_fut.get();
     prof_add_cpu("setup:snr-join(residual)", prof_now_ms() - t_snr_join);
 
-    // Start the first comparison decode now. It used to run synchronously at
-    // the top of the comparison loop (comp:decode(sync), ~187ms with nothing
-    // overlapping it); the pyramid build plus robustness and kernel estimation
-    // now cover it.
+    // Prewarm the robustness noise curves on a worker. On a curve-cache MISS
+    // (every new ISO changes alpha/beta and with them the cache key) the
+    // Monte-Carlo builds otherwise run synchronously inside the FIRST
+    // comparison frame's robustness call -- the "analyzing frame 2" freeze.
+    // The curves' cache is mutex-guarded, so if the frame catches up it waits
+    // for the in-flight build rather than duplicating it. Same keys, same
+    // values; only where the build runs changes. After snr_fut.get() because
+    // the accessors and tune_config_snr share the noise model.
+    std::future<void> noise_warm = std::async(std::launch::async, [&]() {
+        worker_qos();
+        robustness_prewarm_noise_curves(work);
+    });
+
+    // Seed the decode queue now, up to its full depth. These used to run
+    // synchronously at the top of the comparison loop (comp:decode(sync),
+    // ~187ms with nothing overlapping it); the pyramid build plus robustness
+    // and kernel estimation now cover the first, and by the time the loop
+    // consumes frame 1 the queue is refilling behind it.
     //
     // Deliberately after snr_fut.get() rather than before the reference stage:
     // the loader takes Config by non-const reference and may write to it, while
@@ -1036,18 +755,21 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // race on the noise model, changing the SNR and therefore the alignment
     // tile size -- an algorithm change, not an optimization.
     //
-    // Costs one extra resident Bayer frame (~49MB) during the reference stage.
-    // Peak footprint is at merge:band (1861MB), not here, so the peak is
-    // unchanged; headroom to jetsam was 1211MB.
-    for (int i = 0; i < frame_count; ++i) {
-        if (i == ref_index) continue;
-        pref_k = i;
-        pref_fut = std::async(std::launch::async, [&, i]() {
-            worker_qos();
-            return loader(i, work, false, ref.h, ref.w);
-        });
-        break;
+    // Same enumeration as comp_indices below (every frame but the reference,
+    // in order), so the queue's front always matches the loop's next k.
+    {
+        int seeded = 0;
+        for (int i = 0; i < frame_count && seeded < kDecodePrefetchDepth; ++i) {
+            if (i == ref_index) continue;
+            launch_prefetch(i);
+            ++seeded;
+        }
     }
+
+    // Band-limited full-res grey of the reference for the full-res ICA
+    // polish; built lazily at the first comparison frame, held for the burst
+    // (~48MB). Empty when the polish is off or failed to build.
+    Image ref_grey_polish;
 
     // Same UI status line as "Frame N: analyze" (CameraModel.statusText).
     {
@@ -1071,26 +793,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     (void)t_snr;
 
     const int ref_h = ref.h, ref_w = ref.w;
-    // Integrated pre-alignment: one thumbnail of the reference, reused by every
-    // comparison frame. ~7ms, against the ~750ms per-frame decode the separate
-    // pass costs. With reference selection off the reference is frame 0, so
-    // from_reference[k] == to_first[k] identically (ref_t is the identity and
-    // the composition below reduces to rel = tk) -- this produces the same two
-    // thumbnails through the same search, so the result is unchanged.
-    const bool prealign_inline =
-        work.global_prealignment_enabled && work.prealign_use_decoded_frames &&
-        !work.global_prealignment_choose_reference;
-    Image prealign_ref_thumb;
-    f32 prealign_to_raw_x = 1.f, prealign_to_raw_y = 1.f;
-    if (prealign_inline) {
-        const double t_pt = prof_now_ms();
-        prealign_ref_thumb = make_prealign_thumbnail(ref, work);
-        if (prealign_ref_thumb.w > 0 && prealign_ref_thumb.h > 0) {
-            prealign_to_raw_x = (f32)ref_w / (f32)prealign_ref_thumb.w;
-            prealign_to_raw_y = (f32)ref_h / (f32)prealign_ref_thumb.h;
-        }
-        prof_add_cpu("setup:prealign-ref-thumb", prof_now_ms() - t_pt);
-    }
     const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
     // Output dimensions are known as soon as the reference is, and the online
@@ -1140,16 +842,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     metal_release_host_ref_stats(ref_stats);
 #endif
 
-    // Built once per burst, reused for every comparison frame below --
-    // compute_guide(ref, ...) doesn't change per comp frame. Only touched
-    // when the Settings toggle is on and the model actually loaded, so this
-    // costs nothing on the classical path.
-#if defined(__APPLE__)
-    Image ref_guide_neural;
-    if (work.use_neural_flow && neural_flow_available())
-        ref_guide_neural = compute_guide(ref, work);
-#endif
-
     // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
     // Peak during analyze ≈ ref + one comparison (+ optional prefetch on 2×).
 
@@ -1195,8 +887,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
 
-    // pref_k / pref_fut are declared above: the first comparison decode is
-    // already in flight, launched before the reference analysis began.
+    // pref_q is declared above: the first kDecodePrefetchDepth comparison
+    // decodes are already in flight, launched before the reference analysis.
     std::future<bool> spill_fut;
     bool spill_pending = false;
     int n_comp_ok = 0;
@@ -1211,7 +903,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     metal_merge_begin_burst(/*trim_analyze_scratch*/ false);
     // After begin_burst, which clears online state along with the rest of the
     // merge globals.
-    if (use_online) metal_merge_begin_online(out_h, out_w, out_nch);
+    if (use_online)
+        metal_merge_begin_online(out_h, out_w, out_nch,
+                                 work.merge_fp16_accumulator);
     prof_mark_memory(use_online ? "merge:online-armed" : "merge:banded-armed");
 #endif
 
@@ -1237,9 +931,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
         Image comp;
         const double t_decode = prof_now_ms();
-        if (pref_k == k && pref_fut.valid()) {
-            comp = pref_fut.get();
-            pref_k = -1;
+        if (!pref_q.empty() && pref_q.front().k == k && pref_q.front().fut.valid()) {
+            comp = pref_q.front().fut.get();
+            pref_q.pop_front();
             // Stall only. Near-zero here means the prefetch fully hid the decode.
             prof_add_cpu("comp:decode-wait(prefetched)", prof_now_ms() - t_decode);
         } else {
@@ -1254,112 +948,75 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             append_image_summary(debug_summary, raw_name.c_str(), comp);
         }
 
-        // Launch the next decode here on both paths, immediately after this
-        // frame's decode, so it overlaps grey + align + robustness + kernels
-        // (~440ms) instead of only robustness + kernels (~55ms). The full-res
-        // path used to defer until after align to hold peak RAM down, and the
-        // cost was comp:decode-wait sitting at 460ms per burst: a ~190ms decode
-        // with ~55ms of cover.
-        //
-        // The extra resident frame is ~49MB of normalized Bayer held across
-        // grey. Peak footprint is reached at merge:band (1861MB), not during
-        // analyze, so this does not move the peak; headroom to jetsam was
-        // 1211MB. Scheduling only -- the same frames are decoded in the same
-        // order and produce the same values.
-        if (pos + 1 < (int)comp_indices.size()) {
+        // Top the decode queue back up here on both paths, immediately after
+        // this frame's decode is consumed, so the new decode overlaps grey +
+        // align + robustness + kernels of this frame AND the queued decodes
+        // ahead of it. After popping the front, the queue holds positions
+        // pos+1 .. pos+size, so the next frame to launch is comp_indices at
+        // pos + 1 + size. Scheduling only -- the same frames are decoded in
+        // the same order and produce the same values.
+        {
             const double t_pf = prof_now_ms();
-            const int nk = comp_indices[(size_t)pos + 1u];
-            pref_k = nk;
-            pref_fut = std::async(std::launch::async, [&, nk]() {
-                worker_qos();
-                return loader(nk, work, false, ref_h, ref_w);
-            });
+            while ((int)pref_q.size() < kDecodePrefetchDepth &&
+                   pos + 1 + (int)pref_q.size() < (int)comp_indices.size()) {
+                launch_prefetch(comp_indices[(size_t)(pos + 1 + (int)pref_q.size())]);
+            }
             prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
         }
 
         const double t_comp_grey = prof_now_ms();
-        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method,
+                                       work.grey_decimate_lowpass);
         prof_add_cpu("comp:grey", prof_now_ms() - t_comp_grey);
         debug_dump_bin("cpp_mov_grey_" + std::to_string(pos),
                        comp_grey.data.data(), comp_grey.data.size());
-        PrealignTransform init;
-        if (prealign_inline && prealign_ref_thumb.w > 0 && comp.h > 0 && comp.w > 0) {
-            // comp is already decoded and still resident -- this is the whole
-            // point. Thumbnail plus the NCC search, no decode.
-            const double t_pa = prof_now_ms();
-            Image thumb = make_prealign_thumbnail(comp, work);
-            if (thumb.h == prealign_ref_thumb.h && thumb.w == prealign_ref_thumb.w) {
-                init = estimate_prealign_transform(prealign_ref_thumb, thumb, work);
-                if (init.valid) {
-                    init.dx *= prealign_to_raw_x;
-                    init.dy *= prealign_to_raw_y;
-                }
-            }
-            prof_add_cpu("comp:prealign", prof_now_ms() - t_pa);
-        } else if (k >= 0 && k < (int)prealign.from_reference.size()) {
-            init = prealign.from_reference[(size_t)k];
-        }
-        const f32 grey_scale_x = ref_w > 0 ? (f32)ref_grey.w / (f32)ref_w : 1.f;
-        const f32 grey_scale_y = ref_h > 0 ? (f32)ref_grey.h / (f32)ref_h : 1.f;
-        // Counters, not timings. A prior that does nothing looks identical from
-        // the outside to one that is working and simply not needed, and there
-        // are three ways it silently becomes zero: pre-alignment disabled, the
-        // NCC score falling under the 0.03 validity gate, or the transform
-        // being valid but genuinely near zero. These separate them.
-        prof_add_cpu("prealign#frames", 1.0);
-        if (init.valid) prof_add_cpu("prealign#valid", 1.0);
-        prof_add_cpu("prealign#score-sum", (double)init.score);
-        prof_add_cpu("prealign#dx-abs-sum", std::fabs((double)init.dx));
-        prof_add_cpu("prealign#dy-abs-sum", std::fabs((double)init.dy));
-        prof_add_cpu("prealign#angle-abs-sum-deg",
-                     std::fabs((double)init.angle) * 180.0 / 3.14159265358979323846);
-        // What actually reaches align(), in grey pixels -- if this is zero the
-        // prior cannot be influencing anything downstream.
-        prof_add_cpu("prealign#grey-dx-abs-sum",
-                     std::fabs((double)(init.dx * grey_scale_x)));
         const double t_align = prof_now_ms();
-        FlowField flow;
-        bool used_neural_flow = false;
-#if defined(__APPLE__)
-        // Settings "Use Neural Flow": PWCNet via Core ML in place of the
-        // block-matching pyramid. Feeds the exact same downstream path
-        // (flow_from_dense_guide mirrors flow_to_raw_tile_grid's grey/raw
-        // scaling) -- only the source of the flow field changes. Falls back
-        // to the classical path below on any failure (model unavailable,
-        // guide size mismatch, Core ML prediction error) rather than
-        // producing a frame with no flow at all.
-        if (work.use_neural_flow && ref_guide_neural.h > 0) {
-            Image comp_guide_neural = compute_guide(comp, work);
-            std::vector<f32> dense_flow;
-            if (neural_flow_estimate(ref_guide_neural, comp_guide_neural, dense_flow)) {
-                flow = flow_from_dense_guide(dense_flow.data(),
-                                             ref_guide_neural.h, ref_guide_neural.w,
-                                             comp.h, comp.w, tile_size,
-                                             work.r_Mt, work.num_threads);
-                used_neural_flow = true;
+        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        // Alignment ran on the grey. With the Bayer quad average that is
+        // half resolution, so the flow is on a half-res tile grid with
+        // half-res displacements, while robustness and merge both index
+        // it as raw_coordinate / tile_size and add raw pixels. Convert
+        // here, before anything downstream sees it. No-op when the grey
+        // is full resolution, so the FFT path is unaffected.
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
+                                     comp_grey.h, comp_grey.w, tile_size,
+                                     work.r_Mt, work.num_threads,
+                                     work.grey_tile_size(tile_size));
+        flow.sample_bicubic = work.flow_bicubic_sampling &&
+                              work.flow_bilinear_sampling;
+        // Full-res ICA polish (decimate only): re-measure the finished flow's
+        // sub-pixel part at RAW resolution on the band-limited FFT grey --
+        // the image the FFT path measures on. The half-res estimate seeds it,
+        // already sub-pixel, so this is last-mile refinement inside ICA's
+        // basin. The boundary densify below then measures on the SAME
+        // full-res greys, doubling its precision too.
+        const bool polish = work.align_fullres_polish &&
+                            work.bayer_mode &&
+                            work.grey_method == GreyMethod::Decimate;
+        if (polish) {
+            const double t_pol = prof_now_ms();
+            if (ref_grey_polish.h <= 0)   // once per burst, first comp frame
+                ref_grey_polish =
+                    pad_image_circular(compute_grey_fft(ref), tile_size);
+            Image comp_grey_polish =
+                pad_image_circular(compute_grey_fft(comp), tile_size);
+            if (ref_grey_polish.h > 0 && comp_grey_polish.h > 0) {
+                flow_fullres_ica_polish(ref_grey_polish, comp_grey_polish,
+                                        flow, tile_size, work);
+                flow_densify_boundary_select(flow, ref_grey_polish,
+                                             comp_grey_polish,
+                                             comp.h, comp.w, tile_size, work);
+            } else {
+                flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                             comp.h, comp.w, tile_size, work);
             }
+            prof_add_cpu("comp:fullres-polish", prof_now_ms() - t_pol);
+        } else {
+            // Boundary-selected half-pitch refinement (fine grid); must run
+            // here, while both greys are still alive. No-op when off.
+            flow_densify_boundary_select(flow, ref_grey, comp_grey,
+                                         comp.h, comp.w, tile_size, work);
         }
-#endif
-        if (!used_neural_flow) {
-            flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
-                        init.dx * grey_scale_x,
-                        init.dy * grey_scale_y,
-                        init.angle);
-            // Alignment ran on the grey. With the Bayer quad average that is
-            // half resolution, so the flow is on a half-res tile grid with
-            // half-res displacements, while robustness and merge both index
-            // it as raw_coordinate / tile_size and add raw pixels. Convert
-            // here, before anything downstream sees it. No-op when the grey
-            // is full resolution, so the FFT path is unaffected.
-            flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
-                                         comp_grey.h, comp_grey.w, tile_size,
-                                         work.r_Mt, work.num_threads,
-                                         work.grey_tile_size(tile_size));
-        }
-        // Boundary-selected half-pitch refinement (fine grid); must run here,
-        // while both greys are still alive. No-op when the toggle is off.
-        flow_densify_boundary_select(flow, ref_grey, comp_grey,
-                                     comp.h, comp.w, tile_size, work);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
@@ -1377,18 +1034,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         CovField covs;
         std::vector<uint8_t> rob_rows_nonzero;
         bool rob_has_nonzero = true;
-        // Per-frame, freed at the end of this iteration once folded into the
-        // running split. Only allocated when the debug masks are requested.
-        Image rob_s_select;
-        Image* rob_s_select_ptr = want_s_masks ? &rob_s_select : nullptr;
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
                                                   tile_size, work,
                                                   rob_rows_nonzero,
-                                                  rob_has_nonzero,
-                                                  rob_s_select_ptr);
+                                                  rob_has_nonzero);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1415,19 +1067,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
                                                   tile_size, work,
                                                   rob_rows_nonzero,
-                                                  rob_has_nonzero,
-                                                  rob_s_select_ptr);
+                                                  rob_has_nonzero);
             covs = cov_fut.get();
         }
-        // Folded in here rather than beside absorb_robustness_sum, because that
-        // call is made in only two of the three stash branches -- the cached
-        // banded path defers to build_robustness_sum after the loop, and would
-        // otherwise be missing from the split entirely. Frame order matches, and
-        // rob*sel + rob*(1-sel) == rob exactly for sel in {0,1}, so the two
-        // accumulators still partition acc_rob.
-        if (want_s_masks)
-            absorb_robustness_split(acc_rob_s1, acc_rob_s2, rob, rob_s_select,
-                                    have_acc_rob_split);
         debug_dump_bin("cpp_mask_" + std::to_string(pos),
                        rob.data.data(), rob.data.size());
         if (debug) {
@@ -1461,8 +1103,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 // several frames queued together, and a frame's GPU buffers
                 // cannot be released until its work has run.
                 if ((int)online_pending.size() >= online_fuse) {
-                    merged = metal_merge_flush_online();
-                    for (int fk : online_pending) metal_merge_release_frame(fk);
+                    // Non-blocking: commit and continue into the next frame's
+                    // analysis while this merge runs. The frame's uploads are
+                    // released when the NEXT commit (or the final blocking
+                    // flush) retires this one -- so at most one extra frame
+                    // (~110-146 MB) is ever resident, independent of burst
+                    // length. The old blocking wait here cost ~160 ms/frame of
+                    // pure CPU idle against a ~90 ms GPU merge.
+                    merged = metal_merge_commit_online(online_pending);
                     online_pending.clear();
                 }
             }
@@ -1575,7 +1223,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     drain_spill();
     if (mps_warm.valid()) mps_warm.get();
-    if (pref_fut.valid()) (void)pref_fut.get(); // drain unused prefetch
+    if (noise_warm.valid()) noise_warm.get();
+    for (auto& p : pref_q)                      // drain unused prefetches
+        if (p.fut.valid()) (void)p.fut.get();
+    pref_q.clear();
 
     if (n_comp_ok < 1) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
@@ -1639,7 +1290,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                      work.white_balance,
                      work.bake_srgb, make,
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
-                     work.raw_prewhitened)) {
+                     // Unwhitened rows are true camera-space raw again: the
+                     // writer then emits AsShotNeutral = 1/gain and stores
+                     // the real gains in the private tag for the app render.
+                     work.raw_prewhitened && !dng_unwhiten_active(work, nch),
+                     work.dng_lossless_jpeg)) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
 #if defined(__APPLE__)
@@ -1758,11 +1413,65 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             online_pending.clear();
         }
         merge_ref_band(ref, ref_covs, num_sink, den_sink, 0, work, acc_rob_ptr);
-        const f32* nump = nullptr;
-        const f32* denp = nullptr;
-        const bool got = metal_merge_map_online(&nump, &denp, nullptr);
         prof_add_cpu("merge:online-ref+readback", prof_now_ms() - t_ref_online);
         prof_mark_memory("merge:online");
+        // Rows come out of one finished accumulator, so encoding is a plain
+        // top-to-bottom sweep. Every band is fetched through
+        // metal_merge_read_band_float: in fp32 mode that is the same zero-copy
+        // pointer the old whole-image map handed out, in fp16 mode a GPU pass
+        // widens just this band into reused staging -- so the encoder below
+        // and the diagnostics never know which storage the accumulator used.
+        bool got = true;
+        const double t_encode = prof_now_ms();
+        // Ping-pong row16_async so the serial Deflate + fwrite of band N runs
+        // on a worker while the CPU encodes band N+1. Exactly one write is in
+        // flight at a time (the writer's z_stream is stateful and rows must
+        // land in order); the join before each launch enforces that and keeps
+        // the buffer being written untouched, since the encoder only ever
+        // fills the OTHER buffer. Same rows, same order, same bytes -- only
+        // the overlap is new.
+        std::future<void> write_fut;
+        int enc_cur = 0;
+        for (int y0 = 0; y0 < Hs; y0 += band_rows) {
+            const int bh = std::min(band_rows, Hs - y0);
+            const f32* nump = nullptr;
+            const f32* denp = nullptr;
+            if (!metal_merge_read_band_float(y0, bh, &nump, &denp)) {
+                got = false;
+                break;
+            }
+            accumulate_diag_ptr(nump, denp, (size_t)bh * (size_t)Ws, nch, diag);
+            std::vector<uint16_t>& r16 = row16_async[enc_cur];
+            if (r16.size() < (size_t)bh * (size_t)Ws * 3u)
+                r16.resize((size_t)bh * (size_t)Ws * 3u);
+            encode_band_rows_ptr(nump, denp, y0, bh, work, nch, preview, pscale,
+                                 ph, pw, Ws, r16);
+            // Keep the finished rows for the in-memory export (see Rgb16Sink).
+            // Plain copy of bytes the encoder just produced -- the DNG on disk
+            // and this buffer are the same values by construction.
+            if (rgb16_sink) {
+                if (rgb16_sink->rgb.empty()) {
+                    rgb16_sink->w = Ws;
+                    rgb16_sink->h = Hs;
+                    rgb16_sink->rgb.assign((size_t)Hs * (size_t)Ws * 3u, 0);
+                }
+                std::copy(r16.begin(),
+                          r16.begin() + (size_t)bh * (size_t)Ws * 3u,
+                          rgb16_sink->rgb.begin() + (size_t)y0 * (size_t)Ws * 3u);
+            }
+            if (write_fut.valid()) write_fut.get();
+            write_fut = std::async(std::launch::async, [&writer, &r16, bh]() {
+                worker_qos();
+                writer.write_rows(r16.data(), bh);
+            });
+            enc_cur ^= 1;
+            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
+        }
+        if (write_fut.valid()) write_fut.get();
+        // The 48 MP divide + ISP + 16-bit pack + DNG write was invisible in
+        // every profile so far -- roughly 2 s of wall with no bucket. Named so
+        // the next profile shows it instead of leaving it as unexplained wall.
+        prof_add_cpu("out:encode-bands", prof_now_ms() - t_encode);
         if (!got) {
             report("Error: GPU merge failed (memory?)", 1.f);
             metal_merge_end_online();
@@ -1770,23 +1479,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
             return Image();
         }
-        accumulate_diag_ptr(nump, denp, (size_t)Hs * (size_t)Ws, nch, diag);
-        // Rows come out of one finished accumulator, so encoding is a plain
-        // top-to-bottom sweep. Nothing to overlap it with -- the GPU is idle by
-        // now -- which is the cost of not banding.
-        const size_t stride = (size_t)Ws * (size_t)nch;
-        for (int y0 = 0; y0 < Hs; y0 += band_rows) {
-            const int bh = std::min(band_rows, Hs - y0);
-            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
-                row16.resize((size_t)bh * (size_t)Ws * 3u);
-            encode_band_rows_ptr(nump + (size_t)y0 * stride,
-                                 denp + (size_t)y0 * stride,
-                                 y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
-            writer.write_rows(row16.data(), bh);
-            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
-        }
-        // Accumulator released with the burst, not before: nump/denp point
-        // into it and are used above.
+        // Accumulator released with the burst, not before: the band pointers
+        // above aliased it (fp32 mode) until the loop finished.
         metal_merge_end_online();
     } else {
     int cur = 0;
@@ -1978,14 +1672,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (work.robustness_save_mask && have_acc_rob) {
         if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
             report("Wrote robustness mask", 0.985f);
-        // Same normalisation as the combined mask, so the three are directly
-        // comparable: a pixel is bright in exactly one of _s1 and _s2, at the
-        // value it contributed to the combined one.
-        if (want_s_masks && have_acc_rob_split) {
-            write_robustness_mask_pgm(acc_rob_s1, n - 1, dng_path, "_s1");
-            write_robustness_mask_pgm(acc_rob_s2, n - 1, dng_path, "_s2");
-            report("Wrote s1/s2 robustness masks", 0.986f);
-        }
     }
     cached.clear();
     cached_meta.clear();
@@ -2041,14 +1727,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
 Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
                                  const std::string& dng_path, const ProgressFn& progress,
-                                 int maxPreviewDim) {
+                                 int maxPreviewDim, Rgb16Sink* rgb16_sink) {
     return process_burst_loader_to_dng(
         (int)paths.size(),
         [&](int index, Config& work, bool is_reference, int crop_h, int crop_w) {
             if (index < 0 || index >= (int)paths.size()) return Image();
             return load_raw_frame(paths[(size_t)index], work, is_reference, crop_h, crop_w);
         },
-        cfg, dng_path, progress, maxPreviewDim);
+        cfg, dng_path, progress, maxPreviewDim, rgb16_sink);
 }
 
 } // namespace hhsr

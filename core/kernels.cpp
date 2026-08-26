@@ -38,8 +38,20 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
         if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
-            kk1 = 1.f + 0.5f * A * (1.f / cfg.k_shrink - 1.f);
-            kk2 = 1.f + 0.5f * A * (cfg.k_stretch - 1.f);
+            // 0.5*A floors at 0.5; the zero-floor remap sends isotropic
+            // content to round kernels and reaches full stretch (w=1) at
+            // A=1.95, instead of stopping short at 0.975 of it -- the earlier
+            // version left the sharpest achievable edge kernel permanently
+            // ~2.5% wider than k_detail/k_shrink. See
+            // Config::kernel_anisotropy_zero_floor.
+            f32 w = 0.5f * A;
+            if (cfg.kernel_anisotropy_zero_floor) {
+                const f32 t = clampf((A - 1.f) / 0.95f, 0.f, 1.f);
+                const f32 g = std::max(1.f, cfg.kernel_stretch_gamma);
+                w = (g == 1.f) ? t : std::pow(t, g);
+            }
+            kk1 = 1.f + w * (1.f / cfg.k_shrink - 1.f);
+            kk2 = 1.f + w * (cfg.k_stretch - 1.f);
         } else if (A > 1.95f) {
             kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch;
         } else {

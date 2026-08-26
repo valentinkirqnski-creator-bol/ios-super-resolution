@@ -67,12 +67,22 @@ bool downsample_by_metal(const Image& src, int factor, Image& out);
 // (same math as align()). Sobel/Hess are computed one pyramid level at a time
 // (no all-level sticky cache — that jetsams at 1×). Uses sticky grey from
 // compute_grey_fft_metal when dims match. Downloads final flow only.
+// Full-res ICA polish of a raw-grid flow on the band-limited full-res grey
+// (Config::align_fullres_polish). False = could not run; flow untouched.
+bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_full,
+                              FlowField& flow, int tile_size, const Config& cfg);
+// GPU twin of flow_densify_boundary_select's per-cell loops (align.cpp): the
+// bilinear blend plus both measurement branches. Fills flow.fine_* and
+// returns true; false = flow untouched, caller falls back to the CPU body.
+bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
+                               const Image& mov_grey, int raw_h, int raw_w,
+                               int tile_size, const Config& cfg);
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out,
-                 f32 initial_dx = 0.f, f32 initial_dy = 0.f,
-                 f32 initial_rotation_rad = 0.f);
+                 const Config& cfg, int tile_size, FlowField& flow_out);
 
+// Clear the densify reference-grey upload cache (burst start).
+void metal_clear_densify_ref_cache();
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
 
@@ -96,23 +106,8 @@ CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
 RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg);
 void metal_release_host_ref_stats(RefStats& ref_stats); // free host pixels; keep dims
 
-// Copies the pinned reference means/variances back from their Metal buffers
-// into ref_stats.means/.stds on the host.
-//
-// init_robustness_metal deliberately returns a RefStats carrying only
-// DIMENSIONS -- the pixels live in GPU buffers, because every consumer on
-// this path is itself a kernel and a readback would be a pure waste. Anything
-// that needs to touch those statistics from C++ (the learned robustness mask
-// builds its feature planes from them) must call this first, or it will index
-// an Image whose h/w/c look valid and whose data vector is empty.
-//
-// Returns false if the buffers are missing or the dimensions disagree.
-bool metal_fetch_host_ref_stats(RefStats& ref_stats);
-// s_select_out, when non-null, also receives a per-pixel record of which motion
-// prior was applied: 1 where the strict s1 was used, 0 where s2 was.
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg,
-                               Image* s_select_out = nullptr);
+                               const FlowField& flow, int tile_size, const Config& cfg);
 
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
@@ -172,12 +167,34 @@ bool metal_merge_wait_inflight();
 // Drop one frame's cached GPU upload. Online merges a frame once, so its
 // buffers are dead the moment its command buffer completes.
 void metal_merge_release_frame(int frame_id);
-void metal_merge_begin_online(int out_h, int out_w, int nch);
+// half_acc stores the online accumulator as fp16 (arithmetic stays fp32 in
+// the kernels). Halves its footprint and the merge's dominant traffic;
+// output changes by ~1-2 LSB of the 16-bit result from storage quantisation.
+void metal_merge_begin_online(int out_h, int out_w, int nch, bool half_acc);
+
+// One horizontal band of the finished accumulator, as float, regardless of
+// storage mode. Replaces metal_merge_map_online for readers (which now
+// refuses in half mode rather than returning punned bytes).
+bool metal_merge_read_band_float(int y0, int rows, const float** num,
+                                 const float** den);
 // Wait for the merge and hand back the accumulator where it already lives.
 // Shared storage means it is CPU addressable in place, so the caller never
 // needs a full-size host copy of it.
 bool metal_merge_map_online(const float** num, const float** den, size_t* nelem);
 void metal_merge_end_online();
 bool metal_merge_flush_online();
+
+// Commit the queued online merge WITHOUT blocking, retiring the previous
+// frame's committed merge first (normally already finished, so that wait is
+// ~0). Exactly one merge is in flight at a time; its frames' uploads are
+// released at retirement, so the extra GPU working set is bounded by ONE
+// frame (~110-146 MB) regardless of burst length. Lets frame k+1's analysis
+// overlap frame k's merge instead of paying CPU + GPU per frame.
+bool metal_merge_commit_online(const std::vector<int>& frame_ids);
+
+// Wait for the in-flight online merge (if any) and release its frames. Called
+// by metal_merge_flush_online automatically; call directly before reading the
+// accumulator by any other route.
+bool metal_merge_retire_online();
 
 } // namespace hhsr

@@ -225,6 +225,112 @@ static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
 // parked here when the tuning dictionary is parsed.
 static hhsr::IspParams g_isp;
 
+// The final RGB16 rows of the last successful burst, captured as the DNG was
+// encoded (see Rgb16Sink in pipeline.h), plus the path they belong to. The
+// JPEG export and the DNG preview embed used to re-open that file and inflate
+// ~290MB of Deflate to recover pixels that existed in memory moments earlier
+// -- seconds of the "Saving to Photos" stall. Consumed (moved out) by the
+// first export that matches the path; cleared at the start of every burst.
+static hhsr::Rgb16Sink g_render_sink;
+static std::string g_render_sink_path;
+
+// Pixels + colour metadata for rendering `path`. Memory fast path: when the
+// sink matches, take the rows without touching the pixel strips and parse
+// only the DNG header for wb/matrix (load_linear_dng_color_meta) -- the tags
+// were written from the same Config that produced these rows, so the render
+// is identical to the re-read path. Falls back to the full DNG read.
+static bool AcquireRenderPixels(const std::string& path, std::vector<uint16_t>& rgb,
+                                int& W, int& H, float wb[3], float m[9],
+                                bool& has_color) {
+    if (!g_render_sink_path.empty() && g_render_sink_path == path &&
+        g_render_sink.w > 0 && g_render_sink.h > 0 &&
+        g_render_sink.rgb.size() ==
+            (size_t)g_render_sink.w * (size_t)g_render_sink.h * 3u &&
+        load_linear_dng_color_meta(path, wb, m, has_color)) {
+        W = g_render_sink.w;
+        H = g_render_sink.h;
+        rgb = std::move(g_render_sink.rgb);
+        g_render_sink = hhsr::Rgb16Sink();
+        g_render_sink_path.clear();
+        return true;
+    }
+    if (!(load_linear_dng_rgb16_color(path, rgb, W, H, wb, m, has_color) &&
+          W > 0 && H > 0))
+        return false;
+    return true;
+}
+
+// An un-white-balanced DNG (Config::dng_store_unwhitened) stores true
+// camera-space raw with the real gains in the private tag. The render chain
+// was calibrated for PRE-white-balanced input, so the gains are re-applied
+// here and downstream sees neutral wb. Old prewhitened DNGs carry
+// wb = {1,1,1} and pass through untouched.
+//
+// HOW they are re-applied depends on the renderer:
+//  - HDR tone mapping ON: prewhitened / gmax -- a UNIFORM scale (hue
+//    untouched) that fits [0,65535] with ZERO clipping, so the ~1 stop of
+//    R/B highlight the unwhitened container recovered actually reaches the
+//    render. The ISP's automatic exposure is scale-invariant (log-average
+//    keyed), so midtones land exactly where they always did, while the
+//    extended-Reinhard white point now SEES the recovered range and rolls
+//    those highlights off with detail instead of the old hard clip.
+//  - HDR off (preset LUT / calibrated matrix): multiply-and-clamp at the old
+//    ceiling, because those paths were fitted for [0,1]-prewhitened input
+//    and feeding them a rescaled range would break their calibration. This
+//    reproduces the pre-headroom JPEG bit-for-bit.
+static void ReapplyWhiteBalanceIfStored(std::vector<uint16_t>& rgb, int W, int H,
+                                        float wb[3]) {
+    if (rgb.empty() || W <= 0 || H <= 0) return;
+    if (!(wb[1] > 1e-6f)) return;
+    const float g0 = wb[0] / wb[1], g2 = wb[2] / wb[1];
+    if (std::fabs(g0 - 1.f) < 1e-4f && std::fabs(g2 - 1.f) < 1e-4f) return;
+    if (g_isp.enabled) {
+        const float gmax = std::max(1.f, std::max(g0, g2));
+        const float s0 = g0 / gmax, s1 = 1.f / gmax, s2 = g2 / gmax;
+        hhsr::parallel_rows(H, 0, [&](int y) {
+            uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
+            for (int x = 0; x < W; ++x) {
+                float r = row[x * 3 + 0] * s0;
+                float g = row[x * 3 + 1] * s1;
+                float b = row[x * 3 + 2] * s2;
+                // Sensor-clipped pixels are channel-equal at the container
+                // ceiling in the un-whitened DNG; scaling them per-channel
+                // repaints them with the WB gain ratios themselves (R kept,
+                // G and B dropped) -- the pink cast on blown highlights.
+                // Their true colour is unknown-bright, so pull near-clip
+                // pixels to neutral at their brightest channel and let the
+                // tone curve roll them off to white. The ramp starts at 90%
+                // so the sensor's soft clip region blends smoothly.
+                const uint16_t mi = std::max(row[x * 3 + 0],
+                                             std::max(row[x * 3 + 1],
+                                                      row[x * 3 + 2]));
+                const float t = hhsr::smoothstepf(0.90f * 65535.f,
+                                                  0.995f * 65535.f, (float)mi);
+                if (t > 0.f) {
+                    const float m = std::max(r, std::max(g, b));
+                    r += (m - r) * t;
+                    g += (m - g) * t;
+                    b += (m - b) * t;
+                }
+                row[x * 3 + 0] = (uint16_t)(r + 0.5f);
+                row[x * 3 + 1] = (uint16_t)(g + 0.5f);
+                row[x * 3 + 2] = (uint16_t)(b + 0.5f);
+            }
+        });
+    } else {
+        hhsr::parallel_rows(H, 0, [&](int y) {
+            uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
+            for (int x = 0; x < W; ++x) {
+                const float r = row[x * 3 + 0] * g0;
+                const float b = row[x * 3 + 2] * g2;
+                row[x * 3 + 0] = (uint16_t)std::min(65535.f, r + 0.5f);
+                row[x * 3 + 2] = (uint16_t)std::min(65535.f, b + 0.5f);
+            }
+        });
+    }
+    wb[0] = wb[1] = wb[2] = 1.f;
+}
+
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
            std::fabs(wb[1] - 1.f) < 1e-4f &&
@@ -318,77 +424,56 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"alignment_grey_fft"])
         cfg.grey_method = tuning[@"alignment_grey_fft"].boolValue
                               ? GreyMethod::FFT : GreyMethod::Decimate;
-    if (tuning[@"hf_artifact_removal_enabled"])
-        cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
-    if (tuning[@"hf_variance_loss_threshold"])
-        cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
-    if (tuning[@"hf_min_texture_snr"])
-        cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
-    if (tuning[@"flow_reject_1d_enabled"])
-        cfg.flow_reject_1d_enabled = tuning[@"flow_reject_1d_enabled"].boolValue;
     if (tuning[@"flow_regularize_aperture_ratio"])
         cfg.flow_regularize_aperture_ratio =
             std::max(0.f, std::min(1.f, tuning[@"flow_regularize_aperture_ratio"].floatValue));
     if (tuning[@"flow_reject_1d_ambiguity_ratio"])
         cfg.flow_reject_1d_ambiguity_ratio =
             std::max(1.f, tuning[@"flow_reject_1d_ambiguity_ratio"].floatValue);
-    if (tuning[@"flow_reject_1d_residual_threshold"])
-        cfg.flow_reject_1d_residual_threshold =
-            std::max(0.f, tuning[@"flow_reject_1d_residual_threshold"].floatValue);
-    if (tuning[@"motion_edge_rejection_enabled"])
-        cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
-    if (tuning[@"motion_edge_threshold"])
-        cfg.motion_edge_threshold = tuning[@"motion_edge_threshold"].floatValue;
-    if (tuning[@"motion_edge_residual_threshold"])
-        cfg.motion_edge_residual_threshold = tuning[@"motion_edge_residual_threshold"].floatValue;
-    if (tuning[@"motion_edge_noise_floor_multiplier"])
-        cfg.motion_edge_noise_floor_multiplier =
-            tuning[@"motion_edge_noise_floor_multiplier"].floatValue;
-    if (tuning[@"motion_edge_neighborhood_radius"])
-        cfg.motion_edge_neighborhood_radius =
-            std::max(0, std::min(2, tuning[@"motion_edge_neighborhood_radius"].intValue));
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
     if (tuning[@"kernel_anisotropy_continuous"])
         cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
+    if (tuning[@"kernel_anisotropy_zero_floor"])
+        cfg.kernel_anisotropy_zero_floor = tuning[@"kernel_anisotropy_zero_floor"].boolValue;
+    if (tuning[@"kernel_stretch_gamma"])
+        cfg.kernel_stretch_gamma = tuning[@"kernel_stretch_gamma"].floatValue;
+    if (tuning[@"merge_fp16_accumulator"])
+        cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
+    if (tuning[@"merge_fast_weights"])
+        cfg.merge_fast_weights = tuning[@"merge_fast_weights"].boolValue;
+    if (tuning[@"dng_store_unwhitened"])
+        cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
     if (tuning[@"bm_subpixel_quadratic"])
         cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
+    if (tuning[@"grey_decimate_lowpass"])
+        cfg.grey_decimate_lowpass = tuning[@"grey_decimate_lowpass"].boolValue;
+    if (tuning[@"align_fullres_polish"])
+        cfg.align_fullres_polish = tuning[@"align_fullres_polish"].boolValue;
     if (tuning[@"flow_boundary_selection"])
         cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
+    if (tuning[@"flow_bicubic_sampling"])
+        cfg.flow_bicubic_sampling = tuning[@"flow_bicubic_sampling"].boolValue;
     if (tuning[@"flow_overlap_merge"])
         cfg.flow_overlap_merge = tuning[@"flow_overlap_merge"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
+    if (tuning[@"d_thresh_manual"])
+        cfg.d_thresh_manual = tuning[@"d_thresh_manual"].boolValue;
+    if (tuning[@"dng_lossless_jpeg"])
+        cfg.dng_lossless_jpeg = tuning[@"dng_lossless_jpeg"].boolValue;
+    if (tuning[@"D_th"]) cfg.D_th = tuning[@"D_th"].floatValue;
+    if (tuning[@"D_tr"]) cfg.D_tr = std::max(0.001f, tuning[@"D_tr"].floatValue);
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
-    if (tuning[@"debug_pixel4a_noise_profile"])
-        cfg.debug_pixel4a_noise_profile = tuning[@"debug_pixel4a_noise_profile"].boolValue;
     if (tuning[@"alignment_tile_size"]) {
         const int ts = tuning[@"alignment_tile_size"].intValue;
         cfg.alignment_tile_size =
             (ts == 8 || ts == 16 || ts == 32 || ts == 64) ? ts : 0;
     }
-    if (tuning[@"global_prealignment_enabled"])
-        cfg.global_prealignment_enabled = tuning[@"global_prealignment_enabled"].boolValue;
-    if (tuning[@"global_prealignment_choose_reference"])
-        cfg.global_prealignment_choose_reference =
-            tuning[@"global_prealignment_choose_reference"].boolValue;
-    if (tuning[@"global_prealignment_rotation_range_deg"])
-        cfg.global_prealignment_rotation_range_deg =
-            std::max(0.f, std::min(2.f,
-                tuning[@"global_prealignment_rotation_range_deg"].floatValue));
-    if (tuning[@"global_prealignment_rotation_step_deg"])
-        cfg.global_prealignment_rotation_step_deg =
-            std::max(0.05f, std::min(1.f,
-                tuning[@"global_prealignment_rotation_step_deg"].floatValue));
-    if (tuning[@"global_prealignment_max_shift"])
-        cfg.global_prealignment_max_shift =
-            std::max(0, std::min(64, tuning[@"global_prealignment_max_shift"].intValue));
     if (tuning[@"robustness_enabled"])
         cfg.robustness_enabled = tuning[@"robustness_enabled"].boolValue;
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
-    if (tuning[@"robustness_save_s_masks"])
-        cfg.robustness_save_s_masks = tuning[@"robustness_save_s_masks"].boolValue;
     if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
         cfg.accumulated_robustness_denoiser_enabled =
             tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
@@ -417,8 +502,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
     if (tuning[@"align_ica_per_level_fft"])
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
-    if (tuning[@"use_neural_flow"])
-        cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
@@ -427,8 +510,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_bilinear_sampling = tuning[@"flow_bilinear_sampling"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
-    if (tuning[@"use_neural_robustness"])
-        cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])
         cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
     if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
@@ -485,18 +566,21 @@ static NSDictionary *TIFFMetadata(NSDictionary *metadata) {
     return DictValue(metadata, @"{TIFF}");
 }
 
-static NSDictionary *EXIFMetadata(NSDictionary *metadata) {
-    if (!metadata) return nil;
-    NSDictionary *exif = DictValue(metadata, (__bridge NSString *)kCGImagePropertyExifDictionary);
-    if (exif) return exif;
-    return DictValue(metadata, @"{Exif}");
+// One-time: hand the Caches directory to the noise-curve disk cache. Both
+// burst entry points call this, so whichever runs first arms it.
+static void SetupNoiseCurveCacheDirOnce(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *dir = NSSearchPathForDirectoriesInDomains(
+                            NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        if (dir) hhsr::robustness_set_noise_cache_dir(dir.UTF8String);
+    });
 }
 
 static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) {
     NSDictionary *metadata = DictValue(frame, @"metadata");
     NSDictionary *dng = DNGMetadata(metadata);
     NSDictionary *tiff = TIFFMetadata(metadata);
-    NSDictionary *exif = EXIFMetadata(metadata);
 
     cfg.camera_make = NSStringToStd(FirstValueForKeys(tiff, @[
         (__bridge NSString *)kCGImagePropertyTIFFMake, @"Make"
@@ -616,20 +700,50 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
                  cfg.black_levels[0], cfg.black_levels[1], cfg.black_levels[2],
                  cfg.white_level);
     cfg.debug_string_capture = full_log;
-    if (cfg.debug_pixel4a_noise_profile) {
-        const float iso = FirstNumber(FirstValueForKeys(exif, @[
-            (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings,
-            @"ISOSpeedRatings", @"PhotographicSensitivity", @"ISO"
-        ]), 100.f);
-        apply_pixel4a_noise_profile(cfg, iso);
-    }
 
-    std::vector<double> color;
-    CollectNumbers(FirstValueForKeys(dng, @[@"ColorMatrix1", @"ColorMatrix2"]), color);
-    if (color.size() >= 9) {
+    // Read CM1/CM2 SEPARATELY and pick by their own CalibrationIlluminant
+    // tag, rather than assuming array order: FirstValueForKeys(@[CM2, CM1])
+    // silently degrades to CM1 whenever CM2 is simply absent from whatever
+    // AVCapturePhoto.metadata happens to expose for this capture path (its
+    // {DNG} dictionary is Apple's own curated set, not guaranteed to mirror
+    // every tag a written DNG file would carry -- unlike LibRaw, which reads
+    // file bytes directly and is what actually validated the CM2-preferred
+    // fix). Measured through the full render chain on a real iPhone 15 burst
+    // frame: the tungsten calibration (illuminant 17) rendered midtone R/G
+    // at 0.21 against a 1.06 reference -- the magenta JPEG -- while the
+    // daylight one (illuminant 21) landed at 1.04.
+    std::vector<double> cm1, cm2;
+    CollectNumbers(dng[@"ColorMatrix1"], cm1);
+    CollectNumbers(dng[@"ColorMatrix2"], cm2);
+    const int ill1 = (int)FirstNumber(dng[@"CalibrationIlluminant1"], -1.f);
+    const int ill2 = (int)FirstNumber(dng[@"CalibrationIlluminant2"], -1.f);
+    // LightSource enum: 17 = tungsten/StandardLightA, 19-23 = daylight family
+    // (D55/D65/D75/Daylight/D50). Prefer whichever calibration is daylight;
+    // fall back to whichever matrix exists; CM1 wins a genuine tie.
+    auto is_daylight = [](int ill) { return ill == 21 || ill == 19 || ill == 20 ||
+                                            ill == 23 || ill == 1; };
+    std::vector<double>* chosen = nullptr;
+    if (cm2.size() >= 9 && is_daylight(ill2) && !(cm1.size() >= 9 && is_daylight(ill1)))
+        chosen = &cm2;
+    else if (cm1.size() >= 9)
+        chosen = &cm1;
+    else if (cm2.size() >= 9)
+        chosen = &cm2;
+    if (chosen) {
         cfg.has_color_matrix = true;
-        for (int i = 0; i < 9; ++i) cfg.color_matrix[i] = (float)color[(size_t)i];
+        for (int i = 0; i < 9; ++i) cfg.color_matrix[i] = (float)(*chosen)[(size_t)i];
     }
+    // Answers, on the very next capture's on-device log, whether this
+    // metadata source (AVCapturePhoto.metadata, not a re-read file) exposes
+    // a second calibration at all -- the open question behind the fix above.
+    char cm_log[160];
+    std::snprintf(cm_log, sizeof(cm_log),
+                 "ColorMatrix: CM1 %s (illum=%d)  CM2 %s (illum=%d)  chose=%s",
+                 cm1.size() >= 9 ? "present" : "ABSENT", ill1,
+                 cm2.size() >= 9 ? "present" : "ABSENT", ill2,
+                 chosen == &cm2 ? "CM2" : (chosen == &cm1 ? "CM1" : "none"));
+    cfg.debug_string_capture += '\n';
+    cfg.debug_string_capture += cm_log;
 }
 
 static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
@@ -757,6 +871,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     // Grey-FFT + L2 BM + merge accumulate require Metal (no CPU fallback).
     if (!metal_gpu_init()) return NO;
+    SetupNoiseCurveCacheDirOnce();
 
     std::vector<std::string> vpaths;
     vpaths.reserve(paths.count);
@@ -790,13 +905,17 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         };
     }
 
+    g_render_sink = hhsr::Rgb16Sink();
+    g_render_sink_path.clear();
     Image preview;
     @autoreleasepool {
         preview = process_burst_paths_to_dng(
-            vpaths, cfg, std::string(outPath.UTF8String), cb, 256);
+            vpaths, cfg, std::string(outPath.UTF8String), cb, 256,
+            &g_render_sink);
     }
 
-    if (preview.w <= 0) return NO;
+    if (preview.w <= 0) { g_render_sink = hhsr::Rgb16Sink(); return NO; }
+    if (g_render_sink.w > 0) g_render_sink_path = outPath.UTF8String;
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
@@ -813,6 +932,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     if (previewOut) *previewOut = nil;
 
     if (!metal_gpu_init()) return NO;
+    SetupNoiseCurveCacheDirOnce();
 
     Config cfg;
     cfg.scale = scale;
@@ -842,13 +962,17 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
             return DecodeRawFrameDictionary(frame, work, is_reference, crop_h, crop_w);
         };
 
+    g_render_sink = hhsr::Rgb16Sink();
+    g_render_sink_path.clear();
     Image preview;
     @autoreleasepool {
         preview = process_burst_loader_to_dng(
-            (int)frames.count, loader, cfg, std::string(outPath.UTF8String), cb, 256);
+            (int)frames.count, loader, cfg, std::string(outPath.UTF8String), cb, 256,
+            &g_render_sink);
     }
 
-    if (preview.w <= 0) return NO;
+    if (preview.w <= 0) { g_render_sink = hhsr::Rgb16Sink(); return NO; }
+    if (g_render_sink.w > 0) g_render_sink_path = outPath.UTF8String;
 
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
@@ -858,24 +982,25 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     hhsr::mps_fft_prewarm((int)height, (int)width);
 }
 
-+ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
++ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
+                         toPath:(NSString *)jpgPath
+                        quality:(float)quality {
     if (dngPath.length == 0 || jpgPath.length == 0) return NO;
+    if (!(quality > 0.f) || quality > 1.f) quality = 0.92f;
+    quality = std::max(0.5f, quality);
 
     std::vector<uint16_t> rgb;
     int W = 0, H = 0;
     float wb[3] = {1.f, 1.f, 1.f};
     float m[9] = {1,0,0, 0,1,0, 0,0,1};
     bool has_color = false;
-    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+    if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
-    // Before isp_analyse, so the automatic exposure and the local gain map are
-    // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
-        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
@@ -930,11 +1055,12 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         CGImageRelease(cgOut);
         return NO;
     }
-    // 0.92 keeps 4:4:4 chroma and produced ~15MB at 48MP. Measured against that
-    // output, 0.82 lands at 46% of the size for 2.8 LSB RMS -- ImageIO drops to
-    // 4:2:0 below ~0.90, which is where most of the saving comes from, and
-    // chroma subsampling is not visible on a photograph at this resolution.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.82};
+    // Default 0.92: keeps 4:4:4 chroma (ImageIO drops to 4:2:0 below ~0.90)
+    // at ~15MB for 48MP. This was a hard-coded 0.82 to halve the file, but the
+    // 4:2:0 chroma plus the quantisation read as visibly soft on fine colour
+    // detail -- the deliverable is the photograph, so it gets the quality and
+    // the megabytes, and the setting is now the user's.
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @(quality)};
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
@@ -951,9 +1077,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     float wb[3] = {1.f, 1.f, 1.f};
     float m[9] = {1,0,0, 0,1,0, 0,0,1};
     bool has_color = false;
-    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+    if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)
@@ -964,10 +1091,6 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // Analysed at full resolution even though the preview is downscaled, so the
     // thumbnail and the exported JPEG get the same exposure and gain map and
     // cannot disagree about how the shot looks.
-    // Before isp_analyse, so the automatic exposure and the local gain map are
-    // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
-        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
@@ -1023,8 +1146,11 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         CGImageRelease(cgOut);
         return NO;
     }
-    // Embedded DNG preview: a thumbnail source, so it can be leaner still.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.80};
+    // The embedded preview is what Photos actually DISPLAYS for these DNGs
+    // (ImageIO cannot decode the Deflate LinearRaw IFD0), so it is not just a
+    // thumbnail source -- at full size it is the picture the user sees when
+    // they zoom. 0.85 with the full-resolution maxSide the app now passes.
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.85};
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL enc_ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);

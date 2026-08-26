@@ -24,9 +24,11 @@ void irfft2(const std::vector<std::complex<f32>>& in, int h, int w, std::vector<
 void fftshift2d_real(std::vector<f32>& data, int h, int w);
 
 // ---- grey_pyramid.cpp ---------------------------------------------------
-Image compute_grey_decimate(const Image& raw, bool bayer_mode);
+Image compute_grey_decimate(const Image& raw, bool bayer_mode,
+                            bool lowpass = false);
 Image compute_grey_fft(const Image& raw);
-Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method);
+Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method,
+                   bool decimate_lowpass = false);
 
 // Re-express a flow field estimated on the grey onto a raw-resolution tile
 // grid, scaling displacements by the resolution ratio.
@@ -51,6 +53,12 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
 // single tile vector best explains the alignment grey there. Fills
 // FlowField::fine_*; sample_bilinear and the GPU hosts consume it
 // transparently. Run after flow_to_raw_tile_grid, while the greys are alive.
+// Full-res ICA polish of a raw-grid flow field on band-limited full-res greys
+// (Config::align_fullres_polish). Metal on device, CPU on host. Returns false
+// (flow untouched) when it cannot run. Call after flow_to_raw_tile_grid,
+// before flow_densify_boundary_select.
+bool flow_fullres_ica_polish(const Image& ref_grey_full, const Image& mov_grey_full,
+                             FlowField& flow, int tile_size, const Config& cfg);
 void flow_densify_boundary_select(FlowField& flow,
                                   const Image& ref_grey, const Image& mov_grey,
                                   int raw_h, int raw_w, int tile_size,
@@ -62,18 +70,6 @@ void flow_densify_boundary_select(FlowField& flow,
 std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
                                                f32 sx, f32 sy, int num_threads);
 
-// Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
-// field produced by an external neural flow estimator (PWCNet), as a
-// drop-in alternative to align()+flow_to_raw_tile_grid for any downstream
-// consumer. dense_flow: dx plane (guide_h*guide_w floats) followed by dy
-// plane (guide_h*guide_w floats), values in GUIDE-pixel units -- the layout
-// a Core ML (1,2,guide_h,guide_w) MLMultiArray output has. See align.cpp
-// for what's intentionally left unset (aperture_limited, match_ambiguous,
-// motion_irregular) and why.
-FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
-                                int raw_h, int raw_w, int tile_size,
-                                f32 r_Mt, int num_threads);
-
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 
@@ -84,15 +80,9 @@ Image gaussian_blur(const Image& src, float sigma);
 Image pad_image_circular(const Image& img, int tile_size);
 
 // ---- align.cpp ----------------------------------------------------------
-FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor,
-                                   int finest_h, int finest_w,
-                                   f32 initial_dx, f32 initial_dy,
-                                   f32 initial_rotation_rad);
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
-                int tile_size,
-                f32 initial_dx = 0.f, f32 initial_dy = 0.f,
-                f32 initial_rotation_rad = 0.f);
+                int tile_size);
 // Free cached ref Sobel/Hessian (call when reference pyramid is released).
 void clear_align_ref_ica_cache();
 
@@ -100,7 +90,6 @@ void clear_align_ref_ica_cache();
 struct RefStats {
     Image means;
     Image stds;
-    Image hf_loss;   // 1-channel high-frequency variance-loss map
     // Dodgson-quadratic upscale of means/stds to raw resolution (Algorithm
     // 6's literal R <- Zeros(H,W) path -- see Config::
     // robustness_raw_resolution_enabled). Computed once per burst here
@@ -110,6 +99,18 @@ struct RefStats {
     Image stds_hires;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
+
+// Directory for the Monte Carlo noise-curve disk cache. Bit-identical to a
+// rebuild -- unitary_MC is deterministic, seeded per brightness bin -- so this
+// only saves the measured 2-2.8 s/channel cold build across app launches.
+// Unset (host tools, tests) = no disk cache, prior behaviour exactly.
+void robustness_set_noise_cache_dir(const std::string& dir);
+// Build/cache-load every noise curve the burst's robustness calls will use,
+// through the same accessors (same keys, same values). Thread-safe against
+// concurrent curve requests; run it on a worker right after SNR tuning so a
+// curve-cache MISS builds during ref analysis instead of stalling the first
+// comparison frame.
+void robustness_prewarm_noise_curves(const Config& cfg);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
 // lattice, 5x5 min there (Wronski's 10x10-raw footprint on Wronski's grid),
 // nearest-upsample back to raw. Shared by the CPU path and the Metal host
@@ -117,9 +118,7 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // stay bit-identical without a new shader).
 Image robustness_local_min_on_guide(const Image& R);
 
-// Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer
-// mode). Exposed so callers besides robustness.cpp (neural_flow's caller)
-// can build the exact same guide image the classical path scores against.
+// Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer mode).
 Image compute_guide(const Image& raw, const Config& cfg);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
@@ -134,63 +133,12 @@ void fetch_noise_curves(const Config& cfg,
 
 // Per-guide-channel counterpart: ch's curve is built from Config::
 // noise_alpha_ch(ch)/noise_beta_ch(ch) rather than the cross-channel mean.
-// Falls back to the shared bundled table when debug_pixel4a_noise_profile
-// is set (no per-channel data exists for it).
 void fetch_noise_curves_channel(const Config& cfg, int ch,
                                 std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 
 // Robustness mask r at raw resolution [h, w, 1].
-//
-// s_select_out, when non-null, also receives a per-pixel record of which motion
-// prior each pixel was scored with: 1 where the strict s1 applied (sharp local
-// variation in the flow field, or an aperture-limited tile), 0 where the
-// permissive s2 did. Used to split the accumulated mask for inspection.
-// Feature planes for the learned robustness mask (robustness_nn.h), at guide
-// resolution, interleaved, in the exact order the model was trained on:
-//
-//   0-2   reference 3x3 local mean, RGB
-//   3-5   reference 3x3 local standard deviation, RGB
-//   6-8   comparison 3x3 local mean sampled where the estimated flow points
-//   9-10  estimated flow dx, dy at this pixel, in RAW pixels
-//   11    local span of the flow field over the 3x3 tile neighbourhood (M)
-//   12    expected noise sigma at this brightness
-//
-// Kept in portable C++ next to the analytic mask because this layout is a
-// contract with tools/rob_nn/rob_dataset.cpp, which writes the training set;
-// the two must be read side by side to stay in step. Channels 9-12 are the
-// ones the analytic mask cannot use, and are why the network can reject a
-// tile whose photometry looks innocent.
-// Built one horizontal strip at a time. A 32-channel intermediate tensor at
-// guide resolution is ~390 MB, and Core ML holds several at once, so running
-// the network on the whole plane costs over a gigabyte on top of a burst
-// pipeline already holding several 12 MP frames -- which is a jetsam kill,
-// not a slowdown. The weights are tiny; the activations are not.
-//
-// Emits exactly kRobustnessNnStripRows + 2 * kRobustnessNnHalo rows starting
-// at source row y0, so every window has the same shape and Core ML never
-// reshapes mid-burst. The caller must keep the whole window inside the image
-// (clamping y0 near the bottom rather than padding past it): the window's
-// edges then coincide with the image's, making the convolutions' zero-padding
-// identical to whole-plane inference. Padding past the edge does not, because
-// those rows would feed bias-driven activations into the next layer where
-// whole-plane inference has true zeros -- measured as visible strip seams.
-// raw_res selects the resolution the decision is made at:
-//   false - guide resolution. ref_stats.means/.stds and a guide-resolution
-//           comp_means, sampled at the flow offset. 3 MP mask.
-//   true  - raw resolution. ref_stats.means_hires/.stds_hires and a comp_means
-//           that upscale_warp_stats has already Dodgson-upscaled AND warped
-//           into the reference frame, so it is sampled at the same (y,x). 12 MP
-//           mask, 4x the pixels and 4x the cost, but the statistics keep detail
-//           that the 3x3 guide means destroy -- which is the only way a 2-4 px
-//           feature can reach the decision at all.
-Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
-                                   const FlowField& flow, int tile_size,
-                                   const Config& cfg, int y0,
-                                   bool raw_res = false);
-
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
-                         const FlowField& flow, int tile_size, const Config& cfg,
-                         Image* s_select_out = nullptr);
+                         const FlowField& flow, int tile_size, const Config& cfg);
 
 // ---- kernels.cpp --------------------------------------------------------
 CovField estimate_kernels(const Image& raw, const Config& cfg);

@@ -132,15 +132,8 @@ static HessianField compute_hessian(const Image& gradx, const Image& grady, int 
     return H;
 }
 
-static f32 clamped_aperture_ratio(const Config& cfg) {
-    f32 aperture_ratio = cfg.flow_regularize_aperture_ratio;
-    if (!std::isfinite(aperture_ratio)) aperture_ratio = 0.15f;
-    return std::min(std::max(aperture_ratio, 0.f), 1.f);
-}
-
-// ICA damping ratio: the eigenvalue ratio the solve is regularized toward.
-// Shares flow_regularize_aperture_ratio with mark_aperture_limited_tiles, since
-// both express the same thing -- the ratio below which a tile is 1D. 0 disables.
+// ICA damping ratio: the eigenvalue ratio the solve is regularized toward,
+// i.e. the ratio below which a tile counts as 1D. 0 disables.
 static f32 ica_damp_ratio(const Config& cfg) {
     if (!cfg.ica_regularize_enabled) return 0.f;
     const f32 r = cfg.flow_regularize_aperture_ratio;
@@ -207,19 +200,6 @@ static uint32_t match_is_ambiguous(f32 best_cost, f32 second_cost,
     if (second_cost < 0.f) second_cost = 0.f;
     const f32 denom = std::max(best_cost, 1e-12f);
     return (second_cost / denom) < ambiguity_ratio ? 1u : 0u;
-}
-
-static bool hessian_tile_is_1d(const HessianField& hess, int ty, int tx,
-                               f32 aperture_ratio) {
-    const f32* h = hess.at(ty, tx);
-    const f32 h00 = h[0], h01 = h[1], h11 = h[3];
-    const f32 tr = h00 + h11;
-    const f32 det = h00 * h11 - h01 * h[2];
-    if (!(tr > 0.f)) return false; // Flat: weak in both directions, not a 1D edge.
-    const f32 disc = std::sqrt(std::max(0.f, tr * tr * 0.25f - det));
-    const f32 l1 = tr * 0.5f + disc;
-    const f32 l2 = tr * 0.5f - disc;
-    return (l1 > 0.f) && (l2 < aperture_ratio * l1);
 }
 
 }  // namespace
@@ -322,33 +302,6 @@ namespace {  // reopened -- everything below is file-local again
 static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
     flow.motion_irregular =
         compute_motion_irregular(flow, cfg.r_Mt, 1.f, 1.f, cfg.num_threads);
-}
-
-static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
-                                        const Config& cfg) {
-    const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
-    flow.aperture_limited.assign(n, 0u);
-    if (!cfg.flow_reject_1d_enabled) return;
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
-    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx ||
-        hess->data.size() < n * 4u)
-        return;
-
-    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    std::atomic<long long> n_marked{0};
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            if (hessian_tile_is_1d(*hess, ty, tx, aperture_ratio)) {
-                flow.aperture(ty, tx) = 1u;
-                n_marked.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    });
-    if (prof_enabled()) {
-        prof_add_cpu("flow1d#enabled", 1.0);
-        prof_add_cpu("flow1d#aperture-ratio", (double)aperture_ratio);
-        prof_add_cpu("flow1d#rejected-tiles", (double)n_marked.load());
-    }
 }
 
 } // namespace
@@ -994,8 +947,6 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             int sx = std::min(in.nx - 1, tx / repeat_factor);
             upsampled.dx(ty, tx) = in.dx(sy, sx) * (f32)upsample_factor;
             upsampled.dy(ty, tx) = in.dy(sy, sx) * (f32)upsample_factor;
-            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx)
-                upsampled.aperture(ty, tx) = in.aperture(sy, sx);
             if (in.match_ambiguous.size() == (size_t)in.ny * (size_t)in.nx)
                 upsampled.ambiguous(ty, tx) = in.ambiguous(sy, sx);
         }
@@ -1007,8 +958,6 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
             if (ty < up_ny && tx < up_nx) {
                 out.dx(ty, tx) = upsampled.dx(ty, tx);
                 out.dy(ty, tx) = upsampled.dy(ty, tx);
-                if (upsampled.aperture_limited.size() == (size_t)up_ny * (size_t)up_nx)
-                    out.aperture(ty, tx) = upsampled.aperture(ty, tx);
                 if (upsampled.match_ambiguous.size() == (size_t)up_ny * (size_t)up_nx)
                     out.ambiguous(ty, tx) = upsampled.ambiguous(ty, tx);
             }
@@ -1105,18 +1054,6 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                 best_i = 0;
             out.dx(ty, tx) = cand[best_i][0];
             out.dy(ty, tx) = cand[best_i][1];
-            if (in.aperture_limited.size() == (size_t)in.ny * (size_t)in.nx) {
-                int ap_y = prev_y;
-                int ap_x = prev_x;
-                if (best_i == 1) {
-                    ap_y = cand_y;
-                    ap_x = prev_x;
-                } else if (best_i == 2) {
-                    ap_y = prev_y;
-                    ap_x = cand_x;
-                }
-                out.aperture(ty, tx) = in.aperture(ap_y, ap_x);
-            }
             if (in.match_ambiguous.size() == (size_t)in.ny * (size_t)in.nx) {
                 int am_y = prev_y;
                 int am_x = prev_x;
@@ -1150,61 +1087,22 @@ void clear_align_ref_ica_cache() {
     g_ref_ica_cache = {};
 #ifdef __APPLE__
     metal_clear_ref_ica_cache();
+    metal_clear_densify_ref_cache();
 #endif
-}
-
-FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor,
-                                   int finest_h, int finest_w,
-                                   f32 initial_dx, f32 initial_dy,
-                                   f32 initial_rotation_rad) {
-    FlowField flow(ny, nx);
-    const f32 factor = (f32)std::max(1, abs_factor);
-    const f32 inv_factor = 1.f / factor;
-    const f32 dx = std::isfinite(initial_dx) ? initial_dx : 0.f;
-    const f32 dy = std::isfinite(initial_dy) ? initial_dy : 0.f;
-    const f32 a = std::isfinite(initial_rotation_rad) ? initial_rotation_rad : 0.f;
-    const f32 ca = std::cos(a);
-    const f32 sa = std::sin(a);
-    const f32 cx = 0.5f * (f32)std::max(0, finest_w - 1);
-    const f32 cy = 0.5f * (f32)std::max(0, finest_h - 1);
-
-    for (int ty = 0; ty < ny; ++ty) {
-        for (int tx = 0; tx < nx; ++tx) {
-            const f32 x = ((f32)tx * (f32)tile_size + 0.5f * (f32)tile_size) * factor;
-            const f32 y = ((f32)ty * (f32)tile_size + 0.5f * (f32)tile_size) * factor;
-            const f32 rx = x - cx;
-            const f32 ry = y - cy;
-            const f32 rot_x = ca * rx - sa * ry - rx;
-            const f32 rot_y = sa * rx + ca * ry - ry;
-            flow.dx(ty, tx) = (dx + rot_x) * inv_factor;
-            flow.dy(ty, tx) = (dy + rot_y) * inv_factor;
-        }
-    }
-    return flow;
 }
 
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
-                const Image& moving_grey, const Config& cfg, int tile_size,
-                f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
+                const Image& moving_grey, const Config& cfg, int tile_size) {
     int nlev = (int)ref_pyr.levels.size();
 
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
-        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
-                        initial_dx, initial_dy, initial_rotation_rad)) {
-            if (cfg.flow_reject_1d_enabled) {
-                Image gx = compute_sobel_gradx(ref_grey);
-                Image gy = compute_sobel_grady(ref_grey);
-                HessianField hess = compute_hessian(gx, gy, tile_size);
-                mark_aperture_limited_tiles(flow_gpu, &hess, cfg);
-            } else {
-                mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
-            }
+        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu)) {
             mark_motion_irregular_tiles(flow_gpu, cfg);
             return flow_gpu;
         }
@@ -1266,20 +1164,17 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         // is built on the alignment grey. See Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = (lvl < (int)cfg.bm_search_radii.size())
-                     ? cfg.bm_search_radii[lvl] : 2;
+        // Grey-domain search radius -- bm_search_radii is in RAW pixels, same
+        // as bm_tile_sizes. See Config::grey_search_radius.
+        int radius = cfg.grey_search_radius(
+            (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2);
 
         // Tile grid from padded ref level (Python: h // tile_size)
         int ny = r.h / ts;
         int nx = r.w / ts;
 
         if (flow.nx == 0) {
-            const int abs_factor = (lvl < (int)ref_pyr.abs_factors.size())
-                                   ? ref_pyr.abs_factors[(size_t)lvl] : 1;
-            flow = make_global_initial_flow(ny, nx, ts, abs_factor,
-                                            ref_grey.h, ref_grey.w,
-                                            initial_dx, initial_dy,
-                                            initial_rotation_rad);
+            flow = FlowField(ny, nx);
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;
@@ -1317,29 +1212,19 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     // With per-level ICA the loop above already refined level 0, and repeating
     // it here would run ICA twice on the finest scale.
     // Coarse-only leaves the finest level to this pass, so it must still run.
-    HessianField finest_hess;
     if (!ica_all || cfg.ica_per_level_coarse_only()) {
         Image gx = compute_sobel_gradx(ref_grey);
         Image gy = compute_sobel_grady(ref_grey);
-        finest_hess = compute_hessian(gx, gy, cfg.grey_tile_size(tile_size));
+        HessianField finest_hess = compute_hessian(gx, gy, cfg.grey_tile_size(tile_size));
         debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
         debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
-        const int finest_radius = cfg.bm_search_radii.empty() ? 1
-                                                              : cfg.bm_search_radii[0];
+        const int finest_radius = cfg.grey_search_radius(
+            cfg.bm_search_radii.empty() ? 1 : cfg.bm_search_radii[0]);
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow,
                          cfg.grey_tile_size(tile_size),
                          cfg.ica_n_iter, cfg.num_threads,
                          ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
     }
-    const HessianField* mark_hess = nullptr;
-    if (!finest_hess.data.empty()) {
-        mark_hess = &finest_hess;
-    } else if (!g_ref_ica_cache.levels.empty() &&
-               g_ref_ica_cache.levels[0].hess.ny == flow.ny &&
-               g_ref_ica_cache.levels[0].hess.nx == flow.nx) {
-        mark_hess = &g_ref_ica_cache.levels[0].hess;
-    }
-    mark_aperture_limited_tiles(flow, mark_hess, cfg);
     mark_motion_irregular_tiles(flow, cfg);
     return flow;
 }
@@ -1402,8 +1287,6 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 (int)std::floor((raw_cx / sx) / (f32)guide_tile_size)));
             out.dx(ty, tx) = flow.dx(gy, gx) * sx;
             out.dy(ty, tx) = flow.dy(gy, gx) * sy;
-            if (flow.aperture_limited.size() == (size_t)flow.ny * (size_t)flow.nx)
-                out.aperture(ty, tx) = flow.aperture(gy, gx);
             if (flow.match_ambiguous.size() == (size_t)flow.ny * (size_t)flow.nx)
                 out.ambiguous(ty, tx) = flow.ambiguous(gy, gx);
             if (carry_motion)
@@ -1413,68 +1296,38 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     return out;
 }
 
-// Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
-// field produced by an external neural flow estimator (PWCNet), re-using
-// flow_to_raw_tile_grid's grey-to-raw scaling so the result is a drop-in
-// replacement for align()'s output at any downstream consumer
-// (compute_robustness, merge, ...).
-//
-// dense_flow: dx plane (guide_h*guide_w floats) followed by dy plane
-// (guide_h*guide_w floats), values in GUIDE-pixel units -- the layout a
-// Core ML (1,2,guide_h,guide_w) MLMultiArray output has.
-//
-// aperture_limited / match_ambiguous are left unset (all zero): those are
-// specific to the block matcher's own candidate search and have no
-// equivalent for a dense CNN flow field -- match_ambiguous-based rejection
-// (robustness.cpp) simply never fires for tiles sourced this way.
-// motion_irregular is likewise left unmeasured here; flow_to_raw_tile_grid
-// only recomputes it when the input already carries one, so downstream
-// compute_s falls back to its own derivation from the raw-tile output, same
-// as any other flow source that doesn't pre-measure it.
-FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
-                                int raw_h, int raw_w, int tile_size,
-                                f32 r_Mt, int num_threads) {
-    if (!dense_flow || guide_h <= 0 || guide_w <= 0 || raw_h <= 0 || raw_w <= 0 || tile_size <= 0)
-        return FlowField();
-
-    const f32* dx_plane = dense_flow;
-    const f32* dy_plane = dense_flow + (size_t)guide_h * (size_t)guide_w;
-
-    const int gny = (guide_h + tile_size - 1) / tile_size;
-    const int gnx = (guide_w + tile_size - 1) / tile_size;
-    FlowField flow_guide(gny, gnx);
-
-    // Average-pool the dense flow into tile_size x tile_size guide-pixel
-    // blocks -- the same granularity flow_to_raw_tile_grid expects an input
-    // tile grid to already be at (it re-derives the grey/raw ratio from
-    // guide_h/guide_w and this same tile_size).
-    parallel_rows(gny, num_threads, [&](int ty) {
-        const int y0 = ty * tile_size;
-        const int y1 = std::min(guide_h, y0 + tile_size);
-        for (int tx = 0; tx < gnx; ++tx) {
-            const int x0 = tx * tile_size;
-            const int x1 = std::min(guide_w, x0 + tile_size);
-            double sum_dx = 0.0, sum_dy = 0.0;
-            int n = 0;
-            for (int y = y0; y < y1; ++y) {
-                for (int x = x0; x < x1; ++x) {
-                    const size_t idx = (size_t)y * guide_w + x;
-                    sum_dx += dx_plane[idx];
-                    sum_dy += dy_plane[idx];
-                    ++n;
-                }
-            }
-            if (n > 0) {
-                flow_guide.dx(ty, tx) = (f32)(sum_dx / n);
-                flow_guide.dy(ty, tx) = (f32)(sum_dy / n);
-            }
-        }
-    });
-
-    return flow_to_raw_tile_grid(flow_guide, raw_h, raw_w, guide_h, guide_w,
-                                 tile_size, r_Mt, num_threads, tile_size);
+// Full-resolution ICA polish (Config::align_fullres_polish): one final ICA
+// refinement of the RAW-grid flow at raw resolution, on the band-limited
+// full-res FFT grey both frames were converted to -- the same image the FFT
+// path measures on. Run after flow_to_raw_tile_grid and before the boundary
+// densify, while the seed is the finished decimate estimate. On device the
+// Metal path (prep_level_ica_gpu + ica_bufs, ref side cached per burst) does
+// the work; the CPU body below exists for host tools and forced-CPU debug,
+// built from the same Sobel/Hessian/ica_refine_level pieces the CPU align
+// driver uses at its own finest level.
+bool flow_fullres_ica_polish(const Image& ref_grey_full, const Image& mov_grey_full,
+                             FlowField& flow, int tile_size, const Config& cfg) {
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0 ||
+        ref_grey_full.h <= 0 || ref_grey_full.w <= 0 ||
+        mov_grey_full.h <= 0 || mov_grey_full.w <= 0)
+        return false;
+#ifdef __APPLE__
+    if (!env_flag_on("HHSR_ALIGN_CPU"))
+        return ica_fullres_polish_metal(ref_grey_full, mov_grey_full, flow,
+                                        tile_size, cfg);
+#endif
+    const int ny = (ref_grey_full.h + tile_size - 1) / tile_size;
+    const int nx = (ref_grey_full.w + tile_size - 1) / tile_size;
+    if (ny != flow.ny || nx != flow.nx) return false;
+    Image gx = compute_sobel_gradx(ref_grey_full);
+    Image gy = compute_sobel_grady(ref_grey_full);
+    HessianField hess = compute_hessian(gx, gy, tile_size);
+    if (hess.ny != flow.ny || hess.nx != flow.nx) return false;
+    ica_refine_level(ref_grey_full, gx, gy, mov_grey_full, hess, flow,
+                     tile_size, cfg.ica_n_iter, cfg.num_threads,
+                     ica_damp_ratio(cfg), ica_max_step(cfg, 1));
+    return true;
 }
-
 // Build the boundary-selected half-pitch refinement of a RAW-grid flow field
 // (FlowField::fine_*, consumed transparently by sample_bilinear and the GPU
 // hosts). Runs after flow_to_raw_tile_grid, on the same greys alignment used.
@@ -1515,6 +1368,16 @@ void flow_densify_boundary_select(FlowField& flow,
         mov_grey.h <= 0 || mov_grey.w <= 0 || mov_grey.c != 1 ||
         raw_h <= 0 || raw_w <= 0)
         return;
+#ifdef __APPLE__
+    // The measurement branches below are the last CPU hotspot of the align
+    // stage (~200ms/frame on violent bursts with the overlap merge on); the
+    // GPU twin runs one thread per fine cell with identical math. The CPU
+    // body remains for host tools and HHSR_ALIGN_CPU debugging.
+    if (!env_flag_on("HHSR_ALIGN_CPU") &&
+        flow_densify_select_metal(flow, ref_grey, mov_grey, raw_h, raw_w,
+                                  tile_size, cfg))
+        return;
+#endif
     const f32 ts2 = 0.5f * (f32)tile_size;
     const int fny = std::max(1, (int)std::ceil((f32)raw_h / ts2));
     const int fnx = std::max(1, (int)std::ceil((f32)raw_w / ts2));
