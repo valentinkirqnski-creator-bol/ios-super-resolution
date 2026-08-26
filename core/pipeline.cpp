@@ -74,8 +74,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: grey + pyramid", 0.02f);
     // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method,
-                                  work.grey_decimate_lowpass);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     Image ref_grey_padded = pad_image_circular(ref_grey, work.grey_tile_size(tile_size));
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
 
@@ -97,8 +96,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         float base = 0.05f + 0.85f * (float)(k - 1) / std::max(1, n - 1);
         report("Frame " + std::to_string(k + 1) + ": align", base);
         const Image& comp = burst[k];
-        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method,
-                                      work.grey_decimate_lowpass);
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
 
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         // Alignment ran on the grey. With the Bayer quad average that is half
@@ -113,19 +111,6 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
-        flow.sample_bicubic = work.flow_bicubic_sampling &&
-                              work.flow_bilinear_sampling;
-        if (work.align_fullres_polish && work.bayer_mode &&
-            work.grey_method == GreyMethod::Decimate) {
-            Image rp = pad_image_circular(compute_grey_fft(ref), tile_size);
-            Image cp = pad_image_circular(compute_grey_fft(comp), tile_size);
-            flow_fullres_ica_polish(rp, cp, flow, tile_size, work);
-            flow_densify_boundary_select(flow, rp, cp, comp.h, comp.w,
-                                         tile_size, work);
-        } else {
-            flow_densify_boundary_select(flow, ref_grey, comp_grey,
-                                         comp.h, comp.w, tile_size, work);
-        }
         Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
         if (accumulate_r) {
             if (!have_acc_rob) {
@@ -180,8 +165,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 
     report("Reference: grey + pyramid", 0.02f);
     // 460-main block matching circular-pads the reference before pyramid construction.
-    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method,
-                                  work.grey_decimate_lowpass);
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     Image ref_grey_padded = pad_image_circular(ref_grey, work.grey_tile_size(tile_size));
     Pyramid ref_pyr = build_pyramid(ref_grey_padded, work.bm_factors);
     RefStats ref_stats = init_robustness(ref, work);
@@ -198,27 +182,13 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     for (int k = 1; k < n; ++k) {
         report("Frame " + std::to_string(k + 1) + ": analyze",
                0.03f + 0.50f * (float)(k - 1) / std::max(1, n - 1));
-        Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method,
-                                      work.grey_decimate_lowpass);
+        Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method);
         FrameData& fd = frames[k - 1];
         fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
                                         comp_grey.h, comp_grey.w, tile_size,
                                         work.r_Mt, work.num_threads,
                                         work.grey_tile_size(tile_size));
-        fd.flow.sample_bicubic = work.flow_bicubic_sampling &&
-                                 work.flow_bilinear_sampling;
-        if (work.align_fullres_polish && work.bayer_mode &&
-            work.grey_method == GreyMethod::Decimate) {
-            Image rp = pad_image_circular(compute_grey_fft(burst[0]), tile_size);
-            Image cp = pad_image_circular(compute_grey_fft(burst[k]), tile_size);
-            flow_fullres_ica_polish(rp, cp, fd.flow, tile_size, work);
-            flow_densify_boundary_select(fd.flow, rp, cp, burst[k].h,
-                                         burst[k].w, tile_size, work);
-        } else {
-            flow_densify_boundary_select(fd.flow, ref_grey, comp_grey,
-                                         burst[k].h, burst[k].w, tile_size, work);
-        }
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {
@@ -239,14 +209,12 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     int Ws = (int)std::lround(work.scale * ref.w);
 
     DngStreamWriter writer;
-    const CaptureExif exif = DngStreamWriter::exif_from_config(work);
     if (!writer.open(dng_path, Ws, Hs, "HandheldSR-x2", work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
                      work.bayer_mode ? work.white_balance : nullptr,
                      work.bake_srgb, "HandheldSR",
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
-                     work.raw_prewhitened && !dng_unwhiten_active(work, nch),
-                     work.dng_lossless_jpeg, &exif)) {
+                     work.raw_prewhitened)) {
         report("Error: cannot open output DNG", 1.0f);
         return Image();
     }
@@ -303,13 +271,9 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 } else {
                     outc[0] = outc[1] = outc[2] = cn[0];
                 }
-                float sgw[3];
-                dng_unwhiten_gains(work, nch, sgw);
                 for (int k = 0; k < 3; ++k) {
                     f32 v = work.bake_srgb ? to_srgb(outc[k]) : clampf(outc[k], 0.f, 1.f);
-                    const f32 vs = work.bake_srgb
-                        ? v : clampf(outc[k] * sgw[k], 0.f, 1.f);
-                    row16[base + k] = (uint16_t)(vs * 65535.f + 0.5f);
+                    row16[base + k] = (uint16_t)(v * 65535.f + 0.5f);
                     if (k == 0) preview.at(py, std::min(pw - 1, (int)(x * pscale)), 0) = v;
                     else if (k == 1) preview.at(py, std::min(pw - 1, (int)(x * pscale)), 1) = v;
                     else preview.at(py, std::min(pw - 1, (int)(x * pscale)), 2) = v;

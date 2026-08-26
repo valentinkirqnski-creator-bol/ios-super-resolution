@@ -7,8 +7,6 @@
 #include "debug_utils.h"
 #include "prof.h"
 #include "mps_fft.h"
-// dng_unwhiten_gains for merge_normalize_rgb16's store gains.
-#include "dng_writer.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -161,17 +159,15 @@ static MetalCtx& ctx() {
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
-            "merge_accumulate_comp_x4_h", "merge_accumulate_ref_h",
-            "merge_acc_half_to_float",
-            "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
+            "kernel_gat", "kernel_gat_raw", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
-            "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
+            "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
+            "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460",
             "merge_normalize_rgb16",
-            "flow_densify_select",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -179,13 +175,6 @@ static MetalCtx& ctx() {
         c.ok = true;
     });
     return c;
-}
-
-// Flow sampling mode for the kernels' flow_bilinear field:
-// 0 = nearest, 1 = bilinear, 2 = Catmull-Rom bicubic.
-static inline uint32_t flow_sample_mode(const Config& cfg) {
-    if (!cfg.flow_bilinear_sampling) return 0u;
-    return cfg.flow_bicubic_sampling ? 2u : 1u;
 }
 
 static id<MTLBuffer> buf(const void* data, size_t bytes) {
@@ -197,100 +186,6 @@ static id<MTLBuffer> buf(const void* data, size_t bytes) {
     else
         b = [c.device newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
     return b;
-}
-
-// Boundary-selected flow (FlowField::fine_*, built by
-// flow_densify_boundary_select). The kernels only ever consume the flow
-// through flow_sample_bilinear plus per-tile lookups indexed off the same
-// (tile_size, flow_ny, flow_nx) triple, so the fine grid is a pure
-// re-parameterisation for them: upload the fine data, halve the pitch,
-// take the fine dims -- and DUPLICATE any per-tile aux (S, match_ambiguous)
-// onto the fine grid. The duplication is exact, not approximate:
-// floor(floor(a / (ts/2)) / 2) == floor(a / ts), so every per-pixel aux
-// lookup lands on the same source tile's value it always did.
-static bool flow_gpu_grid(const FlowField& flow, int tile_size,
-                          const f32*& data, size_t& nbytes,
-                          int& ny, int& nx, int& ts) {
-    if (flow.has_fine() && tile_size >= 2 && (tile_size % 2) == 0) {
-        data = flow.fine_flow.data();
-        nbytes = flow.fine_flow.size() * sizeof(float);
-        ny = flow.fine_ny;
-        nx = flow.fine_nx;
-        ts = tile_size / 2;
-        return true;
-    }
-    data = flow.flow.empty() ? nullptr : flow.flow.data();
-    nbytes = flow.flow.size() * sizeof(float);
-    ny = flow.ny;
-    nx = flow.nx;
-    ts = tile_size;
-    return false;
-}
-
-template <typename T>
-static std::vector<T> dup_tile_aux_to_fine(const std::vector<T>& src,
-                                           int ny, int nx, int fny, int fnx) {
-    std::vector<T> out((size_t)fny * (size_t)fnx);
-    for (int fy = 0; fy < fny; ++fy) {
-        const int sy = std::min(std::max(0, ny - 1), fy / 2);
-        for (int fx = 0; fx < fnx; ++fx) {
-            const int sx = std::min(std::max(0, nx - 1), fx / 2);
-            out[(size_t)fy * fnx + fx] = src[(size_t)sy * nx + sx];
-        }
-    }
-    return out;
-}
-
-// Covariance GPU residency (see CovField::gpu_tag): the kernel-estimate
-// output lives in a shared scratch buffer; only the most recent estimate's
-// bytes are current. The online loop merges frame k before frame k+1's
-// estimate runs, so binding the scratch is safe by queue order; any consumer
-// arriving later (banded path) sees a stale tag and falls back to uploading
-// its CPU copy.
-static std::mutex g_cov_live_mu;
-static uint64_t g_cov_tag_next = 0;
-static uint64_t g_cov_live_tag = 0;
-static size_t g_cov_live_bytes = 0;
-static id<MTLBuffer> g_cov_live_buf = nil;
-
-// SAFETY: valid only while the frame's merge command buffer COMMITS before
-// the next frame's estimate dispatch (true at kOnlineFuse == 1, the shipped
-// config: commit happens in the same loop iteration). If fusing ever holds a
-// frame's encode across the next frame's analysis again, the tag check here
-// passes at ACQUIRE time but the scratch is overwritten before execution --
-// gate residency off in that world.
-static id<MTLBuffer> cov_gpu_or_upload(const CovField& covs, const f32* cp,
-                                       size_t cov_b) {
-    {
-        std::lock_guard<std::mutex> lk(g_cov_live_mu);
-        if (covs.gpu_tag != 0 && covs.gpu_tag == g_cov_live_tag &&
-            g_cov_live_buf && g_cov_live_bytes == cov_b)
-            return g_cov_live_buf;
-    }
-    return cp ? buf(cp, cov_b) : nil;
-}
-
-// Robustness-mask GPU residency (Image::gpu_tag), same shape as the cov
-// handshake above but SIMPLER in one way: each robustness run creates a fresh
-// output buffer (no shared scratch), so the published buffer is immutable
-// until replaced by the next frame's publish -- no queue-order safety clause
-// needed. Holding one mask buffer alive between frames replaces the upload
-// copy the merge would otherwise allocate, so peak memory does not grow.
-static std::mutex g_rob_live_mu;
-static uint64_t g_rob_tag_next = 0;
-static uint64_t g_rob_live_tag = 0;
-static size_t g_rob_live_bytes = 0;
-static id<MTLBuffer> g_rob_live_buf = nil;
-
-static id<MTLBuffer> rob_gpu_or_upload(const Image& rob, const f32* rp,
-                                       size_t rob_b) {
-    {
-        std::lock_guard<std::mutex> lk(g_rob_live_mu);
-        if (rob.gpu_tag != 0 && rob.gpu_tag == g_rob_live_tag &&
-            g_rob_live_buf && g_rob_live_bytes == rob_b)
-            return g_rob_live_buf;
-    }
-    return rp ? buf(rp, rob_b) : nil;
 }
 
 static void dispatch2(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> p,
@@ -1132,7 +1027,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_h = (uint32_t)grey_h;
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
-    p.selection = 0u; // 460-main kernels.py always uses hard thresholding.
+    p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -1149,11 +1044,11 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
 
     id<MTLBuffer> b_raw = c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
-    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, grey_b);
+    id<MTLBuffer> b_vst_raw = c.scratch(c.kern_vst, c.kern_vst_b, raw_b);
     id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
     id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
     id<MTLBuffer> b_cov = c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
-    if (!b_raw || !b_vst || !b_grey || !b_grad || !b_cov) return CovField();
+    if (!b_raw || !b_vst_raw || !b_grey || !b_grad || !b_cov) return CovField();
     memcpy([b_raw contents], raw.data.data(), raw_b);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1163,18 +1058,18 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
 
-    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst_raw offset:0 atIndex:0];
     [enc setBuffer:b_raw offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat_raw"), p.raw_w, p.raw_h);
+
+    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst_raw offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
-    [enc setBuffer:b_vst offset:0 atIndex:0];
-    [enc setBuffer:b_grey offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("kernel_gat"), p.grey_w, p.grey_h);
-
     [enc setBuffer:b_grad offset:0 atIndex:0];
-    [enc setBuffer:b_vst offset:0 atIndex:1];
+    [enc setBuffer:b_grey offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
 
@@ -1191,15 +1086,6 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
 
     CovField covs(grey_h, grey_w);
     memcpy(covs.cov.data(), [b_cov contents], cov_b);
-    {
-        // Publish this buffer for the merge host (CovField::gpu_tag); the
-        // next estimate call retires it by bumping the live tag.
-        std::lock_guard<std::mutex> lk(g_cov_live_mu);
-        covs.gpu_tag = ++g_cov_tag_next;
-        g_cov_live_tag = covs.gpu_tag;
-        g_cov_live_bytes = cov_b;
-        g_cov_live_buf = b_cov;
-    }
     return covs;
 }
 
@@ -1235,29 +1121,116 @@ static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
     float r_t;
-    float r_s1 = 0.f;   // motion prior for ambiguous tiles
+    uint32_t hf_enabled = 0;
+    float hf_variance_loss_threshold = 0.f;
+    uint32_t motion_edge_enabled = 0;
+    float motion_edge_threshold = 0.f;
+    float motion_edge_residual_threshold = 0.f;
+    float alpha = 0.f;
+    float beta = 0.f;
+    float motion_edge_noise_floor_multiplier = 1.f;
+    uint32_t motion_edge_neighborhood_radius = 0;
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
+    float flow_reject_1d_residual_threshold = 0.f;
+    uint32_t aperture_reject_enabled = 0;
+    float r_s1 = 0.f;   // motion prior for aperture-limited tiles (was _pad0)
+    uint32_t save_s_select = 0;  // 1 = also emit the per-pixel s1/s2 selector
     uint32_t ambiguous_enabled = 0;  // 1 = demote tiles with an ambiguous match
-    // 1 = sample the per-tile flow bilinearly between tile centres. Must
-    // match the merge's setting: the mask has to score the correspondence the
-    // merge actually fetches.
+    // 1 = sample the per-tile flow bilinearly between tile centres (was
+    // _pad1). Must match the merge's setting: the mask has to score the
+    // correspondence the merge actually fetches.
     uint32_t flow_bilinear = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 48, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n;
     float r_t;
     float r_s1;
+    uint32_t save_s_select = 0;
     uint32_t ambiguous_enabled = 0;
     uint32_t chain_reject_enabled = 0;
     float r_s_chain = 0.f;
     uint32_t motion_magnitude_veto_enabled = 0;
+    uint32_t hf_enabled = 0;
+    float hf_variance_loss_threshold = 0.f;
+    uint32_t hf_h = 0, hf_w = 0;    // guide-resolution dims of ref_hf_loss
+    uint32_t motion_edge_enabled = 0;
+    float motion_edge_threshold = 0.f;
+    float motion_edge_residual_threshold = 0.f;
+    float alpha = 0.f;
+    float beta = 0.f;
+    float motion_edge_noise_floor_multiplier = 0.f;
+    uint32_t motion_edge_neighborhood_radius = 0;
     uint32_t _pad0 = 0;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 56, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 104, "RobMaskRawParamsCPU");
+
+struct RobHfLossParamsCPU {
+    uint32_t h, w, nch;
+    uint32_t _pad0 = 0;
+    float alpha = 0.f, beta = 0.f;
+    float min_texture_snr = 0.f;
+    float _pad1 = 0.f;
+};
+static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
+
+static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
+                            id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
+                            int guide_h, int guide_w, int nch,
+                            const Config& cfg, id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
+    const size_t loss_b = (size_t)guide_h * (size_t)guide_w * sizeof(float);
+    id<MTLBuffer> b_lp_guide = buf(nullptr, guide_b);
+    id<MTLBuffer> b_lp_means = buf(nullptr, guide_b);
+    id<MTLBuffer> b_lp_vars = buf(nullptr, guide_b);
+    b_loss = buf(nullptr, loss_b);
+    if (!b_guide || !b_means || !b_vars || !b_lp_guide ||
+        !b_lp_means || !b_lp_vars || !b_loss)
+        return false;
+
+    RobStatsParamsCPU sp{};
+    sp.h = (uint32_t)guide_h;
+    sp.w = (uint32_t)guide_w;
+    sp.nch = (uint32_t)nch;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_lp_guide offset:0 atIndex:0];
+    [enc setBuffer:b_guide offset:0 atIndex:1];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+    dispatch2(enc, c.pipe("rob_lowpass_gaussian5x5"), sp.w, sp.h);
+    [enc endEncoding];
+
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_lp_means offset:0 atIndex:0];
+    [enc setBuffer:b_lp_vars offset:0 atIndex:1];
+    [enc setBuffer:b_lp_guide offset:0 atIndex:2];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+    dispatch2(enc, c.pipe("rob_local_stats_3x3"), sp.w, sp.h);
+    [enc endEncoding];
+
+    RobHfLossParamsCPU hp{};
+    hp.h = (uint32_t)guide_h;
+    hp.w = (uint32_t)guide_w;
+    hp.nch = (uint32_t)nch;
+    hp.alpha = cfg.noise_alpha_robustness();
+    hp.min_texture_snr = cfg.hf_min_texture_snr;
+    hp.beta = cfg.noise_beta_robustness();
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_loss offset:0 atIndex:0];
+    [enc setBuffer:b_means offset:0 atIndex:1];
+    [enc setBuffer:b_vars offset:0 atIndex:2];
+    [enc setBuffer:b_lp_vars offset:0 atIndex:3];
+    [enc setBytes:&hp length:sizeof(hp) atIndex:4];
+    dispatch2(enc, c.pipe("rob_hf_loss_adaptive"), hp.w, hp.h);
+    [enc endEncoding];
+    return true;
+}
 
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                       std::vector<uint32_t>* irregular_out = nullptr) {
@@ -1365,7 +1338,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       uint32_t flow_mode) {
+                       bool flow_bilinear) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1380,20 +1353,15 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.out_w = (uint32_t)out_w;
     dp.nch = (uint32_t)nch;
     dp.is_ref = is_ref ? 1u : 0u;
-    const f32* fg_dat = nullptr;
-    size_t fg_bytes = 0;
-    int fg_ny = 0, fg_nx = 0, fg_ts = tile_size;
-    if (!is_ref && flow)
-        (void)flow_gpu_grid(*flow, tile_size, fg_dat, fg_bytes, fg_ny, fg_nx, fg_ts);
-    dp.tile_size = (uint32_t)std::max(0, fg_ts);
-    dp.flow_ny = (!is_ref && flow) ? (uint32_t)fg_ny : 0u;
-    dp.flow_nx = (!is_ref && flow) ? (uint32_t)fg_nx : 0u;
+    dp.tile_size = (uint32_t)std::max(0, tile_size);
+    dp.flow_ny = (!is_ref && flow) ? (uint32_t)flow->ny : 0u;
+    dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
-    dp.flow_bilinear = flow_mode;
+    dp.flow_bilinear = flow_bilinear ? 1u : 0u;
 
     id<MTLBuffer> b_flow = nil;
-    if (!is_ref && flow && fg_dat && fg_bytes) {
-        b_flow = buf(fg_dat, fg_bytes);
+    if (!is_ref && flow && !flow->flow.empty()) {
+        b_flow = buf(flow->flow.data(), flow->flow.size() * sizeof(float));
         if (!b_flow) return false;
     } else {
         static float kDummyFlow[2] = {0.f, 0.f};
@@ -1415,6 +1383,8 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
 } // namespace
 
 // Sticky ref means/vars for compute_robustness_metal (avoid re-upload + free host).
+static id<MTLBuffer> g_rob_ref_hf = nil;
+static size_t g_rob_ref_hf_bytes = 0;
 static id<MTLBuffer> g_rob_ref_m = nil;
 static id<MTLBuffer> g_rob_ref_v = nil;
 static int g_rob_ref_h = 0, g_rob_ref_w = 0, g_rob_ref_c = 0;
@@ -1439,8 +1409,12 @@ static float g_rob_curve_alpha[3] = {std::numeric_limits<float>::quiet_NaN(),
 static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
+static bool g_rob_curve_pixel4a = false;
+static int g_rob_curve_pixel4a_iso = 0;
 
 static void clear_rob_ref_gpu() {
+    g_rob_ref_hf = nil;
+    g_rob_ref_hf_bytes = 0;
     g_rob_ref_m = nil;
     g_rob_ref_v = nil;
     g_rob_ref_h = g_rob_ref_w = g_rob_ref_c = 0;
@@ -1455,6 +1429,8 @@ static void clear_rob_ref_gpu() {
         g_rob_curve_alpha[i] = std::numeric_limits<float>::quiet_NaN();
         g_rob_curve_beta[i]  = std::numeric_limits<float>::quiet_NaN();
     }
+    g_rob_curve_pixel4a = false;
+    g_rob_curve_pixel4a_iso = 0;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -1469,6 +1445,15 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (!rob_run_guide_stats(ref_raw, cfg, b_guide, b_means, b_vars, gh, gw, nch, cmd))
         return RefStats();
 
+    // Must be encoded before the commit below: a committed MTLCommandBuffer
+    // cannot accept further encoders, and doing so is a hard error rather than
+    // a silent no-op. This block previously sat after the commit, which crashed
+    // as soon as high-frequency rejection was switched on.
+    id<MTLBuffer> b_ref_hf_loss = nil;
+    if (cfg.hf_artifact_removal_enabled &&
+        !rob_run_hf_loss(b_guide, b_means, b_vars, b_ref_hf_loss, gh, gw, nch, cfg, cmd))
+        return RefStats();
+
     // Dodgson-upscale the reference's own local stats to raw resolution once
     // per burst here, same reasoning as CPU init_robustness's means_hires/
     // stds_hires -- is_ref=true, so no flow warp, just the upscale.
@@ -1477,9 +1462,9 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd, flow_sample_mode(cfg)) ||
+                        nullptr, 0, mh, mw, cmd, cfg.flow_bilinear_sampling) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, flow_sample_mode(cfg)) ||
+                       nullptr, 0, vh, vw, cmd, cfg.flow_bilinear_sampling) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -1490,6 +1475,11 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // No CPU readback follows. Commit without waiting; subsequent work on the
     // same queue observes these pinned buffers after this command completes.
     [cmd commit];
+
+    g_rob_ref_hf = b_ref_hf_loss;
+    g_rob_ref_hf_bytes = b_ref_hf_loss
+        ? (size_t)gh * (size_t)gw * sizeof(float)
+        : 0;
 
     // Pin guide-grid local stats for all comparison frames (460-main robustness).
     g_rob_ref_m = b_means;
@@ -1504,8 +1494,8 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     g_rob_ref_hires_w = hires_w;
 
     RefStats st;
-    // Keep only dimensions on the CPU. The actual reference means/vars stay
-    // resident in pinned Metal buffers above; copying them back here is an
+    // Keep only dimensions on the CPU. The actual reference means/vars/HF loss
+    // stay resident in pinned Metal buffers above; copying them back here is an
     // avoidable readback and peak-RAM spike on full-res bursts.
     st.means.h = gh;
     st.means.w = gw;
@@ -1514,6 +1504,42 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     st.stds.w = gw;
     st.stds.c = nch;
     return st;
+}
+
+bool metal_fetch_host_ref_stats(RefStats& ref_stats) {
+    if (!g_rob_ref_m || !g_rob_ref_v) return false;
+    if (g_rob_ref_h <= 0 || g_rob_ref_w <= 0 || g_rob_ref_c <= 0) return false;
+    const size_t bytes = (size_t)g_rob_ref_h * (size_t)g_rob_ref_w *
+                         (size_t)g_rob_ref_c * sizeof(float);
+    if (g_rob_ref_bytes != bytes) return false;
+    // The stats are produced by a command buffer that was committed without a
+    // wait, so make sure it has landed before reading the contents.
+    if (!metal_merge_wait_inflight()) return false;
+    Image m(g_rob_ref_h, g_rob_ref_w, g_rob_ref_c);
+    Image v(g_rob_ref_h, g_rob_ref_w, g_rob_ref_c);
+    memcpy(m.data.data(), [g_rob_ref_m contents], bytes);
+    memcpy(v.data.data(), [g_rob_ref_v contents], bytes);
+    ref_stats.means = std::move(m);
+    ref_stats.stds = std::move(v);
+
+    // The raw-resolution learned mask reads the Dodgson-upscaled statistics
+    // too, and those are GPU-resident for the same reason. Only fetched when
+    // they exist -- 2 x 12 MP x 3ch x f32 is ~292 MB, so this is not something
+    // to pull across speculatively.
+    if (g_rob_ref_m_hires && g_rob_ref_v_hires &&
+        g_rob_ref_hires_h > 0 && g_rob_ref_hires_w > 0) {
+        const size_t hb = (size_t)g_rob_ref_hires_h * (size_t)g_rob_ref_hires_w *
+                          (size_t)g_rob_ref_c * sizeof(float);
+        if ([g_rob_ref_m_hires length] >= hb && [g_rob_ref_v_hires length] >= hb) {
+            Image mh(g_rob_ref_hires_h, g_rob_ref_hires_w, g_rob_ref_c);
+            Image vh(g_rob_ref_hires_h, g_rob_ref_hires_w, g_rob_ref_c);
+            memcpy(mh.data.data(), [g_rob_ref_m_hires contents], hb);
+            memcpy(vh.data.data(), [g_rob_ref_v_hires contents], hb);
+            ref_stats.means_hires = std::move(mh);
+            ref_stats.stds_hires = std::move(vh);
+        }
+    }
+    return true;
 }
 
 void metal_release_host_ref_stats(RefStats& ref_stats) {
@@ -1533,16 +1559,29 @@ void metal_release_host_ref_stats(RefStats& ref_stats) {
 // Algorithm 6, read literally: d^2/sigma^2/R at RAW resolution, reached by
 // Dodgson-quadratic upscaling the guide-resolution local stats (comp warped
 // by the flow in the same pass) rather than computing everything directly
-// at guide resolution the way compute_robustness_metal_impl below does.
+// at guide resolution the way compute_robustness_metal_impl below does. See
+// Config::robustness_raw_resolution_enabled and the mirrored, more heavily
+// commented CPU implementation, compute_robustness_raw_res in
+// robustness.cpp. Supports hf_reject and edge_reject (mirroring the CPU raw
+// path); still no aperture_limited/tile_residual_high, so
+// compute_robustness_metal_impl only calls this when flow_reject_1d_enabled
+// is off.
 static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
                                                     const FlowField& flow, int tile_size,
-                                                    const Config& cfg) {
+                                                    const Config& cfg, Image* s_select_out) {
     if (g_rob_ref_m_hires == nil || g_rob_ref_v_hires == nil ||
         g_rob_ref_hires_h <= 0 || g_rob_ref_hires_w <= 0)
         return Image();
     auto& c = ctx();
 
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                       (cfg.motion_edge_rejection_enabled ||
+                                        cfg.hf_artifact_removal_enabled)
+                                           ? &motion_irregular
+                                           : nullptr);
+    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -1558,13 +1597,15 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    flow_sample_mode(cfg)))
+                    cfg.flow_bilinear_sampling))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
 
     const int curve_nch = std::max(1, std::min(3, nch));
-    bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve;
+    bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
+        g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
+        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -1595,12 +1636,17 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
         g_rob_curve_n = n;
+        g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
+        g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
     }
     if (g_rob_curve_n == 0) return Image();
 
     const size_t mask_b = (size_t)ch_h * (size_t)ch_w * sizeof(float);
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
+    id<MTLBuffer> b_out = buf(nullptr, mask_b);
+    const bool want_s_select = (s_select_out != nullptr);
+    id<MTLBuffer> b_s_select = buf(nullptr, want_s_select ? mask_b : sizeof(float));
     const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
                         flow.match_ambiguous.size() == n_tiles;
@@ -1613,7 +1659,19 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // fire.
     id<MTLBuffer> b_chain = buf(nullptr, sizeof(uint32_t));
     id<MTLBuffer> b_magnitude = buf(nullptr, sizeof(uint32_t));
-    if (!b_S || !b_R || !b_match_amb || !b_chain || !b_magnitude)
+    id<MTLBuffer> b_motion = buf(motion_irregular.data(),
+                                 motion_irregular.size() * sizeof(uint32_t));
+    // Guide-resolution variance-loss map, prepared once per burst by
+    // init_robustness alongside the guide-grid ref stats; the kernel reads
+    // it at gid/2. Inert dummy when hf rejection is off.
+    id<MTLBuffer> b_ref_hf = b_motion;
+    if (cfg.hf_artifact_removal_enabled) {
+        const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
+        if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
+        b_ref_hf = g_rob_ref_hf;
+    }
+    if (!b_S || !b_R || !b_out || !b_s_select || !b_match_amb || !b_chain ||
+        !b_magnitude || !b_motion || !b_ref_hf)
         return Image();
 
     RobMaskRawParamsCPU mp{};
@@ -1626,10 +1684,25 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.r_t = cfg.r_t;
     mp.r_s1 = cfg.r_s1;
+    mp.save_s_select = want_s_select ? 1u : 0u;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.hf_h = (uint32_t)gh;
+    mp.hf_w = (uint32_t)gw;
+    mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
+    mp.motion_edge_threshold = cfg.motion_edge_threshold;
+    mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
+    // CPU motion_edge_reject reads the debug-gated accessors, so the noise
+    // floor drops out with the mask noise model -- keep that parity here.
+    mp.alpha = cfg.noise_alpha_robustness();
+    mp.beta = cfg.noise_beta_robustness();
+    mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
+    mp.motion_edge_neighborhood_radius =
+        (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1641,12 +1714,21 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:g_rob_diff_curve offset:0 atIndex:5];
     [enc setBuffer:b_S offset:0 atIndex:6];
     [enc setBytes:&mp length:sizeof(mp) atIndex:7];
-    [enc setBuffer:b_match_amb offset:0 atIndex:8];
-    [enc setBuffer:b_chain offset:0 atIndex:9];
-    [enc setBuffer:b_magnitude offset:0 atIndex:10];
+    [enc setBuffer:b_s_select offset:0 atIndex:8];
+    [enc setBuffer:b_match_amb offset:0 atIndex:9];
+    [enc setBuffer:b_chain offset:0 atIndex:10];
+    [enc setBuffer:b_magnitude offset:0 atIndex:11];
+    [enc setBuffer:b_motion offset:0 atIndex:12];
+    [enc setBuffer:b_ref_hf offset:0 atIndex:13];
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
+    // Eq. 9 runs on the CPU after readback (robustness_local_min_on_guide:
+    // 2x2 min-reduce to the guide lattice, 5x5 min there = Wronski's
+    // 10x10-raw footprint on Wronski's own grid, nearest-upsample back).
+    // Kept off the GPU so the stage is one shared implementation with the
+    // CPU path -- no new shader, bit-identical results.
+    (void)b_out;
     prof_tag_gpu(cmd, "robustness:raw-res");
     [cmd commit];
     [cmd waitUntilCompleted];
@@ -1654,21 +1736,44 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, 1);
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    return robustness_local_min_on_guide(R_pre);
+    Image r = robustness_local_min_on_guide(R_pre);
+    if (want_s_select) {
+        *s_select_out = Image(ch_h, ch_w, 1);
+        memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
+    }
+    return r;
 }
 
 static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
-                                           const FlowField& flow, int tile_size, const Config& cfg) {
+                                           const FlowField& flow, int tile_size, const Config& cfg,
+                                           Image* s_select_out) {
     if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
 
-    if (cfg.robustness_raw_resolution_active()) {
-        Image raw_res = compute_robustness_metal_raw_res_impl(comp_raw, flow, tile_size, cfg);
+    // Raw-resolution path (Algorithm 6, literally). hf and motion-edge
+    // rejection are supported in rob_make_mask_raw (fed from the
+    // guide-resolution maps, mirroring compute_robustness_raw_res); only the
+    // aperture/tile-residual rejection is not, so that flag alone still
+    // falls back to the guide-resolution path below.
+    if (cfg.robustness_raw_resolution_active() &&
+        !cfg.flow_reject_1d_enabled) {
+        Image raw_res = compute_robustness_metal_raw_res_impl(comp_raw, flow, tile_size,
+                                                               cfg, s_select_out);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
+        // Falls through to the guide-resolution path below if the hires ref
+        // stats weren't ready (e.g. robustness was off when the burst
+        // started -- see init_robustness_metal_impl).
     }
 
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                       (cfg.motion_edge_rejection_enabled ||
+                                        cfg.hf_artifact_removal_enabled)
+                                           ? &motion_irregular
+                                           : nullptr);
+    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -1696,8 +1801,16 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         return Image();
     }
 
+    // nch guide channels -> nch curves fetched (3 for Bayer, 1 otherwise),
+    // each channel scored against its own instead of all sharing the
+    // cross-channel-mean curve. Cache key is per-channel alpha/beta so a
+    // change in any one channel's WB-derived value rebuilds all of them
+    // (curves are concatenated into one buffer, so a partial rebuild isn't
+    // meaningfully cheaper).
     const int curve_nch = std::max(1, std::min(3, nch));
-    bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve;
+    bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
+        g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
+        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -1728,70 +1841,108 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
         g_rob_curve_n = n;
+        g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
+        g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
     }
     if (g_rob_curve_n == 0) return Image();
     id<MTLBuffer> b_std = g_rob_std_curve;
     id<MTLBuffer> b_diff = g_rob_diff_curve;
-    const f32* fg_dat = nullptr;
-    size_t fg_bytes = 0;
-    int fg_ny = 0, fg_nx = 0, fg_ts = tile_size;
-    const bool flow_fine = flow_gpu_grid(flow, tile_size, fg_dat, fg_bytes,
-                                         fg_ny, fg_nx, fg_ts);
-    // The kernel indexes S and match_ambiguous by the tile grid it derives
-    // from (tile_size, flow_ny, flow_nx); on the fine grid both must be
-    // duplicated to match (exact, see flow_gpu_grid).
-    std::vector<f32> S_fine;
-    if (flow_fine)
-        S_fine = dup_tile_aux_to_fine(S, flow.ny, flow.nx, fg_ny, fg_nx);
-    id<MTLBuffer> b_S = flow_fine
-        ? buf(S_fine.data(), S_fine.size() * sizeof(float))
-        : buf(S.data(), S.size() * sizeof(float));
-    id<MTLBuffer> b_flow = buf(fg_dat, fg_bytes);
+    id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
+    id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
+    const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
+    const bool aperture_reject_on =
+        cfg.flow_reject_1d_enabled &&
+        flow.aperture_limited.size() == n_tiles;
+    id<MTLBuffer> b_aperture = aperture_reject_on
+        ? buf(flow.aperture_limited.data(), flow.aperture_limited.size() * sizeof(uint32_t))
+        : b_motion;
+    id<MTLBuffer> b_tile_residual_high = aperture_reject_on
+        ? buf(nullptr, n_tiles * sizeof(uint32_t))
+        : b_motion;
+
+    const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
+    id<MTLBuffer> b_ref_hf = b_ref_v;
+    if (cfg.hf_artifact_removal_enabled) {
+        if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
+        b_ref_hf = g_rob_ref_hf;
+    }
+    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
     id<MTLBuffer> b_R = buf(nullptr, mask_b);
     id<MTLBuffer> b_out = buf(nullptr, mask_b);
-    const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
-    const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
-                        flow.match_ambiguous.size() == n_tiles;
-    std::vector<uint32_t> amb_fine;
-    if (amb_on && flow_fine)
-        amb_fine = dup_tile_aux_to_fine(flow.match_ambiguous,
-                                        flow.ny, flow.nx, fg_ny, fg_nx);
-    id<MTLBuffer> b_match_amb = amb_on
-        ? (flow_fine
-               ? buf(amb_fine.data(), amb_fine.size() * sizeof(uint32_t))
-               : buf(flow.match_ambiguous.data(),
-                     flow.match_ambiguous.size() * sizeof(uint32_t)))
-        : buf(nullptr, sizeof(uint32_t));
+    // Bound unconditionally because the kernel declares it; sized for real only
+    // when asked, so the off case costs 4 bytes rather than a full mask plane.
+    const bool want_s_select = (s_select_out != nullptr);
+    id<MTLBuffer> b_s_select = buf(nullptr, want_s_select ? mask_b : sizeof(float));
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
-        !b_S || !b_flow || !b_R || !b_out || !b_match_amb)
+        !b_S || !b_motion || !b_aperture || !b_tile_residual_high || !b_flow ||
+        !b_R || !b_out || !b_s_select)
         return Image();
 
     RobMaskParamsCPU mp{};
     mp.h = (uint32_t)gh;
     mp.w = (uint32_t)gw;
     mp.nch = (uint32_t)nch;
-    mp.tile_size = (uint32_t)fg_ts;
-    mp.flow_ny = (uint32_t)fg_ny;
-    mp.flow_nx = (uint32_t)fg_nx;
+    mp.tile_size = (uint32_t)tile_size;
+    mp.flow_ny = (uint32_t)flow.ny;
+    mp.flow_nx = (uint32_t)flow.nx;
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
+    mp.motion_edge_threshold = cfg.motion_edge_threshold;
+    mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
+    mp.alpha = cfg.noise_alpha();
+    mp.beta = cfg.noise_beta();
+    mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
+    mp.motion_edge_neighborhood_radius =
+        (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
+    mp.flow_reject_1d_residual_threshold = cfg.flow_reject_1d_residual_threshold;
+    mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;
+    mp.save_s_select = want_s_select ? 1u : 0u;
+    const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
+                        flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.flow_bilinear = flow_sample_mode(cfg);
+    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    id<MTLBuffer> b_match_amb = amb_on
+        ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
+        : b_motion;
+    if (!b_match_amb) return Image();
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
+    if (aperture_reject_on) {
+        [enc setBuffer:b_tile_residual_high offset:0 atIndex:0];
+        [enc setBuffer:b_gmeans offset:0 atIndex:1];
+        [enc setBuffer:b_ref_m offset:0 atIndex:2];
+        [enc setBuffer:b_ref_v offset:0 atIndex:3];
+        [enc setBuffer:b_std offset:0 atIndex:4];
+        [enc setBuffer:b_diff offset:0 atIndex:5];
+        [enc setBuffer:b_flow offset:0 atIndex:6];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+        dispatch2(enc, c.pipe("rob_tile_residual_high"), mp.flow_nx, mp.flow_ny);
+        [enc endEncoding];
+
+        enc = [cmd computeCommandEncoder];
+        if (!enc) return Image();
+    }
     [enc setBuffer:b_R offset:0 atIndex:0];
     [enc setBuffer:b_gmeans offset:0 atIndex:1];
-    [enc setBuffer:b_ref_m offset:0 atIndex:2];
-    [enc setBuffer:b_ref_v offset:0 atIndex:3];
-    [enc setBuffer:b_std offset:0 atIndex:4];
-    [enc setBuffer:b_diff offset:0 atIndex:5];
-    [enc setBuffer:b_S offset:0 atIndex:6];
-    [enc setBuffer:b_flow offset:0 atIndex:7];
-    [enc setBytes:&mp length:sizeof(mp) atIndex:8];
-    [enc setBuffer:b_match_amb offset:0 atIndex:9];
+    [enc setBuffer:b_ref_m offset:0 atIndex:3];
+    [enc setBuffer:b_ref_v offset:0 atIndex:4];
+    [enc setBuffer:b_std offset:0 atIndex:6];
+    [enc setBuffer:b_diff offset:0 atIndex:7];
+    [enc setBuffer:b_S offset:0 atIndex:8];
+    [enc setBuffer:b_motion offset:0 atIndex:9];
+    [enc setBuffer:b_ref_hf offset:0 atIndex:5];
+    [enc setBuffer:b_flow offset:0 atIndex:10];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:11];
+    [enc setBuffer:b_aperture offset:0 atIndex:12];
+    [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
+    [enc setBuffer:b_s_select offset:0 atIndex:14];
+    [enc setBuffer:b_match_amb offset:0 atIndex:15];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1814,14 +1965,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     Image r(gh, gw, 1);
     memcpy(r.data.data(), [b_out contents], mask_b);
-    {
-        // Publish for the merge host (Image::gpu_tag): the merge binds this
-        // buffer instead of re-uploading the bytes it was just copied from.
-        std::lock_guard<std::mutex> lk(g_rob_live_mu);
-        r.gpu_tag = ++g_rob_tag_next;
-        g_rob_live_tag = r.gpu_tag;
-        g_rob_live_bytes = mask_b;
-        g_rob_live_buf = b_out;
+    // Taken from rob_make_mask's output, not rob_local_min_5x5's: the selector
+    // is a per-pixel record of which prior was applied, and eroding it would
+    // smear the boundary between the two regions.
+    if (want_s_select) {
+        *s_select_out = Image(gh, gw, 1);
+        memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
     }
     return r;
 }
@@ -1992,8 +2141,7 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
                                   id<MTLBuffer> b_ambiguity = nil,
                                   float ambiguity_ratio = 1.10f,
                                   bool write_ambiguity = false,
-                                  bool fallback_on_ambiguous = false,
-                                  bool subpixel = false) {
+                                  bool fallback_on_ambiguous = false) {
     if (search_radius < 0 || tile_size <= 0) return false;
     if (ny <= 0 || nx <= 0) return true;
     auto& c = ctx();
@@ -2005,9 +2153,8 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
         float ambiguity_ratio;
         uint32_t write_ambiguity;
         uint32_t fallback_on_ambiguous = 0;  // kunzmi: ambiguous -> keep seed
-        uint32_t subpixel = 0;               // quadratic sub-cell fit at winner
     };
-    static_assert(sizeof(AlignLocalSearch460ParamsCPU) == 52,
+    static_assert(sizeof(AlignLocalSearch460ParamsCPU) == 48,
                   "AlignLocalSearch460ParamsCPU layout");
     AlignLocalSearch460ParamsCPU p{};
     p.ny = (uint32_t)ny;
@@ -2023,7 +2170,6 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     p.ambiguity_ratio = std::max(ambiguity_ratio, 1.0f);
     p.write_ambiguity = (write_ambiguity && b_ambiguity) ? 1u : 0u;
     p.fallback_on_ambiguous = fallback_on_ambiguous ? 1u : 0u;
-    p.subpixel = subpixel ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
@@ -2048,16 +2194,12 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     const NSUInteger tg_limit = c.device.maxThreadgroupMemoryLength;
     NSUInteger lanes = 64;
     while (lanes > 1 && lanes > pipe.maxTotalThreadsPerThreadgroup) lanes >>= 1;
-    // Full candidate cost surface, kept on-chip for the sub-pixel fit. At the
-    // largest shipped radius (4) this is 81 floats -- noise next to the tile.
-    const NSUInteger span_u = (NSUInteger)(2 * search_radius + 1);
-    const NSUInteger cand_bytes = align16(span_u * span_u * sizeof(float));
     auto red_bytes = [&](NSUInteger n) -> NSUInteger {
         return align16(n * sizeof(float)) + align16(n * sizeof(int)) +
                align16(n * sizeof(float)) + align16(n * sizeof(int));
     };
-    while (lanes > 1 && tile_bytes + cand_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
-    if (tile_bytes + cand_bytes + red_bytes(lanes) > tg_limit) return false;
+    while (lanes > 1 && tile_bytes + red_bytes(lanes) > tg_limit) lanes >>= 1;
+    if (tile_bytes + red_bytes(lanes) > tg_limit) return false;
 
     [enc setComputePipelineState:pipe];
     [enc setThreadgroupMemoryLength:tile_bytes atIndex:0];
@@ -2065,7 +2207,6 @@ static bool local_search_460_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:2];
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(float)) atIndex:3];
     [enc setThreadgroupMemoryLength:align16(lanes * sizeof(int)) atIndex:4];
-    [enc setThreadgroupMemoryLength:cand_bytes atIndex:5];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ny * (NSUInteger)nx, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(lanes, 1, 1)];
     [enc endEncoding];
@@ -2211,8 +2352,7 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                 FlowField& flow,
                                 float ambiguity_ratio,
                                 bool write_ambiguity,
-                                bool fallback_on_ambiguous,
-                                bool subpixel) {
+                                bool fallback_on_ambiguous) {
     if (!metal_gpu_init()) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
@@ -2229,7 +2369,7 @@ bool block_match_level_L2_metal(const Image& ref, const Image& moving,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, false, b_ambiguity,
                                ambiguity_ratio, write_ambiguity,
-                               fallback_on_ambiguous, subpixel))
+                               fallback_on_ambiguous))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -2246,8 +2386,7 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                 FlowField& flow,
                                 float ambiguity_ratio,
                                 bool write_ambiguity,
-                                bool fallback_on_ambiguous,
-                                bool subpixel) {
+                                bool fallback_on_ambiguous) {
     if (!metal_gpu_init()) return false;
     const int ny = flow.ny, nx = flow.nx;
     if (ny <= 0 || nx <= 0) return true;
@@ -2264,7 +2403,7 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
                                moving.h, moving.w, tile_size, search_radius,
                                ny, nx, true, b_ambiguity,
                                ambiguity_ratio, write_ambiguity,
-                               fallback_on_ambiguous, subpixel))
+                               fallback_on_ambiguous))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -2536,7 +2675,8 @@ static bool g_dumped_ref_grads = false;
 
 static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out) {
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     if (!metal_gpu_init()) return false;
     // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
     ProfStageScope prof_stage("align:soft-segments");
@@ -2553,8 +2693,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         if (ts != 8 && ts != 16 && ts != 32 && ts != 64) return false;
         std::string metric = "L2";
         if (lvl < (int)cfg.bm_metrics.size()) metric = cfg.bm_metrics[lvl];
-        int radius = cfg.grey_search_radius(
-            (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2);
+        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
         if (metric != "L1" && metric != "L2") return false;
         if (radius < 0) return false;
     }
@@ -2609,10 +2748,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // align() in align.cpp; see Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        // Grey-domain search radius -- bm_search_radii is in RAW pixels, same
-        // as bm_tile_sizes. See Config::grey_search_radius.
-        int radius = cfg.grey_search_radius(
-            (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2);
+        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
 
         id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
         if (!b_ref) return false;
@@ -2623,7 +2759,12 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         if (!b_flow) {
             flow_ny = ny;
             flow_nx = nx;
-            FlowField initial(ny, nx);
+            const int abs_factor = (lvl < (int)ref_pyr.abs_factors.size())
+                                   ? ref_pyr.abs_factors[(size_t)lvl] : 1;
+            FlowField initial = make_global_initial_flow(ny, nx, ts, abs_factor,
+                                                         ref_grey.h, ref_grey.w,
+                                                         initial_dx, initial_dy,
+                                                         initial_rotation_rad);
             b_flow = buf(initial.flow.data(),
                          (size_t)ny * (size_t)nx * 2u * sizeof(float));
             if (!b_flow) return false;
@@ -2672,16 +2813,14 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
                                           want_amb,
-                                          cfg.align_ambiguous_fallback_enabled,
-                                          cfg.bm_subpixel_quadratic);
+                                          cfg.align_ambiguous_fallback_enabled);
         else
             bm_ok = local_search_460_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                           m.h, m.w, ts, radius, ny, nx, false,
                                           b_ambiguity,
                                           cfg.flow_reject_1d_ambiguity_ratio,
                                           want_amb,
-                                          cfg.align_ambiguous_fallback_enabled,
-                                          cfg.bm_subpixel_quadratic);
+                                          cfg.align_ambiguous_fallback_enabled);
         if (!bm_ok) return false;
 
         // alignment.py align_lvl: block matching, then ICA, on this level --
@@ -2718,15 +2857,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!ica_all || cfg.ica_per_level_coarse_only()) {
     id<MTLBuffer> b_ref_native = nil, b_gx = nil, b_gy = nil, b_hess = nil;
     int ica_ny = 0, ica_nx = 0;
-    // Grey-domain tile size, as everywhere else in this file and as align.cpp's
-    // matching CPU pass does. Passing the RAW tile size here built the Hessian
-    // on a grid of grey_h/16 rather than grey_h/8 on the decimate path, which
-    // the flow-grid check below then rejected -- so this branch could only ever
-    // fail there, taking the whole frame's alignment with it. Unreachable at
-    // the shipped defaults because decimate runs per-level ICA and never enters
-    // this block, but it made align_ica_per_level a switch that broke decimate.
-    const int ica_ts = cfg.grey_tile_size(tile_size);
-    if (!prep_level_ica_gpu(ref_grey, ica_ts, b_ref_native, b_gx, b_gy, b_hess,
+    if (!prep_level_ica_gpu(ref_grey, tile_size, b_ref_native, b_gx, b_gy, b_hess,
                             ica_ny, ica_nx))
         return false;
     if (ica_ny != flow_ny || ica_nx != flow_nx) return false;
@@ -2746,10 +2877,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     if (!b_mov_native) return false;
     if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
-                  flow_ny, flow_nx, ica_ts, cfg.ica_n_iter,
+                  flow_ny, flow_nx, tile_size, cfg.ica_n_iter,
                   ica_damp_ratio_metal(cfg),
-                  ica_max_step_metal(cfg, cfg.grey_search_radius(
-                      cfg.bm_search_radii.empty() ? 1 : cfg.bm_search_radii[0]))))
+                  ica_max_step_metal(cfg, cfg.bm_search_radii.empty()
+                                              ? 1 : cfg.bm_search_radii[0])))
         return false;
     }
 
@@ -2798,9 +2929,8 @@ bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
         uint32_t bh, Ws, nch, bake;
         float wb0, wb1, wb2;
         float m00, m01, m02, m10, m11, m12, m20, m21, m22;
-        float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
     };
-    static_assert(sizeof(MergeNormParamsCPU) == 76, "MergeNormParamsCPU");
+    static_assert(sizeof(MergeNormParamsCPU) == 64, "MergeNormParamsCPU");
     MergeNormParamsCPU p{};
     p.bh = (uint32_t)bh;
     p.Ws = (uint32_t)Ws;
@@ -2813,11 +2943,6 @@ bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
     p.m00 = m[0]; p.m01 = m[1]; p.m02 = m[2];
     p.m10 = m[3]; p.m11 = m[4]; p.m12 = m[5];
     p.m20 = m[6]; p.m21 = m[7]; p.m22 = m[8];
-    {
-        float sg[3];
-        dng_unwhiten_gains(cfg, nch, sg);
-        p.sg0 = sg[0]; p.sg1 = sg[1]; p.sg2 = sg[2];
-    }
 
     id<MTLBuffer> b_num = buf(num_p, n * sizeof(float));
     id<MTLBuffer> b_den = buf(den_p, n * sizeof(float));
@@ -2857,8 +2982,7 @@ struct MergeCompParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
-    uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
-    float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling (was _pad3)
+    uint32_t _pad2 = 0, _pad3 = 0;
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -2875,9 +2999,8 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
-    float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling
 };
-static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -2900,7 +3023,6 @@ struct MergeFrameGpu {
     int lr_h = 0, lr_w = 0;
     int rob_h = 0, rob_w = 0;
     int flow_ny = 0, flow_nx = 0;
-    bool flow_fine = false;       // stashed grid is the half-pitch fine grid
     int cov_h = 0, cov_w = 0;
     const f32* img = nullptr;
     const f32* flow = nullptr;
@@ -2926,21 +3048,6 @@ struct MergeRefGpu {
 static MergeAccSlot g_merge_acc[2];
 static int g_merge_write_slot = 0;
 static bool g_merge_need_zero = false;
-// Online accumulator stored as half instead of float. Arithmetic stays fp32 in
-// the kernels; only what lands in memory narrows. Chosen because at 48 MP the
-// fp32 num+den pair is 1116 MB -- the single largest allocation in the
-// pipeline and the dominant traffic of the bandwidth-bound merge (585 MB of
-// read-modify-write per frame). half halves both. Cost: ~0.05% relative
-// storage quantisation per store, i.e. output changes at the level of 1-2
-// LSB of the 16-bit result. Applies to the ONLINE accumulator only; the
-// banded path keeps fp32 untouched.
-static bool g_merge_acc_half = false;
-// Reused per-band staging for handing the half accumulator to the host
-// encoder as float. Band-sized, not image-sized, so the fp16 saving is not
-// given straight back at readback time.
-static id<MTLBuffer> g_acc_stage_num = nil;
-static id<MTLBuffer> g_acc_stage_den = nil;
-static size_t g_acc_stage_cap = 0;
 static bool g_merge_single_slot = false;
 // Online merge: one accumulator that outlives its command buffer, so each frame
 // can be committed and its GPU inputs released instead of every frame staying
@@ -3043,11 +3150,7 @@ static bool merge_flush_pending() {
         [enc setBuffer:e.cov  offset:0 atIndex:12u + i];
         [enc setBuffer:e.rob  offset:0 atIndex:16u + i];
     }
-    dispatch2(enc,
-              c.pipe((g_merge_online && g_merge_acc_half)
-                         ? "merge_accumulate_comp_x4_h"
-                         : "merge_accumulate_comp_x4"),
-              ps[0].Ws, ps[0].band_h);
+    dispatch2(enc, c.pipe("merge_accumulate_comp_x4"), ps[0].Ws, ps[0].band_h);
     g_merge_pending.clear();
     return true;
 }
@@ -3081,18 +3184,11 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
                               __strong id<MTLBuffer>& b_img, __strong id<MTLBuffer>& b_flow,
                               __strong id<MTLBuffer>& b_cov, __strong id<MTLBuffer>& b_rob) {
     const f32* ip = img.data.empty() ? nullptr : img.data.data();
-    // Upload the boundary-selected fine grid when present; the merge kernel
-    // only samples the flow, so grid + dims + pitch swap together (the pitch
-    // is applied at params time from the stashed flow_fine flag).
-    const bool flow_fine = flow.has_fine();
-    const f32* fp = flow_fine
-        ? flow.fine_flow.data()
-        : (flow.flow.empty() ? nullptr : flow.flow.data());
+    const f32* fp = flow.flow.empty() ? nullptr : flow.flow.data();
     const f32* cp = covs.cov.empty() ? nullptr : covs.cov.data();
     const f32* rp = rob.data.empty() ? nullptr : rob.data.data();
     const size_t img_b = img.data.size() * sizeof(float);
-    const size_t flow_b =
-        (flow_fine ? flow.fine_flow.size() : flow.flow.size()) * sizeof(float);
+    const size_t flow_b = flow.flow.size() * sizeof(float);
     const size_t cov_b = covs.cov.size() * sizeof(float);
     const size_t rob_b = rob.data.size() * sizeof(float);
 
@@ -3124,9 +3220,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.lr_w = img.w;
             e.rob_h = rob.h;
             e.rob_w = rob.w;
-            e.flow_ny = flow_fine ? flow.fine_ny : flow.ny;
-            e.flow_nx = flow_fine ? flow.fine_nx : flow.nx;
-            e.flow_fine = flow_fine;
+            e.flow_ny = flow.ny;
+            e.flow_nx = flow.nx;
             e.cov_h = covs.h;
             e.cov_w = covs.w;
             e.img = ip;
@@ -3139,8 +3234,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.rob_b = rob_b;
             e.b_img = buf(ip, img_b);
             e.b_flow = buf(fp, flow_b);
-            e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
-            e.b_rob = rob_gpu_or_upload(rob, rp, rob_b);
+            e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+            e.b_rob = buf(rp, rob_b);
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
             if (!e.b_cov) {
                 static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
@@ -3169,8 +3264,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         // Same img allocation, new contents/aux (legacy streamed path).
         if (!ensure_sized(e.b_img, img_b) || !copy_into(e.b_img, ip, img_b)) return false;
         e.b_flow = buf(fp, flow_b);
-        e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
-        e.b_rob = rob_gpu_or_upload(rob, rp, rob_b);
+        e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+        e.b_rob = buf(rp, rob_b);
         e.rob_h = rob.h;
         e.rob_w = rob.w;
         e.flow = fp;
@@ -3195,9 +3290,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.lr_w = img.w;
     e.rob_h = rob.h;
     e.rob_w = rob.w;
-    e.flow_ny = flow_fine ? flow.fine_ny : flow.ny;
-    e.flow_nx = flow_fine ? flow.fine_nx : flow.nx;
-    e.flow_fine = flow_fine;
+    e.flow_ny = flow.ny;
+    e.flow_nx = flow.nx;
     e.cov_h = covs.h;
     e.cov_w = covs.w;
     e.img = ip;
@@ -3210,8 +3304,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.rob_b = rob_b;
     e.b_img = buf(ip, img_b);
     e.b_flow = buf(fp, flow_b);
-    e.b_cov = cov_b ? cov_gpu_or_upload(covs, cp, cov_b) : nil;
-    e.b_rob = rob_gpu_or_upload(rob, rp, rob_b);
+    e.b_cov = cov_b ? buf(cp, cov_b) : nil;
+    e.b_rob = buf(rp, rob_b);
     if (!e.b_img || !e.b_flow || !e.b_rob) return false;
     if (!e.b_cov) {
         static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
@@ -3278,9 +3372,7 @@ static bool metal_merge_wait_inflight_impl();
 
 // Grow-only per-slot GPU accumulators. Zero via blit when the band CB opens.
 static bool ensure_acc_buffers(size_t nelem, bool start_band) {
-    const size_t elem = (g_merge_online && g_merge_acc_half) ? sizeof(uint16_t)
-                                                             : sizeof(float);
-    const size_t bytes = nelem * elem;
+    const size_t bytes = nelem * sizeof(float);
     if (bytes == 0) return false;
     auto& c = ctx();
     if (start_band) {
@@ -3378,11 +3470,10 @@ void metal_merge_release_frame(int frame_id) {
     }
 }
 
-void metal_merge_begin_online(int out_h, int out_w, int nch, bool half_acc) {
+void metal_merge_begin_online(int out_h, int out_w, int nch) {
     g_online_h = out_h;
     g_online_w = out_w;
     g_online_nch = nch;
-    g_merge_acc_half = half_acc;
     // Resolve anything banded still in flight before the accumulator changes
     // meaning, or its readback would land in a band image that has gone.
     (void)metal_merge_wait_inflight_impl();
@@ -3416,11 +3507,6 @@ void metal_merge_end_online() {
     // encode loop, the rest are error exits that return immediately. The wait
     // and reset mirror begin_burst, which frees the same slots, and cover the
     // error paths that arrive with a band command buffer still open.
-    (void)metal_merge_retire_online();     // pipelined commit, if one is live
-    g_merge_acc_half = false;
-    g_acc_stage_num = nil;
-    g_acc_stage_den = nil;
-    g_acc_stage_cap = 0;
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
     merge_release_acc_slots();
@@ -3429,62 +3515,8 @@ void metal_merge_end_online() {
     g_online_h = g_online_w = g_online_nch = 0;
 }
 
-// Hand the host one horizontal band of the finished accumulator as float.
-// fp32 mode: a zero-copy pointer into the mapped buffer, exactly what
-// metal_merge_map_online + offset used to give. fp16 mode: a small GPU pass
-// widens the band into reused float staging (band-sized, ~50-100 MB, not the
-// 1.1 GB a whole-image conversion would cost). The host encoder is untouched
-// either way.
-bool metal_merge_read_band_float(int y0, int rows, const float** num,
-                                 const float** den) {
-  @autoreleasepool {
-    if (!g_merge_online || !num || !den || rows <= 0) return false;
-    if (!metal_merge_flush_online()) return false;   // acc stable before read
-    if (!g_merge_online_zeroed) return false;
-    MergeAccSlot& slot = g_merge_acc[0];
-    if (!slot.num || !slot.den) return false;
-    const size_t stride = (size_t)g_online_w * (size_t)g_online_nch;
-    const size_t base = (size_t)y0 * stride;
-    const size_t count = (size_t)rows * stride;
-    if (!g_merge_acc_half) {
-        *num = (const float*)[slot.num contents] + base;
-        *den = (const float*)[slot.den contents] + base;
-        return *num != nullptr && *den != nullptr;
-    }
-    auto& c = ctx();
-    const size_t need = count * sizeof(float);
-    if (g_acc_stage_cap < need) {
-        g_acc_stage_num = buf(nullptr, need);
-        g_acc_stage_den = buf(nullptr, need);
-        g_acc_stage_cap = (g_acc_stage_num && g_acc_stage_den) ? need : 0;
-        if (!g_acc_stage_cap) return false;
-    }
-    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
-    const uint32_t cb[2] = {(uint32_t)count, (uint32_t)base};
-    [enc setBuffer:slot.num offset:0 atIndex:0];
-    [enc setBuffer:slot.den offset:0 atIndex:1];
-    [enc setBuffer:g_acc_stage_num offset:0 atIndex:2];
-    [enc setBuffer:g_acc_stage_den offset:0 atIndex:3];
-    [enc setBytes:cb length:sizeof(cb) atIndex:4];
-    dispatch1(enc, c.pipe("merge_acc_half_to_float"), count);
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
-    *num = (const float*)[g_acc_stage_num contents];
-    *den = (const float*)[g_acc_stage_den contents];
-    return *num != nullptr && *den != nullptr;
-  }
-}
-
 bool metal_merge_map_online(const float** num, const float** den, size_t* nelem) {
     if (!g_merge_online || !num || !den) return false;
-    // In half mode the mapped bytes are not floats; handing them out as
-    // float* would be silently-wrong data, the worst failure mode this
-    // codebase has. Readers go through metal_merge_read_band_float instead.
-    if (g_merge_acc_half) return false;
     if (!metal_merge_flush_online()) return false;
     if (!g_merge_online_zeroed) return false;      // nothing ever accumulated
     MergeAccSlot& slot = g_merge_acc[0];
@@ -3498,74 +3530,18 @@ bool metal_merge_map_online(const float** num, const float** den, size_t* nelem)
     return *num != nullptr && *den != nullptr;
 }
 
-// One committed-but-unretired online merge, plus the frame ids whose GPU
-// uploads it still references. Depth is deliberately EXACTLY ONE:
-//
-//   depth 0 (the old blocking wait) serialises the pipeline -- measured, the
-//   CPU spent ~160 ms/frame inside comp:stash+free-raw doing nothing but
-//   waiting for the ~90 ms merge:online-cb, while the GPU was idle for all of
-//   the CPU's analysis. A frame cost CPU + GPU instead of max(CPU, GPU).
-//
-//   depth 1 already buys the whole overlap: while frame k's merge runs on the
-//   GPU, frame k+1's decode/align/robustness/kernels proceed on the CPU, and
-//   the wait at the NEXT flush lands after the GPU has long finished.
-//
-//   deeper would hold several frames' uploads (~110-146 MB each) at a peak
-//   that measured only 305 MB from jetsam. One extra frame is the largest
-//   depth that budget can ever afford, so it is a constant, not a knob.
-//
-// All state is touched from the pipeline thread only; retirement waits on the
-// stored buffer rather than using a completion handler, so no locks appear
-// anywhere near g_merge_frames.
-static __strong id<MTLCommandBuffer> g_online_inflight_cmd = nil;
-static std::vector<int> g_online_inflight_frames;
-
-bool metal_merge_retire_online() {
-  @autoreleasepool {
-    if (!g_online_inflight_cmd) return true;
-    [g_online_inflight_cmd waitUntilCompleted];
-    const bool ok =
-        (g_online_inflight_cmd.status == MTLCommandBufferStatusCompleted);
-    g_online_inflight_cmd = nil;
-    for (int k : g_online_inflight_frames) metal_merge_release_frame(k);
-    g_online_inflight_frames.clear();
-    return ok;
-  }
-}
-
-bool metal_merge_commit_online(const std::vector<int>& frame_ids) {
-  @autoreleasepool {
+bool metal_merge_flush_online() {
     if (!g_merge_online) return false;
     if (!g_merge_band_cmd) return true;
     if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
     merge_enc_close();
     prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
-    // Retire the previous frame's merge first (usually already finished, so
-    // this wait is ~0), then hand the slot to this one and return without
-    // blocking. The frame's uploads stay alive exactly until retirement.
-    const bool prev_ok = metal_merge_retire_online();
-    g_online_inflight_cmd = g_merge_band_cmd;
-    g_online_inflight_frames = frame_ids;
-    [g_online_inflight_cmd commit];
-    merge_band_cmd_reset();
-    return prev_ok;
-  }
-}
-
-bool metal_merge_flush_online() {
-    if (!g_merge_online) return false;
-    // Drain anything committed by the pipelined path before (or instead of)
-    // this blocking flush -- the accumulator must not be read while a prior
-    // frame's adds are still queued.
-    bool ok = metal_merge_retire_online();
-    if (!g_merge_band_cmd) return ok;
-    if (!merge_flush_pending()) { merge_band_cmd_reset(); return false; }
-    merge_enc_close();
-    prof_tag_gpu(g_merge_band_cmd, "merge:online-cb");
     id<MTLCommandBuffer> cmd = g_merge_band_cmd;
     [cmd commit];
+    // Wait rather than pipeline: the point of committing per frame is to free
+    // that frame's GPU buffers, which cannot happen while its work is queued.
     [cmd waitUntilCompleted];
-    ok = (cmd.status == MTLCommandBufferStatusCompleted) && ok;
+    const bool ok = (cmd.status == MTLCommandBufferStatusCompleted);
     merge_band_cmd_reset();
     return ok;
 }
@@ -3641,7 +3617,7 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
                              b_img, b_flow, b_cov, b_rob);
 }
 
-static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& flow,
+bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
                            const CovField& covs, const Image& robustness,
                            int tile_size, Image& num_band, Image& den_band,
                            int y0, const Config& cfg, int frame_id) {
@@ -3681,11 +3657,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     // not from the config flag -- the raw-res path can silently fall back to
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
-    p.flow_bilinear = flow_sample_mode(cfg);
-    p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
-    // Same mode split as merge_soften_max_inv in merge.cpp (128 = coverage
-    // bound: sharper floors zero the off-site colour channels -> speckle).
-    p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    p.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3694,15 +3666,8 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         p.rob_w = (uint32_t)robustness.w;
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
-        if (flow.has_fine() && tile_size >= 2 && (tile_size % 2) == 0) {
-            p.flow_ny = (uint32_t)flow.fine_ny;
-            p.flow_nx = (uint32_t)flow.fine_nx;
-            p.tile_size = (uint32_t)(tile_size / 2);
-            if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
-        } else {
-            p.flow_ny = (uint32_t)flow.ny;
-            p.flow_nx = (uint32_t)flow.nx;
-        }
+        p.flow_ny = (uint32_t)flow.ny;
+        p.flow_nx = (uint32_t)flow.nx;
         p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
         p.cov_w = covs.w > 0 ? (uint32_t)covs.w : 1u;
     } else {
@@ -3717,10 +3682,6 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
-        if (hit->flow_fine && tile_size >= 2 && (tile_size % 2) == 0) {
-            p.tile_size = (uint32_t)(tile_size / 2);
-            if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
-        }
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
         p.cov_w = hit->cov_w > 0 ? (uint32_t)hit->cov_w : 1u;
     }
@@ -3742,7 +3703,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     return true;
 }
 
-static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs,
+bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
                           Image& num_band, Image& den_band, int y0,
                           const Config& cfg, const Image* acc_rob) {
     // Comps first, then ref -- same order the separate dispatches ran in.
@@ -3784,7 +3745,6 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
-    p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];
@@ -3806,11 +3766,7 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     [enc setBuffer:b_cov offset:0 atIndex:3];
     [enc setBuffer:b_acc offset:0 atIndex:4];
     [enc setBytes:&p length:sizeof(p) atIndex:5];
-    dispatch2(enc,
-              c.pipe((g_merge_online && g_merge_acc_half)
-                         ? "merge_accumulate_ref_h"
-                         : "merge_accumulate_ref"),
-              p.Ws, p.band_h);
+    dispatch2(enc, c.pipe("merge_accumulate_ref"), p.Ws, p.band_h);
     merge_enc_close();
 
     // Online: the reference is just the last contribution to a long-lived
@@ -3865,200 +3821,22 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
 }
 
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg) {
+                               const FlowField& flow, int tile_size, const Config& cfg,
+                               Image* s_select_out) {
     @autoreleasepool {
-        return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg);
+        return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg,
+                                             s_select_out);
     }
 }
 
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out) {
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
     @autoreleasepool {
-        return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_out);
+        return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
+                                flow_out, initial_dx, initial_dy, initial_rotation_rad);
     }
-}
-
-// Full-resolution ICA polish of a RAW-grid flow field on the band-limited
-// full-res grey (see Config::align_fullres_polish). Reuses the FFT path's
-// finest-level machinery unchanged: prep_level_ica_gpu builds (and caches by
-// the reference grey's data pointer, so the ref side is prepped once per
-// burst) the Sobel gradients and per-tile Hessians at full resolution, and
-// ica_bufs runs the same refinement kernel with the same step clamp the FFT
-// finest level uses (search radius 1). flow's vectors are raw px and the grey
-// IS raw resolution, so no unit conversion exists to get wrong. Returns false
-// without touching flow when anything cannot run -- the caller keeps the
-// unpolished estimate, mirroring the per-level-ICA "losing precision beats
-// losing the frame" rule.
-bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_full,
-                              FlowField& flow, int tile_size, const Config& cfg) {
-    @autoreleasepool {
-        if (!metal_gpu_init()) return false;
-        if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return false;
-        if (ref_grey_full.h <= 0 || ref_grey_full.w <= 0 ||
-            mov_grey_full.h <= 0 || mov_grey_full.w <= 0)
-            return false;
-        (void)align_drain();
-        id<MTLBuffer> b_mov = buf(mov_grey_full.data.data(),
-                                  mov_grey_full.data.size() * sizeof(float));
-        id<MTLBuffer> b_flow = buf(flow.flow.data(),
-                                   flow.flow.size() * sizeof(float));
-        if (!b_mov || !b_flow) return false;
-        id<MTLBuffer> l_ref = nil, l_gx = nil, l_gy = nil, l_hess = nil;
-        int l_ny = 0, l_nx = 0;
-        if (!prep_level_ica_gpu(ref_grey_full, tile_size, l_ref, l_gx, l_gy,
-                                l_hess, l_ny, l_nx))
-            return false;
-        if (l_ny != flow.ny || l_nx != flow.nx) return false;
-        if (!ica_bufs(l_ref, l_gx, l_gy, l_hess, b_mov, b_flow,
-                      ref_grey_full.h, ref_grey_full.w,
-                      mov_grey_full.h, mov_grey_full.w,
-                      flow.ny, flow.nx, tile_size, cfg.ica_n_iter,
-                      ica_damp_ratio_metal(cfg), ica_max_step_metal(cfg, 1)))
-            return false;
-        if (!align_drain()) return false;
-        memcpy(flow.flow.data(), [b_flow contents],
-               flow.flow.size() * sizeof(float));
-        return true;
-    }
-}
-
-// The MERGE path was the one entry left unpooled, and it leaked the most:
-// each frame's command buffer comes back autoreleased and retains that
-// frame's uploads -- raw 48.8 MB + covs 48.8 MB + rob mask -- so even after
-// metal_merge_release_frame dropped the strong references, the autoreleased
-// command buffer kept ~130 MB/frame alive until the thread's pool drained at
-// burst end. Measured: footprint grew +909 MB across a 7-frame analyze loop
-// and only fell at burst teardown, leaving 305 MB of jetsam headroom at peak.
-//
-// Draining per call is safe for the SAME reason it is safe above: the open
-// band command buffer is held by a __strong file-scope static
-// (g_merge_band_cmd / g_online_inflight_cmd), which survives the pool drain;
-// only the surplus autoreleased references go.
-bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
-                           const CovField& covs, const Image& robustness,
-                           int tile_size, Image& num_band, Image& den_band,
-                           int y0, const Config& cfg, int frame_id) {
-    @autoreleasepool {
-        return merge_comp_band_metal_impl(comp_raw, flow, covs, robustness,
-                                          tile_size, num_band, den_band, y0,
-                                          cfg, frame_id);
-    }
-}
-
-bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
-                          Image& num_band, Image& den_band, int y0,
-                          const Config& cfg, const Image* acc_rob) {
-    @autoreleasepool {
-        return merge_ref_band_metal_impl(ref_raw, covs, num_band, den_band, y0,
-                                         cfg, acc_rob);
-    }
-}
-
-// Densify reference-grey upload cache; see flow_densify_select_metal.
-static std::mutex g_densify_ref_mu;
-static id<MTLBuffer> g_densify_ref_buf = nil;
-static const void* g_densify_ref_ptr = nullptr;
-static size_t g_densify_ref_bytes = 0;
-
-void metal_clear_densify_ref_cache() {
-    std::lock_guard<std::mutex> lk(g_densify_ref_mu);
-    g_densify_ref_buf = nil;
-    g_densify_ref_ptr = nullptr;
-    g_densify_ref_bytes = 0;
-}
-
-namespace {
-// Twin of DensifyParams in HHSRKernels.metal.
-struct DensifyParamsCPU {
-    uint32_t fny = 0, fnx = 0;
-    uint32_t flow_ny = 0, flow_nx = 0;
-    uint32_t ref_h = 0, ref_w = 0;
-    uint32_t mov_h = 0, mov_w = 0;
-    uint32_t tile_size = 0;
-    uint32_t overlap_all = 0;
-    float gsy = 1.f, gsx = 1.f;
-    float thr = 0.f;
-    uint32_t _pad0 = 0;
-};
-static_assert(sizeof(DensifyParamsCPU) == 56, "DensifyParamsCPU size");
-} // namespace
-
-bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
-                               const Image& mov_grey, int raw_h, int raw_w,
-                               int tile_size, const Config& cfg) {
-  @autoreleasepool {
-    if (!metal_gpu_init()) return false;
-    if (flow.ny <= 0 || flow.nx <= 0 ||
-        flow.flow.size() != (size_t)flow.ny * (size_t)flow.nx * 2u)
-        return false;
-    auto& c = ctx();
-    const f32 ts2 = 0.5f * (f32)tile_size;
-    const int fny = std::max(1, (int)std::ceil((f32)raw_h / ts2));
-    const int fnx = std::max(1, (int)std::ceil((f32)raw_w / ts2));
-
-    DensifyParamsCPU p{};
-    p.fny = (uint32_t)fny;
-    p.fnx = (uint32_t)fnx;
-    p.flow_ny = (uint32_t)flow.ny;
-    p.flow_nx = (uint32_t)flow.nx;
-    p.ref_h = (uint32_t)ref_grey.h;
-    p.ref_w = (uint32_t)ref_grey.w;
-    p.mov_h = (uint32_t)mov_grey.h;
-    p.mov_w = (uint32_t)mov_grey.w;
-    p.tile_size = (uint32_t)tile_size;
-    p.overlap_all = cfg.overlap_merge_active() ? 1u : 0u;
-    p.gsy = (f32)mov_grey.h / (f32)raw_h;
-    p.gsx = (f32)mov_grey.w / (f32)raw_w;
-    p.thr = std::max(0.f, cfg.flow_select_threshold);
-
-    const size_t fine_b = (size_t)fny * (size_t)fnx * 2u * sizeof(float);
-    id<MTLBuffer> b_fine = buf(nullptr, fine_b);
-    id<MTLBuffer> b_flow = buf(flow.flow.data(),
-                               flow.flow.size() * sizeof(float));
-    // The reference grey is identical for every comparison frame of a burst;
-    // cache its upload keyed on pointer + size (cleared with the ref ICA
-    // cache at burst start, so allocator address reuse cannot alias).
-    const size_t ref_b = ref_grey.data.size() * sizeof(float);
-    id<MTLBuffer> b_ref = nil;
-    {
-        std::lock_guard<std::mutex> lk(g_densify_ref_mu);
-        if (g_densify_ref_buf && g_densify_ref_ptr == ref_grey.data.data() &&
-            g_densify_ref_bytes == ref_b) {
-            b_ref = g_densify_ref_buf;
-        } else {
-            b_ref = buf(ref_grey.data.data(), ref_b);
-            g_densify_ref_buf = b_ref;
-            g_densify_ref_ptr = ref_grey.data.data();
-            g_densify_ref_bytes = ref_b;
-        }
-    }
-    id<MTLBuffer> b_mov = buf(mov_grey.data.data(),
-                              mov_grey.data.size() * sizeof(float));
-    if (!b_fine || !b_flow || !b_ref || !b_mov) return false;
-
-    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
-    if (!cmd) return false;
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
-    [enc setBuffer:b_fine offset:0 atIndex:0];
-    [enc setBuffer:b_flow offset:0 atIndex:1];
-    [enc setBuffer:b_ref offset:0 atIndex:2];
-    [enc setBuffer:b_mov offset:0 atIndex:3];
-    [enc setBytes:&p length:sizeof(p) atIndex:4];
-    dispatch2(enc, c.pipe("flow_densify_select"), fnx, fny);
-    [enc endEncoding];
-    prof_tag_gpu(cmd, "align:densify-select");
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
-
-    flow.fine_flow.resize((size_t)fny * (size_t)fnx * 2u);
-    memcpy(flow.fine_flow.data(), [b_fine contents], fine_b);
-    flow.fine_ny = fny;
-    flow.fine_nx = fnx;
-    return true;
-  }
 }
 
 } // namespace hhsr

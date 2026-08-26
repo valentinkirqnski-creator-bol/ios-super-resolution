@@ -37,32 +37,18 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                            const std::string& dng_path, const ProgressFn& progress,
                            int maxPreviewDim = 1536);
 
-// Optional sink for the final RGB16 rows as they are encoded into the DNG.
-// The app's JPEG export / DNG preview embed used to re-open the DNG it had
-// just written and inflate all of it back (seconds at 48MP) to get pixels
-// that existed in memory moments earlier. When non-null, the online encode
-// loop appends each band here (w*h*3 uint16, ~292MB at 48MP -- transient,
-// freed by the caller after export) so the export renders straight from
-// memory. Left empty on failure or on the non-online path.
-struct Rgb16Sink {
-    int w = 0, h = 0;
-    std::vector<uint16_t> rgb;
-};
-
 // Low-memory mobile path: reads frames from disk one at a time, caches per-frame
 // analysis to temp files, streams the output DNG. Peak RAM ≈ 1 ref + 1 comp frame.
 Image process_burst_paths_to_dng(const std::vector<std::string>& paths, const Config& cfg,
                                  const std::string& dng_path, const ProgressFn& progress,
-                                 int maxPreviewDim = 512,
-                                 Rgb16Sink* rgb16_sink = nullptr);
+                                 int maxPreviewDim = 512);
 
 // Same low-memory mobile path, but frames are supplied by a caller-owned loader.
 // This lets iOS feed RAW pixel buffers directly while preserving the exact same
 // alignment, robustness, merge, and DNG output stages.
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
                                   const Config& cfg, const std::string& dng_path,
-                                  const ProgressFn& progress, int maxPreviewDim = 512,
-                                  Rgb16Sink* rgb16_sink = nullptr);
+                                  const ProgressFn& progress, int maxPreviewDim = 512);
 
 // Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
 // Path: replace ".dng" with "_robustness<name_suffix>.pgm", or append that.

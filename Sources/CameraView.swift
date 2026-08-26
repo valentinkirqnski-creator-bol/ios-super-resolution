@@ -9,28 +9,16 @@ struct CameraView: View {
     @State private var pinchBaseZoom: CGFloat?
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
-    /// Guards the one-time exposure setup in onAppear, which runs again on
-    /// every scene change otherwise.
+    /// True only while the user is actively dragging the shutter slider.
     @State private var didApplyLaunchShutter = false
+    /// Manual capture controls (burst length, shutter) shown above the
+    /// viewfinder. Collapsible so the preview can fill the screen.
     @State private var showImporter = false
     @State private var showGallery = false
-    @State private var exposureParam: ExposureParam = .shutter
-
-    /// Warm amber, used for every active/selected state. The chrome was built
-    /// around a cyan close to the one Google Camera uses; keeping the layout
-    /// but moving the accent and squaring off the chips is what separates this
-    /// from looking like a clone of it.
-    static let accent = Color(red: 0.98, green: 0.72, blue: 0.28)
-    /// Squircle rather than a circle or a capsule, for the same reason.
-    static var chipShape: RoundedRectangle { RoundedRectangle(cornerRadius: 9, style: .continuous) }
 
     var body: some View {
         GeometryReader { geo in
-            // Three rows now: utilities and readouts, the exposure control, the
-            // frame count. Sized to leave the same slack around the content as
-            // the two-row version did, so the viewfinder gives up only what the
-            // extra row costs.
-            let topBarH: CGFloat = 126
+            let topBarH: CGFloat = 88
             let bottomH: CGFloat = 96
             let vfWidth = geo.size.width
             // One value for the space below the controls, used both to reserve
@@ -104,8 +92,8 @@ struct CameraView: View {
             // match the framing that will actually be saved. The zoom is applied
             // to the preview layer inside CameraPreview, not with .scaleEffect
             // here: .clipped() clips rendering but not hit testing, so scaling
-            // the view made the magnified preview swallow taps on the chrome
-            // around it.
+            // the view made the magnified preview swallow taps on the settings
+            // button and the exposure sliders.
             CameraPreview(
                 session: cam.session,
                 mirrorFront: cam.cameraSelection == .front,
@@ -134,6 +122,26 @@ struct CameraView: View {
             thirdsGrid
                 .frame(width: width, height: height)
                 .allowsHitTesting(false)
+
+            // Exposure controls sit on the frame edges rather than in a bar
+            // above it, so the preview keeps the full height.
+            HStack {
+                edgeSlider(value: $cam.isoSlider,
+                           symbol: "circle.lefthalf.fill",   // .filled variant is iOS 16+
+                           active: !cam.isoIsAuto,
+                           height: height * 0.42,
+                           toggle: { cam.isoIsAuto.toggle() },
+                           goManual: { cam.isoIsAuto = false })
+                Spacer()
+                edgeSlider(value: $cam.shutterSlider,
+                           symbol: "sun.max",
+                           active: !cam.shutterIsAuto,
+                           height: height * 0.42,
+                           toggle: { cam.setShutterAuto(!cam.shutterIsAuto) },
+                           goManual: { cam.applyManualShutterFromSlider() })
+            }
+            .padding(.horizontal, 14)
+            .frame(width: width, height: height)
 
             VStack {
                 Spacer()
@@ -188,6 +196,67 @@ struct CameraView: View {
         }
     }
 
+    /// Vertical track with a round icon handle that rides it. Tapping the
+    /// handle toggles the control between auto and manual; dragging anywhere on
+    /// the track sets the value, so the handle is not a small hit target.
+    private func edgeSlider(value: Binding<Double>,
+                            symbol: String,
+                            active: Bool,
+                            height: CGFloat,
+                            toggle: @escaping () -> Void,
+                            goManual: @escaping () -> Void) -> some View {
+        GeometryReader { g in
+            let h = g.size.height
+            let knob: CGFloat = 34
+            let travel = max(1, h - knob)
+            // Top of the track is the high value, as on a physical fader.
+            let y = knob / 2 + travel * CGFloat(1 - value.wrappedValue)
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(Color.white.opacity(active ? 0.85 : 0.35))
+                    .frame(width: 2, height: h)
+                    .frame(maxWidth: .infinity)
+                ZStack {
+                    Circle().fill(Color.black.opacity(0.55)).frame(width: knob, height: knob)
+                    Circle().strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
+                        .frame(width: knob, height: knob)
+                    Image(systemName: symbol)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(active ? .white : .white.opacity(0.55))
+                }
+                .position(x: g.size.width / 2, y: y)
+            }
+            .contentShape(Rectangle())
+            // One gesture handles both roles. The knob used to be a Button,
+            // which swallowed any drag beginning on it -- and the knob is
+            // exactly where a slider gets grabbed, so dragging did nothing.
+            // minimumDistance 0 also means the value tracks the very first
+            // touch instead of only after 4pt of travel.
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        guard !cam.isBusy else { return }
+                        // Below the tap threshold this may still turn out to be
+                        // a tap, so do not move the value yet.
+                        guard hypot(v.translation.width, v.translation.height) > 4 else { return }
+                        let t = 1 - (v.location.y - knob / 2) / travel
+                        value.wrappedValue = min(1, max(0, Double(t)))
+                        // Dragging leaves Auto, as the previous slider did --
+                        // otherwise the handle has to be tapped first and the
+                        // drag silently does nothing.
+                        if !active { goManual() }
+                    }
+                    .onEnded { v in
+                        guard !cam.isBusy else { return }
+                        if hypot(v.translation.width, v.translation.height) <= 4 {
+                            toggle()
+                        }
+                    }
+            )
+        }
+        .frame(width: 44, height: height)
+    }
+
     private func showFocusIndicator(at point: CGPoint) {
         focusPoint = point
         withAnimation(.easeOut(duration: 0.12)) { focusVisible = true }
@@ -199,7 +268,7 @@ struct CameraView: View {
     // MARK: - Top strip
 
     private var topStrip: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             HStack(spacing: 14) {
                 roundIconButton("gearshape.fill") { showSettings = true }
                 // A stack of frames collapsing into one output is the closest
@@ -207,123 +276,21 @@ struct CameraView: View {
                 roundIconButton("square.stack.3d.down.right.fill") { showImporter = true }
                 formatButton
                 Spacer()
-                readout("ISO", cam.isoLabel, highlighted: exposureParam == .iso)
-                readout("SEC", cam.shutterLabel, highlighted: exposureParam == .shutter)
             }
-
-            exposureBar
 
             HStack(spacing: 16) {
                 frameCountControl
                 Spacer()
+                Text("ISO " + cam.isoLabel)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.6))
+                Text(cam.shutterLabel)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(minWidth: 44, alignment: .trailing)
             }
         }
         .padding(.horizontal, 20)
-    }
-
-    /// Which parameter the exposure track is driving. Only one is editable at a
-    /// time, so the track can be full width and the readouts stay legible --
-    /// the arrangement most camera apps settle on.
-    private enum ExposureParam { case shutter, iso }
-
-    private func readout(_ caption: String, _ value: String, highlighted: Bool) -> some View {
-        VStack(alignment: .trailing, spacing: 1) {
-            Text(caption)
-                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(highlighted ? 0.55 : 0.3))
-            Text(value)
-                .font(.system(size: 13, weight: .medium, design: .monospaced))
-                .foregroundColor(highlighted ? Self.accent : .white.opacity(0.7))
-        }
-        .frame(minWidth: 46, alignment: .trailing)
-    }
-
-    /// Parameter button, track, auto button. Tapping the parameter button
-    /// swaps which of the two the track drives; Auto is deliberately its own
-    /// button rather than a third position, so leaving Auto never costs you the
-    /// parameter you had selected.
-    private var exposureBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                exposureParam = (exposureParam == .shutter) ? .iso : .shutter
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: exposureParam == .shutter ? "stopwatch" : "speedometer")
-                        .font(.system(size: 13, weight: .medium))
-                    Text(exposureParam == .shutter ? "SHUT" : "ISO")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                }
-                .foregroundColor(cam.exposureIsAuto ? .white.opacity(0.5) : Self.accent)
-                .frame(width: 68, height: 30)
-                .background(Self.chipShape.fill(Color.white.opacity(0.07)))
-                .overlay(Self.chipShape.strokeBorder(
-                    (cam.exposureIsAuto ? Color.white.opacity(0.14) : Self.accent.opacity(0.55)),
-                    lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-
-            exposureTrack
-
-            Button {
-                cam.setExposureAuto(!cam.exposureIsAuto)
-            } label: {
-                Text("A")
-                    .font(.system(size: 13, weight: .heavy, design: .rounded))
-                    .foregroundColor(cam.exposureIsAuto ? .black : .white.opacity(0.55))
-                    .frame(width: 34, height: 30)
-                    .background(Self.chipShape.fill(cam.exposureIsAuto
-                                                    ? Self.accent
-                                                    : Color.white.opacity(0.07)))
-                    .overlay(Self.chipShape.strokeBorder(
-                        cam.exposureIsAuto ? Color.clear : Color.white.opacity(0.14),
-                        lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-            .disabled(cam.isBusy)
-        }
-    }
-
-    /// Horizontal fader. The whole track is the hit target, and the very first
-    /// touch moves the value -- the old vertical control needed 4pt of travel
-    /// before it responded, and its handle was a Button that swallowed drags
-    /// starting on it, which is exactly where a slider gets grabbed.
-    private var exposureTrack: some View {
-        let binding = exposureParam == .shutter ? $cam.shutterSlider : $cam.isoSlider
-        return GeometryReader { g in
-            let w = g.size.width
-            let cap: CGFloat = 14
-            let travel = max(1, w - cap)
-            let x = cap / 2 + travel * CGFloat(binding.wrappedValue)
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.white.opacity(0.14))
-                    .frame(height: 3)
-                Capsule()
-                    .fill(cam.exposureIsAuto ? Color.white.opacity(0.3) : Self.accent.opacity(0.8))
-                    .frame(width: max(0, x - cap / 2), height: 3)
-                RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .fill(cam.exposureIsAuto ? Color.white.opacity(0.6) : Self.accent)
-                    .frame(width: cap, height: 22)
-                    .position(x: x, y: g.size.height / 2)
-            }
-            .frame(height: g.size.height)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { v in
-                        guard !cam.isBusy else { return }
-                        // Leave Auto before writing anything: the metering poll
-                        // rewrites these values every 200ms while Auto is on, so
-                        // a value written first can be overwritten before the
-                        // mode change lands.
-                        if cam.exposureIsAuto { cam.beginManualExposureDrag() }
-                        guard !cam.exposureIsAuto else { return }
-                        let t = (v.location.x - cap / 2) / travel
-                        binding.wrappedValue = min(1, max(0, Double(t)))
-                    }
-            )
-        }
-        .frame(height: 30)
     }
 
     private var frameCountControl: some View {
@@ -396,13 +363,13 @@ struct CameraView: View {
     private func zoomSlider(width: CGFloat) -> some View {
         let trackW = max(120, width - 96)
         let ticks = 29
-        let accent = Self.accent
+        let accent = Color(red: 0.62, green: 0.85, blue: 0.88)
         return VStack(spacing: 6) {
             Text(Self.zoomLabel(cam.zoomFactor))
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
                 .foregroundColor(.black)
-                .frame(width: 52, height: 30)
-                .background(Self.chipShape.fill(accent))
+                .frame(width: 52, height: 34)
+                .background(Circle().fill(accent))
                 .offset(x: (zoomPosition(cam.zoomFactor) - 0.5) * trackW)
 
             ZStack {
@@ -476,20 +443,21 @@ struct CameraView: View {
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(Color.black.opacity(0.45)))
+            .background(Capsule().fill(Color.black.opacity(0.45)))
         }
     }
 
     private func lensChip(title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 12, weight: selected ? .bold : .medium, design: .monospaced))
+                .font(.system(size: 12, weight: selected ? .bold : .medium))
                 .foregroundColor(selected ? .black : .white.opacity(0.92))
-                .frame(width: 38, height: 34)
-                .background(Self.chipShape.fill(selected
-                                                ? Self.accent
-                                                : Color.white.opacity(0.12)))
+                .frame(width: 38, height: 38)
+                .background(
+                    Circle().fill(selected
+                                  ? Color(red: 0.86, green: 0.78, blue: 0.60)
+                                  : Color.white.opacity(0.14))
+                )
         }
         .disabled(cam.isBusy)
     }
@@ -727,10 +695,28 @@ struct CameraView: View {
 
     @ViewBuilder
     private var fineAlignmentSection: some View {
-        Toggle("Overlapped Tile Merge (HDR+)", isOn: $cam.tuningParams.flow_overlap_merge)
-        Text("The HDR+ scheme, as the reference author suggests trying first: alignment tiles of Ts=16 at stride 8 (50% overlap), each half-pitch position measured on its own full-tile window -- flow is NOT interpolated -- and the merge blends each output pixel's up to four covering-tile results with the raised-cosine window (a Hann crossfade at 50% overlap, summing to one). Where the tiles agree the hypotheses deduplicate and the merge costs exactly what it does today; where they disagree the results crossfade instead of the flow blending. Decimate mode only; requires Smooth Tile Flow. The robustness mask scores the blended expectation. Experimental; off by default.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
+        Toggle("ICA Per Level In FFT Mode", isOn: $cam.tuningParams.align_ica_per_level_fft)
+        Text("""
+             Extends the above to the full-res FFT grey. Without it that path feeds \
+             integer-only flow into a finest level that can only search +/-1 pixel, so the \
+             correction budget is spent before it starts and tile-shaped displacements \
+             survive. Coarse levels only -- the finest is refined either way -- which keeps \
+             the extra reference gradients to about a quarter of a frame.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
+        Text("""
+             Replaces the block-matching pyramid with a PWCNet model run on-device via \
+             Core ML, feeding the same robustness/merge math either way. Falls back to the \
+             classical path per-frame if the bundled model is missing or fails to load. \
+             Experimental -- not yet validated against real bursts on-device.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Ambiguous-Match Fallback", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
+        Text("""
+             ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
         Text("""
              Block matching produces ONE displacement per 16-pixel tile, and consuming it              nearest makes the warp piecewise constant -- v(x,y) = v_ij across each tile,              jumping at every boundary.
@@ -744,20 +730,22 @@ struct CameraView: View {
              Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Fast Merge Weights", isOn: $cam.tuningParams.merge_fast_weights)
-        Text("Skips merge taps whose kernel weight is below 0.03% of the centre tap and overlapped-merge hypotheses carrying under 5% window weight. The normalisation absorbs both, so the output changes far below one 16-bit step; the merge kernel -- the largest GPU cost -- drops a measurable share of its exp() work.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
-        Toggle("DNG Highlight Headroom", isOn: $cam.tuningParams.dng_store_unwhitened)
+        Toggle("Continuous Kernel Anisotropy", isOn: $cam.tuningParams.kernel_anisotropy_continuous)
         Text("""
-             The merge runs with white balance baked into the pixels (R x2.06, B x1.84 on              this sensor), so the 16-bit DNG used to clip any red highlight above ~49% of              raw full scale -- about a stop of highlight headroom the sensor captured but              the file threw away, with a magenta cast where it clipped. This stores the              DNG un-white-balanced with a real AsShotNeutral instead: Lightroom and other              editors then apply WB in floating point and their highlight recovery sees              everything the sensor saw. The in-app JPEG and preview re-apply the gains on              load and render identically. Only the file's representation changes.
+             Merge kernels are stretched ALONG edges so that a sample slightly off the              ideal position still lands inside the kernel -- Section 5.1.1 gives this the              job of increasing "tolerance for small misalignments and uneven coverage              around edges". Wronski drives the amount of stretch continuously from the              structure tensor; the reference implementation instead switched to the full              8:1 stretch only above anisotropy 0.9025 and used a perfectly ROUND kernel              below it.
+             That penalises text most. A letter puts strokes at several orientations              inside one 3x3 window, so its structure tensor measures as nearly isotropic              -- around 0.6 -- even though it is all edges. Under the switch it fell below              the threshold and got a round 0.177 px kernel, while a long straight edge              beside it got 8:1. At 2x output that round kernel only accepts samples              within about a third of a raw pixel, so coverage along the strokes is sparse              and uneven, which reads as smeared letters.
+             Continuous gives anisotropy 0.6 a 4.8:1 kernel instead of 1:1: still sharp              ACROSS the stroke, but covering along it. Both endpoints are unchanged --              isotropic content stays round, a perfect edge still gets the full 8:1 --              only the middle is filled in, and the middle is where text lives.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("fp16 Merge Accumulator", isOn: $cam.tuningParams.merge_fp16_accumulator)
-        Text("""
-             Stores the online merge accumulator as 16-bit floats instead of 32-bit.              All arithmetic stays float32 in the kernels; only what lands in memory              narrows. At 2x output this halves the pipeline's single largest allocation              (1116 -> 558 MB) and the merge's dominant memory traffic, which it is              bandwidth-bound on. The cost is storage quantisation of about 0.05%              relative per store -- roughly 1-2 LSB of the 16-bit output. Turn off to              restore bit-exact fp32 accumulation at the old memory and speed.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
+            .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
+                + "trained network. The analytic mask decides from a colour difference "
+                + "between 3x3 local means, which cannot see a misalignment that lands on "
+                + "similar-looking content or one finer than that window. The network sees "
+                + "the same statistics plus the estimated flow, its local spread and a wider "
+                + "neighbourhood. Measured against ground truth on synthetic bursts built "
+                + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
+                + "analytic mask automatically if the model is missing.")
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
@@ -769,6 +757,15 @@ struct CameraView: View {
     // was one 343-line expression and the Swift type checker gave up on it
     // ("unable to type-check this expression in reasonable time"); these are
     // the two largest, and moving them lets each be checked on its own.
+    // Out of the ViewBuilder deliberately: an inline ternary in a Text is the
+    // shape that has previously pushed this file past the type-checker limit.
+    private var chooseReferenceHelp: String {
+        if cam.tuningParams.global_prealignment_choose_reference {
+            return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
+        }
+        return "Frame 0 is the merge base, so pre-alignment runs inside the alignment pass at roughly the cost of one thumbnail per frame."
+    }
+
     @ViewBuilder
     private var robustnessSection: some View {
                 Section(header: Text("Robustness (Motion Rejection)")) {
@@ -805,6 +802,81 @@ struct CameraView: View {
                          ? "Full-res FFT low-pass. Slower."
                          : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
                         .font(.caption2).foregroundColor(.secondary)
+                    Toggle("HF Artifact Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
+                    Text("Rejects repetitive fine texture that block matching cannot align (aperture problem). Needs high-frequency content AND unstable flow, so hair and noise are spared.")
+                        .font(.caption2).foregroundColor(.secondary)
+
+                    if cam.tuningParams.hf_artifact_removal_enabled {
+                        HStack {
+                            Text("Variance Loss")
+                            Spacer()
+                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_loss_threshold))
+                        }
+                        Slider(value: $cam.tuningParams.hf_variance_loss_threshold, in: 0.50...0.99, step: 0.01)
+
+                        HStack {
+                            Text("Min Texture SNR")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))
+                        }
+                        Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
+                    }
+
+                    Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
+                    Text("Rejects one-dimensional tiles only when their aligned residual is high.")
+                        .font(.caption2).foregroundColor(.secondary)
+
+                    if cam.tuningParams.flow_reject_1d_enabled {
+                        HStack {
+                            Text("1D Residual")
+                            Spacer()
+                            Text(String(format: "%.2f", cam.tuningParams.flow_reject_1d_residual_threshold))
+                                .monospacedDigit()
+                        }
+                        Slider(value: $cam.tuningParams.flow_reject_1d_residual_threshold,
+                               in: 0.0...8.0,
+                               step: 0.05)
+                    }
+
+                    Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
+
+                    if cam.tuningParams.motion_edge_rejection_enabled {
+                        HStack {
+                            Text("Edge Threshold")
+                            Spacer()
+                            Text(String(format: "%.3f", cam.tuningParams.motion_edge_threshold))
+                        }
+                        Slider(value: $cam.tuningParams.motion_edge_threshold,
+                               in: 0.0...0.12,
+                               step: 0.001)
+
+                        HStack {
+                            Text("Residual Threshold")
+                            Spacer()
+                            Text(String(format: "%.2f", cam.tuningParams.motion_edge_residual_threshold))
+                        }
+                        Slider(value: $cam.tuningParams.motion_edge_residual_threshold,
+                               in: 0.0...8.0,
+                               step: 0.05)
+
+                        HStack {
+                            Text("Edge Noise Floor")
+                            Spacer()
+                            Text(String(format: "%.1f", cam.tuningParams.motion_edge_noise_floor_multiplier))
+                        }
+                        Slider(value: $cam.tuningParams.motion_edge_noise_floor_multiplier,
+                               in: 0.0...2.0,
+                               step: 0.1)
+
+                        Stepper(value: $cam.tuningParams.motion_edge_neighborhood_radius,
+                                in: 0...2) {
+                            HStack {
+                                Text("Edge Neighborhood")
+                                Spacer()
+                                Text("\(cam.tuningParams.motion_edge_neighborhood_radius)")
+                            }
+                        }
+                    }
                 }
     }
 
@@ -812,6 +884,47 @@ struct CameraView: View {
     private var kernelsSection: some View {
                 Section(header: Text("Steerable Kernels (Merging)")) {
                     Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
+                    Toggle("Debug Pixel 4a Noise", isOn: $cam.tuningParams.debug_pixel4a_noise_profile)
+                    Text("Ignores the captured DNG NoiseProfile and uses bundled Pixel 4a correction curves at the rounded ISO. For Python parity/debugging only.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
+
+                    if cam.tuningParams.global_prealignment_enabled {
+                        Toggle("Choose Reference Frame", isOn: $cam.tuningParams.global_prealignment_choose_reference)
+                        Text(chooseReferenceHelp)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        HStack {
+                            Text("Rotation Search")
+                            Spacer()
+                            Text(String(format: "%.1f deg", cam.tuningParams.global_prealignment_rotation_range_deg))
+                        }
+                        Slider(value: $cam.tuningParams.global_prealignment_rotation_range_deg,
+                               in: 0.0...2.0,
+                               step: 0.1)
+
+                        HStack {
+                            Text("Rotation Step")
+                            Spacer()
+                            Text(String(format: "%.2f deg", cam.tuningParams.global_prealignment_rotation_step_deg))
+                        }
+                        Slider(value: $cam.tuningParams.global_prealignment_rotation_step_deg,
+                               in: 0.05...1.0,
+                               step: 0.05)
+
+                        Stepper(value: $cam.tuningParams.global_prealignment_max_shift,
+                                in: 0...64,
+                                step: 4) {
+                            HStack {
+                                Text("Global Shift")
+                                Spacer()
+                                Text("\(cam.tuningParams.global_prealignment_max_shift)")
+                            }
+                        }
+                    }
 
                     Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
                         Text("Auto").tag(0)
@@ -852,29 +965,6 @@ struct CameraView: View {
                         Text(String(format: "%.1f", cam.tuningParams.k_shrink))
                     }
                     Slider(value: $cam.tuningParams.k_shrink, in: 1.0...5.0)
-
-                    Toggle("Lossless DNG (smaller, faster)", isOn: $cam.tuningParams.dng_lossless_jpeg)
-                    Text("Writes the output DNG with lossless-JPEG tiles (Compression 7, the standard DNG codec -- what Apple ProRAW uses). Pixels are bit-identical to the uncompressed file; size drops to roughly a third (varies with scene content) and saving is faster because far fewer bytes hit storage. Off = uncompressed strips as before.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                    Toggle("Manual D Thresholds", isOn: $cam.tuningParams.d_thresh_manual)
-                    Text("D_th/D_tr decide super-resolution vs denoising per pixel: gradients below roughly D_tr*(1+D_th) sigmas of noise are denoised with a wide kernel instead of resolved. SNR Auto-Tune normally sets them per burst (0.71-0.81 / 1.0-1.24, GAT units); this override keeps your values while auto-tune still drives k_detail and tile size. Lower both (e.g. scale by 0.45: D_th 0.34, D_tr 0.50) to push daylight texture into the super-resolution branch; raise them if flat areas turn noisy.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                    HStack {
-                        Text("Denoise Threshold (D_th)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.d_th))
-                    }
-                    Slider(value: $cam.tuningParams.d_th, in: 0.0...1.5)
-                        .disabled(!cam.tuningParams.d_thresh_manual)
-                    HStack {
-                        Text("Denoise Transition (D_tr)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.d_tr))
-                    }
-                    Slider(value: $cam.tuningParams.d_tr, in: 0.001...2.0)
-                        .disabled(!cam.tuningParams.d_thresh_manual)
                     Text("Higher shrink sharpens across edges (helps small text). Default 2.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
@@ -901,10 +991,6 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
-                    Toggle("Fast Burst Shutter (2x)", isOn: $cam.tuningParams.burst_fast_shutter)
-                    Text("Burst frames expose at half the auto-metered duration with ISO raised to compensate: half the per-frame motion blur at the same brightness. The merge averages the extra noise back out across the burst -- blur it cannot undo. No effect in manual exposure mode.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
                     Toggle("Zero Shutter Lag (ZSL)", isOn: $cam.zslEnabled)
                     Text(cam.zslEnabled
                          ? "Buffers \(cam.frameCount) RAW frames continuously. Tap shutter to grab them without holding still afterward. Ready: \(cam.zslBufferReady)/\(cam.frameCount)."
@@ -935,18 +1021,6 @@ struct CameraView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    if cam.exportFormat == .jpg {
-                        HStack {
-                            Text("JPEG Quality")
-                            Slider(value: $cam.jpegExportQuality, in: 0.5...1.0, step: 0.01)
-                            Text(String(format: "%.2f", cam.jpegExportQuality))
-                                .font(.caption.monospacedDigit())
-                                .foregroundColor(.secondary)
-                        }
-                        Text("0.92+ keeps full-resolution colour (4:4:4). Below 0.90 iOS halves the colour resolution (4:2:0), which reads as soft, smeared fine detail -- the old default of 0.82 was why exports looked low quality.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                    }
                     Text(cam.exportFormat == .dng
                          ? "LinearRaw DNG with embedded tone-mapped JPEG preview (Photos thumbnail; Lightroom reads the raw)."
                          : "JPEG rendered by the ISP: auto exposure, local tone mapping, contrast and vibrance. No sharpening.")
@@ -1015,6 +1089,13 @@ struct CameraView: View {
                     Text("When on, also saves a grayscale robustness mask to Photos after processing.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
+
+                    if cam.tuningParams.robustness_save_mask {
+                        Toggle("Save s1/s2 Split Masks", isOn: $cam.tuningParams.robustness_save_s_masks)
+                        Text("Also writes _robustness_s1.pgm and _robustness_s2.pgm next to the DNG. s1 is the strict motion prior, applied where the flow field varies sharply or the tile is aperture-limited; s2 is the permissive default. A pixel is bright in exactly one of the two, at the value it contributed to the combined mask, so the pair shows precisely which regions used which.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("Fallback Denoiser")) {
@@ -1036,6 +1117,12 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
+                        Toggle("ICA Every Pyramid Level", isOn: $cam.tuningParams.align_ica_per_level)
+                        Text("Refines sub-pixel alignment after block matching at every "
+                             + "pyramid level, as the reference does, instead of only the "
+                             + "finest. 2x2 decimate grey only unless the switch below is on.")
+                            .font(.caption2).foregroundColor(.secondary)
+
                         fineAlignmentSection
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
