@@ -1940,9 +1940,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.h = (uint32_t)gh;
     mp.w = (uint32_t)gw;
     mp.nch = (uint32_t)nch;
-    mp.tile_size = (uint32_t)fg_ts;
-    mp.flow_ny = (uint32_t)fg_ny;
-    mp.flow_nx = (uint32_t)fg_nx;
+    // Coarse grid, matching b_S/b_flow/b_aperture above -- see the comment
+    // there for why this function stays off the boundary-selected fine grid.
+    mp.tile_size = (uint32_t)tile_size;
+    mp.flow_ny = (uint32_t)flow.ny;
+    mp.flow_nx = (uint32_t)flow.nx;
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
