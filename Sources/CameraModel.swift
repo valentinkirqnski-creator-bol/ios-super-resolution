@@ -113,6 +113,9 @@ struct TuningParams: Equatable, Codable {
     /// At motion boundaries, pick the best single tile vector instead of
     /// blending two different motions. Smooth regions stay bilinear.
     var flow_boundary_selection: Bool = true
+    /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
+    /// flow (no interpolation), raised-cosine result blending. Decimate only.
+    var flow_overlap_merge: Bool = false
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
     var debug_pixel4a_noise_profile: Bool = false
@@ -230,6 +233,7 @@ struct TuningParams: Equatable, Codable {
         case kernel_anisotropy_continuous
         case bm_subpixel_quadratic
         case flow_boundary_selection
+        case flow_overlap_merge
         case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -279,6 +283,7 @@ struct TuningParams: Equatable, Codable {
         kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
         bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
         flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
+        flow_overlap_merge = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_merge) ?? flow_overlap_merge
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         debug_pixel4a_noise_profile = try c.decodeIfPresent(
             Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
@@ -1901,6 +1906,7 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
             "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
             "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
+            "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),

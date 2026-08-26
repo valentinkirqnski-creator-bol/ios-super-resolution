@@ -356,6 +356,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
     if (tuning[@"flow_boundary_selection"])
         cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
+    if (tuning[@"flow_overlap_merge"])
+        cfg.flow_overlap_merge = tuning[@"flow_overlap_merge"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"snr_auto_tune"]) cfg.snr_auto_tune = tuning[@"snr_auto_tune"].boolValue;
     if (tuning[@"debug_pixel4a_noise_profile"])

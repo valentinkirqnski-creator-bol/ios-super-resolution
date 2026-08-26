@@ -1504,7 +1504,10 @@ void flow_densify_boundary_select(FlowField& flow,
     flow.fine_ny = 0;
     flow.fine_nx = 0;
     flow.fine_flow.clear();
-    if (!cfg.flow_boundary_selection || !cfg.flow_bilinear_sampling) return;
+    const bool overlap_all = cfg.overlap_merge_active();
+    if ((!cfg.flow_boundary_selection && !overlap_all) ||
+        !cfg.flow_bilinear_sampling)
+        return;
     // Even pitch only: the fine grid's pitch is tile_size/2 and the GPU hosts
     // pass it as an integer. Every shipped tile size (16/32/64) is even.
     if (flow.ny <= 0 || flow.nx <= 0 || tile_size < 2 || (tile_size % 2) != 0 ||
@@ -1550,7 +1553,83 @@ void flow_densify_boundary_select(FlowField& flow,
             const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
             f32 out_x = tx0 + (bx0 - tx0) * ay;
             f32 out_y = ty0 + (by0 - ty0) * ay;
-            if (spread > thr) {
+            if (overlap_all) {
+                // Overlapped-tile measurement for EVERY lattice cell
+                // (Config::flow_overlap_merge): the merge will consume these
+                // vectors nearest, one per covering tile, so each must be the
+                // cell's own measurement on its FULL tile-sized window
+                // (Ts = tile_size at stride Ts/2 -- HDR+'s layout), not an
+                // interpolated value.
+                const int win = std::max(2, (int)std::lround((f32)tile_size * gsy));
+                const int gy0 = (int)std::lround(((f32)fy + 0.5f) * ts2 * gsy) - win / 2;
+                const int gx0 = (int)std::lround(((f32)fx + 0.5f) * ts2 * gsx) - win / 2;
+                auto cost_at = [&](int idy, int idx) -> f32 {
+                    f32 dist = 0.f;
+                    for (int i = 0; i < win; ++i) {
+                        for (int j = 0; j < win; ++j) {
+                            const int ry = gy0 + i, rx = gx0 + j;
+                            const int my = ry + idy, mx = rx + idx;
+                            if (!(ry >= 0 && ry < ref_grey.h &&
+                                  rx >= 0 && rx < ref_grey.w &&
+                                  my >= 0 && my < mov_grey.h &&
+                                  mx >= 0 && mx < mov_grey.w))
+                                return std::numeric_limits<f32>::infinity();
+                            dist += std::fabs(ref_grey.at(ry, rx) -
+                                              mov_grey.at(my, mx));
+                        }
+                    }
+                    return dist;
+                };
+                // Seed: best of the four neighbour vectors on this window;
+                // border cells where nothing scores keep the blend.
+                f32 best_cost = std::numeric_limits<f32>::infinity();
+                int seed_y = 0, seed_x = 0;
+                bool have_seed = false;
+                for (int c = 0; c < 4; ++c) {
+                    const int idx = (int)std::lround(vx[c] * gsx);
+                    const int idy = (int)std::lround(vy[c] * gsy);
+                    const f32 d = cost_at(idy, idx);
+                    if (d < best_cost) {
+                        best_cost = d;
+                        seed_y = idy;
+                        seed_x = idx;
+                        have_seed = true;
+                        out_x = vx[c];
+                        out_y = vy[c];
+                    }
+                }
+                // One 3x3 integer refinement plus the quadratic sub-cell fit.
+                // The measurement replaces the seed only when it MOVES: a
+                // grey-integer step is 2 raw px of quantisation on decimate,
+                // so a confirmed seed keeps its ICA-refined fraction.
+                if (have_seed) {
+                    f32 surf[9];
+                    int bo = 4;
+                    f32 bo_cost = best_cost;
+                    for (int oy = -1; oy <= 1; ++oy)
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            const int s = (oy + 1) * 3 + (ox + 1);
+                            surf[s] = (ox == 0 && oy == 0)
+                                          ? best_cost
+                                          : cost_at(seed_y + oy, seed_x + ox);
+                            if (surf[s] < bo_cost) { bo_cost = surf[s]; bo = s; }
+                        }
+                    if (bo != 4) {
+                        seed_y += bo / 3 - 1;
+                        seed_x += bo % 3 - 1;
+                        for (int oy = -1; oy <= 1; ++oy)
+                            for (int ox = -1; ox <= 1; ++ox)
+                                surf[(oy + 1) * 3 + (ox + 1)] =
+                                    cost_at(seed_y + oy, seed_x + ox);
+                        if (std::isfinite(surf[4])) {
+                            f32 sub_x = 0.f, sub_y = 0.f;
+                            (void)quadratic_subpixel_3x3(surf, sub_x, sub_y);
+                            out_x = ((f32)seed_x + sub_x) / gsx;
+                            out_y = ((f32)seed_y + sub_y) / gsy;
+                        }
+                    }
+                }
+            } else if (spread > thr) {
                 // Cell footprint on the grey.
                 const int gy0 = (int)std::floor((f32)fy * ts2 * gsy);
                 const int gx0 = (int)std::floor((f32)fx * ts2 * gsx);
