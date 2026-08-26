@@ -350,13 +350,28 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
             if (!iso) {
+                // Raw position -> covariance/grey grid. Must be the SAME
+                // mapping accumulate_ref uses below, for the same reason the
+                // sampling position must: at zero flow a comparison frame
+                // describes the same scene point as the reference, so both
+                // have to look up the same kernel shape.
+                //
+                // 460-main uses (pos - 0.5)/2 (bayer) and pos (non-bayer) in
+                // BOTH accumulate and accumulate_ref -- merge.py:446 and :162.
+                // This path previously used python-z's accumulate form
+                // (pos/2 - 0.5, pos - 0.5, merge.py:350), which the reference
+                // pass never matched: a constant 0.25 grey px = 0.5 raw px
+                // offset, so comparison frames were reconstructed with a
+                // kernel measured half a raw pixel away from the one the
+                // reference frame used. python-z is internally inconsistent
+                // here too -- its own accumulate_ref uses the 460-main form.
                 f32 kmap_j, kmap_i;
                 if (cfg.bayer_mode) {
-                    kmap_j = lr_mov_x / 2.f - 0.5f;
-                    kmap_i = lr_mov_y / 2.f - 0.5f;
+                    kmap_j = (lr_mov_x - 0.5f) / 2.f;
+                    kmap_i = (lr_mov_y - 0.5f) / 2.f;
                 } else {
-                    kmap_j = lr_mov_x - 0.5f;
-                    kmap_i = lr_mov_y - 0.5f;
+                    kmap_j = lr_mov_x;
+                    kmap_i = lr_mov_y;
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
                                merge_soften_max_inv(cfg));

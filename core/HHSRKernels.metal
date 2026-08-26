@@ -1211,13 +1211,17 @@ static inline void merge_comp_contrib_flowed(device const float* img,
 
     float ixx = 0.f, ixy = 0.f, iyy = 0.f;
     if (!p.iso) {
+        // Same mapping merge_accumulate_ref uses below, and the same one
+        // accumulate_comp uses in merge.cpp -- see the comment there. Was
+        // python-z's accumulate form, which the reference pass never matched
+        // (0.25 grey px = 0.5 raw px apart).
         float kmap_j, kmap_i;
         if (p.bayer) {
-            kmap_j = lr_mov_x / 2.f - 0.5f;
-            kmap_i = lr_mov_y / 2.f - 0.5f;
+            kmap_j = (lr_mov_x - 0.5f) / 2.f;
+            kmap_i = (lr_mov_y - 0.5f) / 2.f;
         } else {
-            kmap_j = lr_mov_x - 0.5f;
-            kmap_i = lr_mov_y - 0.5f;
+            kmap_j = lr_mov_x;
+            kmap_i = lr_mov_y;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true,
                        p.soften_max_inv);
