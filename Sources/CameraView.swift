@@ -727,48 +727,10 @@ struct CameraView: View {
 
     @ViewBuilder
     private var fineAlignmentSection: some View {
-        Toggle("ICA Per Level In FFT Mode", isOn: $cam.tuningParams.align_ica_per_level_fft)
-        Text("""
-             Extends the above to the full-res FFT grey. Without it that path feeds \
-             integer-only flow into a finest level that can only search +/-1 pixel, so the \
-             correction budget is spent before it starts and tile-shaped displacements \
-             survive. Coarse levels only -- the finest is refined either way -- which keeps \
-             the extra reference gradients to about a quarter of a frame.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Ambiguous-Match Fallback", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
-        Text("""
-             ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Full-Res Flow Polish", isOn: $cam.tuningParams.align_fullres_polish)
-        Text("""
-             The decimate path measures every alignment stage, the final ICA included, on              the half-resolution grey -- so every residual error doubles in raw pixels.              This adds one last ICA refinement at FULL raw resolution on the band-limited              FFT grey (the exact image the full-res FFT mode measures on), seeded by the              finished decimate flow. The seed is already sub-pixel, so the pass can only              sharpen, not wander. Closes the decimate mode's sub-pixel accuracy gap to              full-res FFT at a fraction of its cost (~40ms GPU per frame, currently              hidden behind the CPU). Decimate mode only.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Anti-Aliased Decimation", isOn: $cam.tuningParams.grey_decimate_lowpass)
-        Text("""
-             The half-res alignment grey was a plain 2x2 quad average -- a weak low-pass              that lets fine texture between the half-res and full-res Nyquist fold back              into the image as aliasing, which contaminates block matching and ICA: flow              that wobbles with content instead of following motion (the wavy artifact).              This decimates through a proper anti-aliasing filter instead (half-phase              binomial 1-3-3-1, effective Gaussian sigma ~0.87 raw px): same lattice, same              channel balance, ~10x stronger alias suppression. Alignment grey only; the              robustness guide and the merge are untouched. Decimate mode only.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Subpixel Block Matching", isOn: $cam.tuningParams.bm_subpixel_quadratic)
-        Text("""
-             Fits a bivariate quadratic to the 3x3 cost neighbourhood around each              block-matching winner and adds its sub-cell minimum -- the sub-pixel              estimator Wronski's alignment specifies, which this port previously skipped:              block matching emitted integer flow at every level and ICA alone carried the              sub-pixel burden. The costs already exist, so the fit is nearly free. Applies              on both CPU and GPU search paths; matters most on the decimate grey, where              every residual ICA cannot recover is twice as large in raw pixels. The fit is              rejected (integer result stands) at window edges, on ridge-shaped cost              surfaces, and whenever it points more than half a cell away.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Overlapped Tile Merge (HDR+)", isOn: $cam.tuningParams.flow_overlap_merge)
         Text("The HDR+ scheme, as the reference author suggests trying first: alignment tiles of Ts=16 at stride 8 (50% overlap), each half-pitch position measured on its own full-tile window -- flow is NOT interpolated -- and the merge blends each output pixel's up to four covering-tile results with the raised-cosine window (a Hann crossfade at 50% overlap, summing to one). Where the tiles agree the hypotheses deduplicate and the merge costs exactly what it does today; where they disagree the results crossfade instead of the flow blending. Decimate mode only; requires Smooth Tile Flow. The robustness mask scores the blended expectation. Experimental; off by default.")
             .font(.footnote)
             .foregroundColor(.secondary)
-        Toggle("Bicubic Flow Sampling", isOn: $cam.tuningParams.flow_bicubic_sampling)
-        Text("Samples the tile flow with Catmull-Rom bicubic (C1-smooth) instead of bilinear (C0). Removes the derivative kinks at tile centres in smooth regions; NOT expected to help at motion boundaries (flow is only piecewise smooth there -- Boundary Flow Selection is the fix for that). Catmull-Rom can overshoot slightly near sharp flow changes. Every consumer (merge, mask, warped statistics) switches together. Requires Smooth Tile Flow. Experimental; off by default.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
-        Toggle("Boundary Flow Selection", isOn: $cam.tuningParams.flow_boundary_selection)
-        Text("""
-             Bilinear flow sampling is right where motion is smooth but wrong at object              boundaries: it blends two different motions into flow that belongs to neither              side, exactly where robustness then rejects and detail is lost. This builds a              half-tile-pitch refinement after alignment: cells whose four surrounding tile              vectors agree keep the bilinear blend (smooth regions reproduce the coarse              sampling to within the flow field's own curvature -- exact for locally linear              motion, error far below the tile staircase this fixes), while cells at              a disagreement over 1 raw px get whichever single tile vector best explains              the alignment guide there. Mask and merge consume the same refined field, so              they stay in lockstep. Requires Smooth Tile Flow.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
         Text("""
              Block matching produces ONE displacement per 16-pixel tile, and consuming it              nearest makes the warp piecewise constant -- v(x,y) = v_ij across each tile,              jumping at every boundary.
@@ -796,7 +758,6 @@ struct CameraView: View {
              Stores the online merge accumulator as 16-bit floats instead of 32-bit.              All arithmetic stays float32 in the kernels; only what lands in memory              narrows. At 2x output this halves the pipeline's single largest allocation              (1116 -> 558 MB) and the merge's dominant memory traffic, which it is              bandwidth-bound on. The cost is storage quantisation of about 0.05%              relative per store -- roughly 1-2 LSB of the 16-bit output. Turn off to              restore bit-exact fp32 accumulation at the old memory and speed.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Zero-Floor Kernel Stretch", isOn: $cam.tuningParams.kernel_anisotropy_zero_floor)
         HStack {
             Text("Stretch Selectivity")
             Slider(value: $cam.tuningParams.kernel_stretch_gamma, in: 1.0...4.0, step: 0.25)
@@ -807,21 +768,6 @@ struct CameraView: View {
         Text("Exponent on the stretch weight. 1.0 = plain zero-floor law. 2.0 (default) reproduces the readable-text stretch (~2:1 at text-like coherence) measured by hand-tuning k_stretch to 2, while clean single-orientation edges keep ~95% of full k_stretch. Raise further to confine elongation to only the most coherent edges.")
             .font(.footnote)
             .foregroundColor(.secondary)
-        Toggle("ImageStackAlignator Kernel Law", isOn: $cam.tuningParams.kernel_isa_law)
-        Text("Reproduces ImageStackAlignator's kernel.cu ComputeKernelParam exactly: A = 1 + (l1-l2)/(l1+l2) (the coherence ratio directly, not its sqrt -- a measurably less aggressive anisotropy response than every other law here), and the raw multiplicative shape k_detail*k_stretch*A / k_detail/(k_shrink*A) with no zero-floor, so it never goes round at A=1 -- isotropic content still gets stretched. Overrides Zero-Floor Kernel Stretch, Stretch Selectivity and the selection law while on.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
-        Text("""
-             The merge kernel's stretch weight was 0.5*A with A never below 1 -- so even              near-isotropic detail in high-contrast areas was elongated at least              2.5:0.75 along whichever direction the tiny 2x2 structure-tensor window              happened to prefer. Distant text is the worst case: 1-2px multi-oriented              strokes give moderate coherence with a noise orientation, and the resulting              3-6:1 kernels smear glyphs unreadable or double their strokes (which looks              like misalignment). This remaps the weight to reach ZERO for isotropic              content while keeping the exact same stretch at the old A=1.95 threshold --              clean single-orientation edges keep their full elongation.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Continuous Kernel Anisotropy", isOn: $cam.tuningParams.kernel_anisotropy_continuous)
-        Text("""
-             Merge kernels are stretched ALONG edges so that a sample slightly off the              ideal position still lands inside the kernel -- Section 5.1.1 gives this the              job of increasing "tolerance for small misalignments and uneven coverage              around edges". Wronski drives the amount of stretch continuously from the              structure tensor; the reference implementation instead switched to the full              8:1 stretch only above anisotropy 0.9025 and used a perfectly ROUND kernel              below it.
-             That penalises text most. A letter puts strokes at several orientations              inside one 3x3 window, so its structure tensor measures as nearly isotropic              -- around 0.6 -- even though it is all edges. Under the switch it fell below              the threshold and got a round 0.177 px kernel, while a long straight edge              beside it got 8:1. At 2x output that round kernel only accepts samples              within about a third of a raw pixel, so coverage along the strokes is sparse              and uneven, which reads as smeared letters.
-             Continuous gives anisotropy 0.6 a 4.8:1 kernel instead of 1:1: still sharp              ACROSS the stroke, but covering along it. Both endpoints are unchanged --              isotropic content stays round, a perfect edge still gets the full 8:1 --              only the middle is filled in, and the middle is where text lives.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
@@ -1100,12 +1046,6 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
-                        Toggle("ICA Every Pyramid Level", isOn: $cam.tuningParams.align_ica_per_level)
-                        Text("Refines sub-pixel alignment after block matching at every "
-                             + "pyramid level, as the reference does, instead of only the "
-                             + "finest. 2x2 decimate grey only unless the switch below is on.")
-                            .font(.caption2).foregroundColor(.secondary)
-
                         fineAlignmentSection
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)

@@ -446,30 +446,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
-    if (tuning[@"kernel_anisotropy_continuous"])
-        cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
-    if (tuning[@"kernel_anisotropy_zero_floor"])
-        cfg.kernel_anisotropy_zero_floor = tuning[@"kernel_anisotropy_zero_floor"].boolValue;
     if (tuning[@"kernel_stretch_gamma"])
         cfg.kernel_stretch_gamma = tuning[@"kernel_stretch_gamma"].floatValue;
-    if (tuning[@"kernel_isa_law"])
-        cfg.kernel_isa_law = tuning[@"kernel_isa_law"].boolValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
     if (tuning[@"merge_fast_weights"])
         cfg.merge_fast_weights = tuning[@"merge_fast_weights"].boolValue;
     if (tuning[@"dng_store_unwhitened"])
         cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
-    if (tuning[@"bm_subpixel_quadratic"])
-        cfg.bm_subpixel_quadratic = tuning[@"bm_subpixel_quadratic"].boolValue;
-    if (tuning[@"grey_decimate_lowpass"])
-        cfg.grey_decimate_lowpass = tuning[@"grey_decimate_lowpass"].boolValue;
-    if (tuning[@"align_fullres_polish"])
-        cfg.align_fullres_polish = tuning[@"align_fullres_polish"].boolValue;
-    if (tuning[@"flow_boundary_selection"])
-        cfg.flow_boundary_selection = tuning[@"flow_boundary_selection"].boolValue;
-    if (tuning[@"flow_bicubic_sampling"])
-        cfg.flow_bicubic_sampling = tuning[@"flow_bicubic_sampling"].boolValue;
     if (tuning[@"flow_overlap_merge"])
         cfg.flow_overlap_merge = tuning[@"flow_overlap_merge"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
@@ -513,12 +497,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"isp_local_contrast"]) cfg.isp.local_contrast = tuning[@"isp_local_contrast"].floatValue;
     if (tuning[@"isp_skin_protect"])   cfg.isp.skin_protect = tuning[@"isp_skin_protect"].boolValue;
     g_isp = cfg.isp;
-    if (tuning[@"align_ica_per_level"])
-        cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
-    if (tuning[@"align_ica_per_level_fft"])
-        cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
-    if (tuning[@"align_ambiguous_fallback_enabled"])
-        cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
         cfg.debug_noise_model_disabled = tuning[@"debug_noise_model_disabled"].boolValue;
     if (tuning[@"flow_bilinear_sampling"])

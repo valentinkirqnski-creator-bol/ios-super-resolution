@@ -94,20 +94,14 @@ struct TuningParams: Equatable, Codable {
     var k_detail: Float = 0.17
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
-    /// Drive the merge kernel's anisotropy continuously from the structure
-    /// tensor rather than switching to the full stretch only above 0.9025.
-    var kernel_anisotropy_continuous: Bool = true
-    /// Zero-floor the anisotropy law: isotropic detail gets round kernels
-    /// instead of a minimum 2.5:0.75 stretch along a noise orientation.
-    var kernel_anisotropy_zero_floor: Bool = true
+    // Anisotropy shape law fixed at its measured default: continuous from the
+    // structure tensor (not the reference's hard >0.9025 switch), zero-floored
+    // (round at isotropic instead of a forced 2.5:0.75 minimum stretch).
+    // ImageStackAlignator's alternative law (kernel.cu, verbatim) stays off --
+    // it never goes round at A=1.
     /// Exponent on the stretch weight: higher concentrates elongation onto
     /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
     var kernel_stretch_gamma: Float = 1.0
-    /// ImageStackAlignator's kernel.cu ComputeKernelParam, verbatim: A uses
-    /// the coherence ratio directly (not its sqrt), and the shape law is the
-    /// raw multiplicative form with no zero-floor -- overrides the other
-    /// anisotropy settings while on.
-    var kernel_isa_law: Bool = false
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
@@ -117,20 +111,11 @@ struct TuningParams: Equatable, Codable {
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
-    /// Quadratic sub-cell fit at each block-matching winner (Wronski's
-    /// sub-pixel estimator). Integer flow becomes ~0.1-0.25px flow per level.
-    var bm_subpixel_quadratic: Bool = true
-    /// Anti-aliased decimation for the alignment grey: half-phase binomial
-    /// [1 3 3 1]/8 instead of the 2x2 box. Same lattice, less alias wobble.
-    var grey_decimate_lowpass: Bool = true
-    /// Final ICA refinement at full raw resolution on the FFT grey, seeded by
-    /// the decimate flow. Closes the decimate path's sub-pixel gap to FFT.
-    var align_fullres_polish: Bool = true
-    /// At motion boundaries, pick the best single tile vector instead of
-    /// blending two different motions. Smooth regions stay bilinear.
-    var flow_boundary_selection: Bool = true
-    /// Catmull-Rom bicubic tile-flow sampling (C1) instead of bilinear (C0).
-    var flow_bicubic_sampling: Bool = false
+    // Alignment fixed at its measured defaults: quadratic sub-cell fit at
+    // each block-matching winner, anti-aliased (binomial) decimation for the
+    // alignment grey, full-res ICA polish closing the decimate path's
+    // sub-pixel gap to FFT, best-single-tile selection at motion boundaries,
+    // bilinear (not bicubic) tile-flow sampling.
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
@@ -164,23 +149,11 @@ struct TuningParams: Equatable, Codable {
     var merge_arch: Int32 = 0
     /// Adapt the enlargement to the merged frame count instead of the
     /// reference implementation's step. Off reproduces the reference exactly.
-    /// Run ICA after block matching on every pyramid level, as the reference
-    /// implementation does, instead of only on the finest. Half-res 2x2 grey
-    /// only -- the full-res FFT path is unaffected either way.
-    var align_ica_per_level: Bool = true
-    /// Extend the above to the full-res FFT grey. Without it that path feeds
-    /// integer-only flow into a finest level whose search radius is 1, so the
-    /// correction budget is already spent when level 0 starts. Costs roughly
-    /// +120MB at 12MP, because the reference gradient cache goes resident.
-    var align_ica_per_level_fft: Bool = false
-    /// ImageStackAlignator's rule for unreliable block matches: when a
-    /// tile's best and second-best costs are near-tied (flat patch, aperture,
-    /// repetition -- no precise shift determinable), apply NO shift and keep
-    /// the seed from the coarser level, instead of
-    /// trusting a match indistinguishable from noise. Acts on the flow
-    /// itself, unlike the s1 demotion, which is inert under rotation where
-    /// every tile is on s1 already. Off by default -- A/B before adopting.
-    var align_ambiguous_fallback_enabled: Bool = false
+    // ICA refinement fixed at its measured defaults: every pyramid level on
+    // the half-res 2x2 grey (on), the full-res FFT grey (off -- +120MB at
+    // 12MP for a path already ~1px-accurate at level 0). The ambiguous-match
+    // fallback (ImageStackAlignator's near-tied-cost rule) stays off,
+    // pending an A/B.
     /// Debug: zero the noise model as read by the robustness mask ONLY.
     /// R is then scored from the raw measured local variance and the raw
     /// (unshrunk) pixel difference. SNR auto-tune, the alignment tile size
@@ -244,26 +217,16 @@ struct TuningParams: Equatable, Codable {
         case d_thresh_manual, d_th, d_tr
         case burst_fast_shutter
         case dng_lossless_jpeg
-        case kernel_anisotropy_continuous
-        case kernel_anisotropy_zero_floor
         case kernel_stretch_gamma
-        case kernel_isa_law
         case merge_fp16_accumulator
         case merge_fast_weights
         case dng_store_unwhitened
-        case bm_subpixel_quadratic
-        case grey_decimate_lowpass
-        case align_fullres_polish
-        case flow_boundary_selection
-        case flow_bicubic_sampling
         case flow_overlap_merge
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
         case merge_arch
-        case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft
-        case align_ambiguous_fallback_enabled
+        case acc_rob_adaptive, acc_rob_max_frame_count
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -294,18 +257,10 @@ struct TuningParams: Equatable, Codable {
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
-        kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
-        kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
         kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
-        kernel_isa_law = try c.decodeIfPresent(Bool.self, forKey: .kernel_isa_law) ?? kernel_isa_law
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
-        bm_subpixel_quadratic = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_quadratic) ?? bm_subpixel_quadratic
-        grey_decimate_lowpass = try c.decodeIfPresent(Bool.self, forKey: .grey_decimate_lowpass) ?? grey_decimate_lowpass
-        align_fullres_polish = try c.decodeIfPresent(Bool.self, forKey: .align_fullres_polish) ?? align_fullres_polish
-        flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
-        flow_bicubic_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bicubic_sampling) ?? flow_bicubic_sampling
         flow_overlap_merge = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_merge) ?? flow_overlap_merge
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
@@ -332,9 +287,6 @@ struct TuningParams: Equatable, Codable {
         isp_saturation = try c.decodeIfPresent(Float.self, forKey: .isp_saturation) ?? isp_saturation
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
-        align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
-        align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
-        align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
@@ -2077,18 +2029,10 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
-            "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
-            "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
             "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
-            "kernel_isa_law": NSNumber(value: tuningParams.kernel_isa_law),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
-            "bm_subpixel_quadratic": NSNumber(value: tuningParams.bm_subpixel_quadratic),
-            "grey_decimate_lowpass": NSNumber(value: tuningParams.grey_decimate_lowpass),
-            "align_fullres_polish": NSNumber(value: tuningParams.align_fullres_polish),
-            "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
-            "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
@@ -2118,9 +2062,6 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_saturation": NSNumber(value: tuningParams.isp_saturation),
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
-            "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
-            "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
-            "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
