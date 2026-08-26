@@ -252,7 +252,20 @@ struct IspParams {
     // blown highlight renders white. The per-channel output curve used to hide
     // this by compressing the largest channel hardest; moving the curve onto
     // luminance was correct but removed that accidental cover.
-    float highlight_knee = 0.88f;
+    // 1.0 = disabled. recover_highlight (render_isp.cpp) was calibrated for
+    // the PRE-whitened DNG storage era, where anything near full scale was
+    // genuinely clipped -- no headroom above it. With un-whitened storage
+    // (Config::dng_store_unwhitened, the current default) the whole image is
+    // uniformly rescaled by 1/gmax on reload, and recovered highlight detail
+    // (what used to hard-clip at 1.0) now legitimately lives in exactly the
+    // 0.7-1.0 range this knee used to treat as "probably clipped, flatten
+    // it" -- discarding the detail the DNG side was built to preserve, and
+    // reading as a flattened/denoised look in bright regions. Clip
+    // neutralization for un-whitened DNGs is ReapplyWhiteBalanceIfStored's
+    // job now (SRBridge.mm), calibrated against the real container ceiling
+    // in the stored domain. Raise this off 1.0 only for legacy pre-whitened
+    // DNGs (wb == 1,1,1 on load), where that reapply path never runs.
+    float highlight_knee = 1.0f;
     // How much of the local (as opposed to global) tone mapping to apply.
     // 0 disables it and leaves a purely global render.
     float local_strength = 0.75f;

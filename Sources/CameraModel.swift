@@ -201,7 +201,7 @@ struct TuningParams: Equatable, Codable {
     // here without changing the other silently splits the two.
     var isp_enabled: Bool = true
     var isp_exposure_ev: Float = 0.0
-    var isp_highlight_knee: Float = 0.88
+    var isp_highlight_knee: Float = 1.0
     var isp_local_strength: Float = 0.75
     var isp_highlight: Float = 0.65
     var isp_shadow: Float = 0.28
