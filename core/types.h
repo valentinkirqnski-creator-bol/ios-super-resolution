@@ -756,7 +756,15 @@ struct Config {
     // stands, and the ambiguity fallback (keep the seed) is never refined.
     // Matters most on the decimate grey, where every residual ICA cannot
     // recover is twice as large in raw pixels.
-    bool  bm_subpixel_quadratic = true;
+    //
+    // OFF by default here, unlike the commit it came from: this branch is the
+    // dc92f15 snapshot plus the overlapped-tile merge and nothing else, and
+    // this feature arrived only as incidental baggage of that merge's
+    // prerequisite (54505f9 bundled two unrelated flow features in one
+    // commit). It changes the alignment every frame, so leaving it on made
+    // the default output differ from dc92f15 for a reason nobody asked for.
+    // The Settings toggle is still there to opt in.
+    bool  bm_subpixel_quadratic = false;
 
     // At motion boundaries, SELECT a tile vector instead of blending.
     // Bilinear sampling between tile centres is correct where the field is
@@ -771,7 +779,23 @@ struct Config {
     // best explains the alignment guide there (L1 over the cell footprint).
     // Every warping consumer samples the refined grid through the same
     // sample_bilinear entry point, so mask and merge stay in lockstep.
-    bool  flow_boundary_selection = true;
+    //
+    // OFF by default here, for the reason above (incidental baggage of the
+    // overlap merge's prerequisite) AND for a correctness reason specific to
+    // this branch: "mask and merge stay in lockstep" is NOT currently true on
+    // the GPU path. compute_robustness_metal_impl deliberately stays on the
+    // COARSE grid (see the comment there) while acquire_frame_gpu uploads the
+    // FINE one, so with this on, the mask scores a correspondence the merge
+    // never fetches -- exactly what the sample_bilinear comment above warns
+    // about, and it shows up as unrejected sub-pixel misalignment at motion
+    // boundaries. The coarse-grid choice was made to avoid reconciling this
+    // function's aperture-rejection machinery (flow_reject_1d_enabled, which
+    // dc92f15 has and the upstream commit had already deleted) -- but that
+    // branch is dead by default, so the desync buys nothing. Fixing the GPU
+    // mask to duplicate S/motion_irregular/match_ambiguous onto the fine grid
+    // would let this default back on; until then it stays off, and the fine
+    // grid is built only when the overlap merge explicitly asks for it.
+    bool  flow_boundary_selection = false;
     // Raw-pixel disagreement (Chebyshev, across the four corner vectors)
     // above which a cell is treated as a motion boundary. Below it, blending
     // is not just harmless but preferable -- it carries sub-tile gradients

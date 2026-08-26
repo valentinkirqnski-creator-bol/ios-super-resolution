@@ -109,10 +109,10 @@ struct TuningParams: Equatable, Codable {
     var kernel_anisotropy_continuous: Bool = true
     /// Quadratic sub-cell fit at each block-matching winner (Wronski's
     /// sub-pixel estimator). Integer flow becomes ~0.1-0.25px flow per level.
-    var bm_subpixel_quadratic: Bool = true
+    var bm_subpixel_quadratic: Bool = false
     /// At motion boundaries, pick the best single tile vector instead of
     /// blending two different motions. Smooth regions stay bilinear.
-    var flow_boundary_selection: Bool = true
+    var flow_boundary_selection: Bool = false
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
