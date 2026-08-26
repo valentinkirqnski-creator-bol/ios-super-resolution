@@ -102,7 +102,7 @@ struct TuningParams: Equatable, Codable {
     var kernel_anisotropy_zero_floor: Bool = true
     /// Exponent on the stretch weight: higher concentrates elongation onto
     /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
-    var kernel_stretch_gamma: Float = 2.0
+    var kernel_stretch_gamma: Float = 1.0
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true

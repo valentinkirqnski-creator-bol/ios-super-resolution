@@ -997,7 +997,7 @@ struct Config {
     // clean single-orientation edge (coherence ~0.9) keeps 95% of the full
     // k_stretch = 4 elongation the manual override was giving up. Raising
     // gamma concentrates stretch onto ever-more-coherent structure.
-    f32  kernel_stretch_gamma = 2.0f;
+    f32  kernel_stretch_gamma = 1.0f;
 
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
