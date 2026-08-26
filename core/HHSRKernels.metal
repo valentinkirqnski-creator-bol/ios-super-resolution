@@ -1261,8 +1261,8 @@ static inline void merge_comp_contrib(device const float* img,
     int py = int(lr_y / float(p.tile_size));
     float flowx, flowy;
     if (p.flow_bilinear != 0u) {
-        flow_sample(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
-                    float(p.tile_size), p.flow_bilinear, flowx, flowy);
+        flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
+                             float(p.tile_size), flowx, flowy);
     } else {
         flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
         flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
