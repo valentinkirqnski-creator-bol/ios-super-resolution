@@ -1,9 +1,10 @@
 #include "render_isp.h"
-#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <vector>
+
+#include "parallel.h"
 
 namespace hhsr {
 namespace {
@@ -26,6 +27,19 @@ constexpr f32 kAutoKey = 0.2824f;
 
 inline f32 luma_of(f32 r, f32 g, f32 b) {
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+// Pull a near-clipped pixel toward neutral at its own peak. Smoothstep rather
+// than a linear ramp so there is no visible edge where recovery begins.
+inline void recover_highlight(f32& r, f32& g, f32& b, f32 knee) {
+    if (knee >= 1.f) return;
+    const f32 mx = std::max(r, std::max(g, b));
+    if (mx <= knee) return;
+    const f32 t = clampf((mx - knee) / std::max(1.f - knee, kEps), 0.f, 1.f);
+    const f32 w = t * t * (3.f - 2.f * t);
+    r += (mx - r) * w;
+    g += (mx - g) * w;
+    b += (mx - b) * w;
 }
 
 // Camera linear -> sRGB linear, measured from a HandheldSR linear DNG and its
@@ -105,9 +119,25 @@ inline f32 tone_curve(f32 x, f32 white) {
     return x * (1.f + x / w2) / (1.f + x);
 }
 
-inline f32 srgb_oetf(f32 v) {
+inline f32 srgb_oetf_exact(f32 v) {
     v = clampf(v, 0.f, 1.f);
     return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+}
+
+// Table sizes chosen so linear interpolation stays well under a quantisation
+// step: the OETF's worst curvature is near v=0.003, where the interpolation
+// error works out around 0.02 of a 255-level step.
+constexpr int kOetfN = 2048;
+constexpr int kLcN = 2048;
+constexpr f32 kLcMax = 20.f;     // matches the clamp on the detail ratio
+
+inline f32 lut_sample(const std::vector<f32>& t, f32 x, f32 scale) {
+    const f32 p = x * scale;
+    const int i = (int)p;
+    if (i < 0) return t.front();
+    if (i >= (int)t.size() - 1) return t.back();
+    const f32 f = p - (f32)i;
+    return t[i] + (t[i + 1] - t[i]) * f;
 }
 
 // Contrast as an S-curve about mid display grey. Applied to luminance and then
@@ -154,6 +184,36 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
     for (int i = 0; i < 9; ++i)
         st.m[i] = cam_to_srgb ? cam_to_srgb[i] : kDefaultCamToSrgb[i];
 
+    // Blend toward identity, then rescale each row back to its original sum so
+    // the neutral response -- and therefore the exposure -- does not move.
+    // Baked in here so it costs nothing per pixel.
+    const f32 cs = clampf(p.colour_strength, 0.f, 1.f);
+    if (cs < 1.f) {
+        for (int r = 0; r < 3; ++r) {
+            const f32 want = st.m[r * 3 + 0] + st.m[r * 3 + 1] + st.m[r * 3 + 2];
+            f32 got = 0.f;
+            for (int c = 0; c < 3; ++c) {
+                const f32 ident = (r == c) ? 1.f : 0.f;
+                st.m[r * 3 + c] = ident * (1.f - cs) + st.m[r * 3 + c] * cs;
+                got += st.m[r * 3 + c];
+            }
+            if (std::fabs(got) > 1e-6f) {
+                const f32 k = want / got;
+                for (int c = 0; c < 3; ++c) st.m[r * 3 + c] *= k;
+            }
+        }
+    }
+
+    st.oetf.resize(kOetfN);
+    for (int i = 0; i < kOetfN; ++i)
+        st.oetf[i] = srgb_oetf_exact((f32)i / (f32)(kOetfN - 1));
+    st.lcurve.resize(kLcN);
+    const f32 lc = std::max(p.local_contrast, 0.f);
+    for (int i = 0; i < kLcN; ++i) {
+        const f32 ratio = (f32)i / (f32)(kLcN - 1) * kLcMax;
+        st.lcurve[i] = (lc > 0.f) ? std::pow(std::max(ratio, 1e-4f), lc) : 1.f;
+    }
+
     // Downsample so the short side keeps ~128 samples: enough for the base layer
     // to follow real scene structure, small enough that the whole analysis is a
     // few MB and a few milliseconds at 48MP.
@@ -168,21 +228,32 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 
     // Box-average luminance into the low-res grid. Averaging rather than
     // point-sampling keeps the base layer free of the input's own noise.
+    // One task per OUTPUT row, so no two tasks touch the same accumulator and
+    // the reduction needs no locking. Iterating input rows instead would have
+    // several tasks writing the same gy.
     std::vector<f32> Y((size_t)gw * gh, 0.f);
-    std::vector<f32> cnt((size_t)gw * gh, 0.f);
-    for (int y = 0; y < H; ++y) {
-        const int gy = std::min(gh - 1, y / f);
-        const uint16_t* row = rgb16 + (size_t)y * W * 3;
-        for (int x = 0; x < W; ++x) {
-            const int gx = std::min(gw - 1, x / f);
-            const f32 l = luma_of(row[x * 3 + 0] * (1.f / 65535.f),
-                                  row[x * 3 + 1] * (1.f / 65535.f),
-                                  row[x * 3 + 2] * (1.f / 65535.f));
-            Y[(size_t)gy * gw + gx] += l;
-            cnt[(size_t)gy * gw + gx] += 1.f;
+    parallel_rows(gh, 0, [&](int gy) {
+        f32* out = &Y[(size_t)gy * gw];
+        std::vector<f32> cnt((size_t)gw, 0.f);
+        const int y0 = gy * f;
+        const int y1 = (gy == gh - 1) ? H : std::min(H, y0 + f);
+        for (int y = y0; y < y1; ++y) {
+            const uint16_t* row = rgb16 + (size_t)y * W * 3;
+            for (int x = 0; x < W; ++x) {
+                const int gx = std::min(gw - 1, x / f);
+                f32 rr = row[x * 3 + 0] * (1.f / 65535.f);
+                f32 gg = row[x * 3 + 1] * (1.f / 65535.f);
+                f32 bb = row[x * 3 + 2] * (1.f / 65535.f);
+                // Same recovery the render applies, or the base layer would read
+                // a blown magenta highlight as ~30% darker than it renders and
+                // under-compress it.
+                recover_highlight(rr, gg, bb, p.highlight_knee);
+                out[gx] += luma_of(rr, gg, bb);
+                cnt[gx] += 1.f;
+            }
         }
-    }
-    for (size_t i = 0; i < Y.size(); ++i) Y[i] /= std::max(cnt[i], 1.f);
+        for (int gx = 0; gx < gw; ++gx) out[gx] /= std::max(cnt[gx], 1.f);
+    });
 
     // Automatic exposure from the log-average, which tracks what the scene
     // actually contains rather than its extremes: a small bright window does not
@@ -264,9 +335,15 @@ inline f32 sample_map(const std::vector<f32>& map, int gw, int gh,
 
 void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
                 f32& sr, f32& sg, f32& sb) {
-    r = std::max(r, 0.f) * st.exposure;
-    g = std::max(g, 0.f) * st.exposure;
-    b = std::max(b, 0.f) * st.exposure;
+    r = std::max(r, 0.f);
+    g = std::max(g, 0.f);
+    b = std::max(b, 0.f);
+    // Before exposure: the knee is a property of where the stored value sits
+    // against full scale, not of how bright it is rendered.
+    recover_highlight(r, g, b, st.p.highlight_knee);
+    r *= st.exposure;
+    g *= st.exposure;
+    b *= st.exposure;
 
     if (st.valid && st.p.local_strength > 0.f) {
         f32 gain = sample_map(st.gain, st.gw, st.gh, x, y, st.shift);
@@ -275,7 +352,8 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
             // micro-contrast: no high-pass, so no halo and no noise gained.
             const f32 base = sample_map(st.base, st.gw, st.gh, x, y, st.shift);
             const f32 ratio = luma_of(r, g, b) / std::max(base, kEps);
-            gain *= std::pow(clampf(ratio, 0.05f, 20.f), st.p.local_contrast);
+            gain *= lut_sample(st.lcurve, clampf(ratio, 0.05f, kLcMax),
+                               (f32)(kLcN - 1) / kLcMax);
         }
         // One factor for all three channels: hue survives.
         r *= gain;
@@ -296,25 +374,46 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     lg = std::max(lg, 0.f);
     lb = std::max(lb, 0.f);
 
-    // Output curve on LUMINANCE, then re-applied to RGB as a ratio, not on each
-    // channel independently. Per-channel Reinhard is only hue-safe for exactly
-    // neutral input (r==g==b): apply the SAME monotone curve to three DIFFERENT
-    // values and their ratios move, because tone_curve's compression fraction
-    // depends on the input value itself. A warm highlight (e.g. r=1.5, g=1.0,
-    // b=0.8) came out measurably less warm after the old per-channel curve --
-    // exactly the class of shift that reads as a colour cast near clipping.
-    // The luminance ratio preserves chromaticity by construction: every channel
-    // is scaled by the identical factor.
-    const f32 y_in = luma_of(lr, lg, lb);
-    const f32 y_out = tone_curve(y_in, st.white);
-    const f32 scale = y_out / std::max(y_in, kEps);
-    lr *= scale;
-    lg *= scale;
-    lb *= scale;
+    // Output curve on LUMINANCE, with RGB scaled by the resulting ratio.
+    //
+    // Running it on each channel independently -- which is what this did first,
+    // and what most naive tone mappers do -- compresses whichever channel is
+    // largest the hardest. That drains saturation and rotates hue: measured, a
+    // red at value 0.750 came out at 0.562, and a sky blue rotated from hue 214
+    // to 210. Dark and slightly desaturated red reads as brown; blue rotated
+    // toward cyan reads as teal. Neither can be tuned out downstream with the
+    // matrix or vibrance, because the curve itself is doing the damage.
+    const f32 y_lin = luma_of(lr, lg, lb);
+    f32 y_out = 0.f;
+    if (y_lin > kEps) {
+        y_out = tone_curve(y_lin, st.white);
+        const f32 k = y_out / y_lin;
+        lr *= k;
+        lg *= k;
+        lb *= k;
+    } else {
+        lr = lg = lb = 0.f;
+    }
 
-    sr = srgb_oetf(lr);
-    sg = srgb_oetf(lg);
-    sb = srgb_oetf(lb);
+    // Holding luminance lets a saturated channel land above 1. Roll it back
+    // toward the neutral of that same luminance rather than clipping: a bright
+    // saturated colour then desaturates toward white the way it does optically,
+    // and clipping per channel here would reintroduce exactly the hue shift the
+    // luminance curve just removed.
+    {
+        const f32 mx = std::max(lr, std::max(lg, lb));
+        if (mx > 1.f) {
+            const f32 t = clampf((mx - 1.f) / std::max(mx - y_out, kEps), 0.f, 1.f);
+            lr += (y_out - lr) * t;
+            lg += (y_out - lg) * t;
+            lb += (y_out - lb) * t;
+        }
+    }
+
+    const f32 osc = (f32)(kOetfN - 1);
+    sr = lut_sample(st.oetf, clampf(lr, 0.f, 1.f), osc);
+    sg = lut_sample(st.oetf, clampf(lg, 0.f, 1.f), osc);
+    sb = lut_sample(st.oetf, clampf(lb, 0.f, 1.f), osc);
 
     // Black point. Without it the shadow lift leaves the darkest pixels grey,
     // and the image reads flat however much contrast is applied afterwards.
@@ -380,127 +479,6 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     sr = clampf(sr, 0.f, 1.f);
     sg = clampf(sg, 0.f, 1.f);
     sb = clampf(sb, 0.f, 1.f);
-}
-
-
-// Chroma noise reduction, detail-gated -- carried forward from the later
-// render so the bridge and the Settings slider keep working. INERT at the
-// shipped default (chroma_denoise = 0), which keeps this file's output
-// byte-identical to commit c7f3dda's render.
-void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p) {
-    if (!rgb16 || W <= 0 || H <= 0) return;
-    const f32 amount = clampf(p.chroma_denoise, 0.f, 1.f);
-    if (amount <= 0.f) return;
-
-    constexpr int kCShift = 3;                     // 1/8 in each axis
-    const int cw = std::max(1, (W + (1 << kCShift) - 1) >> kCShift);
-    const int ch = std::max(1, (H + (1 << kCShift) - 1) >> kCShift);
-    // Radius is specified in full-resolution pixels so the control means the
-    // same thing regardless of sensor size.
-    const int rad = std::max(1, (int)std::lround(
-        std::max(1.f, p.chroma_denoise_radius) / (f32)(1 << kCShift)));
-
-    std::vector<f32> dr((size_t)cw * ch, 0.f), db((size_t)cw * ch, 0.f);
-    std::vector<f32> wsum((size_t)cw * ch, 0.f);
-
-    // Downsample the colour differences. Accumulating dr/db rather than RGB
-    // keeps the average in the space that gets filtered, so no information
-    // crosses between luma and chroma on the way down.
-    const f32 inv = 1.f / 65535.f;
-    for (int y = 0; y < H; ++y) {
-        const int cy = y >> kCShift;
-        for (int x = 0; x < W; ++x) {
-            const size_t i = ((size_t)y * (size_t)W + (size_t)x) * 3;
-            const f32 r = rgb16[i + 0] * inv;
-            const f32 g = rgb16[i + 1] * inv;
-            const f32 b = rgb16[i + 2] * inv;
-            const f32 Y = luma_of(r, g, b);
-            const size_t c = (size_t)cy * cw + (size_t)(x >> kCShift);
-            dr[c] += r - Y;
-            db[c] += b - Y;
-            wsum[c] += 1.f;
-        }
-    }
-    for (size_t i = 0; i < dr.size(); ++i) {
-        const f32 n = std::max(wsum[i], kEps);
-        dr[i] /= n;
-        db[i] /= n;
-    }
-
-    std::vector<f32> br, bb;
-    box_filter(dr, br, cw, ch, rad);
-    box_filter(db, bb, cw, ch, rad);
-
-    // Noise scale for the detail gate below: the median per-pixel deviation of
-    // chroma from its local smoothed value, measured on a strided sample.
-    // Chroma NOISE deviates from the local mean by about sigma everywhere;
-    // a genuinely coloured object (a flower against grass, a red jacket)
-    // deviates by many sigma. The median is dominated by the former.
-    f32 sigma = 0.f;
-    {
-        std::vector<f32> devs;
-        devs.reserve((size_t)((H + 7) / 8) * (size_t)((W + 7) / 8));
-        for (int y = 0; y < H; y += 8) {
-            for (int x = 0; x < W; x += 8) {
-                const size_t i = ((size_t)y * (size_t)W + (size_t)x) * 3;
-                const f32 r = rgb16[i + 0] * inv;
-                const f32 g = rgb16[i + 1] * inv;
-                const f32 b = rgb16[i + 2] * inv;
-                const f32 Y = luma_of(r, g, b);
-                const f32 nr = sample_map(br, cw, ch, x, y, kCShift);
-                const f32 nb = sample_map(bb, cw, ch, x, y, kCShift);
-                devs.push_back(std::fabs((r - Y) - nr) + std::fabs((b - Y) - nb));
-            }
-        }
-        if (!devs.empty()) {
-            std::nth_element(devs.begin(), devs.begin() + devs.size() / 2, devs.end());
-            sigma = devs[devs.size() / 2];
-        }
-        sigma = std::max(sigma, 1e-5f);
-    }
-    const f32 gate_lo = 2.f * sigma;   // <= this: noise, smooth fully
-    const f32 gate_hi = 6.f * sigma;   // >= this: real colour, leave alone
-
-    // Recombine. The filtered difference is sampled bilinearly so no block
-    // structure from the decimated grid can print through, and blended by
-    // `amount` so the control is continuous rather than on/off.
-    //
-    // The blend is GATED per pixel by how far the pixel's chroma sits from
-    // the local smoothed chroma, in units of the measured noise scale.
-    // Without the gate this stage pulled every chroma deviation toward the
-    // local mean -- which is a fine model of noise on a grey mountainside and
-    // a terrible one of a pink flower in green grass: at amount 0.75 small
-    // saturated objects visibly drained toward grey (measured on burst7).
-    // Soft-coring keeps them: deviations within ~2 sigma are treated as noise
-    // and fully smoothed, beyond ~6 sigma as signal and left untouched, with
-    // a smooth ramp between.
-    parallel_rows(H, 0, [&](int y) {
-        for (int x = 0; x < W; ++x) {
-            const f32 nr = sample_map(br, cw, ch, x, y, kCShift);
-            const f32 nb = sample_map(bb, cw, ch, x, y, kCShift);
-            const size_t i = ((size_t)y * (size_t)W + (size_t)x) * 3;
-            const f32 r = rgb16[i + 0] * inv;
-            const f32 g = rgb16[i + 1] * inv;
-            const f32 b = rgb16[i + 2] * inv;
-            const f32 Y = luma_of(r, g, b);
-            const f32 d = std::fabs((r - Y) - nr) + std::fabs((b - Y) - nb);
-            f32 t = (d - gate_lo) / std::max(gate_hi - gate_lo, kEps);
-            t = clampf(t, 0.f, 1.f);
-            const f32 keep = t * t * (3.f - 2.f * t);   // smoothstep
-            const f32 k = amount * (1.f - keep);
-            f32 cr = (r - Y) + ((nr - (r - Y)) * k);
-            f32 cb = (b - Y) + ((nb - (b - Y)) * k);
-            // dg from the identity, so luma is preserved exactly rather than
-            // approximately: Y == luma_of(Y+cr, Y+cg, Y+cb) holds by construction.
-            const f32 cg = -(0.2126f * cr + 0.0722f * cb) / 0.7152f;
-            const f32 orr = std::max(0.f, Y + cr);
-            const f32 og = std::max(0.f, Y + cg);
-            const f32 ob = std::max(0.f, Y + cb);
-            rgb16[i + 0] = (uint16_t)clampf(std::lround(orr * 65535.f), 0.f, 65535.f);
-            rgb16[i + 1] = (uint16_t)clampf(std::lround(og  * 65535.f), 0.f, 65535.f);
-            rgb16[i + 2] = (uint16_t)clampf(std::lround(ob  * 65535.f), 0.f, 65535.f);
-        }
-    });
 }
 
 }  // namespace hhsr

@@ -1001,10 +1001,6 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
-    // Before isp_analyse, so the automatic exposure and the local gain map are
-    // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
-        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
@@ -1095,10 +1091,6 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // Analysed at full resolution even though the preview is downscaled, so the
     // thumbnail and the exported JPEG get the same exposure and gain map and
     // cannot disagree about how the shot looks.
-    // Before isp_analyse, so the automatic exposure and the local gain map are
-    // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
-        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
