@@ -1285,6 +1285,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     DngStreamWriter writer;
     const std::string& model = work.camera_model.empty() ? std::string("HandheldSR-x2") : work.camera_model;
     const std::string& make = work.camera_make.empty() ? std::string("HandheldSR") : work.camera_make;
+    const CaptureExif exif = DngStreamWriter::exif_from_config(work);
     if (!writer.open(dng_path, Ws, Hs, model, work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
                      work.white_balance,
@@ -1294,7 +1295,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                      // writer then emits AsShotNeutral = 1/gain and stores
                      // the real gains in the private tag for the app render.
                      work.raw_prewhitened && !dng_unwhiten_active(work, nch),
-                     work.dng_lossless_jpeg)) {
+                     work.dng_lossless_jpeg, &exif)) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
 #if defined(__APPLE__)

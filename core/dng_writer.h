@@ -8,6 +8,18 @@
 
 namespace hhsr {
 
+// Capture-time EXIF the writer may embed in a real Exif sub-IFD (tag 34665).
+// Mirrors Config's capture_* fields (see types.h). 0 / empty = not
+// available -- the matching tag is omitted, never written as a false zero.
+struct CaptureExif {
+    float iso = 0.f;
+    float exposure_seconds = 0.f;
+    float f_number = 0.f;
+    float focal_length_mm = 0.f;
+    std::string lens_model;
+    std::string datetime;  // "YYYY:MM:DD HH:MM:SS"; empty = use file time
+};
+
 bool write_linear_dng(const std::string& path, const Image& rgb,
                       const std::string& camera_model = "HandheldSR-x2");
 
@@ -75,7 +87,20 @@ public:
               const std::string& camera_make = "HandheldSR",
               const float* camToSrgb = nullptr,
               bool pixelsPrewhitened = false,
-              bool losslessJpeg = false);
+              bool losslessJpeg = false,
+              const CaptureExif* exif = nullptr);
+
+    // Convenience: build a CaptureExif from a Config's capture_* fields.
+    static CaptureExif exif_from_config(const Config& cfg) {
+        CaptureExif e;
+        e.iso = cfg.capture_iso;
+        e.exposure_seconds = cfg.capture_exposure_seconds;
+        e.f_number = cfg.capture_f_number;
+        e.focal_length_mm = cfg.capture_focal_length_mm;
+        e.lens_model = cfg.capture_lens_model;
+        e.datetime = cfg.capture_datetime;
+        return e;
+    }
 
     bool write_rows(const uint16_t* rgb16, int nrows);
     bool close();

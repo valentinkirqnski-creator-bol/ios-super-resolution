@@ -102,6 +102,47 @@ struct IFD {
     }
 };
 
+// Serialize a standalone IFD (count + 12-byte entries + next-pointer=0 + heap
+// for out-of-line payloads) as it will sit at `base_offset` in the final file.
+// Used for the Exif sub-IFD: same shape as IFD0's own tail below, factored out
+// so a second, nested directory can be built without duplicating the offset
+// arithmetic that IFD0 does inline.
+static std::vector<uint8_t> serialize_ifd_at(IFD& ifd, uint32_t base_offset) {
+    std::sort(ifd.e.begin(), ifd.e.end(), [](const Entry& a, const Entry& b) {
+        return a.tag < b.tag;
+    });
+    const uint32_t n = (uint32_t)ifd.e.size();
+    const uint32_t dir_size = 2 + n * 12 + 4;
+    std::vector<uint8_t> heap;
+    for (auto& en : ifd.e) {
+        if (en.payload.empty()) continue;
+        if (heap.size() & 1) heap.push_back(0);
+        en.inlineval = base_offset + dir_size + (uint32_t)heap.size();
+        heap.insert(heap.end(), en.payload.begin(), en.payload.end());
+    }
+    std::vector<uint8_t> out;
+    w16(out, (uint16_t)n);
+    for (auto& en : ifd.e) {
+        w16(out, en.tag);
+        w16(out, en.type);
+        w32(out, en.count);
+        w32(out, en.inlineval);
+    }
+    w32(out, 0);  // next IFD
+    out.insert(out.end(), heap.begin(), heap.end());
+    return out;
+}
+
+// EXIF RATIONAL from a float exposure/aperture/focal-length value: denominator
+// chosen by magnitude so both very short shutter speeds (1/8000) and long
+// ones (several seconds) keep useful precision within a 32-bit numerator.
+static void push_rational_from_float(std::vector<uint32_t>& nd, float v) {
+    if (!(v > 0.f) || !std::isfinite(v)) { nd.push_back(0); nd.push_back(1); return; }
+    uint32_t den = (v < 1.f) ? 1000000u : 1000u;
+    nd.push_back((uint32_t)std::lround((double)v * den));
+    nd.push_back(den);
+}
+
 static std::string now_tiff_datetime() {
     char buf[20];
     std::time_t t = std::time(nullptr);
@@ -114,6 +155,7 @@ static std::string now_tiff_datetime() {
     std::strftime(buf, sizeof(buf), "%Y:%m:%d %H:%M:%S", &tm);
     return std::string(buf);
 }
+
 
 // TIFF Predictor=2 horizontal differencing (chunky RGB16), in-place, right→left.
 static void apply_hdiff_rgb16(uint16_t* row, int W) {
@@ -253,7 +295,8 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              bool lossless = false,
                                              int tile_w = 0, int tile_l = 0,
                                              uint32_t* tile_off_arr_pos = nullptr,
-                                             uint32_t* tile_cnt_arr_pos = nullptr) {
+                                             uint32_t* tile_cnt_arr_pos = nullptr,
+                                             const CaptureExif* exif = nullptr) {
     float derived_cam_to_srgb[9];
     const float* jpeg_cam_to_srgb = cam_to_srgb;
     // The matrix cached in the private tag must ALWAYS be the whitened-input
@@ -311,7 +354,14 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     }
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
-    ifd.ascii(306, now_tiff_datetime()); // DateTime
+    ifd.ascii(306, now_tiff_datetime()); // DateTime (file write time)
+    // ExifIFD reserved here so it grows IFD0 by exactly one entry regardless
+    // of which fields exif carries; the offset is patched once the Exif
+    // sub-IFD's own bytes are laid out, below.
+    const bool has_exif = exif && (exif->iso > 0.f || exif->exposure_seconds > 0.f ||
+                                   exif->f_number > 0.f || exif->focal_length_mm > 0.f ||
+                                   !exif->lens_model.empty() || !exif->datetime.empty());
+    if (has_exif) ifd.longv(34665, 0);  // ExifIFD (patched below)
     if (!lossless)
         ifd.shortv(317, 1);            // Predictor = none (unused by lossless JPEG)
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
@@ -398,6 +448,34 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
             if (e.tag == 325 && tile_cnt_arr_pos) *tile_cnt_arr_pos = e.inlineval;
         }
     }
+    if (has_exif) {
+        IFD exif_ifd;
+        if (exif->iso > 0.f)
+            exif_ifd.shorts(34855, {(uint16_t)clampf(exif->iso, 0.f, 65535.f)});
+        if (exif->exposure_seconds > 0.f) {
+            std::vector<uint32_t> nd;
+            push_rational_from_float(nd, exif->exposure_seconds);
+            exif_ifd.rational(33434, nd);
+        }
+        if (exif->f_number > 0.f) {
+            std::vector<uint32_t> nd;
+            push_rational_from_float(nd, exif->f_number);
+            exif_ifd.rational(33437, nd);
+        }
+        if (exif->focal_length_mm > 0.f) {
+            std::vector<uint32_t> nd;
+            push_rational_from_float(nd, exif->focal_length_mm);
+            exif_ifd.rational(37386, nd);
+        }
+        if (!exif->lens_model.empty()) exif_ifd.ascii(42036, exif->lens_model);
+        exif_ifd.ascii(36867, exif->datetime.empty() ? now_tiff_datetime() : exif->datetime);
+        if (heap.size() & 1) heap.push_back(0);
+        const uint32_t exif_offset = heap_base + (uint32_t)heap.size();
+        std::vector<uint8_t> exif_bytes = serialize_ifd_at(exif_ifd, exif_offset);
+        heap.insert(heap.end(), exif_bytes.begin(), exif_bytes.end());
+        for (auto& e : ifd.e)
+            if (e.tag == 34665) e.inlineval = exif_offset;
+    }
     uint32_t strip_offset = heap_base + (uint32_t)heap.size();
     if (strip_offset & 1) strip_offset += 1;
     if (strip_off_entry >= 0) ifd.e[(size_t)strip_off_entry].inlineval = strip_offset;
@@ -451,7 +529,8 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
                            const std::string& camera_make, const float* camToSrgb,
-                           bool pixelsPrewhitened, bool losslessJpeg) {
+                           bool pixelsPrewhitened, bool losslessJpeg,
+                           const CaptureExif* exif) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
     compressed_bytes_ = 0;
@@ -480,7 +559,8 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                                                    bakedSrgb, camToSrgb, pixelsPrewhitened,
                                                    strip_offset, strip_byte_counts_offset_,
                                                    lossless_, tile_w_, tile_l_,
-                                                   &tile_off_arr_pos_, &tile_cnt_arr_pos_);
+                                                   &tile_off_arr_pos_, &tile_cnt_arr_pos_,
+                                                   exif);
     if (lossless_ && (!tile_off_arr_pos_ || !tile_cnt_arr_pos_)) return false;
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;

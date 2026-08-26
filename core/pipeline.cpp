@@ -239,13 +239,14 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     int Ws = (int)std::lround(work.scale * ref.w);
 
     DngStreamWriter writer;
+    const CaptureExif exif = DngStreamWriter::exif_from_config(work);
     if (!writer.open(dng_path, Ws, Hs, "HandheldSR-x2", work.orientation,
                      work.has_color_matrix ? work.color_matrix : nullptr,
                      work.bayer_mode ? work.white_balance : nullptr,
                      work.bake_srgb, "HandheldSR",
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
                      work.raw_prewhitened && !dng_unwhiten_active(work, nch),
-                     work.dng_lossless_jpeg)) {
+                     work.dng_lossless_jpeg, &exif)) {
         report("Error: cannot open output DNG", 1.0f);
         return Image();
     }

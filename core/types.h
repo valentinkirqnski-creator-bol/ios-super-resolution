@@ -1044,6 +1044,17 @@ struct Config {
 
     std::string camera_make;
     std::string camera_model;
+    // Capture-time EXIF, read from AVCapturePhoto's own metadata (FillReference
+    // MetadataFromRawFrame). 0 / empty = not available; the writer omits that
+    // tag rather than emitting a false zero. Written into the output DNG's own
+    // Exif sub-IFD, so "which phone / lens / ISO / shutter speed was this shot
+    // with" survives in the file like any other camera's raw output.
+    float capture_iso = 0.f;               // ISOSpeedRatings
+    float capture_exposure_seconds = 0.f;  // ExposureTime
+    float capture_f_number = 0.f;          // FNumber (0 if the lens has no fixed aperture)
+    float capture_focal_length_mm = 0.f;   // FocalLength
+    std::string capture_lens_model;
+    std::string capture_datetime;          // "YYYY:MM:DD HH:MM:SS", EXIF format
 
     int num_threads = 0;      // 0 => hardware_concurrency
     bool use_gpu = false;     // opt-in Vulkan compute merge (experimental)
