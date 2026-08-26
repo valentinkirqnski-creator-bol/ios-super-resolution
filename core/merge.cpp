@@ -210,12 +210,23 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     hy[a] = flow.fine_flow[o + 1];
                     hw[a] = w4[a];
                 }
+                // CLUSTER, not exact-dedup: measured lattice vectors are
+                // never bit-identical (independent sub-pixel fits), so an
+                // exact test never fires and every pixel paid 4 gathers --
+                // the merge stopped hiding behind the CPU. Hypotheses within
+                // a quarter pixel are the same motion to sub-quantisation
+                // accuracy; fold them into their weighted mean. Smooth
+                // regions collapse to ONE gather; only real disagreements
+                // (>= the boundary threshold) stay separate.
                 for (int a = 1; a < 4; ++a)
                     for (int b = 0; b < a; ++b)
                         if (hw[a] > 0.f && hw[b] > 0.f &&
-                            std::fabs(hx[a] - hx[b]) < 1e-3f &&
-                            std::fabs(hy[a] - hy[b]) < 1e-3f) {
-                            hw[b] += hw[a];
+                            std::fabs(hx[a] - hx[b]) < 0.25f &&
+                            std::fabs(hy[a] - hy[b]) < 0.25f) {
+                            const f32 wsum = hw[b] + hw[a];
+                            hx[b] = (hx[b] * hw[b] + hx[a] * hw[a]) / wsum;
+                            hy[b] = (hy[b] * hw[b] + hy[a] * hw[a]) / wsum;
+                            hw[b] = wsum;
                             hw[a] = 0.f;
                             break;
                         }

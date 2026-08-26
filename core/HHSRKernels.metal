@@ -1235,11 +1235,16 @@ static inline void merge_comp_contrib(device const float* img,
             hy[a] = flow[o + 1u];
             hw[a] = w4[a];
         }
+        // Cluster within a quarter pixel (weighted mean), matching the CPU
+        // path: exact dedup never fires on measured lattices and cost 4x.
         for (int a = 1; a < 4; ++a)
             for (int b = 0; b < a; ++b)
                 if (hw[a] > 0.f && hw[b] > 0.f &&
-                    fabs(hx[a] - hx[b]) < 1e-3f && fabs(hy[a] - hy[b]) < 1e-3f) {
-                    hw[b] += hw[a];
+                    fabs(hx[a] - hx[b]) < 0.25f && fabs(hy[a] - hy[b]) < 0.25f) {
+                    float wsum = hw[b] + hw[a];
+                    hx[b] = (hx[b] * hw[b] + hx[a] * hw[a]) / wsum;
+                    hy[b] = (hy[b] * hw[b] + hy[a] * hw[a]) / wsum;
+                    hw[b] = wsum;
                     hw[a] = 0.f;
                     break;
                 }
