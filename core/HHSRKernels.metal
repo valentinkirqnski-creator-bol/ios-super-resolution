@@ -1209,8 +1209,15 @@ static inline void merge_comp_contrib(device const float* img,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
     int hr_i = int(p.y0 + local_i);
-    float lr_x = (float(hr_j) + 0.5f) / p.scale;
-    float lr_y = (float(hr_i) + 0.5f) / p.scale;
+    // NO +0.5 half-pixel offset here: that came from b65b51f, which lands
+    // after dc92f15 and is not on this branch. It rode in with the d0f2b89
+    // port because this dispatcher was lifted whole from a version that
+    // already had it. Keep this identical to accumulate_comp in merge.cpp
+    // (the golden CPU reference), which samples at hr / scale -- half an
+    // output pixel of drift here shifts every img fetch AND the robustness
+    // mask lookup below, which reads as sub-pixel misalignment.
+    float lr_x = float(hr_j) / p.scale;
+    float lr_y = float(hr_i) / p.scale;
 
     if (p.flow_bilinear == 3u) {
         float P = float(p.tile_size);
