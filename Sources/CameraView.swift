@@ -760,12 +760,12 @@ struct CameraView: View {
             .font(.caption2).foregroundColor(.secondary)
         HStack {
             Text("Stretch Selectivity")
-            Slider(value: $cam.tuningParams.kernel_stretch_gamma, in: 1.0...4.0, step: 0.25)
+            Slider(value: $cam.tuningParams.kernel_stretch_gamma, in: 1.0...16.0, step: 0.5)
             Text(String(format: "%.2f", cam.tuningParams.kernel_stretch_gamma))
                 .font(.caption.monospacedDigit())
                 .foregroundColor(.secondary)
         }
-        Text("Exponent on the stretch weight. 1.0 = plain zero-floor law. 2.0 (default) reproduces the readable-text stretch (~2:1 at text-like coherence) measured by hand-tuning k_stretch to 2, while clean single-orientation edges keep ~95% of full k_stretch. Raise further to confine elongation to only the most coherent edges.")
+        Text("Exponent on the stretch weight. 1.0 (default) = plain zero-floor law: moderate coherence (e.g. text-scale strokes) already gets 30-75% of full k_stretch. Raising it pushes that down fast -- at 4.0 moderate coherence gets under 10%; at 8.0+, only content close to a genuinely clean single-orientation edge gets stretched at all, everything short of that stays close to round. Both endpoints (round at A=1, full k_stretch/k_shrink at A>=1.95) are unchanged by this slider -- only the transition between them narrows.")
             .font(.footnote)
             .foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
