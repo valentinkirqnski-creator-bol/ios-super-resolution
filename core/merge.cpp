@@ -102,50 +102,38 @@ static inline f32 merge_soften_max_inv(const Config& cfg) {
     return 128.f;
 }
 
+// Non-finite guard ONLY. The kernel-width floor this used to apply is gone:
+// it clamped the sharp axis to sigma >= 1/sqrt(128) = 0.088 px, which at
+// k_detail 0.10 (true sigma 0.05) widened every across-edge kernel by 1.77x
+// -- softening the whole image to buy something the coverage floor already
+// provides for free.
+//
+// What the floor was actually defending against: with a very sharp kernel
+// every tap beyond a fraction of a pixel underflows exp() to 0 in float32, so
+// a colour channel whose only taps sit ~1 px away ends up with den == 0, and
+// the normalisation emits a green or black pixel. 460-main never hits this
+// because its reference pass runs the accumulated-robustness denoiser by
+// default (params.py 'merge': on), which both widens the kernel (y /= 8) and
+// grows the window to 5x5 -- neither of which this port enables.
+//
+// This port closes the same hole a cheaper way, and only where it matters:
+// accumulate_ref adds a 5e-4-weighted isotropic sigma=1 term to EVERY in-
+// bounds tap (cover_eps, below). A 3x3 window always contains all four CFA
+// sites and the reference pass always runs, so every channel of every output
+// pixel gets den >= ~1.8e-4 -- fp16-safe -- no matter how sharp the kernels
+// are or how much robustness rejected. Where real taps survive that term is
+// under 0.1% of the weight, so it costs no sharpness at all; where none does
+// it is the difference between a soft chroma estimate and a hole.
+//
+// Keep the guard itself: a non-finite inverse covariance would otherwise
+// propagate NaN into the weights and out into the image.
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
+    (void)k_max_abs;
     if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
         ixx = 2.f;
         ixy = 0.f;
         iyy = 2.f;
-        return;
     }
-    // Clamp EIGENVALUES, not the whole matrix. The previous form rescaled all
-    // three entries by one factor, which bounds the sharp axis (what the
-    // speckle fix needs) but widens the already-wide axis by the same factor
-    // -- pure blur with no coverage benefit. Measured on an edge kernel with
-    // the continuous-anisotropy defaults: sigma 0.085 x 0.68 px became
-    // 0.177 x 1.41 px, doubling the along-edge width for nothing, which is
-    // the reported over-smoothing. Bounding each eigenvalue independently
-    // gives 0.177 x 0.68: the across-edge axis widened exactly to the
-    // coverage floor, the along-edge axis untouched.
-    const f32 mean = 0.5f * (ixx + iyy);
-    const f32 half_diff = 0.5f * (ixx - iyy);
-    const f32 disc = std::sqrt(half_diff * half_diff + ixy * ixy);
-    const f32 l1 = mean + disc;                    // largest eigenvalue
-    if (!(l1 > k_max_abs)) return;                 // nothing too sharp
-    const f32 l2 = mean - disc;
-    const f32 c1 = k_max_abs;
-    const f32 c2 = std::min(l2, k_max_abs);
-    // Eigenvector of l1. Both constructions degenerate only when the matrix
-    // is (near-)isotropic diagonal, where a plain per-entry clamp is exact.
-    f32 vx = ixy;
-    f32 vy = l1 - ixx;
-    f32 n2 = vx * vx + vy * vy;
-    if (!(n2 > 0.f)) {
-        vx = l1 - iyy;
-        vy = ixy;
-        n2 = vx * vx + vy * vy;
-    }
-    if (!(n2 > 0.f)) {
-        ixx = std::min(ixx, k_max_abs);
-        iyy = std::min(iyy, k_max_abs);
-        return;
-    }
-    const f32 inv_n2 = 1.f / n2;
-    const f32 d = c1 - c2;
-    ixx = c2 + d * (vx * vx * inv_n2);
-    ixy = d * (vx * vy * inv_n2);
-    iyy = c2 + d * (vy * vy * inv_n2);
 }
 
 static inline int cuda_round_to_int(f32 x) {
@@ -414,9 +402,12 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    // See the coverage-floor comment in the tap loop below. Always active
-    // now that the ceiling is 128 in every mode.
-    const f32 cover_eps = (merge_soften_max_inv(cfg) > 64.f) ? 5e-4f : 0.f;
+    // See the coverage-floor comment in the tap loop below. Unconditional:
+    // it is now the ONLY thing standing between a very sharp kernel and a
+    // zero-denominator colour channel, since soften_inv_cov no longer floors
+    // the kernel width. Previously keyed on the ceiling being > 64, which is
+    // meaningless with the ceiling gone.
+    const f32 cover_eps = 5e-4f;
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
     const int nch = cfg.bayer_mode ? 3 : 1;
