@@ -296,11 +296,21 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     lg = std::max(lg, 0.f);
     lb = std::max(lb, 0.f);
 
-    // Output curve on each channel, then gamma. The curve is monotone and shared
-    // across channels, so neutrals stay neutral.
-    lr = tone_curve(lr, st.white);
-    lg = tone_curve(lg, st.white);
-    lb = tone_curve(lb, st.white);
+    // Output curve on LUMINANCE, then re-applied to RGB as a ratio, not on each
+    // channel independently. Per-channel Reinhard is only hue-safe for exactly
+    // neutral input (r==g==b): apply the SAME monotone curve to three DIFFERENT
+    // values and their ratios move, because tone_curve's compression fraction
+    // depends on the input value itself. A warm highlight (e.g. r=1.5, g=1.0,
+    // b=0.8) came out measurably less warm after the old per-channel curve --
+    // exactly the class of shift that reads as a colour cast near clipping.
+    // The luminance ratio preserves chromaticity by construction: every channel
+    // is scaled by the identical factor.
+    const f32 y_in = luma_of(lr, lg, lb);
+    const f32 y_out = tone_curve(y_in, st.white);
+    const f32 scale = y_out / std::max(y_in, kEps);
+    lr *= scale;
+    lg *= scale;
+    lb *= scale;
 
     sr = srgb_oetf(lr);
     sg = srgb_oetf(lg);
