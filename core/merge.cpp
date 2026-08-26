@@ -234,9 +234,27 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // Python accumulate(): lr = (output_pixel + 0.5) / scale.
-            const f32 lr_x = ((f32)hr_j + 0.5f) / scale;
-            const f32 lr_y = ((f32)hr_i + 0.5f) / scale;
+            // output_pixel / scale -- the SAME expression accumulate_ref uses
+            // for coarse_x/coarse_y below. These two must agree: the reference
+            // frame and every comparison frame are accumulated into one shared
+            // num/den grid, so sampling them at different positions offsets
+            // every comparison frame against the reference they are being
+            // fused onto.
+            //
+            // b65b51f had this as (hr + 0.5) / scale "to match python-z's
+            // accumulate" while leaving accumulate_ref on hr / scale, which
+            // put the two half an output pixel apart -- 0.25 raw px at 2x --
+            // and that mismatch is the sub-pixel misalignment. It did not
+            // actually match python-z either: python-z pairs its (hr+0.5)/s
+            // with a compensating `lr_mov_j = lr_mov_x - 0.5` before the
+            // distance (merge.py accumulate, line 398), which this port has
+            // never had, so the +0.5 alone landed a further half pixel out.
+            //
+            // 460-main -- which this function's header says it mirrors --
+            // uses output_pixel / scale in BOTH accumulate and accumulate_ref
+            // (merge.py:143 and :399). Verified by reading both references.
+            const f32 lr_x = (f32)hr_j / scale;
+            const f32 lr_y = (f32)hr_i / scale;
 
             // Python: px = int(lr_x // tile_size); no clamp on flow tile index
             const int px = (int)(lr_x / (f32)tile_size);

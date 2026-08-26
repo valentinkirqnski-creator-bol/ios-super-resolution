@@ -1281,8 +1281,14 @@ static inline void merge_comp_contrib(device const float* img,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
     int hr_i = int(p.y0 + local_i);
-    float lr_x = (float(hr_j) + 0.5f) / p.scale;
-    float lr_y = (float(hr_i) + 0.5f) / p.scale;
+    // output_pixel / scale -- twin of accumulate_comp in merge.cpp, and the
+    // SAME expression merge_accumulate_ref uses for coarse_x/coarse_y below.
+    // Reference and comparison frames share one num/den grid, so sampling
+    // them at different positions offsets every comparison frame against the
+    // reference. See the comment in merge.cpp for the b65b51f history and the
+    // reference-implementation evidence.
+    float lr_x = float(hr_j) / p.scale;
+    float lr_y = float(hr_i) / p.scale;
 
     if (p.flow_bilinear == 3u) {
         float P = float(p.tile_size);
