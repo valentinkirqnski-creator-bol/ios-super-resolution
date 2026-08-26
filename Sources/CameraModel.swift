@@ -95,13 +95,7 @@ struct TuningParams: Equatable, Codable {
     var k_denoise: Float = 0.0
     var k_stretch: Float = 4.0
     // Anisotropy shape law fixed at its measured default: continuous from the
-    // structure tensor (not the reference's hard >0.9025 switch), zero-floored
-    // (round at isotropic instead of a forced 2.5:0.75 minimum stretch).
-    // ImageStackAlignator's alternative law (kernel.cu, verbatim) stays off --
-    // it never goes round at A=1.
-    /// Exponent on the stretch weight: higher concentrates elongation onto
-    /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
-    var kernel_stretch_gamma: Float = 1.0
+    // structure tensor (not the reference's hard >0.9025 switch).
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
@@ -217,7 +211,6 @@ struct TuningParams: Equatable, Codable {
         case d_thresh_manual, d_th, d_tr
         case burst_fast_shutter
         case dng_lossless_jpeg
-        case kernel_stretch_gamma
         case merge_fp16_accumulator
         case merge_fast_weights
         case dng_store_unwhitened
@@ -257,7 +250,6 @@ struct TuningParams: Equatable, Codable {
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
-        kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
@@ -2029,7 +2021,6 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
-            "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),

@@ -163,7 +163,7 @@ static MetalCtx& ctx() {
             "merge_accumulate_comp", "merge_accumulate_ref",
             "merge_accumulate_comp_x4_h", "merge_accumulate_ref_h",
             "merge_acc_half_to_float",
-            "kernel_gat", "kernel_gat_raw", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
+            "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
@@ -1117,11 +1117,9 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
         uint32_t aniso_continuous = 0;  // 1 = continuous Eq. 4 shape (was _pad0)
-        uint32_t aniso_zero_floor = 0;  // 1 = zero-floor linear law (was _pad1)
-        float aniso_gamma = 1.f;        // exponent on the zero-floored weight
-        uint32_t isa_law = 0;           // 1 = ImageStackAlignator's law (was _pad2)
+        uint32_t _pad1 = 0;
     };
-    static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
+    static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
 
     const bool bayer = cfg.bayer_mode;
     const int grey_h = bayer ? raw.h / 2 : raw.h;
@@ -1134,10 +1132,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_h = (uint32_t)grey_h;
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
-    p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
-    p.aniso_zero_floor = cfg.kernel_anisotropy_zero_floor ? 1u : 0u;
-    p.aniso_gamma = cfg.kernel_stretch_gamma;
-    p.isa_law = cfg.kernel_isa_law ? 1u : 0u;
+    p.selection = 0u; // 460-main kernels.py always uses hard thresholding.
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -1154,11 +1149,11 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
 
     id<MTLBuffer> b_raw = c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
-    id<MTLBuffer> b_vst_raw = c.scratch(c.kern_vst, c.kern_vst_b, raw_b);
+    id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, grey_b);
     id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
     id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
     id<MTLBuffer> b_cov = c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
-    if (!b_raw || !b_vst_raw || !b_grey || !b_grad || !b_cov) return CovField();
+    if (!b_raw || !b_vst || !b_grey || !b_grad || !b_cov) return CovField();
     memcpy([b_raw contents], raw.data.data(), raw_b);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1168,18 +1163,18 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
 
-    [enc setBuffer:b_vst_raw offset:0 atIndex:0];
-    [enc setBuffer:b_raw offset:0 atIndex:1];
-    [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("kernel_gat_raw"), p.raw_w, p.raw_h);
-
     [enc setBuffer:b_grey offset:0 atIndex:0];
-    [enc setBuffer:b_vst_raw offset:0 atIndex:1];
+    [enc setBuffer:b_raw offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
-    [enc setBuffer:b_grad offset:0 atIndex:0];
+    [enc setBuffer:b_vst offset:0 atIndex:0];
     [enc setBuffer:b_grey offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat"), p.grey_w, p.grey_h);
+
+    [enc setBuffer:b_grad offset:0 atIndex:0];
+    [enc setBuffer:b_vst offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
 

@@ -966,7 +966,7 @@ struct Config {
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
-    SelectionLaw selection = SelectionLaw::Linear;
+    SelectionLaw selection = SelectionLaw::HardThreshold;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
@@ -978,13 +978,6 @@ struct Config {
     // kernel) and denoising (D=1: k_detail*k_denoise wide kernel); the two
     // thresholds are in GAT-domain gradient units where noise has sigma ~ 1.
     bool  d_thresh_manual = false;
-    // ImageStackAlignator's kernel.cu ComputeKernelParam, verbatim (read from
-    // their CUDA source, not inferred): A = 1 + (l1-l2)/(l1+l2) -- the ratio
-    // directly, not its sqrt, unlike every other law here -- and the raw
-    // multiplicative shape (k_detail*k_stretch*A / k_detail/(k_shrink*A), no
-    // zero-floor, so it never goes round at A=1). Overrides selection /
-    // kernel_anisotropy_continuous / kernel_anisotropy_zero_floor while on.
-    bool kernel_isa_law = false;
     // Drive Eq. 4's kernel anisotropy continuously from (l1-l2)/(l1+l2), as
     // the paper describes, instead of switching to the full stretch only above
     // 0.9025. See compute_k in kernels.cpp for why the switch mattered: it
@@ -992,32 +985,6 @@ struct Config {
     // edges -- with a round kernel and none of the misalignment tolerance
     // Section 5.1.1 designs the anisotropic kernel to provide.
     bool kernel_anisotropy_continuous = true;
-
-    // Zero-floor the linear anisotropy law. The reference's linear selection
-    // (and the continuous mode above) interpolates the kernel shape with
-    // weight 0.5*A, and A = 1 + sqrt(coherence) never goes below 1 -- so the
-    // stretch weight never drops below 0.5: even NEAR-ISOTROPIC detail in
-    // high-contrast areas (D ~ 0) is elongated 2.5:0.75 along whichever
-    // eigenvector the 2x2-gradient tensor happened to prefer. Distant text is
-    // the worst case: multi-oriented strokes of 1-2 raw px produce moderate
-    // coherence (~0.3-0.6) with an orientation that is mostly aliasing noise
-    // at the half-res tensor's scale, and the resulting 3-6:1 kernels smear
-    // glyphs into unreadability (or double their strokes, which reads as
-    // misalignment). This remaps the weight to w = 0.975 * (A - 1) / 0.95,
-    // clamped: zero at A = 1 (isotropic -> round kernel), the SAME value at
-    // the old hard threshold A = 1.95, full stretch only for genuinely
-    // coherent single-orientation edges. Clean edges keep their elongation;
-    // junk orientations stop being amplified.
-    bool kernel_anisotropy_zero_floor = true;
-    // Exponent on the zero-floored stretch weight: w = 0.975 * t^gamma with
-    // t = clamp((A-1)/0.95). 1 = the plain zero-floor law. The default 2 was
-    // fitted to a measurement, not a guess: distant text (coherence ~0.36)
-    // was only readable with a manual global k_stretch of 2.0, and gamma = 2
-    // reproduces exactly that stretch (2.2:1) AT text's coherence while a
-    // clean single-orientation edge (coherence ~0.9) keeps 95% of the full
-    // k_stretch = 4 elongation the manual override was giving up. Raising
-    // gamma concentrates stretch onto ever-more-coherent structure.
-    f32  kernel_stretch_gamma = 1.0f;
 
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;

@@ -1623,14 +1623,12 @@ kernel void merge_acc_half_to_float(device const half* num_h [[buffer(0)]],
 
 struct KernelEstParams {
     uint raw_h, raw_w, grey_h, grey_w;
-    uint bayer;     // 1 = decimate 2x2 Bayer VST to grey
-    uint selection; // 1 = python-z linear selection law, 0 = hard threshold
+    uint bayer;     // 1 = decimate 2x2 raw to grey before GAT
+    uint selection; // retained for CPU layout; 460-main always hard-thresholds
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint aniso_continuous;  // 1 = drive Eq. 4's shape continuously (was _pad0)
-    uint aniso_zero_floor;  // 1 = zero-floor the linear law (was _pad1)
-    float aniso_gamma;      // exponent on the zero-floored weight
-    uint isa_law;           // 1 = ImageStackAlignator's kernel.cu law (was _pad2)
+    uint _pad1;
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1681,36 +1679,27 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
 }
 
 // Eq. 4's k1/k2. Twin of compute_k in core/kernels.cpp -- keep them in step.
-// This follows python-z kernels.py: A = 1 + sqrt(aniso), then either the
-// linear A/2 interpolation or the hard A > 1.95 branch.
+// The paper drives anisotropy continuously from (l1-l2)/(l1+l2); 460-main
+// switched at A > 1.95 (anisotropy > 0.9025) and was round below it, which
+// denied the misalignment tolerance of Section 5.1.1 to every moderately
+// anisotropic feature. The flat-patch guard is deliberate: the old 0/0 gave
+// NaN, and NaN > 1.95 being false fell to isotropic by accident, whereas a
+// continuous blend would propagate the NaN into k1/k2.
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
     float tr = l1 + l2;
     float ratio = (tr > 1e-12f) ? max(0.f, (l1 - l2) / tr) : 0.f;
     if (!isfinite(ratio)) ratio = 0.f;
-    // ImageStackAlignator's kernel.cu uses the ratio directly, not its sqrt --
-    // twin of the same branch in kernels.cpp compute_k.
-    float A = (p.isa_law != 0u) ? (1.f + ratio) : (1.f + sqrt(ratio));
+    float a = sqrt(ratio);   // only the legacy threshold uses this
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (p.isa_law != 0u) {
-        // Verbatim kernel.cu ComputeKernelParam: sharp-on-dominant-eigenvector,
-        // stretch-on-perpendicular -- same pairing our e1/e2 assignment below
-        // already uses. No zero-floor: never round at A=1, by design.
-        kk1 = A / p.k_shrink;
-        kk2 = p.k_stretch * A;
-    } else if (p.selection != 0u || p.aniso_continuous != 0u) {
-        // Twin of the zero-floor remap in kernels.cpp compute_k. Reaches full
-        // stretch (w=1) at A=1.95 instead of stopping short at 0.975 of it.
-        float w = 0.5f * A;
-        if (p.aniso_zero_floor != 0u) {
-            float t = clamp((A - 1.f) / 0.95f, 0.f, 1.f);
-            float g = max(1.f, p.aniso_gamma);
-            w = (g == 1.f) ? t : pow(t, g);
-        }
-        kk1 = 1.f + w * (1.f / p.k_shrink - 1.f);
-        kk2 = 1.f + w * (p.k_stretch - 1.f);
-    } else if (A > 1.95f) {
+    if (p.aniso_continuous != 0u) {
+        // Blend on the RATIO, not sqrt(ratio): at low anisotropy the dominant
+        // eigenvector is noise-dominated, and stretching along it smears in an
+        // arbitrary direction. Matches compute_k in kernels.cpp.
+        kk1 = 1.f + ratio * (1.f / p.k_shrink - 1.f);
+        kk2 = 1.f + ratio * (p.k_stretch - 1.f);
+    } else if (1.f + a > 1.95f) {
         kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch;
     } else {
         kk1 = 1.f; kk2 = 1.f;
@@ -1726,15 +1715,6 @@ kernel void kernel_gat(device float* out [[buffer(0)]],
     if (gid.x >= p.grey_w || gid.y >= p.grey_h) return;
     uint i = gid.y * p.grey_w + gid.x;
     out[i] = gat_sample(grey[i], p.alpha, p.beta);
-}
-
-kernel void kernel_gat_raw(device float* out [[buffer(0)]],
-                           device const float* raw [[buffer(1)]],
-                           constant KernelEstParams& p [[buffer(2)]],
-                           uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
-    uint i = gid.y * p.raw_w + gid.x;
-    out[i] = gat_sample(raw[i], p.alpha, p.beta);
 }
 
 kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],

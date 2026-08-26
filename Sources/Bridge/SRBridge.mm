@@ -446,8 +446,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
-    if (tuning[@"kernel_stretch_gamma"])
-        cfg.kernel_stretch_gamma = tuning[@"kernel_stretch_gamma"].floatValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
     if (tuning[@"merge_fast_weights"])

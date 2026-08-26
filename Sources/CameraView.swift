@@ -758,16 +758,6 @@ struct CameraView: View {
              Stores the online merge accumulator as 16-bit floats instead of 32-bit.              All arithmetic stays float32 in the kernels; only what lands in memory              narrows. At 2x output this halves the pipeline's single largest allocation              (1116 -> 558 MB) and the merge's dominant memory traffic, which it is              bandwidth-bound on. The cost is storage quantisation of about 0.05%              relative per store -- roughly 1-2 LSB of the 16-bit output. Turn off to              restore bit-exact fp32 accumulation at the old memory and speed.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        HStack {
-            Text("Stretch Selectivity")
-            Slider(value: $cam.tuningParams.kernel_stretch_gamma, in: 1.0...16.0, step: 0.5)
-            Text(String(format: "%.2f", cam.tuningParams.kernel_stretch_gamma))
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.secondary)
-        }
-        Text("Exponent on the stretch weight. 1.0 (default) = plain zero-floor law: moderate coherence (e.g. text-scale strokes) already gets 30-75% of full k_stretch. Raising it pushes that down fast -- at 4.0 moderate coherence gets under 10%; at 8.0+, only content close to a genuinely clean single-orientation edge gets stretched at all, everything short of that stays close to round. Both endpoints (round at A=1, full k_stretch/k_shrink at A>=1.95) are unchanged by this slider -- only the transition between them narrows.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
