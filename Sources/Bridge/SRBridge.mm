@@ -701,18 +701,49 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
                  cfg.white_level);
     cfg.debug_string_capture = full_log;
 
-    std::vector<double> color;
-    // ColorMatrix2 FIRST: DNG convention puts the low-CCT calibration
-    // (illuminant 17, tungsten) in ColorMatrix1 and the daylight one (21,
-    // D65) in ColorMatrix2, and the render derivation converts to sRGB with
-    // a D65 matrix. Measured through the full chain on a real burst frame:
-    // CM1 renders midtone R/G at 0.21 against a 1.06 reference -- the
-    // magenta/off-colour JPEG -- while CM2 lands at 1.04.
-    CollectNumbers(FirstValueForKeys(dng, @[@"ColorMatrix2", @"ColorMatrix1"]), color);
-    if (color.size() >= 9) {
+    // Read CM1/CM2 SEPARATELY and pick by their own CalibrationIlluminant
+    // tag, rather than assuming array order: FirstValueForKeys(@[CM2, CM1])
+    // silently degrades to CM1 whenever CM2 is simply absent from whatever
+    // AVCapturePhoto.metadata happens to expose for this capture path (its
+    // {DNG} dictionary is Apple's own curated set, not guaranteed to mirror
+    // every tag a written DNG file would carry -- unlike LibRaw, which reads
+    // file bytes directly and is what actually validated the CM2-preferred
+    // fix). Measured through the full render chain on a real iPhone 15 burst
+    // frame: the tungsten calibration (illuminant 17) rendered midtone R/G
+    // at 0.21 against a 1.06 reference -- the magenta JPEG -- while the
+    // daylight one (illuminant 21) landed at 1.04.
+    std::vector<double> cm1, cm2;
+    CollectNumbers(dng[@"ColorMatrix1"], cm1);
+    CollectNumbers(dng[@"ColorMatrix2"], cm2);
+    const int ill1 = (int)FirstNumber(dng[@"CalibrationIlluminant1"], -1.f);
+    const int ill2 = (int)FirstNumber(dng[@"CalibrationIlluminant2"], -1.f);
+    // LightSource enum: 17 = tungsten/StandardLightA, 19-23 = daylight family
+    // (D55/D65/D75/Daylight/D50). Prefer whichever calibration is daylight;
+    // fall back to whichever matrix exists; CM1 wins a genuine tie.
+    auto is_daylight = [](int ill) { return ill == 21 || ill == 19 || ill == 20 ||
+                                            ill == 23 || ill == 1; };
+    std::vector<double>* chosen = nullptr;
+    if (cm2.size() >= 9 && is_daylight(ill2) && !(cm1.size() >= 9 && is_daylight(ill1)))
+        chosen = &cm2;
+    else if (cm1.size() >= 9)
+        chosen = &cm1;
+    else if (cm2.size() >= 9)
+        chosen = &cm2;
+    if (chosen) {
         cfg.has_color_matrix = true;
-        for (int i = 0; i < 9; ++i) cfg.color_matrix[i] = (float)color[(size_t)i];
+        for (int i = 0; i < 9; ++i) cfg.color_matrix[i] = (float)(*chosen)[(size_t)i];
     }
+    // Answers, on the very next capture's on-device log, whether this
+    // metadata source (AVCapturePhoto.metadata, not a re-read file) exposes
+    // a second calibration at all -- the open question behind the fix above.
+    char cm_log[160];
+    std::snprintf(cm_log, sizeof(cm_log),
+                 "ColorMatrix: CM1 %s (illum=%d)  CM2 %s (illum=%d)  chose=%s",
+                 cm1.size() >= 9 ? "present" : "ABSENT", ill1,
+                 cm2.size() >= 9 ? "present" : "ABSENT", ill2,
+                 chosen == &cm2 ? "CM2" : (chosen == &cm1 ? "CM1" : "none"));
+    cfg.debug_string_capture += '\n';
+    cfg.debug_string_capture += cm_log;
 }
 
 static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
