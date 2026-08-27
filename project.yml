@@ -51,7 +51,7 @@ targets:
           - "lj92_enc.cpp"
           - "snr_tuning.cpp"
           - "preset_lut.cpp"
-          - "render_isp.cpp"
+          - "render_hdrplus.cpp"
           - "metal_gpu.mm"
           - "mps_fft.mm"
           - "debug_utils.mm"

@@ -204,7 +204,7 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var robustness_raw_resolution_enabled: Bool = false
-    // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
+    // JPEG/preview rendering (core/render_hdrplus.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
     var isp_enabled: Bool = true
