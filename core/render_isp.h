@@ -59,13 +59,6 @@ struct IspState {
 // scene-referred and already white balanced (what this pipeline writes to the
 // linear DNG). cam_to_srgb may be null, in which case a measured default for
 // this sensor is used.
-// Chroma noise reduction, in place, on the same scene-referred linear buffer
-// isp_analyse reads. Must run BEFORE isp_analyse so the exposure and gain map
-// are derived from the cleaned image. Luminance is untouched per pixel: only
-// the colour difference from luma is filtered, so no detail is lost, only fine
-// colour variation. No-op when p.chroma_denoise <= 0.
-void isp_denoise_chroma(uint16_t* rgb16, int W, int H, const IspParams& p);
-
 bool isp_analyse(const uint16_t* rgb16, int W, int H,
                  const float* cam_to_srgb, const IspParams& p, IspState& st);
 

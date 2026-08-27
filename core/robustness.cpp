@@ -1,7 +1,7 @@
 #include "stages.h"
-#include "robustness_nn.h"
 #include "parallel.h"
-#include "pixel4a_noise_curves.h"
+#include "prof.h"
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -264,36 +264,77 @@ static bool try_load_python_noise_curves(f32 alpha, f32 beta, NoiseCurves& nc) {
     return true;
 }
 
-static int closest_pixel4a_curve_iso(int iso) {
-    int best = pixel4a_noise::kIsos[0];
-    int best_d = std::abs(iso - best);
-    for (int i = 1; i < pixel4a_noise::kIsoCount; ++i) {
-        int d = std::abs(iso - pixel4a_noise::kIsos[i]);
-        if (d < best_d) {
-            best = pixel4a_noise::kIsos[i];
-            best_d = d;
-        }
-    }
-    return best;
-}
-
-static bool load_bundled_pixel4a_noise_curves(int iso, NoiseCurves& nc) {
-    iso = closest_pixel4a_curve_iso(iso);
-    int idx = pixel4a_noise::index_for_iso(iso);
-    if (idx < 0) return false;
-    const float* std_curve = pixel4a_noise::kStdCurves[idx];
-    const float* diff_curve = pixel4a_noise::kDiffCurves[idx];
-    nc.std_curve.assign(std_curve, std_curve + pixel4a_noise::kBins);
-    nc.diff_curve.assign(diff_curve, diff_curve + pixel4a_noise::kBins);
-    return true;
-}
-
 // Pure builder, no caching -- shared by the single-slot and per-channel
 // cache wrappers below so the ~1e5-patch Monte Carlo logic exists once.
+// Disk cache for the Monte Carlo curves, keyed on the EXACT float bits of
+// (alpha, beta). unitary_MC is fully deterministic -- the RNG seed is a fixed
+// function of the brightness bin -- so a cached table is bit-identical to a
+// rebuild; the cache changes when the answer arrives, never what it is.
+//
+// Why it exists: the build is ~1.8M gaussian draws per non-linear bin and was
+// measured at 2.0-2.8 s PER CHANNEL cold, i.e. up to ~7.5 s hiding inside the
+// first frame's comp:robustness. In-process statics already amortise repeat
+// bursts; this amortises across app launches. The directory is provided by
+// the app (Caches/); when unset -- host tools, tests -- behaviour is exactly
+// as before.
+static std::string g_noise_cache_dir;
+
+static std::string noise_cache_file(f32 alpha, f32 beta) {
+    uint32_t ab, bb;
+    std::memcpy(&ab, &alpha, 4);
+    std::memcpy(&bb, &beta, 4);
+    char name[96];
+    std::snprintf(name, sizeof(name), "/mccurve_v1_%08x_%08x_%d.bin", ab, bb,
+                  k_n_patches);
+    return g_noise_cache_dir + name;
+}
+
+static bool noise_cache_load(f32 alpha, f32 beta, NoiseCurves& nc) {
+    if (g_noise_cache_dir.empty()) return false;
+    FILE* f = std::fopen(noise_cache_file(alpha, beta).c_str(), "rb");
+    if (!f) return false;
+    const size_t n = (size_t)k_n_brightness + 1;
+    nc.std_curve.resize(n);
+    nc.diff_curve.resize(n);
+    const bool ok = std::fread(nc.std_curve.data(), sizeof(f32), n, f) == n &&
+                    std::fread(nc.diff_curve.data(), sizeof(f32), n, f) == n &&
+                    std::fgetc(f) == EOF;   // reject truncated/oversized files
+    std::fclose(f);
+    if (!ok) { nc.std_curve.clear(); nc.diff_curve.clear(); }
+    return ok;
+}
+
+static void noise_cache_store(f32 alpha, f32 beta, const NoiseCurves& nc) {
+    if (g_noise_cache_dir.empty()) return;
+    // Write-to-temp + rename so a mid-write kill can never leave a short file
+    // that a later launch would half-trust.
+    const std::string path = noise_cache_file(alpha, beta);
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const size_t n = (size_t)k_n_brightness + 1;
+    const bool ok = std::fwrite(nc.std_curve.data(), sizeof(f32), n, f) == n &&
+                    std::fwrite(nc.diff_curve.data(), sizeof(f32), n, f) == n;
+    std::fclose(f);
+    if (ok) std::rename(tmp.c_str(), path.c_str());
+    else std::remove(tmp.c_str());
+}
+
 static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
     NoiseCurves nc;
     if (try_load_python_noise_curves(alpha, beta, nc))
         return nc;
+    if (noise_cache_load(alpha, beta, nc)) {
+        std::printf("[noise] MC curve cache HIT (a=%g b=%g)\n", alpha, beta);
+        return nc;
+    }
+    std::printf("[noise] MC curve cache MISS (a=%g b=%g)%s -- building, ~2-3 s\n",
+                alpha, beta,
+                g_noise_cache_dir.empty() ? " [cache dir NOT SET]" : "");
+    // Bucketed so a profile shows the Monte-Carlo build as its own line
+    // instead of hiding inside whichever caller (SNR tuning or the first
+    // robustness call) happened to trigger it.
+    const double t_build = prof_now_ms();
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
@@ -324,11 +365,24 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
         interp_MC_range(nc, imin, imax);
     }
 
+    noise_cache_store(alpha, beta, nc);
+    prof_add_cpu("rob:noise-mc-build", prof_now_ms() - t_build);
     return nc;
 }
 
+// Guards the two lazy curve caches below. Needed since the burst prewarms the
+// curves on a worker thread (see robustness_prewarm_noise_curves) while the
+// main thread may request the same curves for frame analysis. The lock covers
+// the lookup AND the build, so a concurrent request for a key being built
+// blocks until it is cached rather than building it twice. Returned
+// references stay valid after unlock because within one burst every caller
+// asks for the same keys, so the slots are never rebuilt underneath them --
+// the same invariant the unlocked single-thread version relied on.
+static std::mutex g_noise_curves_mu;
+
 static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
     // Cache like Python (curves built once per alpha/beta, reused every frame).
+    std::lock_guard<std::mutex> lock(g_noise_curves_mu);
     static NoiseCurves cached;
     static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
     static f32 cached_beta  = std::numeric_limits<f32>::quiet_NaN();
@@ -341,25 +395,6 @@ static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
 }
 
 static const NoiseCurves& make_noise_curves(const Config& cfg) {
-    if (cfg.debug_pixel4a_noise_profile) {
-        static NoiseCurves cached_pixel4a;
-        static int cached_iso = 0;
-        int iso = cfg.debug_pixel4a_noise_curve_iso > 0
-            ? cfg.debug_pixel4a_noise_curve_iso
-            : 100;
-        iso = closest_pixel4a_curve_iso(iso);
-        if (!cached_pixel4a.std_curve.empty() && cached_iso == iso)
-            return cached_pixel4a;
-
-        NoiseCurves nc;
-        if (load_bundled_pixel4a_noise_curves(iso, nc)) {
-            cached_pixel4a = std::move(nc);
-            cached_iso = iso;
-            std::printf("[noise] Loaded bundled Pixel 4a ISO %d curves (%d bins)\n",
-                        iso, pixel4a_noise::kBins);
-            return cached_pixel4a;
-        }
-    }
     return make_noise_curves(cfg.noise_alpha(), cfg.noise_beta());
 }
 
@@ -367,11 +402,9 @@ static const NoiseCurves& make_noise_curves(const Config& cfg) {
 // rather than routing through the single-slot cache above: R/G/B typically
 // have different alpha'/beta' after white balance, so 3 calls through a
 // 1-slot cache would evict and rebuild the Monte Carlo curve on every call --
-// 3x the cost every frame instead of once per burst. debug_pixel4a_noise_
-// profile has no per-channel data (it's a fixed bundled table for parity
-// checks against the reference implementation), so every channel shares
-// that one curve, same as before this function existed.
+// 3x the cost every frame instead of once per burst.
 static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch) {
+    std::lock_guard<std::mutex> lock(g_noise_curves_mu);
     static NoiseCurves cached[3];
     static f32 cached_alpha[3] = {std::numeric_limits<f32>::quiet_NaN(),
                                   std::numeric_limits<f32>::quiet_NaN(),
@@ -389,8 +422,6 @@ static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch)
 }
 
 static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
-    if (cfg.debug_pixel4a_noise_profile)
-        return make_noise_curves(cfg);
     // WB-scaled per-channel alpha/beta, matching the WB'd guide. Only mask
     // paths call this wrapper.
     return make_noise_curves_channel(cfg.noise_alpha_ch_robustness(ch),
@@ -406,8 +437,6 @@ static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
 static const NoiseCurves& mask_noise_curves(const Config& cfg) {
     if (cfg.debug_noise_model_disabled)
         return make_noise_curves(0.f, 0.f);
-    if (cfg.debug_pixel4a_noise_profile)
-        return make_noise_curves(cfg);
     return make_noise_curves(cfg.noise_alpha_robustness(), cfg.noise_beta_robustness());
 }
 static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
@@ -417,6 +446,34 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
 }
 
 } // namespace
+
+// Defined OUTSIDE the anonymous namespace above, deliberately. Inside it the
+// symbol gets internal linkage -- hhsr::(anonymous)::robustness_set_noise_...
+// -- and the app links against hhsr::robustness_set_noise_cache_dir, which is
+// exactly the undefined-symbol failure CI produced. Host -fsyntax-only cannot
+// catch linkage, so this class of slip only surfaces at the device link.
+// Anonymous-namespace members stay visible unqualified from the enclosing
+// namespace in the same TU, so the assignment still reaches g_noise_cache_dir.
+void robustness_set_noise_cache_dir(const std::string& dir) { g_noise_cache_dir = dir; }
+
+// Builds (or cache-loads) every noise curve the burst's robustness calls will
+// request, through the exact same accessors they use -- same keys, same
+// debug_noise_model_disabled gating, same values. Meant to run on a worker
+// thread right after SNR tuning has fixed the noise model: on a curve-cache
+// MISS (any new ISO changes alpha/beta and with them the cache key) the
+// Monte-Carlo builds otherwise run synchronously inside the FIRST comparison
+// frame's robustness call, which is the "analyzing frame 2" freeze. The
+// g_noise_curves_mu lock inside the accessors makes the concurrent warm safe:
+// if the frame catches up it waits for the in-flight build, never duplicates
+// it. Also outside the anonymous namespace: pipeline callers link against
+// hhsr::robustness_prewarm_noise_curves.
+void robustness_prewarm_noise_curves(const Config& cfg) {
+    (void)make_noise_curves(cfg);
+    (void)mask_noise_curves(cfg);
+    for (int ch = 0; ch < 3; ++ch)
+        (void)mask_noise_curves_channel(cfg, ch);
+}
+
 
 // Python indexes std_curve[round(1000*brightness)] with no clamp, which is safe
 // there only because the loader clipped every sample to [0,1]. Now that white
@@ -465,9 +522,8 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
     diff_curve = nc.diff_curve;
 }
 
-// Not in the anonymous namespace below: neural_flow's caller (pipeline_paths.cpp)
-// needs the exact same guide image the classical robustness path scores
-// against, rather than re-deriving its own and risking the two drifting.
+// Not in the anonymous namespace below: pipeline callers need the exact same
+// guide image the classical robustness path scores against.
 Image compute_guide(const Image& raw, const Config& cfg) {
     if (!cfg.bayer_mode) {
         // Python: guide_img = raw.reshape((1, H, W))
@@ -504,59 +560,6 @@ Image compute_guide(const Image& raw, const Config& cfg) {
 
 namespace {
 
-static Image local_lowpass_gaussian5x5(const Image& guide) {
-    static constexpr f32 k[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
-    Image out(guide.h, guide.w, guide.c);
-    for (int ch = 0; ch < guide.c; ++ch) {
-        for (int y = 0; y < guide.h; ++y) {
-            for (int x = 0; x < guide.w; ++x) {
-                f32 s = 0.f;
-                for (int i = -2; i <= 2; ++i) {
-                    int yy = (int)clampf((f32)(y + i), 0.f, (f32)(guide.h - 1));
-                    f32 wy = k[i + 2];
-                    for (int j = -2; j <= 2; ++j) {
-                        int xx = (int)clampf((f32)(x + j), 0.f, (f32)(guide.w - 1));
-                        s += wy * k[j + 2] * guide.at(yy, xx, ch);
-                    }
-                }
-                out.at(y, x, ch) = s / 256.f;
-            }
-        }
-    }
-    return out;
-}
-
-// Defined below, next to the other noise-model helpers.
-static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness);
-
-static Image high_frequency_loss_map_adaptive(const Image& means, const Image& vars,
-                                              const Image& lp_vars, const Config& cfg) {
-    Image loss(vars.h, vars.w, 1);
-    constexpr f32 kLocalVarianceNoiseScale = 8.f / 9.f;
-    constexpr f32 kGaussian5x5NoiseEnergy = 4900.f / 65536.f;
-    const f32 kMinTextureSnr = std::max(cfg.hf_min_texture_snr, 0.f);
-    for (int y = 0; y < vars.h; ++y) {
-        for (int x = 0; x < vars.w; ++x) {
-            f32 var = 0.f, lp_var = 0.f;
-            f32 noise_var = 0.f, lp_noise_var = 0.f;
-            for (int ch = 0; ch < vars.c; ++ch) {
-                var += std::max(vars.at(y, x, ch), 0.f);
-                lp_var += std::max(lp_vars.at(y, x, ch), 0.f);
-                const f32 n = guide_noise_var(cfg, vars.c, ch, means.at(y, x, ch));
-                noise_var += kLocalVarianceNoiseScale * n;
-                lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * n;
-            }
-            const f32 signal_var = std::max(var - noise_var, 0.f);
-            const f32 signal_lp_var = std::max(lp_var - lp_noise_var, 0.f);
-            const f32 min_signal_var = kMinTextureSnr * std::max(noise_var, 1.0e-20f);
-            loss.at(y, x) = (signal_var > min_signal_var)
-                ? std::max((signal_var - signal_lp_var) / signal_var, 0.f)
-                : 0.f;
-        }
-    }
-    return loss;
-}
-
 static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     means = Image(guide.h, guide.w, guide.c);
     vars  = Image(guide.h, guide.w, guide.c);
@@ -582,54 +585,6 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     }
 }
 
-static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
-    if (!std::isfinite(brightness)) brightness = 0.f;
-    brightness = clampf(brightness, 0.f, 1.f);
-    f32 v = std::max(cfg.noise_alpha_robustness() * brightness +
-                     cfg.noise_beta_robustness(), 0.f);
-    if (nch == 3 && ch == 1)
-        v *= 0.5f; // green guide channel is the average of two Bayer greens.
-    return v;
-}
-
-static f32 guide_edge_strength_sq(const Image& means, int y, int x) {
-    if (means.h <= 0 || means.w <= 0 || means.c <= 0) return 0.f;
-    const int xm = (int)clampf((f32)(x - 1), 0.f, (f32)(means.w - 1));
-    const int xp = (int)clampf((f32)(x + 1), 0.f, (f32)(means.w - 1));
-    const int ym = (int)clampf((f32)(y - 1), 0.f, (f32)(means.h - 1));
-    const int yp = (int)clampf((f32)(y + 1), 0.f, (f32)(means.h - 1));
-    f32 edge_sq = 0.f;
-    for (int ch = 0; ch < means.c; ++ch) {
-        const f32 gx = 0.5f * (means.at(y, xp, ch) - means.at(y, xm, ch));
-        const f32 gy = 0.5f * (means.at(yp, x, ch) - means.at(ym, x, ch));
-        edge_sq = std::max(edge_sq, gx * gx + gy * gy);
-    }
-    return edge_sq;
-}
-
-static f32 guide_edge_strength_sq_neighborhood(const Image& means, int y, int x, int radius) {
-    radius = std::max(0, std::min(2, radius));
-    f32 edge_sq = 0.f;
-    for (int dy = -radius; dy <= radius; ++dy) {
-        const int yy = (int)clampf((f32)(y + dy), 0.f, (f32)(means.h - 1));
-        for (int dx = -radius; dx <= radius; ++dx) {
-            const int xx = (int)clampf((f32)(x + dx), 0.f, (f32)(means.w - 1));
-            edge_sq = std::max(edge_sq, guide_edge_strength_sq(means, yy, xx));
-        }
-    }
-    return edge_sq;
-}
-
-static f32 guide_brightness(const Image& means, int y, int x) {
-    if (means.h <= 0 || means.w <= 0 || means.c <= 0 ||
-        y < 0 || y >= means.h || x < 0 || x >= means.w)
-        return 0.f;
-    f32 sum = 0.f;
-    for (int ch = 0; ch < means.c; ++ch)
-        sum += means.at(y, x, ch);
-    return clampf(sum / (f32)means.c, 0.f, 1.f);
-}
-
 static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
     if (!(y >= 0.f && y < (f32)img.h && x >= 0.f && x < (f32)img.w))
         return std::numeric_limits<f32>::infinity();
@@ -644,36 +599,6 @@ static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
     const f32 bot = img.at(y1, x0, ch) +
                     (img.at(y1, x1, ch) - img.at(y1, x0, ch)) * fx;
     return top + (bot - top) * fy;
-}
-
-static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
-                               const std::vector<uint32_t>& motion_irregular,
-                               size_t pidx, int y, int x, int new_y, int new_x,
-                               f32 residual_ratio, const Config& cfg) {
-    if (!cfg.motion_edge_rejection_enabled) return false;
-    if (pidx >= motion_irregular.size() || motion_irregular[pidx] == 0u) return false;
-    if (!std::isfinite(residual_ratio) ||
-        residual_ratio <= cfg.motion_edge_residual_threshold)
-        return false;
-
-    const int edge_radius = std::max(0, cfg.motion_edge_neighborhood_radius);
-    f32 edge_sq = guide_edge_strength_sq_neighborhood(ref_means, y, x, edge_radius);
-    f32 brightness = guide_brightness(ref_means, y, x);
-    if (new_y >= 0 && new_y < comp_means.h && new_x >= 0 && new_x < comp_means.w)
-    {
-        edge_sq = std::max(edge_sq,
-                           guide_edge_strength_sq_neighborhood(comp_means, new_y, new_x,
-                                                               edge_radius));
-        brightness = std::max(brightness, guide_brightness(comp_means, new_y, new_x));
-    }
-    const f32 noise_var =
-        std::max(0.f, cfg.noise_alpha_robustness() * brightness +
-                          cfg.noise_beta_robustness());
-    const f32 noise_edge_floor =
-        std::max(0.f, cfg.motion_edge_noise_floor_multiplier) * std::sqrt(noise_var);
-    const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
-    const f32 effective_th = std::max(th, noise_edge_floor);
-    return edge_sq > effective_th * effective_th;
 }
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
@@ -846,56 +771,6 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
     });
 }
 
-static std::vector<uint32_t> compute_tile_residual_high(const Image& d_sq,
-                                                        const Image& sigma_sq,
-                                                        const FlowField& flow,
-                                                        int tile_size,
-                                                        int guide_channels,
-                                                        f32 residual_threshold,
-                                                        bool already_raw_res = false) {
-    const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
-    std::vector<uint32_t> out(n_tiles, 0u);
-    if (n_tiles == 0 || tile_size <= 0 || !std::isfinite(residual_threshold))
-        return out;
-
-    std::vector<uint32_t> count(n_tiles, 0u);
-    std::vector<uint32_t> high_count(n_tiles, 0u);
-    for (int y = 0; y < d_sq.h; ++y) {
-        for (int x = 0; x < d_sq.w; ++x) {
-            int ty, tx;
-            // already_raw_res: d_sq/sigma_sq were computed directly at raw
-            // resolution (Config::robustness_raw_resolution_active), so the
-            // guide->raw 2x+0.5 conversion below would double-scale them --
-            // a plain tile_size divide is already the raw tile grid.
-            if (!already_raw_res && guide_channels == 3) {
-                ty = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
-                tx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
-            } else {
-                ty = y / tile_size;
-                tx = x / tile_size;
-            }
-            if (ty < 0 || ty >= flow.ny || tx < 0 || tx >= flow.nx) continue;
-            const size_t pidx = (size_t)ty * flow.nx + tx;
-            const f32 sig = sigma_sq.at(y, x);
-            const f32 dsq = d_sq.at(y, x);
-            const f32 ratio = (sig > 0.f && std::isfinite(sig))
-                ? dsq / sig
-                : (dsq > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            if (!std::isfinite(ratio)) continue;
-            ++count[pidx];
-            if (ratio > residual_threshold) ++high_count[pidx];
-        }
-    }
-
-    for (size_t i = 0; i < n_tiles; ++i) {
-        if (count[i] == 0) continue;
-        const uint32_t need = std::max<uint32_t>(
-            2u, (uint32_t)std::ceil((double)count[i] * 0.10));
-        out[i] = high_count[i] >= need ? 1u : 0u;
-    }
-    return out;
-}
-
 static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                   std::vector<uint32_t>* irregular_out = nullptr) {
     const f32 inf = std::numeric_limits<f32>::infinity();
@@ -984,12 +859,6 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
     st.stds  = std::move(vars);
-    if (cfg.hf_artifact_removal_enabled) {
-        Image lp_guide = local_lowpass_gaussian5x5(guide);
-        Image lp_means, lp_vars;
-        local_stats_3x3(lp_guide, lp_means, lp_vars);
-        st.hf_loss = high_frequency_loss_map_adaptive(st.means, st.stds, lp_vars, cfg);
-    }
     if (cfg.robustness_raw_resolution_active()) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
@@ -1012,17 +881,10 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // compute_robustness below does. See Config::robustness_raw_resolution_
 // enabled for why this exists and why it's decimate-only; RefStats::
 // means_hires/stds_hires for the reference side (upscaled once per burst in
-// init_robustness, not once per comparison frame).
-//
-// hf_artifact_removal_enabled's noise floor still reads ref_stats.hf_loss,
-// which is guide-resolution (its own Dodgson upscale would be a further
-// feature, not built here) -- mapped down from the raw pixel to its parent
-// guide pixel for that one lookup. Neither that nor motion_edge_rejection_
-// enabled are the common case this toggle is meant for; both stay correct,
-// just at their existing granularity rather than the new one.
+// init_robustness, not once per comparison frame.
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
                                         const FlowField& flow, int tile_size,
-                                        const Config& cfg, Image* s_select_out) {
+                                        const Config& cfg) {
     if (ref_stats.means_hires.h <= 0 || ref_stats.means_hires.w <= 0 ||
         ref_stats.stds_hires.h <= 0 || ref_stats.stds_hires.w <= 0) {
         // init_robustness didn't populate the hires stats (e.g. robustness
@@ -1076,26 +938,10 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     Image d_sq, sigma_sq;
     apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
                             cfg.num_threads);
-    std::vector<uint32_t> tile_residual_high;
-    if (cfg.flow_reject_1d_enabled) {
-        tile_residual_high = compute_tile_residual_high(
-            d_sq, sigma_sq, flow, tile_size, ref_stats.means.c,
-            cfg.flow_reject_1d_residual_threshold, /*already_raw_res=*/true);
-    }
 
-    std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   (cfg.motion_edge_rejection_enabled ||
-                                    cfg.hf_artifact_removal_enabled)
-                                       ? &motion_irregular
-                                       : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
-        motion_irregular.assign(S.size(), 0u);
-
-    const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
-    if (s_select_out) *s_select_out = Image(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             // Raw resolution throughout -- a plain tile_size divide is
@@ -1106,46 +952,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             if (patch_idy < 0 || patch_idy >= flow.ny ||
                 patch_idx < 0 || patch_idx >= flow.nx) {
                 R.at(y, x) = 0.f;
-                if (s_select_out) s_select_out->at(y, x) = 0.f;
                 continue;
             }
             f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
-            const f32 ratio = (sig > 0.f && std::isfinite(sig))
-                ? d_sq.at(y, x) / sig
-                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            const bool residual_high =
-                std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
-            (void)residual_high;
-            const int gy = std::min(std::max(y / 2, 0), std::max(0, ref_stats.hf_loss.h - 1));
-            const int gx = std::min(std::max(x / 2, 0), std::max(0, ref_stats.hf_loss.w - 1));
-            const bool hf_reject =
-                cfg.hf_artifact_removal_enabled &&
-                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
-                have_hf_loss &&
-                ref_stats.hf_loss.at(gy, gx) > cfg.hf_variance_loss_threshold;
-            // comp_means is already warped into the reference's coordinate
-            // frame (the Dodgson upscale above), so the "moved" position for
-            // the edge-strength neighbourhood lookup is just (y,x) again.
-            const bool edge_reject =
-                motion_edge_reject(ref_means, comp_means, motion_irregular,
-                                   pidx, y, x, y, x, ratio, cfg);
-            const bool aperture_limited =
-                cfg.flow_reject_1d_enabled &&
-                pidx < flow.aperture_limited.size() &&
-                pidx < tile_residual_high.size() &&
-                flow.aperture_limited[pidx] != 0u &&
-                tile_residual_high[pidx] != 0u;
-            if (aperture_limited) s = std::min(s, cfg.r_s1);
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            const bool hard_reject = hf_reject || edge_reject;
-            f32 r_val = hard_reject
-                ? 0.f
-                : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
             // design ("infinite will imply R = 0"), which makes d_sq +inf and
             // the Wiener shrink inf/inf = NaN, so r_val is NaN. The Python
@@ -1155,7 +971,6 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             // this pixel.
             if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
-            if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
@@ -1191,256 +1006,33 @@ static Image local_min_5x5_on_guide(const Image& R) {
     return out;
 }
 
-Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_means,
-                                   const FlowField& flow, int tile_size,
-                                   const Config& cfg, int y0, bool raw_res) {
-    const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
-    const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
-    if (rm.h <= 0 || rm.w <= 0 || rm.c != 3 || rv.c != 3) return Image();
-    // Dimensions are not enough. On the Metal path init_robustness returns a
-    // RefStats with h/w/c filled and the pixel vectors EMPTY -- the statistics
-    // stay resident on the GPU. Indexing that reads off the end of an empty
-    // vector on every pixel, which is an out-of-bounds read on the first
-    // comparison frame, not a graceful failure. Check the storage, not the
-    // shape.
-    if (rm.data.size() < (size_t)rm.h * rm.w * rm.c ||
-        rv.data.size() < (size_t)rv.h * rv.w * rv.c)
-        return Image();
-    if (comp_means.h != rm.h || comp_means.w != rm.w || comp_means.c != 3) return Image();
-    if (flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return Image();
-
-    const int h = rm.h, w = rm.w;
-    const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
-    Image feat(strip_h, w, kRobustnessNnChannels);
-    // y0 is the first source row of the window, which the caller keeps fully
-    // inside the image. That matters: the window's edges then coincide with
-    // the image's, so the convolutions' zero-padding is the same padding
-    // whole-plane inference would apply. Extending past the edge instead --
-    // by replicating or zero-filling rows here -- does NOT reproduce it,
-    // because those rows carry bias-driven activations into the next layer
-    // where whole-plane inference has true zeros. Verified bit-identical to
-    // whole-plane output with this windowing, and visibly seamed without it.
-    parallel_rows(strip_h, cfg.num_threads, [&](int sy) {
-        const int y = std::min(std::max(y0 + sy, 0), h - 1);
-        for (int x = 0; x < w; ++x) {
-            // Guide pixel (y,x) covers raw pixels (2y,2x); the flow grid is
-            // indexed in raw pixels, same convention as the analytic mask.
-            // The flow field is one vector per tile. Sampling it nearest --
-            // which is what the MERGE correctly does, since it must fetch the
-            // pixel the search actually evaluated -- makes three of the input
-            // channels piecewise constant over 16 raw pixels, and the network
-            // draws what it is shown: a mask tiled into visible squares with
-            // stair-stepped edges. For the DECISION "is this motion plausible
-            // and consistent with its neighbours" the tile grid is an artifact
-            // of the search, not a property of the scene, so the flow-derived
-            // channels are sampled bilinearly between tile centres. This does
-            // not change what the merge fetches; only what the mask reasons
-            // about.
-            // At raw resolution a pixel IS a raw pixel, so the tile index is a
-            // plain divide; at guide resolution it covers two.
-            const f32 pos_scale = raw_res ? 1.f : 2.f;
-            const f32 tcy = (pos_scale * (f32)y) / (f32)tile_size - 0.5f;
-            const f32 tcx = (pos_scale * (f32)x) / (f32)tile_size - 0.5f;
-            const int t0y = (int)std::floor(tcy), t0x = (int)std::floor(tcx);
-            const f32 ay = tcy - (f32)t0y, ax = tcx - (f32)t0x;
-            auto tclamp = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
-            const int iy0 = tclamp(t0y, flow.ny), iy1 = tclamp(t0y + 1, flow.ny);
-            const int ix0 = tclamp(t0x, flow.nx), ix1 = tclamp(t0x + 1, flow.nx);
-            auto bilerp = [&](f32 v00, f32 v01, f32 v10, f32 v11) {
-                const f32 top = v00 + (v01 - v00) * ax;
-                const f32 bot = v10 + (v11 - v10) * ax;
-                return top + (bot - top) * ay;
-            };
-            const f32 fx = bilerp(flow.dx(iy0, ix0), flow.dx(iy0, ix1),
-                                  flow.dx(iy1, ix0), flow.dx(iy1, ix1));
-            const f32 fy = bilerp(flow.dy(iy0, ix0), flow.dy(iy0, ix1),
-                                  flow.dy(iy1, ix0), flow.dy(iy1, ix1));
-            // Nearest tile is still needed wherever a genuinely per-tile
-            // quantity is required.
-            const int pty = tclamp((int)std::floor(tcy + 0.5f), flow.ny);
-            const int ptx = tclamp((int)std::floor(tcx + 0.5f), flow.nx);
-
-            // Local span of the flow field, Wronski Eq. 7 -- the same motion
-            // statistic the analytic mask reduces to a binary s1/s2 choice.
-            // Handed over as a continuous value so the network can grade it,
-            // and bilinearly blended for the same reason as the flow above.
-            auto span_at = [&](int cy, int cx) {
-                f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
-                f32 mxx = -mnx, mxy = -mnx;
-                for (int i = -1; i <= 1; ++i)
-                    for (int j = -1; j <= 1; ++j) {
-                        const int yy = cy + i, xx = cx + j;
-                        if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
-                        const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
-                        mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
-                        mny = std::min(mny, vy); mxy = std::max(mxy, vy);
-                    }
-                const f32 dxs = (mxx > mnx) ? (mxx - mnx) : 0.f;
-                const f32 dys = (mxy > mny) ? (mxy - mny) : 0.f;
-                return std::sqrt(dxs * dxs + dys * dys);
-            };
-            const f32 Mspan = bilerp(span_at(iy0, ix0), span_at(iy0, ix1),
-                                     span_at(iy1, ix0), span_at(iy1, ix1));
-
-            // Comparison statistics sampled where the flow points, in guide
-            // units (half the raw displacement), matching the generator.
-            // upscale_warp_stats has already applied the flow when building the
-            // hires comparison statistics, so at raw resolution the correct
-            // sample sits at (y,x); shifting again would double-apply it.
-            int qy = y, qx = x;
-            if (!raw_res) {
-                qy = std::min(std::max((int)std::lround((f32)y + 0.5f * fy), 0), h - 1);
-                qx = std::min(std::max((int)std::lround((f32)x + 0.5f * fx), 0), w - 1);
-            }
-
-            f32 brightness = 0.f;
-            for (int c = 0; c < 3; ++c) brightness += rm.at(y, x, c);
-            brightness = clampf(brightness / 3.f, 0.f, 1.f);
-            // Gated accessors, so the noise plane vanishes with the mask
-            // noise-model toggle exactly as the analytic path's does.
-            const f32 nsig = std::sqrt(std::max(cfg.noise_alpha_robustness() * brightness +
-                                                cfg.noise_beta_robustness(), 0.f));
-
-            f32* o = &feat.at(sy, x, 0);
-            for (int c = 0; c < 3; ++c) o[c] = rm.at(y, x, c);
-            // stds holds VARIANCE (see local_stats_3x3); the generator fed the
-            // network standard deviations, so take the root here too.
-            for (int c = 0; c < 3; ++c) o[3 + c] = std::sqrt(std::max(rv.at(y, x, c), 0.f));
-            for (int c = 0; c < 3; ++c) o[6 + c] = comp_means.at(qy, qx, c);
-            o[9] = fx;
-            o[10] = fy;
-            o[11] = Mspan;
-            o[12] = nsig;
-        }
-    });
-    return feat;
-}
-
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
-                         const FlowField& flow, int tile_size, const Config& cfg,
-                         Image* s_select_out) {
+                         const FlowField& flow, int tile_size, const Config& cfg) {
     if (!cfg.robustness_enabled) {
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
         std::fill(r.data.begin(), r.data.end(), 1.f);
-        // Nothing was scored, so no prior was chosen. Report s2 uniformly so the
-        // split masks stay well-formed and still sum to the combined one.
-        if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
     }
     // Empty flow (e.g. grey/align failed) — do not index flow.flow.data()==nullptr.
     if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) {
-        // Do not fully trust comps when alignment produced no flow (Python has no
-        // such bandage; ones here made the mask white and let ghosts through).
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
         std::fill(r.data.begin(), r.data.end(), 0.f);
-        if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
-    }
-
-    // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both
-    // the Metal and CPU analytic paths, and falls through to them whenever the
-    // model is absent, fails to load, or the features cannot be built -- so a
-    // missing model degrades to the reference behaviour rather than to no mask.
-    //
-    // Eq. 9's 5x5 minimum is deliberately NOT applied on top. That step exists
-    // to spread rejection outward from a pointwise test with no spatial
-    // context; this network has a ~30 raw-pixel receptive field and was
-    // trained and measured to emit the final per-pixel decision, so dilating
-    // it again would double-count and would not match the reported numbers.
-    if (cfg.use_neural_robustness && robustness_nn_available()) {
-#ifdef __APPLE__
-        // See metal_fetch_host_ref_stats: on this path the reference stats are
-        // GPU-resident by design, so bring them across before building
-        // features from them. One readback per burst, not per frame -- the
-        // copy stays in ref_stats.
-        RefStats* mutable_stats = const_cast<RefStats*>(&ref_stats);
-        if (mutable_stats->means.data.empty() &&
-            !metal_fetch_host_ref_stats(*mutable_stats)) {
-            // Could not get them; the analytic path below reads the same
-            // statistics straight from the GPU and is unaffected.
-            return compute_robustness_metal(comp_raw, ref_stats, flow, tile_size,
-                                            cfg, s_select_out);
-        }
-#endif
-        // Honour the raw-resolution toggle. Previously this hook ran before the
-        // raw-res dispatch and always returned a 3 MP mask, so enabling that
-        // setting alongside the learned mask silently did nothing.
-        const bool nn_raw = cfg.robustness_raw_resolution_active() &&
-                            ref_stats.means_hires.h > 0 &&
-                            ref_stats.means_hires.data.size() ==
-                                (size_t)ref_stats.means_hires.h *
-                                ref_stats.means_hires.w * ref_stats.means_hires.c;
-        Image cm_nn;
-        {
-            Image guide_nn = compute_guide(comp_raw, cfg);
-            Image cv_nn;   // variance is not a feature; freed with this scope
-            local_stats_3x3(guide_nn, cm_nn, cv_nn);
-            if (nn_raw) {
-                // Dodgson upscale + flow warp into the reference frame, the
-                // same transform the analytic raw-res path applies.
-                Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
-                                                 tile_size, cfg.num_threads,
-                                                 cfg.flow_bilinear_sampling);
-                cm_nn = std::move(hires);
-            }
-        }
-        const int nh = cm_nn.h, nw = cm_nn.w;
-        const int strip_h = kRobustnessNnStripRows + 2 * kRobustnessNnHalo;
-        Image nn_mask(nh, nw, 1);
-        // Every window is strip_h tall and fully inside the image, so Core ML
-        // sees one input shape for the whole burst (no reshape per strip) and
-        // the result matches whole-plane inference exactly. An image shorter
-        // than one window would make that impossible; there is nothing to
-        // save there either, so fall back to the analytic mask.
-        bool ok = (nh >= strip_h && nw > 0);
-        for (int y0 = 0; ok && y0 < nh; y0 += kRobustnessNnStripRows) {
-            const int top = std::min(std::max(y0 - kRobustnessNnHalo, 0), nh - strip_h);
-            Image feat = build_robustness_nn_features(ref_stats, cm_nn, flow,
-                                                      tile_size, cfg, top, nn_raw);
-            Image strip;
-            if (feat.h != strip_h || !robustness_nn_infer(feat, strip) ||
-                strip.h != strip_h || strip.w != nw) {
-                ok = false;
-                break;
-            }
-            const int rows = std::min(kRobustnessNnStripRows, nh - y0);
-            for (int r = 0; r < rows; ++r)
-                std::memcpy(&nn_mask.at(y0 + r, 0),
-                            &strip.at(y0 - top + r, 0),
-                            (size_t)nw * sizeof(f32));
-        }
-        if (ok) {
-            // The learned mask makes no s1/s2 choice, so report the strict
-            // prior uniformly rather than leaving the split masks undefined.
-            if (s_select_out) {
-                *s_select_out = Image(nn_mask.h, nn_mask.w, 1);
-                std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
-            }
-            return nn_mask;
-        }
     }
 
 #ifdef __APPLE__
     // Metal GPU only — same Alg. robustness math as the CPU path below.
-    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
-                                         s_select_out);
+    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg);
     if (gpu.h > 0 && gpu.w > 0) return gpu;
     return Image();
 #else
     if (cfg.robustness_raw_resolution_active()) {
-        Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
-                                                    cfg, s_select_out);
+        Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size, cfg);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
-        // Falls through to the guide-resolution path below if the hires ref
-        // stats weren't populated (e.g. robustness was off when the burst
-        // started).
     }
 
-    // One curve per guide channel (3 for Bayer, matching R/(G1+G2)/2/B; 1
-    // otherwise) rather than one curve shared by all channels -- see
-    // Config::noise_alpha_ch/noise_beta_ch and make_noise_curves_channel.
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     if (ref_stats.means.c == 3) {
         for (int ch = 0; ch < 3; ++ch)
@@ -1459,8 +1051,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
             int patch_idy = 0, patch_idx = 0;
-            // Same sampling as the merge, deliberately: the mask must score
-            // the correspondence the merge will actually fetch.
             if (d_p.c == 1) {
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
@@ -1474,7 +1064,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
                 if (cfg.flow_bilinear_sampling) {
-                    // guide pixel -> its raw centre, then raw px -> guide px
                     f32 rdx, rdy;
                     flow.sample_bilinear(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
                                          tile_size, rdx, rdy);
@@ -1499,24 +1088,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     Image d_sq, sigma_sq;
     apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
-    std::vector<uint32_t> tile_residual_high;
-    if (cfg.flow_reject_1d_enabled) {
-        tile_residual_high = compute_tile_residual_high(
-            d_sq, sigma_sq, flow, tile_size, ref_stats.means.c,
-            cfg.flow_reject_1d_residual_threshold);
-    }
-
-    std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   (cfg.motion_edge_rejection_enabled ||
-                                    cfg.hf_artifact_removal_enabled)
-                                       ? &motion_irregular
-                                       : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
-        motion_irregular.assign(S.size(), 0u);
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
-    if (s_select_out) *s_select_out = Image(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             int patch_idy, patch_idx;
@@ -1527,82 +1101,16 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
             }
-            // Same sampling as the merge and Eq. 6's d.
-            f32 flow_x = 0.f, flow_y = 0.f;
-            if (cfg.flow_bilinear_sampling) {
-                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
-                f32 rdx, rdy;
-                flow.sample_bilinear(sc * (f32)y + 0.5f * (sc - 1.f),
-                                     sc * (f32)x + 0.5f * (sc - 1.f),
-                                     tile_size, rdx, rdy);
-                flow_x = rdx / sc; flow_y = rdy / sc;
-            } else if (ref_stats.means.c == 3) {
-                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
-            } else {
-                flow_x = flow.dx(patch_idy, patch_idx);
-                flow_y = flow.dy(patch_idy, patch_idx);
-            }
-            const int new_x = (int)std::lround((f32)x + flow_x);
-            const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
             f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
-            const f32 ratio = (sig > 0.f && std::isfinite(sig))
-                ? d_sq.at(y, x) / sig
-                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            const bool residual_high =
-                std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
-            // Both required: an almost-entirely-high-frequency patch, and a
-            // large local variation in the alignment vector field -- "the same
-            // as used in the motion prior", i.e. the r_Mt test. Hair is
-            // high-frequency but tracks cleanly; a noisy flat wall varies but
-            // has no real high-frequency signal.
-            const bool hf_reject =
-                cfg.hf_artifact_removal_enabled &&
-                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
-                !ref_stats.hf_loss.data.empty() &&
-                ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold;
-            const bool edge_reject =
-                motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
-                                   pidx, y, x, new_y, new_x, ratio, cfg);
-            // Aperture-limited tiles are demoted to the irregular-motion prior
-            // rather than discarded. The tile is not wrong, it is unverifiable:
-            // the gradient constrains motion across the edge but not along it,
-            // so one component of the flow is unmeasured rather than measured
-            // badly. Zeroing threw away the component that WAS measured, and on
-            // scenes with long edges -- architecture, horizons, railings -- that
-            // removed enough of the burst to cost real detail. s1 keeps the tile
-            // contributing while holding it to the same standard as any other
-            // tile whose motion estimate is not trusted.
-            const bool aperture_limited =
-                cfg.flow_reject_1d_enabled &&
-                pidx < flow.aperture_limited.size() &&
-                pidx < tile_residual_high.size() &&
-                flow.aperture_limited[pidx] != 0u &&
-                tile_residual_high[pidx] != 0u;
-            // min, not assignment: a tile already flagged motion-irregular must
-            // not be promoted, and lower s is strictly stricter here.
-            if (aperture_limited) s = std::min(s, cfg.r_s1);
-            // Block matching found two near-equal minima here, so the offset it
-            // picked is not distinguishable from at least one other. Demote to
-            // the strict prior. This is the one input to the mask that does not
-            // come from the image residual, which matters because the residual
-            // cannot see this failure: the wrong offset was selected precisely
-            // for producing a small difference.
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            const bool hard_reject = hf_reject || edge_reject;
-            f32 r_val = hard_reject
-                ? 0.f
-                : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             R.at(y, x) = r_val;
-            // Compared against r_s1 rather than recomputing the conditions, so
-            // the record cannot drift from the value actually used above.
-            if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
     return local_min_5x5(R);

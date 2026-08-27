@@ -44,9 +44,6 @@ jobs:
       - name: Vendor LibRaw
         run: bash scripts/fetch_libraw.sh
 
-      - name: Build neural flow Core ML model
-        run: bash scripts/build_neural_flow_model.sh
-
       - name: Generate Xcode project
         run: $XCODEGEN generate --spec project.yml
 

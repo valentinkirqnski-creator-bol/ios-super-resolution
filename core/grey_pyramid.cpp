@@ -265,7 +265,8 @@ Image compute_grey_fft(const Image& raw) {
 #endif
 }
 
-Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method) {
+Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method,
+                   bool decimate_lowpass) {
     if (!bayer_mode) return raw;
     if (method == GreyMethod::FFT) return compute_grey_fft(raw);
 #ifdef __APPLE__
@@ -275,13 +276,53 @@ Image compute_grey(const Image& raw, bool bayer_mode, GreyMethod method) {
     // that is a coincidence, not a guarantee.
     metal_invalidate_sticky_grey();
 #endif
-    return compute_grey_decimate(raw, true);
+    return compute_grey_decimate(raw, true, decimate_lowpass);
 }
 
-Image compute_grey_decimate(const Image& raw, bool bayer_mode) {
+Image compute_grey_decimate(const Image& raw, bool bayer_mode, bool lowpass) {
     if (!bayer_mode) return raw;
     int gh = raw.h / 2, gw = raw.w / 2;
     Image grey(gh, gw, 1);
+    if (lowpass) {
+        // Anti-aliased decimation: half-phase separable binomial [1 3 3 1]/8
+        // on the raw mosaic, sampled at the quad centres (2g+0.5). The 2x2
+        // box below IS a low-pass, but a weak one -- its transfer, cos(pi f),
+        // still passes substantial energy between the grey Nyquist and the
+        // raw Nyquist, and at decimation that energy folds back as aliasing
+        // that contaminates block matching and ICA on fine texture (flow that
+        // wobbles with content instead of following motion). The binomial is
+        // cos^3(pi f): ~0.09 residual at the old kernel's half-power point,
+        // for an effective Gaussian sigma of ~0.87 raw px (0.43 grey px) --
+        // strong enough suppression to matter, gentle enough to keep the
+        // sub-pixel matching signal.
+        //
+        // Geometry and channel balance are both preserved exactly: the 4-tap
+        // half-phase footprint {2g-1 .. 2g+2} is centred at 2g+0.5, the SAME
+        // lattice phase as the quad average, so every raw<->grey coordinate
+        // conversion downstream is untouched; and per axis the taps land on
+        // CFA parities as (1+3)/8 even, (3+1)/8 odd -- equal -- so the grey
+        // stays the same R:G:G:B = 1:1:1:1 mix as the box (borders clamp,
+        // which bends that balance only in the outermost grey ring).
+        static const f32 w4[4] = {1.f / 8.f, 3.f / 8.f, 3.f / 8.f, 1.f / 8.f};
+        parallel_rows(gh, 0, [&](int y) {
+            const int ry0 = 2 * y - 1;
+            for (int x = 0; x < gw; ++x) {
+                const int rx0 = 2 * x - 1;
+                f32 s = 0.f;
+                for (int i = 0; i < 4; ++i) {
+                    const int ry = std::min(raw.h - 1, std::max(0, ry0 + i));
+                    f32 row = 0.f;
+                    for (int j = 0; j < 4; ++j) {
+                        const int rx = std::min(raw.w - 1, std::max(0, rx0 + j));
+                        row += w4[j] * raw.at(ry, rx);
+                    }
+                    s += w4[i] * row;
+                }
+                grey.at(y, x) = s;
+            }
+        });
+        return grey;
+    }
     // One output pixel per 2x2 RGGB quad, each summed in a fixed order, so
     // splitting across rows cannot change any value -- this stays bit-identical
     // to the serial loop it replaces.
