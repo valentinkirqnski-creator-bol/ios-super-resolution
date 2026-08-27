@@ -1358,12 +1358,9 @@ void flow_densify_boundary_select(FlowField& flow,
     flow.fine_nx = 0;
     flow.fine_flow.clear();
     const bool overlap_all = cfg.overlap_merge_active();
-    if (!cfg.flow_boundary_selection && !overlap_all) return;
-    // Boundary selection still needs interpolation: the cells whose four
-    // neighbours agree hold their bilinear BLEND, which is meaningless if
-    // nothing interpolates. The overlapped-tile merge does not -- it reads
-    // each covering cell nearest -- so it builds the grid either way.
-    if (!overlap_all && !cfg.flow_bilinear_sampling) return;
+    if ((!cfg.flow_boundary_selection && !overlap_all) ||
+        !cfg.flow_bilinear_sampling)
+        return;
     // Even pitch only: the fine grid's pitch is tile_size/2 and the GPU hosts
     // pass it as an integer. Every shipped tile size (16/32/64) is even.
     if (flow.ny <= 0 || flow.nx <= 0 || tile_size < 2 || (tile_size % 2) != 0 ||
@@ -1413,26 +1410,13 @@ void flow_densify_boundary_select(FlowField& flow,
                     spread = std::max(spread,
                                       std::max(std::fabs(vx[a] - vx[b]),
                                                std::fabs(vy[a] - vy[b])));
-            f32 out_x, out_y;
-            if (cfg.flow_bilinear_sampling) {
-                const f32 tx0 = vx[0] + (vx[1] - vx[0]) * ax;
-                const f32 bx0 = vx[2] + (vx[3] - vx[2]) * ax;
-                const f32 ty0 = vy[0] + (vy[1] - vy[0]) * ax;
-                const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
-                out_x = tx0 + (bx0 - tx0) * ay;
-                out_y = ty0 + (by0 - ty0) * ay;
-            } else {
-                // Interpolation off: a cell that is not measured below holds
-                // the vector of the coarse tile CONTAINING it, never a blend
-                // of its neighbours -- otherwise "nearest" would quietly
-                // interpolate at half pitch. Fine cell centre is
-                // (f + 0.5) * (tile_size/2) raw, so the containing tile is f/2.
-                const int sy2 = std::min(fy / 2, flow.ny - 1);
-                const int sx2 = std::min(fx / 2, flow.nx - 1);
-                out_x = flow.dx(sy2, sx2);
-                out_y = flow.dy(sy2, sx2);
-            }
-            if (overlap_all && (cfg.flow_overlap_measure_all || spread > thr)) {
+            const f32 tx0 = vx[0] + (vx[1] - vx[0]) * ax;
+            const f32 bx0 = vx[2] + (vx[3] - vx[2]) * ax;
+            const f32 ty0 = vy[0] + (vy[1] - vy[0]) * ax;
+            const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
+            f32 out_x = tx0 + (bx0 - tx0) * ay;
+            f32 out_y = ty0 + (by0 - ty0) * ay;
+            if (overlap_all && spread > thr) {
                 // Overlapped-tile measurement (Config::flow_overlap_merge),
                 // for cells whose four neighbour vectors DISAGREE: the merge
                 // consumes these nearest, one per covering tile, so each must
