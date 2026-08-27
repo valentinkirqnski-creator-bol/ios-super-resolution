@@ -1677,7 +1677,11 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    // No flow_bilinear here: RobMaskRawParams has no such field and
+    // rob_make_mask_raw never samples the flow -- it uses flow_ny/flow_nx
+    // only to index per-tile metadata. The guide-resolution rob_make_mask
+    // does sample it, and its fill site below sets it on RobMaskParamsCPU,
+    // which does carry the field.
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
