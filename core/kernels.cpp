@@ -24,48 +24,22 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         return out;
     };
-    // Eq. 4's k1/k2. This follows python-z kernels.py: A = 1 + sqrt(aniso),
-    // then either linear interpolation with A/2 or the hard A > 1.95 branch.
+    // Matches 460-main kernels.py compute_k.
     auto compute_k = [](f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
-        const f32 tr = l1 + l2;
-        // Flat patch: both eigenvalues ~0. The old form computed 0/0 -> NaN,
-        // and NaN > 1.95 is false, so it fell to isotropic by accident. A
-        // continuous blend would propagate the NaN into k1/k2 instead, so the
-        // degenerate case is now handled on purpose.
-        f32 ratio = (tr > 1e-12f) ? std::max(0.f, (l1 - l2) / tr) : 0.f;
-        if (!std::isfinite(ratio)) ratio = 0.f;
-        const f32 A = 1.f + std::sqrt(ratio);
-        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
+        f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
+        f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
-            // 0.5*A floors at 0.5; the zero-floor remap sends isotropic
-            // content to round kernels and reaches full stretch (w=1) at
-            // A=1.95, instead of stopping short at 0.975 of it -- the earlier
-            // version left the sharpest achievable edge kernel permanently
-            // ~2.5% wider than k_detail/k_shrink. See
-            // Config::kernel_anisotropy_zero_floor.
-            f32 w = 0.5f * A;
-            if (cfg.kernel_anisotropy_zero_floor) {
-                const f32 t = clampf((A - 1.f) / 0.95f, 0.f, 1.f);
-                const f32 g = std::max(1.f, cfg.kernel_stretch_gamma);
-                w = (g == 1.f) ? t : std::pow(t, g);
-            }
-            kk1 = 1.f + w * (1.f / cfg.k_shrink - 1.f);
-            kk2 = 1.f + w * (cfg.k_stretch - 1.f);
-        } else if (A > 1.95f) {
-            kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch;
-        } else {
-            kk1 = 1.f; kk2 = 1.f;
-        }
+        if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
+        else           { kk1 = 1.f; kk2 = 1.f; }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };
 
-    Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
-    Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
-    Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
+    Image grey = compute_grey_decimate(raw, cfg.bayer_mode);
+    Image vst = apply_gat(grey, cfg.noise_alpha(), cfg.noise_beta());
+    Image grad = compute_gradients(vst); // [gh-1, gw-1, 2]
 
-    int H = grey.h, W = grey.w;
+    int H = vst.h, W = vst.w;
     CovField covs(H, W);
 
     parallel_rows(H, cfg.num_threads, [&](int y) {

@@ -60,10 +60,8 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     // params.update_snr_config
     cfg.k_detail = lerpf(snr, 6.f, 30.f, 0.33f, 0.25f);
     cfg.k_denoise = lerpf(snr, 6.f, 30.f, 5.0f, 3.0f);
-    if (!cfg.d_thresh_manual) {
-        cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
-        cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
-    }
+    cfg.D_th = lerpf(snr, 6.f, 30.f, 0.81f, 0.71f);
+    cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
 
     int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;
     // 460-main falls back to 32 because its block matching kernels do not

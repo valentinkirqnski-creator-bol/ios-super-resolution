@@ -31,11 +31,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Decode our LinearRaw Deflate DNG and write a calibrated sRGB JPEG.
 /// Uses the same renderer as the embedded DNG preview. No CI sharpen or NR.
-/// quality: ImageIO lossy quality in (0,1]. At/above ~0.90 ImageIO keeps
-/// 4:4:4 chroma; below it drops to 4:2:0, which reads as soft colour detail.
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
-                         toPath:(NSString *)jpgPath
-                        quality:(float)quality;
+                         toPath:(NSString *)jpgPath;
 
 /// Render the LinearRaw DNG (same look as export JPEG), encode a JPEG preview
 /// (longest side ≤ maxSide), and embed it as a DNG SubIFD so Photos can thumbnail

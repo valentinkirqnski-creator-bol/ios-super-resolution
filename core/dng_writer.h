@@ -3,7 +3,6 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
-#include <future>
 #include <vector>
 
 namespace hhsr {
@@ -24,40 +23,12 @@ bool embed_dng_jpeg_preview(const std::string& path,
 
 // Same as load_linear_dng_rgb16, plus WB gains (green-normalized) and cam→sRGB 3×3
 // when written by DngStreamWriter (private tags). Falls back to identity / 1,1,1.
-// Color-rendering metadata only (wb, matrix) from a linear DNG we wrote --
-// no pixel inflate, reads a small file prefix. For when the pixels are
-// already in memory (Rgb16Sink).
-bool load_linear_dng_color_meta(const std::string& path, float wb[3],
-                                float cam_to_srgb[9], bool& has_color);
 bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
                                  int& W, int& H, float wb[3], float cam_to_srgb[9],
                                  bool& has_color);
 
 // Streaming LinearRaw RGB DNG with fast lossless Deflate (ZIP), no predictor.
 // Same decoded pixels as before; write path optimized for merge latency.
-// Option A highlight headroom (Config::dng_store_unwhitened): whether the
-// encoder should divide the stored rows by the WB gains, and those gains.
-// One definition so the writer's AsShotNeutral branch and every encoder make
-// the same decision. Active only for the linear (non-baked) RGB DNG of a
-// pre-whitened merge with valid gains.
-inline bool dng_unwhiten_active(const Config& cfg, int nch) {
-    if (!cfg.dng_store_unwhitened || !cfg.raw_prewhitened || cfg.bake_srgb ||
-        nch < 3)
-        return false;
-    for (int i = 0; i < 3; ++i)
-        if (!(cfg.white_balance[i] > 1e-6f) ||
-            !std::isfinite(cfg.white_balance[i]))
-            return false;
-    return true;
-}
-// Per-channel multipliers applied to the stored rows: 1/gain, G-normalised.
-inline void dng_unwhiten_gains(const Config& cfg, int nch, float g[3]) {
-    const bool on = dng_unwhiten_active(cfg, nch);
-    g[0] = on ? cfg.white_balance[1] / cfg.white_balance[0] : 1.f;
-    g[1] = 1.f;
-    g[2] = on ? cfg.white_balance[1] / cfg.white_balance[2] : 1.f;
-}
-
 class DngStreamWriter {
 public:
     // colorMatrixXYZtoCam: 9 floats row-major (optional).
@@ -74,8 +45,7 @@ public:
               bool bakedSrgb = false,
               const std::string& camera_make = "HandheldSR",
               const float* camToSrgb = nullptr,
-              bool pixelsPrewhitened = false,
-              bool losslessJpeg = false);
+              bool pixelsPrewhitened = false);
 
     bool write_rows(const uint16_t* rgb16, int nrows);
     bool close();
@@ -90,23 +60,6 @@ private:
     void* z_stream_ = nullptr;             // z_stream*
     std::vector<uint8_t> z_out_;
     bool deflate_ok_ = false;
-
-    // Lossless-JPEG tiled mode (Config::dng_lossless_jpeg): rows accumulate
-    // into one tile-row band; full bands encode their tiles in parallel and
-    // stream out. Tile offset/count arrays are patched at close.
-    bool lossless_ = false;
-    int tile_w_ = 0, tile_l_ = 0, ntx_ = 0, nty_ = 0;
-    int rows_in_band_ = 0;
-    std::vector<uint16_t> band_buf_;
-    // One band in flight: the filled band encodes + writes on a worker while
-    // the caller fills the other buffer, so tile encoding hides behind the
-    // next band's normalize/readback instead of extending the tail.
-    std::vector<uint16_t> band_back_;
-    std::future<bool> band_fut_;
-    std::vector<uint32_t> tile_offsets_, tile_counts_;
-    uint32_t tile_off_arr_pos_ = 0, tile_cnt_arr_pos_ = 0;
-    bool flush_band();
-    bool encode_and_write_band(std::vector<uint16_t>& band, int valid_rows);
 };
 
 } // namespace hhsr

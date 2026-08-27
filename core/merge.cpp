@@ -68,84 +68,21 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 // Guard against singular/near-singular covariance inversions producing
 // infinitely sharp kernels. That can leave R/B denominators at zero while G
 // receives weight, showing up as green or black speckles.
-//
-// A kernel this sharp contributes weight to essentially one raw sample. Under
-// a Bayer CFA that sample belongs to one channel, so the other two accumulate
-// nothing at that output pixel and their denominators stay at zero -- hence
-// the speckle rather than a general softness. Clamping the largest magnitude
-// to k_max_abs bounds the kernel's minimum width instead of rejecting the
-// tile, so the sample still contributes, just over more than one pixel.
-//
-// Keep in step with the Metal twin in HHSRKernels.metal and the mirror in
-// tools/validate_merge_equiv.py: all three are compared against each other.
-// The ceiling is mode-dependent, and its upper bound is set by COVERAGE, not
-// by taste: the fast-weights tap cutoff (z > 16 = beyond 4 sigma) and the
-// fp16 accumulator both need the sharpest kernel to still reach the nearest
-// same-color sample, which sits at ~0.2-0.4 px across an 8-frame Bayer
-// merge. 512 (sigma floor 0.044 px) violated that -- every off-site colour
-// channel lost all its taps and the denominator zeroed, which is exactly the
-// green/black per-channel speckle the guard exists to prevent. 128 floors
-// sigma at 0.088 px: z at 0.35 px is ~15.8 (inside the cutoff), the weight
-// ~4e-4 (fp16-safe), and the resolution cost vs 0.044 px is 97% vs 98%
-// contrast at 1 px strokes -- nothing, for artifact-free coverage.
-//
-// BOTH modes use 128 now. The legacy value 32 (sigma floor 0.177 px) was a
-// silent divergence from the 460-main reference, which has NO width floor:
-// at k_detail 0.17 its across-edge kernels run at 0.085 px and ours were
-// doubled to 0.177 -- every edge ~2x softer than the reference at identical
-// settings, which is why matching its detail took k_detail ~0.10 here. At
-// 128 the same k_detail means the same kernel as 460-main down to the
-// coverage bound, and the reference-pass coverage floor (keyed on this
-// value being > 64) guards the denominators in both modes.
-static inline f32 merge_soften_max_inv(const Config& cfg) {
-    (void)cfg;
-    return 128.f;
-}
-
-static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
-    if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-        ixx = 2.f;
-        ixy = 0.f;
-        iyy = 2.f;
+static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
+    constexpr f32 k_max_abs = 32.f;
+    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
+    if (!(m > k_max_abs) || !std::isfinite(m)) {
+        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
         return;
     }
-    // Clamp EIGENVALUES, not the whole matrix. The previous form rescaled all
-    // three entries by one factor, which bounds the sharp axis (what the
-    // speckle fix needs) but widens the already-wide axis by the same factor
-    // -- pure blur with no coverage benefit. Measured on an edge kernel with
-    // the continuous-anisotropy defaults: sigma 0.085 x 0.68 px became
-    // 0.177 x 1.41 px, doubling the along-edge width for nothing, which is
-    // the reported over-smoothing. Bounding each eigenvalue independently
-    // gives 0.177 x 0.68: the across-edge axis widened exactly to the
-    // coverage floor, the along-edge axis untouched.
-    const f32 mean = 0.5f * (ixx + iyy);
-    const f32 half_diff = 0.5f * (ixx - iyy);
-    const f32 disc = std::sqrt(half_diff * half_diff + ixy * ixy);
-    const f32 l1 = mean + disc;                    // largest eigenvalue
-    if (!(l1 > k_max_abs)) return;                 // nothing too sharp
-    const f32 l2 = mean - disc;
-    const f32 c1 = k_max_abs;
-    const f32 c2 = std::min(l2, k_max_abs);
-    // Eigenvector of l1. Both constructions degenerate only when the matrix
-    // is (near-)isotropic diagonal, where a plain per-entry clamp is exact.
-    f32 vx = ixy;
-    f32 vy = l1 - ixx;
-    f32 n2 = vx * vx + vy * vy;
-    if (!(n2 > 0.f)) {
-        vx = l1 - iyy;
-        vy = ixy;
-        n2 = vx * vx + vy * vy;
-    }
-    if (!(n2 > 0.f)) {
-        ixx = std::min(ixx, k_max_abs);
-        iyy = std::min(iyy, k_max_abs);
-        return;
-    }
-    const f32 inv_n2 = 1.f / n2;
-    const f32 d = c1 - c2;
-    ixx = c2 + d * (vx * vx * inv_n2);
-    ixy = d * (vx * vy * inv_n2);
-    iyy = c2 + d * (vy * vy * inv_n2);
+    f32 s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
 }
 
 static inline int cuda_round_to_int(f32 x) {
@@ -173,8 +110,7 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det,
-                                  f32 soften_max) {
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -216,7 +152,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    soften_inv_cov(ixx, ixy, iyy, soften_max);
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -229,30 +165,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     const int nch = cfg.bayer_mode ? 3 : 1;
     const bool iso = (cfg.kernel == KernelShape::Iso);
     const f32 scale = cfg.scale;
-    const bool fastw = cfg.merge_fast_weights;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // output_pixel / scale -- the SAME expression accumulate_ref uses
-            // for coarse_x/coarse_y below. These two must agree: the reference
-            // frame and every comparison frame are accumulated into one shared
-            // num/den grid, so sampling them at different positions offsets
-            // every comparison frame against the reference they are being
-            // fused onto.
-            //
-            // b65b51f had this as (hr + 0.5) / scale "to match python-z's
-            // accumulate" while leaving accumulate_ref on hr / scale, which
-            // put the two half an output pixel apart -- 0.25 raw px at 2x --
-            // and that mismatch is the sub-pixel misalignment. It did not
-            // actually match python-z either: python-z pairs its (hr+0.5)/s
-            // with a compensating `lr_mov_j = lr_mov_x - 0.5` before the
-            // distance (merge.py accumulate, line 398), which this port has
-            // never had, so the +0.5 alone landed a further half pixel out.
-            //
-            // 460-main -- which this function's header says it mirrors --
-            // uses output_pixel / scale in BOTH accumulate and accumulate_ref
-            // (merge.py:143 and :399). Verified by reading both references.
+            // Python accumulate(): coarse_ref_sub_pos = output_pixel / scale.
             const f32 lr_x = (f32)hr_j / scale;
             const f32 lr_y = (f32)hr_i / scale;
 
@@ -264,61 +181,12 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // constant, which rotation turns into a visible tile grid. The
             // mask samples the SAME way, so it still grades the fetch that
             // actually happens. See FlowField::sample_bilinear.
-            // Flow hypotheses. Normally one (sampled); in overlapped-tile
-            // merge mode (Config::flow_overlap_merge) up to four -- the
-            // covering half-pitch tiles' OWN vectors, Hann-crossfaded
-            // (cos^2/sin^2 per axis == the 50%-overlap raised cosine,
-            // partition of unity). Duplicates are merged so smooth regions
-            // cost a single gather.
-            f32 hx[4], hy[4], hw[4] = {1.f, 0.f, 0.f, 0.f};
-            int nhyp = 1;
-            if (cfg.overlap_merge_active() && flow.has_fine()) {
-                const f32 P = 0.5f * (f32)tile_size;
-                const f32 tcy = lr_y / P - 0.5f;
-                const f32 tcx = lr_x / P - 0.5f;
-                const int cy0i = (int)std::floor(tcy), cx0i = (int)std::floor(tcx);
-                const f32 ay = tcy - (f32)cy0i, ax = tcx - (f32)cx0i;
-                auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
-                const int iy0 = cl(cy0i, flow.fine_ny), iy1 = cl(cy0i + 1, flow.fine_ny);
-                const int ix0 = cl(cx0i, flow.fine_nx), ix1 = cl(cx0i + 1, flow.fine_nx);
-                const f32 sy = std::sin(1.57079632679f * ay);
-                const f32 sx = std::sin(1.57079632679f * ax);
-                const f32 wy1 = sy * sy, wy0 = 1.f - wy1;
-                const f32 wx1 = sx * sx, wx0 = 1.f - wx1;
-                const int idx4[4][2] = {{iy0, ix0}, {iy0, ix1}, {iy1, ix0}, {iy1, ix1}};
-                const f32 w4[4] = {wy0 * wx0, wy0 * wx1, wy1 * wx0, wy1 * wx1};
-                for (int a = 0; a < 4; ++a) {
-                    const size_t o = ((size_t)idx4[a][0] * flow.fine_nx + idx4[a][1]) * 2u;
-                    hx[a] = flow.fine_flow[o + 0];
-                    hy[a] = flow.fine_flow[o + 1];
-                    hw[a] = w4[a];
-                }
-                // CLUSTER, not exact-dedup: measured lattice vectors are
-                // never bit-identical (independent sub-pixel fits), so an
-                // exact test never fires and every pixel paid 4 gathers --
-                // the merge stopped hiding behind the CPU. Hypotheses within
-                // a quarter pixel are the same motion to sub-quantisation
-                // accuracy; fold them into their weighted mean. Smooth
-                // regions collapse to ONE gather; only real disagreements
-                // (>= the boundary threshold) stay separate.
-                for (int a = 1; a < 4; ++a)
-                    for (int b = 0; b < a; ++b)
-                        if (hw[a] > 0.f && hw[b] > 0.f &&
-                            std::fabs(hx[a] - hx[b]) < 0.25f &&
-                            std::fabs(hy[a] - hy[b]) < 0.25f) {
-                            const f32 wsum = hw[b] + hw[a];
-                            hx[b] = (hx[b] * hw[b] + hx[a] * hw[a]) / wsum;
-                            hy[b] = (hy[b] * hw[b] + hy[a] * hw[a]) / wsum;
-                            hw[b] = wsum;
-                            hw[a] = 0.f;
-                            break;
-                        }
-                nhyp = 4;
-            } else if (cfg.flow_bilinear_sampling) {
-                flow.sample_bilinear(lr_y, lr_x, tile_size, hx[0], hy[0]);
+            f32 flowx, flowy;
+            if (cfg.flow_bilinear_sampling) {
+                flow.sample_bilinear(lr_y, lr_x, tile_size, flowx, flowy);
             } else {
-                hx[0] = flow.dx(py, px);
-                hy[0] = flow.dy(py, px);
+                flowx = flow.dx(py, px);
+                flowy = flow.dy(py, px);
             }
 
             // Which coordinate space R lives in is decided by R's ACTUAL
@@ -336,12 +204,6 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             }
             const f32 local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
 
-            f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
-            for (int h = 0; h < nhyp; ++h) {
-            if (hw[h] <= 0.f) continue;
-            if (fastw && nhyp > 1 && hw[h] < 0.05f) continue;
-            const f32 flowx = hx[h], flowy = hy[h];
-            const f32 wsc = hw[h];
             const f32 lr_mov_x = lr_x + flowx;
             const f32 lr_mov_y = lr_y + flowy;
             if (!(lr_mov_x >= 0.f && lr_mov_x < (f32)lr_w &&
@@ -350,48 +212,21 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
             if (!iso) {
-                // Raw position -> covariance/grey grid. Must be the SAME
-                // mapping accumulate_ref uses below, for the same reason the
-                // sampling position must: at zero flow a comparison frame
-                // describes the same scene point as the reference, so both
-                // have to look up the same kernel shape.
-                //
-                // 460-main uses (pos - 0.5)/2 (bayer) and pos (non-bayer) in
-                // BOTH accumulate and accumulate_ref -- merge.py:446 and :162.
-                // This path previously used python-z's accumulate form
-                // (pos/2 - 0.5, pos - 0.5, merge.py:350), which the reference
-                // pass never matched: a constant 0.25 grey px = 0.5 raw px
-                // offset, so comparison frames were reconstructed with a
-                // kernel measured half a raw pixel away from the one the
-                // reference frame used. python-z is internally inconsistent
-                // here too -- its own accumulate_ref uses the 460-main form.
-                // Config::kernel_lookup_quad_centre selects between the two;
-                // see there for why the legacy form is still reachable.
                 f32 kmap_j, kmap_i;
-                if (cfg.kernel_lookup_quad_centre) {
-                    if (cfg.bayer_mode) {
-                        kmap_j = (lr_mov_x - 0.5f) / 2.f;
-                        kmap_i = (lr_mov_y - 0.5f) / 2.f;
-                    } else {
-                        kmap_j = lr_mov_x;
-                        kmap_i = lr_mov_y;
-                    }
+                if (cfg.bayer_mode) {
+                    kmap_j = lr_mov_x / 2.f - 0.5f;
+                    kmap_i = lr_mov_y / 2.f - 0.5f;
                 } else {
-                    if (cfg.bayer_mode) {
-                        kmap_j = lr_mov_x / 2.f - 0.5f;
-                        kmap_i = lr_mov_y / 2.f - 0.5f;
-                    } else {
-                        kmap_j = lr_mov_x - 0.5f;
-                        kmap_i = lr_mov_y - 0.5f;
-                    }
+                    kmap_j = lr_mov_x - 0.5f;
+                    kmap_i = lr_mov_y - 0.5f;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
-                               merge_soften_max_inv(cfg));
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
 
             const int center_j = cuda_round_to_int(lr_mov_x);
             const int center_i = cuda_round_to_int(lr_mov_y);
 
+            f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
                 for (int dj = -1; dj <= 1; ++dj) {
                     const int j = center_j + dj;
@@ -407,13 +242,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
                     z = std::max(0.f, z);
-                    if (fastw && z > 16.f) continue;
                     const f32 w = std::exp(-0.5f * z);
 
-                    val[channel] += w * local_r * wsc * c;
-                    acc[channel] += w * local_r * wsc;
+                    val[channel] += w * local_r * c;
+                    acc[channel] += w * local_r;
                 }
-            }
             }
             for (int ch = 0; ch < nch; ++ch) {
                 num.at(local_i, hr_j, ch) += val[ch];
@@ -426,9 +259,6 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    // See the coverage-floor comment in the tap loop below. Always active
-    // now that the ceiling is 128 in every mode.
-    const f32 cover_eps = (merge_soften_max_inv(cfg) > 64.f) ? 5e-4f : 0.f;
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
     const int nch = cfg.bayer_mode ? 3 : 1;
@@ -492,8 +322,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
-                               merge_soften_max_inv(cfg));
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
             }
 
             // Python: center = round(coarse)
@@ -517,19 +346,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;
-                    f32 w = std::exp(-0.5f * y);
-                    // Coverage floor: a tiny isotropic sigma=1
-                    // reference contribution guarantees every colour channel
-                    // of every output pixel a nonzero denominator, whatever
-                    // the sharp kernels and robustness rejection left behind.
-                    // 5e-4 relative: invisible (<1%) wherever any real tap
-                    // survives, decisive where none does -- the residual
-                    // green/black per-channel holes. The 3x3 window (rad >=
-                    // 1) always contains all four CFA sites, so the floor
-                    // closes every hole. Twin in merge_accumulate_ref_body.
-                    if (cover_eps > 0.f)
-                        w += cover_eps * std::exp(-0.5f * (dist_x * dist_x +
-                                                           dist_y * dist_y));
+                    const f32 w = std::exp(-0.5f * y);
 
                     val[channel] += c * w;
                     acc[channel] += w;
@@ -604,35 +421,7 @@ void merge_ref(const Image& ref_raw, const CovField& covs,
 
 void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
                          int c, AccumDiag& d) {
-    // Chunked parallel scan. Every field is an additive integer count, so
-    // per-chunk partials summed in chunk order are bit-identical to the
-    // serial scan -- this was a SERIAL walk over 144M values at 48MP,
-    // costing a few hundred ms of the encode tail for one status line.
-    const int nch_par = std::min(3, c);
-    const size_t kChunk = 1u << 20;
-    if (n > 2 * kChunk) {
-        const size_t nchunks = (n + kChunk - 1) / kChunk;
-        std::vector<AccumDiag> parts(nchunks);
-        parallel_rows((int)nchunks, 0, [&](int ci) {
-            const size_t p0 = (size_t)ci * kChunk;
-            const size_t p1 = std::min(n, p0 + kChunk);
-            accumulate_diag_ptr(nump + p0 * (size_t)c, denp + p0 * (size_t)c,
-                                p1 - p0, c, parts[(size_t)ci]);
-        });
-        for (const AccumDiag& q : parts) {
-            d.pixels += q.pixels;
-            for (int ch = 0; ch < 3; ++ch) {
-                d.den_zero[ch] += q.den_zero[ch];
-                d.den_tiny[ch] += q.den_tiny[ch];
-                d.den_nonfinite[ch] += q.den_nonfinite[ch];
-                d.num_nonfinite[ch] += q.num_nonfinite[ch];
-            }
-            d.only_green += q.only_green;
-            d.rgb_all_zero += q.rgb_all_zero;
-        }
-        return;
-    }
-    const int nch = nch_par;
+    const int nch = std::min(3, c);
     for (size_t p = 0; p < n; ++p) {
         ++d.pixels;
         f32 dens[3] = {0, 0, 0};
