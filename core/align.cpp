@@ -1636,6 +1636,21 @@ void flow_densify_boundary_select(FlowField& flow,
     flow.fine_ny = 0;
     flow.fine_nx = 0;
     flow.fine_flow.clear();
+    flow.fine_div = 2;
+    // Layer 3 replaces this whole stage: instead of deciding per half-pitch
+    // cell between a blend and one of the four neighbouring tile vectors, it
+    // re-estimates the flow densely. Dispatched from here so all seven call
+    // sites keep working unchanged.
+    //
+    // Deliberately ahead of the flow_bilinear_sampling gate: at one cell per
+    // grey pixel the lattice step under rotation is 0.035 raw px (0.28 sigma
+    // against the merge kernel), so consuming the field nearest is no longer
+    // the staircase that gate exists to avoid.
+    if (cfg.flow_dense_lk_enabled) {
+        flow_densify_lucas_kanade(flow, ref_grey, mov_grey, raw_h, raw_w,
+                                  tile_size, cfg);
+        return;
+    }
     const bool overlap_all = cfg.overlap_merge_active();
     if ((!cfg.flow_boundary_selection && !overlap_all) ||
         !cfg.flow_bilinear_sampling)
@@ -1816,6 +1831,170 @@ void flow_densify_boundary_select(FlowField& flow,
     flow.fine_flow = std::move(fine);
     flow.fine_ny = fny;
     flow.fine_nx = fnx;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: dense Lucas-Kanade refinement (ImageStackAlignator lucasKanadeOptim)
+// ---------------------------------------------------------------------------
+//
+// opticalFlow.cu:190 runs one thread PER PIXEL over the dense flow field,
+// solving a 2x2 normal-equation system over a sliding window. That is the
+// layer that actually removes the tile lattice from the result, and it is the
+// one this port never had: ica_refine_level solves once per TILE, so the
+// output is a lattice of independent constants no matter how it is later
+// interpolated.
+//
+// Two error terms die here that no interpolator can touch:
+//
+//  - Independent per-tile estimation noise. Neighbouring tiles share no pixels,
+//    so their errors are uncorrelated and show as a step of ~eps*sqrt(2) at
+//    every seam, with exactly the tile pitch. Interpolation rounds the step's
+//    edges; the field is still wrong by eps inside each tile.
+//  - Attribution bias. A per-tile solve minimises sum |grad I . u + I_t|^2
+//    over the tile, so the vector it returns is the field's value at the
+//    tile's GRADIENT-ENERGY CENTROID, not at its centre -- but it is stored
+//    and interpolated as if it belonged at the centre. With a field gradient
+//    of theta = 0.0175 px/px, a centroid 5 px off-centre biases that tile by
+//    0.087 px. Content-dependent, so it differs tile to tile: another grid.
+//
+// Solving per cell at one cell per grey pixel makes both terms local instead
+// of tile-periodic. The window still spans several pixels, so neighbouring
+// cells share most of their data and their errors are strongly correlated --
+// which is the point: correlated error is smooth, and smooth error is not a
+// visible seam.
+//
+// Departures from ISA, both deliberate:
+//  - It solves with an SVD and a minDet cutoff; this uses Levenberg damping
+//    (A + lambda*I, lambda from the trace). Same intent -- do not invert an
+//    aperture-problem system -- but it degrades toward the seeded value
+//    continuously instead of switching at a threshold, which matters when the
+//    switch itself would be a visible boundary.
+//  - Cells are seeded by sampling the coarse field, which for the rigid part
+//    of the motion is exact: bilinear interpolation reproduces a linear
+//    function, and a rotation's displacement field IS linear in position.
+void flow_densify_lucas_kanade(FlowField& flow,
+                               const Image& ref_grey, const Image& mov_grey,
+                               int raw_h, int raw_w, int tile_size,
+                               const Config& cfg) {
+    flow.fine_flow.clear();
+    flow.fine_div = 2;
+    if (flow.ny <= 0 || flow.nx <= 0 || tile_size < 2 ||
+        ref_grey.h <= 0 || ref_grey.w <= 0 || ref_grey.c != 1 ||
+        mov_grey.h <= 0 || mov_grey.w <= 0 || mov_grey.c != 1 ||
+        raw_h <= 0 || raw_w <= 0)
+        return;
+
+    // Pitch selection. Finest first: the lattice step under rotation is
+    // theta * pitch, so a smaller pitch is strictly better for the artifact,
+    // and the only reason to back off is the buffer. A 12MP raw at pitch 2
+    // costs 24 MB; a 48MP raw would cost 96 MB, which is why this is a budget
+    // and not a constant.
+    const size_t budget = (size_t)std::max(1, cfg.flow_dense_lk_max_mb)
+                          * 1024u * 1024u;
+    int div = 0, fny = 0, fnx = 0;
+    f32 pitch = 0.f;
+    for (int d : {8, 4, 2}) {
+        if (tile_size % d != 0) continue;
+        const f32 p = (f32)tile_size / (f32)d;
+        const int ny = std::max(1, (int)std::ceil((f32)raw_h / p));
+        const int nx = std::max(1, (int)std::ceil((f32)raw_w / p));
+        if ((size_t)ny * (size_t)nx * 2u * sizeof(f32) > budget) continue;
+        div = d; pitch = p; fny = ny; fnx = nx;
+        break;
+    }
+    if (div == 0) return;   // nothing fits: leave the coarse field alone
+
+    // Raw -> grey scale (0.5 on the decimate grey, 1 on the FFT grey). The
+    // flow carries RAW-px displacements (flow_to_raw_tile_grid scaled them),
+    // so positions and displacements both convert.
+    const f32 gsy = (f32)ref_grey.h / (f32)raw_h;
+    const f32 gsx = (f32)ref_grey.w / (f32)raw_w;
+    if (!(gsy > 0.f) || !(gsx > 0.f)) return;
+
+    const Image gx = compute_sobel_gradx(ref_grey);
+    const Image gy = compute_sobel_grady(ref_grey);
+    if (gx.h != ref_grey.h || gx.w != ref_grey.w ||
+        gy.h != ref_grey.h || gy.w != ref_grey.w) return;
+
+    const int hw = std::max(1, cfg.flow_dense_lk_half_window);
+    const int iters = std::max(1, cfg.flow_dense_lk_iters);
+    const f32 damp = std::max(0.f, cfg.flow_dense_lk_damping);
+    const f32 max_step_g = std::max(0.f, cfg.flow_dense_lk_max_step) *
+                           0.5f * (gsy + gsx);
+
+    std::vector<f32> fine((size_t)fny * (size_t)fnx * 2u, 0.f);
+
+    auto samp = [](const Image& im, f32 y, f32 x) -> f32 {
+        // Clamped bilinear: a window that runs off the moving frame keeps
+        // contributing edge data rather than dropping to zero, which would
+        // read as a huge temporal gradient and throw the solve.
+        const f32 cy = (y < 0.f) ? 0.f : (y > (f32)(im.h - 1) ? (f32)(im.h - 1) : y);
+        const f32 cx = (x < 0.f) ? 0.f : (x > (f32)(im.w - 1) ? (f32)(im.w - 1) : x);
+        const int y0 = (int)cy, x0 = (int)cx;
+        const int y1 = (y0 + 1 < im.h) ? y0 + 1 : y0;
+        const int x1 = (x0 + 1 < im.w) ? x0 + 1 : x0;
+        const f32 ay = cy - (f32)y0, ax = cx - (f32)x0;
+        return (im.at(y0, x0) * (1.f - ax) + im.at(y0, x1) * ax) * (1.f - ay) +
+               (im.at(y1, x0) * (1.f - ax) + im.at(y1, x1) * ax) * ay;
+    };
+
+    parallel_rows(fny, cfg.num_threads, [&](int fy) {
+        for (int fx = 0; fx < fnx; ++fx) {
+            // Cell centre in raw px, then on the alignment grey.
+            const f32 ry = ((f32)fy + 0.5f) * pitch;
+            const f32 rx = ((f32)fx + 0.5f) * pitch;
+            f32 dxr = 0.f, dyr = 0.f;
+            flow.sample_bilinear(ry, rx, tile_size, dxr, dyr);  // coarse: no fine yet
+
+            const f32 cy = ry * gsy, cx = rx * gsx;
+            f32 ux = dxr * gsx, uy = dyr * gsy;   // grey-px displacement
+
+            for (int it = 0; it < iters; ++it) {
+                f32 a00 = 0.f, a01 = 0.f, a11 = 0.f, b0 = 0.f, b1 = 0.f;
+                for (int wy = -hw; wy <= hw; ++wy) {
+                    const f32 py = cy + (f32)wy;
+                    if (py < 0.f || py > (f32)(ref_grey.h - 1)) continue;
+                    for (int wx = -hw; wx <= hw; ++wx) {
+                        const f32 px = cx + (f32)wx;
+                        if (px < 0.f || px > (f32)(ref_grey.w - 1)) continue;
+                        const f32 ix = samp(gx, py, px);
+                        const f32 iy = samp(gy, py, px);
+                        const f32 it_ = samp(mov_grey, py + uy, px + ux) -
+                                        samp(ref_grey, py, px);
+                        a00 += ix * ix; a01 += ix * iy; a11 += iy * iy;
+                        b0  -= ix * it_; b1 -= iy * it_;
+                    }
+                }
+                // Levenberg damping off the trace: scale-free, and it leaves
+                // an aperture-problem cell sitting at its seeded value rather
+                // than sliding along the edge.
+                const f32 lam = damp * 0.5f * (a00 + a11);
+                const f32 m00 = a00 + lam, m11 = a11 + lam;
+                const f32 det = m00 * m11 - a01 * a01;
+                if (!(std::fabs(det) > 1e-20f)) break;
+                f32 sx_ = ( m11 * b0 - a01 * b1) / det;
+                f32 sy_ = (-a01 * b0 + m00 * b1) / det;
+                if (max_step_g > 0.f) {
+                    const f32 mag = std::sqrt(sx_ * sx_ + sy_ * sy_);
+                    if (mag > max_step_g) {
+                        const f32 k = max_step_g / mag;
+                        sx_ *= k; sy_ *= k;
+                    }
+                }
+                if (!std::isfinite(sx_) || !std::isfinite(sy_)) break;
+                ux += sx_; uy += sy_;
+            }
+
+            const size_t o = ((size_t)fy * fnx + fx) * 2u;
+            fine[o + 0] = ux / gsx;   // back to raw px
+            fine[o + 1] = uy / gsy;
+        }
+    });
+
+    flow.fine_flow.swap(fine);
+    flow.fine_ny = fny;
+    flow.fine_nx = fnx;
+    flow.fine_div = div;
 }
 
 } // namespace hhsr

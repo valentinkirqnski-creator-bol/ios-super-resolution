@@ -273,7 +273,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             f32 hx[4], hy[4], hw[4] = {1.f, 0.f, 0.f, 0.f};
             int nhyp = 1;
             if (cfg.overlap_merge_active() && flow.has_fine()) {
-                const f32 P = 0.5f * (f32)tile_size;
+                const f32 P = (f32)tile_size / (f32)std::max(1, flow.fine_div);
                 const f32 tcy = lr_y / P - 0.5f;
                 const f32 tcx = lr_x / P - 0.5f;
                 const int cy0i = (int)std::floor(tcy), cx0i = (int)std::floor(tcx);

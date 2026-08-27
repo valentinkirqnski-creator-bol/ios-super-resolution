@@ -211,12 +211,13 @@ static id<MTLBuffer> buf(const void* data, size_t bytes) {
 static bool flow_gpu_grid(const FlowField& flow, int tile_size,
                           const f32*& data, size_t& nbytes,
                           int& ny, int& nx, int& ts) {
-    if (flow.has_fine() && tile_size >= 2 && (tile_size % 2) == 0) {
+    const int fdiv = std::max(1, flow.fine_div);
+    if (flow.has_fine() && tile_size >= fdiv && (tile_size % fdiv) == 0) {
         data = flow.fine_flow.data();
         nbytes = flow.fine_flow.size() * sizeof(float);
         ny = flow.fine_ny;
         nx = flow.fine_nx;
-        ts = tile_size / 2;
+        ts = tile_size / fdiv;
         return true;
     }
     data = flow.flow.empty() ? nullptr : flow.flow.data();
@@ -229,12 +230,14 @@ static bool flow_gpu_grid(const FlowField& flow, int tile_size,
 
 template <typename T>
 static std::vector<T> dup_tile_aux_to_fine(const std::vector<T>& src,
-                                           int ny, int nx, int fny, int fnx) {
+                                           int ny, int nx, int fny, int fnx,
+                                           int fdiv) {
     std::vector<T> out((size_t)fny * (size_t)fnx);
+    const int d = std::max(1, fdiv);
     for (int fy = 0; fy < fny; ++fy) {
-        const int sy = std::min(std::max(0, ny - 1), fy / 2);
+        const int sy = std::min(std::max(0, ny - 1), fy / d);
         for (int fx = 0; fx < fnx; ++fx) {
-            const int sx = std::min(std::max(0, nx - 1), fx / 2);
+            const int sx = std::min(std::max(0, nx - 1), fx / d);
             out[(size_t)fy * fnx + fx] = src[(size_t)sy * nx + sx];
         }
     }
@@ -1746,7 +1749,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // duplicated to match (exact, see flow_gpu_grid).
     std::vector<f32> S_fine;
     if (flow_fine)
-        S_fine = dup_tile_aux_to_fine(S, flow.ny, flow.nx, fg_ny, fg_nx);
+        S_fine = dup_tile_aux_to_fine(S, flow.ny, flow.nx, fg_ny, fg_nx,
+                                      flow.fine_div);
     id<MTLBuffer> b_S = flow_fine
         ? buf(S_fine.data(), S_fine.size() * sizeof(float))
         : buf(S.data(), S.size() * sizeof(float));
@@ -1759,7 +1763,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     std::vector<uint32_t> amb_fine;
     if (amb_on && flow_fine)
         amb_fine = dup_tile_aux_to_fine(flow.match_ambiguous,
-                                        flow.ny, flow.nx, fg_ny, fg_nx);
+                                        flow.ny, flow.nx, fg_ny, fg_nx,
+                                        flow.fine_div);
     id<MTLBuffer> b_match_amb = amb_on
         ? (flow_fine
                ? buf(amb_fine.data(), amb_fine.size() * sizeof(uint32_t))
@@ -2909,7 +2914,8 @@ struct MergeFrameGpu {
     int lr_h = 0, lr_w = 0;
     int rob_h = 0, rob_w = 0;
     int flow_ny = 0, flow_nx = 0;
-    bool flow_fine = false;       // stashed grid is the half-pitch fine grid
+    bool flow_fine = false;       // stashed grid is the fine grid
+    int  flow_div = 2;            // its pitch: tile_size / flow_div
     int cov_h = 0, cov_w = 0;
     const f32* img = nullptr;
     const f32* flow = nullptr;
@@ -3136,6 +3142,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.flow_ny = flow_fine ? flow.fine_ny : flow.ny;
             e.flow_nx = flow_fine ? flow.fine_nx : flow.nx;
             e.flow_fine = flow_fine;
+            e.flow_div = std::max(1, flow.fine_div);
             e.cov_h = covs.h;
             e.cov_w = covs.w;
             e.img = ip;
@@ -3703,10 +3710,11 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         p.rob_w = (uint32_t)robustness.w;
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
-        if (flow.has_fine() && tile_size >= 2 && (tile_size % 2) == 0) {
+        const int fdiv_l = std::max(1, flow.fine_div);
+        if (flow.has_fine() && tile_size >= fdiv_l && (tile_size % fdiv_l) == 0) {
             p.flow_ny = (uint32_t)flow.fine_ny;
             p.flow_nx = (uint32_t)flow.fine_nx;
-            p.tile_size = (uint32_t)(tile_size / 2);
+            p.tile_size = (uint32_t)(tile_size / fdiv_l);
             if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
         } else {
             p.flow_ny = (uint32_t)flow.ny;
@@ -3726,8 +3734,9 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
-        if (hit->flow_fine && tile_size >= 2 && (tile_size % 2) == 0) {
-            p.tile_size = (uint32_t)(tile_size / 2);
+        const int fdiv_c = std::max(1, hit->flow_div);
+        if (hit->flow_fine && tile_size >= fdiv_c && (tile_size % fdiv_c) == 0) {
+            p.tile_size = (uint32_t)(tile_size / fdiv_c);
             if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
         }
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
@@ -4068,6 +4077,7 @@ bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
     memcpy(flow.fine_flow.data(), [b_fine contents], fine_b);
     flow.fine_ny = fny;
     flow.fine_nx = fnx;
+    flow.fine_div = 2;   // this builder is half-pitch by construction
     return true;
   }
 }

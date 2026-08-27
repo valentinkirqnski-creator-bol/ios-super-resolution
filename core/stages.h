@@ -59,6 +59,14 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
 // before flow_densify_boundary_select.
 bool flow_fullres_ica_polish(const Image& ref_grey_full, const Image& mov_grey_full,
                              FlowField& flow, int tile_size, const Config& cfg);
+// Dense per-cell Lucas-Kanade refinement of the flow field, at the finest
+// lattice pitch that fits Config::flow_dense_lk_max_mb. Dispatched from
+// flow_densify_boundary_select when Config::flow_dense_lk_enabled.
+void flow_densify_lucas_kanade(FlowField& flow,
+                               const Image& ref_grey, const Image& mov_grey,
+                               int raw_h, int raw_w, int tile_size,
+                               const Config& cfg);
+
 void flow_densify_boundary_select(FlowField& flow,
                                   const Image& ref_grey, const Image& mov_grey,
                                   int raw_h, int raw_w, int tile_size,

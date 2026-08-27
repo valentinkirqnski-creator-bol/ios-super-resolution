@@ -157,7 +157,8 @@ struct FlowField {
         const f32* g = has_fine() ? fine_flow.data() : flow.data();
         const int gny = has_fine() ? fine_ny : ny;
         const int gnx = has_fine() ? fine_nx : nx;
-        const f32 ts = has_fine() ? 0.5f * (f32)tile_size : (f32)tile_size;
+        const f32 ts = has_fine()
+            ? (f32)tile_size / (f32)std::max(1, fine_div) : (f32)tile_size;
         if (gny <= 0 || gnx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
         if (sample_bicubic)
             sample_grid_bicubic(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
@@ -240,6 +241,14 @@ struct FlowField {
     // Empty means not built: sampling falls through to the coarse grid.
     int fine_ny = 0, fine_nx = 0;
     std::vector<f32> fine_flow;   // fine_ny * fine_nx * 2, raw-px displacements
+    // Pitch of the fine lattice, as a divisor of tile_size: pitch =
+    // tile_size / fine_div. 2 is the half-pitch boundary-select grid; the
+    // dense Lucas-Kanade refinement uses a larger divisor to reach one cell
+    // per grey pixel. Must divide tile_size exactly -- every consumer derives
+    // its pitch from this, and the per-tile aux duplication
+    // (dup_tile_aux_to_fine) is exact only because
+    // floor(floor(a / (ts/div)) / div) == floor(a / ts) for integer div.
+    int fine_div = 2;
     inline bool has_fine() const {
         return fine_ny > 0 && fine_nx > 0 &&
                fine_flow.size() == (size_t)fine_ny * (size_t)fine_nx * 2u;
@@ -696,6 +705,33 @@ struct Config {
     // Off by default: it changes every frame's alignment, so it is opt-in
     // until measured against the current path on a real burst.
     bool  prealign_enabled    = false;
+
+    // Layer 3: dense Lucas-Kanade refinement (ISA lucasKanadeOptim). Replaces
+    // flow_densify_boundary_select's blend-or-select with a real per-cell
+    // solve at one cell per grey pixel, which is what removes the tile
+    // lattice from the field. Off by default; see
+    // flow_densify_lucas_kanade for what it does and does not fix.
+    bool  flow_dense_lk_enabled     = false;
+    // Defaults chosen by sweeping (window, iters, damping) against a
+    // synthetic 1-degree rotation with seeded per-tile noise, not by taste:
+    //  - a LARGER window is monotonically better (hw 4 beats 3 beats 2), so
+    //    the residual is solve noise, which averaging reduces -- not the
+    //    within-window attribution bias, which would grow with the window;
+    //  - MORE iterations is worse at every setting (3 -> 6 raised the error
+    //    everywhere), so the solve drifts rather than converging. ISA and the
+    //    paper both stop at 3, which this independently reproduces;
+    //  - damping trades seed against data. It shrinks the step toward the
+    //    seeded value, and the seed is EXACT for the rigid part of the motion
+    //    (bilinear interpolation reproduces a linear function, and a
+    //    rotation's displacement field is linear in position), so shrinkage
+    //    is not merely a regulariser here -- it is a prior worth keeping.
+    //    0.25 is the value that beats the unrefined field across the whole
+    //    plausible seed-noise range instead of only at one end.
+    int   flow_dense_lk_half_window = 4;    // grey px; 4 -> a 9x9 solve
+    int   flow_dense_lk_iters       = 3;    // ISA and the paper both use 3
+    float flow_dense_lk_damping     = 0.25f; // Levenberg lambda, x trace/2
+    float flow_dense_lk_max_step    = 1.0f;  // raw px per iteration
+    int   flow_dense_lk_max_mb      = 64;    // fine-field buffer budget
     float prealign_rot_range  = 1.0f;  // degrees, sweep is +/- this
     float prealign_rot_incr   = 0.2f;  // degrees, fine step (coarse is 5x)
 

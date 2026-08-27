@@ -191,6 +191,11 @@ struct TuningParams: Equatable, Codable {
     /// block-matching level with it, so the search only has to find the
     /// residual. ImageStackAlignator's pre-alignment stage.
     var prealign_enabled: Bool = false
+    /// Re-estimate the flow densely, one Lucas-Kanade solve per lattice cell
+    /// at the finest pitch that fits the buffer budget, instead of the
+    /// half-pitch blend-or-select densify. ImageStackAlignator's
+    /// lucasKanadeOptim. This is the layer that removes the tile lattice.
+    var flow_dense_lk_enabled: Bool = false
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -267,6 +272,7 @@ struct TuningParams: Equatable, Codable {
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
         case prealign_enabled
+        case flow_dense_lk_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -338,6 +344,7 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_enabled) ?? prealign_enabled
+        flow_dense_lk_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_dense_lk_enabled) ?? flow_dense_lk_enabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -2124,6 +2131,7 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "prealign_enabled": NSNumber(value: tuningParams.prealign_enabled),
+            "flow_dense_lk_enabled": NSNumber(value: tuningParams.flow_dense_lk_enabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
