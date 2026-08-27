@@ -129,14 +129,6 @@ struct TuningParams: Equatable, Codable {
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
-    /// Align every half-pitch overlap cell on its own full-tile window,
-    /// as HDR+ does (4x the alignment work). Without it the fine grid is
-    /// derived from the coarse one and stays at the coarse pitch.
-    var flow_overlap_measure_all: Bool = false
-    /// Where the merge looks the steerable kernel up in the covariance grid.
-    /// On = (pos-0.5)/2, the Bayer quad centre the grid is actually sampled
-    /// at. Off = the legacy pos/2-0.5, which fetches it 0.5 raw px away.
-    var kernel_lookup_quad_centre: Bool = true
     var k_shrink: Float = 2.0
     /// D gate: below-threshold gradients are routed to denoising instead of
     /// super-resolution. GAT-domain units (noise sigma ~ 1). Only applied
@@ -204,7 +196,7 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var robustness_raw_resolution_enabled: Bool = false
-    // JPEG/preview rendering (core/render_hdrplus.cpp). Defaults mirror the C++
+    // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
     var isp_enabled: Bool = true
@@ -244,7 +236,6 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
-        case kernel_lookup_quad_centre
         case d_thresh_manual, d_th, d_tr
         case burst_fast_shutter
         case dng_lossless_jpeg
@@ -260,7 +251,6 @@ struct TuningParams: Equatable, Codable {
         case flow_boundary_selection
         case flow_bicubic_sampling
         case flow_overlap_merge
-        case flow_overlap_measure_all
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
@@ -293,7 +283,6 @@ struct TuningParams: Equatable, Codable {
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
-        kernel_lookup_quad_centre = try c.decodeIfPresent(Bool.self, forKey: .kernel_lookup_quad_centre) ?? kernel_lookup_quad_centre
         d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
         burst_fast_shutter = try c.decodeIfPresent(Bool.self, forKey: .burst_fast_shutter) ?? burst_fast_shutter
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
@@ -311,7 +300,6 @@ struct TuningParams: Equatable, Codable {
         flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
         flow_bicubic_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bicubic_sampling) ?? flow_bicubic_sampling
         flow_overlap_merge = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_merge) ?? flow_overlap_merge
-        flow_overlap_measure_all = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_measure_all) ?? flow_overlap_measure_all
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
@@ -2094,9 +2082,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
             "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
-            "flow_overlap_measure_all": NSNumber(value: tuningParams.flow_overlap_measure_all),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
-            "kernel_lookup_quad_centre": NSNumber(value: tuningParams.kernel_lookup_quad_centre),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
             "dng_lossless_jpeg": NSNumber(value: tuningParams.dng_lossless_jpeg),
             "D_th": NSNumber(value: tuningParams.d_th),

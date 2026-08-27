@@ -2863,11 +2863,8 @@ struct MergeCompParamsCPU {
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
     float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling (was _pad3)
-    // 1 = kmap = (pos - 0.5)/2 (Bayer quad centre); 0 = legacy pos/2 - 0.5.
-    // Config::kernel_lookup_quad_centre. Comparison path only.
-    uint32_t kmap_quad_centre = 1;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 100, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -3690,7 +3687,6 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.raw_res_robustness = 0u;
     p.flow_bilinear = flow_sample_mode(cfg);
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
-    p.kmap_quad_centre = cfg.kernel_lookup_quad_centre ? 1u : 0u;
     // Same mode split as merge_soften_max_inv in merge.cpp (128 = coverage
     // bound: sharper floors zero the off-site colour channels -> speckle).
     p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv

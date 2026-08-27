@@ -913,10 +913,6 @@ struct MergeCompParams {
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
     float soften_max_inv; // inverse-covariance eigenvalue ceiling (was _pad3)
-    // 1 = kmap = (pos - 0.5)/2 (Bayer quad centre, correct); 0 = legacy
-    // pos/2 - 0.5. Config::kernel_lookup_quad_centre. Comparison path only --
-    // merge_accumulate_ref has always used the quad-centre form.
-    uint kmap_quad_centre;
 };
 
 struct MergeRefParams {
@@ -959,20 +955,46 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
 
-// Twin of soften_inv_cov in core/merge.cpp -- keep them in step. Non-finite
-// guard ONLY; the kernel-width floor is gone. See the CPU twin for why: the
-// zero-denominator green/black speckle it defended against is now closed by
-// accumulate_ref's coverage floor (the 5e-4 isotropic sigma=1 term below),
-// which costs no sharpness because it is under 0.1% of the weight wherever a
-// real tap survives.
+// Twin of soften_inv_cov in core/merge.cpp -- keep them in step. See there for
+// why an unclamped inverse covariance shows up as green or black speckles
+// rather than as general softness.
 inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy,
                            float k_max_abs) {
-    (void)k_max_abs;
     if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
         ixx = 2.f;
         ixy = 0.f;
         iyy = 2.f;
+        return;
     }
+    // Eigenvalue clamp, same op order as the CPU twin: bound only the sharp
+    // axis to the coverage floor; the wide axis is left alone, so edges are
+    // not blurred along themselves the way the whole-matrix rescale did.
+    const float mean = 0.5f * (ixx + iyy);
+    const float half_diff = 0.5f * (ixx - iyy);
+    const float disc = sqrt(half_diff * half_diff + ixy * ixy);
+    const float l1 = mean + disc;
+    if (!(l1 > k_max_abs)) return;
+    const float l2 = mean - disc;
+    const float c1 = k_max_abs;
+    const float c2 = min(l2, k_max_abs);
+    float vx = ixy;
+    float vy = l1 - ixx;
+    float n2 = vx * vx + vy * vy;
+    if (!(n2 > 0.f)) {
+        vx = l1 - iyy;
+        vy = ixy;
+        n2 = vx * vx + vy * vy;
+    }
+    if (!(n2 > 0.f)) {
+        ixx = min(ixx, k_max_abs);
+        iyy = min(iyy, k_max_abs);
+        return;
+    }
+    const float inv_n2 = 1.f / n2;
+    const float d = c1 - c2;
+    ixx = c2 + d * (vx * vx * inv_n2);
+    ixy = d * (vx * vy * inv_n2);
+    iyy = c2 + d * (vy * vy * inv_n2);
 }
 
 inline float cov_lerp2(device const float* covs, uint cov_w,
@@ -1193,24 +1215,13 @@ static inline void merge_comp_contrib_flowed(device const float* img,
         // accumulate_comp uses in merge.cpp -- see the comment there. Was
         // python-z's accumulate form, which the reference pass never matched
         // (0.25 grey px = 0.5 raw px apart).
-        // p.kmap_quad_centre -- twin of the branch in accumulate_comp.
         float kmap_j, kmap_i;
-        if (p.kmap_quad_centre != 0u) {
-            if (p.bayer) {
-                kmap_j = (lr_mov_x - 0.5f) / 2.f;
-                kmap_i = (lr_mov_y - 0.5f) / 2.f;
-            } else {
-                kmap_j = lr_mov_x;
-                kmap_i = lr_mov_y;
-            }
+        if (p.bayer) {
+            kmap_j = (lr_mov_x - 0.5f) / 2.f;
+            kmap_i = (lr_mov_y - 0.5f) / 2.f;
         } else {
-            if (p.bayer) {
-                kmap_j = lr_mov_x / 2.f - 0.5f;
-                kmap_i = lr_mov_y / 2.f - 0.5f;
-            } else {
-                kmap_j = lr_mov_x - 0.5f;
-                kmap_i = lr_mov_y - 0.5f;
-            }
+            kmap_j = lr_mov_x;
+            kmap_i = lr_mov_y;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true,
                        p.soften_max_inv);
@@ -1486,15 +1497,15 @@ inline void merge_accumulate_ref_body(device AccT* num,
     float additional_denoise_power = 1.f;
     int rad = 1;
     if (p.robustness_denoise) {
+        // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
         float acc_y = coarse_y, acc_x = coarse_x;
         if (p.raw_res_robustness == 0u && p.bayer != 0u) {
             acc_y = (coarse_y - 0.5f) / 2.f;
             acc_x = (coarse_x - 0.5f) / 2.f;
         }
-        // Fractional -- twin of accumulate_ref in merge.cpp; see there. The
-        // sampler clamps internally, so no explicit index clamp is needed.
-        local_acc_r = sample_robustness_bilinear(acc_rob, p.acc_h, p.acc_w,
-                                                 acc_y, acc_x);
+        int ay = min(max(lround_away(acc_y), 0), int(p.acc_h) - 1);
+        int ax = min(max(lround_away(acc_x), 0), int(p.acc_w) - 1);
+        local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
         if (p.adaptive != 0u) {
             // Must match denoise_power_merge / denoise_range_merge in merge.cpp.
             // m = N / (r_acc + 1): kernel area scales as m, merging k frames cuts
@@ -1558,12 +1569,11 @@ inline void merge_accumulate_ref_body(device AccT* num,
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
             float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
-            // Coverage floor -- twin of accumulate_ref in merge.cpp.
-            // Unconditional: with soften_inv_cov reduced to a non-finite
-            // guard this is the only thing keeping a colour channel's
-            // denominator off zero under a very sharp kernel.
-            w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
-                                            dist_y * dist_y));
+            // Coverage floor -- twin of accumulate_ref in merge.cpp. Keyed
+            // on the ceiling in the params (>64), always active at 128.
+            if (p.soften_max_inv > 64.f)
+                w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
+                                                dist_y * dist_y));
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }

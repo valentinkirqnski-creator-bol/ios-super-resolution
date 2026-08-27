@@ -128,40 +128,6 @@ struct FlowField {
             sample_grid(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
     }
 
-    // Nearest-cell counterpart of sample_bilinear, and the important part is
-    // that it switches to the fine grid on exactly the same condition. Every
-    // GPU consumer already does: flow_gpu_grid() and acquire_frame_gpu() swap
-    // in fine_flow whenever has_fine() is true, with the pitch halved,
-    // unconditionally. The CPU nearest paths used to read the COARSE grid
-    // instead, which was harmless only because the fine grid could not exist
-    // without flow_bilinear_sampling. Once the overlapped-tile merge is
-    // allowed to build it with interpolation off, that asymmetry becomes a
-    // CPU/GPU split -- the two would warp the same frame with different flow
-    // fields. Route every nearest read through here so they cannot drift.
-    //
-    // Indexing mirrors the shader: tile index = int(raw / pitch), pitch
-    // halved on the fine grid. Clamped, where the shader relies on the
-    // pipeline's padding; identical wherever the index is in range, and
-    // bounded rather than out-of-bounds where it is not.
-    inline void sample_nearest(f32 raw_y, f32 raw_x, int tile_size,
-                               f32& out_dx, f32& out_dy) const {
-        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
-        if (has_fine() && tile_size >= 2 && (tile_size % 2) == 0) {
-            const f32 ts = 0.5f * (f32)tile_size;
-            const int ty = cl((int)(raw_y / ts), fine_ny);
-            const int tx = cl((int)(raw_x / ts), fine_nx);
-            const size_t o = ((size_t)ty * fine_nx + tx) * 2u;
-            out_dx = fine_flow[o + 0];
-            out_dy = fine_flow[o + 1];
-            return;
-        }
-        if (ny <= 0 || nx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
-        const int ty = cl((int)(raw_y / (f32)tile_size), ny);
-        const int tx = cl((int)(raw_x / (f32)tile_size), nx);
-        out_dx = dx(ty, tx);
-        out_dy = dy(ty, tx);
-    }
-
     static inline f32 catmull1(f32 p0, f32 p1, f32 p2, f32 p3, f32 t) {
         return 0.5f * (2.f * p1 + (-p0 + p2) * t +
                        (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t +
@@ -775,47 +741,10 @@ struct Config {
     bool  flow_overlap_merge = false;
 
     // True when the overlapped-tile merge should actually run.
-    // No longer requires flow_bilinear_sampling. The overlapped-tile merge
-    // never interpolated the flow in the first place -- it reads its <=4
-    // hypotheses straight out of fine_flow, one per covering cell, nearest.
-    // The old dependency existed because the fine grid was only BUILT when
-    // interpolation was on, and because the robustness mask picked its grid
-    // off the same flag; with FlowField::sample_nearest routing every CPU
-    // nearest read through the fine grid exactly as the GPU already does,
-    // and flow_densify_boundary_select building it for overlap regardless,
-    // mask and merge stay on one grid either way.
     bool overlap_merge_active() const {
-        return flow_overlap_merge && grey_method == GreyMethod::Decimate;
+        return flow_overlap_merge && flow_bilinear_sampling &&
+               grey_method == GreyMethod::Decimate;
     }
-
-    // Measure EVERY half-pitch cell on its own full-tile window, instead of
-    // only the cells whose four neighbours disagree.
-    //
-    // This is what HDR+ actually does, and it is the piece this port has been
-    // approximating. Monod/Delon/Veit, Section 4: "Tiles (for both the
-    // alignment and merging steps) are overlapped by half in each spatial
-    // dimension. This means that the total number of tiles (and thus the
-    // number of operations for ALIGNMENT and merging) is actually multiplied
-    // by a factor of 4." Every Ts/2-strided tile is aligned in its own right,
-    // which is precisely why HDR+ needs no interpolated flow: nearest is
-    // exact when a real measurement exists at every cell.
-    //
-    // Without this, the overlap merge derives its fine grid from the coarse
-    // one -- interpolated when flow_bilinear_sampling is on, or the
-    // containing tile's vector when it is off. The latter leaves both fine
-    // cells of a coarse tile holding the same vector, so the field stays
-    // piecewise-constant at the COARSE pitch and the rotation staircase is
-    // unchanged (theta*16, not theta*8). Only a measurement per cell buys the
-    // half-pitch field.
-    //
-    // Costs what the paper says it costs: 4x the alignment work over the
-    // lattice, and measured vectors are never bit-equal, so the merge's
-    // hypothesis clustering stops collapsing agreeing cells and every pixel
-    // pays up to 4 gathers. eda53e2 gated the measurement to disagreement
-    // cells for exactly that reason ("much slower"); this makes the full HDR+
-    // behaviour available again as an explicit, opt-in choice rather than a
-    // silent default. Requires the overlapped-tile merge.
-    bool flow_overlap_measure_all = false;
 
     // Sub-pixel refinement of every block-matching result: fit a bivariate
     // quadratic to the 3x3 cost neighbourhood around the winning integer
@@ -994,35 +923,6 @@ struct Config {
     // Output changes at the ~1e-3 relative level of individual weights --
     // far below one 16-bit LSB after normalisation.
     bool merge_fast_weights = true;
-
-    // Where accumulate_comp looks the steerable kernel up in the covariance
-    // grid, as a raw -> grey/cov mapping.
-    //
-    //   true  (quad centre): kmap = (lr_mov - 0.5) / 2
-    //   false (legacy):      kmap =  lr_mov / 2 - 0.5      -- 0.5 raw px lower
-    //
-    // True is the correct mapping and the default. The covariance grid is
-    // sampled at the CENTRE of each Bayer quad -- raw 2g + 0.5 -- which is
-    // established three ways: this port's own construction (quad decimation
-    // puts grey g at raw 2g+0.5, the [-0.5,0.5] gradient stencil centres at
-    // +0.5, the -1+i tensor neighbourhood recentres to (y,x)); 460-main
-    // building it identically; and 460-main's estimate_kernels docstring
-    // saying so outright ("sampled at the center of each bayer quad").
-    // accumulate_ref has always used the quad-centre form, so with this false
-    // the comparison frames fetch their kernel 0.5 raw px away from where the
-    // reference frame fetches its own.
-    //
-    // Exposed as a toggle anyway, because the legacy mapping is not simply
-    // worse to look at. Fetching the covariance off-centre blends neighbouring
-    // cells through the bilinear interpolation, which pulls the field toward
-    // isotropic -- a permanent low-grade rounding of every kernel. Section
-    // 5.1.1 gives anisotropic kernels the job of tolerating small
-    // misalignments, so that rounding silently buys extra misalignment
-    // tolerance. Correcting it removes the slack and can EXPOSE residual
-    // alignment error that was previously smeared over. A/B it on real
-    // captures; if the legacy form looks better, the thing to chase is the
-    // alignment residual, not this mapping.
-    bool kernel_lookup_quad_centre = true;
 
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
