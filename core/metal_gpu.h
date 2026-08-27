@@ -77,6 +77,14 @@ bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_
 bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
                                const Image& mov_grey, int raw_h, int raw_w,
                                int tile_size, const Config& cfg);
+// GPU twin of flow_densify_lucas_kanade: one thread per lattice cell. gradx /
+// grady are the REFERENCE Sobel gradients, which the caller holds across the
+// burst. Returns false with the flow untouched when it cannot run, and the
+// caller falls back to the CPU body.
+bool flow_dense_lk_metal(FlowField& flow, const Image& ref_grey,
+                         const Image& mov_grey, const Image& gradx,
+                         const Image& grady, int raw_h, int raw_w,
+                         int tile_size, const Config& cfg);
 // `rigid` is the global rigid pre-alignment for this comparison frame (see
 // estimate_global_rigid). An invalid model means "not estimated", and the
 // coarsest level starts from zero exactly as before.
@@ -87,6 +95,8 @@ bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
 
 // Clear the densify reference-grey upload cache (burst start).
 void metal_clear_densify_ref_cache();
+// Clear the dense-LK reference uploads (grey + both gradient images).
+void metal_clear_dense_lk_cache();
 // Clear GPU-resident reference ICA buffers reused across comparison frames.
 void metal_clear_ref_ica_cache();
 

@@ -4082,4 +4082,153 @@ bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
   }
 }
 
+namespace {
+struct DenseLKParamsCPU {
+    uint32_t fny = 0, fnx = 0;
+    uint32_t flow_ny = 0, flow_nx = 0;
+    uint32_t ref_h = 0, ref_w = 0;
+    uint32_t mov_h = 0, mov_w = 0;
+    uint32_t tile_size = 0;
+    uint32_t fine_div = 2;
+    uint32_t half_window = 0;
+    uint32_t iters = 0;
+    float gsy = 1.f, gsx = 1.f;
+    float damping = 0.f;
+    float max_step_g = 0.f;
+};
+static_assert(sizeof(DenseLKParamsCPU) == 64, "DenseLKParamsCPU size");
+} // namespace
+
+// Reference-side uploads for the dense LK. The reference grey and its two
+// gradient images are identical for every comparison frame of a burst, so all
+// three are cached on the same key as the densify reference cache and cleared
+// with it at burst start.
+static std::mutex g_dlk_ref_mu;
+static id<MTLBuffer> g_dlk_ref_buf = nil;
+static id<MTLBuffer> g_dlk_gx_buf = nil;
+static id<MTLBuffer> g_dlk_gy_buf = nil;
+static const f32* g_dlk_ref_ptr = nullptr;
+static size_t g_dlk_ref_bytes = 0;
+
+void metal_clear_dense_lk_cache() {
+    std::lock_guard<std::mutex> lk(g_dlk_ref_mu);
+    g_dlk_ref_buf = nil;
+    g_dlk_gx_buf = nil;
+    g_dlk_gy_buf = nil;
+    g_dlk_ref_ptr = nullptr;
+    g_dlk_ref_bytes = 0;
+}
+
+bool flow_dense_lk_metal(FlowField& flow, const Image& ref_grey,
+                         const Image& mov_grey, const Image& gradx,
+                         const Image& grady, int raw_h, int raw_w,
+                         int tile_size, const Config& cfg) {
+  @autoreleasepool {
+    if (!metal_gpu_init()) return false;
+    if (flow.ny <= 0 || flow.nx <= 0 ||
+        flow.flow.size() != (size_t)flow.ny * (size_t)flow.nx * 2u)
+        return false;
+    if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
+        gradx.h != ref_grey.h || gradx.w != ref_grey.w ||
+        grady.h != ref_grey.h || grady.w != ref_grey.w ||
+        mov_grey.h <= 0 || mov_grey.w <= 0)
+        return false;
+
+    int div = 0, fny = 0, fnx = 0;
+    f32 pitch = 0.f;
+    if (!flow_dense_lk_lattice(raw_h, raw_w, tile_size, cfg,
+                               div, fny, fnx, pitch))
+        return false;
+
+    const f32 gsy = (f32)ref_grey.h / (f32)raw_h;
+    const f32 gsx = (f32)ref_grey.w / (f32)raw_w;
+    if (!(gsy > 0.f) || !(gsx > 0.f)) return false;
+
+    auto& c = ctx();
+    DenseLKParamsCPU p{};
+    p.fny = (uint32_t)fny;
+    p.fnx = (uint32_t)fnx;
+    p.flow_ny = (uint32_t)flow.ny;
+    p.flow_nx = (uint32_t)flow.nx;
+    p.ref_h = (uint32_t)ref_grey.h;
+    p.ref_w = (uint32_t)ref_grey.w;
+    p.mov_h = (uint32_t)mov_grey.h;
+    p.mov_w = (uint32_t)mov_grey.w;
+    p.tile_size = (uint32_t)tile_size;
+    p.fine_div = (uint32_t)std::max(1, div);
+    p.half_window = (uint32_t)std::max(1, cfg.flow_dense_lk_half_window);
+    p.iters = (uint32_t)std::max(1, cfg.flow_dense_lk_iters);
+    p.gsy = gsy;
+    p.gsx = gsx;
+    p.damping = std::max(0.f, cfg.flow_dense_lk_damping);
+    // Same conversion the CPU body makes: the configured clamp is in raw px,
+    // the solve runs in grey px.
+    p.max_step_g = std::max(0.f, cfg.flow_dense_lk_max_step) *
+                   0.5f * (gsy + gsx);
+
+    const size_t fine_b = (size_t)fny * (size_t)fnx * 2u * sizeof(float);
+    id<MTLBuffer> b_fine = buf(nullptr, fine_b);
+    id<MTLBuffer> b_flow = buf(flow.flow.data(),
+                               flow.flow.size() * sizeof(float));
+    id<MTLBuffer> b_mov = buf(mov_grey.data.data(),
+                              mov_grey.data.size() * sizeof(float));
+
+    const size_t ref_b = ref_grey.data.size() * sizeof(float);
+    id<MTLBuffer> b_ref = nil, b_gx = nil, b_gy = nil;
+    {
+        std::lock_guard<std::mutex> lk(g_dlk_ref_mu);
+        if (g_dlk_ref_buf && g_dlk_gx_buf && g_dlk_gy_buf &&
+            g_dlk_ref_ptr == ref_grey.data.data() &&
+            g_dlk_ref_bytes == ref_b) {
+            b_ref = g_dlk_ref_buf; b_gx = g_dlk_gx_buf; b_gy = g_dlk_gy_buf;
+        } else {
+            b_ref = buf(ref_grey.data.data(), ref_b);
+            b_gx = buf(gradx.data.data(), gradx.data.size() * sizeof(float));
+            b_gy = buf(grady.data.data(), grady.data.size() * sizeof(float));
+            // All three or none: a partial cache would pair this burst's
+            // reference with the previous one's gradients.
+            if (b_ref && b_gx && b_gy) {
+                g_dlk_ref_buf = b_ref; g_dlk_gx_buf = b_gx; g_dlk_gy_buf = b_gy;
+                g_dlk_ref_ptr = ref_grey.data.data();
+                g_dlk_ref_bytes = ref_b;
+            }
+        }
+    }
+    if (!b_fine || !b_flow || !b_ref || !b_mov || !b_gx || !b_gy) return false;
+
+    // dispatch2 is nil-safe, which here would be the wrong kind of safe: a
+    // missing or renamed kernel would encode nothing, leave b_fine at its
+    // zero fill, and this function would then install an all-zero flow field
+    // and report success. Resolve the pipeline first so that case falls back
+    // to the CPU body instead.
+    id<MTLComputePipelineState> pso = c.pipe("flow_dense_lk");
+    if (!pso) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_fine offset:0 atIndex:0];
+    [enc setBuffer:b_flow offset:0 atIndex:1];
+    [enc setBuffer:b_ref offset:0 atIndex:2];
+    [enc setBuffer:b_mov offset:0 atIndex:3];
+    [enc setBuffer:b_gx offset:0 atIndex:4];
+    [enc setBuffer:b_gy offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    dispatch2(enc, pso, fnx, fny);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "align:dense-lk");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    flow.fine_flow.resize((size_t)fny * (size_t)fnx * 2u);
+    memcpy(flow.fine_flow.data(), [b_fine contents], fine_b);
+    flow.fine_ny = fny;
+    flow.fine_nx = fnx;
+    flow.fine_div = div;
+    return true;
+  }
+}
+
 } // namespace hhsr

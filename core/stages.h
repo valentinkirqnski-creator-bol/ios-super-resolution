@@ -62,6 +62,14 @@ bool flow_fullres_ica_polish(const Image& ref_grey_full, const Image& mov_grey_f
 // Dense per-cell Lucas-Kanade refinement of the flow field, at the finest
 // lattice pitch that fits Config::flow_dense_lk_max_mb. Dispatched from
 // flow_densify_boundary_select when Config::flow_dense_lk_enabled.
+// Lattice the dense refinement will fill: the finest pitch = tile_size/div
+// whose field fits Config::flow_dense_lk_max_mb. False when none fits, in
+// which case the coarse field is left alone. Shared by the CPU body and the
+// Metal twin so they cannot fill different lattices.
+bool flow_dense_lk_lattice(int raw_h, int raw_w, int tile_size,
+                           const Config& cfg,
+                           int& div, int& fny, int& fnx, f32& pitch);
+
 void flow_densify_lucas_kanade(FlowField& flow,
                                const Image& ref_grey, const Image& mov_grey,
                                int raw_h, int raw_w, int tile_size,

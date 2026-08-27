@@ -3166,3 +3166,126 @@ kernel void flow_densify_select(device float* fine [[buffer(0)]],
     fine[o + 0] = out_x;
     fine[o + 1] = out_y;
 }
+
+// ---------------------------------------------------------------------------
+// Dense Lucas-Kanade flow refinement (ISA opticalFlow.cu lucasKanadeOptim).
+// ---------------------------------------------------------------------------
+//
+// GPU twin of flow_densify_lucas_kanade in align.cpp: one thread per lattice
+// cell, same seed, same damped 2x2 solve, same step clamp, same iteration
+// order. The reference gradients arrive precomputed (gx/gy) because they
+// depend only on the reference and are therefore built once per burst -- and
+// because recomputing a Sobel per window sample would multiply this kernel's
+// memory traffic by roughly nine.
+struct DenseLKParams {
+    uint fny, fnx;          // fine lattice
+    uint flow_ny, flow_nx;  // coarse tile grid
+    uint ref_h, ref_w;
+    uint mov_h, mov_w;
+    uint tile_size;
+    uint fine_div;          // lattice pitch = tile_size / fine_div
+    uint half_window;
+    uint iters;
+    float gsy, gsx;         // raw -> grey scale
+    float damping;          // Levenberg lambda, x trace/2
+    float max_step_g;       // grey px per iteration; 0 = unclamped
+};                          // 64 bytes
+
+// Clamped bilinear: a window running off the frame keeps contributing edge
+// data rather than dropping to zero, which would read as a huge temporal
+// gradient and throw the solve. Twin of `samp` in flow_densify_lucas_kanade.
+static inline float dlk_samp(device const float* im, int h, int w,
+                             float y, float x) {
+    const float cy = clamp(y, 0.f, (float)(h - 1));
+    const float cx = clamp(x, 0.f, (float)(w - 1));
+    const int y0 = (int)cy, x0 = (int)cx;
+    const int y1 = min(y0 + 1, h - 1), x1 = min(x0 + 1, w - 1);
+    const float ay = cy - (float)y0, ax = cx - (float)x0;
+    const float a = im[y0 * w + x0], b = im[y0 * w + x1];
+    const float c = im[y1 * w + x0], d = im[y1 * w + x1];
+    return (a * (1.f - ax) + b * ax) * (1.f - ay) +
+           (c * (1.f - ax) + d * ax) * ay;
+}
+
+kernel void flow_dense_lk(device float* fine [[buffer(0)]],
+                          device const float* flowv [[buffer(1)]],
+                          device const float* ref [[buffer(2)]],
+                          device const float* mov [[buffer(3)]],
+                          device const float* gradx [[buffer(4)]],
+                          device const float* grady [[buffer(5)]],
+                          constant DenseLKParams& p [[buffer(6)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.fnx || gid.y >= p.fny) return;
+    const int fy = (int)gid.y, fx = (int)gid.x;
+    const float pitch = (float)p.tile_size / (float)max(1u, p.fine_div);
+    const float ry = ((float)fy + 0.5f) * pitch;
+    const float rx = ((float)fx + 0.5f) * pitch;
+
+    // Seed from the coarse field. Written in the same lerp form as
+    // FlowField::sample_grid rather than as a weight sum, so the two agree
+    // bit for bit and not merely algebraically.
+    const int ny = (int)p.flow_ny, nx = (int)p.flow_nx;
+    const float tcy = ry / (float)p.tile_size - 0.5f;
+    const float tcx = rx / (float)p.tile_size - 0.5f;
+    const int cy0 = (int)floor(tcy), cx0 = (int)floor(tcx);
+    const float ay = tcy - (float)cy0, ax = tcx - (float)cx0;
+    const int iy0 = clamp(cy0, 0, ny - 1), iy1 = clamp(cy0 + 1, 0, ny - 1);
+    const int ix0 = clamp(cx0, 0, nx - 1), ix1 = clamp(cx0 + 1, 0, nx - 1);
+    const float gx00 = flowv[(iy0 * nx + ix0) * 2 + 0];
+    const float gx01 = flowv[(iy0 * nx + ix1) * 2 + 0];
+    const float gx10 = flowv[(iy1 * nx + ix0) * 2 + 0];
+    const float gx11 = flowv[(iy1 * nx + ix1) * 2 + 0];
+    const float gy00 = flowv[(iy0 * nx + ix0) * 2 + 1];
+    const float gy01 = flowv[(iy0 * nx + ix1) * 2 + 1];
+    const float gy10 = flowv[(iy1 * nx + ix0) * 2 + 1];
+    const float gy11 = flowv[(iy1 * nx + ix1) * 2 + 1];
+    const float tx0 = gx00 + (gx01 - gx00) * ax;
+    const float bx0 = gx10 + (gx11 - gx10) * ax;
+    const float ty0 = gy00 + (gy01 - gy00) * ax;
+    const float by0 = gy10 + (gy11 - gy10) * ax;
+    const float dxr = tx0 + (bx0 - tx0) * ay;
+    const float dyr = ty0 + (by0 - ty0) * ay;
+
+    const int refh = (int)p.ref_h, refw = (int)p.ref_w;
+    const int movh = (int)p.mov_h, movw = (int)p.mov_w;
+    const float cy = ry * p.gsy, cx = rx * p.gsx;
+    float ux = dxr * p.gsx, uy = dyr * p.gsy;   // grey-px displacement
+    const int hw = (int)max(1u, p.half_window);
+
+    for (uint it = 0; it < p.iters; ++it) {
+        float a00 = 0.f, a01 = 0.f, a11 = 0.f, b0 = 0.f, b1 = 0.f;
+        for (int wy = -hw; wy <= hw; ++wy) {
+            const float py = cy + (float)wy;
+            if (py < 0.f || py > (float)(refh - 1)) continue;
+            for (int wx = -hw; wx <= hw; ++wx) {
+                const float px = cx + (float)wx;
+                if (px < 0.f || px > (float)(refw - 1)) continue;
+                const float ix = dlk_samp(gradx, refh, refw, py, px);
+                const float iy = dlk_samp(grady, refh, refw, py, px);
+                const float itv = dlk_samp(mov, movh, movw, py + uy, px + ux) -
+                                  dlk_samp(ref, refh, refw, py, px);
+                a00 += ix * ix; a01 += ix * iy; a11 += iy * iy;
+                b0  -= ix * itv; b1 -= iy * itv;
+            }
+        }
+        const float lam = p.damping * 0.5f * (a00 + a11);
+        const float m00 = a00 + lam, m11 = a11 + lam;
+        const float det = m00 * m11 - a01 * a01;
+        if (!(fabs(det) > 1e-20f)) break;
+        float sx = ( m11 * b0 - a01 * b1) / det;
+        float sy = (-a01 * b0 + m00 * b1) / det;
+        if (p.max_step_g > 0.f) {
+            const float mag = sqrt(sx * sx + sy * sy);
+            if (mag > p.max_step_g) {
+                const float k = p.max_step_g / mag;
+                sx *= k; sy *= k;
+            }
+        }
+        if (!isfinite(sx) || !isfinite(sy)) break;
+        ux += sx; uy += sy;
+    }
+
+    const int o = (fy * (int)p.fnx + fx) * 2;
+    fine[o + 0] = ux / p.gsx;   // back to raw px
+    fine[o + 1] = uy / p.gsy;
+}

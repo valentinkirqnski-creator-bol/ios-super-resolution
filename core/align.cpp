@@ -1083,11 +1083,30 @@ struct RefIcaBurstCache {
 };
 static RefIcaBurstCache g_ref_ica_cache;
 
+// Reference Sobel gradients for the dense Lucas-Kanade stage, held across the
+// burst: they depend only on the reference, so recomputing them per comparison
+// frame would be pure waste -- and on the Metal path it would also re-upload
+// two full-resolution buffers every frame. Keyed on the grey's data pointer
+// AND size, and dropped at burst start, so allocator address reuse cannot
+// alias one burst's gradients onto the next.
+static std::mutex g_dlk_grad_mu;
+static const f32* g_dlk_grad_key = nullptr;
+static size_t g_dlk_grad_n = 0;
+static Image g_dlk_gx, g_dlk_gy;
+
 void clear_align_ref_ica_cache() {
     g_ref_ica_cache = {};
+    {
+        std::lock_guard<std::mutex> lk(g_dlk_grad_mu);
+        g_dlk_grad_key = nullptr;
+        g_dlk_grad_n = 0;
+        g_dlk_gx = Image();
+        g_dlk_gy = Image();
+    }
 #ifdef __APPLE__
     metal_clear_ref_ica_cache();
     metal_clear_densify_ref_cache();
+    metal_clear_dense_lk_cache();
 #endif
 }
 
@@ -1872,6 +1891,34 @@ void flow_densify_boundary_select(FlowField& flow,
 //  - Cells are seeded by sampling the coarse field, which for the rigid part
 //    of the motion is exact: bilinear interpolation reproduces a linear
 //    function, and a rotation's displacement field IS linear in position.
+// Pitch selection for the dense lattice. Finest first: the lattice step under
+// rotation is theta * pitch, so a smaller pitch is strictly better for the
+// artifact, and the only reason to back off is the buffer. A 12MP raw at
+// pitch 2 costs 24 MB; a 48MP raw would cost 96 MB, which is why this is a
+// budget and not a constant.
+//
+// Shared with the Metal twin so the two cannot disagree about the lattice
+// they are filling -- a mismatch there would not fail, it would silently
+// write a correct field at the wrong pitch.
+bool flow_dense_lk_lattice(int raw_h, int raw_w, int tile_size,
+                           const Config& cfg,
+                           int& div, int& fny, int& fnx, f32& pitch) {
+    div = 0; fny = 0; fnx = 0; pitch = 0.f;
+    if (raw_h <= 0 || raw_w <= 0 || tile_size < 2) return false;
+    const size_t budget = (size_t)std::max(1, cfg.flow_dense_lk_max_mb)
+                          * 1024u * 1024u;
+    for (int d : {8, 4, 2}) {
+        if (tile_size % d != 0) continue;
+        const f32 p = (f32)tile_size / (f32)d;
+        const int ny = std::max(1, (int)std::ceil((f32)raw_h / p));
+        const int nx = std::max(1, (int)std::ceil((f32)raw_w / p));
+        if ((size_t)ny * (size_t)nx * 2u * sizeof(f32) > budget) continue;
+        div = d; pitch = p; fny = ny; fnx = nx;
+        return true;
+    }
+    return false;
+}
+
 void flow_densify_lucas_kanade(FlowField& flow,
                                const Image& ref_grey, const Image& mov_grey,
                                int raw_h, int raw_w, int tile_size,
@@ -1884,25 +1931,11 @@ void flow_densify_lucas_kanade(FlowField& flow,
         raw_h <= 0 || raw_w <= 0)
         return;
 
-    // Pitch selection. Finest first: the lattice step under rotation is
-    // theta * pitch, so a smaller pitch is strictly better for the artifact,
-    // and the only reason to back off is the buffer. A 12MP raw at pitch 2
-    // costs 24 MB; a 48MP raw would cost 96 MB, which is why this is a budget
-    // and not a constant.
-    const size_t budget = (size_t)std::max(1, cfg.flow_dense_lk_max_mb)
-                          * 1024u * 1024u;
     int div = 0, fny = 0, fnx = 0;
     f32 pitch = 0.f;
-    for (int d : {8, 4, 2}) {
-        if (tile_size % d != 0) continue;
-        const f32 p = (f32)tile_size / (f32)d;
-        const int ny = std::max(1, (int)std::ceil((f32)raw_h / p));
-        const int nx = std::max(1, (int)std::ceil((f32)raw_w / p));
-        if ((size_t)ny * (size_t)nx * 2u * sizeof(f32) > budget) continue;
-        div = d; pitch = p; fny = ny; fnx = nx;
-        break;
-    }
-    if (div == 0) return;   // nothing fits: leave the coarse field alone
+    if (!flow_dense_lk_lattice(raw_h, raw_w, tile_size, cfg,
+                               div, fny, fnx, pitch))
+        return;             // nothing fits: leave the coarse field alone
 
     // Raw -> grey scale (0.5 on the decimate grey, 1 on the FFT grey). The
     // flow carries RAW-px displacements (flow_to_raw_tile_grid scaled them),
@@ -1911,10 +1944,35 @@ void flow_densify_lucas_kanade(FlowField& flow,
     const f32 gsx = (f32)ref_grey.w / (f32)raw_w;
     if (!(gsy > 0.f) || !(gsx > 0.f)) return;
 
-    const Image gx = compute_sobel_gradx(ref_grey);
-    const Image gy = compute_sobel_grady(ref_grey);
+    // Reference gradients, built once per burst (see g_dlk_grad_*). Copied
+    // out under the lock rather than aliased: the caller may run comparison
+    // frames concurrently, and a later burst start would otherwise free these
+    // while a worker is still reading them.
+    Image gx, gy;
+    {
+        std::lock_guard<std::mutex> lk(g_dlk_grad_mu);
+        if (g_dlk_grad_key != ref_grey.data.data() ||
+            g_dlk_grad_n != ref_grey.data.size()) {
+            g_dlk_gx = compute_sobel_gradx(ref_grey);
+            g_dlk_gy = compute_sobel_grady(ref_grey);
+            g_dlk_grad_key = ref_grey.data.data();
+            g_dlk_grad_n = ref_grey.data.size();
+        }
+        gx = g_dlk_gx;
+        gy = g_dlk_gy;
+    }
     if (gx.h != ref_grey.h || gx.w != ref_grey.w ||
         gy.h != ref_grey.h || gy.w != ref_grey.w) return;
+
+#ifdef __APPLE__
+    // One thread per lattice cell with identical math; the CPU body below
+    // remains for host tools and HHSR_ALIGN_CPU debugging. At one cell per
+    // grey pixel this stage is far too heavy to leave on the CPU.
+    if (!env_flag_on("HHSR_ALIGN_CPU") &&
+        flow_dense_lk_metal(flow, ref_grey, mov_grey, gx, gy,
+                            raw_h, raw_w, tile_size, cfg))
+        return;
+#endif
 
     const int hw = std::max(1, cfg.flow_dense_lk_half_window);
     const int iters = std::max(1, cfg.flow_dense_lk_iters);
@@ -1944,7 +2002,17 @@ void flow_densify_lucas_kanade(FlowField& flow,
             const f32 ry = ((f32)fy + 0.5f) * pitch;
             const f32 rx = ((f32)fx + 0.5f) * pitch;
             f32 dxr = 0.f, dyr = 0.f;
-            flow.sample_bilinear(ry, rx, tile_size, dxr, dyr);  // coarse: no fine yet
+            // Bilinear explicitly, NOT flow.sample_bilinear: the pipeline sets
+            // FlowField::sample_bicubic from Config::flow_bicubic_sampling
+            // BEFORE this stage runs (pipeline.cpp), so going through the
+            // dispatcher would seed with Catmull-Rom here while the Metal twin
+            // seeds bilinearly -- a divergence visible only with Bicubic Flow
+            // on. The order is immaterial to the result (this is the starting
+            // point of an iterative solve, and the dense field is what
+            // consumers interpolate afterwards), so both are pinned to the
+            // cheaper one rather than teaching the shader a second form.
+            FlowField::sample_grid(flow.flow.data(), flow.ny, flow.nx,
+                                   (f32)tile_size, ry, rx, dxr, dyr);
 
             const f32 cy = ry * gsy, cx = rx * gsx;
             f32 ux = dxr * gsx, uy = dyr * gsy;   // grey-px displacement
