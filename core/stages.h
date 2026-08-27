@@ -80,6 +80,24 @@ Image gaussian_blur(const Image& src, float sigma);
 Image pad_image_circular(const Image& img, int tile_size);
 
 // ---- align.cpp ----------------------------------------------------------
+// Global rigid (rotation + translation) model of one comparison frame
+// relative to the reference, in alignment-grey pixels, by an FFT correlation
+// sweep over candidate angles. ImageStackAlignator's PreAlignment.ScanAngles.
+// Returns RigidModel::valid == false when it could not run.
+RigidModel estimate_global_rigid(const Image& ref_grey, const Image& moving_grey,
+                                 const Config& cfg);
+
+// Cumulative downscale of pyramid level `lvl` relative to the alignment grey
+// (the running product of bm_factors[0..lvl]).
+f32 pyramid_level_scale(const Config& cfg, int lvl);
+
+// Fill a coarsest-level flow field with the rigid model evaluated at each
+// tile centre, expressed in that level's own pixel units. No-op when the
+// model is not valid. Both align() and align_metal_impl call this on the
+// field they build for the coarsest level, so the two stay twins.
+void seed_flow_from_rigid(FlowField& flow, const RigidModel& model,
+                          int level_tile_size, f32 level_scale);
+
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg,
                 int tile_size);

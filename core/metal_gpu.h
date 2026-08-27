@@ -77,9 +77,13 @@ bool ica_fullres_polish_metal(const Image& ref_grey_full, const Image& mov_grey_
 bool flow_densify_select_metal(FlowField& flow, const Image& ref_grey,
                                const Image& mov_grey, int raw_h, int raw_w,
                                int tile_size, const Config& cfg);
+// `rigid` is the global rigid pre-alignment for this comparison frame (see
+// estimate_global_rigid). An invalid model means "not estimated", and the
+// coarsest level starts from zero exactly as before.
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out);
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 const RigidModel& rigid = RigidModel());
 
 // Clear the densify reference-grey upload cache (burst start).
 void metal_clear_densify_ref_cache();

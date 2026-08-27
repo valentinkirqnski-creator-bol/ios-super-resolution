@@ -769,6 +769,13 @@ struct CameraView: View {
              Bilinear flow sampling is right where motion is smooth but wrong at object              boundaries: it blends two different motions into flow that belongs to neither              side, exactly where robustness then rejects and detail is lost. This builds a              half-tile-pitch refinement after alignment: cells whose four surrounding tile              vectors agree keep the bilinear blend (smooth regions reproduce the coarse              sampling to within the flow field's own curvature -- exact for locally linear              motion, error far below the tile staircase this fixes), while cells at              a disagreement over 1 raw px get whichever single tile vector best explains              the alignment guide there. Mask and merge consume the same refined field, so              they stay in lockstep. Requires Smooth Tile Flow.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Global Pre-Alignment (rotation)", isOn: $cam.tuningParams.prealign_enabled)
+        Text("""
+             Estimates ONE rotation+translation for the whole frame before any tiling, by              rotating the frame through candidate angles and cross-correlating each against              the reference in the Fourier domain -- the peak value picks the angle, the peak              location gives the translation. The coarsest block-matching level then starts              from that model instead of from zero.
+             Why it matters: at 1 degree on a 12MP frame the true displacement reaches ~44              px in the corners, and its gradient means the field varies 0.279 px ACROSS EVERY              16-px tile. Block matching answers that ramp with one constant per tile, and the              leftover is what reads as a grid of squares. Removing the ramp first leaves a              residual a per-tile constant can actually represent.
+             This is ImageStackAlignator's pre-alignment (PreAlignment.ScanAngles +              convertToTilesOverlapBorder). It does NOT remove the ramp WITHIN a tile -- that              needs the dense per-pixel refinement.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
         Text("""
              Block matching produces ONE displacement per 16-pixel tile, and consuming it              nearest makes the warp piecewise constant -- v(x,y) = v_ij across each tile,              jumping at every boundary.

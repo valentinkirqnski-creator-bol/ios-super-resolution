@@ -1094,15 +1094,292 @@ void clear_align_ref_ica_cache() {
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
+// ---------------------------------------------------------------------------
+// Layer 0: global rigid pre-alignment (ImageStackAlignator PreAlignment.cs)
+// ---------------------------------------------------------------------------
+//
+// ScanAngles: for every candidate angle, rotate the moving frame about its
+// centre, cross-correlate against the reference in the Fourier domain
+// (conjugate multiply then inverse transform -- kernel.cu
+// conjugateComplexMulKernel does a plain correlation, NOT a whitened phase
+// correlation), and take the peak. The peak VALUE selects the angle; the peak
+// LOCATION gives the translation. Coarse sweep at 5x the increment, then a
+// fine sweep around the winner, exactly as PreAlignment.ScanAngles does.
+//
+// What the peak means, in this codebase's flow convention (a moving-frame
+// position is a reference position plus u):
+//     mov(q)          = ref(R_-th (q - c - t) + c)
+//     W_ph(mov)(p)    = mov(R_ph (p - c) + c)        [warp by candidate ph]
+//     W_th(mov)(p)    = ref(p - R_-th t)
+// so correlating ref against W_th(mov) peaks at s = R_-th t, hence
+// t = R_th s. Sign conventions are pinned by prealign_selftest(), which
+// synthesises a known (theta, t) and checks both come back.
+//
+// Working resolution is PA_N square. The source is box-averaged down to it
+// (area resampling, so a 16x decimation of a 12MP grey does not alias) and
+// padded to preserve aspect, which keeps the scale uniform -- a rotation by
+// theta about the grey centre is then a rotation by the same theta about the
+// PA centre.
+namespace {
+
+constexpr int PA_N = 256;
+
+inline f32 pa_bilinear(const f32* img, int h, int w, f32 y, f32 x) {
+    if (!(y >= 0.f) || !(x >= 0.f) ||
+        y > (f32)(h - 1) || x > (f32)(w - 1)) return 0.f;
+    const int y0 = (int)y, x0 = (int)x;
+    const int y1 = (y0 + 1 < h) ? y0 + 1 : y0;
+    const int x1 = (x0 + 1 < w) ? x0 + 1 : x0;
+    const f32 ay = y - (f32)y0, ax = x - (f32)x0;
+    const f32 a = img[(size_t)y0 * w + x0], b = img[(size_t)y0 * w + x1];
+    const f32 c = img[(size_t)y1 * w + x0], d = img[(size_t)y1 * w + x1];
+    return (a * (1.f - ax) + b * ax) * (1.f - ay) +
+           (c * (1.f - ax) + d * ax) * ay;
+}
+
+// Area-average `src` into a centred oh x ow region of a PA_N x PA_N buffer and
+// subtract the region mean, so the zeros outside the region -- and the zeros a
+// rotation later brings in -- all sit at the image's own DC level.
+//
+// The mean has to go before anything else: with zero padding the overlap area
+// shrinks as |d| grows, so a non-zero mean makes the correlation fall off with
+// displacement and biases the peak toward d = 0 -- which would report every
+// frame as unrotated and untranslated.
+void pa_decimate(const Image& src, std::vector<f32>& out,
+                 int& oh, int& ow, int& oy0, int& ox0) {
+    out.assign((size_t)PA_N * PA_N, 0.f);
+    const int h = src.h, w = src.w;
+    oh = ow = 0; oy0 = ox0 = 0;
+    if (h <= 0 || w <= 0) return;
+    const f32 s = (f32)PA_N / (f32)std::max(h, w);
+    oh = std::max(1, std::min(PA_N, (int)std::lround((double)h * s)));
+    ow = std::max(1, std::min(PA_N, (int)std::lround((double)w * s)));
+    oy0 = (PA_N - oh) / 2; ox0 = (PA_N - ow) / 2;
+
+    double sum = 0.0;
+    for (int y = 0; y < oh; ++y) {
+        const int sy0 = (int)((int64_t)y * h / oh);
+        const int sy1 = std::max(sy0 + 1, (int)((int64_t)(y + 1) * h / oh));
+        for (int x = 0; x < ow; ++x) {
+            const int sx0 = (int)((int64_t)x * w / ow);
+            const int sx1 = std::max(sx0 + 1, (int)((int64_t)(x + 1) * w / ow));
+            double acc = 0.0;
+            for (int sy = sy0; sy < sy1; ++sy)
+                for (int sx = sx0; sx < sx1; ++sx)
+                    acc += (double)src.data[(size_t)sy * w + sx];
+            const f32 v = (f32)(acc / (double)((sy1 - sy0) * (sx1 - sx0)));
+            out[(size_t)(oy0 + y) * PA_N + (ox0 + x)] = v;
+            sum += (double)v;
+        }
+    }
+    const f32 mean = (f32)(sum / (double)(oh * ow));
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x)
+            out[(size_t)(oy0 + y) * PA_N + (ox0 + x)] -= mean;
+}
+
+// Separable Hann over the region, zeroing everything outside it. Returns the
+// L2 norm of the result.
+//
+// Applied AFTER the rotation, never before: rotating an already-windowed
+// buffer carries the taper around with the content, so the correlation energy
+// would depend on the angle and the raw peak would always prefer 0 degrees.
+// That is precisely what the self-test caught -- +0.6 and +0.3 degrees both
+// came back as 0.00 while -0.8 happened to survive. Dividing the peak by the
+// two norms (a normalised cross-correlation on the peak alone) closes the
+// same hole from the other side; both are kept because either one failing
+// silently would restore the bias.
+f32 pa_window(std::vector<f32>& b, int oh, int ow, int oy0, int ox0) {
+    double n2 = 0.0;
+    for (int y = 0; y < PA_N; ++y) {
+        const bool in_y = (y >= oy0 && y < oy0 + oh);
+        const f32 wy = in_y ? (0.5f - 0.5f * std::cos(6.28318530718f *
+                          ((f32)(y - oy0) + 0.5f) / (f32)oh)) : 0.f;
+        for (int x = 0; x < PA_N; ++x) {
+            const bool in_x = (x >= ox0 && x < ox0 + ow);
+            f32& v = b[(size_t)y * PA_N + x];
+            if (!in_y || !in_x) { v = 0.f; continue; }
+            const f32 wx = 0.5f - 0.5f * std::cos(6.28318530718f *
+                           ((f32)(x - ox0) + 0.5f) / (f32)ow);
+            v *= wy * wx;
+            n2 += (double)v * (double)v;
+        }
+    }
+    return (f32)std::sqrt(n2);
+}
+
+// out(p) = in(R_phi (p - cN) + cN), bilinear, zero outside.
+void pa_rotate(const std::vector<f32>& in, std::vector<f32>& out, f32 phi) {
+    out.assign((size_t)PA_N * PA_N, 0.f);
+    const f32 cs = std::cos(phi), sn = std::sin(phi);
+    const f32 cN = 0.5f * (f32)PA_N;
+    for (int y = 0; y < PA_N; ++y) {
+        const f32 py = (f32)y - cN;
+        for (int x = 0; x < PA_N; ++x) {
+            const f32 px = (f32)x - cN;
+            const f32 sx = cs * px - sn * py + cN;
+            const f32 sy = sn * px + cs * py + cN;
+            out[(size_t)y * PA_N + x] = pa_bilinear(in.data(), PA_N, PA_N, sy, sx);
+        }
+    }
+}
+
+// Parabolic vertex through three samples, clamped to the sample spacing.
+inline f32 pa_subpixel(f32 vm, f32 v0, f32 vp) {
+    const f32 den = vm - 2.f * v0 + vp;
+    if (!(std::fabs(den) > 1e-20f)) return 0.f;
+    const f32 d = 0.5f * (vm - vp) / den;
+    return (d > 1.f) ? 1.f : ((d < -1.f) ? -1.f : d);
+}
+
+} // namespace
+
+RigidModel estimate_global_rigid(const Image& ref_grey, const Image& moving_grey,
+                                 const Config& cfg) {
+    RigidModel m;
+    m.cx = 0.5f * (f32)ref_grey.w;
+    m.cy = 0.5f * (f32)ref_grey.h;
+    if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
+        moving_grey.h != ref_grey.h || moving_grey.w != ref_grey.w)
+        return m;
+
+    std::vector<f32> ref_pa, mov_pa;
+    int oh = 0, ow = 0, oy0 = 0, ox0 = 0;
+    int moh = 0, mow = 0, moy0 = 0, mox0 = 0;
+    pa_decimate(ref_grey, ref_pa, oh, ow, oy0, ox0);
+    pa_decimate(moving_grey, mov_pa, moh, mow, moy0, mox0);
+    if (oh <= 0 || ow <= 0) return m;
+
+    const f32 norm_ref = pa_window(ref_pa, oh, ow, oy0, ox0);
+    if (!(norm_ref > 0.f)) return m;
+
+    std::vector<std::complex<f32>> F_ref, F_mov;
+    rfft2(ref_pa.data(), PA_N, PA_N, F_ref);
+
+    std::vector<f32> rot, corr;
+
+    // One correlation at angle phi: returns the normalised peak value, and
+    // writes the sub-pixel peak displacement s into (sy, sx).
+    auto score = [&](f32 phi, f32& sy, f32& sx) -> f32 {
+        pa_rotate(mov_pa, rot, phi);
+        const f32 norm_mov = pa_window(rot, moh, mow, moy0, mox0);
+        if (!(norm_mov > 0.f)) { sy = sx = 0.f; return -std::numeric_limits<f32>::max(); }
+        rfft2(rot.data(), PA_N, PA_N, F_mov);
+        for (size_t i = 0; i < F_mov.size() && i < F_ref.size(); ++i)
+            F_mov[i] = std::conj(F_ref[i]) * F_mov[i];
+        irfft2(F_mov, PA_N, PA_N, corr);
+        int by = 0, bx = 0;
+        f32 best = -std::numeric_limits<f32>::max();
+        for (int y = 0; y < PA_N; ++y)
+            for (int x = 0; x < PA_N; ++x) {
+                const f32 v = corr[(size_t)y * PA_N + x];
+                if (v > best) { best = v; by = y; bx = x; }
+            }
+        auto wrap = [](int i) { return (i > PA_N / 2) ? i - PA_N : i; };
+        const int ym = (by + PA_N - 1) % PA_N, yp = (by + 1) % PA_N;
+        const int xm = (bx + PA_N - 1) % PA_N, xp = (bx + 1) % PA_N;
+        sy = (f32)wrap(by) + pa_subpixel(corr[(size_t)ym * PA_N + bx], best,
+                                         corr[(size_t)yp * PA_N + bx]);
+        sx = (f32)wrap(bx) + pa_subpixel(corr[(size_t)by * PA_N + xm], best,
+                                         corr[(size_t)by * PA_N + xp]);
+        return best / (norm_ref * norm_mov);
+    };
+
+    const f32 deg = 3.14159265358979f / 180.f;
+    const f32 incr = std::max(0.01f, cfg.prealign_rot_incr) * deg;
+    const f32 range = std::max(incr, cfg.prealign_rot_range * deg);
+
+    f32 best_v = -std::numeric_limits<f32>::max(), best_a = 0.f;
+    f32 best_sy = 0.f, best_sx = 0.f;
+    for (f32 a = -range; a <= range + 1e-6f; a += 5.f * incr) {
+        f32 sy, sx;
+        const f32 v = score(a, sy, sx);
+        if (v > best_v) { best_v = v; best_a = a; best_sy = sy; best_sx = sx; }
+    }
+    const f32 zero = best_a, fine_range = 10.f * incr;
+    for (f32 a = zero - fine_range; a <= zero + fine_range + 1e-6f; a += incr) {
+        f32 sy, sx;
+        const f32 v = score(a, sy, sx);
+        if (v > best_v) { best_v = v; best_a = a; best_sy = sy; best_sx = sx; }
+    }
+
+    // t = R_theta * s, then PA pixels back to grey pixels. Per-axis scale:
+    // aspect is preserved to within the rounding of oh/ow, so the two factors
+    // agree to well under a percent and the angle is unaffected.
+    const f32 cs = std::cos(best_a), sn = std::sin(best_a);
+    const f32 tx_pa = cs * best_sx - sn * best_sy;
+    const f32 ty_pa = sn * best_sx + cs * best_sy;
+    m.theta = best_a;
+    m.tx = tx_pa * ((f32)ref_grey.w / (f32)ow);
+    m.ty = ty_pa * ((f32)ref_grey.h / (f32)oh);
+    m.peak = best_v;
+    m.valid = true;
+    return m;
+}
+
+// Cumulative downscale of pyramid level `lvl` relative to the alignment grey.
+//
+// build_pyramid applies bm_factors[0] to level 0 as well (a no-op at the
+// default 1), then bm_factors[k] from level k-1 to level k -- so the scale is
+// the running product from 0, not from 1. With {1,2,4,4} the levels sit at
+// 1x, 2x, 8x, 32x.
+f32 pyramid_level_scale(const Config& cfg, int lvl) {
+    f32 s = 1.f;
+    for (int k = 0; k <= lvl && k < (int)cfg.bm_factors.size(); ++k)
+        s *= (f32)std::max(1, cfg.bm_factors[k]);
+    return s;
+}
+
+// Layer 1: start the coarsest block-matching level from the global rigid
+// model instead of from zero, so the search sees only the residual.
+//
+// This is ImageStackAlignator's convertToTilesOverlapBorder (kernel.cu
+// 203-220), which evaluates the model at each tile's CENTRE and offsets that
+// tile's fetch by it. Seeding the flow is the same operation expressed in
+// this codebase's terms: block matching searches around the current vector,
+// so a seeded tile compares the reference tile against an already
+// model-compensated moving tile.
+//
+// Note what this does and does not fix. It removes the large, ambiguous part
+// of the search (a rotation reaches ~44 raw px in the corners at 1 degree)
+// and gives ICA a linearisation point that is actually near the answer. It
+// does NOT remove the ramp WITHIN a tile: after subtracting the model at the
+// tile centre the field still varies +/-0.14 px across a 16-px tile at 1
+// degree, and block matching still answers that with one constant. ISA has
+// the same property; what removes it there is the dense per-pixel
+// Lucas-Kanade, not the pre-alignment.
+void seed_flow_from_rigid(FlowField& flow, const RigidModel& model,
+                          int level_tile_size, f32 level_scale) {
+    if (!model.valid || flow.ny <= 0 || flow.nx <= 0 ||
+        level_tile_size <= 0 || !(level_scale > 0.f)) return;
+    for (int ty = 0; ty < flow.ny; ++ty) {
+        const f32 gy = ((f32)ty + 0.5f) * (f32)level_tile_size * level_scale;
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const f32 gx = ((f32)tx + 0.5f) * (f32)level_tile_size * level_scale;
+            f32 dx = 0.f, dy = 0.f;
+            model.displacement(gy, gx, dx, dy);
+            flow.dx(ty, tx) = dx / level_scale;
+            flow.dy(ty, tx) = dy / level_scale;
+        }
+    }
+}
+
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg, int tile_size) {
     int nlev = (int)ref_pyr.levels.size();
+
+    // Layer 0. One model per comparison frame, estimated on the alignment
+    // greys before any tiling, and handed to whichever path runs.
+    RigidModel rigid;
+    if (cfg.prealign_enabled)
+        rigid = estimate_global_rigid(ref_grey, moving_grey, cfg);
 
 #ifdef __APPLE__
     // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
     if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
-        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu)) {
+        if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
+                        rigid)) {
             mark_motion_irregular_tiles(flow_gpu, cfg);
             return flow_gpu;
         }
@@ -1175,6 +1452,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 
         if (flow.nx == 0) {
             flow = FlowField(ny, nx);
+            // Layer 1: seed the coarsest level with the global model.
+            seed_flow_from_rigid(flow, rigid, ts, pyramid_level_scale(cfg, lvl));
         } else {
             int upsample_factor = ((lvl + 1) < (int)cfg.bm_factors.size())
                                   ? cfg.bm_factors[lvl + 1] : 1;

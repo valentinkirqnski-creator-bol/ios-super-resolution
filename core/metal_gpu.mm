@@ -2540,7 +2540,8 @@ static bool g_dumped_ref_grads = false;
 
 static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out) {
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 const RigidModel& rigid) {
     if (!metal_gpu_init()) return false;
     // Same reason as the grey FFT: the L2 path soft-commits mid-stage.
     ProfStageScope prof_stage("align:soft-segments");
@@ -2628,6 +2629,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             flow_ny = ny;
             flow_nx = nx;
             FlowField initial(ny, nx);
+            // Layer 1: seed the coarsest level with the global rigid model,
+            // the twin of the same call in align() (align.cpp).
+            seed_flow_from_rigid(initial, rigid, ts,
+                                 pyramid_level_scale(cfg, lvl));
             b_flow = buf(initial.flow.data(),
                          (size_t)ny * (size_t)nx * 2u * sizeof(float));
             if (!b_flow) return false;
@@ -3877,9 +3882,11 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
 
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,
                  const Image& moving_grey,
-                 const Config& cfg, int tile_size, FlowField& flow_out) {
+                 const Config& cfg, int tile_size, FlowField& flow_out,
+                 const RigidModel& rigid) {
     @autoreleasepool {
-        return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_out);
+        return align_metal_impl(ref_pyr, ref_grey, moving_grey, cfg, tile_size,
+                                flow_out, rigid);
     }
 }
 

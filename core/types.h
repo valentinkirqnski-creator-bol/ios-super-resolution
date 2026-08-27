@@ -42,6 +42,43 @@ struct Image {
     inline size_t size() const { return data.size(); }
 };
 
+// Global rigid (rotation + translation) motion model for one comparison
+// frame, in ALIGNMENT-GREY pixels. ImageStackAlignator's "pre-alignment":
+// PreAlignment.ScanAngles estimates it by an FFT phase-correlation sweep over
+// candidate angles, and both its tile extraction (kernel.cu
+// convertToTilesOverlapBorder) and its flow-field construction
+// (opticalFlow.cu CreateFlowFieldFromTiles, lines 78-85) evaluate it
+// analytically per position.
+//
+// Why a burst needs one: handheld rotation is not a small perturbation of a
+// translation. At 1 degree on a 12MP frame the displacement reaches ~44 px in
+// the corners and its gradient is theta = 0.0175 px per px, so the true field
+// varies 0.279 px ACROSS EVERY 16-px tile. Block matching answers that ramp
+// with a single constant per tile, which is where the tile-pitch error that
+// reads as a grid of squares comes from. Removing the ramp before matching
+// leaves a residual that a per-tile constant really can represent.
+//
+// Sign convention matches FlowField: displacement(p) is added to a REFERENCE
+// position to reach the corresponding position in the moving frame, i.e.
+// moving = R(ref - c) + c + t, so u(p) = (R - I)(p - c) + t.
+struct RigidModel {
+    f32 theta = 0.f;      // radians, positive = counter-clockwise in (x, y)
+    f32 tx = 0.f;         // grey px
+    f32 ty = 0.f;         // grey px
+    f32 cx = 0.f;         // rotation centre, grey px
+    f32 cy = 0.f;
+    f32 peak = 0.f;       // correlation peak that selected theta (diagnostic)
+    bool valid = false;   // false = estimator did not run or did not converge
+
+    inline void displacement(f32 y, f32 x, f32& out_dx, f32& out_dy) const {
+        if (!valid) { out_dx = 0.f; out_dy = 0.f; return; }
+        const f32 s = std::sin(theta), c = std::cos(theta);
+        const f32 px = x - cx, py = y - cy;
+        out_dx = c * px - s * py - px + tx;
+        out_dy = s * px + c * py - py + ty;
+    }
+};
+
 // Per-tile optical flow field: shape [nTilesY, nTilesX, 2] (dx, dy).
 struct FlowField {
     int ny = 0;
@@ -648,6 +685,19 @@ struct Config {
         return (s <= 1) ? raw_radius : std::max(1, raw_radius / s);
     }
     int  alignment_tile_size = 0; // 0 = SNR auto; otherwise force 8/16/32/64.
+
+    // Global rigid pre-alignment (ImageStackAlignator PreAlignment.ScanAngles
+    // + convertToTilesOverlapBorder). Estimates one rotation+translation per
+    // comparison frame by an FFT correlation sweep over candidate angles, and
+    // seeds the coarsest block-matching level with it, so the search only ever
+    // has to find the residual instead of a displacement that reaches ~44 raw
+    // px in the corners at 1 degree. See RigidModel.
+    //
+    // Off by default: it changes every frame's alignment, so it is opt-in
+    // until measured against the current path on a real burst.
+    bool  prealign_enabled    = false;
+    float prealign_rot_range  = 1.0f;  // degrees, sweep is +/- this
+    float prealign_rot_incr   = 0.2f;  // degrees, fine step (coarse is 5x)
 
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
