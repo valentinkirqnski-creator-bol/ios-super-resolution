@@ -988,7 +988,23 @@ struct Config {
     // the old hard threshold A = 1.95, full stretch only for genuinely
     // coherent single-orientation edges. Clean edges keep their elongation;
     // junk orientations stop being amplified.
-    bool kernel_anisotropy_zero_floor = true;
+    //
+    // OFF by default: with this false, compute_k is python-z's `linear`
+    // selection law EXACTLY --
+    //     k1 = 1 + A/2 * (1/k_shrink - 1)
+    //     k2 = 1 + A/2 * (k_stretch  - 1)
+    // (kernels.py:240) -- and Config::selection already defaults to Linear,
+    // which is what python-z's configs/default.yaml ships
+    // (selection_law: linear). Every other term in the kernel path already
+    // matches it verbatim: A = 1 + sqrt((l1-l2)/(l1+l2)), D = clamp(1 -
+    // sqrt(l1)/D_tr + D_th, 0, 1), the GAT-then-decimate ordering, the
+    // pixel_idx-1+j tensor neighbourhood, and k = k_detail*((1-D)*k + D*
+    // k_denoise) squared into k1^2*e1e1' + k2^2*e2e2'.
+    //
+    // Turning it back on restores this port's own law, which differs from
+    // python-z only in the low-A end: round at A = 1 instead of python-z's
+    // permanent 3.3:1 stretch on isotropic content.
+    bool kernel_anisotropy_zero_floor = false;
     // Exponent on the zero-floored stretch weight: w = 0.975 * t^gamma with
     // t = clamp((A-1)/0.95). 1 = the plain zero-floor law. The default 2 was
     // fitted to a measurement, not a guess: distant text (coherence ~0.36)

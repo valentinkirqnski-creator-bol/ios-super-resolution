@@ -99,7 +99,8 @@ struct TuningParams: Equatable, Codable {
     var kernel_anisotropy_continuous: Bool = true
     /// Zero-floor the anisotropy law: isotropic detail gets round kernels
     /// instead of a minimum 2.5:0.75 stretch along a noise orientation.
-    var kernel_anisotropy_zero_floor: Bool = true
+    /// OFF = python-z's `linear` law exactly (w = A/2). See core/types.h.
+    var kernel_anisotropy_zero_floor: Bool = false
     /// Exponent on the stretch weight: higher concentrates elongation onto
     /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
     var kernel_stretch_gamma: Float = 1.0
