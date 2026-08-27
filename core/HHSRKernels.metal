@@ -1486,15 +1486,15 @@ inline void merge_accumulate_ref_body(device AccT* num,
     float additional_denoise_power = 1.f;
     int rad = 1;
     if (p.robustness_denoise) {
-        // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
         float acc_y = coarse_y, acc_x = coarse_x;
         if (p.raw_res_robustness == 0u && p.bayer != 0u) {
             acc_y = (coarse_y - 0.5f) / 2.f;
             acc_x = (coarse_x - 0.5f) / 2.f;
         }
-        int ay = min(max(lround_away(acc_y), 0), int(p.acc_h) - 1);
-        int ax = min(max(lround_away(acc_x), 0), int(p.acc_w) - 1);
-        local_acc_r = acc_rob[uint(ay) * p.acc_w + uint(ax)];
+        // Fractional -- twin of accumulate_ref in merge.cpp; see there. The
+        // sampler clamps internally, so no explicit index clamp is needed.
+        local_acc_r = sample_robustness_bilinear(acc_rob, p.acc_h, p.acc_w,
+                                                 acc_y, acc_x);
         if (p.adaptive != 0u) {
             // Must match denoise_power_merge / denoise_range_merge in merge.cpp.
             // m = N / (r_acc + 1): kernel area scales as m, merging k frames cuts

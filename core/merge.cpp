@@ -457,9 +457,17 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     acc_y = (coarse_y - 0.5f) / 2.f;
                     acc_x = (coarse_x - 0.5f) / 2.f;
                 }
-                const int ay = std::min(std::max(cuda_round_to_int(acc_y), 0), acc_rob->h - 1);
-                const int ax = std::min(std::max(cuda_round_to_int(acc_x), 0), acc_rob->w - 1);
-                local_acc_r = acc_rob->at(ay, ax);
+                // Fractional, matching what 6dd12a8 did for the per-frame R in
+                // accumulate_comp: same grid, same (pos-0.5)/2 mapping, so it
+                // read oddly for one to interpolate and the other to snap to
+                // the nearest cell. The sampler clamps internally, so the
+                // explicit index clamp above is no longer needed.
+                //
+                // Both references take acc_rob nearest (460-main:
+                // acc_rob[round(grey_pos[0]), round(grey_pos[1])]), so this is
+                // a deliberate deviation, consistent with the one already made
+                // for R rather than a new one.
+                local_acc_r = sample_robustness_bilinear(*acc_rob, acc_y, acc_x);
                 if (adaptive) {
                     additional_denoise_power =
                         denoise_power_merge(local_acc_r, max_multiplier, burst_frames);
