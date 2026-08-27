@@ -129,6 +129,10 @@ struct TuningParams: Equatable, Codable {
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
+    /// Where the merge looks the steerable kernel up in the covariance grid.
+    /// On = (pos-0.5)/2, the Bayer quad centre the grid is actually sampled
+    /// at. Off = the legacy pos/2-0.5, which fetches it 0.5 raw px away.
+    var kernel_lookup_quad_centre: Bool = true
     var k_shrink: Float = 2.0
     /// D gate: below-threshold gradients are routed to denoising instead of
     /// super-resolution. GAT-domain units (noise sigma ~ 1). Only applied
@@ -236,6 +240,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
+        case kernel_lookup_quad_centre
         case d_thresh_manual, d_th, d_tr
         case burst_fast_shutter
         case dng_lossless_jpeg
@@ -283,6 +288,7 @@ struct TuningParams: Equatable, Codable {
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
+        kernel_lookup_quad_centre = try c.decodeIfPresent(Bool.self, forKey: .kernel_lookup_quad_centre) ?? kernel_lookup_quad_centre
         d_thresh_manual = try c.decodeIfPresent(Bool.self, forKey: .d_thresh_manual) ?? d_thresh_manual
         burst_fast_shutter = try c.decodeIfPresent(Bool.self, forKey: .burst_fast_shutter) ?? burst_fast_shutter
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
@@ -2083,6 +2089,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
+            "kernel_lookup_quad_centre": NSNumber(value: tuningParams.kernel_lookup_quad_centre),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),
             "dng_lossless_jpeg": NSNumber(value: tuningParams.dng_lossless_jpeg),
             "D_th": NSNumber(value: tuningParams.d_th),

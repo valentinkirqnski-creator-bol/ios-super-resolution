@@ -913,6 +913,10 @@ struct CameraView: View {
                     }
                     Slider(value: $cam.tuningParams.k_shrink, in: 1.0...5.0)
 
+                    Toggle("Quad-Centre Kernel Lookup", isOn: $cam.tuningParams.kernel_lookup_quad_centre)
+                    Text("Where a comparison frame fetches its steerable kernel from the covariance grid. ON (default, correct): (pos-0.5)/2 -- the centre of the Bayer quad, which is where the grid is actually sampled, and the same mapping the reference frame has always used. OFF: the legacy pos/2-0.5, which fetches the kernel 0.5 raw px away from the pixel being reconstructed. Because the grid is bilinearly interpolated, that offset blends neighbouring cells and rounds every kernel slightly toward isotropic -- which accidentally buys extra tolerance for residual alignment error. So turning this OFF can look smoother even though it is wrong: it hides misalignment rather than fixing it. Reference frames are unaffected either way. A/B on real captures; if OFF looks better, the alignment residual is what needs attention.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     Toggle("Lossless DNG (smaller, faster)", isOn: $cam.tuningParams.dng_lossless_jpeg)
                     Text("Writes the output DNG with lossless-JPEG tiles (Compression 7, the standard DNG codec -- what Apple ProRAW uses). Pixels are bit-identical to the uncompressed file; size drops to roughly a third (varies with scene content) and saving is faster because far fewer bytes hit storage. Off = uncompressed strips as before.")
                         .font(.footnote)
