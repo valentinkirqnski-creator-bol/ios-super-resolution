@@ -1436,7 +1436,7 @@ void flow_densify_boundary_select(FlowField& flow,
                 out_x = flow.dx(sy, sx);
                 out_y = flow.dy(sy, sx);
             }
-            if (overlap_all && spread > thr) {
+            if (overlap_all && (cfg.flow_overlap_measure_all || spread > thr)) {
                 // Overlapped-tile measurement (Config::flow_overlap_merge),
                 // for cells whose four neighbour vectors DISAGREE: the merge
                 // consumes these nearest, one per covering tile, so each must

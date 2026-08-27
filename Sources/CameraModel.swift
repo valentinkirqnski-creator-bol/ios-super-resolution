@@ -129,6 +129,10 @@ struct TuningParams: Equatable, Codable {
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
     var flow_overlap_merge: Bool = false
+    /// Align every half-pitch overlap cell on its own full-tile window,
+    /// as HDR+ does (4x the alignment work). Without it the fine grid is
+    /// derived from the coarse one and stays at the coarse pitch.
+    var flow_overlap_measure_all: Bool = false
     /// Where the merge looks the steerable kernel up in the covariance grid.
     /// On = (pos-0.5)/2, the Bayer quad centre the grid is actually sampled
     /// at. Off = the legacy pos/2-0.5, which fetches it 0.5 raw px away.
@@ -256,6 +260,7 @@ struct TuningParams: Equatable, Codable {
         case flow_boundary_selection
         case flow_bicubic_sampling
         case flow_overlap_merge
+        case flow_overlap_measure_all
         case snr_auto_tune, alignment_tile_size
         case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
@@ -306,6 +311,7 @@ struct TuningParams: Equatable, Codable {
         flow_boundary_selection = try c.decodeIfPresent(Bool.self, forKey: .flow_boundary_selection) ?? flow_boundary_selection
         flow_bicubic_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bicubic_sampling) ?? flow_bicubic_sampling
         flow_overlap_merge = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_merge) ?? flow_overlap_merge
+        flow_overlap_measure_all = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_measure_all) ?? flow_overlap_measure_all
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
@@ -2088,6 +2094,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_boundary_selection": NSNumber(value: tuningParams.flow_boundary_selection),
             "flow_bicubic_sampling": NSNumber(value: tuningParams.flow_bicubic_sampling),
             "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
+            "flow_overlap_measure_all": NSNumber(value: tuningParams.flow_overlap_measure_all),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "kernel_lookup_quad_centre": NSNumber(value: tuningParams.kernel_lookup_quad_centre),
             "d_thresh_manual": NSNumber(value: tuningParams.d_thresh_manual),

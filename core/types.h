@@ -788,6 +788,35 @@ struct Config {
         return flow_overlap_merge && grey_method == GreyMethod::Decimate;
     }
 
+    // Measure EVERY half-pitch cell on its own full-tile window, instead of
+    // only the cells whose four neighbours disagree.
+    //
+    // This is what HDR+ actually does, and it is the piece this port has been
+    // approximating. Monod/Delon/Veit, Section 4: "Tiles (for both the
+    // alignment and merging steps) are overlapped by half in each spatial
+    // dimension. This means that the total number of tiles (and thus the
+    // number of operations for ALIGNMENT and merging) is actually multiplied
+    // by a factor of 4." Every Ts/2-strided tile is aligned in its own right,
+    // which is precisely why HDR+ needs no interpolated flow: nearest is
+    // exact when a real measurement exists at every cell.
+    //
+    // Without this, the overlap merge derives its fine grid from the coarse
+    // one -- interpolated when flow_bilinear_sampling is on, or the
+    // containing tile's vector when it is off. The latter leaves both fine
+    // cells of a coarse tile holding the same vector, so the field stays
+    // piecewise-constant at the COARSE pitch and the rotation staircase is
+    // unchanged (theta*16, not theta*8). Only a measurement per cell buys the
+    // half-pitch field.
+    //
+    // Costs what the paper says it costs: 4x the alignment work over the
+    // lattice, and measured vectors are never bit-equal, so the merge's
+    // hypothesis clustering stops collapsing agreeing cells and every pixel
+    // pays up to 4 gathers. eda53e2 gated the measurement to disagreement
+    // cells for exactly that reason ("much slower"); this makes the full HDR+
+    // behaviour available again as an explicit, opt-in choice rather than a
+    // silent default. Requires the overlapped-tile merge.
+    bool flow_overlap_measure_all = false;
+
     // Sub-pixel refinement of every block-matching result: fit a bivariate
     // quadratic to the 3x3 cost neighbourhood around the winning integer
     // offset and add its sub-cell minimum (mu = -H^-1 g), the piece of
