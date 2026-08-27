@@ -717,6 +717,10 @@ struct CameraView: View {
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Quad-Centre Kernel Lookup", isOn: $cam.tuningParams.kernel_lookup_quad_centre)
+        Text("Where a comparison frame fetches its steerable kernel from the covariance grid. ON (default, correct): (pos-0.5)/2 -- the centre of the Bayer quad, which is where the grid is actually sampled, and the same mapping the reference frame has always used. OFF: the legacy pos/2-0.5, which fetches the kernel 0.5 raw px away from the pixel being reconstructed, so comparison frames use a kernel measured half a pixel from where the reference frame measured its own. Because the grid is bilinearly interpolated, that offset also blends neighbouring cells and rounds every kernel slightly toward isotropic -- which accidentally buys tolerance for residual alignment error. So OFF can look smoother while being wrong: it hides misalignment rather than fixing it. Reference frames are unaffected either way.")
+            .font(.footnote)
+            .foregroundColor(.secondary)
         Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
         Text("""
              Block matching produces ONE displacement per 16-pixel tile, and consuming it              nearest makes the warp piecewise constant -- v(x,y) = v_ij across each tile,              jumping at every boundary.

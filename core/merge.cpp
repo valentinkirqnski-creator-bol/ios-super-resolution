@@ -212,13 +212,28 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
             if (!iso) {
+                // Raw position -> covariance/grey grid. Must be the SAME
+                // mapping accumulate_ref uses below: at zero flow a comparison
+                // frame describes the same scene point as the reference, so
+                // both have to look up the same kernel. Selected by
+                // Config::kernel_lookup_quad_centre; see there.
                 f32 kmap_j, kmap_i;
-                if (cfg.bayer_mode) {
-                    kmap_j = lr_mov_x / 2.f - 0.5f;
-                    kmap_i = lr_mov_y / 2.f - 0.5f;
+                if (cfg.kernel_lookup_quad_centre) {
+                    if (cfg.bayer_mode) {
+                        kmap_j = (lr_mov_x - 0.5f) / 2.f;
+                        kmap_i = (lr_mov_y - 0.5f) / 2.f;
+                    } else {
+                        kmap_j = lr_mov_x;
+                        kmap_i = lr_mov_y;
+                    }
                 } else {
-                    kmap_j = lr_mov_x - 0.5f;
-                    kmap_i = lr_mov_y - 0.5f;
+                    if (cfg.bayer_mode) {
+                        kmap_j = lr_mov_x / 2.f - 0.5f;
+                        kmap_i = lr_mov_y / 2.f - 0.5f;
+                    } else {
+                        kmap_j = lr_mov_x - 0.5f;
+                        kmap_i = lr_mov_y - 0.5f;
+                    }
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }

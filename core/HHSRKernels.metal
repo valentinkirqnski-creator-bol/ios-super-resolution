@@ -858,7 +858,10 @@ struct MergeCompParams {
     // conversion below (was _pad0).
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint _pad2;
+    // 1 = kmap = (pos - 0.5)/2 (Bayer quad centre, correct); 0 = legacy
+    // pos/2 - 0.5. Config::kernel_lookup_quad_centre. Comparison path
+    // only -- merge_accumulate_ref always uses the quad-centre form.
+    uint kmap_quad_centre;   // was _pad2
     uint _pad3;
 };
 
@@ -1102,13 +1105,24 @@ static inline void merge_comp_contrib(device const float* img,
 
     float ixx = 0.f, ixy = 0.f, iyy = 0.f;
     if (!p.iso) {
+        // p.kmap_quad_centre -- twin of the branch in accumulate_comp.
         float kmap_j, kmap_i;
-        if (p.bayer) {
-            kmap_j = lr_mov_x / 2.f - 0.5f;
-            kmap_i = lr_mov_y / 2.f - 0.5f;
+        if (p.kmap_quad_centre != 0u) {
+            if (p.bayer) {
+                kmap_j = (lr_mov_x - 0.5f) / 2.f;
+                kmap_i = (lr_mov_y - 0.5f) / 2.f;
+            } else {
+                kmap_j = lr_mov_x;
+                kmap_i = lr_mov_y;
+            }
         } else {
-            kmap_j = lr_mov_x - 0.5f;
-            kmap_i = lr_mov_y - 0.5f;
+            if (p.bayer) {
+                kmap_j = lr_mov_x / 2.f - 0.5f;
+                kmap_i = lr_mov_y / 2.f - 0.5f;
+            } else {
+                kmap_j = lr_mov_x - 0.5f;
+                kmap_i = lr_mov_y - 0.5f;
+            }
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
     }

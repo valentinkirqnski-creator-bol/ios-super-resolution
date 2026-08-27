@@ -417,6 +417,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.debug_noise_model_disabled = tuning[@"debug_noise_model_disabled"].boolValue;
     if (tuning[@"flow_bilinear_sampling"])
         cfg.flow_bilinear_sampling = tuning[@"flow_bilinear_sampling"].boolValue;
+    if (tuning[@"kernel_lookup_quad_centre"])
+        cfg.kernel_lookup_quad_centre = tuning[@"kernel_lookup_quad_centre"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])

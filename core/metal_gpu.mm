@@ -2974,7 +2974,10 @@ struct MergeCompParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
-    uint32_t _pad2 = 0, _pad3 = 0;
+    // 1 = kmap = (pos - 0.5)/2 (Bayer quad centre); 0 = legacy
+    // pos/2 - 0.5. Config::kernel_lookup_quad_centre. Comp path only.
+    uint32_t kmap_quad_centre = 1;  // was _pad2
+    uint32_t _pad3 = 0;
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -3650,6 +3653,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
     p.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    p.kmap_quad_centre = cfg.kernel_lookup_quad_centre ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

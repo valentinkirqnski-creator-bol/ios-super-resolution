@@ -704,6 +704,30 @@ struct Config {
     // correspondence the merge never fetches.
     bool  flow_bilinear_sampling = true;
 
+    // Where accumulate_comp looks the steerable kernel up in the covariance
+    // grid, as a raw -> grey/cov mapping.
+    //
+    //   true  (quad centre): kmap = (lr_mov - 0.5) / 2
+    //   false (legacy):      kmap =  lr_mov / 2 - 0.5      -- 0.5 raw px lower
+    //
+    // True is correct and the default. The covariance grid is sampled at the
+    // CENTRE of each Bayer quad -- raw 2g + 0.5 -- established three ways:
+    // this port's own construction (quad decimation puts grey g at raw 2g+0.5,
+    // the [-0.5,0.5] gradient stencil centres at +0.5, the -1+i tensor
+    // neighbourhood recentres to (y,x)); 460-main building it identically; and
+    // 460-main's estimate_kernels docstring saying so outright ("sampled at
+    // the center of each bayer quad"). accumulate_ref has always used the
+    // quad-centre form, so with this false the comparison frames fetch their
+    // kernel 0.5 raw px from where the reference frame fetches its own.
+    //
+    // Kept switchable because the legacy mapping is not simply worse to look
+    // at: fetching the covariance off-centre blends neighbouring cells through
+    // the bilinear interpolation, rounding every kernel slightly toward
+    // isotropic. Section 5.1.1 gives anisotropic kernels the job of tolerating
+    // small misalignments, so that rounding silently buys extra tolerance, and
+    // correcting it can EXPOSE alignment residual rather than cause it.
+    bool  kernel_lookup_quad_centre = true;
+
     bool  align_ambiguous_fallback_enabled = false;
 
     // Test switch from the aperture experiments: force merge robustness to zero

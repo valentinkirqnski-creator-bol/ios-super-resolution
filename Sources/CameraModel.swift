@@ -162,6 +162,10 @@ struct TuningParams: Equatable, Codable {
     /// Sample the per-tile flow bilinearly between tile centres everywhere it
     /// is consumed, instead of taking the containing tile's vector.
     var flow_bilinear_sampling: Bool = true
+    /// Where the merge fetches the steerable kernel from the covariance grid.
+    /// On = (pos-0.5)/2, the Bayer quad centre the grid is sampled at, and the
+    /// mapping the reference frame already uses. Off = legacy pos/2-0.5.
+    var kernel_lookup_quad_centre: Bool = true
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -230,6 +234,7 @@ struct TuningParams: Equatable, Codable {
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
+        case kernel_lookup_quad_centre
         case use_neural_robustness
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -303,6 +308,7 @@ struct TuningParams: Equatable, Codable {
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
+        kernel_lookup_quad_centre = try c.decodeIfPresent(Bool.self, forKey: .kernel_lookup_quad_centre) ?? kernel_lookup_quad_centre
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -1920,6 +1926,7 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
+            "kernel_lookup_quad_centre": NSNumber(value: tuningParams.kernel_lookup_quad_centre),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
