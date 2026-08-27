@@ -317,8 +317,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             } else if (cfg.flow_bilinear_sampling) {
                 flow.sample_bilinear(lr_y, lr_x, tile_size, hx[0], hy[0]);
             } else {
-                hx[0] = flow.dx(py, px);
-                hy[0] = flow.dy(py, px);
+                // sample_nearest, not flow.dx(py,px): follows the fine grid
+                // when one exists, which every GPU path already does.
+                flow.sample_nearest(lr_y, lr_x, tile_size, hx[0], hy[0]);
             }
 
             // Which coordinate space R lives in is decided by R's ACTUAL

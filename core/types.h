@@ -128,6 +128,33 @@ struct FlowField {
             sample_grid(g, gny, gnx, ts, raw_y, raw_x, out_dx, out_dy);
     }
 
+    // Nearest-cell read, switching to the fine grid on exactly the same
+    // condition sample_bilinear does. Every GPU path already swaps in
+    // fine_flow at halved pitch whenever has_fine() is true, unconditionally;
+    // the CPU nearest paths used to read the COARSE grid, which was harmless
+    // only while a fine grid could not exist without flow_bilinear_sampling.
+    // The overlapped-tile merge now builds one with interpolation OFF, so
+    // routing every nearest read through here is what stops the CPU and the
+    // GPU warping the same frame with different flow.
+    inline void sample_nearest(f32 raw_y, f32 raw_x, int tile_size,
+                               f32& out_dx, f32& out_dy) const {
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+        if (has_fine() && tile_size >= 2 && (tile_size % 2) == 0) {
+            const f32 ts = 0.5f * (f32)tile_size;
+            const int ty = cl((int)(raw_y / ts), fine_ny);
+            const int tx = cl((int)(raw_x / ts), fine_nx);
+            const size_t o = ((size_t)ty * fine_nx + tx) * 2u;
+            out_dx = fine_flow[o + 0];
+            out_dy = fine_flow[o + 1];
+            return;
+        }
+        if (ny <= 0 || nx <= 0 || tile_size <= 0) { out_dx = 0.f; out_dy = 0.f; return; }
+        const int ty = cl((int)(raw_y / (f32)tile_size), ny);
+        const int tx = cl((int)(raw_x / (f32)tile_size), nx);
+        out_dx = dx(ty, tx);
+        out_dy = dy(ty, tx);
+    }
+
     static inline f32 catmull1(f32 p0, f32 p1, f32 p2, f32 p3, f32 t) {
         return 0.5f * (2.f * p1 + (-p0 + p2) * t +
                        (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t +
@@ -741,10 +768,32 @@ struct Config {
     bool  flow_overlap_merge = false;
 
     // True when the overlapped-tile merge should actually run.
+    // No flow_bilinear_sampling requirement. HDR+ does not interpolate flow at
+    // all -- Monod/Delon/Veit Sec. 4: tiles are overlapped by half for BOTH
+    // alignment and merging, each tile carries its own measured vector, and
+    // continuity comes from the raised-cosine WINDOW blending the merged
+    // results, not from smoothing the flow field. The merge here matches that:
+    // it reads its <=4 hypotheses straight out of fine_flow, one per covering
+    // cell, nearest. The old dependency existed only because the fine grid was
+    // built solely for boundary selection, and because the robustness mask
+    // picked its grid off the same flag; FlowField::sample_nearest now routes
+    // every CPU nearest read through the fine grid exactly as the GPU already
+    // does, so mask and merge stay on one grid either way.
     bool overlap_merge_active() const {
-        return flow_overlap_merge && flow_bilinear_sampling &&
-               grey_method == GreyMethod::Decimate;
+        return flow_overlap_merge && grey_method == GreyMethod::Decimate;
     }
+
+    // Align EVERY half-pitch cell on its own full-tile window, which is what
+    // makes this HDR+ rather than an approximation of it. The paper is explicit
+    // that the 4x cost is for "the number of operations for ALIGNMENT and
+    // merging". Without it, cells whose four neighbours agree just inherit a
+    // vector derived from the coarse grid, so the field stays at the coarse
+    // tile pitch and the half-overlap buys nothing but the window.
+    //
+    // Costs what the paper says: 4x the lattice alignment work, and measured
+    // vectors are never bit-equal, so the merge's hypothesis clustering stops
+    // collapsing agreeing cells and every pixel pays up to 4 gathers.
+    bool flow_overlap_measure_all = true;
 
     // Sub-pixel refinement of every block-matching result: fit a bivariate
     // quadratic to the 3x3 cost neighbourhood around the winning integer

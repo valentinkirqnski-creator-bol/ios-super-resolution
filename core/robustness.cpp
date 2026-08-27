@@ -646,14 +646,10 @@ static Image upscale_warp_stats(const Image& guide_stats,
                 if (bilinear_flow) {
                     flow->sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
                 } else {
-                    // Python: patch_idy = int(y // tile_size)  (no clamp)
-                    int patch_idy = y / tile_size;
-                    int patch_idx = x / tile_size;
-                    if (patch_idy >= 0 && patch_idy < flow->ny &&
-                        patch_idx >= 0 && patch_idx < flow->nx) {
-                        flow_x = flow->dx(patch_idy, patch_idx);
-                        flow_y = flow->dy(patch_idy, patch_idx);
-                    }
+                    // Fine-grid aware, matching the GPU twin (flow_gpu_grid
+                    // swaps it in unconditionally). The mask must score the
+                    // correspondence the merge actually fetches.
+                    flow->sample_nearest((f32)y, (f32)x, tile_size, flow_x, flow_y);
                 }
             }
             f32 LR_y = (y + flow_y + 0.5f) / s - 0.5f;
@@ -1056,10 +1052,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idx = x / tile_size;
                 if (cfg.flow_bilinear_sampling)
                     flow.sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
-                else {
-                    flow_x = flow.dx(patch_idy, patch_idx);
-                    flow_y = flow.dy(patch_idy, patch_idx);
-                }
+                else
+                    flow.sample_nearest((f32)y, (f32)x, tile_size, flow_x, flow_y);
             } else {
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
@@ -1069,8 +1063,10 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                                          tile_size, rdx, rdy);
                     flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
                 } else {
-                    flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                    flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                    f32 rdx, rdy;
+                    flow.sample_nearest(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
+                                        tile_size, rdx, rdy);
+                    flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
                 }
             }
 
