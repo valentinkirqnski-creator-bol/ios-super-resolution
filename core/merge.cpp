@@ -444,8 +444,6 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             f32 additional_denoise_power = 1.f;
             int rad = 1;
             if (robustness_denoise && acc_rob) {
-                // Python: acc_rob[min(round(coarse_y), h-1), min(round(coarse_x), w-1)]
-                // (high clamp only — no max(0,·))
                 f32 acc_y = coarse_y;
                 f32 acc_x = coarse_x;
                 // acc_rob inherits whatever resolution the per-frame R had --
@@ -460,13 +458,20 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 // Fractional, matching what 6dd12a8 did for the per-frame R in
                 // accumulate_comp: same grid, same (pos-0.5)/2 mapping, so it
                 // read oddly for one to interpolate and the other to snap to
-                // the nearest cell. The sampler clamps internally, so the
-                // explicit index clamp above is no longer needed.
+                // the nearest cell. The sampler clamps internally, so no
+                // explicit index clamp is needed.
                 //
-                // Both references take acc_rob nearest (460-main:
-                // acc_rob[round(grey_pos[0]), round(grey_pos[1])]), so this is
-                // a deliberate deviation, consistent with the one already made
-                // for R rather than a new one.
+                // DELIBERATE DEVIATION from the references, and note that the
+                // nearest form this replaced was deliberate too: it carried the
+                // comment "Python: acc_rob[min(round(coarse_y), h-1),
+                // min(round(coarse_x), w-1)] (high clamp only -- no max(0,.))",
+                // i.e. it was written to reproduce Python exactly, down to the
+                // one-sided clamp. Both references do take acc_rob nearest
+                // (460-main accumulate_ref: acc_rob[round(grey_pos[0]),
+                // round(grey_pos[1])]). This follows the choice 6dd12a8 already
+                // made for R -- which left the two lookups on the same grid
+                // disagreeing -- rather than adding a new deviation. Revert
+                // both together if reference parity is wanted back.
                 local_acc_r = sample_robustness_bilinear(*acc_rob, acc_y, acc_x);
                 if (adaptive) {
                     additional_denoise_power =
