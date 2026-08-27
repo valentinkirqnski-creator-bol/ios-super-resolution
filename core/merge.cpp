@@ -365,13 +365,25 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 // kernel measured half a raw pixel away from the one the
                 // reference frame used. python-z is internally inconsistent
                 // here too -- its own accumulate_ref uses the 460-main form.
+                // Config::kernel_lookup_quad_centre selects between the two;
+                // see there for why the legacy form is still reachable.
                 f32 kmap_j, kmap_i;
-                if (cfg.bayer_mode) {
-                    kmap_j = (lr_mov_x - 0.5f) / 2.f;
-                    kmap_i = (lr_mov_y - 0.5f) / 2.f;
+                if (cfg.kernel_lookup_quad_centre) {
+                    if (cfg.bayer_mode) {
+                        kmap_j = (lr_mov_x - 0.5f) / 2.f;
+                        kmap_i = (lr_mov_y - 0.5f) / 2.f;
+                    } else {
+                        kmap_j = lr_mov_x;
+                        kmap_i = lr_mov_y;
+                    }
                 } else {
-                    kmap_j = lr_mov_x;
-                    kmap_i = lr_mov_y;
+                    if (cfg.bayer_mode) {
+                        kmap_j = lr_mov_x / 2.f - 0.5f;
+                        kmap_i = lr_mov_y / 2.f - 0.5f;
+                    } else {
+                        kmap_j = lr_mov_x - 0.5f;
+                        kmap_i = lr_mov_y - 0.5f;
+                    }
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
                                merge_soften_max_inv(cfg));

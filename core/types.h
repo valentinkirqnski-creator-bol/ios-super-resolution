@@ -924,6 +924,35 @@ struct Config {
     // far below one 16-bit LSB after normalisation.
     bool merge_fast_weights = true;
 
+    // Where accumulate_comp looks the steerable kernel up in the covariance
+    // grid, as a raw -> grey/cov mapping.
+    //
+    //   true  (quad centre): kmap = (lr_mov - 0.5) / 2
+    //   false (legacy):      kmap =  lr_mov / 2 - 0.5      -- 0.5 raw px lower
+    //
+    // True is the correct mapping and the default. The covariance grid is
+    // sampled at the CENTRE of each Bayer quad -- raw 2g + 0.5 -- which is
+    // established three ways: this port's own construction (quad decimation
+    // puts grey g at raw 2g+0.5, the [-0.5,0.5] gradient stencil centres at
+    // +0.5, the -1+i tensor neighbourhood recentres to (y,x)); 460-main
+    // building it identically; and 460-main's estimate_kernels docstring
+    // saying so outright ("sampled at the center of each bayer quad").
+    // accumulate_ref has always used the quad-centre form, so with this false
+    // the comparison frames fetch their kernel 0.5 raw px away from where the
+    // reference frame fetches its own.
+    //
+    // Exposed as a toggle anyway, because the legacy mapping is not simply
+    // worse to look at. Fetching the covariance off-centre blends neighbouring
+    // cells through the bilinear interpolation, which pulls the field toward
+    // isotropic -- a permanent low-grade rounding of every kernel. Section
+    // 5.1.1 gives anisotropic kernels the job of tolerating small
+    // misalignments, so that rounding silently buys extra misalignment
+    // tolerance. Correcting it removes the slack and can EXPOSE residual
+    // alignment error that was previously smeared over. A/B it on real
+    // captures; if the legacy form looks better, the thing to chase is the
+    // alignment residual, not this mapping.
+    bool kernel_lookup_quad_centre = true;
+
     bool  accumulated_robustness_denoiser_enabled = false;
     float acc_rob_rad_max = 2.0f;
     float acc_rob_max_multiplier = 8.0f;

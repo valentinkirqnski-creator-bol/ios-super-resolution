@@ -457,6 +457,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_bicubic_sampling = tuning[@"flow_bicubic_sampling"].boolValue;
     if (tuning[@"flow_overlap_merge"])
         cfg.flow_overlap_merge = tuning[@"flow_overlap_merge"].boolValue;
+    if (tuning[@"kernel_lookup_quad_centre"])
+        cfg.kernel_lookup_quad_centre = tuning[@"kernel_lookup_quad_centre"].boolValue;
     if (tuning[@"k_shrink"]) cfg.k_shrink = tuning[@"k_shrink"].floatValue;
     if (tuning[@"d_thresh_manual"])
         cfg.d_thresh_manual = tuning[@"d_thresh_manual"].boolValue;
