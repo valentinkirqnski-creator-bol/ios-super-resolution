@@ -1358,9 +1358,14 @@ void flow_densify_boundary_select(FlowField& flow,
     flow.fine_nx = 0;
     flow.fine_flow.clear();
     const bool overlap_all = cfg.overlap_merge_active();
-    if ((!cfg.flow_boundary_selection && !overlap_all) ||
-        !cfg.flow_bilinear_sampling)
-        return;
+    if (!cfg.flow_boundary_selection && !overlap_all) return;
+    // Boundary selection still requires interpolation: the cells whose four
+    // neighbours agree hold their bilinear BLEND, so the grid is meaningless
+    // if nothing is interpolating. The overlapped-tile merge does not -- it
+    // reads each covering cell nearest -- so it may build the grid either
+    // way. See the agreeing-cell fill below for what those cells hold when
+    // interpolation is off.
+    if (!overlap_all && !cfg.flow_bilinear_sampling) return;
     // Even pitch only: the fine grid's pitch is tile_size/2 and the GPU hosts
     // pass it as an integer. Every shipped tile size (16/32/64) is even.
     if (flow.ny <= 0 || flow.nx <= 0 || tile_size < 2 || (tile_size % 2) != 0 ||
@@ -1410,12 +1415,27 @@ void flow_densify_boundary_select(FlowField& flow,
                     spread = std::max(spread,
                                       std::max(std::fabs(vx[a] - vx[b]),
                                                std::fabs(vy[a] - vy[b])));
-            const f32 tx0 = vx[0] + (vx[1] - vx[0]) * ax;
-            const f32 bx0 = vx[2] + (vx[3] - vx[2]) * ax;
-            const f32 ty0 = vy[0] + (vy[1] - vy[0]) * ax;
-            const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
-            f32 out_x = tx0 + (bx0 - tx0) * ay;
-            f32 out_y = ty0 + (by0 - ty0) * ay;
+            f32 out_x, out_y;
+            if (cfg.flow_bilinear_sampling) {
+                const f32 tx0 = vx[0] + (vx[1] - vx[0]) * ax;
+                const f32 bx0 = vx[2] + (vx[3] - vx[2]) * ax;
+                const f32 ty0 = vy[0] + (vy[1] - vy[0]) * ax;
+                const f32 by0 = vy[2] + (vy[3] - vy[2]) * ax;
+                out_x = tx0 + (bx0 - tx0) * ay;
+                out_y = ty0 + (by0 - ty0) * ay;
+            } else {
+                // Interpolation off (only reachable via the overlapped-tile
+                // merge, which builds this grid regardless): a cell that is
+                // not measured or selected below must hold the vector of the
+                // coarse tile CONTAINING it, not a blend of its neighbours --
+                // otherwise "nearest" would quietly interpolate at half pitch.
+                // The fine cell centre is (f + 0.5) * (tile_size/2) raw, so
+                // the containing coarse tile is simply f/2.
+                const int sy = std::min(fy / 2, flow.ny - 1);
+                const int sx = std::min(fx / 2, flow.nx - 1);
+                out_x = flow.dx(sy, sx);
+                out_y = flow.dy(sy, sx);
+            }
             if (overlap_all && spread > thr) {
                 // Overlapped-tile measurement (Config::flow_overlap_merge),
                 // for cells whose four neighbour vectors DISAGREE: the merge
