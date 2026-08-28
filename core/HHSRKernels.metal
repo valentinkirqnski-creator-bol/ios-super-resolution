@@ -1577,7 +1577,9 @@ inline void merge_accumulate_ref_body(device AccT* num,
             // Reference behaviour: step at the frame-count threshold.
             additional_denoise_power =
                 (local_acc_r <= p.max_frame_count) ? p.max_multiplier : 1.f;
-            rad = (local_acc_r <= p.max_frame_count) ? int(p.rad_max) : 1;
+            // max(1, ...) -- twin of denoise_range_step in merge.cpp; a
+            // zero radius leaves one CFA colour and kills the other two.
+            rad = max(1, (local_acc_r <= p.max_frame_count) ? int(p.rad_max) : 1);
         }
     }
 
@@ -1595,8 +1597,11 @@ inline void merge_accumulate_ref_body(device AccT* num,
                        p.soften_max_inv, p.legacy_soften != 0u);
     }
 
-    int center_j = int(round(coarse_x));
-    int center_i = int(round(coarse_y));
+    // Clamped into the image -- twin of the reference pass in merge.cpp.
+    // Rounding could land one past the last column, leaving a single CFA
+    // parity in the window and a dead channel along the whole edge.
+    int center_j = clamp(int(round(coarse_x)), 0, int(p.lr_w) - 1);
+    int center_i = clamp(int(round(coarse_y)), 0, int(p.lr_h) - 1);
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;

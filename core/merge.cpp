@@ -38,8 +38,14 @@ static inline f32 denoise_power_step(f32 r_acc, f32 power_max, f32 max_frame_cou
     return (r_acc <= max_frame_count) ? power_max : 1.f;
 }
 
+// Floored at 1, like its sibling denoise_range_merge. acc_rob_rad_max is a
+// user slider whose minimum is 0, and an unfloored 0 collapses the reference
+// window to a SINGLE raw sample -- one CFA colour, so the other two channels
+// get a zero denominator and every division site emits 0 for them. Measured
+// before the floor: 16384 of 16384 output pixels lost a channel, 33023 dead
+// channels out of 49152. That is the green/black speckle, at full strength.
 static inline int denoise_range_step(f32 r_acc, int rad_max, f32 max_frame_count) {
-    return (r_acc <= max_frame_count) ? rad_max : 1;
+    return std::max(1, (r_acc <= max_frame_count) ? rad_max : 1);
 }
 
 static inline f32 denoise_power_merge(f32 r_acc, f32 power_max, f32 burst_frames) {
@@ -564,8 +570,17 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             }
 
             // Python: center = round(coarse)
-            const int center_j = cuda_round_to_int(coarse_x);
-            const int center_i = cuda_round_to_int(coarse_y);
+            // Clamped INTO the image. The last output column maps to
+            // coarse_x = (Ws-1)/scale, which rounds to lr_w -- one past the
+            // end -- so at rad 1 the only in-bounds column was lr_w-1 and the
+            // window held a single CFA parity. That killed one channel on the
+            // entire last row and column (measured: 255 of 255 dead pixels
+            // sat there) in the DEFAULT configuration, where rad is 1.
+            // Clamping keeps at least two columns and two rows in bounds, so
+            // all four CFA sites are always present. Weights are unaffected:
+            // dist_x/dist_y are still measured from the true coarse position.
+            const int center_j = std::min(std::max(cuda_round_to_int(coarse_x), 0), lr_w - 1);
+            const int center_i = std::min(std::max(cuda_round_to_int(coarse_y), 0), lr_h - 1);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -rad; di <= rad; ++di) {
