@@ -1601,7 +1601,10 @@ inline void merge_accumulate_ref_body(device AccT* num,
             float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
             // Coverage floor -- twin of accumulate_ref in merge.cpp. Keyed
             // on the ceiling in the params (>64), always active at 128.
-            if (p.soften_max_inv > 64.f)
+            // Unconditional, twin of cover_eps in merge_ref_band -- the
+            // > 64 key it replaced would have disabled the floor exactly
+            // where the red channel still has no taps.
+            if (true)
                 w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
                                                 dist_y * dist_y));
 

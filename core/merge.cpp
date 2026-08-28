@@ -89,14 +89,18 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 // ~4e-4 (fp16-safe), and the resolution cost vs 0.044 px is 97% vs 98%
 // contrast at 1 px strokes -- nothing, for artifact-free coverage.
 //
-// BOTH modes use 128 now. The legacy value 32 (sigma floor 0.177 px) was a
-// silent divergence from the 460-main reference, which has NO width floor:
-// at k_detail 0.17 its across-edge kernels run at 0.085 px and ours were
-// doubled to 0.177 -- every edge ~2x softer than the reference at identical
-// settings, which is why matching its detail took k_detail ~0.10 here. At
-// 128 the same k_detail means the same kernel as 460-main down to the
-// coverage bound, and the reference-pass coverage floor (keyed on this
-// value being > 64) guards the denominators in both modes.
+// BOTH modes now use 32 (sigma floor 0.1768 px) -- see kMergeInvCovMax in
+// types.h for why it moved back off 128. The trade is explicit: 460-main and
+// python-z have NO width floor, so at k_detail 0.17 their across-edge kernels
+// run at 0.085 px while ours are held at 0.1768, roughly 2x softer at
+// identical settings. That is the cost of not needing a long burst to give
+// every colour channel a surviving tap.
+//
+// The reference-pass coverage floor used to be keyed on this value being
+// > 64, which would have switched it off at 32 and turned the red channel's
+// empty rows from a colour fringe into a black hole. It is unconditional now;
+// see the cover_eps comment below. Run with merge_chroma_difference on, which
+// fixes the underlying coverage problem rather than papering over it.
 static inline f32 merge_soften_max_inv(const Config& cfg) {
     (void)cfg;
     return kMergeInvCovMax;
@@ -456,7 +460,16 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                            Image& num, Image& den, int y0, const Config& cfg) {
     // See the coverage-floor comment in the tap loop below. Always active
     // now that the ceiling is 128 in every mode.
-    const f32 cover_eps = (merge_soften_max_inv(cfg) > 64.f) ? 5e-4f : 0.f;
+    // Unconditional. This used to switch off below a ceiling of 64, on the
+    // assumption that a kernel that wide reaches the nearest same-colour
+    // sample by itself. Measurement says otherwise: even at 0.1768 px the red
+    // channel has ZERO taps on the output rows whose nearest red sample is a
+    // full pixel away (see kMergeInvCovMax), so dropping the floor there turns
+    // a colour fringe into an exactly-zero denominator, which every division
+    // site guards to black. A guaranteed-nonzero denominator is wanted at
+    // every ceiling, and at 5e-4 relative it is under 1% wherever real taps
+    // survive.
+    const f32 cover_eps = 5e-4f;
     const bool chroma_diff = cfg.merge_chroma_difference && cfg.bayer_mode;
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;

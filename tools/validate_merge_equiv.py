@@ -49,6 +49,9 @@ def round_half_away(x: float) -> int:
 
 
 def soften_inv_cov(ixx: float, ixy: float, iyy: float) -> Tuple[float, float, float]:
+    # Mirror of kMergeInvCovMax in core/types.h. This had gone STALE while the
+    # C++ and Metal twins ran at 128 -- in the tool whose whole job is to catch
+    # exactly that kind of divergence. Keep it in step by hand.
     k_max_abs = f32(32.0)
     if not isfinite_f(ixx) or not isfinite_f(ixy) or not isfinite_f(iyy):
         return f32(2.0), f32(0.0), f32(2.0)

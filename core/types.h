@@ -43,9 +43,45 @@ struct Image {
 };
 
 // Ceiling on the eigenvalues of the INVERSE merge covariance, i.e. a floor on
-// the kernel's half-width: sigma_min = 1/sqrt(this) = 0.0884 raw px. Without
+// the kernel's half-width: sigma_min = 1/sqrt(this) = 0.1768 raw px. Without
 // a floor a very sharp region drives the kernel toward a delta, the
 // denominator collapses, and the output speckles.
+//
+// 32, not the 128 this briefly used. 128 floors sigma at 0.0884 px, which is
+// eleven times NARROWER than the 1 px raw sample spacing -- at that width the
+// kernel is not a reconstruction filter, it is a delta that takes whichever
+// single sample lands nearest and gives every other one a weight around
+// 1e-7. That only reconstructs anything because a long burst scatters samples
+// at many sub-pixel offsets, so it degrades badly wherever robustness leaves
+// few frames. It also never actually engaged: the SNR-tuned kernels bottom
+// out at 0.128 px across a strong edge, already above 0.0884, so the floor
+// was inert exactly where coverage was thinnest.
+//
+// At 32 the floor binds under auto-tune: the across-edge axis goes from
+// 0.128 to 0.1768 px, so edges are about 1.4x wider across than they were.
+//
+// Be clear about what that does and does not buy, because the obvious claim
+// is wrong. It does NOT restore per-channel coverage at a strong edge.
+// Measured red-channel denominators there, kernel taps vs the isotropic
+// coverage floor, at two adjacent output rows:
+//
+//     floor 128 (0.0884)   y=1.0: 0.000e+00   y=1.5: 0.000e+00
+//     floor  32 (0.1768)   y=1.0: 0.000e+00   y=1.5: 2.183e-02
+//     floor  16 (0.2500)   y=1.0: 0.000e+00   y=1.5: 1.611e-01
+//     floor   8 (0.3536)   y=1.0: 4.365e-02   y=1.5: 4.381e-01
+//
+// 32 half-fixes it: the row whose nearest red sample is 0.5 px away comes
+// back, the row whose nearest is a full 1 px away is still cut, because
+// z = (1/0.1768)^2 plus the along-axis term is 33 against a cutoff of 16.
+// Alternate output rows still have no red taps at all, which is a fringe at
+// half the old frequency, not no fringe. Killing it by width alone needs
+// floor 8 (0.3536 px), i.e. 2.8x softer across edges than the SNR tuning
+// asks for. Config::merge_chroma_difference removes the same artifact at no
+// resolution cost, which is why the two are independent switches.
+//
+// Neither python-z nor 460-main has any floor at all, so this is a deliberate
+// departure: it trades sharpness for not depending on frame count to keep
+// denominators populated.
 //
 // It is applied twice on purpose, and the earlier application is the one that
 // matters. soften_inv_cov() clamps AFTER inverting, which is too late when the
@@ -57,7 +93,7 @@ struct Image {
 // Clamping k1/k2 in compute_k -- exactly equivalent, since the eigenvalues of
 // the covariance ARE k1^2 and k2^2 -- keeps det away from the cliff and makes
 // the transition continuous. soften_inv_cov then stays as a safety net.
-inline constexpr f32 kMergeInvCovMax = 128.f;
+inline constexpr f32 kMergeInvCovMax = 32.f;
 
 // Global rigid (rotation + translation) motion model for one comparison
 // frame, in ALIGNMENT-GREY pixels. ImageStackAlignator's "pre-alignment":

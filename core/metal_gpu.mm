@@ -1127,7 +1127,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         // literal. Was _pad2. Defaulted to the real value rather than 0: a
         // zero here would silently disable the floor -- max(k, 0) is a no-op --
         // and bring back the 11.3x width cliff it exists to remove.
-        float k_min = 0.08838835f;  // 1/sqrt(128); assigned from
+        float k_min = 0.17677670f;  // 1/sqrt(32); assigned from
                                     // kMergeInvCovMax at the populate site
     };
     static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
