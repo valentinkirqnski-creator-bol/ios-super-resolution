@@ -94,10 +94,65 @@ static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
     return n ? sm / (f32)n : 0.f;
 }
 
-// python-z has NO clamp on the inverse covariance -- no soften_inv_cov, no
-// eigenvalue ceiling, no width floor. Its only guard is invert_2x2's
-// abs(det) > EPSILON_DIV (1e-10) falling back to the identity, which
-// interp_inv_cov below mirrors exactly. Removed to match.
+// Guard against singular/near-singular covariance inversions producing
+// infinitely sharp kernels, which leave a channel's denominator at or near
+// zero while the others are fine. NOT from python-z, which clamps nothing:
+// it merges a full burst in float32, so the other frames' sub-pixel offsets
+// keep every channel populated. This port has to survive single-frame regions
+// AND a half-precision accumulator, where an unclamped kernel drives
+// denominators to ~2e-14 -- far under half's smallest subnormal, so they
+// flush to exactly zero and the pixel loses R and B while keeping G.
+static inline f32 merge_soften_max_inv(const Config& cfg) {
+    (void)cfg;
+    return kMergeInvCovMax;
+}
+
+static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
+    if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+        ixx = 2.f;
+        ixy = 0.f;
+        iyy = 2.f;
+        return;
+    }
+    // Clamp EIGENVALUES, not the whole matrix. The previous form rescaled all
+    // three entries by one factor, which bounds the sharp axis (what the
+    // speckle fix needs) but widens the already-wide axis by the same factor
+    // -- pure blur with no coverage benefit. Measured on an edge kernel with
+    // the continuous-anisotropy defaults: sigma 0.085 x 0.68 px became
+    // 0.177 x 1.41 px, doubling the along-edge width for nothing, which is
+    // the reported over-smoothing. Bounding each eigenvalue independently
+    // gives 0.177 x 0.68: the across-edge axis widened exactly to the
+    // coverage floor, the along-edge axis untouched.
+    const f32 mean = 0.5f * (ixx + iyy);
+    const f32 half_diff = 0.5f * (ixx - iyy);
+    const f32 disc = std::sqrt(half_diff * half_diff + ixy * ixy);
+    const f32 l1 = mean + disc;                    // largest eigenvalue
+    if (!(l1 > k_max_abs)) return;                 // nothing too sharp
+    const f32 l2 = mean - disc;
+    const f32 c1 = k_max_abs;
+    const f32 c2 = std::min(l2, k_max_abs);
+    // Eigenvector of l1. Both constructions degenerate only when the matrix
+    // is (near-)isotropic diagonal, where a plain per-entry clamp is exact.
+    f32 vx = ixy;
+    f32 vy = l1 - ixx;
+    f32 n2 = vx * vx + vy * vy;
+    if (!(n2 > 0.f)) {
+        vx = l1 - iyy;
+        vy = ixy;
+        n2 = vx * vx + vy * vy;
+    }
+    if (!(n2 > 0.f)) {
+        ixx = std::min(ixx, k_max_abs);
+        iyy = std::min(iyy, k_max_abs);
+        return;
+    }
+    const f32 inv_n2 = 1.f / n2;
+    const f32 d = c1 - c2;
+    ixx = c2 + d * (vx * vx * inv_n2);
+    ixy = d * (vx * vy * inv_n2);
+    iyy = c2 + d * (vy * vy * inv_n2);
+}
+
 static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -123,7 +178,8 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det,
+                                  f32 soften_max) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -165,6 +221,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
+    soften_inv_cov(ixx, ixy, iyy, soften_max);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -322,7 +379,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x;
                     kmap_i = lr_mov_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
+                               merge_soften_max_inv(cfg));
             }
 
             const int center_j = cuda_round_to_int(lr_mov_x);
@@ -439,7 +497,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
+                               merge_soften_max_inv(cfg));
             }
 
             // Python: center = round(coarse)

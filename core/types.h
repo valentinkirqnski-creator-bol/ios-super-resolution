@@ -42,10 +42,27 @@ struct Image {
     inline size_t size() const { return data.size(); }
 };
 
-// python-z clamps nothing about the kernel width: no ceiling on the inverse
-// covariance, no floor on k1/k2. Its only guard is invert_2x2's
-// abs(det) > 1e-10 -> identity fallback. Matched, so the constant that used
-// to live here is gone along with soften_inv_cov.
+// Ceiling on the eigenvalues of the INVERSE merge covariance: a floor on the
+// kernel half-width at sigma_min = 1/sqrt(this) = 0.1768 raw px.
+//
+// python-z has no such clamp -- it merges a full burst in float32, where the
+// other frames' sub-pixel offsets keep every channel's denominator large and
+// float32 does not flush tiny values away. This port needs it for two reasons
+// python-z does not face: single-frame fallback regions, and a HALF-precision
+// accumulator (Config::merge_fp16_accumulator, on by default). Measured with
+// the clamp removed, an unclamped kernel left red and blue denominators at
+// 2.2e-14 -- three orders under half's smallest subnormal of 6.0e-8 -- so 368
+// channel samples flushed to exactly zero and those pixels kept only green.
+//
+// Applied TWICE, and the earlier one is what matters. soften_inv_cov() clamps
+// after inverting, which is too late when the covariance itself collapsed:
+// det then falls under merge.cpp's 1e-10 degeneracy test and the kernel snaps
+// to the identity fallback at sigma 1.0 px instead of the floor, an 11.3x jump
+// between adjacent gradient levels that draws a line along the iso-gradient
+// contour. Clamping k1/k2 in compute_k is exactly equivalent -- the
+// covariance's eigenvalues ARE k1^2 and k2^2 -- but keeps det away from that
+// cliff, leaving soften_inv_cov as the safety net it should be.
+inline constexpr f32 kMergeInvCovMax = 32.f;
 
 // Global rigid (rotation + translation) motion model for one comparison
 // frame, in ALIGNMENT-GREY pixels. ImageStackAlignator's "pre-alignment":

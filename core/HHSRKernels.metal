@@ -912,7 +912,8 @@ struct MergeCompParams {
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
-    uint chroma_diff;     // 1 = accumulate R-G / B-G (96 bytes)
+    float soften_max_inv; // inverse-covariance eigenvalue ceiling
+    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
 };
 
 struct MergeRefParams {
@@ -943,7 +944,8 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
-    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
+    float soften_max_inv; // inverse-covariance eigenvalue ceiling
+    uint chroma_diff;     // 1 = accumulate R-G / B-G (104 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -955,10 +957,46 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
     return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
 }
 
-// python-z clamps nothing about the inverse covariance -- no soften step at
-// all. Its invert_2x2 guards abs(det) > EPSILON_DIV and falls back to the
-// identity, which interp_inv_cov below mirrors. Matched, so soften_inv_cov and
-// its legacy twin are gone.
+// Twin of soften_inv_cov in merge.cpp. Not python-z's -- see kMergeInvCovMax
+// in types.h for why this port needs a width clamp that python-z does not.
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy,
+                           float k_max_abs) {
+    if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+        ixx = 2.f;
+        ixy = 0.f;
+        iyy = 2.f;
+        return;
+    }
+    // Eigenvalue clamp, same op order as the CPU twin: bound only the sharp
+    // axis to the coverage floor; the wide axis is left alone, so edges are
+    // not blurred along themselves the way the whole-matrix rescale did.
+    const float mean = 0.5f * (ixx + iyy);
+    const float half_diff = 0.5f * (ixx - iyy);
+    const float disc = sqrt(half_diff * half_diff + ixy * ixy);
+    const float l1 = mean + disc;
+    if (!(l1 > k_max_abs)) return;
+    const float l2 = mean - disc;
+    const float c1 = k_max_abs;
+    const float c2 = min(l2, k_max_abs);
+    float vx = ixy;
+    float vy = l1 - ixx;
+    float n2 = vx * vx + vy * vy;
+    if (!(n2 > 0.f)) {
+        vx = l1 - iyy;
+        vy = ixy;
+        n2 = vx * vx + vy * vy;
+    }
+    if (!(n2 > 0.f)) {
+        ixx = min(ixx, k_max_abs);
+        iyy = min(iyy, k_max_abs);
+        return;
+    }
+    const float inv_n2 = 1.f / n2;
+    const float d = c1 - c2;
+    ixx = c2 + d * (vx * vx * inv_n2);
+    ixy = d * (vx * vy * inv_n2);
+    iyy = c2 + d * (vy * vy * inv_n2);
+}
 
 inline float cov_lerp2(device const float* covs, uint cov_w,
                        int fy, int fx, int cy, int cx,
@@ -976,7 +1014,7 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
-                           bool raw_det) {
+                           bool raw_det, float soften_max) {
     float frac_x = kmap_j - trunc(kmap_j);
     float frac_y = kmap_i - trunc(kmap_i);
     int fx, fy;
@@ -1209,7 +1247,8 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             kmap_j = lr_mov_x;
             kmap_i = lr_mov_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true,
+                       p.soften_max_inv);
     }
 
     int center_j = lround_away(lr_mov_x);
@@ -1533,7 +1572,8 @@ inline void merge_accumulate_ref_body(device AccT* num,
             kmap_j = coarse_x;
             kmap_i = coarse_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false,
+                       p.soften_max_inv);
     }
 
     // Clamped into the image -- twin of the reference pass in merge.cpp.
@@ -1645,7 +1685,7 @@ struct KernelEstParams {
     uint _pad0;
     uint _pad1;
     uint _pad2;
-    uint _pad3;             // 72 bytes total for setBytes
+    float k_min;            // kernel half-width floor, raw px (was _pad3)
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1716,6 +1756,10 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
+    // Twin of the floor in kernels.cpp compute_k; value arrives in the params
+    // so it cannot drift from kMergeInvCovMax in types.h.
+    k1 = max(k1, p.k_min);
+    k2 = max(k2, p.k_min);
 }
 
 kernel void kernel_gat(device float* out [[buffer(0)]],

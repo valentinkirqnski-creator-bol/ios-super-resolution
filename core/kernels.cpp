@@ -59,6 +59,13 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
+        // Width floor, applied here rather than only after inversion -- see
+        // kMergeInvCovMax. Not python-z's; it is what keeps a collapsing
+        // covariance out of the degeneracy fallback, and what keeps the
+        // half accumulator's denominators representable.
+        const f32 kmin = 1.f / std::sqrt(kMergeInvCovMax);
+        k1 = std::max(k1, kmin);
+        k2 = std::max(k2, kmin);
     };
 
     // python-z order: GAT the raw, then decimate to grey (kernels.py:80, :84).
