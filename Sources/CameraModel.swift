@@ -92,7 +92,9 @@ struct TuningParams: Equatable, Codable {
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
     var k_detail: Float = 0.17
-    var k_denoise: Float = 0.0
+    /// See Config::k_denoise -- 0 collapses the kernel in flat regions rather
+    /// than widening it; 3.0 is the low end of the SNR-tuned range.
+    var k_denoise: Float = 3.0
     var k_stretch: Float = 4.0
     /// Drive the merge kernel's anisotropy continuously from the structure
     /// tensor rather than switching to the full stretch only above 0.9025.

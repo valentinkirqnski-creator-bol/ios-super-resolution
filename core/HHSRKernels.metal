@@ -1719,6 +1719,11 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
+    // Twin of the floor in kernels.cpp compute_k; see Config's
+    // kMergeInvCovMax (128) in types.h. 1/sqrt(128) = 0.08838835.
+    const float kmin = 0.08838835f;
+    k1 = max(k1, kmin);
+    k2 = max(k2, kmin);
 }
 
 kernel void kernel_gat(device float* out [[buffer(0)]],

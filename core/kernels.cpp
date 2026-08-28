@@ -59,6 +59,14 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
+        // Width floor here rather than only after inversion -- see
+        // kMergeInvCovMax. A no-op for every configuration whose kernels are
+        // already wider than the floor (the SNR auto-tuned ones never come
+        // near it); it only bites where the covariance would otherwise
+        // collapse into merge.cpp's degeneracy fallback.
+        const f32 kmin = 1.f / std::sqrt(kMergeInvCovMax);
+        k1 = std::max(k1, kmin);
+        k2 = std::max(k2, kmin);
     };
 
     Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());

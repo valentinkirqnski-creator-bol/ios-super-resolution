@@ -42,6 +42,23 @@ struct Image {
     inline size_t size() const { return data.size(); }
 };
 
+// Ceiling on the eigenvalues of the INVERSE merge covariance, i.e. a floor on
+// the kernel's half-width: sigma_min = 1/sqrt(this) = 0.0884 raw px. Without
+// a floor a very sharp region drives the kernel toward a delta, the
+// denominator collapses, and the output speckles.
+//
+// It is applied twice on purpose, and the earlier application is the one that
+// matters. soften_inv_cov() clamps AFTER inverting, which is too late when the
+// covariance itself has collapsed: at k_denoise = 0 the denoising blend drives
+// k1 and k2 to zero, det falls under merge.cpp's 1e-10 degeneracy test, and
+// the kernel snaps to the identity fallback (sigma 1.0 px) instead of the
+// floor (0.0884 px). Adjacent pixels straddling that threshold then differ
+// 11.3x in kernel width, which draws a line along the iso-gradient contour.
+// Clamping k1/k2 in compute_k -- exactly equivalent, since the eigenvalues of
+// the covariance ARE k1^2 and k2^2 -- keeps det away from the cliff and makes
+// the transition continuous. soften_inv_cov then stays as a safety net.
+inline constexpr f32 kMergeInvCovMax = 128.f;
+
 // Global rigid (rotation + translation) motion model for one comparison
 // frame, in ALIGNMENT-GREY pixels. ImageStackAlignator's "pre-alignment":
 // PreAlignment.ScanAngles estimates it by an FFT phase-correlation sweep over
@@ -1042,7 +1059,13 @@ struct Config {
     SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
-    float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
+    // 3.0 = the low end of the SNR lerp, not 0. Zero is not "no denoising",
+    // it is a kernel that COLLAPSES as the denoise blend engages: k1 and k2
+    // both go to zero in flat regions, which is where the paper wants the
+    // widest kernel. Auto-tune overwrites this unconditionally
+    // (snr_tuning.cpp), so the old 0.0 only ever applied with auto-tune off --
+    // exactly the configuration it broke.
+    float k_denoise = 3.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
     float D_th      = 0.76f;  // overwritten by SNR lerp [0.81, 0.71]
     float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]
     // Keep the manually-set D_th/D_tr above even when snr_auto_tune is on
