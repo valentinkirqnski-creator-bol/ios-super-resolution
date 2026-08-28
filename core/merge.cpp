@@ -99,7 +99,7 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
 // value being > 64) guards the denominators in both modes.
 static inline f32 merge_soften_max_inv(const Config& cfg) {
     (void)cfg;
-    return 128.f;
+    return kMergeInvCovMax;
 }
 
 // Local green at a red or blue CFA site. In every Bayer phase the four

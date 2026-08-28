@@ -1122,7 +1122,13 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t aniso_continuous = 0;  // 1 = continuous Eq. 4 shape (was _pad0)
         uint32_t aniso_zero_floor = 0;  // 1 = zero-floor linear law (was _pad1)
         float aniso_gamma = 1.f;        // exponent on the zero-floored weight
-        uint32_t _pad2 = 0;
+        // Kernel half-width floor in raw px, so the shader's compute_k floors
+        // at the same place the CPU one does instead of carrying its own
+        // literal. Was _pad2. Defaulted to the real value rather than 0: a
+        // zero here would silently disable the floor -- max(k, 0) is a no-op --
+        // and bring back the 11.3x width cliff it exists to remove.
+        float k_min = 0.08838835f;  // 1/sqrt(128); assigned from
+                                    // kMergeInvCovMax at the populate site
     };
     static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
 
@@ -1140,6 +1146,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.aniso_zero_floor = cfg.kernel_anisotropy_zero_floor ? 1u : 0u;
     p.aniso_gamma = cfg.kernel_stretch_gamma;
+    p.k_min = 1.f / std::sqrt(kMergeInvCovMax);
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -2877,7 +2884,7 @@ struct MergeCompParamsCPU {
     // PendingMergeComp::p, which is copied whole from a populated one), but a
     // stale 32 here would mean a sigma floor of 0.177 px instead of 0.088 --
     // every edge twice as soft, on one path only, with nothing to flag it.
-    float soften_max_inv = 128.f; // inv-cov eigenvalue ceiling (was _pad3)
+    float soften_max_inv = kMergeInvCovMax; // inv-cov eigenvalue ceiling (was _pad3)
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
 };
 static_assert(sizeof(MergeCompParamsCPU) == 100, "MergeCompParamsCPU layout");
@@ -2895,7 +2902,7 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
-    float soften_max_inv = 128.f; // inv-cov eigenvalue ceiling (see above)
+    float soften_max_inv = kMergeInvCovMax; // inv-cov eigenvalue ceiling (see above)
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
 };
 static_assert(sizeof(MergeRefParamsCPU) == 104, "MergeRefParamsCPU layout");
@@ -3708,7 +3715,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
     // Same mode split as merge_soften_max_inv in merge.cpp (128 = coverage
     // bound: sharper floors zero the off-site colour channels -> speckle).
-    p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    p.soften_max_inv = kMergeInvCovMax;  // both modes -- see merge_soften_max_inv
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
@@ -3810,7 +3817,7 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
-    p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    p.soften_max_inv = kMergeInvCovMax;  // both modes -- see merge_soften_max_inv
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
