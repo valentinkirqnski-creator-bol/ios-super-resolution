@@ -913,7 +913,8 @@ struct MergeCompParams {
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
     float soften_max_inv; // inverse-covariance eigenvalue ceiling (was _pad3)
-    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G
+    uint legacy_soften;   // 1 = 832f7b8 whole-matrix rescale (104 bytes)
 };
 
 struct MergeRefParams {
@@ -945,7 +946,8 @@ struct MergeRefParams {
     // below (was _pad0).
     uint raw_res_robustness;
     float soften_max_inv; // inverse-covariance eigenvalue ceiling
-    uint chroma_diff;     // 1 = accumulate R-G / B-G (104 bytes)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G
+    uint legacy_soften;   // 1 = 832f7b8 whole-matrix rescale (108 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -960,6 +962,22 @@ inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx)
 // Twin of soften_inv_cov in core/merge.cpp -- keep them in step. See there for
 // why an unclamped inverse covariance shows up as green or black speckles
 // rather than as general softness.
+// 832f7b8's form, twin of soften_inv_cov_legacy in merge.cpp: rescale all
+// three entries by one factor keyed on the largest, which widens the wide axis
+// by as much as it narrows the sharp one.
+inline void soften_inv_cov_legacy(thread float& ixx, thread float& ixy,
+                                  thread float& iyy, float k_max_abs) {
+    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
+    if (!(m > k_max_abs) || !isfinite(m)) {
+        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+            ixx = 2.f; ixy = 0.f; iyy = 2.f;
+        }
+        return;
+    }
+    const float s = k_max_abs / m;
+    ixx *= s; ixy *= s; iyy *= s;
+}
+
 inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy,
                            float k_max_abs) {
     if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
@@ -1015,7 +1033,7 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
-                           bool raw_det, float soften_max) {
+                           bool raw_det, float soften_max, bool legacy_soften) {
     float frac_x = kmap_j - trunc(kmap_j);
     float frac_y = kmap_i - trunc(kmap_i);
     int fx, fy;
@@ -1054,7 +1072,8 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
-    soften_inv_cov(ixx, ixy, iyy, soften_max);
+    if (legacy_soften) soften_inv_cov_legacy(ixx, ixy, iyy, soften_max);
+    else               soften_inv_cov(ixx, ixy, iyy, soften_max);
 }
 
 // Twin of bayer_green_at in merge.cpp: directional (Hamilton-Adams) green at
@@ -1250,7 +1269,7 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             kmap_i = lr_mov_y;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true,
-                       p.soften_max_inv);
+                       p.soften_max_inv, p.legacy_soften != 0u);
     }
 
     int center_j = lround_away(lr_mov_x);
@@ -1573,7 +1592,7 @@ inline void merge_accumulate_ref_body(device AccT* num,
             kmap_i = coarse_y;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false,
-                       p.soften_max_inv);
+                       p.soften_max_inv, p.legacy_soften != 0u);
     }
 
     int center_j = int(round(coarse_x));

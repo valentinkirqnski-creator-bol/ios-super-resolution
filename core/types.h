@@ -779,6 +779,33 @@ struct Config {
     // from G, which always has samples on its own row.
     bool  merge_chroma_difference = false;
 
+    // Restore commit 832f7b8's kernel path exactly, for A/B against the
+    // current one. Four things move together, because they were four separate
+    // changes and comparing them one at a time is what this exists for:
+    //
+    //  - Eq. 4's shape law reverts to the HARD THRESHOLD: isotropic below
+    //    A = 1.95, full (1/k_shrink, k_stretch) above. A > 1.95 needs
+    //    lambda2/lambda1 < 0.05, so most real edges got no anisotropy at all.
+    //  - The kernel width floor in compute_k is REMOVED. 832f7b8 had none, so
+    //    a collapsing covariance falls through merge.cpp's 1e-10 degeneracy
+    //    test to the identity fallback at sigma 1.0 px. That is the 11.3x
+    //    width cliff that draws lines along iso-gradient contours, and it is
+    //    part of what this flag faithfully restores.
+    //  - soften_inv_cov reverts to rescaling the WHOLE MATRIX by one factor
+    //    rather than clamping each eigenvalue. Measured cost: identical
+    //    across-edge sharpness, but 1.4142 px along an edge instead of 0.9889
+    //    -- 43% of pure over-smoothing on the axis that was never too sharp.
+    //  - The GAT moves back AFTER the 2x2 decimation. Variance stabilisation
+    //    belongs on the raw Poisson samples, not on their mean, so this
+    //    changes the structure tensor's noise scaling and therefore which
+    //    pixels read as edge rather than flat.
+    //
+    // Overrides selection / kernel_anisotropy_continuous while it is on.
+    // k_denoise is a user-facing slider and is NOT overridden: 832f7b8
+    // shipped 0.0, and with the floor gone that is what drives the collapse,
+    // so set it to 0.0 by hand for a true match.
+    bool  kernel_legacy_832f7b8 = false;
+
     bool  prealign_enabled    = false;
 
     // Layer 3: dense Lucas-Kanade refinement (ISA lucasKanadeOptim). Replaces

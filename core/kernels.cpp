@@ -37,7 +37,9 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         const f32 A = 1.f + std::sqrt(ratio);
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous) {
+        const bool legacy = cfg.kernel_legacy_832f7b8;
+        if (!legacy &&
+            (cfg.selection == SelectionLaw::Linear || cfg.kernel_anisotropy_continuous)) {
             // 0.5*A floors at 0.5; the zero-floor remap sends isotropic
             // content to round kernels and reaches full stretch (w=1) at
             // A=1.95, instead of stopping short at 0.975 of it -- the earlier
@@ -64,13 +66,23 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         // already wider than the floor (the SNR auto-tuned ones never come
         // near it); it only bites where the covariance would otherwise
         // collapse into merge.cpp's degeneracy fallback.
-        const f32 kmin = 1.f / std::sqrt(kMergeInvCovMax);
-        k1 = std::max(k1, kmin);
-        k2 = std::max(k2, kmin);
+        if (!legacy) {
+            const f32 kmin = 1.f / std::sqrt(kMergeInvCovMax);
+            k1 = std::max(k1, kmin);
+            k2 = std::max(k2, kmin);
+        }
     };
 
-    Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
-    Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
+    // 832f7b8 decimated first and stabilised the MEAN; the current order
+    // stabilises the raw Poisson samples, which is what a GAT is for.
+    Image grey;
+    if (cfg.kernel_legacy_832f7b8) {
+        grey = apply_gat(compute_grey_decimate(raw, cfg.bayer_mode),
+                         cfg.noise_alpha(), cfg.noise_beta());
+    } else {
+        Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
+        grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
+    }
     Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
 
     int H = grey.h, W = grey.w;

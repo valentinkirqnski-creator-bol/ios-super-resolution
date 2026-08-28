@@ -141,6 +141,28 @@ static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
     return n ? s / (f32)n : 0.f;
 }
 
+// 832f7b8's form, restored by Config::kernel_legacy_832f7b8: rescale all
+// three entries by ONE factor keyed on the largest. It bounds the sharp axis
+// (which is what the speckle guard needs) but widens the already-wide axis by
+// the same factor -- 1.4142 px along an edge where the eigenvalue clamp gives
+// 0.9889, i.e. 43% of pure blur on the axis that was never too sharp.
+static inline void soften_inv_cov_legacy(f32& ixx, f32& ixy, f32& iyy,
+                                         f32 k_max_abs) {
+    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
+    if (!(m > k_max_abs) || !std::isfinite(m)) {
+        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
+        return;
+    }
+    const f32 s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
     if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
         ixx = 2.f;
@@ -213,7 +235,7 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
                                   f32& ixx, f32& ixy, f32& iyy, bool raw_det,
-                                  f32 soften_max) {
+                                  f32 soften_max, bool legacy_soften) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -255,7 +277,8 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    soften_inv_cov(ixx, ixy, iyy, soften_max);
+    if (legacy_soften) soften_inv_cov_legacy(ixx, ixy, iyy, soften_max);
+    else               soften_inv_cov(ixx, ixy, iyy, soften_max);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -414,7 +437,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_i = lr_mov_y;
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
-                               merge_soften_max_inv(cfg));
+                               merge_soften_max_inv(cfg),
+                               cfg.kernel_legacy_832f7b8);
             }
 
             const int center_j = cuda_round_to_int(lr_mov_x);
@@ -535,7 +559,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_i = coarse_y;
                 }
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
-                               merge_soften_max_inv(cfg));
+                               merge_soften_max_inv(cfg),
+                               cfg.kernel_legacy_832f7b8);
             }
 
             // Python: center = round(coarse)

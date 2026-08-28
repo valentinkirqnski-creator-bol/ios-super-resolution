@@ -512,6 +512,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.prealign_enabled = tuning[@"prealign_enabled"].boolValue;
     if (tuning[@"merge_chroma_difference"])
         cfg.merge_chroma_difference = tuning[@"merge_chroma_difference"].boolValue;
+    if (tuning[@"kernel_legacy_832f7b8"])
+        cfg.kernel_legacy_832f7b8 = tuning[@"kernel_legacy_832f7b8"].boolValue;
     if (tuning[@"flow_dense_lk_enabled"])
         cfg.flow_dense_lk_enabled = tuning[@"flow_dense_lk_enabled"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
