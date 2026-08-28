@@ -2872,7 +2872,12 @@ struct MergeCompParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
-    float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling (was _pad3)
+    // Fail-open at the value merge_soften_max_inv() actually returns. Every
+    // dispatch assigns this (audited: the only unassigned declaration is
+    // PendingMergeComp::p, which is copied whole from a populated one), but a
+    // stale 32 here would mean a sigma floor of 0.177 px instead of 0.088 --
+    // every edge twice as soft, on one path only, with nothing to flag it.
+    float soften_max_inv = 128.f; // inv-cov eigenvalue ceiling (was _pad3)
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -2889,7 +2894,7 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
-    float soften_max_inv = 32.f;  // inv-cov eigenvalue ceiling
+    float soften_max_inv = 128.f; // inv-cov eigenvalue ceiling (see above)
 };
 static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
 
