@@ -2295,7 +2295,17 @@ final class CameraModel: NSObject, ObservableObject {
                 // LinearRaw IFD0 at all, so this preview IS the image the user
                 // sees at every zoom level. It therefore gets full resolution;
                 // 4096 here was why a 48MP capture looked soft in Photos.
-                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 32768)
+                // Same quality as the JPEG export, so the DNG's preview and a
+                // JPEG of the same burst are byte-for-byte the same render.
+                if !SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 32768,
+                                              quality: Float(quality)) {
+                    // This preview IS what Photos shows for these DNGs, so a
+                    // silent failure here leaves an asset that renders as
+                    // garbage with nothing explaining why.
+                    DispatchQueue.main.async {
+                        self.lastPipelineError = "Preview embed failed"
+                    }
+                }
             } else if format == .jpg {
                 if let jpg = Self.renderExportJPEG(fromDNG: url, quality: quality) {
                     saveURL = jpg

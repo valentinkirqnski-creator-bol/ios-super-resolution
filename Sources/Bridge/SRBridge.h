@@ -45,8 +45,13 @@ NS_ASSUME_NONNULL_BEGIN
 // on the reference frame of the first burst. Safe to call repeatedly.
 + (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height;
 
+/// Embed the DNG's displayed preview. Same renderer, same tone mapping and
+/// same JPEG quality as exportJPEGFromLinearDNG -- both go through one
+/// implementation, so the picture cannot depend on which output format was
+/// chosen. Pass the user's export quality here too.
 + (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath
-                      maxSide:(NSInteger)maxSide;
+                      maxSide:(NSInteger)maxSide
+                      quality:(float)quality;
 
 @end
 

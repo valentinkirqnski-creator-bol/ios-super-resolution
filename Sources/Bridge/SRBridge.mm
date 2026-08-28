@@ -982,10 +982,22 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     hhsr::mps_fft_prewarm((int)height, (int)width);
 }
 
-+ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
-                         toPath:(NSString *)jpgPath
-                        quality:(float)quality {
-    if (dngPath.length == 0 || jpgPath.length == 0) return NO;
+// One renderer for BOTH the exported JPEG and the DNG's embedded preview.
+//
+// These were two copies of the same twelve steps, and they had drifted: the
+// preview hard-coded quality 0.85 while the export used the user's setting
+// (default 0.92), and they built their CGImage with different bitmap layouts.
+// Same pixels, different files. Since the embedded preview IS what Photos
+// displays for these DNGs, "the JPEG" and "the preview" being different
+// renders of the same frame is a bug waiting to be re-reported, so there is
+// now one implementation and the callers only choose size and quality.
+//
+// maxSide <= 0 means full resolution. Returns nil on failure; ow/oh receive
+// the encoded dimensions.
+static NSData* RenderDNGToJPEGData(NSString* dngPath, NSInteger maxSide,
+                                   float quality, int& ow, int& oh) {
+    ow = oh = 0;
+    if (dngPath.length == 0) return nil;
     if (!(quality > 0.f) || quality > 1.f) quality = 0.92f;
     quality = std::max(0.5f, quality);
 
@@ -996,37 +1008,45 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     bool has_color = false;
     if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
-        return NO;
+        return nil;
     ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
+
+    const int long_side = std::max(W, H);
+    const float scale = (maxSide > 0 && long_side > (int)maxSide)
+        ? ((float)maxSide / (float)long_side) : 1.f;
+    ow = std::max(1, (int)std::lround(W * scale));
+    oh = std::max(1, (int)std::lround(H * scale));
 
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
+    // Always at FULL resolution even when the output is downscaled, so a
+    // downscaled preview and a full-size export cannot disagree about how the
+    // shot looks.
     hhsr::IspState isp;
     const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
-    // Row-parallel: 48MP through a scalar loop on one core was the difference
-    // between a JPEG appearing at once and taking seconds. Rows are independent
-    // -- the gain map is read-only by now -- so this needs no synchronisation.
     // RGB, not RGBA. The alpha byte was 255 everywhere and JPEG has no use for
     // it, so at 48MP it cost 48MB of allocation and a quarter of the store
     // traffic for nothing.
-    std::vector<uint8_t> srgb((size_t)W * (size_t)H * 3);
-    hhsr::parallel_rows(H, 0, [&](int y) {
-        const size_t row = (size_t)y * (size_t)W;
-        for (int x = 0; x < W; ++x) {
-            const size_t i = row + (size_t)x;
+    std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 3);
+    hhsr::parallel_rows(oh, 0, [&](int y) {
+        const int sy = (scale < 1.f)
+            ? std::max(0, std::min(H - 1, (int)((y + 0.5f) / scale))) : y;
+        for (int x = 0; x < ow; ++x) {
+            const int sx = (scale < 1.f)
+                ? std::max(0, std::min(W - 1, (int)((x + 0.5f) / scale))) : x;
+            const size_t i = (size_t)sy * (size_t)W + (size_t)sx;
             float r = rgb[i * 3 + 0] * (1.f / 65535.f);
             float g = rgb[i * 3 + 1] * (1.f / 65535.f);
             float b = rgb[i * 3 + 2] * (1.f / 65535.f);
             float sr, sg, sb;
-            if (use_isp)
-                hhsr::isp_render(isp, r, g, b, x, y, sr, sg, sb);
-            else
-                render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-            srgb[i * 3 + 0] = (uint8_t)std::lround(sr * 255.f);
-            srgb[i * 3 + 1] = (uint8_t)std::lround(sg * 255.f);
-            srgb[i * 3 + 2] = (uint8_t)std::lround(sb * 255.f);
+            if (use_isp) hhsr::isp_render(isp, r, g, b, sx, sy, sr, sg, sb);
+            else         render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+            const size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 3;
+            srgb[o + 0] = (uint8_t)std::lround(sr * 255.f);
+            srgb[o + 1] = (uint8_t)std::lround(sg * 255.f);
+            srgb[o + 2] = (uint8_t)std::lround(sb * 255.f);
         }
     });
     rgb.clear();
@@ -1034,132 +1054,62 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!cs) cs = CGColorSpaceCreateDeviceRGB();
-    if (!cs) return NO;
+    if (!cs) return nil;
     NSData* data = [NSData dataWithBytes:srgb.data() length:srgb.size()];
     srgb.clear();
     srgb.shrink_to_fit();
 
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
     CGImageRef cgOut = CGImageCreate(
-        W, H, 8, 24, W * 3, cs,
+        ow, oh, 8, 24, (size_t)ow * 3, cs,
         kCGBitmapByteOrderDefault | kCGImageAlphaNone,
         provider, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(cs);
-    if (!cgOut) return NO;
-
-    NSURL* url = [NSURL fileURLWithPath:jpgPath];
-    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
-        (__bridge CFURLRef)url, CFSTR("public.jpeg"), 1, NULL);
-    if (!dest) {
-        CGImageRelease(cgOut);
-        return NO;
-    }
-    // Default 0.92: keeps 4:4:4 chroma (ImageIO drops to 4:2:0 below ~0.90)
-    // at ~15MB for 48MP. This was a hard-coded 0.82 to halve the file, but the
-    // 4:2:0 chroma plus the quantisation read as visibly soft on fine colour
-    // detail -- the deliverable is the photograph, so it gets the quality and
-    // the megabytes, and the setting is now the user's.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @(quality)};
-    CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
-    BOOL ok = CGImageDestinationFinalize(dest);
-    CFRelease(dest);
-    CGImageRelease(cgOut);
-    return ok;
-}
-
-+ (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath maxSide:(NSInteger)maxSide {
-    if (dngPath.length == 0) return NO;
-    if (maxSide < 256) maxSide = 256;
-
-    std::vector<uint16_t> rgb;
-    int W = 0, H = 0;
-    float wb[3] = {1.f, 1.f, 1.f};
-    float m[9] = {1,0,0, 0,1,0, 0,0,1};
-    bool has_color = false;
-    if (!AcquireRenderPixels(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
-        W <= 0 || H <= 0)
-        return NO;
-    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
-
-    const int long_side = std::max(W, H);
-    const float scale = (long_side > (int)maxSide)
-        ? ((float)maxSide / (float)long_side) : 1.f;
-    const int ow = std::max(1, (int)std::lround(W * scale));
-    const int oh = std::max(1, (int)std::lround(H * scale));
-
-    // Analysed at full resolution even though the preview is downscaled, so the
-    // thumbnail and the exported JPEG get the same exposure and gain map and
-    // cannot disagree about how the shot looks.
-    hhsr::IspState isp;
-    const bool use_isp = g_isp.enabled &&
-                         hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
-
-    std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
-    auto sample_tonemap = [&](int sx, int sy, float& sr, float& sg, float& sb) {
-        sx = std::max(0, std::min(W - 1, sx));
-        sy = std::max(0, std::min(H - 1, sy));
-        size_t i = (size_t)sy * (size_t)W + (size_t)sx;
-        float r = rgb[i * 3 + 0] * (1.f / 65535.f);
-        float g = rgb[i * 3 + 1] * (1.f / 65535.f);
-        float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        if (use_isp) hhsr::isp_render(isp, r, g, b, sx, sy, sr, sg, sb);
-        else         render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-    };
-
-    hhsr::parallel_rows(oh, 0, [&](int y) {
-        int sy = (scale < 1.f) ? (int)((y + 0.5f) / scale) : y;
-        for (int x = 0; x < ow; ++x) {
-            int sx = (scale < 1.f) ? (int)((x + 0.5f) / scale) : x;
-            float sr, sg, sb;
-            sample_tonemap(sx, sy, sr, sg, sb);
-            size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 4;
-            srgb[o + 0] = (uint8_t)std::lround(sr * 255.f);
-            srgb[o + 1] = (uint8_t)std::lround(sg * 255.f);
-            srgb[o + 2] = (uint8_t)std::lround(sb * 255.f);
-            srgb[o + 3] = 255;
-        }
-    });
-    rgb.clear();
-    rgb.shrink_to_fit();
-
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
-    if (!cs) return NO;
-    NSData* data = [NSData dataWithBytes:srgb.data() length:srgb.size()];
-    srgb.clear();
-    srgb.shrink_to_fit();
-
-    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-    CGImageRef cgOut = CGImageCreate(
-        ow, oh, 8, 32, ow * 4, cs,
-        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast,
-        provider, NULL, false, kCGRenderingIntentDefault);
-    CGDataProviderRelease(provider);
-    CGColorSpaceRelease(cs);
-    if (!cgOut) return NO;
+    if (!cgOut) return nil;
 
     NSMutableData* jpegData = [NSMutableData data];
     CGImageDestinationRef dest = CGImageDestinationCreateWithData(
         (__bridge CFMutableDataRef)jpegData, CFSTR("public.jpeg"), 1, NULL);
-    if (!dest) {
-        CGImageRelease(cgOut);
-        return NO;
-    }
+    if (!dest) { CGImageRelease(cgOut); return nil; }
+    // 0.92 default: keeps 4:4:4 chroma (ImageIO drops to 4:2:0 below ~0.90).
+    // The preview used to be pinned at 0.85 and therefore chroma-subsampled
+    // where the exported JPEG was not -- the single most visible way the two
+    // differed.
+    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @(quality)};
+    CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
+    const BOOL enc_ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CGImageRelease(cgOut);
+    if (!enc_ok || jpegData.length < 4) return nil;
+    return jpegData;
+}
+
++ (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
+                         toPath:(NSString *)jpgPath
+                        quality:(float)quality {
+    if (jpgPath.length == 0) return NO;
+    int ow = 0, oh = 0;
+    NSData* jpeg = RenderDNGToJPEGData(dngPath, 0, quality, ow, oh);
+    if (!jpeg) return NO;
+    return [jpeg writeToFile:jpgPath atomically:YES] ? YES : NO;
+}
+
++ (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath
+                      maxSide:(NSInteger)maxSide
+                      quality:(float)quality {
+    if (dngPath.length == 0) return NO;
+    if (maxSide < 256) maxSide = 256;
+    int ow = 0, oh = 0;
     // The embedded preview is what Photos actually DISPLAYS for these DNGs
     // (ImageIO cannot decode the Deflate LinearRaw IFD0), so it is not just a
     // thumbnail source -- at full size it is the picture the user sees when
-    // they zoom. 0.85 with the full-resolution maxSide the app now passes.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.85};
-    CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
-    BOOL enc_ok = CGImageDestinationFinalize(dest);
-    CFRelease(dest);
-    CGImageRelease(cgOut);
-    if (!enc_ok || jpegData.length < 4) return NO;
-
+    // they zoom, and it gets the same quality as the exported JPEG.
+    NSData* jpeg = RenderDNGToJPEGData(dngPath, maxSide, quality, ow, oh);
+    if (!jpeg) return NO;
     return embed_dng_jpeg_preview(std::string(dngPath.UTF8String),
-                                  (const uint8_t*)jpegData.bytes,
-                                  (size_t)jpegData.length,
+                                  (const uint8_t*)jpeg.bytes,
+                                  (size_t)jpeg.length,
                                   ow, oh) ? YES : NO;
 }
 
