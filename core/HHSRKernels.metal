@@ -913,6 +913,7 @@ struct MergeCompParams {
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
     float soften_max_inv; // inverse-covariance eigenvalue ceiling (was _pad3)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
 };
 
 struct MergeRefParams {
@@ -943,7 +944,8 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
-    float soften_max_inv; // inverse-covariance eigenvalue ceiling (100 bytes)
+    float soften_max_inv; // inverse-covariance eigenvalue ceiling
+    uint chroma_diff;     // 1 = accumulate R-G / B-G (104 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -1053,6 +1055,30 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
         }
     }
     soften_inv_cov(ixx, ixy, iyy, soften_max);
+}
+
+// Twin of bayer_green_at in merge.cpp: directional (Hamilton-Adams) green at
+// a red/blue CFA site. Average along the SMOOTHER axis only -- a flat
+// 4-neighbour mean straddles an edge exactly the way the isotropic coverage
+// floor does, which is the failure this path exists to remove.
+inline float bayer_green_at(device const float* img, uint w, uint h, int i, int j) {
+    const bool up = i > 0, dn = uint(i + 1) < h, lf = j > 0, rt = uint(j + 1) < w;
+    if (up && dn && lf && rt) {
+        const float gu = img[uint(i - 1) * w + uint(j)];
+        const float gd = img[uint(i + 1) * w + uint(j)];
+        const float gl = img[uint(i) * w + uint(j - 1)];
+        const float gr = img[uint(i) * w + uint(j + 1)];
+        const float dv = fabs(gu - gd), dh = fabs(gl - gr);
+        if (dh < dv) return 0.5f * (gl + gr);
+        if (dv < dh) return 0.5f * (gu + gd);
+        return 0.25f * (gu + gd + gl + gr);
+    }
+    float sm = 0.f; int n = 0;
+    if (up) { sm += img[uint(i - 1) * w + uint(j)]; ++n; }
+    if (dn) { sm += img[uint(i + 1) * w + uint(j)]; ++n; }
+    if (lf) { sm += img[uint(i) * w + uint(j - 1)]; ++n; }
+    if (rt) { sm += img[uint(i) * w + uint(j + 1)]; ++n; }
+    return n ? sm / float(n) : 0.f;
 }
 
 inline int cfa_channel(constant MergeCompParams& p, int i, int j) {
@@ -1240,6 +1266,8 @@ static inline void merge_comp_contrib_flowed(device const float* img,
 
             int channel = cfa_channel(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
+            if (p.chroma_diff != 0u && channel != 1)
+                c -= bayer_green_at(img, p.lr_w, p.lr_h, i, j);
             float dist_x = float(j) - lr_mov_x;
             float dist_y = float(i) - lr_mov_y;
             float z;
@@ -1561,6 +1589,8 @@ inline void merge_accumulate_ref_body(device AccT* num,
 
             int channel = cfa_channel_ref(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
+            if (p.chroma_diff != 0u && channel != 1)
+                c -= bayer_green_at(img, p.lr_w, p.lr_h, i, j);
             float dist_x = float(j) - coarse_x;
             float dist_y = float(i) - coarse_y;
             float y;
@@ -1594,6 +1624,15 @@ inline void merge_accumulate_ref_body(device AccT* num,
         if (p.nch >= 1) { num[base + 0] = AccT(float(num[base + 0]) + val0); den[base + 0] = AccT(float(den[base + 0]) + acc0); }
         if (p.nch >= 2) { num[base + 1] = AccT(float(num[base + 1]) + val1); den[base + 1] = AccT(float(den[base + 1]) + acc1); }
         if (p.nch >= 3) { num[base + 2] = AccT(float(num[base + 2]) + val2); den[base + 2] = AccT(float(den[base + 2]) + acc2); }
+    }
+    // Twin of the un-differencing in merge_ref_band: R = G + (R-G) means
+    // num_R += G * den_R. Last write to this output pixel -- comparison
+    // frames accumulated before the reference, which visits each pixel once.
+    if (p.chroma_diff != 0u && p.nch >= 3) {
+        const float dG = float(den[base + 1]);
+        const float G = (dG > 0.f) ? float(num[base + 1]) / dG : 0.f;
+        num[base + 0] = AccT(float(num[base + 0]) + G * float(den[base + 0]));
+        num[base + 2] = AccT(float(num[base + 2]) + G * float(den[base + 2]));
     }
 }
 

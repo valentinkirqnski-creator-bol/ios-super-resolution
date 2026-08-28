@@ -102,6 +102,41 @@ static inline f32 merge_soften_max_inv(const Config& cfg) {
     return 128.f;
 }
 
+// Local green at a red or blue CFA site. In every Bayer phase the four
+// orthogonal neighbours of a non-green site are green: they flip exactly one
+// parity bit, and the CFA table maps both single-flips to index 1.
+//
+// DIRECTIONAL, not a plain 4-neighbour mean (Hamilton-Adams). Averaging all
+// four straddles an edge exactly the way the isotropic coverage floor does --
+// the very failure this whole path exists to remove, reproduced one level
+// down. Measured on a grey step edge, the flat mean left 65.5 levels of
+// colour where the directional pick leaves far less. Compare the variation
+// along each axis and average only along the smoother one, which at a
+// horizontal edge is the pair sharing the sample's own row: both on the same
+// side of the edge, so the difference stays a true chroma difference.
+//
+// Ties and borders fall back to whatever neighbours exist. The estimate blurs
+// G, which does not matter: it is only ever used to form the DIFFERENCE, and
+// the sharp G is added back afterwards, so it never reaches the output's luma.
+static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
+    const bool up = i > 0, dn = i + 1 < h, lf = j > 0, rt = j + 1 < w;
+    if (up && dn && lf && rt) {
+        const f32 gu = img.at(i - 1, j), gd = img.at(i + 1, j);
+        const f32 gl = img.at(i, j - 1), gr = img.at(i, j + 1);
+        const f32 dv = std::fabs(gu - gd), dh = std::fabs(gl - gr);
+        if (dh < dv) return 0.5f * (gl + gr);
+        if (dv < dh) return 0.5f * (gu + gd);
+        return 0.25f * (gu + gd + gl + gr);
+    }
+    f32 s = 0.f;
+    int n = 0;
+    if (up) { s += img.at(i - 1, j); ++n; }
+    if (dn) { s += img.at(i + 1, j); ++n; }
+    if (lf) { s += img.at(i, j - 1); ++n; }
+    if (rt) { s += img.at(i, j + 1); ++n; }
+    return n ? s / (f32)n : 0.f;
+}
+
 static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
     if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
         ixx = 2.f;
@@ -230,6 +265,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     const bool iso = (cfg.kernel == KernelShape::Iso);
     const f32 scale = cfg.scale;
     const bool fastw = cfg.merge_fast_weights;
+    const bool chroma_diff = cfg.merge_chroma_difference && cfg.bayer_mode;
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -387,7 +423,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     if (!(j >= 0 && j < lr_w && i >= 0 && i < lr_h)) continue;
 
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
-                    const f32 c = img.at(i, j);
+                    f32 c = img.at(i, j);
+                    // Green is index 1 in every CFA phase (the table stores
+                    // the colour, not the position).
+                    if (chroma_diff && channel != 1)
+                        c -= bayer_green_at(img, i, j, lr_h, lr_w);
 
                     const f32 dist_x = (f32)j - lr_mov_x;
                     const f32 dist_y = (f32)i - lr_mov_y;
@@ -417,6 +457,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     // See the coverage-floor comment in the tap loop below. Always active
     // now that the ceiling is 128 in every mode.
     const f32 cover_eps = (merge_soften_max_inv(cfg) > 64.f) ? 5e-4f : 0.f;
+    const bool chroma_diff = cfg.merge_chroma_difference && cfg.bayer_mode;
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
     const int nch = cfg.bayer_mode ? 3 : 1;
@@ -496,7 +537,9 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     if (!(j >= 0 && j < lr_w && i >= 0 && i < lr_h)) continue;
 
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
-                    const f32 c = img.at(i, j);
+                    f32 c = img.at(i, j);
+                    if (chroma_diff && channel != 1)
+                        c -= bayer_green_at(img, i, j, lr_h, lr_w);
 
                     const f32 dist_x = (f32)j - coarse_x;
                     const f32 dist_y = (f32)i - coarse_y;
@@ -542,6 +585,19 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     num.at(local_i, hr_j, ch) += val[ch];
                     den.at(local_i, hr_j, ch) += acc[ch];
                 }
+            }
+
+            // Chroma back to colour, in place, so no consumer of num/den has
+            // to know this happened -- including the GPU normalize kernel.
+            // R = G + (R-G) means num_R/den_R must become G + num_R/den_R,
+            // i.e. num_R += G * den_R. This is the last write to this output
+            // pixel: comparison frames accumulated before the reference, and
+            // the reference visits each pixel exactly once.
+            if (chroma_diff && nch >= 3) {
+                const f32 dG = den.at(local_i, hr_j, 1);
+                const f32 G = (dG > 0.f) ? num.at(local_i, hr_j, 1) / dG : 0.f;
+                num.at(local_i, hr_j, 0) += G * den.at(local_i, hr_j, 0);
+                num.at(local_i, hr_j, 2) += G * den.at(local_i, hr_j, 2);
             }
         }
     });

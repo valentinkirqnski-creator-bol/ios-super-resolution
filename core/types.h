@@ -721,6 +721,28 @@ struct Config {
     //
     // Off by default: it changes every frame's alignment, so it is opt-in
     // until measured against the current path on a real burst.
+    // Chroma-difference reconstruction. Accumulate R-G and B-G in the R and B
+    // accumulators instead of R and B, then add the reconstructed G back at
+    // the end of the reference pass.
+    //
+    // Fixes the coloured fringing along edges. The merge shares one Omega
+    // across all three channels, but R and B sit on a 2 px CFA lattice while
+    // the across-edge sigma is 0.128 px (auto-tuned) or 0.0625 px (the
+    // paper's) -- 15x to 32x finer. At a strong edge every same-channel
+    // sample for one colour falls outside the z > 16 cutoff, so that channel's
+    // real-kernel denominator is EXACTLY zero and it is reconstructed entirely
+    // by the isotropic sigma=1 coverage floor, which averages across the edge,
+    // while the channels the kernel still reaches stay sharp and oriented.
+    // Two different reconstructions at one pixel is the fringe.
+    //
+    // Wronski hides this by merging many frames whose random sub-pixel offsets
+    // fill the coverage temporally; it reappears wherever few frames survive
+    // robustness. Differencing removes it outright: R-G is smooth ACROSS an
+    // edge even when R and G separately are not, so reconstructing it from a
+    // straddling floor costs almost nothing, and all the edge structure comes
+    // from G, which always has samples on its own row.
+    bool  merge_chroma_difference = false;
+
     bool  prealign_enabled    = false;
 
     // Layer 3: dense Lucas-Kanade refinement (ISA lucasKanadeOptim). Replaces

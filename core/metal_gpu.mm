@@ -2878,8 +2878,9 @@ struct MergeCompParamsCPU {
     // stale 32 here would mean a sigma floor of 0.177 px instead of 0.088 --
     // every edge twice as soft, on one path only, with nothing to flag it.
     float soften_max_inv = 128.f; // inv-cov eigenvalue ceiling (was _pad3)
+    uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
 };
-static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 100, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -2895,8 +2896,9 @@ struct MergeRefParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     float soften_max_inv = 128.f; // inv-cov eigenvalue ceiling (see above)
+    uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
 };
-static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 104, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3707,6 +3709,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     // Same mode split as merge_soften_max_inv in merge.cpp (128 = coverage
     // bound: sharper floors zero the off-site colour channels -> speckle).
     p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3808,6 +3811,7 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
     p.soften_max_inv = 128.f;  // both modes -- see merge_soften_max_inv
+    p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];
