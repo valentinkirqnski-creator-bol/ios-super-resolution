@@ -769,13 +769,6 @@ struct CameraView: View {
              Bilinear flow sampling is right where motion is smooth but wrong at object              boundaries: it blends two different motions into flow that belongs to neither              side, exactly where robustness then rejects and detail is lost. This builds a              half-tile-pitch refinement after alignment: cells whose four surrounding tile              vectors agree keep the bilinear blend (smooth regions reproduce the coarse              sampling to within the flow field's own curvature -- exact for locally linear              motion, error far below the tile staircase this fixes), while cells at              a disagreement over 1 raw px get whichever single tile vector best explains              the alignment guide there. Mask and merge consume the same refined field, so              they stay in lockstep. Requires Smooth Tile Flow.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Legacy Kernels (832f7b8)", isOn: $cam.tuningParams.kernel_legacy_832f7b8)
-        Text("""
-             Restores commit 832f7b8's kernel path exactly, for A/B. Four things move              together: Eq. 4's shape reverts to the HARD THRESHOLD (isotropic below A = 1.95,              full stretch above -- and A > 1.95 needs lambda2/lambda1 < 0.05, so most real              edges got no anisotropy at all); the kernel width floor is REMOVED; soften              reverts to rescaling the whole matrix by one factor; and the GAT moves back              after the 2x2 decimation.
-             Measured on a clean edge at SNR-tuned settings: across-edge sigma is identical              (0.1768 both), but along-edge goes 0.9889 -> 1.4142, so edges are 43% softer              ALONG themselves. Removing the floor also restores the 11.3x width cliff that              draws lines along iso-gradient contours when k_denoise is 0.
-             Overrides the selection law and the anisotropy switches while on. k_denoise is              NOT overridden -- 832f7b8 shipped 0.0, so set that by hand for a true match.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Chroma-Difference Merge", isOn: $cam.tuningParams.merge_chroma_difference)
         Text("""
              Fixes the coloured fringes along edges. The merge shares ONE kernel across all              three channels, but R and B sit on a 2 px CFA lattice while the across-edge sigma              is 0.128 px -- 15x finer. At a strong edge every same-channel sample for one              colour falls outside the weight cutoff, so that channel's real denominator is              EXACTLY zero and it is rebuilt entirely by the isotropic coverage floor, which              averages ACROSS the edge, while the channels the kernel still reaches stay sharp              and oriented. Two different reconstructions at one pixel is the fringe.
@@ -821,28 +814,6 @@ struct CameraView: View {
         Toggle("fp16 Merge Accumulator", isOn: $cam.tuningParams.merge_fp16_accumulator)
         Text("""
              Stores the online merge accumulator as 16-bit floats instead of 32-bit.              All arithmetic stays float32 in the kernels; only what lands in memory              narrows. At 2x output this halves the pipeline's single largest allocation              (1116 -> 558 MB) and the merge's dominant memory traffic, which it is              bandwidth-bound on. The cost is storage quantisation of about 0.05%              relative per store -- roughly 1-2 LSB of the 16-bit output. Turn off to              restore bit-exact fp32 accumulation at the old memory and speed.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Zero-Floor Kernel Stretch", isOn: $cam.tuningParams.kernel_anisotropy_zero_floor)
-        HStack {
-            Text("Stretch Selectivity")
-            Slider(value: $cam.tuningParams.kernel_stretch_gamma, in: 1.0...4.0, step: 0.25)
-            Text(String(format: "%.2f", cam.tuningParams.kernel_stretch_gamma))
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.secondary)
-        }
-        Text("Exponent on the stretch weight. 1.0 = plain zero-floor law. 2.0 (default) reproduces the readable-text stretch (~2:1 at text-like coherence) measured by hand-tuning k_stretch to 2, while clean single-orientation edges keep ~95% of full k_stretch. Raise further to confine elongation to only the most coherent edges.")
-            .font(.footnote)
-            .foregroundColor(.secondary)
-        Text("""
-             The merge kernel's stretch weight was 0.5*A with A never below 1 -- so even              near-isotropic detail in high-contrast areas was elongated at least              2.5:0.75 along whichever direction the tiny 2x2 structure-tensor window              happened to prefer. Distant text is the worst case: 1-2px multi-oriented              strokes give moderate coherence with a noise orientation, and the resulting              3-6:1 kernels smear glyphs unreadable or double their strokes (which looks              like misalignment). This remaps the weight to reach ZERO for isotropic              content while keeping the exact same stretch at the old A=1.95 threshold --              clean single-orientation edges keep their full elongation.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Continuous Kernel Anisotropy", isOn: $cam.tuningParams.kernel_anisotropy_continuous)
-        Text("""
-             Merge kernels are stretched ALONG edges so that a sample slightly off the              ideal position still lands inside the kernel -- Section 5.1.1 gives this the              job of increasing "tolerance for small misalignments and uneven coverage              around edges". Wronski drives the amount of stretch continuously from the              structure tensor; the reference implementation instead switched to the full              8:1 stretch only above anisotropy 0.9025 and used a perfectly ROUND kernel              below it.
-             That penalises text most. A letter puts strokes at several orientations              inside one 3x3 window, so its structure tensor measures as nearly isotropic              -- around 0.6 -- even though it is all edges. Under the switch it fell below              the threshold and got a round 0.177 px kernel, while a long straight edge              beside it got 8:1. At 2x output that round kernel only accepts samples              within about a third of a raw pixel, so coverage along the strokes is sparse              and uneven, which reads as smeared letters.
-             Continuous gives anisotropy 0.6 a 4.8:1 kernel instead of 1:1: still sharp              ACROSS the stroke, but covering along it. Both endpoints are unchanged --              isotropic content stays round, a perfect edge still gets the full 8:1 --              only the middle is filled in, and the middle is where text lives.
              """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)

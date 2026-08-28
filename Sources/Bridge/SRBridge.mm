@@ -433,12 +433,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;
-    if (tuning[@"kernel_anisotropy_continuous"])
-        cfg.kernel_anisotropy_continuous = tuning[@"kernel_anisotropy_continuous"].boolValue;
-    if (tuning[@"kernel_anisotropy_zero_floor"])
-        cfg.kernel_anisotropy_zero_floor = tuning[@"kernel_anisotropy_zero_floor"].boolValue;
-    if (tuning[@"kernel_stretch_gamma"])
-        cfg.kernel_stretch_gamma = tuning[@"kernel_stretch_gamma"].floatValue;
     if (tuning[@"merge_fp16_accumulator"])
         cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
     if (tuning[@"merge_fast_weights"])
@@ -512,8 +506,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.prealign_enabled = tuning[@"prealign_enabled"].boolValue;
     if (tuning[@"merge_chroma_difference"])
         cfg.merge_chroma_difference = tuning[@"merge_chroma_difference"].boolValue;
-    if (tuning[@"kernel_legacy_832f7b8"])
-        cfg.kernel_legacy_832f7b8 = tuning[@"kernel_legacy_832f7b8"].boolValue;
     if (tuning[@"flow_dense_lk_enabled"])
         cfg.flow_dense_lk_enabled = tuning[@"flow_dense_lk_enabled"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])

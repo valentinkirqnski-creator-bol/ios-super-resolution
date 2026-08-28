@@ -98,14 +98,11 @@ struct TuningParams: Equatable, Codable {
     var k_stretch: Float = 4.0
     /// Drive the merge kernel's anisotropy continuously from the structure
     /// tensor rather than switching to the full stretch only above 0.9025.
-    var kernel_anisotropy_continuous: Bool = true
     /// Zero-floor the anisotropy law: isotropic detail gets round kernels
     /// instead of a minimum 2.5:0.75 stretch along a noise orientation.
     /// OFF = python-z's `linear` law exactly (w = A/2). See core/types.h.
-    var kernel_anisotropy_zero_floor: Bool = false
     /// Exponent on the stretch weight: higher concentrates elongation onto
     /// genuinely coherent edges. 2.0 was fitted to the distant-text finding.
-    var kernel_stretch_gamma: Float = 1.0
     /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
     /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
     var merge_fp16_accumulator: Bool = true
@@ -196,9 +193,6 @@ struct TuningParams: Equatable, Codable {
     /// Accumulate R-G and B-G instead of R and B, adding the reconstructed
     /// green back at the end. Removes the coloured fringing along edges.
     var merge_chroma_difference: Bool = false
-    /// Restore commit 832f7b8's kernel path exactly: hard-threshold Eq. 4
-    /// shape, no width floor, whole-matrix soften, GAT after decimation.
-    var kernel_legacy_832f7b8: Bool = false
     /// Re-estimate the flow densely, one Lucas-Kanade solve per lattice cell
     /// at the finest pitch that fits the buffer budget, instead of the
     /// half-pitch blend-or-select densify. ImageStackAlignator's
@@ -258,9 +252,6 @@ struct TuningParams: Equatable, Codable {
         case d_thresh_manual, d_th, d_tr
         case burst_fast_shutter
         case dng_lossless_jpeg
-        case kernel_anisotropy_continuous
-        case kernel_anisotropy_zero_floor
-        case kernel_stretch_gamma
         case merge_fp16_accumulator
         case merge_fast_weights
         case dng_store_unwhitened
@@ -281,7 +272,6 @@ struct TuningParams: Equatable, Codable {
         case flow_bilinear_sampling
         case prealign_enabled
         case merge_chroma_difference
-        case kernel_legacy_832f7b8
         case flow_dense_lk_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -311,9 +301,6 @@ struct TuningParams: Equatable, Codable {
         dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
         d_th = try c.decodeIfPresent(Float.self, forKey: .d_th) ?? d_th
         d_tr = try c.decodeIfPresent(Float.self, forKey: .d_tr) ?? d_tr
-        kernel_anisotropy_continuous = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_continuous) ?? kernel_anisotropy_continuous
-        kernel_anisotropy_zero_floor = try c.decodeIfPresent(Bool.self, forKey: .kernel_anisotropy_zero_floor) ?? kernel_anisotropy_zero_floor
-        kernel_stretch_gamma = try c.decodeIfPresent(Float.self, forKey: .kernel_stretch_gamma) ?? kernel_stretch_gamma
         merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         merge_fast_weights = try c.decodeIfPresent(Bool.self, forKey: .merge_fast_weights) ?? merge_fast_weights
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
@@ -355,7 +342,6 @@ struct TuningParams: Equatable, Codable {
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_enabled) ?? prealign_enabled
         merge_chroma_difference = try c.decodeIfPresent(Bool.self, forKey: .merge_chroma_difference) ?? merge_chroma_difference
-        kernel_legacy_832f7b8 = try c.decodeIfPresent(Bool.self, forKey: .kernel_legacy_832f7b8) ?? kernel_legacy_832f7b8
         flow_dense_lk_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_dense_lk_enabled) ?? flow_dense_lk_enabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -2097,9 +2083,6 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
-            "kernel_anisotropy_continuous": NSNumber(value: tuningParams.kernel_anisotropy_continuous),
-            "kernel_anisotropy_zero_floor": NSNumber(value: tuningParams.kernel_anisotropy_zero_floor),
-            "kernel_stretch_gamma": NSNumber(value: tuningParams.kernel_stretch_gamma),
             "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "merge_fast_weights": NSNumber(value: tuningParams.merge_fast_weights),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
@@ -2144,7 +2127,6 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "prealign_enabled": NSNumber(value: tuningParams.prealign_enabled),
             "merge_chroma_difference": NSNumber(value: tuningParams.merge_chroma_difference),
-            "kernel_legacy_832f7b8": NSNumber(value: tuningParams.kernel_legacy_832f7b8),
             "flow_dense_lk_enabled": NSNumber(value: tuningParams.flow_dense_lk_enabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),

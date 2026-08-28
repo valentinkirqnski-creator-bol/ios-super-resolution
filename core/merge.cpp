@@ -71,63 +71,10 @@ static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
     return std::min(std::max(r, 1), std::max(1, rad_max));
 }
 
-// Guard against singular/near-singular covariance inversions producing
-// infinitely sharp kernels. That can leave R/B denominators at zero while G
-// receives weight, showing up as green or black speckles.
-//
-// A kernel this sharp contributes weight to essentially one raw sample. Under
-// a Bayer CFA that sample belongs to one channel, so the other two accumulate
-// nothing at that output pixel and their denominators stay at zero -- hence
-// the speckle rather than a general softness. Clamping the largest magnitude
-// to k_max_abs bounds the kernel's minimum width instead of rejecting the
-// tile, so the sample still contributes, just over more than one pixel.
-//
-// Keep in step with the Metal twin in HHSRKernels.metal and the mirror in
-// tools/validate_merge_equiv.py: all three are compared against each other.
-// The ceiling is mode-dependent, and its upper bound is set by COVERAGE, not
-// by taste: the fast-weights tap cutoff (z > 16 = beyond 4 sigma) and the
-// fp16 accumulator both need the sharpest kernel to still reach the nearest
-// same-color sample, which sits at ~0.2-0.4 px across an 8-frame Bayer
-// merge. 512 (sigma floor 0.044 px) violated that -- every off-site colour
-// channel lost all its taps and the denominator zeroed, which is exactly the
-// green/black per-channel speckle the guard exists to prevent. 128 floors
-// sigma at 0.088 px: z at 0.35 px is ~15.8 (inside the cutoff), the weight
-// ~4e-4 (fp16-safe), and the resolution cost vs 0.044 px is 97% vs 98%
-// contrast at 1 px strokes -- nothing, for artifact-free coverage.
-//
-// BOTH modes now use 32 (sigma floor 0.1768 px) -- see kMergeInvCovMax in
-// types.h for why it moved back off 128. The trade is explicit: 460-main and
-// python-z have NO width floor, so at k_detail 0.17 their across-edge kernels
-// run at 0.085 px while ours are held at 0.1768, roughly 2x softer at
-// identical settings. That is the cost of not needing a long burst to give
-// every colour channel a surviving tap.
-//
-// The reference-pass coverage floor used to be keyed on this value being
-// > 64, which would have switched it off at 32 and turned the red channel's
-// empty rows from a colour fringe into a black hole. It is unconditional now;
-// see the cover_eps comment below. Run with merge_chroma_difference on, which
-// fixes the underlying coverage problem rather than papering over it.
-static inline f32 merge_soften_max_inv(const Config& cfg) {
-    (void)cfg;
-    return kMergeInvCovMax;
-}
-
-// Local green at a red or blue CFA site. In every Bayer phase the four
-// orthogonal neighbours of a non-green site are green: they flip exactly one
-// parity bit, and the CFA table maps both single-flips to index 1.
-//
-// DIRECTIONAL, not a plain 4-neighbour mean (Hamilton-Adams). Averaging all
-// four straddles an edge exactly the way the isotropic coverage floor does --
-// the very failure this whole path exists to remove, reproduced one level
-// down. Measured on a grey step edge, the flat mean left 65.5 levels of
-// colour where the directional pick leaves far less. Compare the variation
-// along each axis and average only along the smoother one, which at a
-// horizontal edge is the pair sharing the sample's own row: both on the same
-// side of the edge, so the difference stays a true chroma difference.
-//
-// Ties and borders fall back to whatever neighbours exist. The estimate blurs
-// G, which does not matter: it is only ever used to form the DIFFERENCE, and
-// the sharp G is added back afterwards, so it never reaches the output's luma.
+// Local green at a red or blue CFA site, directional (Hamilton-Adams):
+// average along the SMOOTHER axis only, since a flat 4-neighbour mean
+// straddles an edge. Used only to form the chroma difference; the sharp green
+// is added back afterwards, so the blur never reaches the output's luma.
 static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
     const bool up = i > 0, dn = i + 1 < h, lf = j > 0, rt = j + 1 < w;
     if (up && dn && lf && rt) {
@@ -138,83 +85,19 @@ static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
         if (dv < dh) return 0.5f * (gu + gd);
         return 0.25f * (gu + gd + gl + gr);
     }
-    f32 s = 0.f;
+    f32 sm = 0.f;
     int n = 0;
-    if (up) { s += img.at(i - 1, j); ++n; }
-    if (dn) { s += img.at(i + 1, j); ++n; }
-    if (lf) { s += img.at(i, j - 1); ++n; }
-    if (rt) { s += img.at(i, j + 1); ++n; }
-    return n ? s / (f32)n : 0.f;
+    if (up) { sm += img.at(i - 1, j); ++n; }
+    if (dn) { sm += img.at(i + 1, j); ++n; }
+    if (lf) { sm += img.at(i, j - 1); ++n; }
+    if (rt) { sm += img.at(i, j + 1); ++n; }
+    return n ? sm / (f32)n : 0.f;
 }
 
-// 832f7b8's form, restored by Config::kernel_legacy_832f7b8: rescale all
-// three entries by ONE factor keyed on the largest. It bounds the sharp axis
-// (which is what the speckle guard needs) but widens the already-wide axis by
-// the same factor -- 1.4142 px along an edge where the eigenvalue clamp gives
-// 0.9889, i.e. 43% of pure blur on the axis that was never too sharp.
-static inline void soften_inv_cov_legacy(f32& ixx, f32& ixy, f32& iyy,
-                                         f32 k_max_abs) {
-    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
-    if (!(m > k_max_abs) || !std::isfinite(m)) {
-        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-            ixx = 2.f;
-            ixy = 0.f;
-            iyy = 2.f;
-        }
-        return;
-    }
-    const f32 s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
-}
-
-static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy, f32 k_max_abs) {
-    if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
-        ixx = 2.f;
-        ixy = 0.f;
-        iyy = 2.f;
-        return;
-    }
-    // Clamp EIGENVALUES, not the whole matrix. The previous form rescaled all
-    // three entries by one factor, which bounds the sharp axis (what the
-    // speckle fix needs) but widens the already-wide axis by the same factor
-    // -- pure blur with no coverage benefit. Measured on an edge kernel with
-    // the continuous-anisotropy defaults: sigma 0.085 x 0.68 px became
-    // 0.177 x 1.41 px, doubling the along-edge width for nothing, which is
-    // the reported over-smoothing. Bounding each eigenvalue independently
-    // gives 0.177 x 0.68: the across-edge axis widened exactly to the
-    // coverage floor, the along-edge axis untouched.
-    const f32 mean = 0.5f * (ixx + iyy);
-    const f32 half_diff = 0.5f * (ixx - iyy);
-    const f32 disc = std::sqrt(half_diff * half_diff + ixy * ixy);
-    const f32 l1 = mean + disc;                    // largest eigenvalue
-    if (!(l1 > k_max_abs)) return;                 // nothing too sharp
-    const f32 l2 = mean - disc;
-    const f32 c1 = k_max_abs;
-    const f32 c2 = std::min(l2, k_max_abs);
-    // Eigenvector of l1. Both constructions degenerate only when the matrix
-    // is (near-)isotropic diagonal, where a plain per-entry clamp is exact.
-    f32 vx = ixy;
-    f32 vy = l1 - ixx;
-    f32 n2 = vx * vx + vy * vy;
-    if (!(n2 > 0.f)) {
-        vx = l1 - iyy;
-        vy = ixy;
-        n2 = vx * vx + vy * vy;
-    }
-    if (!(n2 > 0.f)) {
-        ixx = std::min(ixx, k_max_abs);
-        iyy = std::min(iyy, k_max_abs);
-        return;
-    }
-    const f32 inv_n2 = 1.f / n2;
-    const f32 d = c1 - c2;
-    ixx = c2 + d * (vx * vx * inv_n2);
-    ixy = d * (vx * vy * inv_n2);
-    iyy = c2 + d * (vy * vy * inv_n2);
-}
-
+// python-z has NO clamp on the inverse covariance -- no soften_inv_cov, no
+// eigenvalue ceiling, no width floor. Its only guard is invert_2x2's
+// abs(det) > EPSILON_DIV (1e-10) falling back to the identity, which
+// interp_inv_cov below mirrors exactly. Removed to match.
 static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -240,8 +123,7 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det,
-                                  f32 soften_max, bool legacy_soften) {
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -283,8 +165,6 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    if (legacy_soften) soften_inv_cov_legacy(ixx, ixy, iyy, soften_max);
-    else               soften_inv_cov(ixx, ixy, iyy, soften_max);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -442,9 +322,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x;
                     kmap_i = lr_mov_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
-                               merge_soften_max_inv(cfg),
-                               cfg.kernel_legacy_832f7b8);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
 
             const int center_j = cuda_round_to_int(lr_mov_x);
@@ -488,17 +366,14 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    // See the coverage-floor comment in the tap loop below. Always active
-    // now that the ceiling is 128 in every mode.
-    // Unconditional. This used to switch off below a ceiling of 64, on the
-    // assumption that a kernel that wide reaches the nearest same-colour
-    // sample by itself. Measurement says otherwise: even at 0.1768 px the red
-    // channel has ZERO taps on the output rows whose nearest red sample is a
-    // full pixel away (see kMergeInvCovMax), so dropping the floor there turns
-    // a colour fringe into an exactly-zero denominator, which every division
-    // site guards to black. A guaranteed-nonzero denominator is wanted at
-    // every ceiling, and at 5e-4 relative it is under 1% wherever real taps
-    // survive.
+    // Coverage floor. NOT from python-z -- it merges a full burst, so a
+    // channel whose every kernel tap falls outside the cutoff at one frame
+    // still gets taps from the others' sub-pixel offsets. This port has to
+    // survive regions where robustness leaves one frame, where that sum really
+    // is zero and the division sites guard it to black. Kept deliberately: it
+    // is a merge coverage guard, not a kernel parameter, and removing it would
+    // reintroduce per-channel holes rather than match anything python-z does.
+    // At 5e-4 relative it is under 1% wherever real taps survive.
     const f32 cover_eps = 5e-4f;
     const bool chroma_diff = cfg.merge_chroma_difference && cfg.bayer_mode;
     const int band_h = num.h, Ws = num.w;
@@ -564,9 +439,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
-                               merge_soften_max_inv(cfg),
-                               cfg.kernel_legacy_832f7b8);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
             }
 
             // Python: center = round(coarse)

@@ -42,58 +42,10 @@ struct Image {
     inline size_t size() const { return data.size(); }
 };
 
-// Ceiling on the eigenvalues of the INVERSE merge covariance, i.e. a floor on
-// the kernel's half-width: sigma_min = 1/sqrt(this) = 0.1768 raw px. Without
-// a floor a very sharp region drives the kernel toward a delta, the
-// denominator collapses, and the output speckles.
-//
-// 32, not the 128 this briefly used. 128 floors sigma at 0.0884 px, which is
-// eleven times NARROWER than the 1 px raw sample spacing -- at that width the
-// kernel is not a reconstruction filter, it is a delta that takes whichever
-// single sample lands nearest and gives every other one a weight around
-// 1e-7. That only reconstructs anything because a long burst scatters samples
-// at many sub-pixel offsets, so it degrades badly wherever robustness leaves
-// few frames. It also never actually engaged: the SNR-tuned kernels bottom
-// out at 0.128 px across a strong edge, already above 0.0884, so the floor
-// was inert exactly where coverage was thinnest.
-//
-// At 32 the floor binds under auto-tune: the across-edge axis goes from
-// 0.128 to 0.1768 px, so edges are about 1.4x wider across than they were.
-//
-// Be clear about what that does and does not buy, because the obvious claim
-// is wrong. It does NOT restore per-channel coverage at a strong edge.
-// Measured red-channel denominators there, kernel taps vs the isotropic
-// coverage floor, at two adjacent output rows:
-//
-//     floor 128 (0.0884)   y=1.0: 0.000e+00   y=1.5: 0.000e+00
-//     floor  32 (0.1768)   y=1.0: 0.000e+00   y=1.5: 2.183e-02
-//     floor  16 (0.2500)   y=1.0: 0.000e+00   y=1.5: 1.611e-01
-//     floor   8 (0.3536)   y=1.0: 4.365e-02   y=1.5: 4.381e-01
-//
-// 32 half-fixes it: the row whose nearest red sample is 0.5 px away comes
-// back, the row whose nearest is a full 1 px away is still cut, because
-// z = (1/0.1768)^2 plus the along-axis term is 33 against a cutoff of 16.
-// Alternate output rows still have no red taps at all, which is a fringe at
-// half the old frequency, not no fringe. Killing it by width alone needs
-// floor 8 (0.3536 px), i.e. 2.8x softer across edges than the SNR tuning
-// asks for. Config::merge_chroma_difference removes the same artifact at no
-// resolution cost, which is why the two are independent switches.
-//
-// Neither python-z nor 460-main has any floor at all, so this is a deliberate
-// departure: it trades sharpness for not depending on frame count to keep
-// denominators populated.
-//
-// It is applied twice on purpose, and the earlier application is the one that
-// matters. soften_inv_cov() clamps AFTER inverting, which is too late when the
-// covariance itself has collapsed: at k_denoise = 0 the denoising blend drives
-// k1 and k2 to zero, det falls under merge.cpp's 1e-10 degeneracy test, and
-// the kernel snaps to the identity fallback (sigma 1.0 px) instead of the
-// floor (0.0884 px). Adjacent pixels straddling that threshold then differ
-// 11.3x in kernel width, which draws a line along the iso-gradient contour.
-// Clamping k1/k2 in compute_k -- exactly equivalent, since the eigenvalues of
-// the covariance ARE k1^2 and k2^2 -- keeps det away from the cliff and makes
-// the transition continuous. soften_inv_cov then stays as a safety net.
-inline constexpr f32 kMergeInvCovMax = 32.f;
+// python-z clamps nothing about the kernel width: no ceiling on the inverse
+// covariance, no floor on k1/k2. Its only guard is invert_2x2's
+// abs(det) > 1e-10 -> identity fallback. Matched, so the constant that used
+// to live here is gone along with soften_inv_cov.
 
 // Global rigid (rotation + translation) motion model for one comparison
 // frame, in ALIGNMENT-GREY pixels. ImageStackAlignator's "pre-alignment":
@@ -779,33 +731,6 @@ struct Config {
     // from G, which always has samples on its own row.
     bool  merge_chroma_difference = false;
 
-    // Restore commit 832f7b8's kernel path exactly, for A/B against the
-    // current one. Four things move together, because they were four separate
-    // changes and comparing them one at a time is what this exists for:
-    //
-    //  - Eq. 4's shape law reverts to the HARD THRESHOLD: isotropic below
-    //    A = 1.95, full (1/k_shrink, k_stretch) above. A > 1.95 needs
-    //    lambda2/lambda1 < 0.05, so most real edges got no anisotropy at all.
-    //  - The kernel width floor in compute_k is REMOVED. 832f7b8 had none, so
-    //    a collapsing covariance falls through merge.cpp's 1e-10 degeneracy
-    //    test to the identity fallback at sigma 1.0 px. That is the 11.3x
-    //    width cliff that draws lines along iso-gradient contours, and it is
-    //    part of what this flag faithfully restores.
-    //  - soften_inv_cov reverts to rescaling the WHOLE MATRIX by one factor
-    //    rather than clamping each eigenvalue. Measured cost: identical
-    //    across-edge sharpness, but 1.4142 px along an edge instead of 0.9889
-    //    -- 43% of pure over-smoothing on the axis that was never too sharp.
-    //  - The GAT moves back AFTER the 2x2 decimation. Variance stabilisation
-    //    belongs on the raw Poisson samples, not on their mean, so this
-    //    changes the structure tensor's noise scaling and therefore which
-    //    pixels read as edge rather than flat.
-    //
-    // Overrides selection / kernel_anisotropy_continuous while it is on.
-    // k_denoise is a user-facing slider and is NOT overridden: 832f7b8
-    // shipped 0.0, and with the floor gone that is what drives the collapse,
-    // so set it to 0.0 by hand for a true match.
-    bool  kernel_legacy_832f7b8 = false;
-
     bool  prealign_enabled    = false;
 
     // Layer 3: dense Lucas-Kanade refinement (ISA lucasKanadeOptim). Replaces
@@ -1165,7 +1090,6 @@ struct Config {
     // left every moderately-anisotropic feature -- poles, wires, most real
     // edges -- with a round kernel and none of the misalignment tolerance
     // Section 5.1.1 designs the anisotropic kernel to provide.
-    bool kernel_anisotropy_continuous = true;
 
     // Zero-floor the linear anisotropy law. The reference's linear selection
     // (and the continuous mode above) interpolates the kernel shape with
@@ -1198,7 +1122,6 @@ struct Config {
     // Turning it back on restores this port's own law, which differs from
     // python-z only in the low-A end: round at A = 1 instead of python-z's
     // permanent 3.3:1 stretch on isotropic content.
-    bool kernel_anisotropy_zero_floor = false;
     // Exponent on the zero-floored stretch weight: w = 0.975 * t^gamma with
     // t = clamp((A-1)/0.95). 1 = the plain zero-floor law. The default 2 was
     // fitted to a measurement, not a guess: distant text (coherence ~0.36)
@@ -1207,7 +1130,6 @@ struct Config {
     // clean single-orientation edge (coherence ~0.9) keeps 95% of the full
     // k_stretch = 4 elongation the manual override was giving up. Raising
     // gamma concentrates stretch onto ever-more-coherent structure.
-    f32  kernel_stretch_gamma = 1.0f;
 
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;

@@ -1119,16 +1119,10 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t bayer, selection;
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-        uint32_t aniso_continuous = 0;  // 1 = continuous Eq. 4 shape (was _pad0)
-        uint32_t aniso_zero_floor = 0;  // 1 = zero-floor linear law (was _pad1)
-        float aniso_gamma = 1.f;        // exponent on the zero-floored weight
-        // Kernel half-width floor in raw px, so the shader's compute_k floors
-        // at the same place the CPU one does instead of carrying its own
-        // literal. Was _pad2. Defaulted to the real value rather than 0: a
-        // zero here would silently disable the floor -- max(k, 0) is a no-op --
-        // and bring back the 11.3x width cliff it exists to remove.
-        float k_min = 0.17677670f;  // 1/sqrt(32); assigned from
-                                    // kMergeInvCovMax at the populate site
+        uint32_t _pad0 = 0;
+        uint32_t _pad1 = 0;
+        uint32_t _pad2 = 0;
+        uint32_t _pad3 = 0;
     };
     static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
 
@@ -1143,11 +1137,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_h = (uint32_t)grey_h;
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
-    const bool k_legacy = cfg.kernel_legacy_832f7b8;
-    p.selection = (!k_legacy && cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
-    p.aniso_zero_floor = (!k_legacy && cfg.kernel_anisotropy_zero_floor) ? 1u : 0u;
-    p.aniso_gamma = cfg.kernel_stretch_gamma;
-    p.k_min = k_legacy ? 0.f : 1.f / std::sqrt(kMergeInvCovMax);
+    p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -1156,7 +1146,6 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.D_tr = cfg.D_tr;
     p.k_stretch = cfg.k_stretch;
     p.k_shrink = cfg.k_shrink;
-    p.aniso_continuous = (!k_legacy && cfg.kernel_anisotropy_continuous) ? 1u : 0u;
 
     const size_t raw_b = raw.data.size() * sizeof(float);
     const size_t grey_b = (size_t)grey_h * (size_t)grey_w * sizeof(float);
@@ -1178,30 +1167,16 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return CovField();
 
-    if (k_legacy) {
-        // 832f7b8 order: decimate the RAW, then stabilise the mean. The GAT
-        // runs in place on b_grey -- one element per thread, same index in
-        // and out, so aliasing the buffer is safe.
-        [enc setBuffer:b_grey offset:0 atIndex:0];
-        [enc setBuffer:b_raw offset:0 atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-        dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
+    // python-z order: GAT the raw, then decimate to grey.
+    [enc setBuffer:b_vst_raw offset:0 atIndex:0];
+    [enc setBuffer:b_raw offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_gat_raw"), p.raw_w, p.raw_h);
 
-        [enc setBuffer:b_grey offset:0 atIndex:0];
-        [enc setBuffer:b_grey offset:0 atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-        dispatch2(enc, c.pipe("kernel_gat"), p.grey_w, p.grey_h);
-    } else {
-        [enc setBuffer:b_vst_raw offset:0 atIndex:0];
-        [enc setBuffer:b_raw offset:0 atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-        dispatch2(enc, c.pipe("kernel_gat_raw"), p.raw_w, p.raw_h);
-
-        [enc setBuffer:b_grey offset:0 atIndex:0];
-        [enc setBuffer:b_vst_raw offset:0 atIndex:1];
-        [enc setBytes:&p length:sizeof(p) atIndex:2];
-        dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
-    }
+    [enc setBuffer:b_grey offset:0 atIndex:0];
+    [enc setBuffer:b_vst_raw offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
     [enc setBuffer:b_grad offset:0 atIndex:0];
     [enc setBuffer:b_grey offset:0 atIndex:1];
@@ -2895,16 +2870,9 @@ struct MergeCompParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
-    // Fail-open at the value merge_soften_max_inv() actually returns. Every
-    // dispatch assigns this (audited: the only unassigned declaration is
-    // PendingMergeComp::p, which is copied whole from a populated one), but a
-    // stale 32 here would mean a sigma floor of 0.177 px instead of 0.088 --
-    // every edge twice as soft, on one path only, with nothing to flag it.
-    float soften_max_inv = kMergeInvCovMax; // inv-cov eigenvalue ceiling (was _pad3)
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
-    uint32_t legacy_soften = 0;   // 1 = 832f7b8 whole-matrix rescale
 };
-static_assert(sizeof(MergeCompParamsCPU) == 104, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -2919,11 +2887,9 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
-    float soften_max_inv = kMergeInvCovMax; // inv-cov eigenvalue ceiling (see above)
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
-    uint32_t legacy_soften = 0;   // 1 = 832f7b8 whole-matrix rescale
 };
-static_assert(sizeof(MergeRefParamsCPU) == 108, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3731,11 +3697,7 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.raw_res_robustness = 0u;
     p.flow_bilinear = flow_sample_mode(cfg);
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
-    // Same mode split as merge_soften_max_inv in merge.cpp (128 = coverage
-    // bound: sharper floors zero the off-site colour channels -> speckle).
-    p.soften_max_inv = kMergeInvCovMax;  // both modes -- see merge_soften_max_inv
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
-    p.legacy_soften = cfg.kernel_legacy_832f7b8 ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3836,9 +3798,7 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
-    p.soften_max_inv = kMergeInvCovMax;  // both modes -- see merge_soften_max_inv
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
-    p.legacy_soften = cfg.kernel_legacy_832f7b8 ? 1u : 0u;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];
