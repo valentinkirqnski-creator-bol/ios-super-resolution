@@ -1682,7 +1682,7 @@ struct KernelEstParams {
     uint selection; // 1 = python-z linear selection law, 0 = hard threshold
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-    uint _pad0;
+    float grey_scale;       // noise autoscale multiplier (was _pad0)
     uint _pad1;
     uint _pad2;
     float k_min;            // kernel half-width floor, raw px (was _pad3)
@@ -1790,9 +1790,11 @@ kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],
         uint y0 = y * 2u, x0 = x * 2u;
         float s = raw[y0 * p.raw_w + x0] + raw[y0 * p.raw_w + x0 + 1u] +
                   raw[(y0 + 1u) * p.raw_w + x0] + raw[(y0 + 1u) * p.raw_w + x0 + 1u];
-        grey[y * p.grey_w + x] = 0.25f * s;
+        // grey_scale: noise autoscale, twin of kernel_noise_autoscale_factor
+        // in kernels.cpp. 1.0 leaves the declared noise model alone.
+        grey[y * p.grey_w + x] = 0.25f * s * p.grey_scale;
     } else {
-        grey[y * p.grey_w + x] = raw[y * p.raw_w + x];
+        grey[y * p.grey_w + x] = raw[y * p.raw_w + x] * p.grey_scale;
     }
 }
 

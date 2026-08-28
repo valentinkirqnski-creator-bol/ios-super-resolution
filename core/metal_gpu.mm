@@ -1119,7 +1119,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t bayer, selection;
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-        uint32_t _pad0 = 0;
+        float grey_scale = 1.f;  // noise autoscale multiplier (was _pad0)
         uint32_t _pad1 = 0;
         uint32_t _pad2 = 0;
         // Kernel half-width floor in raw px, so the shader's compute_k floors
@@ -1142,6 +1142,10 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.bayer = bayer ? 1u : 0u;
     p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
     p.k_min = 1.f / std::sqrt(kMergeInvCovMax);
+    // Measured from the frame, not taken from alpha/beta -- see
+    // kernel_noise_autoscale_factor. Shared with the CPU body so the two
+    // paths cannot disagree about the scale D's thresholds are compared at.
+    p.grey_scale = kernel_noise_autoscale_factor(raw, cfg);
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;

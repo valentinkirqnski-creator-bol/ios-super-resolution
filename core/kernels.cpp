@@ -7,6 +7,70 @@
 
 namespace hhsr {
 
+// Multiplier that puts the kernel-estimate grey's NOISE at the amplitude
+// D_th/D_tr are calibrated against. 1.0 means "leave it alone".
+//
+// D = clamp(1 - sqrt(l1)/D_tr + D_th, 0, 1) compares sqrt(l1) to D_tr ~ 1.1,
+// which only means anything if the GAT actually mapped sensor noise to unit
+// variance -- true ONLY when alpha/beta match the real noise. They frequently
+// do not: a DNG without a NoiseProfile falls back to a single fixed alpha with
+// no ISO scaling, and Config::has_noise_profile is used for logging only, so
+// the mismatch is silent.
+//
+// The failure is not subtle. Measured on a flat patch of pure noise, model too
+// small by a factor of:
+//     1x   -> sigma 0.7500 isotropic     (denoise branch, correct)
+//     4x   -> sigma 0.5451               (partly)
+//     10x  -> sigma 0.1768, aspect 5.0   (DETAIL branch, on PURE NOISE)
+// Beyond ~10x every pixel of a noisy frame takes the sharpest, most
+// anisotropic kernel available, oriented by noise rather than by any edge --
+// which reads as oversharpening, colour fringing, and anisotropy that looks
+// random. D_tr would need to reach ~4 to compensate a 30x error and its slider
+// stops at 2.0, so no setting can reach it.
+//
+// Measuring instead of trusting makes D scale-invariant. Robust estimator:
+// the median absolute adjacent difference is dominated by flat areas, so edges
+// and texture do not inflate it, and MAD/0.6745 recovers a Gaussian sigma.
+// Computed from the RAW rather than the grey so the CPU and Metal paths can
+// share it -- the GPU never has the grey host-side.
+f32 kernel_noise_autoscale_factor(const Image& raw, const Config& cfg) {
+    if (!cfg.kernel_noise_autoscale || raw.h < 8 || raw.w < 8) return 1.f;
+    const f32 alpha = cfg.noise_alpha(), beta = cfg.noise_beta();
+    if (!(alpha > 0.f) || !std::isfinite(alpha) || !std::isfinite(beta)) return 1.f;
+    const f32 c = 0.375f * alpha * alpha + beta;
+    auto g = [&](int y, int x) {
+        return (2.f / alpha) * std::sqrt(std::max(0.f, alpha * raw.at(y, x) + c));
+    };
+    // Quad mean, mirroring compute_grey_decimate, then adjacent differences of
+    // neighbouring quads. Subsampled: the noise level needs a distribution, not
+    // every pixel.
+    const int step = std::max(2, (std::min(raw.h, raw.w) / 256) * 2);
+    std::vector<f32> d;
+    d.reserve(4096);
+    auto quad = [&](int y, int x) {
+        if (!cfg.bayer_mode) return g(y, x);
+        return 0.25f * (g(y, x) + g(y, x + 1) + g(y + 1, x) + g(y + 1, x + 1));
+    };
+    const int qs = cfg.bayer_mode ? 2 : 1;
+    for (int y = 0; y + qs < raw.h - qs; y += step)
+        for (int x = 0; x + 2 * qs < raw.w - qs; x += step)
+            d.push_back(std::fabs(quad(y, x + qs) - quad(y, x)));
+    if (d.size() < 64) return 1.f;
+    std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+    const f32 mad = d[d.size() / 2];
+    // an adjacent difference of iid noise has variance 2*sigma^2
+    const f32 meas = mad / 0.6745f / 1.41421356f;
+    if (!(meas > 1e-8f) || !std::isfinite(meas)) return 1.f;
+    // What a correct model would have produced: the GAT leaves unit variance
+    // per raw sample and the quad decimation averages 4 of them.
+    const f32 want = cfg.bayer_mode ? 0.5f : 1.f;
+    const f32 k = want / meas;
+    // Only correct GROSS mismatch -- within 2x the declaration is trusted, so a
+    // well-formed NoiseProfile is left exactly alone.
+    if (k >= 0.5f && k <= 2.f) return 1.f;
+    return (std::isfinite(k) && k > 0.f) ? k : 1.f;
+}
+
 CovField estimate_kernels(const Image& raw, const Config& cfg) {
 #ifdef __APPLE__
     // Metal GPU only — same Alg. 5 math as the CPU path below (golden reference).
@@ -71,6 +135,10 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
     // python-z order: GAT the raw, then decimate to grey (kernels.py:80, :84).
     Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
     Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
+
+    const f32 nscale = kernel_noise_autoscale_factor(raw, cfg);
+    if (nscale != 1.f) for (f32& v : grey.data) v *= nscale;
+
     Image grad = compute_gradients(grey); // [gh-1, gw-1, 2]
 
     int H = grey.h, W = grey.w;

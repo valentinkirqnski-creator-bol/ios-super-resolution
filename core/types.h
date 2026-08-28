@@ -746,6 +746,15 @@ struct Config {
     // edge even when R and G separately are not, so reconstructing it from a
     // straddling floor costs almost nothing, and all the edge structure comes
     // from G, which always has samples on its own row.
+    // Renormalise the kernel-estimate grey so its noise amplitude matches what
+    // D_th/D_tr are calibrated against, instead of trusting alpha/beta to have
+    // been right. See the block in kernels.cpp estimate_kernels: a DNG with no
+    // NoiseProfile falls back to a fixed alpha with no ISO scaling, and a model
+    // 10x too small drives D to 0 on PURE NOISE -- every pixel then gets the
+    // sharpest anisotropic kernel, oriented by noise. Only engages on a gross
+    // (>2x) mismatch, so a correct profile is untouched.
+    bool  kernel_noise_autoscale = true;
+
     bool  merge_chroma_difference = false;
 
     bool  prealign_enabled    = false;
