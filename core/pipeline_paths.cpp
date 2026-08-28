@@ -781,13 +781,22 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         const f32 brightness = ref_brightness;
         const f32 sigma = noise_std_at_brightness(brightness, work);
         const f32 snr = (sigma > 1e-8f) ? brightness / sigma : 0.f;
-        char buf[288];
+        char buf[352];
         const int t0 = work.bm_tile_sizes.size() > 0 ? work.bm_tile_sizes[0] : -1;
+        // Measured-over-declared noise ratio. D = clamp(1 - sqrt(l1)/D_tr + D_th)
+        // compares sqrt(l1) against D_tr ~ 1.1, which only means anything if the
+        // GAT actually mapped this frame's noise to unit variance. 1.00 means the
+        // NoiseProfile matches what the sensor actually did; far from 1 means the
+        // thresholds are being compared at the wrong scale, and past ~10x the
+        // denoise branch stops engaging even on pure noise.
+        const f32 nscale = kernel_noise_autoscale_factor(ref, work);
         std::snprintf(buf, sizeof(buf),
-            "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f",
+            "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f  "
+            "noise_scale=%.2f%s",
             work.has_noise_profile ? "OK" : "FALLBACK",
             work.noise_alpha(), work.noise_beta(), brightness, sigma, snr, t0,
-            work.r_t);
+            work.r_t, nscale,
+            (nscale != 1.f) ? " (AUTOSCALED - declared model is off)" : "");
         report(buf, 0.065f);
     }
     (void)t_snr;

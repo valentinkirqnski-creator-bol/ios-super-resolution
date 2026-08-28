@@ -35,7 +35,7 @@ namespace hhsr {
 // share it -- the GPU never has the grey host-side.
 f32 kernel_noise_autoscale_factor(const Image& raw, const Config& cfg) {
     if (!cfg.kernel_noise_autoscale || raw.h < 8 || raw.w < 8) return 1.f;
-    const f32 alpha = cfg.noise_alpha(), beta = cfg.noise_beta();
+    const f32 alpha = cfg.noise_alpha_gat(), beta = cfg.noise_beta_gat();
     if (!(alpha > 0.f) || !std::isfinite(alpha) || !std::isfinite(beta)) return 1.f;
     const f32 c = 0.375f * alpha * alpha + beta;
     auto g = [&](int y, int x) {
@@ -133,7 +133,7 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
     };
 
     // python-z order: GAT the raw, then decimate to grey (kernels.py:80, :84).
-    Image vst_raw = apply_gat(raw, cfg.noise_alpha(), cfg.noise_beta());
+    Image vst_raw = apply_gat(raw, cfg.noise_alpha_gat(), cfg.noise_beta_gat());
     Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
 
     const f32 nscale = kernel_noise_autoscale_factor(raw, cfg);

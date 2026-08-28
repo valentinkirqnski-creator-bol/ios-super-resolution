@@ -1146,8 +1146,8 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     // kernel_noise_autoscale_factor. Shared with the CPU body so the two
     // paths cannot disagree about the scale D's thresholds are compared at.
     p.grey_scale = kernel_noise_autoscale_factor(raw, cfg);
-    p.alpha = cfg.noise_alpha();
-    p.beta = cfg.noise_beta();
+    p.alpha = cfg.noise_alpha_gat();
+    p.beta = cfg.noise_beta_gat();
     p.k_detail = cfg.k_detail;
     p.k_denoise = cfg.k_denoise;
     p.D_th = cfg.D_th;

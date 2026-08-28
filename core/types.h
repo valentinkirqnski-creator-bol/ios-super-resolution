@@ -498,6 +498,31 @@ struct Config {
         }
         return s / 3.f;
     }
+    // Same, WITHOUT the guide's per-channel averaging weight.
+    //
+    // noise_guide_weight is the reciprocal of how many Bayer sites
+    // compute_guide averaged into that channel -- 1/2 for green. That is
+    // correct for the robustness guide, which is what it was written for, and
+    // wrong for the kernel-estimate GAT, which runs on the RAW before any
+    // averaging happens. Including it makes alpha about 11% too small there
+    // (the exact factor depends on the white balance), so the GAT
+    // under-stabilises and every gradient the structure tensor sees is
+    // slightly inflated. Small next to a wrong NoiseProfile, but wrong on its
+    // own terms and in the direction that pushes D toward the detail branch.
+    float noise_alpha_gat() const {
+        float s = 0.f;
+        for (int c = 0; c < 3; ++c)
+            s += alpha_dng[c] * noise_wb_gain(c);
+        return s / 3.f;
+    }
+    float noise_beta_gat() const {
+        float s = 0.f;
+        for (int c = 0; c < 3; ++c) {
+            const float g = noise_wb_gain(c);
+            s += beta_dng[c] * g * g;
+        }
+        return s / 3.f;
+    }
     // Per-channel counterparts of the above, undivided by 3 and not summed
     // across channels. compute_robustness's Monte Carlo curve (apply_noise_
     // model) scores each guide channel against its own brightness; feeding
