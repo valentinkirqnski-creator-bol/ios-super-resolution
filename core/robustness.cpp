@@ -919,9 +919,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         // cuda_uspcale_dogson has no interpolation option: the flow lookup
         // inside the Dogson warp is a bare per-tile array index
         // (patch_idy = int(y // tile_size)) under every configuration.
+        //
+        // Overridden by Config::flow_dense_lattice_trusted(): dense LK plus
+        // global pre-alignment together are trusted enough to justify
+        // reading the fine lattice here specifically -- see that accessor's
+        // comment. sample_bilinear already falls back to the coarse grid
+        // when flow.has_fine() is false, so this is only ever a live switch
+        // when Dense Flow actually produced one.
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads,
-                                        /*bilinear_flow=*/false);
+                                        /*bilinear_flow=*/cfg.flow_dense_lattice_trusted());
     }
 
     const Image& ref_means = ref_stats.means_hires;

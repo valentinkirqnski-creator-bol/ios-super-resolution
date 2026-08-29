@@ -839,6 +839,27 @@ struct Config {
     // lattice from the field. Off by default; see
     // flow_densify_lucas_kanade for what it does and does not fix.
     bool  flow_dense_lk_enabled     = false;
+    // True when the dense-LK fine lattice should be trusted downstream --
+    // merge and the raw-resolution robustness mask both default to consuming
+    // the flow at COARSE, one-vector-per-tile granularity (merge falls back
+    // to it whenever Config::flow_bilinear_sampling is off; robustness always
+    // does, unconditionally, to match python-z's literal nearest-tile lookup
+    // -- see compute_robustness_raw_res). Both of those defaults exist for a
+    // reason: on their own, a fine lattice built from a noisy, unseeded
+    // per-tile search is not obviously worth trusting over the coarse one.
+    //
+    // Global pre-alignment changes that calculus for the fine lattice
+    // specifically: it is what makes each fine cell's LK solve start near the
+    // truth (see flow_densify_lucas_kanade's seeding comment) rather than
+    // fighting a large, possibly-wrong per-tile estimate, which is the
+    // condition under which the fine lattice is worth reading everywhere it
+    // is available rather than only where a consumer happens to already
+    // default to bilinear. So: BOTH toggles, not either alone -- dense LK
+    // without pre-alignment is the existing, narrower default behaviour;
+    // this only widens what reads the result once the seed is trustworthy.
+    bool flow_dense_lattice_trusted() const {
+        return flow_dense_lk_enabled && prealign_enabled;
+    }
     // Defaults chosen by sweeping (window, iters, damping) against a
     // synthetic 1-degree rotation with seeded per-tile noise, not by taste:
     //  - a LARGER window is monotonically better (hw 4 beats 3 beats 2), so

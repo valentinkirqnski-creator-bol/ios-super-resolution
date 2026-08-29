@@ -1387,7 +1387,11 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     b_out = buf(nullptr, out_b);
     if (!b_out) return false;
 
-    (void)flow_mode;  // see below: this call always forces nearest now.
+    // flow_mode == 0: python-z parity, forced below regardless of the caller.
+    // flow_mode != 0: Config::flow_dense_lattice_trusted() override -- use
+    // THIS sample mode (1 = bilinear, 2 = bicubic, matching FlowField::
+    // sample_bilinear's own dispatch on Config::flow_bicubic_sampling) and
+    // read the fine lattice through flow_gpu_grid instead of forcing coarse.
     RobDogsonParamsCPU dp{};
     dp.in_h = (uint32_t)in_h;
     dp.in_w = (uint32_t)in_w;
@@ -1395,26 +1399,31 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.out_w = (uint32_t)out_w;
     dp.nch = (uint32_t)nch;
     dp.is_ref = is_ref ? 1u : 0u;
-    // python-z parity: cuda_uspcale_dogson's flow lookup is a bare per-tile
-    // array index at the ORIGINAL tile_size -- no interpolation, and no finer
-    // sub-tile lattice. Bind the coarse array directly rather than going
-    // through flow_gpu_grid, which would swap in the fine boundary-select/
-    // dense-LK lattice when present; patch_idy = y/tile_size must land on
-    // exactly the tile python-z's alignments array holds, always.
     const f32* fg_dat = nullptr;
     size_t fg_bytes = 0;
     int fg_ny = 0, fg_nx = 0, fg_ts = tile_size;
-    if (!is_ref && flow) {
+    if (!is_ref && flow && flow_mode != 0u) {
+        // Trusted pairing: let flow_gpu_grid swap in the fine (dense-LK)
+        // lattice when present, exactly as the merge and the CPU twin
+        // (compute_robustness_raw_res, gated the same way) now do.
+        (void)flow_gpu_grid(*flow, tile_size, fg_dat, fg_bytes, fg_ny, fg_nx, fg_ts);
+    } else if (!is_ref && flow) {
+        // python-z parity: cuda_uspcale_dogson's flow lookup is a bare
+        // per-tile array index at the ORIGINAL tile_size -- no
+        // interpolation, no finer sub-tile lattice. Bind the coarse array
+        // directly; patch_idy = y/tile_size must land on exactly the tile
+        // python-z's alignments array holds.
         fg_dat = flow->flow.data();
         fg_bytes = flow->flow.size() * sizeof(float);
         fg_ny = flow->ny;
         fg_nx = flow->nx;
+        fg_ts = tile_size;
     }
     dp.tile_size = (uint32_t)std::max(0, fg_ts);
     dp.flow_ny = (!is_ref && flow) ? (uint32_t)fg_ny : 0u;
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)fg_nx : 0u;
     dp.s = 2.f;
-    dp.flow_bilinear = 0u;
+    dp.flow_bilinear = (!is_ref && flow) ? flow_mode : 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && fg_dat && fg_bytes) {
@@ -1501,10 +1510,13 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     int hires_h = 0, hires_w = 0;
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
+        // is_ref=true takes neither branch of the flow_mode dispatch inside
+        // rob_dogson (no flow, no warp) -- 0 here is inert, not a claim about
+        // sample mode.
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd, flow_sample_mode(cfg)) ||
+                        nullptr, 0, mh, mw, cmd, 0u) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, flow_sample_mode(cfg)) ||
+                       nullptr, 0, vh, vw, cmd, 0u) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -1581,9 +1593,17 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     id<MTLBuffer> b_comp_means_hires = nil;
     int ch_h = 0, ch_w = 0;
+    // 0 = python-z parity (coarse, nearest), the default; otherwise the
+    // fine-lattice sample mode -- see Config::flow_dense_lattice_trusted and
+    // the twin gate in compute_robustness_raw_res (robustness.cpp). NOT
+    // flow_sample_mode(cfg) unconditionally: that also reads
+    // flow_bilinear_sampling, which this override is deliberately
+    // independent of.
+    const uint32_t rob_dogson_mode = cfg.flow_dense_lattice_trusted()
+        ? (cfg.flow_bicubic_sampling ? 2u : 1u) : 0u;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    flow_sample_mode(cfg)))
+                    rob_dogson_mode))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
@@ -3760,6 +3780,16 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
             p.flow_nx = (uint32_t)flow.fine_nx;
             p.tile_size = (uint32_t)(tile_size / fdiv_l);
             if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
+            // See Config::flow_dense_lattice_trusted: dense LK's fine buffer
+            // is already selected above regardless of flow_bilinear_sampling
+            // (flow_gpu_grid gates purely on has_fine() + tile_size
+            // divisibility) -- only the SAMPLE MODE within it is gated by
+            // that toggle. This pairing forces bilinear reading of that
+            // already-selected fine lattice even when the toggle left mode
+            // at nearest, so Dense Flow's refinement is never computed and
+            // then discarded once pre-alignment has made it trustworthy.
+            else if (cfg.flow_dense_lattice_trusted() && p.flow_bilinear == 0u)
+                p.flow_bilinear = 1u;
         } else {
             p.flow_ny = (uint32_t)flow.ny;
             p.flow_nx = (uint32_t)flow.nx;
@@ -3782,6 +3812,9 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         if (hit->flow_fine && tile_size >= fdiv_c && (tile_size % fdiv_c) == 0) {
             p.tile_size = (uint32_t)(tile_size / fdiv_c);
             if (cfg.overlap_merge_active()) p.flow_bilinear = 3u;
+            // Twin of the live-frame branch above -- see the comment there.
+            else if (cfg.flow_dense_lattice_trusted() && p.flow_bilinear == 0u)
+                p.flow_bilinear = 1u;
         }
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
         p.cov_w = hit->cov_w > 0 ? (uint32_t)hit->cov_w : 1u;

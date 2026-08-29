@@ -320,7 +320,15 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                             break;
                         }
                 nhyp = 4;
-            } else if (cfg.flow_bilinear_sampling) {
+            } else if (cfg.flow_bilinear_sampling ||
+                      (cfg.flow_dense_lattice_trusted() && flow.has_fine())) {
+                // The dense-LK + pre-alignment pairing (flow_dense_lattice_
+                // trusted) reads the fine lattice here even with Smooth Tile
+                // Flow off: FlowField::sample_bilinear already auto-selects
+                // the fine grid over the coarse one whenever has_fine() is
+                // true, so nothing else about this call changes -- only
+                // whether it fires instead of falling through to the coarse
+                // nearest lookup below.
                 flow.sample_bilinear(lr_y, lr_x, tile_size, hx[0], hy[0]);
             } else {
                 hx[0] = flow.dx(py, px);
