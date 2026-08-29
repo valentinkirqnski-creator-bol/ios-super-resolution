@@ -175,13 +175,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg);
 
 // ---- kernels.cpp --------------------------------------------------------
-// Multiplier that puts the kernel-estimate grey's noise at the amplitude
-// D_th/D_tr are calibrated against, measured from the frame rather than taken
-// from the declared alpha/beta. 1.0 when the declaration is within 2x, when
-// Config::kernel_noise_autoscale is off, or when it cannot be measured.
-// Shared by estimate_kernels and its Metal twin so they cannot disagree.
-f32 kernel_noise_autoscale_factor(const Image& raw, const Config& cfg);
-
 CovField estimate_kernels(const Image& raw, const Config& cfg);
 
 // ---- merge.cpp ----------------------------------------------------------

@@ -48,34 +48,6 @@ def round_half_away(x: float) -> int:
     return int(f32(np.floor(np.float32(x) + np.float32(0.5))))
 
 
-def soften_inv_cov(ixx: float, ixy: float, iyy: float) -> Tuple[float, float, float]:
-    """Mirror of soften_inv_cov in core/merge.cpp. k_max_abs must match
-    kMergeInvCovMax in core/types.h -- keep it in step by hand."""
-    k_max_abs = f32(32.0)
-    if not isfinite_f(ixx) or not isfinite_f(ixy) or not isfinite_f(iyy):
-        return f32(2.0), f32(0.0), f32(2.0)
-    mean = f32(f32(0.5) * f32(ixx + iyy))
-    half_diff = f32(f32(0.5) * f32(ixx - iyy))
-    disc = f32(np.sqrt(np.float32(f32(half_diff * half_diff) + f32(ixy * ixy))))
-    l1 = f32(mean + disc)
-    if not (l1 > k_max_abs):
-        return ixx, ixy, iyy
-    l2 = f32(mean - disc)
-    c1 = k_max_abs
-    c2 = min(l2, k_max_abs)
-    vx, vy = ixy, f32(l1 - ixx)
-    n2 = f32(f32(vx * vx) + f32(vy * vy))
-    if not (n2 > 0):
-        vx, vy = f32(l1 - iyy), ixy
-        n2 = f32(f32(vx * vx) + f32(vy * vy))
-    if not (n2 > 0):
-        return min(ixx, k_max_abs), ixy, min(iyy, k_max_abs)
-    inv_n2 = f32(1.0 / n2)
-    d = f32(c1 - c2)
-    nixx = f32(c2 + f32(d * f32(f32(vx * vx) * inv_n2)))
-    nixy = f32(d * f32(f32(vx * vy) * inv_n2))
-    niyy = f32(c2 + f32(d * f32(f32(vy * vy) * inv_n2)))
-    return nixx, nixy, niyy
 def invert_sym_2x2(xx: float, xy: float, yy: float) -> Tuple[float, float, float]:
     det = f32(xx * yy - xy * xy)
     if fabs_f(det) > f32(1e-10):
@@ -121,7 +93,7 @@ def interp_inv_cov(
             ixx, ixy, iyy = f32(1.0), f32(0.0), f32(1.0)
     else:
         ixx, ixy, iyy = invert_sym_2x2(xx, xy, yy)
-    return soften_inv_cov(ixx, ixy, iyy)
+    return ixx, ixy, iyy
 
 
 @dataclass

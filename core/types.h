@@ -42,28 +42,6 @@ struct Image {
     inline size_t size() const { return data.size(); }
 };
 
-// Ceiling on the eigenvalues of the INVERSE merge covariance: a floor on the
-// kernel half-width at sigma_min = 1/sqrt(this) = 0.1768 raw px.
-//
-// python-z has no such clamp -- it merges a full burst in float32, where the
-// other frames' sub-pixel offsets keep every channel's denominator large and
-// float32 does not flush tiny values away. This port needs it for two reasons
-// python-z does not face: single-frame fallback regions, and a HALF-precision
-// accumulator (Config::merge_fp16_accumulator, on by default). Measured with
-// the clamp removed, an unclamped kernel left red and blue denominators at
-// 2.2e-14 -- three orders under half's smallest subnormal of 6.0e-8 -- so 368
-// channel samples flushed to exactly zero and those pixels kept only green.
-//
-// Applied TWICE, and the earlier one is what matters. soften_inv_cov() clamps
-// after inverting, which is too late when the covariance itself collapsed:
-// det then falls under merge.cpp's 1e-10 degeneracy test and the kernel snaps
-// to the identity fallback at sigma 1.0 px instead of the floor, an 11.3x jump
-// between adjacent gradient levels that draws a line along the iso-gradient
-// contour. Clamping k1/k2 in compute_k is exactly equivalent -- the
-// covariance's eigenvalues ARE k1^2 and k2^2 -- but keeps det away from that
-// cliff, leaving soften_inv_cov as the safety net it should be.
-inline constexpr f32 kMergeInvCovMax = 32.f;
-
 // Global rigid (rotation + translation) motion model for one comparison
 // frame, in ALIGNMENT-GREY pixels. ImageStackAlignator's "pre-alignment":
 // PreAlignment.ScanAngles estimates it by an FFT phase-correlation sweep over
@@ -518,31 +496,6 @@ struct Config {
         }
         return s / 3.f;
     }
-    // Same, WITHOUT the guide's per-channel averaging weight.
-    //
-    // noise_guide_weight is the reciprocal of how many Bayer sites
-    // compute_guide averaged into that channel -- 1/2 for green. That is
-    // correct for the robustness guide, which is what it was written for, and
-    // wrong for the kernel-estimate GAT, which runs on the RAW before any
-    // averaging happens. Including it makes alpha about 11% too small there
-    // (the exact factor depends on the white balance), so the GAT
-    // under-stabilises and every gradient the structure tensor sees is
-    // slightly inflated. Small next to a wrong NoiseProfile, but wrong on its
-    // own terms and in the direction that pushes D toward the detail branch.
-    float noise_alpha_gat() const {
-        float s = 0.f;
-        for (int c = 0; c < 3; ++c)
-            s += alpha_dng[c] * noise_wb_gain(c);
-        return s / 3.f;
-    }
-    float noise_beta_gat() const {
-        float s = 0.f;
-        for (int c = 0; c < 3; ++c) {
-            const float g = noise_wb_gain(c);
-            s += beta_dng[c] * g * g;
-        }
-        return s / 3.f;
-    }
     // Per-channel counterparts of the above, undivided by 3 and not summed
     // across channels. compute_robustness's Monte Carlo curve (apply_noise_
     // model) scores each guide channel against its own brightness; feeding
@@ -551,8 +504,7 @@ struct Config {
     // characteristics into one shared answer. These let each channel build
     // and look up its own curve instead. noise_alpha()/noise_beta() stay as
     // they are for the callers that genuinely want one representative
-    // scalar for the whole (single-channel) grey image -- kernel estimation
-    // (kernels.cpp apply_gat) and SNR auto-tuning.
+    // scalar for the whole (single-channel) grey image -- SNR auto-tuning.
     float noise_alpha_ch(int c) const {
         if (c < 0 || c > 2) return 0.f;
         return alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
@@ -569,18 +521,9 @@ struct Config {
     // the same object into both estimate_kernels and compute_robustness.
     // Plain mean of the three declared per-channel values, matching what a
     // single scalar reduction of a 3-plane DNG NoiseProfile most directly
-    // corresponds to.
-    //
-    // NOT used by this port's own GAT (noise_alpha_gat/beta_gat, a deliberate
-    // earlier fix for a real measured bug: an unscaled model let a noisy
-    // frame's kernels collapse to the sharpest, most anisotropic shape
-    // available on pure sensor noise -- see kernel_noise_autoscale_factor).
-    // Reverting that fix is not what matching robustness asks for, so GAT
-    // keeps its own accessor and this one exists only for robustness to reach
-    // python-z's actual formula. The two accessors necessarily disagree with
-    // each other now, where python-z's single object agreed with itself by
-    // construction; that is the cost of fixing one without regressing the
-    // other's already-measured bug.
+    // corresponds to. kernels.cpp's apply_gat and metal_gpu.mm's
+    // KernelEstParamsCPU populate alpha/beta from this, exactly as
+    // compute_robustness does.
     float noise_alpha_shared() const {
         return (alpha_dng[0] + alpha_dng[1] + alpha_dng[2]) / 3.f;
     }
@@ -820,15 +763,6 @@ struct Config {
     // edge even when R and G separately are not, so reconstructing it from a
     // straddling floor costs almost nothing, and all the edge structure comes
     // from G, which always has samples on its own row.
-    // Renormalise the kernel-estimate grey so its noise amplitude matches what
-    // D_th/D_tr are calibrated against, instead of trusting alpha/beta to have
-    // been right. See the block in kernels.cpp estimate_kernels: a DNG with no
-    // NoiseProfile falls back to a fixed alpha with no ISO scaling, and a model
-    // 10x too small drives D to 0 on PURE NOISE -- every pixel then gets the
-    // sharpest anisotropic kernel, oriented by noise. Only engages on a gross
-    // (>2x) mismatch, so a correct profile is untouched.
-    bool  kernel_noise_autoscale = true;
-
     bool  merge_chroma_difference = false;
 
     bool  prealign_enabled    = false;

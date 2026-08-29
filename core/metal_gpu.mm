@@ -1119,15 +1119,10 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t bayer, selection;
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-        float grey_scale = 1.f;  // noise autoscale multiplier (was _pad0)
         uint32_t _pad1 = 0;
         uint32_t _pad2 = 0;
-        // Kernel half-width floor in raw px, so the shader's compute_k floors
-        // where the CPU one does. Defaulted to the real value, not 0: a zero
-        // makes max(k, k_min) a no-op and silently removes the floor.
-        float k_min = 0.17677670f;  // 1/sqrt(32), assigned at the populate site
     };
-    static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
+    static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
 
     const bool bayer = cfg.bayer_mode;
     const int grey_h = bayer ? raw.h / 2 : raw.h;
@@ -1141,13 +1136,11 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
     p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
-    p.k_min = 1.f / std::sqrt(kMergeInvCovMax);
-    // Measured from the frame, not taken from alpha/beta -- see
-    // kernel_noise_autoscale_factor. Shared with the CPU body so the two
-    // paths cannot disagree about the scale D's thresholds are compared at.
-    p.grey_scale = kernel_noise_autoscale_factor(raw, cfg);
-    p.alpha = cfg.noise_alpha_gat();
-    p.beta = cfg.noise_beta_gat();
+    // python-z's single noise_model object, used identically for kernel-GAT
+    // AND for every robustness channel -- no white-balance scaling, no
+    // guide-averaging weight.
+    p.alpha = cfg.noise_alpha_shared();
+    p.beta = cfg.noise_beta_shared();
     p.k_detail = cfg.k_detail;
     p.k_denoise = cfg.k_denoise;
     p.D_th = cfg.D_th;
@@ -2933,12 +2926,9 @@ struct MergeCompParamsCPU {
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
-    // Fail-open at the value merge_soften_max_inv() actually returns: a stale
-    // default here would change kernel width on one path only.
-    float soften_max_inv = kMergeInvCovMax;
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
 };
-static_assert(sizeof(MergeCompParamsCPU) == 100, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -2953,10 +2943,9 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
-    float soften_max_inv = kMergeInvCovMax;
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
 };
-static_assert(sizeof(MergeRefParamsCPU) == 104, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3764,7 +3753,6 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.raw_res_robustness = 0u;
     p.flow_bilinear = flow_sample_mode(cfg);
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
-    p.soften_max_inv = kMergeInvCovMax;
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
@@ -3879,7 +3867,6 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.burst_frames = (float)cfg.burst_frame_count;
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
-    p.soften_max_inv = kMergeInvCovMax;
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
