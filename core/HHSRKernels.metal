@@ -1015,15 +1015,23 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
                            bool raw_det, float soften_max) {
-    float frac_x = kmap_j - trunc(kmap_j);
-    float frac_y = kmap_i - trunc(kmap_i);
+    // Twin of the CPU fix in merge.cpp's interp_inv_cov: frac must use the
+    // SAME rounding mode as the floor index, or a negative kmap (reachable
+    // by accumulate_ref in the leftmost/topmost output column) blends fx/fy
+    // from one cell against a fraction measured relative to a different one
+    // -- an out-of-[0,1] fraction that extrapolates instead of interpolates.
     int fx, fy;
+    float frac_x, frac_y;
     if (raw_det) {
         fx = max(int(kmap_j), 0);
         fy = max(int(kmap_i), 0);
+        frac_x = kmap_j - trunc(kmap_j);
+        frac_y = kmap_i - trunc(kmap_i);
     } else {
         fx = max(int(floor(kmap_j)), 0);
         fy = max(int(floor(kmap_i)), 0);
+        frac_x = kmap_j - floor(kmap_j);
+        frac_y = kmap_i - floor(kmap_i);
     }
     int cx = min(fx + 1, int(cov_w) - 1);
     int cy = min(fy + 1, int(cov_h) - 1);

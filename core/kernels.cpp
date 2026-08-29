@@ -68,7 +68,19 @@ f32 kernel_noise_autoscale_factor(const Image& raw, const Config& cfg) {
     // Only correct GROSS mismatch -- within 2x the declaration is trusted, so a
     // well-formed NoiseProfile is left exactly alone.
     if (k >= 0.5f && k <= 2.f) return 1.f;
-    return (std::isfinite(k) && k > 0.f) ? k : 1.f;
+    if (!std::isfinite(k) || !(k > 0.f)) return 1.f;
+    // Bounded, not just gross-mismatch-gated: a scene whose adjacent-quad
+    // spacing (2 raw px, matching compute_grey_decimate) aliases against real
+    // content -- period-2 checkerboard is the measured worst case, an 85x
+    // apparent mismatch on a scene with an EXACT noise model -- reads as
+    // noise no median can separate from signal at that scale, and would
+    // otherwise scale the grey by two orders of magnitude on a single frame
+    // of real, non-noisy texture. A genuine metadata error (wrong ISO's
+    // NoiseProfile, a missing one) is a sigma-space mismatch of a few x at
+    // most for any plausible ISO gap; clamping to 8x keeps correcting those
+    // while bounding what an aliased scene can do to a kernel that was never
+    // actually noisy.
+    return clampf(k, 1.f / 8.f, 8.f);
 }
 
 CovField estimate_kernels(const Image& raw, const Config& cfg) {

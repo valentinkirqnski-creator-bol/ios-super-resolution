@@ -180,18 +180,38 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
                                   f32& ixx, f32& ixy, f32& iyy, bool raw_det,
                                   f32 soften_max) {
-    // math.modf: fractional part keeps sign of value
-    f32 frac_x = kmap_j - std::trunc(kmap_j);
-    f32 frac_y = kmap_i - std::trunc(kmap_i);
+    // math.modf: fractional part keeps sign of value. The fraction must be
+    // computed with the SAME rounding mode as the floor index below, or a
+    // negative kmap can pick fx/fy from one cell while blending with a
+    // fraction measured against a different one.
     int fx, fy;
+    f32 frac_x, frac_y;
     if (raw_det) {
-        // Python accumulate: floor_x = max(int(kmap_j), 0) — no high clamp
+        // Python accumulate: floor_x = max(int(kmap_j), 0) — no high clamp.
+        // int() truncates toward zero, so frac must too (trunc == floor for
+        // kmap_j >= 0, which is the near-totality of pixels; comparison
+        // frames can still push kmap_j negative near a border under real
+        // motion, where trunc/trunc stays self-consistent -- it reproduces
+        // python-z's own int()-truncation exactly, not a bug this port
+        // introduced).
         fx = std::max((int)kmap_j, 0);
         fy = std::max((int)kmap_i, 0);
+        frac_x = kmap_j - std::trunc(kmap_j);
+        frac_y = kmap_i - std::trunc(kmap_i);
     } else {
-        // Python accumulate_ref: floor_x = int(max(math.floor(grey_pos), 0))
+        // Python accumulate_ref: floor_x = int(max(math.floor(grey_pos), 0)).
+        // frac must be floor-based to match -- trunc disagrees with floor
+        // for negative kmap_j/kmap_i, which the reference path can reach in
+        // the leftmost/topmost output column (coarse_x < 0.5, no flow to
+        // otherwise move it there). Trunc there picked fx from floor(kmap_j)
+        // but blended with a frac measured against trunc(kmap_j) = a
+        // different, un-clamped cell, giving a fraction outside [0,1] and an
+        // extrapolated rather than interpolated covariance right at the
+        // border. Bit-identical to floor/floor for every kmap >= 0.
         fx = std::max((int)std::floor(kmap_j), 0);
         fy = std::max((int)std::floor(kmap_i), 0);
+        frac_x = kmap_j - std::floor(kmap_j);
+        frac_y = kmap_i - std::floor(kmap_i);
     }
     int cx = std::min(fx + 1, covs.w - 1), cy = std::min(fy + 1, covs.h - 1);
 
