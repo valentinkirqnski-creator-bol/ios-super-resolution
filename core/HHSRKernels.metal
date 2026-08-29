@@ -2081,16 +2081,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     }
     float sample_x = float(gid.x) + flow_x;
     float sample_y = float(gid.y) + flow_y;
-    // Eq. 6 aggregates each term into ONE scalar across channels first
-    // (sigma = sqrt(sum of per-channel variances); d/d_ms/d_md are bare
-    // per-pixel scalars, not per-channel), and only then applies max()/
-    // shrinkage once -- see the mirrored comment in apply_noise_model
-    // (robustness.cpp). Summing per-channel max(measured, noise-floor)
-    // instead of max-of-sums is not the same computation and is
-    // systematically more forgiving whenever which term dominates differs
-    // across channels (e.g. a colored edge).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // python-z cuda_apply_noise_model, read literally: each channel gets its
+    // OWN max(measured, noise-floor) and its OWN Wiener shrink (using that
+    // channel's own d_t), and only the RESULTS are summed across channels --
+    // see the mirrored fix in apply_noise_model (robustness.cpp). NOT
+    // max-of-sums / one-shrink-of-sums, which this kernel ran before and
+    // which is a different, more-forgiving computation whenever which term
+    // dominates differs across channels (e.g. a colored edge).
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -2105,23 +2102,22 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         else if (id_noise >= int(p.curve_n))
             id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
-        // std_curve/diff_curve hold up to 3 concatenated per-channel curves
-        // (metal_gpu.mm), each ch its own -- not one shared by every guide
-        // channel. See Config::noise_alpha_ch/noise_beta_ch (types.h).
+        // std_curve/diff_curve hold curve_nch concatenated curves
+        // (metal_gpu.mm); every slot is now the SAME shared curve (python-z
+        // parity -- one (alpha,beta), used identically for every channel),
+        // so this offset still resolves correctly whether curve_nch is 1 or 3.
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+        d_sq_ += d_p_sq * shrink * shrink;
     }
-    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    d_sq_ = d_ms_sq * shrink * shrink;
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -2181,11 +2177,10 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
-    // Same aggregate-then-max / aggregate-then-shrink as rob_make_mask's
-    // fixed form -- see the comment there and in apply_noise_model
-    // (robustness.cpp).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // python-z parity: each channel's own max(measured, floor) and own
+    // Wiener shrink, summed after -- see rob_make_mask and apply_noise_model
+    // (robustness.cpp) for the same fix and the reasoning.
+    float sigma_sq_ = 0.f, d_sq_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2200,16 +2195,13 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        sigma_sq_ += max(ref_vars[o], sigma_t * sigma_t);
+        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+        d_sq_ += d_p_sq * shrink * shrink;
     }
-    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    float d_sq_ = d_ms_sq * shrink * shrink;
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)

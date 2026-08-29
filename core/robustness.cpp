@@ -537,11 +537,15 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     // to the previous 0.5*gsum for any Bayer pattern -- scaling by 1 and by 1/2
     // are both exact in IEEE754 -- but it stays correct, and stays in step with
     // Config::noise_guide_weight, if a pattern ever arrives with a different
-    // count.
-    f32 inv[3];
+    // count. undo[c] folds in Config::guide_wb_undo -- python-z divides each
+    // site by wb[c] before averaging (robustness.py compute_guide_image);
+    // since that factor is constant per channel it commutes with the /n
+    // average, so multiplying the finished sum once is bit-identical to
+    // dividing each of the n samples first.
+    f32 undo[3];
     for (int c = 0; c < 3; ++c) {
         const int n = cfg.cfa.count((uint8_t)c);
-        inv[c] = (n > 0) ? 1.f / (f32)n : 0.f;
+        undo[c] = (n > 0) ? cfg.guide_wb_undo(c) / (f32)n : 0.f;
     }
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {
@@ -552,7 +556,7 @@ Image compute_guide(const Image& raw, const Config& cfg) {
                     if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
                 }
             }
-            for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c];
+            for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * undo[c];
         }
     }
     return guide;
@@ -678,20 +682,17 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            // Eq. 6 aggregates each term into ONE scalar across channels
-            // first (sigma = sqrt(sum of per-channel variances), Eq 6's d/
-            // d_ms/d_md are bare per-pixel scalars, not per-channel), and
-            // only then applies max()/shrinkage once. Summing per-channel
-            // max(measured, noise-floor) instead of max-of-sums is not the
-            // same computation: max(a,b) >= a and >= b always, so
-            // sum(max(a_c,b_c)) >= max(sum(a_c), sum(b_c)) in every case,
-            // strictly greater whenever which term dominates differs across
-            // channels (e.g. a colored edge: real structure in one channel,
-            // near-zero in the others). That inflates sigma^2, which shrinks
-            // d^2/sigma^2 and makes R more forgiving than Eq. 6 specifies
-            // exactly in that mixed-channel-dominance case.
-            f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-            f32 d_ms_sq = 0.f, d_md_sq = 0.f;
+            // python-z cuda_apply_noise_model, read literally: each channel
+            // gets its OWN max(measured, noise-floor) and its OWN Wiener
+            // shrink, using that channel's own d_t, and only the RESULTS are
+            // summed across channels. Not max-of-sums / one-shrink-of-sums --
+            // those are a different, later computation this port used to run
+            // instead (see git history), on the (debatable, but not
+            // reference-matching) argument that Eq. 6's d/sigma are bare
+            // per-pixel scalars rather than per-channel. Matching python-z
+            // here means matching ITS order, not re-deriving one from the
+            // paper text.
+            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -706,15 +707,12 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                sigma_ms_sq += ref_vars.at(y, x, ch);
-                sigma_md_sq += sigma_t * sigma_t;
-                f32 d_p_ = d_p.at(y, x, ch);
-                d_ms_sq += d_p_ * d_p_;
-                d_md_sq += d_t * d_t;
+                f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                f32 d_p_sq = d_p.at(y, x, ch) * d_p.at(y, x, ch);
+                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
             }
-            f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-            f32 d_sq_ = d_ms_sq * shrink * shrink;
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }
@@ -727,10 +725,10 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 // H*W*3 floats (146 MB on a 12 MP frame) written once and read once by the
 // very next stage -- the single biggest allocation in the raw-resolution
 // robustness path, and the one that pushed a multi-frame burst past the
-// memory ceiling. Arithmetic is identical to apply_noise_model above
-// (same sum-across-channels-then-combine-once order); an out-of-bounds
-// Dodgson sample arrives as +inf in comp_means and must stay +inf in the
-// difference so R lands at 0 downstream.
+// memory ceiling. Arithmetic is identical to apply_noise_model above: each
+// channel's own max(measured, floor) and own Wiener shrink, summed after. An
+// out-of-bounds Dodgson sample arrives as +inf in comp_means and must stay
+// +inf in the difference so R lands at 0 downstream.
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
@@ -740,8 +738,7 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     parallel_rows(ref_means.h, num_threads, [&](int y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-            f32 d_ms_sq = 0.f, d_md_sq = 0.f;
+            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -754,18 +751,17 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                sigma_ms_sq += ref_vars.at(y, x, ch);
-                sigma_md_sq += sigma_t * sigma_t;
                 const f32 comp = comp_means.at(y, x, ch);
                 f32 d_p_ = std::isfinite(comp)
                     ? std::fabs(brightness - comp)
                     : std::numeric_limits<f32>::infinity();
-                d_ms_sq += d_p_ * d_p_;
-                d_md_sq += d_t * d_t;
+                f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                f32 d_p_sq = d_p_ * d_p_;
+                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
             }
-            f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-            d_sq.at(y, x) = d_ms_sq * shrink * shrink;
+            d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }
     });
@@ -776,18 +772,13 @@ static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
     const f32 inf = std::numeric_limits<f32>::infinity();
     std::vector<f32> S((size_t)flow.ny * flow.nx, s2);
     if (irregular_out) irregular_out->assign((size_t)flow.ny * flow.nx, 0u);
-    // Measured on the alignment grid by mark_motion_irregular_tiles and carried
-    // through flow_to_raw_tile_grid. Re-deriving it from a field whose tiles
-    // have been duplicated 2x and whose displacements have been scaled 2x
-    // measures a different span; see the note on FlowField::motion_irregular.
-    if (flow.has_motion_prior()) {
-        for (size_t i = 0; i < S.size(); ++i) {
-            const bool irregular = flow.motion_irregular[i] != 0u;
-            S[i] = irregular ? s1 : s2;
-            if (irregular_out) (*irregular_out)[i] = irregular ? 1u : 0u;
-        }
-        return S;
-    }
+    // python-z parity: cuda_compute_s always recomputes the Eq. 7/8 span
+    // live, on the exact flow array compute_robustness receives -- which is
+    // `flow` right here, so the live loop below already operates on the
+    // correct array with no extra plumbing needed. This used to shortcut to
+    // FlowField::motion_irregular, a value measured earlier in alignment on
+    // an unduplicated, unscaled grid (see that field's own comment) --
+    // deliberate at the time, but not what python-z does, so it is gone.
     for (int ty = 0; ty < flow.ny; ++ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             // Python: mini = +1/0, maxi = -1/0
@@ -893,13 +884,14 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
     }
 
-    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
-    if (ref_stats.means.c == 3) {
-        for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
-    } else {
-        nc_ch[0] = &mask_noise_curves(cfg);
-    }
+    // python-z parity: ONE shared curve, reused for every guide channel --
+    // robustness.py derives a single (alpha, beta) once and scores R/G/B
+    // against the same std_curve/diff_curve, never a per-channel variant.
+    // mask_noise_curves(cfg) already reads Config::noise_alpha_robustness(),
+    // which is that shared, unscaled value; the same pointer just goes in
+    // every slot instead of building three different curves.
+    const NoiseCurves& shared_curve = mask_noise_curves(cfg);
+    const NoiseCurves* nc_ch[3] = {&shared_curve, &shared_curve, &shared_curve};
 
     // Comparison frame's own local stats, still built at guide resolution
     // (compute_guide/local_stats_3x3 are unchanged) -- only the upscale step
@@ -923,9 +915,13 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             Image comp_vars_guide; // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
+        // Nearest, always -- not cfg.flow_bilinear_sampling. python-z's
+        // cuda_uspcale_dogson has no interpolation option: the flow lookup
+        // inside the Dogson warp is a bare per-tile array index
+        // (patch_idy = int(y // tile_size)) under every configuration.
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads,
-                                        cfg.flow_bilinear_sampling);
+                                        /*bilinear_flow=*/false);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -973,10 +969,14 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             R.at(y, x) = r_val;
         }
     }
-    // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
-    // there (= the paper's 10x10-raw footprint), nearest-upsample back.
-    // See local_min_5x5_on_guide.
-    return local_min_5x5_on_guide(R);
+    // python-z parity: cuda_compute_local_min is a literal 5x5, clamped-edge
+    // window run directly on the raw-resolution R -- no guide-grid collapse,
+    // no upsample-back staircase. local_min_5x5_on_guide (still below, and
+    // still reachable via robustness_local_min_on_guide for anything that
+    // wants the coarser, cheaper approximation) exists as a distinct,
+    // non-default choice now, not what this path claims to be exact to
+    // python-z runs.
+    return local_min_5x5(R);
 }
 
 Image robustness_local_min_on_guide(const Image& R) {

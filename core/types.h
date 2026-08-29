@@ -475,6 +475,26 @@ struct Config {
         const float g = white_balance[c] / white_balance[1];
         return (std::isfinite(g) && g > 0.f) ? g : 1.f;
     }
+    // Undo the white-balance multiply the raw loader applied, so the guide
+    // (and every d/sigma/R built from it) lives in sensor-native units --
+    // robustness.py's compute_guide_image: "x = raw_img[...] / wb[c] # Undo
+    // whitebalance", called with wb = the RAW (not green-normalized)
+    // white_balance array, the same one this port stores here.
+    //
+    // NOT the same factor as noise_wb_gain(c) above. The loader multiplies by
+    // k[c] = white_balance[c]/white_balance[1] (raw_io.cpp / SRBridge.mm,
+    // matching utils_dng.py's k), so dividing by white_balance[c] (python-z's
+    // literal divisor, not k[c]) leaves a residual UNIFORM 1/white_balance[1]
+    // scale on every channel -- which is what python-z's own guide actually
+    // ends up in, not fully undone sensor units. Replicated exactly rather
+    // than "corrected further", since the ask is to match the reference, not
+    // improve on it.
+    float guide_wb_undo(int c) const {
+        if (!raw_prewhitened) return 1.f;
+        if (c < 0 || c > 2) return 1.f;
+        const float wb = white_balance[c];
+        return (std::isfinite(wb) && wb > 0.f) ? 1.f / wb : 1.f;
+    }
     // Per-guide-channel variance weight: the reciprocal of how many Bayer sites
     // compute_guide averaged into that channel. Two greens gives 1/2, single R
     // and B give 1. Read from the CFA rather than hardcoded, so it tracks
@@ -542,6 +562,31 @@ struct Config {
         const float g = noise_wb_gain(c);
         return beta_dng[c] * g * g * noise_guide_weight(c);
     }
+    // python-z's actual noise model: a single (alpha, beta) scalar
+    // (config.noise_model.alpha/beta), used identically for kernel-GAT AND
+    // for every robustness channel, with NO white-balance scaling and NO
+    // guide-averaging weight -- super_resolution.py:230 reads it once, passes
+    // the same object into both estimate_kernels and compute_robustness.
+    // Plain mean of the three declared per-channel values, matching what a
+    // single scalar reduction of a 3-plane DNG NoiseProfile most directly
+    // corresponds to.
+    //
+    // NOT used by this port's own GAT (noise_alpha_gat/beta_gat, a deliberate
+    // earlier fix for a real measured bug: an unscaled model let a noisy
+    // frame's kernels collapse to the sharpest, most anisotropic shape
+    // available on pure sensor noise -- see kernel_noise_autoscale_factor).
+    // Reverting that fix is not what matching robustness asks for, so GAT
+    // keeps its own accessor and this one exists only for robustness to reach
+    // python-z's actual formula. The two accessors necessarily disagree with
+    // each other now, where python-z's single object agreed with itself by
+    // construction; that is the cost of fixing one without regressing the
+    // other's already-measured bug.
+    float noise_alpha_shared() const {
+        return (alpha_dng[0] + alpha_dng[1] + alpha_dng[2]) / 3.f;
+    }
+    float noise_beta_shared() const {
+        return (beta_dng[0] + beta_dng[1] + beta_dng[2]) / 3.f;
+    }
     // Debug: zero the noise model as read by the ROBUSTNESS MASK only. With
     // it on, apply_noise_model's sigma_t and d_t collapse to 0 for every
     // brightness bin, so sigma_sq = measured variance unfloored and the
@@ -565,18 +610,22 @@ struct Config {
     // (green averages two samples). Gated by debug_noise_model_disabled;
     // GAT/SNR read the ungated noise_alpha()/noise_beta().
     //
-    // Known, accepted imprecision of this space: the Monte-Carlo curves
-    // model sensor clipping at brightness 1.0, but WB'd red/blue clip at
-    // roughly their gain (>1), so the rolloff near the white point applies
-    // at the wrong brightness for those channels. The sensor-space
-    // alternative was measured on the ok/ burst and reverted by explicit
-    // choice.
+    // python-z parity: ONE shared, unscaled value -- see noise_alpha_shared()
+    // above. Previously WB-scaled and split per channel (noise_alpha_ch,
+    // "eca686c's convention", kept below for anyone who turns raw-resolution
+    // robustness off and wants that behaviour back), which is not what
+    // robustness.py does: it derives a single (alpha, beta) once and scores
+    // every guide channel against the same curve, unscaled by white balance.
     float noise_alpha_robustness() const {
-        return debug_noise_model_disabled ? 0.f : noise_alpha();
+        return debug_noise_model_disabled ? 0.f : noise_alpha_shared();
     }
     float noise_beta_robustness() const {
-        return debug_noise_model_disabled ? 0.f : noise_beta();
+        return debug_noise_model_disabled ? 0.f : noise_beta_shared();
     }
+    // Retained for the non-default (robustness_raw_resolution_enabled=false,
+    // no longer python-z-exact) guide-resolution path; no longer called by
+    // the raw-resolution one, which uses noise_alpha_robustness() for every
+    // channel instead. See the comment above noise_alpha_ch.
     float noise_alpha_ch_robustness(int c) const {
         return debug_noise_model_disabled ? 0.f : noise_alpha_ch(c);
     }
@@ -851,20 +900,25 @@ struct Config {
     // native raw-tile-grid granularity, so the case for this is weaker
     // there.
     //
-    // Off by default: ~4x the pixel count for R and the new upscale
-    // buffers, and merge.cpp's R-sampling coordinate math has to know
-    // which resolution R actually is this run (it reads it off the mask's
-    // own dimensions rather than trusting this flag, because this path
-    // silently falls back to guide resolution when the hires ref stats
-    // are missing).
-
-    bool robustness_raw_resolution_enabled = false;
+    // On by default: python-z's Algorithm 6 has no guide-resolution mode at
+    // all -- compute_guide_image always halves the raw regardless of how
+    // alignment's own grey was built, and compute_robustness always
+    // Dodgson-upscales those guide stats back to full raw resolution before
+    // computing d/sigma/R. The restriction this used to carry to
+    // grey_method == Decimate had no basis in that: compute_guide's 2x2
+    // decimation is independent of align()'s grey_method, so the mismatch
+    // this path corrects exists on the FFT grey exactly as much as on the
+    // decimate one. Off costs ~4x the pixel count for R and the upscale
+    // buffers; merge.cpp's R-sampling coordinate math needs no change either
+    // way, since it reads the resolution off the mask's own dimensions
+    // rather than trusting this flag.
+    bool robustness_raw_resolution_enabled = true;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
     // which one gates it.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
+        return robustness_raw_resolution_enabled;
     }
     // Sample the per-tile flow BILINEARLY between tile centres wherever it is
     // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution

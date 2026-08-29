@@ -1343,11 +1343,12 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        // Guide stays in WB space (eca686c convention): the kernel's wb
-        // multipliers are unity no-ops.
-        gp.wb0 = 1.f;
-        gp.wb1 = 1.f;
-        gp.wb2 = 1.f;
+        // python-z parity: undo the white-balance multiply so the guide (and
+        // every d/sigma/R built from it) lives in sensor-native units, same
+        // as compute_guide's CPU twin -- see Config::guide_wb_undo.
+        gp.wb0 = cfg.guide_wb_undo(0);
+        gp.wb1 = cfg.guide_wb_undo(1);
+        gp.wb2 = cfg.guide_wb_undo(2);
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];
@@ -1386,6 +1387,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     b_out = buf(nullptr, out_b);
     if (!b_out) return false;
 
+    (void)flow_mode;  // see below: this call always forces nearest now.
     RobDogsonParamsCPU dp{};
     dp.in_h = (uint32_t)in_h;
     dp.in_w = (uint32_t)in_w;
@@ -1393,16 +1395,26 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.out_w = (uint32_t)out_w;
     dp.nch = (uint32_t)nch;
     dp.is_ref = is_ref ? 1u : 0u;
+    // python-z parity: cuda_uspcale_dogson's flow lookup is a bare per-tile
+    // array index at the ORIGINAL tile_size -- no interpolation, and no finer
+    // sub-tile lattice. Bind the coarse array directly rather than going
+    // through flow_gpu_grid, which would swap in the fine boundary-select/
+    // dense-LK lattice when present; patch_idy = y/tile_size must land on
+    // exactly the tile python-z's alignments array holds, always.
     const f32* fg_dat = nullptr;
     size_t fg_bytes = 0;
     int fg_ny = 0, fg_nx = 0, fg_ts = tile_size;
-    if (!is_ref && flow)
-        (void)flow_gpu_grid(*flow, tile_size, fg_dat, fg_bytes, fg_ny, fg_nx, fg_ts);
+    if (!is_ref && flow) {
+        fg_dat = flow->flow.data();
+        fg_bytes = flow->flow.size() * sizeof(float);
+        fg_ny = flow->ny;
+        fg_nx = flow->nx;
+    }
     dp.tile_size = (uint32_t)std::max(0, fg_ts);
     dp.flow_ny = (!is_ref && flow) ? (uint32_t)fg_ny : 0u;
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)fg_nx : 0u;
     dp.s = 2.f;
-    dp.flow_bilinear = flow_mode;
+    dp.flow_bilinear = 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && fg_dat && fg_bytes) {
@@ -1576,11 +1588,16 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
 
+    // python-z parity: ONE shared curve in every slot -- robustness.py scores
+    // every guide channel against the same (alpha, beta), never a per-channel
+    // variant. Same curve copied into all curve_nch slots rather than the
+    // shader reading one shared buffer, so rob_make_mask_raw's existing
+    // per-channel offset (ch * p.curve_n + id) needs no change.
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
-        const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
-        const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
+        const f32 a = cfg.noise_alpha_robustness();
+        const f32 b = cfg.noise_beta_robustness();
         if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b) curves_stale = true;
     }
     if (curves_stale) {
@@ -1588,10 +1605,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         size_t n = 0;
         for (int ch = 0; ch < curve_nch; ++ch) {
             std::vector<f32> std_curve, diff_curve;
-            if (curve_nch == 3)
-                fetch_noise_curves_channel(cfg, ch, std_curve, diff_curve);
-            else
-                fetch_noise_curves(cfg, std_curve, diff_curve);
+            fetch_noise_curves(cfg, std_curve, diff_curve);
             if (std_curve.empty() || diff_curve.empty()) return Image();
             if (ch == 0) {
                 n = std_curve.size();
@@ -1602,8 +1616,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
             }
             std::copy(std_curve.begin(), std_curve.end(), std_all.begin() + (size_t)ch * n);
             std::copy(diff_curve.begin(), diff_curve.end(), diff_all.begin() + (size_t)ch * n);
-            g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
-            g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
+            g_rob_curve_alpha[ch] = cfg.noise_alpha_robustness();
+            g_rob_curve_beta[ch] = cfg.noise_beta_robustness();
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
@@ -1660,14 +1674,35 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
+    // python-z parity: cuda_compute_local_min is a literal 5x5, clamped-edge
+    // window run directly on the raw-resolution R -- rob_local_min_5x5 is
+    // exactly that kernel, already used by the guide-resolution path below.
+    // Chained into this same command buffer rather than round-tripping R
+    // through the CPU's guide-grid approximation (robustness_local_min_
+    // on_guide), which stayed on Apple builds only as a fallback this path
+    // no longer takes.
+    id<MTLBuffer> b_R_min = buf(nullptr, mask_b);
+    if (!b_R_min) return Image();
+    RobStatsParamsCPU sp{};
+    sp.h = (uint32_t)ch_h;
+    sp.w = (uint32_t)ch_w;
+    sp.nch = 1u;
+    enc = [cmd computeCommandEncoder];
+    if (!enc) return Image();
+    [enc setBuffer:b_R_min offset:0 atIndex:0];
+    [enc setBuffer:b_R offset:0 atIndex:1];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+    dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
+    [enc endEncoding];
+
     prof_tag_gpu(cmd, "robustness:raw-res");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    Image R_pre(ch_h, ch_w, 1);
-    memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    return robustness_local_min_on_guide(R_pre);
+    Image R_final(ch_h, ch_w, 1);
+    memcpy(R_final.data.data(), [b_R_min contents], mask_b);
+    return R_final;
 }
 
 static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
