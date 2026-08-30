@@ -94,6 +94,97 @@ static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
     return n ? sm / (f32)n : 0.f;
 }
 
+// Standalone classical Bayer demosaic, used ONLY as accumulate_ref's
+// per-channel fallback (Config::merge_ref_fallback_enabled below) for output
+// pixels the merge kernel could not actually cover. Deliberately independent
+// of bayer_green_at above: this is full Hamilton & Adams (2-tap average of
+// the same-axis green neighbours, corrected by that axis's own second
+// derivative -- same-colour samples two taps away -- which cancels the
+// low-frequency part of an edge crossing the interpolation and is what keeps
+// a hard edge from bleeding colour into the green plane), then colour-
+// difference red/blue: chrominance (channel minus green) varies far more
+// smoothly across an edge than the raw channel does, so interpolating THAT
+// and adding the local green back is what keeps the fallback from smearing
+// colour across edges the way a flat channel average would.
+static inline f32 classical_green_at(const Image& img, const CFA& cfa, int y, int x) {
+    if (cfa.p[y & 1][x & 1] == 1) return img.at(y, x);
+    const int h = img.h, w = img.w;
+    auto cl = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    const int yu = cl(y - 1, 0, h - 1), yd = cl(y + 1, 0, h - 1);
+    const int yu2 = cl(y - 2, 0, h - 1), yd2 = cl(y + 2, 0, h - 1);
+    const int xl = cl(x - 1, 0, w - 1), xr = cl(x + 1, 0, w - 1);
+    const int xl2 = cl(x - 2, 0, w - 1), xr2 = cl(x + 2, 0, w - 1);
+    const f32 c0 = img.at(y, x);
+    const f32 gL = img.at(y, xl), gR = img.at(y, xr);
+    const f32 cL2 = img.at(y, xl2), cR2 = img.at(y, xr2);
+    const f32 gU = img.at(yu, x), gD = img.at(yd, x);
+    const f32 cU2 = img.at(yu2, x), cD2 = img.at(yd2, x);
+    const f32 dH = std::fabs(gL - gR) + std::fabs(2.f * c0 - cL2 - cR2);
+    const f32 dV = std::fabs(gU - gD) + std::fabs(2.f * c0 - cU2 - cD2);
+    const f32 eH = 0.5f * (gL + gR) + 0.25f * (2.f * c0 - cL2 - cR2);
+    const f32 eV = 0.5f * (gU + gD) + 0.25f * (2.f * c0 - cU2 - cD2);
+    if (dH < dV) return eH;
+    if (dV < dH) return eV;
+    return 0.5f * (eH + eV);
+}
+
+// Interpolated (target_ch - green) chroma at (y,x), whatever colour (y,x)
+// actually is. A green site has the target colour on one orthogonal axis
+// (2-tap average); the opposite-colour site (e.g. red requested at a blue
+// site) only has it on the four diagonals (4-tap average).
+static inline f32 classical_chroma_at(const Image& img, const CFA& cfa, int y, int x, int target_ch) {
+    const int h = img.h, w = img.w;
+    auto cl = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    const int site = cfa.p[y & 1][x & 1];
+    if (site == target_ch)
+        return img.at(y, x) - classical_green_at(img, cfa, y, x);
+    if (site == 1) {
+        const int xl = cl(x - 1, 0, w - 1), xr = cl(x + 1, 0, w - 1);
+        if (cfa.p[y & 1][xl & 1] == target_ch || cfa.p[y & 1][xr & 1] == target_ch) {
+            const f32 a = img.at(y, xl) - classical_green_at(img, cfa, y, xl);
+            const f32 b = img.at(y, xr) - classical_green_at(img, cfa, y, xr);
+            return 0.5f * (a + b);
+        }
+        const int yu = cl(y - 1, 0, h - 1), yd = cl(y + 1, 0, h - 1);
+        const f32 a = img.at(yu, x) - classical_green_at(img, cfa, yu, x);
+        const f32 b = img.at(yd, x) - classical_green_at(img, cfa, yd, x);
+        return 0.5f * (a + b);
+    }
+    const int yu = cl(y - 1, 0, h - 1), yd = cl(y + 1, 0, h - 1);
+    const int xl = cl(x - 1, 0, w - 1), xr = cl(x + 1, 0, w - 1);
+    const f32 a = img.at(yu, xl) - classical_green_at(img, cfa, yu, xl);
+    const f32 b = img.at(yu, xr) - classical_green_at(img, cfa, yu, xr);
+    const f32 c = img.at(yd, xl) - classical_green_at(img, cfa, yd, xl);
+    const f32 d = img.at(yd, xr) - classical_green_at(img, cfa, yd, xr);
+    return 0.25f * (a + b + c + d);
+}
+
+static inline f32 classical_demosaic_at(const Image& img, const CFA& cfa, int y, int x, int ch) {
+    const f32 g = classical_green_at(img, cfa, y, x);
+    return (ch == 1) ? g : (g + classical_chroma_at(img, cfa, y, x, ch));
+}
+
+// Bilinear blend of the classical demosaic at the 4 integer raw taps around
+// a fractional raw-resolution coordinate -- the same "sample the reference at
+// a fractional position" shape accumulate_ref's own kernel regression uses,
+// so the fallback lands at the exact position its virtual tap is meant to
+// stand in for.
+static inline f32 classical_demosaic_bilinear(const Image& img, const CFA& cfa, f32 y, f32 x, int ch) {
+    const int h = img.h, w = img.w;
+    const int y0 = std::min(std::max((int)std::floor(y), 0), h - 1);
+    const int x0 = std::min(std::max((int)std::floor(x), 0), w - 1);
+    const int y1 = std::min(y0 + 1, h - 1), x1 = std::min(x0 + 1, w - 1);
+    const f32 fy = std::min(std::max(y - (f32)y0, 0.f), 1.f);
+    const f32 fx = std::min(std::max(x - (f32)x0, 0.f), 1.f);
+    const f32 tl = classical_demosaic_at(img, cfa, y0, x0, ch);
+    const f32 tr = classical_demosaic_at(img, cfa, y0, x1, ch);
+    const f32 bl = classical_demosaic_at(img, cfa, y1, x0, ch);
+    const f32 br = classical_demosaic_at(img, cfa, y1, x1, ch);
+    const f32 top = tl + fx * (tr - tl);
+    const f32 bot = bl + fx * (br - bl);
+    return top + fy * (bot - top);
+}
+
 static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -548,6 +639,27 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 const f32 G = (dG > 0.f) ? num.at(local_i, hr_j, 1) / dG : 0.f;
                 num.at(local_i, hr_j, 0) += G * den.at(local_i, hr_j, 0);
                 num.at(local_i, hr_j, 2) += G * den.at(local_i, hr_j, 2);
+            }
+
+            // Per-channel reference-demosaic fallback. Below a trusted weight,
+            // top the accumulator up with a virtual tap at the classical
+            // demosaic's estimate instead of letting the channel's own
+            // division site default to 0: num += (w_min - w) * fallback,
+            // den = w_min. A pixel already at or above w_min is untouched; one
+            // at exactly 0 gets the fallback value outright; anything between
+            // blends continuously, so there is no seam where this engages.
+            // Last write to this pixel -- after chroma-difference, so it sees
+            // real RGB regardless of that mode.
+            if (cfg.merge_ref_fallback_enabled && nch >= 3) {
+                const f32 w_min = cfg.merge_ref_fallback_min_weight;
+                for (int ch = 0; ch < nch; ++ch) {
+                    const f32 w = den.at(local_i, hr_j, ch);
+                    if (w < w_min) {
+                        const f32 fb = classical_demosaic_bilinear(img, cfg.cfa, coarse_y, coarse_x, ch);
+                        num.at(local_i, hr_j, ch) += (w_min - w) * fb;
+                        den.at(local_i, hr_j, ch) = w_min;
+                    }
+                }
             }
         }
     });

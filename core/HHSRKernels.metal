@@ -943,7 +943,9 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
-    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G
+    uint ref_fallback_enabled;
+    float ref_fallback_min_weight; // (108 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -1060,6 +1062,84 @@ inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
     if (ii == 0 && jj == 1) return int(p.cfa01);
     if (ii == 1 && jj == 0) return int(p.cfa10);
     return int(p.cfa11);
+}
+
+// Standalone classical Bayer demosaic -- twin of classical_green_at /
+// classical_chroma_at / classical_demosaic_at / classical_demosaic_bilinear
+// in merge.cpp. Used ONLY as merge_ref_band's per-channel fallback
+// (MergeRefParams::ref_fallback_enabled) for output pixels the merge kernel
+// could not actually cover. Deliberately independent of bayer_green_at
+// above: full Hamilton & Adams (2-tap average of the same-axis green
+// neighbours, corrected by that axis's own second derivative -- same-colour
+// samples two taps away, cancelling the low-frequency part of an edge
+// crossing the interpolation), then colour-difference red/blue.
+inline float classical_green_at(device const float* img, constant MergeRefParams& p, int y, int x) {
+    if (cfa_channel_ref(p, y, x) == 1) return img[uint(y) * p.lr_w + uint(x)];
+    int h = int(p.lr_h), w = int(p.lr_w);
+    int yu = clamp(y - 1, 0, h - 1), yd = clamp(y + 1, 0, h - 1);
+    int yu2 = clamp(y - 2, 0, h - 1), yd2 = clamp(y + 2, 0, h - 1);
+    int xl = clamp(x - 1, 0, w - 1), xr = clamp(x + 1, 0, w - 1);
+    int xl2 = clamp(x - 2, 0, w - 1), xr2 = clamp(x + 2, 0, w - 1);
+    float c0 = img[uint(y) * p.lr_w + uint(x)];
+    float gL = img[uint(y) * p.lr_w + uint(xl)], gR = img[uint(y) * p.lr_w + uint(xr)];
+    float cL2 = img[uint(y) * p.lr_w + uint(xl2)], cR2 = img[uint(y) * p.lr_w + uint(xr2)];
+    float gU = img[uint(yu) * p.lr_w + uint(x)], gD = img[uint(yd) * p.lr_w + uint(x)];
+    float cU2 = img[uint(yu2) * p.lr_w + uint(x)], cD2 = img[uint(yd2) * p.lr_w + uint(x)];
+    float dH = fabs(gL - gR) + fabs(2.f * c0 - cL2 - cR2);
+    float dV = fabs(gU - gD) + fabs(2.f * c0 - cU2 - cD2);
+    float eH = 0.5f * (gL + gR) + 0.25f * (2.f * c0 - cL2 - cR2);
+    float eV = 0.5f * (gU + gD) + 0.25f * (2.f * c0 - cU2 - cD2);
+    if (dH < dV) return eH;
+    if (dV < dH) return eV;
+    return 0.5f * (eH + eV);
+}
+
+inline float classical_chroma_at(device const float* img, constant MergeRefParams& p,
+                                 int y, int x, int target_ch) {
+    int h = int(p.lr_h), w = int(p.lr_w);
+    int site = cfa_channel_ref(p, y, x);
+    if (site == target_ch)
+        return img[uint(y) * p.lr_w + uint(x)] - classical_green_at(img, p, y, x);
+    if (site == 1) {
+        int xl = clamp(x - 1, 0, w - 1), xr = clamp(x + 1, 0, w - 1);
+        if (cfa_channel_ref(p, y, xl) == target_ch || cfa_channel_ref(p, y, xr) == target_ch) {
+            float a = img[uint(y) * p.lr_w + uint(xl)] - classical_green_at(img, p, y, xl);
+            float b = img[uint(y) * p.lr_w + uint(xr)] - classical_green_at(img, p, y, xr);
+            return 0.5f * (a + b);
+        }
+        int yu = clamp(y - 1, 0, h - 1), yd = clamp(y + 1, 0, h - 1);
+        float a = img[uint(yu) * p.lr_w + uint(x)] - classical_green_at(img, p, yu, x);
+        float b = img[uint(yd) * p.lr_w + uint(x)] - classical_green_at(img, p, yd, x);
+        return 0.5f * (a + b);
+    }
+    int yu = clamp(y - 1, 0, h - 1), yd = clamp(y + 1, 0, h - 1);
+    int xl = clamp(x - 1, 0, w - 1), xr = clamp(x + 1, 0, w - 1);
+    float a = img[uint(yu) * p.lr_w + uint(xl)] - classical_green_at(img, p, yu, xl);
+    float b = img[uint(yu) * p.lr_w + uint(xr)] - classical_green_at(img, p, yu, xr);
+    float c = img[uint(yd) * p.lr_w + uint(xl)] - classical_green_at(img, p, yd, xl);
+    float d = img[uint(yd) * p.lr_w + uint(xr)] - classical_green_at(img, p, yd, xr);
+    return 0.25f * (a + b + c + d);
+}
+
+inline float classical_demosaic_at(device const float* img, constant MergeRefParams& p,
+                                   int y, int x, int ch) {
+    float g = classical_green_at(img, p, y, x);
+    return (ch == 1) ? g : (g + classical_chroma_at(img, p, y, x, ch));
+}
+
+inline float classical_demosaic_bilinear(device const float* img, constant MergeRefParams& p,
+                                         float y, float x, int ch) {
+    int h = int(p.lr_h), w = int(p.lr_w);
+    int y0 = clamp(int(floor(y)), 0, h - 1), x0 = clamp(int(floor(x)), 0, w - 1);
+    int y1 = min(y0 + 1, h - 1), x1 = min(x0 + 1, w - 1);
+    float fy = clamp(y - float(y0), 0.f, 1.f), fx = clamp(x - float(x0), 0.f, 1.f);
+    float tl = classical_demosaic_at(img, p, y0, x0, ch);
+    float tr = classical_demosaic_at(img, p, y0, x1, ch);
+    float bl = classical_demosaic_at(img, p, y1, x0, ch);
+    float br = classical_demosaic_at(img, p, y1, x1, ch);
+    float top = tl + fx * (tr - tl);
+    float bot = bl + fx * (br - bl);
+    return top + fy * (bot - top);
 }
 
 // Bilinear sample of the per-tile flow at a RAW position. Twin of
@@ -1602,6 +1682,21 @@ inline void merge_accumulate_ref_body(device AccT* num,
         const float G = (dG > 0.f) ? float(num[base + 1]) / dG : 0.f;
         num[base + 0] = AccT(float(num[base + 0]) + G * float(den[base + 0]));
         num[base + 2] = AccT(float(num[base + 2]) + G * float(den[base + 2]));
+    }
+
+    // Per-channel reference-demosaic fallback -- twin of the block in
+    // accumulate_ref, merge.cpp. Last write to this pixel, after the
+    // chroma-difference un-differencing above so it always sees real RGB.
+    if (p.ref_fallback_enabled != 0u && p.nch >= 3) {
+        for (int ch = 0; ch < int(p.nch); ++ch) {
+            uint idx = base + uint(ch);
+            float w = float(den[idx]);
+            if (w < p.ref_fallback_min_weight) {
+                float fb = classical_demosaic_bilinear(img, p, coarse_y, coarse_x, ch);
+                num[idx] = AccT(float(num[idx]) + (p.ref_fallback_min_weight - w) * fb);
+                den[idx] = AccT(p.ref_fallback_min_weight);
+            }
+        }
     }
 }
 

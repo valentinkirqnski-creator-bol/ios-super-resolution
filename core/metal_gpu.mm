@@ -2944,8 +2944,10 @@ struct MergeRefParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
+    uint32_t ref_fallback_enabled = 0;
+    float ref_fallback_min_weight = 0.f;
 };
-static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 108, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3876,6 +3878,8 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     // accumulate_ref in merge.cpp.
     p.raw_res_robustness =
         (denoise && p.acc_h == p.lr_h && p.acc_w == p.lr_w) ? 1u : 0u;
+    p.ref_fallback_enabled = cfg.merge_ref_fallback_enabled ? 1u : 0u;
+    p.ref_fallback_min_weight = cfg.merge_ref_fallback_min_weight;
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {

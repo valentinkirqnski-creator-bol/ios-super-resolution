@@ -765,6 +765,24 @@ struct Config {
     // from G, which always has samples on its own row.
     bool  merge_chroma_difference = false;
 
+    // Per-channel fallback for the reference frame's own merge pass: when a
+    // channel's accumulated weight at an output pixel falls below
+    // merge_ref_fallback_min_weight, blend in a value from a standalone
+    // classical Bayer demosaic (Hamilton-Adams green, colour-difference
+    // red/blue) of the reference frame at that pixel, as an additional
+    // weighted tap rather than a hard branch or a blind isotropic floor.
+    // Neither python-z nor ImageStackAlignator's super-resolution mode does
+    // this -- python-z has no such fallback at all (a full float32 burst
+    // keeps every channel populated by construction), and ImageStackAlignator
+    // has one, but it is gated to a threshold of 0 in SR mode, making it dead
+    // code there; only its separate, non-SR classic-merge mode actually uses
+    // it. This closes that gap for the SR path specifically.
+    bool  merge_ref_fallback_enabled    = true;
+    // In the same weight units as a single kernel tap (max 1.0 at dead
+    // centre, plus a small cover_eps contribution). Below this, the channel
+    // is considered too thinly sampled to trust on its own.
+    float merge_ref_fallback_min_weight = 0.35f;
+
     bool  prealign_enabled    = false;
 
     // Layer 3: dense Lucas-Kanade refinement (ISA lucasKanadeOptim). Replaces
