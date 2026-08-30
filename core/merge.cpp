@@ -185,6 +185,33 @@ static inline f32 classical_demosaic_bilinear(const Image& img, const CFA& cfa, 
     return top + fy * (bot - top);
 }
 
+// Guard against singular/near-singular covariance inversions producing
+// infinitely sharp kernels. That can leave R/B denominators at zero while G
+// receives weight, showing up as green or black speckles. Removed at ff54ccf
+// for python-z parity ("python-z does not have it"), restored on request:
+// beyond the speckle guard, capping every inverse-covariance element at 32
+// bounds how sharp any merge kernel can get, which dilutes the colour
+// fringing that residual (robustness-unrejected) misalignments otherwise
+// print at full kernel sharpness -- the 832f7b8-vs-HEAD difference isolated
+// earlier. Whole-matrix rescale form, verbatim from 832f7b8. Deliberate
+// deviation from python-z. Twin in HHSRKernels.metal soften_inv_cov.
+static inline void soften_inv_cov(f32& ixx, f32& ixy, f32& iyy) {
+    constexpr f32 k_max_abs = 32.f;
+    f32 m = std::max(std::fabs(ixx), std::max(std::fabs(iyy), std::fabs(ixy)));
+    if (!(m > k_max_abs) || !std::isfinite(m)) {
+        if (!std::isfinite(ixx) || !std::isfinite(ixy) || !std::isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
+        return;
+    }
+    f32 s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
 static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -272,6 +299,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().

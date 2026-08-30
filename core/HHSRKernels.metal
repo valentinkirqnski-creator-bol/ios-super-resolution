@@ -970,6 +970,29 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
     return top + frac_y * (bot - top);
 }
 
+// Twin of soften_inv_cov in merge.cpp: cap every inverse-covariance element
+// at 32 (whole-matrix rescale, verbatim from 832f7b8), bounding kernel
+// sharpness so residual robustness-unrejected misalignments dilute into
+// blur instead of printing as full-sharpness colour fringes; non-finite
+// matrices land on a safe isotropic fallback. Deliberate deviation from
+// python-z, restored on request -- see the CPU twin's comment.
+inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
+    const float k_max_abs = 32.f;
+    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
+    if (!(m > k_max_abs) || !isfinite(m)) {
+        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
+            ixx = 2.f;
+            ixy = 0.f;
+            iyy = 2.f;
+        }
+        return;
+    }
+    float s = k_max_abs / m;
+    ixx *= s;
+    ixy *= s;
+    iyy *= s;
+}
+
 // raw_det=true -> accumulate (comp); false -> accumulate_ref
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
@@ -1021,6 +1044,7 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
+    soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Twin of bayer_green_at in merge.cpp: directional (Hamilton-Adams) green at
