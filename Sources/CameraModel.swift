@@ -193,6 +193,11 @@ struct TuningParams: Equatable, Codable {
     /// Accumulate R-G and B-G instead of R and B, adding the reconstructed
     /// green back at the end. Removes the coloured fringing along edges.
     var merge_chroma_difference: Bool = false
+    /// Cap merge kernel sharpness (the 832f7b8 soften_inv_cov, inverse-
+    /// covariance elements clamped at 32). Dilutes the colour fringing that
+    /// robustness-unrejected misalignments print at full kernel sharpness,
+    /// at the cost of softening detail sharper than the cap.
+    var merge_soften_inv_cov: Bool = true
     /// Re-estimate the flow densely, one Lucas-Kanade solve per lattice cell
     /// at the finest pitch that fits the buffer budget, instead of the
     /// half-pitch blend-or-select densify. ImageStackAlignator's
@@ -272,6 +277,7 @@ struct TuningParams: Equatable, Codable {
         case flow_bilinear_sampling
         case prealign_enabled
         case merge_chroma_difference
+        case merge_soften_inv_cov
         case flow_dense_lk_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -342,6 +348,7 @@ struct TuningParams: Equatable, Codable {
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_enabled) ?? prealign_enabled
         merge_chroma_difference = try c.decodeIfPresent(Bool.self, forKey: .merge_chroma_difference) ?? merge_chroma_difference
+        merge_soften_inv_cov = try c.decodeIfPresent(Bool.self, forKey: .merge_soften_inv_cov) ?? merge_soften_inv_cov
         flow_dense_lk_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_dense_lk_enabled) ?? flow_dense_lk_enabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -2127,6 +2134,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "prealign_enabled": NSNumber(value: tuningParams.prealign_enabled),
             "merge_chroma_difference": NSNumber(value: tuningParams.merge_chroma_difference),
+            "merge_soften_inv_cov": NSNumber(value: tuningParams.merge_soften_inv_cov),
             "flow_dense_lk_enabled": NSNumber(value: tuningParams.flow_dense_lk_enabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),

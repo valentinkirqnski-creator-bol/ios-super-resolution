@@ -776,6 +776,11 @@ struct CameraView: View {
              Measured on a grey step edge (any colour in the output is pure artifact): worst              case 113.9 -> 12.3 levels, mean 1.50 -> 0.00, and no longer sensitive to kernel              sharpness. Costs some accuracy on genuinely fine coloured texture.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Soften Merge Kernels (cap 32)", isOn: $cam.tuningParams.merge_soften_inv_cov)
+        Text("""
+             Caps merge kernel sharpness: any inverse covariance whose largest element              exceeds 32 is rescaled to land exactly at 32 (the 832f7b8 soften_inv_cov).              Root cause of the magenta/green edge fringes is alignment error robustness              fails to reject; this bounds how sharply the merge prints that mistake, so it              dilutes into blur instead of a crisp colour fringe. Measured on the real              8-frame burst: worst-case chroma excursion in the fringed region down ~21%              (p99.9 47 -> 37). Cost: softens legitimately sharp detail wherever the tensor              asks for a kernel tighter than the cap. python-z has no such clamp.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Dense Flow (per-pixel Lucas-Kanade)", isOn: $cam.tuningParams.flow_dense_lk_enabled)
         Text("""
              Replaces the half-pitch densify with a real Lucas-Kanade solve per lattice              cell, at the finest pitch that fits the buffer budget (2 raw px at a 16-px tile,              a 64x denser field than one vector per tile). ImageStackAlignator's              lucasKanadeOptim, which is the layer that actually removes the tile lattice --              per-tile solves share no pixels with their neighbours, so their errors are              independent and land at exactly the tile pitch, and no interpolator removes              error at its own sampling scale.

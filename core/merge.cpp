@@ -237,7 +237,7 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det, bool soften) {
     // math.modf: fractional part keeps sign of value. The fraction must be
     // computed with the SAME rounding mode as the floor index below, or a
     // negative kmap can pick fx/fy from one cell while blending with a
@@ -299,7 +299,7 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
-    soften_inv_cov(ixx, ixy, iyy);
+    if (soften) soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Alg. 4 — matches handheld_super_resolution/merge.py accumulate().
@@ -465,7 +465,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x;
                     kmap_i = lr_mov_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
+                               cfg.merge_soften_inv_cov);
             }
 
             const int center_j = cuda_round_to_int(lr_mov_x);
@@ -582,7 +583,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
+                               cfg.merge_soften_inv_cov);
             }
 
             // Python: center = round(coarse)
