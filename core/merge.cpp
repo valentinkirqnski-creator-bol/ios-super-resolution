@@ -641,23 +641,38 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 num.at(local_i, hr_j, 2) += G * den.at(local_i, hr_j, 2);
             }
 
-            // Per-channel reference-demosaic fallback. Below a trusted weight,
-            // top the accumulator up with a virtual tap at the classical
-            // demosaic's estimate instead of letting the channel's own
-            // division site default to 0: num += (w_min - w) * fallback,
-            // den = w_min. A pixel already at or above w_min is untouched; one
-            // at exactly 0 gets the fallback value outright; anything between
-            // blends continuously, so there is no seam where this engages.
-            // Last write to this pixel -- after chroma-difference, so it sees
-            // real RGB regardless of that mode.
+            // Per-channel reference-demosaic fallback. The trusted weight is
+            // whichever is LARGER of an absolute floor (catches genuine
+            // near-total starvation) and a fraction of this pixel's own
+            // best-covered channel (catches a channel that is merely thin
+            // NEXT TO its siblings -- a few frames' worth of real weight is
+            // "enough" in isolation but still reads as a colour cast if the
+            // other two channels each merged many more frames' worth. An
+            // absolute floor alone cannot see that, since multi-frame
+            // accumulation routinely pushes every channel's total weight past
+            // any single fixed number regardless of whether the KERNEL that
+            // produced it was ever wide enough to be trustworthy).
+            // Below the target: top the accumulator up with a virtual tap at
+            // the classical demosaic's estimate instead of leaving the
+            // channel's own division site to whatever thin real support it
+            // has: num += (target - w) * fallback, den = target. A channel
+            // already at or above target is untouched; one at exactly 0 gets
+            // the fallback value outright; anything between blends
+            // continuously, so there is no seam where this engages. Last
+            // write to this pixel -- after chroma-difference, so it sees real
+            // RGB regardless of that mode.
             if (cfg.merge_ref_fallback_enabled && nch >= 3) {
-                const f32 w_min = cfg.merge_ref_fallback_min_weight;
+                f32 w[3];
+                for (int ch = 0; ch < nch; ++ch) w[ch] = den.at(local_i, hr_j, ch);
+                const f32 w_max = std::max(w[0], std::max(w[1], w[2]));
+                const f32 w_min_abs = cfg.merge_ref_fallback_min_weight;
+                const f32 rel = cfg.merge_ref_fallback_relative_floor;
                 for (int ch = 0; ch < nch; ++ch) {
-                    const f32 w = den.at(local_i, hr_j, ch);
-                    if (w < w_min) {
+                    const f32 target = std::max(w_min_abs, rel * w_max);
+                    if (w[ch] < target) {
                         const f32 fb = classical_demosaic_bilinear(img, cfg.cfa, coarse_y, coarse_x, ch);
-                        num.at(local_i, hr_j, ch) += (w_min - w) * fb;
-                        den.at(local_i, hr_j, ch) = w_min;
+                        num.at(local_i, hr_j, ch) += (target - w[ch]) * fb;
+                        den.at(local_i, hr_j, ch) = target;
                     }
                 }
             }

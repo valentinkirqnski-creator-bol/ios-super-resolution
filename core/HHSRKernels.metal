@@ -945,7 +945,8 @@ struct MergeRefParams {
     uint raw_res_robustness;
     uint chroma_diff;     // 1 = accumulate R-G / B-G
     uint ref_fallback_enabled;
-    float ref_fallback_min_weight; // (108 bytes)
+    float ref_fallback_min_weight;
+    float ref_fallback_relative_floor; // (112 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -1688,13 +1689,16 @@ inline void merge_accumulate_ref_body(device AccT* num,
     // accumulate_ref, merge.cpp. Last write to this pixel, after the
     // chroma-difference un-differencing above so it always sees real RGB.
     if (p.ref_fallback_enabled != 0u && p.nch >= 3) {
+        float w0 = float(den[base + 0]), w1 = float(den[base + 1]), w2 = float(den[base + 2]);
+        float w_max = max(w0, max(w1, w2));
         for (int ch = 0; ch < int(p.nch); ++ch) {
             uint idx = base + uint(ch);
             float w = float(den[idx]);
-            if (w < p.ref_fallback_min_weight) {
+            float target = max(p.ref_fallback_min_weight, p.ref_fallback_relative_floor * w_max);
+            if (w < target) {
                 float fb = classical_demosaic_bilinear(img, p, coarse_y, coarse_x, ch);
-                num[idx] = AccT(float(num[idx]) + (p.ref_fallback_min_weight - w) * fb);
-                den[idx] = AccT(p.ref_fallback_min_weight);
+                num[idx] = AccT(float(num[idx]) + (target - w) * fb);
+                den[idx] = AccT(target);
             }
         }
     }

@@ -780,8 +780,19 @@ struct Config {
     bool  merge_ref_fallback_enabled    = true;
     // In the same weight units as a single kernel tap (max 1.0 at dead
     // centre, plus a small cover_eps contribution). Below this, the channel
-    // is considered too thinly sampled to trust on its own.
+    // is considered too thinly sampled to trust on its own regardless of how
+    // its siblings look -- a floor under the relative test below, not a
+    // replacement for it.
     float merge_ref_fallback_min_weight = 0.35f;
+    // A channel is ALSO considered starved if its weight is under this
+    // fraction of the best-covered channel at the same pixel, whatever that
+    // channel's absolute weight is. Catches the case an absolute floor alone
+    // misses: many merged frames can push every channel's total weight past
+    // any fixed number even when the kernel that produced it was never wide
+    // enough for one channel to keep up with its siblings, which is what
+    // actually reads as a colour cast (a relative imbalance, not a low
+    // absolute number).
+    float merge_ref_fallback_relative_floor = 0.4f;
 
     bool  prealign_enabled    = false;
 
