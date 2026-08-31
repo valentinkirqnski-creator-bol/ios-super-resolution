@@ -604,6 +604,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                   Rgb16Sink* rgb16_sink) {
     if (rgb16_sink) { rgb16_sink->w = 0; rgb16_sink->h = 0; rgb16_sink->rgb.clear(); }
     if (frame_count < 2 || !loader) return Image();
+    if (cfg.hdrplus_mode)
+        return process_burst_loader_to_dng_hdrplus(frame_count, loader, cfg, dng_path,
+                                                   progress, maxPreviewDim, rgb16_sink);
 
     prof_reset();
     prof_mark_memory("burst:begin");

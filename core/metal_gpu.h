@@ -211,4 +211,16 @@ bool metal_merge_commit_online(const std::vector<int>& frame_ids);
 // accumulator by any other route.
 bool metal_merge_retire_online();
 
+// HDR+ mode (Config::hdrplus_mode) on GPU: streaming burst accumulator
+// matching hdrplus_mode.cpp's HdrPlusCpuState (same pyramid, alignment,
+// weight, and parity-plane accumulation math). begin uploads the reference
+// and builds its pyramid + accumulators; add_frame aligns, weighs and
+// accumulates one comparison frame; finish blends and reads back the merged
+// MOSAIC (demosaic stays on the CPU). Any false return leaves the state
+// unusable -- call hdrplus_metal_abort and rerun the CPU body.
+bool hdrplus_metal_begin(const Image& ref, const Config& cfg);
+bool hdrplus_metal_add_frame(const Image& comp);
+bool hdrplus_metal_finish(Image& mosaic_out);
+void hdrplus_metal_abort();
+
 } // namespace hhsr

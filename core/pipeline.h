@@ -64,6 +64,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                   const ProgressFn& progress, int maxPreviewDim = 512,
                                   Rgb16Sink* rgb16_sink = nullptr);
 
+// HDR+ mode (Config::hdrplus_mode, hdrplus_mode.cpp): burst align + merge
+// from hdr-plus-master instead of the super-resolution pipeline. Output is
+// at INPUT resolution (denoise, not upscale), demosaicked bilinearly.
+// process_burst and process_burst_to_dng / the loader path branch into
+// these when the toggle is on -- callers keep their usual entry points.
+Image process_burst_hdrplus(const std::vector<Image>& burst, const Config& cfg,
+                            const ProgressFn& progress = nullptr);
+Image process_burst_loader_to_dng_hdrplus(int frame_count, const RawFrameLoaderFn& loader,
+                                          const Config& cfg, const std::string& dng_path,
+                                          const ProgressFn& progress, int maxPreviewDim = 512,
+                                          Rgb16Sink* rgb16_sink = nullptr);
+Image hdrplus_demosaic_bilinear(const Image& mosaic, const Config& cfg,
+                                int num_threads);
+
 // Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
 // Path: replace ".dng" with "_robustness<name_suffix>.pgm", or append that.
 // name_suffix is "" for the combined mask, "_s1"/"_s2" for the split ones.

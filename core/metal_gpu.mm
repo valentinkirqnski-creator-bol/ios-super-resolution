@@ -172,6 +172,8 @@ static MetalCtx& ctx() {
             "align_upscale_flow", "align_upscale_flow_460",
             "merge_normalize_rgb16",
             "flow_densify_select",
+            "hp_box_down2", "hp_gauss_down4", "hp_align_layer",
+            "hp_weight_tiles", "hp_accum_frame", "hp_init_ref", "hp_finalize",
             nullptr};
         for (int i = 0; need[i]; ++i) {
             if (!c.pipe(need[i])) return;
@@ -4292,5 +4294,260 @@ bool flow_dense_lk_metal(FlowField& flow, const Image& ref_grey,
     return true;
   }
 }
+
+// ============================================================================
+// HDR+ mode (Config::hdrplus_mode) -- see hdrplus_mode.cpp for the CPU golden
+// body these twins must match. One streaming state for the burst: begin()
+// uploads the reference and builds its pyramid + the 4-parity accumulation
+// planes, add_frame() runs pyramid + 3-level alignment + weights + accumulate
+// for one comparison frame, finish() blends and reads back the merged mosaic.
+// Any failure leaves the state unusable; the caller aborts and reruns on CPU.
+// ============================================================================
+
+namespace {
+
+// Byte-for-byte mirrors of the HHSRKernels.metal structs.
+struct HpDimsCPU { uint32_t in_w, in_h, out_w, out_h; };
+static_assert(sizeof(HpDimsCPU) == 16, "HpDims mirror drifted");
+struct HpAlignParamsCPU {
+    uint32_t lw, lh, nx, ny, pnx, pny, has_prev, _pad0;
+    int32_t prev_min, prev_max;
+    uint32_t _pad1, _pad2;
+};
+static_assert(sizeof(HpAlignParamsCPU) == 48, "HpAlignParams mirror drifted");
+struct HpWeightParamsCPU {
+    uint32_t l0w, l0h, nx, ny, wnx, wny;
+    float value_scale;
+    uint32_t _pad0;
+};
+static_assert(sizeof(HpWeightParamsCPU) == 32, "HpWeightParams mirror drifted");
+struct HpAccumParamsCPU {
+    uint32_t W, H, nx, ny, wnx, wny, _pad0, _pad1;
+};
+static_assert(sizeof(HpAccumParamsCPU) == 32, "HpAccumParams mirror drifted");
+
+struct HdrPlusGpu {
+    bool active = false;
+    int H = 0, W = 0;
+    int l0w = 0, l0h = 0, l1w = 0, l1h = 0, l2w = 0, l2h = 0;
+    int n0x = 0, n0y = 0, n1x = 0, n1y = 0, n2x = 0, n2y = 0;
+    int wnx = 0, wny = 0;
+    id<MTLBuffer> ref = nil, ref_l0 = nil, ref_l1 = nil, ref_l2 = nil;
+    id<MTLBuffer> S = nil, wsum = nil;
+    id<MTLBuffer> comp = nil, comp_l0 = nil, comp_l1 = nil, comp_l2 = nil;
+    id<MTLBuffer> a2 = nil, a1 = nil, a0 = nil, wt = nil;
+    void release() {
+        ref = ref_l0 = ref_l1 = ref_l2 = nil;
+        S = wsum = nil;
+        comp = comp_l0 = comp_l1 = comp_l2 = nil;
+        a2 = a1 = a0 = wt = nil;
+        active = false;
+    }
+};
+static HdrPlusGpu g_hp;
+
+constexpr float kHpValueScaleGpu = 4095.f;  // == hdrplus_mode.cpp kHpValueScale
+
+static void hp_encode_pyramid(id<MTLComputeCommandEncoder> enc, MetalCtx& c,
+                              id<MTLBuffer> mosaic, int W, int H,
+                              id<MTLBuffer> l0, id<MTLBuffer> l1, id<MTLBuffer> l2,
+                              const HdrPlusGpu& s) {
+    HpDimsCPU d0{(uint32_t)W, (uint32_t)H, (uint32_t)s.l0w, (uint32_t)s.l0h};
+    [enc setBuffer:mosaic offset:0 atIndex:0];
+    [enc setBuffer:l0 offset:0 atIndex:1];
+    [enc setBytes:&d0 length:sizeof(d0) atIndex:2];
+    dispatch2(enc, c.pipe("hp_box_down2"), s.l0w, s.l0h);
+    HpDimsCPU d1{(uint32_t)s.l0w, (uint32_t)s.l0h, (uint32_t)s.l1w, (uint32_t)s.l1h};
+    [enc setBuffer:l0 offset:0 atIndex:0];
+    [enc setBuffer:l1 offset:0 atIndex:1];
+    [enc setBytes:&d1 length:sizeof(d1) atIndex:2];
+    dispatch2(enc, c.pipe("hp_gauss_down4"), s.l1w, s.l1h);
+    HpDimsCPU d2{(uint32_t)s.l1w, (uint32_t)s.l1h, (uint32_t)s.l2w, (uint32_t)s.l2h};
+    [enc setBuffer:l1 offset:0 atIndex:0];
+    [enc setBuffer:l2 offset:0 atIndex:1];
+    [enc setBytes:&d2 length:sizeof(d2) atIndex:2];
+    dispatch2(enc, c.pipe("hp_gauss_down4"), s.l2w, s.l2h);
+}
+
+} // namespace
+
+bool hdrplus_metal_begin(const Image& ref, const Config& cfg) {
+  @autoreleasepool {
+    (void)cfg;
+    g_hp.release();
+    if (!metal_gpu_init()) return false;
+    auto& c = ctx();
+    if (ref.h <= 0 || ref.w <= 0 || ref.c != 1) return false;
+
+    HdrPlusGpu& s = g_hp;
+    s.H = ref.h; s.W = ref.w;
+    s.l0w = s.W / 2; s.l0h = s.H / 2;
+    s.l1w = s.l0w / 4; s.l1h = s.l0h / 4;
+    s.l2w = s.l1w / 4; s.l2h = s.l1h / 4;
+    if (s.l2w < 16 || s.l2h < 16) return false;
+    s.n0x = std::max(1, s.l0w / 8 - 1); s.n0y = std::max(1, s.l0h / 8 - 1);
+    s.n1x = std::max(1, s.l1w / 8 - 1); s.n1y = std::max(1, s.l1h / 8 - 1);
+    s.n2x = std::max(1, s.l2w / 8 - 1); s.n2y = std::max(1, s.l2h / 8 - 1);
+    // The extended Bayer tile grid must coincide with the finest align grid
+    // (floor(floor(W/2)/8) == floor(W/16), see hdrplus_mode.cpp); refuse the
+    // degenerate sizes where it would not.
+    const int num_tx = s.W / 16 - 1, num_ty = s.H / 16 - 1;
+    if (num_tx != s.n0x || num_ty != s.n0y) return false;
+    s.wnx = num_tx + 2; s.wny = num_ty + 2;
+
+    const size_t plane_b = (size_t)s.W * s.H * sizeof(float);
+    s.ref = buf(ref.data.data(), plane_b);
+    s.ref_l0 = buf(nullptr, (size_t)s.l0w * s.l0h * sizeof(float));
+    s.ref_l1 = buf(nullptr, (size_t)s.l1w * s.l1h * sizeof(float));
+    s.ref_l2 = buf(nullptr, (size_t)s.l2w * s.l2h * sizeof(float));
+    s.S = buf(nullptr, 4 * plane_b);
+    s.wsum = buf(nullptr, (size_t)s.wnx * s.wny * sizeof(float));
+    s.comp_l0 = buf(nullptr, (size_t)s.l0w * s.l0h * sizeof(float));
+    s.comp_l1 = buf(nullptr, (size_t)s.l1w * s.l1h * sizeof(float));
+    s.comp_l2 = buf(nullptr, (size_t)s.l2w * s.l2h * sizeof(float));
+    s.a2 = buf(nullptr, (size_t)s.n2x * s.n2y * 2 * sizeof(int32_t));
+    s.a1 = buf(nullptr, (size_t)s.n1x * s.n1y * 2 * sizeof(int32_t));
+    s.a0 = buf(nullptr, (size_t)s.n0x * s.n0y * 2 * sizeof(int32_t));
+    s.wt = buf(nullptr, (size_t)s.wnx * s.wny * sizeof(float));
+    if (!s.ref || !s.ref_l0 || !s.ref_l1 || !s.ref_l2 || !s.S || !s.wsum ||
+        !s.comp_l0 || !s.comp_l1 || !s.comp_l2 || !s.a2 || !s.a1 || !s.a0 || !s.wt) {
+        g_hp.release();
+        return false;
+    }
+    // every tile starts at weight 1 (the reference's own contribution)
+    float* wp = (float*)[s.wsum contents];
+    for (int i = 0; i < s.wnx * s.wny; ++i) wp[i] = 1.f;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) { g_hp.release(); return false; }
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) { g_hp.release(); return false; }
+    hp_encode_pyramid(enc, c, s.ref, s.W, s.H, s.ref_l0, s.ref_l1, s.ref_l2, s);
+    HpAccumParamsCPU ap{(uint32_t)s.W, (uint32_t)s.H, (uint32_t)s.n0x, (uint32_t)s.n0y,
+                        (uint32_t)s.wnx, (uint32_t)s.wny, 0, 0};
+    [enc setBuffer:s.ref offset:0 atIndex:0];
+    [enc setBuffer:s.S offset:0 atIndex:1];
+    [enc setBytes:&ap length:sizeof(ap) atIndex:2];
+    dispatch2(enc, c.pipe("hp_init_ref"), s.W, s.H);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) { g_hp.release(); return false; }
+    s.active = true;
+    return true;
+  }
+}
+
+bool hdrplus_metal_add_frame(const Image& comp) {
+  @autoreleasepool {
+    HdrPlusGpu& s = g_hp;
+    if (!s.active) return false;
+    if (comp.h != s.H || comp.w != s.W || comp.c != 1) return false;
+    auto& c = ctx();
+
+    const size_t plane_b = (size_t)s.W * s.H * sizeof(float);
+    s.comp = buf(comp.data.data(), plane_b);  // fresh upload each frame
+    if (!s.comp) return false;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+
+    hp_encode_pyramid(enc, c, s.comp, s.W, s.H, s.comp_l0, s.comp_l1, s.comp_l2, s);
+
+    // 3-level alignment, coarse to fine. Bounds from align.cpp: the clamp on
+    // the coarser field is [0,0] at L2 (zero field), [-4,3] into L1,
+    // [-20,15] into L0.
+    HpAlignParamsCPU a2p{(uint32_t)s.l2w, (uint32_t)s.l2h, (uint32_t)s.n2x, (uint32_t)s.n2y,
+                         0, 0, 0u, 0, 0, 0, 0, 0};
+    [enc setBuffer:s.ref_l2 offset:0 atIndex:0];
+    [enc setBuffer:s.comp_l2 offset:0 atIndex:1];
+    [enc setBuffer:s.a2 offset:0 atIndex:2];  // unused (has_prev=0)
+    [enc setBuffer:s.a2 offset:0 atIndex:3];
+    [enc setBytes:&a2p length:sizeof(a2p) atIndex:4];
+    dispatch2(enc, c.pipe("hp_align_layer"), s.n2x, s.n2y);
+
+    HpAlignParamsCPU a1p{(uint32_t)s.l1w, (uint32_t)s.l1h, (uint32_t)s.n1x, (uint32_t)s.n1y,
+                         (uint32_t)s.n2x, (uint32_t)s.n2y, 1u, 0, -4, 3, 0, 0};
+    [enc setBuffer:s.ref_l1 offset:0 atIndex:0];
+    [enc setBuffer:s.comp_l1 offset:0 atIndex:1];
+    [enc setBuffer:s.a2 offset:0 atIndex:2];
+    [enc setBuffer:s.a1 offset:0 atIndex:3];
+    [enc setBytes:&a1p length:sizeof(a1p) atIndex:4];
+    dispatch2(enc, c.pipe("hp_align_layer"), s.n1x, s.n1y);
+
+    HpAlignParamsCPU a0p{(uint32_t)s.l0w, (uint32_t)s.l0h, (uint32_t)s.n0x, (uint32_t)s.n0y,
+                         (uint32_t)s.n1x, (uint32_t)s.n1y, 1u, 0, -20, 15, 0, 0};
+    [enc setBuffer:s.ref_l0 offset:0 atIndex:0];
+    [enc setBuffer:s.comp_l0 offset:0 atIndex:1];
+    [enc setBuffer:s.a1 offset:0 atIndex:2];
+    [enc setBuffer:s.a0 offset:0 atIndex:3];
+    [enc setBytes:&a0p length:sizeof(a0p) atIndex:4];
+    dispatch2(enc, c.pipe("hp_align_layer"), s.n0x, s.n0y);
+
+    HpWeightParamsCPU wp{(uint32_t)s.l0w, (uint32_t)s.l0h, (uint32_t)s.n0x, (uint32_t)s.n0y,
+                         (uint32_t)s.wnx, (uint32_t)s.wny, kHpValueScaleGpu, 0};
+    [enc setBuffer:s.ref_l0 offset:0 atIndex:0];
+    [enc setBuffer:s.comp_l0 offset:0 atIndex:1];
+    [enc setBuffer:s.a0 offset:0 atIndex:2];
+    [enc setBuffer:s.wt offset:0 atIndex:3];
+    [enc setBuffer:s.wsum offset:0 atIndex:4];
+    [enc setBytes:&wp length:sizeof(wp) atIndex:5];
+    dispatch2(enc, c.pipe("hp_weight_tiles"), s.wnx, s.wny);
+
+    HpAccumParamsCPU ap{(uint32_t)s.W, (uint32_t)s.H, (uint32_t)s.n0x, (uint32_t)s.n0y,
+                        (uint32_t)s.wnx, (uint32_t)s.wny, 0, 0};
+    [enc setBuffer:s.comp offset:0 atIndex:0];
+    [enc setBuffer:s.wt offset:0 atIndex:1];
+    [enc setBuffer:s.a0 offset:0 atIndex:2];
+    [enc setBuffer:s.S offset:0 atIndex:3];
+    [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+    dispatch2(enc, c.pipe("hp_accum_frame"), s.W, s.H);
+
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "hdrplus:frame");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    s.comp = nil;  // frame upload is dead once accumulated
+    return cmd.status == MTLCommandBufferStatusCompleted;
+  }
+}
+
+bool hdrplus_metal_finish(Image& mosaic_out) {
+  @autoreleasepool {
+    HdrPlusGpu& s = g_hp;
+    if (!s.active) return false;
+    auto& c = ctx();
+    const size_t plane_b = (size_t)s.W * s.H * sizeof(float);
+    id<MTLBuffer> out = buf(nullptr, plane_b);
+    if (!out) { g_hp.release(); return false; }
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) { g_hp.release(); return false; }
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) { g_hp.release(); return false; }
+    HpAccumParamsCPU ap{(uint32_t)s.W, (uint32_t)s.H, (uint32_t)s.n0x, (uint32_t)s.n0y,
+                        (uint32_t)s.wnx, (uint32_t)s.wny, 0, 0};
+    [enc setBuffer:s.S offset:0 atIndex:0];
+    [enc setBuffer:s.wsum offset:0 atIndex:1];
+    [enc setBuffer:out offset:0 atIndex:2];
+    [enc setBytes:&ap length:sizeof(ap) atIndex:3];
+    dispatch2(enc, c.pipe("hp_finalize"), s.W, s.H);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "hdrplus:finalize");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    const bool ok = cmd.status == MTLCommandBufferStatusCompleted;
+    if (ok) {
+        mosaic_out = Image(s.H, s.W, 1);
+        memcpy(mosaic_out.data.data(), [out contents], plane_b);
+    }
+    g_hp.release();
+    return ok;
+  }
+}
+
+void hdrplus_metal_abort() { g_hp.release(); }
 
 } // namespace hhsr

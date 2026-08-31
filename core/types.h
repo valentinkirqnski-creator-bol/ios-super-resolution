@@ -1124,6 +1124,21 @@ struct Config {
     // disables the enlargement rather than guessing.
     int   burst_frame_count = 0;
 
+    // HDR+ mode: replace the whole super-resolution pipeline (alignment,
+    // robustness, kernel regression) with the HDR+ burst align + merge from
+    // hdr-plus-master (the Halide implementation, src/align.cpp +
+    // src/merge.cpp): 3-level L1 pyramid alignment on the mosaic and a
+    // per-32x32-tile temporal weighted average (weight = inverse of the
+    // tile's mean L1 distance on the half-res layer, Google's
+    // factor 8 / min_dist 10 / max_dist 300 constants) blended with the
+    // modified raised-cosine window. A denoiser, not an upscaler: output is
+    // at INPUT resolution (scale is ignored), demosaicked bilinearly for the
+    // DNG. Runs on Metal when available, with a bit-equivalent CPU fallback
+    // (see hdrplus_mode.cpp). Values here are the app's normalized floats,
+    // scaled internally to a 12-bit range so the integer-tuned distance
+    // constants keep their meaning.
+    bool hdrplus_mode = false;
+
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;

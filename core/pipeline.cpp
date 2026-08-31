@@ -61,6 +61,7 @@ Image pad_image_circular(const Image& img, int tile_size) {
 Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                     const ProgressFn& progress) {
     if (burst.empty()) return Image();
+    if (cfg.hdrplus_mode) return process_burst_hdrplus(burst, cfg, progress);
     Config work = cfg;
     // Drives the reference-kernel enlargement; not a tuning knob.
     work.burst_frame_count = (int)burst.size();
@@ -168,6 +169,16 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                            const std::string& dng_path, const ProgressFn& progress,
                            int maxPreviewDim) {
     if (burst.empty()) return Image();
+    if (cfg.hdrplus_mode) {
+        // Same streaming implementation as the loader path, fed from memory.
+        return process_burst_loader_to_dng_hdrplus(
+            (int)burst.size(),
+            [&](int index, Config&, bool, int, int) {
+                return (index >= 0 && index < (int)burst.size()) ? burst[(size_t)index]
+                                                                 : Image();
+            },
+            cfg, dng_path, progress, maxPreviewDim, nullptr);
+    }
     Config work = cfg;
     // Drives the reference-kernel enlargement; not a tuning knob.
     work.burst_frame_count = (int)burst.size();

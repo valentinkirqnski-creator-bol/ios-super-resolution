@@ -200,6 +200,13 @@ struct TuningParams: Equatable, Codable {
     /// fringing survives with this on, kernel estimation is exonerated and
     /// the cause is upstream (alignment/robustness).
     var merge_kernel_iso: Bool = false
+    /// HDR+ mode: replace the whole super-resolution pipeline with the HDR+
+    /// burst align + merge (hdr-plus-master's Halide implementation, ported
+    /// to the core with a Metal path). A denoiser, not an upscaler: the
+    /// output DNG is at sensor resolution, demosaicked bilinearly. All the
+    /// super-resolution tuning (kernels, robustness, flow) is bypassed
+    /// while this is on.
+    var hdrplus_mode: Bool = false
     /// Re-estimate the flow densely, one Lucas-Kanade solve per lattice cell
     /// at the finest pitch that fits the buffer budget, instead of the
     /// half-pitch blend-or-select densify. ImageStackAlignator's
@@ -280,6 +287,7 @@ struct TuningParams: Equatable, Codable {
         case prealign_enabled
         case merge_chroma_difference
         case merge_kernel_iso
+        case hdrplus_mode
         case flow_dense_lk_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -351,6 +359,7 @@ struct TuningParams: Equatable, Codable {
         prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_enabled) ?? prealign_enabled
         merge_chroma_difference = try c.decodeIfPresent(Bool.self, forKey: .merge_chroma_difference) ?? merge_chroma_difference
         merge_kernel_iso = try c.decodeIfPresent(Bool.self, forKey: .merge_kernel_iso) ?? merge_kernel_iso
+        hdrplus_mode = try c.decodeIfPresent(Bool.self, forKey: .hdrplus_mode) ?? hdrplus_mode
         flow_dense_lk_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_dense_lk_enabled) ?? flow_dense_lk_enabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -2137,6 +2146,7 @@ final class CameraModel: NSObject, ObservableObject {
             "prealign_enabled": NSNumber(value: tuningParams.prealign_enabled),
             "merge_chroma_difference": NSNumber(value: tuningParams.merge_chroma_difference),
             "merge_kernel_iso": NSNumber(value: tuningParams.merge_kernel_iso),
+            "hdrplus_mode": NSNumber(value: tuningParams.hdrplus_mode),
             "flow_dense_lk_enabled": NSNumber(value: tuningParams.flow_dense_lk_enabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),

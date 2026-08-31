@@ -3270,3 +3270,232 @@ kernel void flow_dense_lk(device float* fine [[buffer(0)]],
     fine[o + 0] = ux / p.gsx;   // back to raw px
     fine[o + 1] = uy / p.gsy;
 }
+
+// ============================================================================
+// HDR+ mode (Config::hdrplus_mode) -- GPU twins of hdrplus_mode.cpp's
+// HdrPlusCpuState. Same pyramid (box2 + two gauss4), same 3-level L1 tile
+// alignment (search [-4,3], floor division, first-minimum tie-break), same
+// inverse-L1-distance temporal weights (distances scaled by value_scale so
+// the integer-tuned constants keep their 12-bit meaning), same 4-parity-
+// plane accumulation and raised-cosine finalize. Mirror boundary is
+// mirror_interior (period 2n-2), applied at the mosaic and at each layer,
+// matching the CPU body exactly.
+// ============================================================================
+
+inline int hp_mirror_m(int x, int n) {
+    if (n <= 1) return 0;
+    const int p = 2 * n - 2;
+    x = ((x % p) + p) % p;
+    return x < n ? x : p - x;
+}
+
+inline int hp_div_floor_m(int a, int b) {
+    int q = a / b, r = a % b;
+    return (r != 0 && (r < 0)) ? q - 1 : q;
+}
+
+inline float hp_read_m(device const float* img, int w, int h, int x, int y) {
+    return img[(ulong)hp_mirror_m(y, h) * (ulong)w + (ulong)hp_mirror_m(x, w)];
+}
+
+struct HpDims {
+    uint in_w, in_h, out_w, out_h;
+};
+
+kernel void hp_box_down2(device const float* in [[buffer(0)]],
+                         device float* out [[buffer(1)]],
+                         constant HpDims& p [[buffer(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    const ulong x = 2ul * gid.x, y = 2ul * gid.y;
+    const float s = in[y * p.in_w + x] + in[y * p.in_w + x + 1ul] +
+                    in[(y + 1ul) * p.in_w + x] + in[(y + 1ul) * p.in_w + x + 1ul];
+    out[(ulong)gid.y * p.out_w + gid.x] = 0.25f * s;
+}
+
+kernel void hp_gauss_down4(device const float* in [[buffer(0)]],
+                           device float* out [[buffer(1)]],
+                           constant HpDims& p [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    const float k0[5] = {2.f, 4.f, 5.f, 4.f, 2.f};
+    const float k1[5] = {4.f, 9.f, 12.f, 9.f, 4.f};
+    const float k2[5] = {5.f, 12.f, 15.f, 12.f, 5.f};
+    float s = 0.f;
+    for (int j = -2; j <= 2; ++j) {
+        const int aj = abs(j);
+        for (int i = -2; i <= 2; ++i) {
+            const float rw = (aj == 0) ? k2[i + 2] : ((aj == 1) ? k1[i + 2] : k0[i + 2]);
+            s += hp_read_m(in, (int)p.in_w, (int)p.in_h,
+                           4 * (int)gid.x + i, 4 * (int)gid.y + j) * rw;
+        }
+    }
+    out[(ulong)gid.y * p.out_w + gid.x] = s / 159.f;
+}
+
+struct HpAlignParams {
+    uint lw, lh;        // this layer's dims
+    uint nx, ny;        // this level's tile grid
+    uint pnx, pny;      // previous (coarser) grid; 0 when none
+    uint has_prev, _pad0;
+    int prev_min, prev_max;
+    uint _pad1, _pad2;
+};
+
+kernel void hp_align_layer(device const float* ref [[buffer(0)]],
+                           device const float* alt [[buffer(1)]],
+                           device const int2* prev [[buffer(2)]],
+                           device int2* out [[buffer(3)]],
+                           constant HpAlignParams& p [[buffer(4)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.nx || gid.y >= p.ny) return;
+    const int tx = (int)gid.x, ty = (int)gid.y;
+    int pox = 0, poy = 0;
+    if (p.has_prev != 0u) {
+        int ptx = hp_div_floor_m(tx - 1, 4);
+        int pty = hp_div_floor_m(ty - 1, 4);
+        ptx = clamp(ptx, 0, (int)p.pnx - 1);
+        pty = clamp(pty, 0, (int)p.pny - 1);
+        const int2 pa = prev[pty * (int)p.pnx + ptx];
+        pox = 4 * clamp(pa.x, p.prev_min, p.prev_max);
+        poy = 4 * clamp(pa.y, p.prev_min, p.prev_max);
+    }
+    const int x0 = tx * 8, y0 = ty * 8;
+    float best = FLT_MAX;
+    int bxi = 0, byi = 0;
+    for (int yi = -4; yi <= 3; ++yi) {
+        for (int xi = -4; xi <= 3; ++xi) {
+            float score = 0.f;
+            for (int j = 0; j < 16; ++j)
+                for (int i = 0; i < 16; ++i)
+                    score += fabs(hp_read_m(ref, (int)p.lw, (int)p.lh, x0 + i, y0 + j) -
+                                  hp_read_m(alt, (int)p.lw, (int)p.lh,
+                                            x0 + pox + xi + i, y0 + poy + yi + j));
+            if (score < best) { best = score; bxi = xi; byi = yi; }
+        }
+    }
+    out[ty * (int)p.nx + tx] = int2(bxi + pox, byi + poy);
+}
+
+struct HpWeightParams {
+    uint l0w, l0h;      // half-res layer dims
+    uint nx, ny;        // finest align grid (== Bayer tile grid)
+    uint wnx, wny;      // extended tile grid (tiles -1..num_t*)
+    float value_scale;
+    uint _pad0;
+};
+
+// One thread per extended tile: temporal weight from the half-res layer L1
+// distance (offsets are the finest-level values BEFORE the x2 to Bayer
+// coords; clamp(2*a,-168,126) then floor-halve, exactly the CPU order).
+// Also accumulates this frame's weight into wsum (one thread per tile, no
+// race).
+kernel void hp_weight_tiles(device const float* ref_l0 [[buffer(0)]],
+                            device const float* comp_l0 [[buffer(1)]],
+                            device const int2* a0 [[buffer(2)]],
+                            device float* wt [[buffer(3)]],
+                            device float* wsum [[buffer(4)]],
+                            constant HpWeightParams& p [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.wnx || gid.y >= p.wny) return;
+    const int tx = (int)gid.x - 1, ty = (int)gid.y - 1;
+    const int cx = clamp(tx, 0, (int)p.nx - 1);
+    const int cy = clamp(ty, 0, (int)p.ny - 1);
+    const int2 a = a0[cy * (int)p.nx + cx];
+    const int offx = clamp(2 * a.x, -168, 126);
+    const int offy = clamp(2 * a.y, -168, 126);
+    const int ox2 = hp_div_floor_m(offx, 2), oy2 = hp_div_floor_m(offy, 2);
+    const int lx0 = tx * 8, ly0 = ty * 8;
+    float sad = 0.f;
+    for (int j = 0; j < 16; ++j)
+        for (int i = 0; i < 16; ++i)
+            sad += fabs(hp_read_m(ref_l0, (int)p.l0w, (int)p.l0h, lx0 + i, ly0 + j) -
+                        hp_read_m(comp_l0, (int)p.l0w, (int)p.l0h,
+                                  lx0 + ox2 + i, ly0 + oy2 + j));
+    const int dist = (int)(sad * p.value_scale / 256.f);
+    const float norm_dist = max(1.f, (float)dist / 8.f - 10.f / 8.f);
+    const float w = (norm_dist > 290.f) ? 0.f : 1.f / norm_dist;
+    const uint wi = gid.y * p.wnx + gid.x;
+    wt[wi] = w;
+    wsum[wi] += w;
+}
+
+struct HpAccumParams {
+    uint W, H;          // mosaic dims
+    uint nx, ny;        // finest align grid
+    uint wnx, wny;      // extended tile grid
+    uint _pad0, _pad1;
+};
+
+// One thread per mosaic pixel: add this frame's warped value into the 4
+// parity planes (S is 4 planes of H*W; parity = (tx&1) | ((ty&1)<<1)).
+// The pixel fetch uses the UNCLAMPED doubled offset, as in merge_temporal.
+kernel void hp_accum_frame(device const float* comp [[buffer(0)]],
+                           device const float* wt [[buffer(1)]],
+                           device const int2* a0 [[buffer(2)]],
+                           device float* S [[buffer(3)]],
+                           constant HpAccumParams& p [[buffer(4)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.W || gid.y >= p.H) return;
+    const int x = (int)gid.x, y = (int)gid.y;
+    const int txs[2] = {x / 16 - 1, x / 16};
+    const int tys[2] = {y / 16 - 1, y / 16};
+    const ulong plane = (ulong)p.W * (ulong)p.H;
+    const ulong pix = (ulong)y * p.W + (ulong)x;
+    for (int b = 0; b < 2; ++b) {
+        for (int a = 0; a < 2; ++a) {
+            const int tx = txs[a], ty = tys[b];
+            const float w = wt[(ulong)(ty + 1) * p.wnx + (ulong)(tx + 1)];
+            if (w == 0.f) continue;
+            const int cx = clamp(tx, 0, (int)p.nx - 1);
+            const int cy = clamp(ty, 0, (int)p.ny - 1);
+            const int2 al = a0[cy * (int)p.nx + cx];
+            const float v = hp_read_m(comp, (int)p.W, (int)p.H,
+                                      x + 2 * al.x, y + 2 * al.y);
+            const int par = (tx & 1) | ((ty & 1) << 1);
+            S[(ulong)par * plane + pix] += w * v;
+        }
+    }
+}
+
+// One thread per pixel: seed all 4 parity planes with the reference value
+// (the reference merges with itself at weight 1 in every tile).
+kernel void hp_init_ref(device const float* ref [[buffer(0)]],
+                        device float* S [[buffer(1)]],
+                        constant HpAccumParams& p [[buffer(2)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.W || gid.y >= p.H) return;
+    const ulong plane = (ulong)p.W * (ulong)p.H;
+    const ulong pix = (ulong)gid.y * p.W + (ulong)gid.x;
+    const float v = ref[pix];
+    for (int par = 0; par < 4; ++par) S[(ulong)par * plane + pix] = v;
+}
+
+// merge_spatial: modified raised-cosine blend of the 4 covering tiles'
+// normalized sums.
+kernel void hp_finalize(device const float* S [[buffer(0)]],
+                        device const float* wsum [[buffer(1)]],
+                        device float* out [[buffer(2)]],
+                        constant HpAccumParams& p [[buffer(3)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.W || gid.y >= p.H) return;
+    const int x = (int)gid.x, y = (int)gid.y;
+    const int txs[2] = {x / 16 - 1, x / 16};
+    const int tys[2] = {y / 16 - 1, y / 16};
+    const int ixs[2] = {x % 16 + 16, x % 16};
+    const int iys[2] = {y % 16 + 16, y % 16};
+    const ulong plane = (ulong)p.W * (ulong)p.H;
+    const ulong pix = (ulong)y * p.W + (ulong)x;
+    float acc = 0.f;
+    for (int b = 0; b < 2; ++b) {
+        for (int a = 0; a < 2; ++a) {
+            const int tx = txs[a], ty = tys[b];
+            const int par = (tx & 1) | ((ty & 1) << 1);
+            const float wx = 0.5f - 0.5f * cos(2.f * PI * ((float)ixs[a] + 0.5f) / 32.f);
+            const float wy = 0.5f - 0.5f * cos(2.f * PI * ((float)iys[b] + 0.5f) / 32.f);
+            const float tw = wsum[(ulong)(ty + 1) * p.wnx + (ulong)(tx + 1)];
+            acc += wx * wy * (S[(ulong)par * plane + pix] / tw);
+        }
+    }
+    out[pix] = acc;
+}
