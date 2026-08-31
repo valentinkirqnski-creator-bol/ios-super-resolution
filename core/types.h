@@ -910,13 +910,20 @@ struct Config {
     // The robustness mask keeps sampling the same lattice bilinearly -- with
     // multiple correspondences per pixel there is no single fetch to score,
     // so it grades their expectation (documented approximation).
-    // Decimate only, requires flow_bilinear_sampling. Off by default.
+    // Decimate only. Off by default.
+    //
+    // STANDALONE: this mode does not require flow_bilinear_sampling. HDR+
+    // itself has no flow-interpolation concept -- overlap-blending is the
+    // ALTERNATIVE to interpolating the flow -- and the earlier coupling
+    // (overlap_merge_active required the Smooth Tile Flow toggle, and the
+    // densify bailed without it) made this toggle silently inert in every
+    // nearest-flow configuration. The lattice construction and the mask's
+    // expectation sampling are enabled by THIS toggle directly now.
     bool  flow_overlap_merge = false;
 
     // True when the overlapped-tile merge should actually run.
     bool overlap_merge_active() const {
-        return flow_overlap_merge && flow_bilinear_sampling &&
-               grey_method == GreyMethod::Decimate;
+        return flow_overlap_merge && grey_method == GreyMethod::Decimate;
     }
 
     // Sub-pixel refinement of every block-matching result: fit a bivariate

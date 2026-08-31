@@ -1599,7 +1599,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // checker equivalent; bilinear over the same lattice is the closest
     // verifiable field, and overlap is Decimate-gated anyway.)
     uint32_t rob_dogson_mode = flow_sample_mode(cfg);
-    if (cfg.flow_dense_lattice_trusted() && rob_dogson_mode == 0u)
+    if ((cfg.flow_dense_lattice_trusted() || cfg.overlap_merge_active()) &&
+        rob_dogson_mode == 0u)
         rob_dogson_mode = 1u;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
@@ -1841,6 +1842,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.r_s1 = cfg.r_s1;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = flow_sample_mode(cfg);
+    // Overlap merge: no single fetch to score, grade the lattice expectation
+    // (same upgrade the CPU guide-res path applies).
+    if (cfg.overlap_merge_active() && mp.flow_bilinear == 0u)
+        mp.flow_bilinear = 1u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();

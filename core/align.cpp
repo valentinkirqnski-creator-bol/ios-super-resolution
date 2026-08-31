@@ -1694,8 +1694,12 @@ void flow_densify_boundary_select(FlowField& flow,
         return;
     }
     const bool overlap_all = cfg.overlap_merge_active();
-    if ((!cfg.flow_boundary_selection && !overlap_all) ||
-        !cfg.flow_bilinear_sampling)
+    // Overlap mode builds the lattice unconditionally: its merge consumes the
+    // cells' own vectors and needs no interpolation toggle. Otherwise the
+    // boundary-select densify only matters when the flow is consumed
+    // bilinearly, as before.
+    if (!overlap_all &&
+        (!cfg.flow_boundary_selection || !cfg.flow_bilinear_sampling))
         return;
     // Even pitch only: the fine grid's pitch is tile_size/2 and the GPU hosts
     // pass it as an integer. Every shipped tile size (16/32/64) is even.

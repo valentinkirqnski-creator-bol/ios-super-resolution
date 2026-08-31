@@ -128,6 +128,8 @@ struct TuningParams: Equatable, Codable {
     var flow_bicubic_sampling: Bool = false
     /// HDR+-style overlapped-tile merge: Ts at stride Ts/2, per-tile measured
     /// flow (no interpolation), raised-cosine result blending. Decimate only.
+    /// Standalone: does NOT require Smooth Tile Flow (HDR+ has no flow
+    /// interpolation; overlap-blending is the alternative to it).
     var flow_overlap_merge: Bool = false
     var k_shrink: Float = 2.0
     /// D gate: below-threshold gradients are routed to denoising instead of

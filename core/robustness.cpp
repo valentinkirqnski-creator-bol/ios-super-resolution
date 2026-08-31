@@ -928,7 +928,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         // same nearest flow, so checker == doer holds there too).
         const bool merge_samples_flow =
             cfg.flow_bilinear_sampling ||
-            (cfg.flow_dense_lattice_trusted() && flow.has_fine());
+            ((cfg.flow_dense_lattice_trusted() || cfg.overlap_merge_active()) &&
+             flow.has_fine());
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads,
                                         /*bilinear_flow=*/merge_samples_flow);
@@ -1058,6 +1059,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
+    // Checker follows doer here too: with the overlapped-tile merge active
+    // there is no single fetch per pixel, so the mask grades the lattice
+    // expectation (sample_bilinear auto-selects the fine grid) -- same
+    // documented approximation as the raw-res path.
+    const bool sample_flow_g =
+        cfg.flow_bilinear_sampling ||
+        (cfg.overlap_merge_active() && flow.has_fine());
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
@@ -1065,7 +1073,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             if (d_p.c == 1) {
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
-                if (cfg.flow_bilinear_sampling)
+                if (sample_flow_g)
                     flow.sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
                 else {
                     flow_x = flow.dx(patch_idy, patch_idx);
@@ -1074,7 +1082,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             } else {
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
-                if (cfg.flow_bilinear_sampling) {
+                if (sample_flow_g) {
                     f32 rdx, rdy;
                     flow.sample_bilinear(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
                                          tile_size, rdx, rdy);
