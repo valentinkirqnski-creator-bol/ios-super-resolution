@@ -4,6 +4,7 @@
 #include "prof.h"
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <complex>
 #include <cstdlib>
@@ -1498,11 +1499,33 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         if (ica_all && lvl < (int)g_ref_ica_cache.levels.size() &&
             !(lvl == 0 && cfg.ica_per_level_coarse_only())) {
             const RefIcaLevel& L = g_ref_ica_cache.levels[(size_t)lvl];
-            if (L.hess.ny == flow.ny && L.hess.nx == flow.nx)
-                ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts,
+            // compute_hessian sizes its tile grid ceil(h/ts) (python
+            // init_ICA's convention); the flow grid is floor(h/ts) (block
+            // matching's). On any pyramid level not divisible by ts they
+            // differ by one row/column, and the old exact-equality guard
+            // here silently skipped ICA -- on real pyramids that was EVERY
+            // coarse level, so per-level ICA never actually ran anywhere
+            // while claiming python-z's per-level refinement. Crop the
+            // hessian to the flow grid instead: the extra ceil tiles are
+            // partial tiles block matching never emits flow for.
+            if (L.hess.ny >= flow.ny && L.hess.nx >= flow.nx) {
+                const HessianField* hp = &L.hess;
+                HessianField cropped;
+                if (L.hess.ny != flow.ny || L.hess.nx != flow.nx) {
+                    cropped.ny = flow.ny;
+                    cropped.nx = flow.nx;
+                    cropped.data.resize((size_t)flow.ny * flow.nx * 4);
+                    for (int cty = 0; cty < flow.ny; ++cty)
+                        std::memcpy(&cropped.data[(size_t)cty * flow.nx * 4],
+                                    L.hess.at(cty, 0),
+                                    (size_t)flow.nx * 4 * sizeof(f32));
+                    hp = &cropped;
+                }
+                ica_refine_level(r, L.gx, L.gy, m, *hp, flow, ts,
                                  cfg.ica_n_iter, cfg.num_threads,
                                  ica_damp_ratio(cfg),
                                  ica_max_step(cfg, radius));
+            }
         }
     }
 

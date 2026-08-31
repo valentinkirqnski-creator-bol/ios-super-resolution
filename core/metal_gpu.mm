@@ -2763,11 +2763,35 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             // failed" and skips it. Losing precision beats losing the frame.
             if (!prep_level_ica_gpu(r, ts, l_ref, l_gx, l_gy, l_hess, l_ny, l_nx))
                 continue;
-            // prep tiles with ceil, block matching with floor; they agree for
-            // every shipped pyramid, but skip rather than dispatch a mismatched
-            // grid if a future tile size makes them differ.
-            if (l_ny == ny && l_nx == nx &&
-                !ica_bufs(l_ref, l_gx, l_gy, l_hess, m.img, b_flow,
+            // prep tiles with ceil(h/ts), block matching with floor(h/ts).
+            // The old equality guard here assumed they agree "for every
+            // shipped pyramid" -- they do NOT: every coarse level of a real
+            // pyramid is indivisible by ts, so the guard silently skipped
+            // ICA on all of them and per-level ICA never actually ran
+            // (same bug, same fix as align.cpp's CPU loop). Crop the
+            // ceil-grid hessian to the flow grid; the dropped tiles are
+            // partial edge tiles block matching never emits flow for.
+            id<MTLBuffer> l_hess_use = l_hess;
+            if (l_ny != ny || l_nx != nx) {
+                if (l_ny < ny || l_nx < nx) continue;  // cannot happen (ceil>=floor)
+                const size_t row_b = (size_t)nx * 4u * sizeof(float);
+                id<MTLBuffer> crop = buf(nullptr, (size_t)ny * row_b);
+                if (!crop) continue;
+                id<MTLCommandBuffer> ccmd = [ctx().queue commandBuffer];
+                if (!ccmd) continue;
+                id<MTLBlitCommandEncoder> blit = [ccmd blitCommandEncoder];
+                if (!blit) continue;
+                for (int cty = 0; cty < ny; ++cty)
+                    [blit copyFromBuffer:l_hess
+                            sourceOffset:(NSUInteger)((size_t)cty * (size_t)l_nx * 4u * sizeof(float))
+                                toBuffer:crop
+                       destinationOffset:(NSUInteger)((size_t)cty * row_b)
+                                    size:row_b];
+                [blit endEncoding];
+                [ccmd commit];  // queue order puts this ahead of the ICA dispatch
+                l_hess_use = crop;
+            }
+            if (!ica_bufs(l_ref, l_gx, l_gy, l_hess_use, m.img, b_flow,
                           r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter,
                           ica_damp_ratio_metal(cfg), ica_max_step_metal(cfg, radius)))
                 return false;
