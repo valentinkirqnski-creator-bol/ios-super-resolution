@@ -943,10 +943,7 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
-    uint chroma_diff;     // 1 = accumulate R-G / B-G
-    uint ref_fallback_enabled;
-    float ref_fallback_min_weight;
-    float ref_fallback_relative_floor; // (112 bytes)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -1000,15 +997,12 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     float xy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 1);
     float yy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 3);
     if (raw_det) {
-        float det = xx * yy - xy * xy;
-        if (fabs(det) > 1e-10f) {
-            float inv_det = 1.f / det;
-            ixx =  inv_det * yy;
-            ixy = -inv_det * xy;
-            iyy =  inv_det * xx;
-        } else {
-            ixx = 1.f; ixy = 0.f; iyy = 1.f;
-        }
+        // python-z accumulate: raw 1/det, no singularity guard ("Invertible
+        // by design") -- twin of the CPU comment in merge.cpp interp_inv_cov.
+        float inv_det = 1.f / (xx * yy - xy * xy);
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
     } else {
         // invert_sym_2x2 / invert_2x2 with EPSILON_DIV
         float det = xx * yy - xy * xy;
@@ -1065,83 +1059,6 @@ inline int cfa_channel_ref(constant MergeRefParams& p, int i, int j) {
     return int(p.cfa11);
 }
 
-// Standalone classical Bayer demosaic -- twin of classical_green_at /
-// classical_chroma_at / classical_demosaic_at / classical_demosaic_bilinear
-// in merge.cpp. Used ONLY as merge_ref_band's per-channel fallback
-// (MergeRefParams::ref_fallback_enabled) for output pixels the merge kernel
-// could not actually cover. Deliberately independent of bayer_green_at
-// above: full Hamilton & Adams (2-tap average of the same-axis green
-// neighbours, corrected by that axis's own second derivative -- same-colour
-// samples two taps away, cancelling the low-frequency part of an edge
-// crossing the interpolation), then colour-difference red/blue.
-inline float classical_green_at(device const float* img, constant MergeRefParams& p, int y, int x) {
-    if (cfa_channel_ref(p, y, x) == 1) return img[uint(y) * p.lr_w + uint(x)];
-    int h = int(p.lr_h), w = int(p.lr_w);
-    int yu = clamp(y - 1, 0, h - 1), yd = clamp(y + 1, 0, h - 1);
-    int yu2 = clamp(y - 2, 0, h - 1), yd2 = clamp(y + 2, 0, h - 1);
-    int xl = clamp(x - 1, 0, w - 1), xr = clamp(x + 1, 0, w - 1);
-    int xl2 = clamp(x - 2, 0, w - 1), xr2 = clamp(x + 2, 0, w - 1);
-    float c0 = img[uint(y) * p.lr_w + uint(x)];
-    float gL = img[uint(y) * p.lr_w + uint(xl)], gR = img[uint(y) * p.lr_w + uint(xr)];
-    float cL2 = img[uint(y) * p.lr_w + uint(xl2)], cR2 = img[uint(y) * p.lr_w + uint(xr2)];
-    float gU = img[uint(yu) * p.lr_w + uint(x)], gD = img[uint(yd) * p.lr_w + uint(x)];
-    float cU2 = img[uint(yu2) * p.lr_w + uint(x)], cD2 = img[uint(yd2) * p.lr_w + uint(x)];
-    float dH = fabs(gL - gR) + fabs(2.f * c0 - cL2 - cR2);
-    float dV = fabs(gU - gD) + fabs(2.f * c0 - cU2 - cD2);
-    float eH = 0.5f * (gL + gR) + 0.25f * (2.f * c0 - cL2 - cR2);
-    float eV = 0.5f * (gU + gD) + 0.25f * (2.f * c0 - cU2 - cD2);
-    if (dH < dV) return eH;
-    if (dV < dH) return eV;
-    return 0.5f * (eH + eV);
-}
-
-inline float classical_chroma_at(device const float* img, constant MergeRefParams& p,
-                                 int y, int x, int target_ch) {
-    int h = int(p.lr_h), w = int(p.lr_w);
-    int site = cfa_channel_ref(p, y, x);
-    if (site == target_ch)
-        return img[uint(y) * p.lr_w + uint(x)] - classical_green_at(img, p, y, x);
-    if (site == 1) {
-        int xl = clamp(x - 1, 0, w - 1), xr = clamp(x + 1, 0, w - 1);
-        if (cfa_channel_ref(p, y, xl) == target_ch || cfa_channel_ref(p, y, xr) == target_ch) {
-            float a = img[uint(y) * p.lr_w + uint(xl)] - classical_green_at(img, p, y, xl);
-            float b = img[uint(y) * p.lr_w + uint(xr)] - classical_green_at(img, p, y, xr);
-            return 0.5f * (a + b);
-        }
-        int yu = clamp(y - 1, 0, h - 1), yd = clamp(y + 1, 0, h - 1);
-        float a = img[uint(yu) * p.lr_w + uint(x)] - classical_green_at(img, p, yu, x);
-        float b = img[uint(yd) * p.lr_w + uint(x)] - classical_green_at(img, p, yd, x);
-        return 0.5f * (a + b);
-    }
-    int yu = clamp(y - 1, 0, h - 1), yd = clamp(y + 1, 0, h - 1);
-    int xl = clamp(x - 1, 0, w - 1), xr = clamp(x + 1, 0, w - 1);
-    float a = img[uint(yu) * p.lr_w + uint(xl)] - classical_green_at(img, p, yu, xl);
-    float b = img[uint(yu) * p.lr_w + uint(xr)] - classical_green_at(img, p, yu, xr);
-    float c = img[uint(yd) * p.lr_w + uint(xl)] - classical_green_at(img, p, yd, xl);
-    float d = img[uint(yd) * p.lr_w + uint(xr)] - classical_green_at(img, p, yd, xr);
-    return 0.25f * (a + b + c + d);
-}
-
-inline float classical_demosaic_at(device const float* img, constant MergeRefParams& p,
-                                   int y, int x, int ch) {
-    float g = classical_green_at(img, p, y, x);
-    return (ch == 1) ? g : (g + classical_chroma_at(img, p, y, x, ch));
-}
-
-inline float classical_demosaic_bilinear(device const float* img, constant MergeRefParams& p,
-                                         float y, float x, int ch) {
-    int h = int(p.lr_h), w = int(p.lr_w);
-    int y0 = clamp(int(floor(y)), 0, h - 1), x0 = clamp(int(floor(x)), 0, w - 1);
-    int y1 = min(y0 + 1, h - 1), x1 = min(x0 + 1, w - 1);
-    float fy = clamp(y - float(y0), 0.f, 1.f), fx = clamp(x - float(x0), 0.f, 1.f);
-    float tl = classical_demosaic_at(img, p, y0, x0, ch);
-    float tr = classical_demosaic_at(img, p, y0, x1, ch);
-    float bl = classical_demosaic_at(img, p, y1, x0, ch);
-    float br = classical_demosaic_at(img, p, y1, x1, ch);
-    float top = tl + fx * (tr - tl);
-    float bot = bl + fx * (br - bl);
-    return top + fy * (bot - top);
-}
 
 // Bilinear sample of the per-tile flow at a RAW position. Twin of
 // FlowField::sample_bilinear in core/types.h -- keep them in step. Block
@@ -1646,14 +1563,6 @@ inline void merge_accumulate_ref_body(device AccT* num,
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
             float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
-            // Coverage floor -- twin of accumulate_ref in merge.cpp. Keyed
-            // on the ceiling in the params (>64), always active at 128.
-            // Unconditional, twin of cover_eps in merge_ref_band -- the
-            // > 64 key it replaced would have disabled the floor exactly
-            // where the red channel still has no taps.
-            if (true)
-                w += 5e-4f * fast::exp(-0.5f * (dist_x * dist_x +
-                                                dist_y * dist_y));
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }
@@ -1685,23 +1594,6 @@ inline void merge_accumulate_ref_body(device AccT* num,
         num[base + 2] = AccT(float(num[base + 2]) + G * float(den[base + 2]));
     }
 
-    // Per-channel reference-demosaic fallback -- twin of the block in
-    // accumulate_ref, merge.cpp. Last write to this pixel, after the
-    // chroma-difference un-differencing above so it always sees real RGB.
-    if (p.ref_fallback_enabled != 0u && p.nch >= 3) {
-        float w0 = float(den[base + 0]), w1 = float(den[base + 1]), w2 = float(den[base + 2]);
-        float w_max = max(w0, max(w1, w2));
-        for (int ch = 0; ch < int(p.nch); ++ch) {
-            uint idx = base + uint(ch);
-            float w = float(den[idx]);
-            float target = max(p.ref_fallback_min_weight, p.ref_fallback_relative_floor * w_max);
-            if (w < target) {
-                float fb = classical_demosaic_bilinear(img, p, coarse_y, coarse_x, ch);
-                num[idx] = AccT(float(num[idx]) + (target - w) * fb);
-                den[idx] = AccT(target);
-            }
-        }
-    }
 }
 
 #define MERGE_REF_KERNEL(NAME, ACC_T) \

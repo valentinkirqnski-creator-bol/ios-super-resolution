@@ -94,97 +94,6 @@ static inline f32 bayer_green_at(const Image& img, int i, int j, int h, int w) {
     return n ? sm / (f32)n : 0.f;
 }
 
-// Standalone classical Bayer demosaic, used ONLY as accumulate_ref's
-// per-channel fallback (Config::merge_ref_fallback_enabled below) for output
-// pixels the merge kernel could not actually cover. Deliberately independent
-// of bayer_green_at above: this is full Hamilton & Adams (2-tap average of
-// the same-axis green neighbours, corrected by that axis's own second
-// derivative -- same-colour samples two taps away -- which cancels the
-// low-frequency part of an edge crossing the interpolation and is what keeps
-// a hard edge from bleeding colour into the green plane), then colour-
-// difference red/blue: chrominance (channel minus green) varies far more
-// smoothly across an edge than the raw channel does, so interpolating THAT
-// and adding the local green back is what keeps the fallback from smearing
-// colour across edges the way a flat channel average would.
-static inline f32 classical_green_at(const Image& img, const CFA& cfa, int y, int x) {
-    if (cfa.p[y & 1][x & 1] == 1) return img.at(y, x);
-    const int h = img.h, w = img.w;
-    auto cl = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    const int yu = cl(y - 1, 0, h - 1), yd = cl(y + 1, 0, h - 1);
-    const int yu2 = cl(y - 2, 0, h - 1), yd2 = cl(y + 2, 0, h - 1);
-    const int xl = cl(x - 1, 0, w - 1), xr = cl(x + 1, 0, w - 1);
-    const int xl2 = cl(x - 2, 0, w - 1), xr2 = cl(x + 2, 0, w - 1);
-    const f32 c0 = img.at(y, x);
-    const f32 gL = img.at(y, xl), gR = img.at(y, xr);
-    const f32 cL2 = img.at(y, xl2), cR2 = img.at(y, xr2);
-    const f32 gU = img.at(yu, x), gD = img.at(yd, x);
-    const f32 cU2 = img.at(yu2, x), cD2 = img.at(yd2, x);
-    const f32 dH = std::fabs(gL - gR) + std::fabs(2.f * c0 - cL2 - cR2);
-    const f32 dV = std::fabs(gU - gD) + std::fabs(2.f * c0 - cU2 - cD2);
-    const f32 eH = 0.5f * (gL + gR) + 0.25f * (2.f * c0 - cL2 - cR2);
-    const f32 eV = 0.5f * (gU + gD) + 0.25f * (2.f * c0 - cU2 - cD2);
-    if (dH < dV) return eH;
-    if (dV < dH) return eV;
-    return 0.5f * (eH + eV);
-}
-
-// Interpolated (target_ch - green) chroma at (y,x), whatever colour (y,x)
-// actually is. A green site has the target colour on one orthogonal axis
-// (2-tap average); the opposite-colour site (e.g. red requested at a blue
-// site) only has it on the four diagonals (4-tap average).
-static inline f32 classical_chroma_at(const Image& img, const CFA& cfa, int y, int x, int target_ch) {
-    const int h = img.h, w = img.w;
-    auto cl = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    const int site = cfa.p[y & 1][x & 1];
-    if (site == target_ch)
-        return img.at(y, x) - classical_green_at(img, cfa, y, x);
-    if (site == 1) {
-        const int xl = cl(x - 1, 0, w - 1), xr = cl(x + 1, 0, w - 1);
-        if (cfa.p[y & 1][xl & 1] == target_ch || cfa.p[y & 1][xr & 1] == target_ch) {
-            const f32 a = img.at(y, xl) - classical_green_at(img, cfa, y, xl);
-            const f32 b = img.at(y, xr) - classical_green_at(img, cfa, y, xr);
-            return 0.5f * (a + b);
-        }
-        const int yu = cl(y - 1, 0, h - 1), yd = cl(y + 1, 0, h - 1);
-        const f32 a = img.at(yu, x) - classical_green_at(img, cfa, yu, x);
-        const f32 b = img.at(yd, x) - classical_green_at(img, cfa, yd, x);
-        return 0.5f * (a + b);
-    }
-    const int yu = cl(y - 1, 0, h - 1), yd = cl(y + 1, 0, h - 1);
-    const int xl = cl(x - 1, 0, w - 1), xr = cl(x + 1, 0, w - 1);
-    const f32 a = img.at(yu, xl) - classical_green_at(img, cfa, yu, xl);
-    const f32 b = img.at(yu, xr) - classical_green_at(img, cfa, yu, xr);
-    const f32 c = img.at(yd, xl) - classical_green_at(img, cfa, yd, xl);
-    const f32 d = img.at(yd, xr) - classical_green_at(img, cfa, yd, xr);
-    return 0.25f * (a + b + c + d);
-}
-
-static inline f32 classical_demosaic_at(const Image& img, const CFA& cfa, int y, int x, int ch) {
-    const f32 g = classical_green_at(img, cfa, y, x);
-    return (ch == 1) ? g : (g + classical_chroma_at(img, cfa, y, x, ch));
-}
-
-// Bilinear blend of the classical demosaic at the 4 integer raw taps around
-// a fractional raw-resolution coordinate -- the same "sample the reference at
-// a fractional position" shape accumulate_ref's own kernel regression uses,
-// so the fallback lands at the exact position its virtual tap is meant to
-// stand in for.
-static inline f32 classical_demosaic_bilinear(const Image& img, const CFA& cfa, f32 y, f32 x, int ch) {
-    const int h = img.h, w = img.w;
-    const int y0 = std::min(std::max((int)std::floor(y), 0), h - 1);
-    const int x0 = std::min(std::max((int)std::floor(x), 0), w - 1);
-    const int y1 = std::min(y0 + 1, h - 1), x1 = std::min(x0 + 1, w - 1);
-    const f32 fy = std::min(std::max(y - (f32)y0, 0.f), 1.f);
-    const f32 fx = std::min(std::max(x - (f32)x0, 0.f), 1.f);
-    const f32 tl = classical_demosaic_at(img, cfa, y0, x0, ch);
-    const f32 tr = classical_demosaic_at(img, cfa, y0, x1, ch);
-    const f32 bl = classical_demosaic_at(img, cfa, y1, x0, ch);
-    const f32 br = classical_demosaic_at(img, cfa, y1, x1, ch);
-    const f32 top = tl + fx * (tr - tl);
-    const f32 bot = bl + fx * (br - bl);
-    return top + fy * (bot - top);
-}
-
 static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
@@ -258,17 +167,14 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
     if (raw_det) {
-        f32 det = xx * yy - xy * xy;
-        if (std::fabs(det) > 1e-10f) {
-            f32 inv_det = 1.f / det;
-            ixx =  inv_det * yy;
-            ixy = -inv_det * xy;
-            iyy =  inv_det * xx;
-        } else {
-            ixx = 1.f;
-            ixy = 0.f;
-            iyy = 1.f;
-        }
+        // python-z accumulate (merge.py:389-390): raw inv_det = 1.0/det with
+        // NO singularity guard -- "Invertible by design". Matched verbatim;
+        // the previous |det| > 1e-10 -> identity fallback was a port-only
+        // softening on near-singular covs, removed for parity on request.
+        f32 inv_det = 1.f / (xx * yy - xy * xy);
+        ixx =  inv_det * yy;
+        ixy = -inv_det * xy;
+        iyy =  inv_det * xx;
     } else {
         invert_sym_2x2(xx, xy, yy, ixx, ixy, iyy);
     }
@@ -481,15 +387,6 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
 // Alg. 11 — matches handheld_super_resolution/merge.py accumulate_ref().
 static void accumulate_ref(const Image& img, const CovField& covs, const Image* acc_rob,
                            Image& num, Image& den, int y0, const Config& cfg) {
-    // Coverage floor. NOT from python-z -- it merges a full burst, so a
-    // channel whose every kernel tap falls outside the cutoff at one frame
-    // still gets taps from the others' sub-pixel offsets. This port has to
-    // survive regions where robustness leaves one frame, where that sum really
-    // is zero and the division sites guard it to black. Kept deliberately: it
-    // is a merge coverage guard, not a kernel parameter, and removing it would
-    // reintroduce per-channel holes rather than match anything python-z does.
-    // At 5e-4 relative it is under 1% wherever real taps survive.
-    const f32 cover_eps = 5e-4f;
     const bool chroma_diff = cfg.merge_chroma_difference && cfg.bayer_mode;
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
@@ -589,19 +486,7 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;
-                    f32 w = std::exp(-0.5f * y);
-                    // Coverage floor: a tiny isotropic sigma=1
-                    // reference contribution guarantees every colour channel
-                    // of every output pixel a nonzero denominator, whatever
-                    // the sharp kernels and robustness rejection left behind.
-                    // 5e-4 relative: invisible (<1%) wherever any real tap
-                    // survives, decisive where none does -- the residual
-                    // green/black per-channel holes. The 3x3 window (rad >=
-                    // 1) always contains all four CFA sites, so the floor
-                    // closes every hole. Twin in merge_accumulate_ref_body.
-                    if (cover_eps > 0.f)
-                        w += cover_eps * std::exp(-0.5f * (dist_x * dist_x +
-                                                           dist_y * dist_y));
+                    const f32 w = std::exp(-0.5f * y);
 
                     val[channel] += c * w;
                     acc[channel] += w;
@@ -641,41 +526,6 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 num.at(local_i, hr_j, 2) += G * den.at(local_i, hr_j, 2);
             }
 
-            // Per-channel reference-demosaic fallback. The trusted weight is
-            // whichever is LARGER of an absolute floor (catches genuine
-            // near-total starvation) and a fraction of this pixel's own
-            // best-covered channel (catches a channel that is merely thin
-            // NEXT TO its siblings -- a few frames' worth of real weight is
-            // "enough" in isolation but still reads as a colour cast if the
-            // other two channels each merged many more frames' worth. An
-            // absolute floor alone cannot see that, since multi-frame
-            // accumulation routinely pushes every channel's total weight past
-            // any single fixed number regardless of whether the KERNEL that
-            // produced it was ever wide enough to be trustworthy).
-            // Below the target: top the accumulator up with a virtual tap at
-            // the classical demosaic's estimate instead of leaving the
-            // channel's own division site to whatever thin real support it
-            // has: num += (target - w) * fallback, den = target. A channel
-            // already at or above target is untouched; one at exactly 0 gets
-            // the fallback value outright; anything between blends
-            // continuously, so there is no seam where this engages. Last
-            // write to this pixel -- after chroma-difference, so it sees real
-            // RGB regardless of that mode.
-            if (cfg.merge_ref_fallback_enabled && nch >= 3) {
-                f32 w[3];
-                for (int ch = 0; ch < nch; ++ch) w[ch] = den.at(local_i, hr_j, ch);
-                const f32 w_max = std::max(w[0], std::max(w[1], w[2]));
-                const f32 w_min_abs = cfg.merge_ref_fallback_min_weight;
-                const f32 rel = cfg.merge_ref_fallback_relative_floor;
-                for (int ch = 0; ch < nch; ++ch) {
-                    const f32 target = std::max(w_min_abs, rel * w_max);
-                    if (w[ch] < target) {
-                        const f32 fb = classical_demosaic_bilinear(img, cfg.cfa, coarse_y, coarse_x, ch);
-                        num.at(local_i, hr_j, ch) += (target - w[ch]) * fb;
-                        den.at(local_i, hr_j, ch) = target;
-                    }
-                }
-            }
         }
     });
 }
