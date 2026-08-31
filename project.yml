@@ -46,6 +46,7 @@ targets:
           - "merge.cpp"
           - "pipeline.cpp"
           - "pipeline_paths.cpp"
+          - "hdrplus_mode.cpp"
           - "raw_io.cpp"
           - "dng_writer.cpp"
           - "lj92_enc.cpp"
