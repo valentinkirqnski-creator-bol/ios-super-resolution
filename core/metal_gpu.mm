@@ -2919,9 +2919,8 @@ struct MergeCompParamsCPU {
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
     uint32_t fast_weights = 0;    // skip negligible taps/hypotheses (was _pad2)
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
-    uint32_t soften_inv_cov = 1;  // 1 = cap inverse-covariance elements at 32
 };
-static_assert(sizeof(MergeCompParamsCPU) == 100, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -2940,9 +2939,8 @@ struct MergeRefParamsCPU {
     uint32_t ref_fallback_enabled = 0;
     float ref_fallback_min_weight = 0.f;
     float ref_fallback_relative_floor = 0.f;
-    uint32_t soften_inv_cov = 1;  // 1 = cap inverse-covariance elements at 32
 };
-static_assert(sizeof(MergeRefParamsCPU) == 116, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 112, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3751,7 +3749,6 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
     p.flow_bilinear = flow_sample_mode(cfg);
     p.fast_weights = cfg.merge_fast_weights ? 1u : 0u;
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
-    p.soften_inv_cov = cfg.merge_soften_inv_cov ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
@@ -3877,7 +3874,6 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.ref_fallback_enabled = cfg.merge_ref_fallback_enabled ? 1u : 0u;
     p.ref_fallback_min_weight = cfg.merge_ref_fallback_min_weight;
     p.ref_fallback_relative_floor = cfg.merge_ref_fallback_relative_floor;
-    p.soften_inv_cov = cfg.merge_soften_inv_cov ? 1u : 0u;
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {

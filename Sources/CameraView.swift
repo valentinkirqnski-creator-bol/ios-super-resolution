@@ -776,9 +776,9 @@ struct CameraView: View {
              Measured on a grey step edge (any colour in the output is pure artifact): worst              case 113.9 -> 12.3 levels, mean 1.50 -> 0.00, and no longer sensitive to kernel              sharpness. Costs some accuracy on genuinely fine coloured texture.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Soften Merge Kernels (cap 32)", isOn: $cam.tuningParams.merge_soften_inv_cov)
+        Toggle("Isotropic Merge Kernels", isOn: $cam.tuningParams.merge_kernel_iso)
         Text("""
-             Caps merge kernel sharpness: any inverse covariance whose largest element              exceeds 32 is rescaled to land exactly at 32 (the 832f7b8 soften_inv_cov).              Root cause of the magenta/green edge fringes is alignment error robustness              fails to reject; this bounds how sharply the merge prints that mistake, so it              dilutes into blur instead of a crisp colour fringe. Isolated A/B on the real              8-frame burst (only this flag flipped): fringed-region chroma p99.9 39 -> 37,              mean 8.00 -> 7.83 -- real but modest. Cost: softens legitimately sharp detail              wherever the tensor asks for a kernel tighter than the cap. python-z has no              such clamp.
+             python-z's merging.kernel=iso, byte-for-byte: every pixel of every frame              merges with the same fixed round Gaussian (z = 2*(dx^2+dy^2), sigma ~0.71 px)              and the covariance fetch is skipped entirely, so the whole kernel-estimation              chain (structure tensor, A, D, k_detail/k_denoise/k_stretch/k_shrink, the              selection law) is bypassed -- those sliders do nothing while this is on.              Diagnostic mode: if the magenta/green edge fringes SURVIVE with this on, the              kernel code is exonerated and the cause is upstream (alignment + robustness).              If they vanish, that alone does not prove a kernel bug -- iso is also just a              wider kernel across edges, and wider kernels dilute misalignment artifacts              without fixing them. Costs sharpness: no edge-adaptive shaping at all.
              """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Dense Flow (per-pixel Lucas-Kanade)", isOn: $cam.tuningParams.flow_dense_lk_enabled)

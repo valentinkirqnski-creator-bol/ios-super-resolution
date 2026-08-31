@@ -912,8 +912,7 @@ struct MergeCompParams {
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint fast_weights;   // skip negligible taps/hypotheses (was _pad2)
-    uint chroma_diff;     // 1 = accumulate R-G / B-G
-    uint soften_inv_cov;  // 1 = cap inverse-covariance elements at 32 (100 bytes)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G (96 bytes)
 };
 
 struct MergeRefParams {
@@ -947,8 +946,7 @@ struct MergeRefParams {
     uint chroma_diff;     // 1 = accumulate R-G / B-G
     uint ref_fallback_enabled;
     float ref_fallback_min_weight;
-    float ref_fallback_relative_floor;
-    uint soften_inv_cov;  // 1 = cap inverse-covariance elements at 32 (116 bytes)
+    float ref_fallback_relative_floor; // (112 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -972,34 +970,11 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
     return top + frac_y * (bot - top);
 }
 
-// Twin of soften_inv_cov in merge.cpp: cap every inverse-covariance element
-// at 32 (whole-matrix rescale, verbatim from 832f7b8), bounding kernel
-// sharpness so residual robustness-unrejected misalignments dilute into
-// blur instead of printing as full-sharpness colour fringes; non-finite
-// matrices land on a safe isotropic fallback. Deliberate deviation from
-// python-z, restored on request -- see the CPU twin's comment.
-inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
-    const float k_max_abs = 32.f;
-    float m = max(fabs(ixx), max(fabs(iyy), fabs(ixy)));
-    if (!(m > k_max_abs) || !isfinite(m)) {
-        if (!isfinite(ixx) || !isfinite(ixy) || !isfinite(iyy)) {
-            ixx = 2.f;
-            ixy = 0.f;
-            iyy = 2.f;
-        }
-        return;
-    }
-    float s = k_max_abs / m;
-    ixx *= s;
-    ixy *= s;
-    iyy *= s;
-}
-
 // raw_det=true -> accumulate (comp); false -> accumulate_ref
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
-                           bool raw_det, bool soften) {
+                           bool raw_det) {
     // Twin of the CPU fix in merge.cpp's interp_inv_cov: frac must use the
     // SAME rounding mode as the floor index, or a negative kmap (reachable
     // by accumulate_ref in the leftmost/topmost output column) blends fx/fy
@@ -1046,7 +1021,6 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
             ixx = 1.f; ixy = 0.f; iyy = 1.f;
         }
     }
-    if (soften) soften_inv_cov(ixx, ixy, iyy);
 }
 
 // Twin of bayer_green_at in merge.cpp: directional (Hamilton-Adams) green at
@@ -1319,8 +1293,7 @@ static inline void merge_comp_contrib_flowed(device const float* img,
             kmap_j = lr_mov_x;
             kmap_i = lr_mov_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true,
-                       p.soften_inv_cov != 0u);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
     int center_j = lround_away(lr_mov_x);
@@ -1644,8 +1617,7 @@ inline void merge_accumulate_ref_body(device AccT* num,
             kmap_j = coarse_x;
             kmap_i = coarse_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false,
-                       p.soften_inv_cov != 0u);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false);
     }
 
     // Clamped into the image -- twin of the reference pass in merge.cpp.

@@ -765,20 +765,6 @@ struct Config {
     // from G, which always has samples on its own row.
     bool  merge_chroma_difference = false;
 
-    // Cap merge kernel sharpness: rescale any interpolated inverse
-    // covariance whose largest element exceeds 32 so it lands exactly at 32
-    // (whole-matrix rescale, the 832f7b8 soften_inv_cov). Bounds how sharply
-    // the merge prints a misalignment robustness failed to reject, at the
-    // cost of softening legitimately sharp detail wherever the tensor asks
-    // for a kernel tighter than the cap. Isolated A/B on the real 8-frame
-    // burst (this flag the ONLY difference): fringed-region chroma p99.9
-    // 39 -> 37, mean 8.00 -> 7.83 -- a real but small dilution. (An earlier
-    // ~21% figure conflated this with the merge_ref_fallback commits that
-    // landed in the same rebase; those carry the larger share.) python-z
-    // has no such clamp; ff54ccf removed it for that reason, b308fa3
-    // restored it, this flag makes the trade selectable.
-    bool  merge_soften_inv_cov = true;
-
     // Per-channel fallback for the reference frame's own merge pass: when a
     // channel's accumulated weight at an output pixel falls below
     // merge_ref_fallback_min_weight, blend in a value from a standalone

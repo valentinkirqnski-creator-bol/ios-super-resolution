@@ -506,8 +506,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.prealign_enabled = tuning[@"prealign_enabled"].boolValue;
     if (tuning[@"merge_chroma_difference"])
         cfg.merge_chroma_difference = tuning[@"merge_chroma_difference"].boolValue;
-    if (tuning[@"merge_soften_inv_cov"])
-        cfg.merge_soften_inv_cov = tuning[@"merge_soften_inv_cov"].boolValue;
+    if (tuning[@"merge_kernel_iso"])
+        cfg.kernel = tuning[@"merge_kernel_iso"].boolValue ? hhsr::KernelShape::Iso
+                                                           : hhsr::KernelShape::Steerable;
     if (tuning[@"flow_dense_lk_enabled"])
         cfg.flow_dense_lk_enabled = tuning[@"flow_dense_lk_enabled"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
