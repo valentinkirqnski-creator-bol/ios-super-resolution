@@ -1396,9 +1396,10 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     size_t fg_bytes = 0;
     int fg_ny = 0, fg_nx = 0, fg_ts = tile_size;
     if (!is_ref && flow && flow_mode != 0u) {
-        // Trusted pairing: let flow_gpu_grid swap in the fine (dense-LK)
-        // lattice when present, exactly as the merge and the CPU twin
-        // (compute_robustness_raw_res, gated the same way) now do.
+        // Interpolated modes read the same lattice the merge reads: let
+        // flow_gpu_grid swap in the fine (boundary-select / dense-LK)
+        // lattice when present, exactly as the merge's own flow binding and
+        // the CPU twin (compute_robustness_raw_res, gated the same way) do.
         (void)flow_gpu_grid(*flow, tile_size, fg_dat, fg_bytes, fg_ny, fg_nx, fg_ts);
     } else if (!is_ref && flow) {
         // python-z parity: cuda_uspcale_dogson's flow lookup is a bare
@@ -1586,14 +1587,18 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     id<MTLBuffer> b_comp_means_hires = nil;
     int ch_h = 0, ch_w = 0;
-    // 0 = python-z parity (coarse, nearest), the default; otherwise the
-    // fine-lattice sample mode -- see Config::flow_dense_lattice_trusted and
-    // the twin gate in compute_robustness_raw_res (robustness.cpp). NOT
-    // flow_sample_mode(cfg) unconditionally: that also reads
-    // flow_bilinear_sampling, which this override is deliberately
-    // independent of.
-    const uint32_t rob_dogson_mode = cfg.flow_dense_lattice_trusted()
-        ? (cfg.flow_bicubic_sampling ? 2u : 1u) : 0u;
+    // Checker follows doer -- twin of the gate in compute_robustness_raw_res
+    // (robustness.cpp): warp the comparison stats with the same flow-sample
+    // mode the merge kernel uses (flow_sample_mode honours the bilinear/
+    // bicubic toggles; the dense-lattice trusted pairing upgrades nearest to
+    // bilinear exactly as the merge's own param fill does). Mode 0 = coarse
+    // nearest = python-z parity, which the merge also uses when the toggle
+    // is off. (Overlap merge's 4-hypothesis blend has no single-vector
+    // checker equivalent; bilinear over the same lattice is the closest
+    // verifiable field, and overlap is Decimate-gated anyway.)
+    uint32_t rob_dogson_mode = flow_sample_mode(cfg);
+    if (cfg.flow_dense_lattice_trusted() && rob_dogson_mode == 0u)
+        rob_dogson_mode = 1u;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
                     rob_dogson_mode))

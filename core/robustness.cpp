@@ -916,20 +916,22 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             Image comp_vars_guide; // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
-        // Nearest, always -- not cfg.flow_bilinear_sampling. python-z's
-        // cuda_uspcale_dogson has no interpolation option: the flow lookup
-        // inside the Dogson warp is a bare per-tile array index
-        // (patch_idy = int(y // tile_size)) under every configuration.
-        //
-        // Overridden by Config::flow_dense_lattice_trusted(): dense LK plus
-        // global pre-alignment together are trusted enough to justify
-        // reading the fine lattice here specifically -- see that accessor's
-        // comment. sample_bilinear already falls back to the coarse grid
-        // when flow.has_fine() is false, so this is only ever a live switch
-        // when Dense Flow actually produced one.
+        // Checker follows doer: warp the comparison stats with the SAME
+        // flow field the merge will apply -- the exact gate accumulate_comp
+        // uses (flow_bilinear_sampling, or the dense-lattice trusted
+        // pairing when a fine lattice exists). R certifying one flow while
+        // the merge fetches samples with another means merged samples were
+        // never verified at all between tile centres. When the toggle is
+        // off this is nearest per-tile, which is also python-z parity
+        // (cuda_uspcale_dogson's bare patch_idy = int(y // tile_size) --
+        // python-z has no interpolation option, but its merge consumes the
+        // same nearest flow, so checker == doer holds there too).
+        const bool merge_samples_flow =
+            cfg.flow_bilinear_sampling ||
+            (cfg.flow_dense_lattice_trusted() && flow.has_fine());
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads,
-                                        /*bilinear_flow=*/cfg.flow_dense_lattice_trusted());
+                                        /*bilinear_flow=*/merge_samples_flow);
     }
 
     const Image& ref_means = ref_stats.means_hires;
