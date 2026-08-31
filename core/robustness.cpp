@@ -884,14 +884,15 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
     }
 
-    // python-z parity: ONE shared curve, reused for every guide channel --
-    // robustness.py derives a single (alpha, beta) once and scores R/G/B
-    // against the same std_curve/diff_curve, never a per-channel variant.
-    // mask_noise_curves(cfg) already reads Config::noise_alpha_robustness(),
-    // which is that shared, unscaled value; the same pointer just goes in
-    // every slot instead of building three different curves.
-    const NoiseCurves& shared_curve = mask_noise_curves(cfg);
-    const NoiseCurves* nc_ch[3] = {&shared_curve, &shared_curve, &shared_curve};
+    // 832f7b8-style per-channel curves, restored on request: each guide
+    // channel scored against its own WB-scaled (alpha', beta') curve
+    // (Config::noise_alpha_ch_robustness -- alpha_dng[c] * wb_gain *
+    // guide_weight, same accessor 832f7b8 used), NOT python-z's single
+    // shared unscaled curve (3585bef item 2). Deliberate deviation from
+    // python-z; the guide-resolution path below always kept this form.
+    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
+    for (int ch = 0; ch < 3; ++ch)
+        nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
 
     // Comparison frame's own local stats, still built at guide resolution
     // (compute_guide/local_stats_3x3 are unchanged) -- only the upscale step
@@ -976,14 +977,15 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             R.at(y, x) = r_val;
         }
     }
-    // python-z parity: cuda_compute_local_min is a literal 5x5, clamped-edge
-    // window run directly on the raw-resolution R -- no guide-grid collapse,
-    // no upsample-back staircase. local_min_5x5_on_guide (still below, and
-    // still reachable via robustness_local_min_on_guide for anything that
-    // wants the coarser, cheaper approximation) exists as a distinct,
-    // non-default choice now, not what this path claims to be exact to
-    // python-z runs.
-    return local_min_5x5(R);
+    // 832f7b8-style Eq. 9, restored on request: the guide-grid erosion
+    // (2x2 min-reduce -> 5x5 min on the coarser grid -> nearest upsample,
+    // an effective ~10-12 raw-px minimum footprint) instead of python-z's
+    // literal 5x5 on raw R (3585bef item 5's filter change). The wider
+    // erosion spreads every rejection over roughly double the area, which
+    // is most of why the 832f7b8-era mask read darker. Deliberate deviation
+    // from python-z; local_min_5x5(R) is the python-z-exact form if parity
+    // is wanted back.
+    return local_min_5x5_on_guide(R);
 }
 
 Image robustness_local_min_on_guide(const Image& R) {
