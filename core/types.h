@@ -867,6 +867,20 @@ struct Config {
     // buffers; merge.cpp's R-sampling coordinate math needs no change either
     // way, since it reads the resolution off the mask's own dimensions
     // rather than trusting this flag.
+    // EXPERIMENT (IPOL author's suggestion, 2026-09-01): compute the
+    // robustness statistics in colour-transformed linear sRGB instead of
+    // the camera-native prewhitened space. The guide (ref and comp alike)
+    // is multiplied by cam_to_srgb before the 3x3 stats, and the noise
+    // model transforms with it (alpha'_c = sum_j M_cj^2 alpha_j, same for
+    // beta -- exact for read noise, first-order for shot noise). Two
+    // intended effects: one tuning works across cameras (d and sigma live
+    // in a camera-independent space), and the matrix's large off-diagonals
+    // amplify chroma-coherent differences -- the colour-fringe signature --
+    // relative to luma. CPU paths only for now: when active the mask is
+    // computed on the CPU golden path even where Metal twins exist, so the
+    // experiment cannot silently no-op on device. Requires has_cam_to_srgb.
+    bool robustness_color_space = false;
+
     bool robustness_raw_resolution_enabled = true;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

@@ -445,6 +445,49 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
     return make_noise_curves_channel(cfg, ch);
 }
 
+// --- Colour-space robustness experiment (Config::robustness_color_space) ---
+// Statistics in linear sRGB instead of the camera-native prewhitened space.
+static bool rob_color_space_active(const Config& cfg) {
+    return cfg.robustness_color_space && cfg.bayer_mode && cfg.has_cam_to_srgb;
+}
+
+// Guide RGB -> linear sRGB, in place. Off-diagonals produce negatives;
+// downstream math (means, variances, |d|, curve indexing with its >=0
+// clamp) handles them.
+static void transform_guide_srgb(Image& guide, const Config& cfg, int num_threads) {
+    if (guide.c != 3) return;
+    const f32* m = cfg.cam_to_srgb;
+    parallel_rows(guide.h, num_threads, [&](int y) {
+        for (int x = 0; x < guide.w; ++x) {
+            const f32 r = guide.at(y, x, 0);
+            const f32 g = guide.at(y, x, 1);
+            const f32 b = guide.at(y, x, 2);
+            guide.at(y, x, 0) = m[0] * r + m[1] * g + m[2] * b;
+            guide.at(y, x, 1) = m[3] * r + m[4] * g + m[5] * b;
+            guide.at(y, x, 2) = m[6] * r + m[7] * g + m[8] * b;
+        }
+    });
+}
+
+// Noise model transformed with the guide: for output channel c of a linear
+// map M, var'_c(x) = sum_j M_cj^2 var_j -- exact for the signal-independent
+// (beta) term, first-order for the signal-dependent (alpha) term (exact when
+// the three camera channels share the local brightness the curve is indexed
+// by). Cached per channel like every other curve.
+static const NoiseCurves& mask_noise_curves_channel_space(const Config& cfg, int ch) {
+    if (!rob_color_space_active(cfg))
+        return mask_noise_curves_channel(cfg, ch);
+    if (cfg.debug_noise_model_disabled)
+        return make_noise_curves_channel(0.f, 0.f, ch);
+    f32 a = 0.f, b = 0.f;
+    for (int j = 0; j < 3; ++j) {
+        const f32 m = cfg.cam_to_srgb[ch * 3 + j];
+        a += m * m * cfg.noise_alpha_ch_robustness(j);
+        b += m * m * cfg.noise_beta_ch_robustness(j);
+    }
+    return make_noise_curves_channel(a, b, ch);
+}
+
 } // namespace
 
 // Defined OUTSIDE the anonymous namespace above, deliberately. Inside it the
@@ -837,13 +880,19 @@ static Image local_min_5x5_on_guide(const Image& R);
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
-    // Metal GPU only — same math as the CPU path below (golden reference).
-    RefStats gpu = init_robustness_metal(ref_raw, cfg);
-    if (gpu.means.h > 0 && gpu.means.w > 0) return gpu;
-    return RefStats();
-#else
+    // Metal GPU — same math as the CPU path below (golden reference). The
+    // colour-space experiment has no Metal twin yet, so it takes the CPU
+    // body even on device rather than silently no-oping.
+    if (!rob_color_space_active(cfg)) {
+        RefStats gpu = init_robustness_metal(ref_raw, cfg);
+        if (gpu.means.h > 0 && gpu.means.w > 0) return gpu;
+        return RefStats();
+    }
+#endif
     RefStats st;
     Image guide = compute_guide(ref_raw, cfg);
+    if (rob_color_space_active(cfg))
+        transform_guide_srgb(guide, cfg, cfg.num_threads);
     Image means, vars;
     local_stats_3x3(guide, means, vars);
     // 460-main keeps robustness local statistics on the guide grid
@@ -862,7 +911,6 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
                                            cfg.flow_bilinear_sampling);
     }
     return st;
-#endif
 }
 
 // Algorithm 6, read literally: d^2/sigma^2/R computed at RAW resolution,
@@ -892,7 +940,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // python-z; the guide-resolution path below always kept this form.
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     for (int ch = 0; ch < 3; ++ch)
-        nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
+        nc_ch[ch] = &mask_noise_curves_channel_space(cfg, ch);
 
     // Comparison frame's own local stats, still built at guide resolution
     // (compute_guide/local_stats_3x3 are unchanged) -- only the upscale step
@@ -913,6 +961,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         Image comp_means_guide;
         {
             Image guide = compute_guide(comp_raw, cfg);
+            if (rob_color_space_active(cfg))
+                transform_guide_srgb(guide, cfg, cfg.num_threads);
             Image comp_vars_guide; // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
@@ -1035,11 +1085,15 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
 #ifdef __APPLE__
-    // Metal GPU only — same Alg. robustness math as the CPU path below.
-    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg);
-    if (gpu.h > 0 && gpu.w > 0) return gpu;
-    return Image();
-#else
+    // Metal GPU — same Alg. robustness math as the CPU path below. The
+    // colour-space experiment has no Metal twin yet, so it takes the CPU
+    // body even on device rather than silently no-oping.
+    if (!rob_color_space_active(cfg)) {
+        Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg);
+        if (gpu.h > 0 && gpu.w > 0) return gpu;
+        return Image();
+    }
+#endif
     if (cfg.robustness_raw_resolution_active()) {
         Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size, cfg);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
@@ -1048,12 +1102,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     if (ref_stats.means.c == 3) {
         for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
+            nc_ch[ch] = &mask_noise_curves_channel_space(cfg, ch);
     } else {
         nc_ch[0] = &mask_noise_curves(cfg);
     }
 
     Image guide = compute_guide(comp_raw, cfg);
+    if (rob_color_space_active(cfg))
+        transform_guide_srgb(guide, cfg, cfg.num_threads);
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
 
@@ -1133,7 +1189,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         }
     }
     return local_min_5x5(R);
-#endif
 }
 
 } // namespace hhsr
