@@ -724,9 +724,22 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     return buf / w_acc;
 }
 
+// values_bilinear: sample the STATS with bilinear (non-negative) weights
+// instead of the Dodgson quadratic, at the same coordinates with the same
+// flow warp and the same OOB->inf convention. Exists for VARIANCE fields:
+// the Dodgson kernel's negative lobes (|x| in (1,1.5)) can push an
+// interpolated sigma^2 BELOW every neighbouring guide cell, and with the
+// noise model disabled there is no sigma_t floor to catch the undershoot,
+// so d^2/sigma^2 spikes on perfectly aligned content. Measured on the
+// synthetic misalignment repro (noise model off, nearest flow): the raw-res
+// mask fully rejected 3.6% of perfectly aligned pixels with Dodgson-sampled
+// variance vs 1.1% bilinear (guide-res path: 0.9%) -- those false holes
+// merge as single-frame demosaic speckle. Means keep Dodgson (python-z
+// parity; overshoot on a mean is harmless to R).
 static Image upscale_warp_stats(const Image& guide_stats,
                                 bool is_ref, const FlowField* flow, int tile_size,
-                                int num_threads, bool bilinear_flow) {
+                                int num_threads, bool bilinear_flow,
+                                bool values_bilinear = false) {
     const int nc = guide_stats.c;
     // Match Python upscale_warp_stats sizing: 3ch -> 2x, else same size
     const int out_h = (nc == 3) ? guide_stats.h * 2 : guide_stats.h;
@@ -757,7 +770,9 @@ static Image upscale_warp_stats(const Image& guide_stats,
             f32 LR_y = (y + flow_y + 0.5f) / s - 0.5f;
             f32 LR_x = (x + flow_x + 0.5f) / s - 0.5f;
             for (int ch = 0; ch < nc; ++ch) {
-                out.at(y, x, ch) = sample_dogson(guide_stats, LR_y, LR_x, ch);
+                out.at(y, x, ch) = values_bilinear
+                    ? sample_bilinear_or_inf(guide_stats, LR_y, LR_x, ch)
+                    : sample_dogson(guide_stats, LR_y, LR_x, ch);
             }
         }
     });
@@ -956,9 +971,14 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
                                             0, cfg.num_threads,
                                             cfg.flow_bilinear_sampling);
+        // Variance upscales BILINEARLY -- see upscale_warp_stats: the
+        // Dodgson kernel's negative lobes undershoot sigma^2 between guide
+        // cells and manufacture false rejections (single-frame speckle
+        // holes) whenever sigma_t cannot floor them.
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
                                            0, cfg.num_threads,
-                                           cfg.flow_bilinear_sampling);
+                                           cfg.flow_bilinear_sampling,
+                                           /*values_bilinear=*/true);
     }
     return st;
 }
