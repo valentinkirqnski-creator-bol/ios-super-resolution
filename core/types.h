@@ -1146,6 +1146,19 @@ struct Config {
     // constants keep their meaning.
     bool hdrplus_mode = false;
 
+    // ISA mode: replace the whole pipeline with ImageStackAlignator,
+    // algorithmically identical to ImageStackAlignator-master (vendored
+    // 1:1 port in core/isa/, verified stage by stage against the C#/CUDA
+    // sources on desktop). Full-resolution rotation-scan pre-alignment,
+    // all-pairs patch tracking with the global shift-consistency solve,
+    // dense per-pixel Lucas-Kanade flow, ISA's own robustness mask and
+    // kernel-regression accumulate (kDetail 0.25 / kDenoise 3 / kStretch 4
+    // / kShrink 2, Dth 0.001 / Dtr 0.006), and ISA's SaveAs16BitTiff
+    // colour chain baked into the output DNG. Output at input resolution.
+    // Currently the CPU golden reference (multithreaded); Metal twins land
+    // stage by stage against it. Takes precedence over hdrplus_mode.
+    bool isa_mode = false;
+
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
     SelectionLaw selection = SelectionLaw::Linear;

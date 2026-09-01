@@ -209,6 +209,15 @@ struct TuningParams: Equatable, Codable {
     /// super-resolution tuning (kernels, robustness, flow) is bypassed
     /// while this is on.
     var hdrplus_mode: Bool = false
+    /// ISA mode: run ImageStackAlignator -- algorithmically identical to
+    /// ImageStackAlignator-master (vendored 1:1 port) -- instead of the
+    /// super-resolution pipeline. Rotation-scan pre-alignment, all-pairs
+    /// patch tracking, dense Lucas-Kanade flow, ISA's robustness and
+    /// kernel-regression merge, ISA's own colour rendering baked into the
+    /// output DNG (input resolution). CPU reference implementation for
+    /// now: slow (the rotation scan especially) but exact; Metal ports of
+    /// the stages follow, verified against it. Overrides HDR+ mode.
+    var isa_mode: Bool = false
     /// Re-estimate the flow densely, one Lucas-Kanade solve per lattice cell
     /// at the finest pitch that fits the buffer budget, instead of the
     /// half-pitch blend-or-select densify. ImageStackAlignator's
@@ -290,6 +299,7 @@ struct TuningParams: Equatable, Codable {
         case merge_chroma_difference
         case merge_kernel_iso
         case hdrplus_mode
+        case isa_mode
         case flow_dense_lk_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -362,6 +372,7 @@ struct TuningParams: Equatable, Codable {
         merge_chroma_difference = try c.decodeIfPresent(Bool.self, forKey: .merge_chroma_difference) ?? merge_chroma_difference
         merge_kernel_iso = try c.decodeIfPresent(Bool.self, forKey: .merge_kernel_iso) ?? merge_kernel_iso
         hdrplus_mode = try c.decodeIfPresent(Bool.self, forKey: .hdrplus_mode) ?? hdrplus_mode
+        isa_mode = try c.decodeIfPresent(Bool.self, forKey: .isa_mode) ?? isa_mode
         flow_dense_lk_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_dense_lk_enabled) ?? flow_dense_lk_enabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -2149,6 +2160,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_chroma_difference": NSNumber(value: tuningParams.merge_chroma_difference),
             "merge_kernel_iso": NSNumber(value: tuningParams.merge_kernel_iso),
             "hdrplus_mode": NSNumber(value: tuningParams.hdrplus_mode),
+            "isa_mode": NSNumber(value: tuningParams.isa_mode),
             "flow_dense_lk_enabled": NSNumber(value: tuningParams.flow_dense_lk_enabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),

@@ -169,6 +169,16 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                            const std::string& dng_path, const ProgressFn& progress,
                            int maxPreviewDim) {
     if (burst.empty()) return Image();
+    if (cfg.isa_mode) {
+        // Same streaming implementation as the loader path, fed from memory.
+        return process_burst_loader_to_dng_isa(
+            (int)burst.size(),
+            [&](int index, Config&, bool, int, int) {
+                return (index >= 0 && index < (int)burst.size()) ? burst[(size_t)index]
+                                                                 : Image();
+            },
+            cfg, dng_path, progress, maxPreviewDim, nullptr);
+    }
     if (cfg.hdrplus_mode) {
         // Same streaming implementation as the loader path, fed from memory.
         return process_burst_loader_to_dng_hdrplus(

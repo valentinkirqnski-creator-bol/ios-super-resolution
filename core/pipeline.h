@@ -78,6 +78,18 @@ Image process_burst_loader_to_dng_hdrplus(int frame_count, const RawFrameLoaderF
 Image hdrplus_demosaic_bilinear(const Image& mosaic, const Config& cfg,
                                 int num_threads);
 
+// ISA mode (Config::isa_mode, isa_mode.cpp): ImageStackAlignator's full
+// pipeline (pre-alignment rotation scan, all-pairs patch tracking + shift
+// solve, dense LK flow, ISA robustness, kernel-regression accumulate, ISA's
+// SaveAs16BitTiff colour chain), algorithmically identical to
+// ImageStackAlignator-master via the vendored core/isa/ port. Output is a
+// baked-sRGB DNG at input resolution. CPU golden reference (Metal twins to
+// follow, verified against it).
+Image process_burst_loader_to_dng_isa(int frame_count, const RawFrameLoaderFn& loader,
+                                      const Config& cfg, const std::string& dng_path,
+                                      const ProgressFn& progress, int maxPreviewDim = 512,
+                                      Rgb16Sink* rgb16_sink = nullptr);
+
 // Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
 // Path: replace ".dng" with "_robustness<name_suffix>.pgm", or append that.
 // name_suffix is "" for the combined mask, "_s1"/"_s2" for the split ones.

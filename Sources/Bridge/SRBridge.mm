@@ -511,6 +511,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
                                                            : hhsr::KernelShape::Steerable;
     if (tuning[@"hdrplus_mode"])
         cfg.hdrplus_mode = tuning[@"hdrplus_mode"].boolValue;
+    if (tuning[@"isa_mode"])
+        cfg.isa_mode = tuning[@"isa_mode"].boolValue;
     if (tuning[@"flow_dense_lk_enabled"])
         cfg.flow_dense_lk_enabled = tuning[@"flow_dense_lk_enabled"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
