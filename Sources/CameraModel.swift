@@ -209,6 +209,11 @@ struct TuningParams: Equatable, Codable {
     /// super-resolution tuning (kernels, robustness, flow) is bypassed
     /// while this is on.
     var hdrplus_mode: Bool = false
+    /// Robustness statistics computed in colour-transformed linear sRGB
+    /// instead of the camera-native space (the IPOL author's cross-camera
+    /// direction). Guide and noise model transform together. CPU-only mask
+    /// path while on (no Metal twin yet) -- slower per frame.
+    var robustness_color_space: Bool = false
     /// ISA mode: run ImageStackAlignator -- algorithmically identical to
     /// ImageStackAlignator-master (vendored 1:1 port) -- instead of the
     /// super-resolution pipeline. Rotation-scan pre-alignment, all-pairs
@@ -300,6 +305,7 @@ struct TuningParams: Equatable, Codable {
         case merge_kernel_iso
         case hdrplus_mode
         case isa_mode
+        case robustness_color_space
         case flow_dense_lk_enabled
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -373,6 +379,7 @@ struct TuningParams: Equatable, Codable {
         merge_kernel_iso = try c.decodeIfPresent(Bool.self, forKey: .merge_kernel_iso) ?? merge_kernel_iso
         hdrplus_mode = try c.decodeIfPresent(Bool.self, forKey: .hdrplus_mode) ?? hdrplus_mode
         isa_mode = try c.decodeIfPresent(Bool.self, forKey: .isa_mode) ?? isa_mode
+        robustness_color_space = try c.decodeIfPresent(Bool.self, forKey: .robustness_color_space) ?? robustness_color_space
         flow_dense_lk_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_dense_lk_enabled) ?? flow_dense_lk_enabled
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -2161,6 +2168,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_kernel_iso": NSNumber(value: tuningParams.merge_kernel_iso),
             "hdrplus_mode": NSNumber(value: tuningParams.hdrplus_mode),
             "isa_mode": NSNumber(value: tuningParams.isa_mode),
+            "robustness_color_space": NSNumber(value: tuningParams.robustness_color_space),
             "flow_dense_lk_enabled": NSNumber(value: tuningParams.flow_dense_lk_enabled),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
