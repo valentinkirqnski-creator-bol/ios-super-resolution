@@ -473,6 +473,17 @@ struct Config {
         const float wb = white_balance[c];
         return (std::isfinite(wb) && wb > 0.f) ? 1.f / wb : 1.f;
     }
+    // The UNIFORM residual scale the guide actually lives at. compute_guide
+    // divides the prewhitened site value k_c*v (k_c = wb_c/wb_1) by wb_c, so
+    // every guide channel is v/wb_1 -- sensor units times this one constant,
+    // with NO per-channel factor left. Any noise coefficient expressed in
+    // guide units therefore transforms with 1/wb_1 (alpha) and 1/wb_1^2
+    // (beta) uniformly across channels; see noise_alpha_ch/noise_beta_ch.
+    float guide_residual_scale() const {
+        if (!raw_prewhitened) return 1.f;
+        const float wb = white_balance[1];
+        return (std::isfinite(wb) && wb > 0.f) ? 1.f / wb : 1.f;
+    }
     // Per-guide-channel variance weight: the reciprocal of how many Bayer sites
     // compute_guide averaged into that channel. Two greens gives 1/2, single R
     // and B give 1. Read from the CFA rather than hardcoded, so it tracks
@@ -505,25 +516,34 @@ struct Config {
     // and look up its own curve instead. noise_alpha()/noise_beta() stay as
     // they are for the callers that genuinely want one representative
     // scalar for the whole (single-channel) grey image -- SNR auto-tuning.
+    // GUIDE-DOMAIN transform, matching what compute_guide actually outputs
+    // today: guide_c = mean(v)/wb_1 for every channel (see
+    // guide_residual_scale). For the mean of n_c sensor samples scaled by a
+    // uniform u = 1/wb_1: Var = alpha*u*(1/n)*b + beta*u^2*(1/n) at guide
+    // brightness b. The previous form multiplied by the PER-CHANNEL gain
+    // k_c = wb_c/wb_1 (and its square) -- correct for the eca686c-era guide
+    // built from the WB-multiplied raw, but stale once guide_wb_undo landed:
+    // it overestimated sigma_t/d_t by ~sqrt(wb_c)..wb_c on R/B (green
+    // exact), so the mask under-rejected chroma differences in flat and
+    // dark regions. That k_c transform now lives where it belongs: the GAT
+    // over the still-prewhitened raw (kernels.cpp apply_gat).
     float noise_alpha_ch(int c) const {
         if (c < 0 || c > 2) return 0.f;
-        return alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
+        const float u = guide_residual_scale();
+        return alpha_dng[c] * u * noise_guide_weight(c);
     }
     float noise_beta_ch(int c) const {
         if (c < 0 || c > 2) return 0.f;
-        const float g = noise_wb_gain(c);
-        return beta_dng[c] * g * g * noise_guide_weight(c);
+        const float u = guide_residual_scale();
+        return beta_dng[c] * u * u * noise_guide_weight(c);
     }
-    // python-z's actual noise model: a single (alpha, beta) scalar
-    // (config.noise_model.alpha/beta), used identically for kernel-GAT AND
-    // for every robustness channel, with NO white-balance scaling and NO
-    // guide-averaging weight -- super_resolution.py:230 reads it once, passes
-    // the same object into both estimate_kernels and compute_robustness.
-    // Plain mean of the three declared per-channel values, matching what a
-    // single scalar reduction of a 3-plane DNG NoiseProfile most directly
-    // corresponds to. kernels.cpp's apply_gat and metal_gpu.mm's
-    // KernelEstParamsCPU populate alpha/beta from this, exactly as
-    // compute_robustness does.
+    // Single sensor-domain (alpha, beta) scalar: plain mean of the three
+    // declared per-channel values, matching what a single scalar reduction
+    // of a 3-plane DNG NoiseProfile most directly corresponds to. Consumers:
+    // the kernel-estimation GAT (kernels.cpp apply_gat / metal_gpu.mm
+    // KernelEstParamsCPU) uses it as the sensor-domain BASE pair and applies
+    // the per-site k_c prewhiten transform itself; the single-channel (grey)
+    // robustness path reads it via noise_alpha_robustness() below.
     float noise_alpha_shared() const {
         return (alpha_dng[0] + alpha_dng[1] + alpha_dng[2]) / 3.f;
     }
@@ -546,29 +566,21 @@ struct Config {
     // SNR tuning keep reading the ungated accessors above; only the mask's
     // own curve builds and noise floors read these.
     bool debug_noise_model_disabled = false;
-    // Robustness-mask noise accessors: WB-SCALED per channel (eca686c's
-    // convention), matching a guide built from the WB-multiplied, unclipped
-    // raw. Under a per-channel gain g the noise law transforms exactly as
-    // alpha' = g*alpha, beta' = g^2*beta, and the guide-quad weight stays
-    // (green averages two samples). Gated by debug_noise_model_disabled;
-    // GAT/SNR read the ungated noise_alpha()/noise_beta().
+    // Robustness-mask noise accessors, gated by debug_noise_model_disabled;
+    // GAT/SNR read the ungated noise_alpha()/noise_beta()/noise_alpha_shared().
     //
-    // python-z parity: ONE shared, unscaled value -- see noise_alpha_shared()
-    // above. Previously WB-scaled and split per channel (noise_alpha_ch,
-    // "eca686c's convention", kept below for anyone who turns raw-resolution
-    // robustness off and wants that behaviour back), which is not what
-    // robustness.py does: it derives a single (alpha, beta) once and scores
-    // every guide channel against the same curve, unscaled by white balance.
+    // The shared pair below is python-z's single unscaled scalar, kept for
+    // the single-channel (grey) mask path.
     float noise_alpha_robustness() const {
         return debug_noise_model_disabled ? 0.f : noise_alpha_shared();
     }
     float noise_beta_robustness() const {
         return debug_noise_model_disabled ? 0.f : noise_beta_shared();
     }
-    // Retained for the non-default (robustness_raw_resolution_enabled=false,
-    // no longer python-z-exact) guide-resolution path; no longer called by
-    // the raw-resolution one, which uses noise_alpha_robustness() for every
-    // channel instead. See the comment above noise_alpha_ch.
+    // Per-channel curves for the Bayer mask paths (BOTH the raw-resolution
+    // path -- robustness.cpp compute_robustness_raw_res / metal_gpu.mm --
+    // and the guide-resolution fallback). Guide-domain transform: see
+    // noise_alpha_ch above.
     float noise_alpha_ch_robustness(int c) const {
         return debug_noise_model_disabled ? 0.f : noise_alpha_ch(c);
     }

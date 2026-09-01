@@ -14,13 +14,42 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
     if (gpu.h > 0 && gpu.w > 0) return gpu;
     return CovField();
 #else
-    // Generalized Anscombe VST — matches utils_image.GAT / cuda_GAT.
-    auto apply_gat = [](const Image& img, f32 alpha, f32 beta) {
+    // Generalized Anscombe VST, per CFA site. The raw entering here is the
+    // loader's PREWHITENED raw -- site value x = k_c*v with k_c = wb_c/wb_1
+    // (Config::noise_wb_gain) -- while (alpha, beta) describe the SENSOR
+    // noise law Var(v) = alpha*v + beta. Under that gain the law transforms
+    // exactly: Var(x) = (k_c*alpha)*x + k_c^2*beta, so each site must be
+    // stabilized with its own (k_c*alpha, k_c^2*beta). The previous single
+    // shared (alpha, beta) stabilized the wrong variable: post-GAT noise std
+    // came out ~sqrt(k_c) per channel ({~1.4 R, 1 G, ~1.25 B} at daylight
+    // WB) instead of the unit value D_th/D_tr are calibrated against, so
+    // flat-region noise read as structure and k_denoise under-engaged.
+    // Note (2/(k*a))*sqrt(k*a*(k*v) + ...) == (2/a)*sqrt(a*v + ...) up to
+    // the same 3/8+beta offset in transformed units: the per-site transform
+    // lands every channel back on the sensor-domain GAT of v, so the grey
+    // sees channel-consistent signal as well as unit noise. Non-Bayer and
+    // un-prewhitened inputs have k = 1 and are bit-identical to before.
+    auto apply_gat = [&cfg](const Image& img, f32 alpha, f32 beta) {
         Image out(img.h, img.w, 1);
-        f32 c = 0.375f * alpha * alpha + beta; // 3/8 * alpha^2 + beta
-        for (size_t i = 0; i < img.data.size(); ++i) {
-            f32 v = alpha * img.data[i] + c;
-            out.data[i] = (2.f / alpha) * std::sqrt(std::max(0.f, v));
+        f32 a_site[2][2], c_site[2][2];
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                f32 k = 1.f;
+                if (cfg.bayer_mode) {
+                    const uint8_t ch = cfg.cfa.p[i][j];
+                    if (ch < 3) k = cfg.noise_wb_gain((int)ch);
+                }
+                const f32 a = k * alpha;
+                a_site[i][j] = a;
+                c_site[i][j] = 0.375f * a * a + k * k * beta; // 3/8*a^2 + b
+            }
+        }
+        for (int y = 0; y < img.h; ++y) {
+            for (int x = 0; x < img.w; ++x) {
+                const f32 a = a_site[y & 1][x & 1];
+                const f32 v = a * img.at(y, x) + c_site[y & 1][x & 1];
+                out.at(y, x) = (2.f / a) * std::sqrt(std::max(0.f, v));
+            }
         }
         return out;
     };
@@ -68,9 +97,10 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
     };
 
     // python-z order: GAT the raw, then decimate to grey (kernels.py:80, :84).
-    // Same (alpha, beta) python-z's single noise_model object hands to both
-    // estimate_kernels and compute_robustness -- no white-balance scaling, no
-    // guide-averaging weight.
+    // Base (alpha, beta) is python-z's single sensor-domain noise_model pair;
+    // the per-site k_c transform inside apply_gat adapts it to the
+    // prewhitened raw (a deliberate fix over python-z, which GATs its own
+    // k-multiplied raw with the unscaled pair and so under-stabilizes R/B).
     Image vst_raw = apply_gat(raw, cfg.noise_alpha_shared(), cfg.noise_beta_shared());
     Image grey = compute_grey_decimate(vst_raw, cfg.bayer_mode);
 

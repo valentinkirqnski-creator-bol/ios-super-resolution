@@ -1636,8 +1636,12 @@ struct KernelEstParams {
     uint selection; // 1 = python-z linear selection law, 0 = hard threshold
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-    uint _pad1;
-    uint _pad2;
+    // Per-channel prewhiten gains k_c = wb_c/wb_1 (1 when the raw is not
+    // prewhitened) and the CFA colour per quad site (byte i*2+j), so
+    // kernel_gat_raw can stabilize each site with (k_c*alpha, k_c^2*beta).
+    // Twin of the per-site apply_gat in kernels.cpp -- keep in step.
+    float wbk0, wbk1, wbk2;
+    uint cfa_packed;
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1727,7 +1731,15 @@ kernel void kernel_gat_raw(device float* out [[buffer(0)]],
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.raw_w || gid.y >= p.raw_h) return;
     uint i = gid.y * p.raw_w + gid.x;
-    out[i] = gat_sample(raw[i], p.alpha, p.beta);
+    // Per-CFA-site domain fix, twin of apply_gat in kernels.cpp: the raw is
+    // prewhitened (site x = k_c*v), so Var(x) = (k_c*alpha)*x + k_c^2*beta
+    // and each site stabilizes with its own scaled pair.
+    float k = 1.f;
+    if (p.bayer) {
+        uint ch = (p.cfa_packed >> (((gid.y & 1u) * 2u + (gid.x & 1u)) * 8u)) & 0xffu;
+        k = (ch == 0u) ? p.wbk0 : (ch == 1u) ? p.wbk1 : (ch == 2u) ? p.wbk2 : 1.f;
+    }
+    out[i] = gat_sample(raw[i], k * p.alpha, k * k * p.beta);
 }
 
 kernel void kernel_decimate_grey(device float* grey [[buffer(0)]],
@@ -1992,7 +2004,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const uint* match_ambiguous [[buffer(9)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
-    float d_sq_ = 0.f, sigma_sq_ = 0.f;
     int patch_idy;
     int patch_idx;
     float flow_x;
@@ -2029,13 +2040,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     }
     float sample_x = float(gid.x) + flow_x;
     float sample_y = float(gid.y) + flow_y;
-    // python-z cuda_apply_noise_model, read literally: each channel gets its
-    // OWN max(measured, noise-floor) and its OWN Wiener shrink (using that
-    // channel's own d_t), and only the RESULTS are summed across channels --
-    // see the mirrored fix in apply_noise_model (robustness.cpp). NOT
-    // max-of-sums / one-shrink-of-sums, which this kernel ran before and
-    // which is a different, more-forgiving computation whenever which term
-    // dominates differs across channels (e.g. a colored edge).
+    // Unit-invariant aggregation, twin of apply_noise_model (robustness.cpp):
+    // z = (1/n) * sum_ch d_ch^2*shrink^2 / max(sigma_p^2, sigma_t^2), each
+    // channel with its OWN noise floor and its OWN Wiener shrink. A
+    // per-channel rescale of the guide cancels inside each ratio, so R no
+    // longer depends on the guide's units the way the old ratio-of-sums did
+    // (which down-weighted R/B votes by wb^2 in the WB-undone guide).
+    float z_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -2051,9 +2062,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
         // std_curve/diff_curve hold curve_nch concatenated curves
-        // (metal_gpu.mm); every slot is now the SAME shared curve (python-z
-        // parity -- one (alpha,beta), used identically for every channel),
-        // so this offset still resolves correctly whether curve_nch is 1 or 3.
+        // (metal_gpu.mm), one per guide channel when curve_nch is 3.
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
@@ -2062,12 +2071,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
-        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+        float sigma_ch_sq = max(sigma_p_sq, sigma_t * sigma_t);
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-        d_sq_ += d_p_sq * shrink * shrink;
+        z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
     }
+    z_ /= float(p.nch);
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
-    float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
     // Two near-equal minima in the block-matching cost surface: the offset that
     // was picked is not distinguishable from another. See compute_robustness in
@@ -2076,7 +2085,11 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // offset was chosen for producing a small difference.
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
         s = min(s, p.r_s1);
-    float r_val = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    float r_val = clamp(s * exp(-z_) - p.r_t, 0.f, 1.f);
+    // NaN guard, same as rob_make_mask_raw and the CPU paths: an OOB comp
+    // sample (+inf) or a 0/0 shrink with the noise model disabled makes z_
+    // NaN, and Metal's clamp() propagates NaN.
+    if (!isfinite(r_val)) r_val = 0.f;
     R[gid.y * p.w + gid.x] = r_val;
 }
 
@@ -2125,10 +2138,12 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
-    // python-z parity: each channel's own max(measured, floor) and own
-    // Wiener shrink, summed after -- see rob_make_mask and apply_noise_model
-    // (robustness.cpp) for the same fix and the reasoning.
-    float sigma_sq_ = 0.f, d_sq_ = 0.f;
+    // Unit-invariant aggregation, twin of apply_noise_model_fused
+    // (robustness.cpp): mean of per-channel d^2*shrink^2 / max(sigma_p^2,
+    // sigma_t^2) ratios, each channel with its own noise floor and its own
+    // Wiener shrink. See that function's comment for why the old
+    // ratio-of-sums depended on the guide's per-channel units.
+    float z_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2146,10 +2161,11 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
-        sigma_sq_ += max(ref_vars[o], sigma_t * sigma_t);
+        float sigma_ch_sq = max(ref_vars[o], sigma_t * sigma_t);
         float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-        d_sq_ += d_p_sq * shrink * shrink;
+        z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
     }
+    z_ /= float(p.nch);
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
@@ -2162,9 +2178,9 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
 
     float r_val = motion_magnitude_reject_tile
         ? 0.f
-        : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
-    // An OOB Dodgson sample arrives as +inf in comp_means -> d_sq_ = +inf ->
-    // shrink inf/inf = NaN -> r_val NaN. Metal's clamp() propagates NaN; the
+        : clamp(s * exp(-z_) - p.r_t, 0.f, 1.f);
+    // An OOB Dodgson sample arrives as +inf in comp_means -> shrink
+    // inf/inf = NaN -> z_ and r_val NaN. Metal's clamp() propagates NaN; the
     // Python reference's min/max clamp yields the intended 0. Mirror the CPU
     // guard in compute_robustness_raw_res.
     if (!isfinite(r_val)) r_val = 0.f;

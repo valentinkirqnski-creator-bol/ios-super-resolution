@@ -1121,10 +1121,12 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t bayer, selection;
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-        uint32_t _pad1 = 0;
-        uint32_t _pad2 = 0;
+        // Per-channel prewhiten gains + packed CFA for the per-site GAT
+        // (see KernelEstParams in HHSRKernels.metal -- keep in step).
+        float wbk0 = 1.f, wbk1 = 1.f, wbk2 = 1.f;
+        uint32_t cfa_packed = 0;
     };
-    static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
+    static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
 
     const bool bayer = cfg.bayer_mode;
     const int grey_h = bayer ? raw.h / 2 : raw.h;
@@ -1138,11 +1140,17 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
     p.selection = (cfg.selection == SelectionLaw::Linear) ? 1u : 0u;
-    // python-z's single noise_model object, used identically for kernel-GAT
-    // AND for every robustness channel -- no white-balance scaling, no
-    // guide-averaging weight.
+    // Base pair is python-z's single sensor-domain noise_model scalar; the
+    // per-site k_c transform in kernel_gat_raw adapts it to the prewhitened
+    // raw (twin of apply_gat in kernels.cpp -- deliberate fix over python-z,
+    // whose GAT under-stabilizes R/B by sqrt(k_c)).
     p.alpha = cfg.noise_alpha_shared();
     p.beta = cfg.noise_beta_shared();
+    p.wbk0 = cfg.noise_wb_gain(0);
+    p.wbk1 = cfg.noise_wb_gain(1);
+    p.wbk2 = cfg.noise_wb_gain(2);
+    p.cfa_packed = (uint32_t)cfg.cfa.p[0][0] | ((uint32_t)cfg.cfa.p[0][1] << 8) |
+                   ((uint32_t)cfg.cfa.p[1][0] << 16) | ((uint32_t)cfg.cfa.p[1][1] << 24);
     p.k_detail = cfg.k_detail;
     p.k_denoise = cfg.k_denoise;
     p.D_th = cfg.D_th;

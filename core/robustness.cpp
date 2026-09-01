@@ -769,24 +769,25 @@ static Image upscale_warp_stats(const Image& guide_stats,
 // than all channels sharing one built from the cross-channel mean of
 // alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
 // make_noise_curves_channel.
+// Outputs z = (1/n) * sum_ch d_ch^2*shrink_ch^2 / max(sigma_p_ch^2,
+// sigma_t_ch^2); R is then s*exp(-z) - t. UNIT-INVARIANT aggregation: a
+// per-channel rescale of the guide multiplies d_ch^2 and sigma_ch^2
+// identically, so each ratio -- and R -- no longer depends on which units
+// the guide happens to live in. The previous ratio-of-sums
+// (sum d^2 / sum sigma^2) weighted every channel's vote by its numeric
+// magnitude squared: in the WB-undone guide, R/B votes shrank by wb_c^2
+// (~4x red at daylight WB) and R degenerated into a green-difference
+// detector that under-rejected chroma ghosts. When all per-channel ratios
+// agree the mean equals the old ratio-of-sums exactly, so the s1/s2/t
+// calibration is unchanged for achromatic differences. Each channel still
+// gets its OWN noise floor and its OWN Wiener shrink from its own curve.
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq) {
+                              const NoiseCurves* const nc_ch[3], Image& z) {
     const int n_ch = ref_means.c;
-    d_sq = Image(ref_means.h, ref_means.w, 1);
-    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    z = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            // python-z cuda_apply_noise_model, read literally: each channel
-            // gets its OWN max(measured, noise-floor) and its OWN Wiener
-            // shrink, using that channel's own d_t, and only the RESULTS are
-            // summed across channels. Not max-of-sums / one-shrink-of-sums --
-            // those are a different, later computation this port used to run
-            // instead (see git history), on the (debatable, but not
-            // reference-matching) argument that Eq. 6's d/sigma are bare
-            // per-pixel scalars rather than per-channel. Matching python-z
-            // here means matching ITS order, not re-deriving one from the
-            // paper text.
-            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
+            f32 z_ = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -803,12 +804,11 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 f32 d_p_sq = d_p.at(y, x, ch) * d_p.at(y, x, ch);
-                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                f32 sigma_ch_sq = std::max(sigma_p_sq, sigma_t * sigma_t);
                 f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                d_sq_ += d_p_sq * shrink * shrink;
+                z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
             }
-            d_sq.at(y, x) = d_sq_;
-            sigma_sq.at(y, x) = sigma_sq_;
+            z.at(y, x) = z_ / (f32)n_ch;
         }
     }
 }
@@ -819,20 +819,20 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 // H*W*3 floats (146 MB on a 12 MP frame) written once and read once by the
 // very next stage -- the single biggest allocation in the raw-resolution
 // robustness path, and the one that pushed a multi-frame burst past the
-// memory ceiling. Arithmetic is identical to apply_noise_model above: each
-// channel's own max(measured, floor) and own Wiener shrink, summed after. An
+// memory ceiling. Arithmetic is identical to apply_noise_model above:
+// unit-invariant mean of per-channel ratios, each channel with its own
+// noise floor and its own Wiener shrink -- see that function's comment. An
 // out-of-bounds Dodgson sample arrives as +inf in comp_means and must stay
 // +inf in the difference so R lands at 0 downstream.
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
-                                    Image& d_sq, Image& sigma_sq, int num_threads) {
+                                    Image& z, int num_threads) {
     const int n_ch = ref_means.c;
-    d_sq = Image(ref_means.h, ref_means.w, 1);
-    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    z = Image(ref_means.h, ref_means.w, 1);
     parallel_rows(ref_means.h, num_threads, [&](int y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
+            f32 z_ = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -851,12 +851,11 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                     : std::numeric_limits<f32>::infinity();
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 f32 d_p_sq = d_p_ * d_p_;
-                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                f32 sigma_ch_sq = std::max(sigma_p_sq, sigma_t * sigma_t);
                 f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                d_sq_ += d_p_sq * shrink * shrink;
+                z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
             }
-            d_sq.at(y, x) = d_sq_;
-            sigma_sq.at(y, x) = sigma_sq_;
+            z.at(y, x) = z_ / (f32)n_ch;
         }
     });
 }
@@ -983,12 +982,12 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
     }
 
-    // 832f7b8-style per-channel curves, restored on request: each guide
-    // channel scored against its own WB-scaled (alpha', beta') curve
-    // (Config::noise_alpha_ch_robustness -- alpha_dng[c] * wb_gain *
-    // guide_weight, same accessor 832f7b8 used), NOT python-z's single
-    // shared unscaled curve (3585bef item 2). Deliberate deviation from
-    // python-z; the guide-resolution path below always kept this form.
+    // Per-channel curves: each guide channel scored against its own
+    // GUIDE-DOMAIN (alpha', beta') curve (Config::noise_alpha_ch_robustness
+    // -- alpha * guide_residual_scale * guide_weight; see noise_alpha_ch in
+    // types.h for the domain derivation), NOT python-z's single shared
+    // unscaled curve. Deliberate deviation from python-z; the
+    // guide-resolution path below keeps the same form.
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     for (int ch = 0; ch < 3; ++ch)
         nc_ch[ch] = &mask_noise_curves_channel_space(cfg, ch);
@@ -1043,8 +1042,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     if (comp_means.h != h || comp_means.w != w || comp_means.c != nch)
         return Image();
 
-    Image d_sq, sigma_sq;
-    apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
+    Image z;
+    apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, z,
                             cfg.num_threads);
 
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
@@ -1063,16 +1062,15 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 continue;
             }
             f32 s = S[pidx];
-            f32 sig = sigma_sq.at(y, x);
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            f32 r_val = clampf(s * std::exp(-z.at(y, x)) - cfg.r_t, 0.f, 1.f);
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
-            // design ("infinite will imply R = 0"), which makes d_sq +inf and
-            // the Wiener shrink inf/inf = NaN, so r_val is NaN. The Python
+            // design ("infinite will imply R = 0"), which makes the Wiener
+            // shrink inf/inf = NaN and z NaN, so r_val is NaN. The Python
             // clamp (CUDA fmaxf/fminf) returns the non-NaN operand and yields
             // the intended 0; clampf's comparisons are both false for NaN and
             // would return NaN, poisoning every merge accumulator that touches
@@ -1212,8 +1210,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         }
     }
 
-    Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
+    Image z;
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, z);
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
@@ -1229,13 +1227,18 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             }
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
             f32 s = S[pidx];
-            f32 sig = sigma_sq.at(y, x);
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            f32 r_val = clampf(s * std::exp(-z.at(y, x)) - cfg.r_t, 0.f, 1.f);
+            // Same NaN-to-0 guard as the raw-res path: an OOB comp sample
+            // (+inf) or a 0/0 Wiener shrink with the noise model disabled
+            // makes z NaN, and clampf would pass the NaN straight into
+            // local_min and the merge accumulators. This path previously
+            // lacked the guard.
+            if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
         }
     }
