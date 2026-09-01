@@ -1244,11 +1244,7 @@ struct RobDogsonParamsCPU {
     // the GPU twin of upscale_warp_stats, so it must match the CPU setting or
     // the two paths warp the comparison statistics differently.
     uint32_t flow_bilinear = 0;
-    // 1 = sample the STATS bilinearly instead of Dodgson (was _pad1). Used
-    // for variance fields only -- Dodgson's negative lobes undershoot
-    // sigma^2 between guide cells; see upscale_warp_stats in robustness.cpp
-    // (the CPU twin) for the measured false-rejection numbers.
-    uint32_t value_bilinear = 0;
+    uint32_t _pad1 = 0;
 };
 static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 
@@ -1386,7 +1382,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       uint32_t flow_mode, uint32_t value_bilinear = 0u) {
+                       uint32_t flow_mode) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1432,7 +1428,6 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)fg_nx : 0u;
     dp.s = 2.f;
     dp.flow_bilinear = (!is_ref && flow) ? flow_mode : 0u;
-    dp.value_bilinear = value_bilinear;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && fg_dat && fg_bytes) {
@@ -1522,13 +1517,10 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
         // is_ref=true takes neither branch of the flow_mode dispatch inside
         // rob_dogson (no flow, no warp) -- 0 here is inert, not a claim about
         // sample mode.
-        // Variance upscales BILINEARLY (value_bilinear=1) -- Dodgson's
-        // negative lobes undershoot sigma^2; see upscale_warp_stats in
-        // robustness.cpp, the CPU twin of this call pair.
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
                         nullptr, 0, mh, mw, cmd, 0u) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, 0u, /*value_bilinear=*/1u) ||
+                       nullptr, 0, vh, vw, cmd, 0u) ||
             mh != vh || mw != vw) {
             return RefStats();
         }

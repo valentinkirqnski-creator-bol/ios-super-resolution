@@ -1835,10 +1835,7 @@ struct RobDogsonParams {
     uint flow_ny, flow_nx;
     float s;          // always 2.f (Python CUDA hardcode)
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad0)
-    // 1 = sample the stats bilinearly instead of Dodgson (variance fields:
-    // Dodgson's negative lobes undershoot sigma^2 -- see upscale_warp_stats
-    // in robustness.cpp, the CPU twin).
-    uint value_bilinear;
+    uint _pad1;
 };
 
 struct RobMaskParams {
@@ -1973,11 +1970,6 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
         float val;
         if (!(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w))) {
             val = INFINITY;
-        } else if (p.value_bilinear != 0u) {
-            // Non-negative weights for variance fields; same coordinates,
-            // same OOB convention (handled above).
-            val = rob_sample_bilinear_or_inf(stats, p.in_h, p.in_w, p.nch,
-                                             LR_y, LR_x, ch);
         } else {
             int center_y = lround_away(LR_y);
             int center_x = lround_away(LR_x);
