@@ -3830,6 +3830,20 @@ static bool merge_comp_band_metal_impl(const Image& comp_raw, const FlowField& f
         p.lr_w = (uint32_t)hit->lr_w;
         p.rob_h = (uint32_t)std::max(1, hit->rob_h);
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
+        // Same dims-based decision as the live-frame branch above. This
+        // branch (frame resident on GPU, CPU copies already freed by the
+        // streamed pipeline after metal_merge_prefetch_frame) previously
+        // left raw_res_robustness at its 0 default, so a RAW-resolution mask
+        // was consumed with the guide-scale (lr-0.5)/2 transform -- the
+        // kernel sampled the mask's top-left quadrant stretched over the
+        // whole frame. Every rejection landed at half its true position and
+        // real misalignments were graded by mask values from the wrong scene
+        // location: random colored misalignment speckle, exclusive to the
+        // raw-res mask (a guide-res mask with flag 0 is the correct pairing,
+        // which is why half-res runs were clean) and to the GPU streamed
+        // path (the CPU merge never runs from a resident cache).
+        p.raw_res_robustness =
+            (hit->rob_h == hit->lr_h && hit->rob_w == hit->lr_w) ? 1u : 0u;
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
         const int fdiv_c = std::max(1, hit->flow_div);
