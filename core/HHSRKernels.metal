@@ -1699,8 +1699,10 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     float D = min(1.f, max(0.f, 1.f - sqrt(max(0.f, l1)) / p.D_tr + p.D_th));
     float kk1, kk2;
     if (p.selection != 0u) {
-        kk1 = 1.f + 0.5f * A * (1.f / p.k_shrink - 1.f);
-        kk2 = 1.f + 0.5f * A * (p.k_stretch - 1.f);
+        // python-z 12ce005: isotropic at A=1, extremes at A=2 (see
+        // kernels.cpp compute_k, the CPU golden reference).
+        kk1 = (2.f - A) + (A - 1.f) / p.k_shrink;
+        kk2 = (2.f - A) + (A - 1.f) * p.k_stretch;
     } else if (A > 1.95f) {
         kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch;
     } else {

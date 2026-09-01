@@ -50,8 +50,14 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
             1.f - std::sqrt(std::max(0.f, l1)) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
         if (cfg.selection == SelectionLaw::Linear) {
-            kk1 = 1.f + 0.5f * A * (1.f / cfg.k_shrink - 1.f);
-            kk2 = 1.f + 0.5f * A * (cfg.k_stretch - 1.f);
+            // python-z "Adjust k1 k2 law" (commit 12ce005, 2026-08-31): lerp
+            // from ISOTROPIC (1,1) at A=1 to the extremes (1/k_shrink,
+            // k_stretch) at A=2. The previous law (1 + A/2*(extreme-1))
+            // was already ~25% anisotropic at A=1 -- elongated kernels with
+            // ARBITRARY eigenvector orientation on isotropic-gradient
+            // pixels, exactly where orientation is meaningless.
+            kk1 = (2.f - A) + (A - 1.f) / cfg.k_shrink;
+            kk2 = (2.f - A) + (A - 1.f) * cfg.k_stretch;
         } else if (A > 1.95f) {
             kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch;
         } else {
