@@ -448,7 +448,53 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
 // --- Colour-space robustness experiment (Config::robustness_color_space) ---
 // Statistics in linear sRGB instead of the camera-native prewhitened space.
 static bool rob_color_space_active(const Config& cfg) {
-    return cfg.robustness_color_space && cfg.bayer_mode && cfg.has_cam_to_srgb;
+    return cfg.robustness_color_space && cfg.bayer_mode &&
+           (cfg.has_cam_to_srgb || cfg.has_color_matrix);
+}
+
+// Resolve the camera->linear-sRGB matrix: LibRaw's rgb_cam when a file load
+// provided it; otherwise derive it dcraw-style from the capture's
+// ColorMatrix (XYZ->cam) -- cam_srgb = CM * srgb_to_xyz, rows normalized to
+// 1 (white preservation), inverted. The LIVE capture path only carries the
+// ColorMatrix, so without this fallback the toggle would silently gate off
+// on real captures. Both conventions expect WB'd camera RGB, which the
+// prewhitened frames are.
+static bool rob_srgb_matrix(const Config& cfg, f32 m[9]) {
+    if (cfg.has_cam_to_srgb) {
+        for (int i = 0; i < 9; ++i) m[i] = cfg.cam_to_srgb[i];
+        return true;
+    }
+    if (!cfg.has_color_matrix) return false;
+    static const double s2x[9] = {0.412453, 0.357580, 0.180423,
+                                  0.212671, 0.715160, 0.072169,
+                                  0.019334, 0.119193, 0.950227};
+    double a[9];
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            double s = 0.0;
+            for (int k = 0; k < 3; ++k)
+                s += (double)cfg.color_matrix[i * 3 + k] * s2x[k * 3 + j];
+            a[i * 3 + j] = s;
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        const double rs = a[i * 3] + a[i * 3 + 1] + a[i * 3 + 2];
+        if (std::fabs(rs) < 1e-9) return false;
+        for (int j = 0; j < 3; ++j) a[i * 3 + j] /= rs;
+    }
+    const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) -
+                       a[1] * (a[3] * a[8] - a[5] * a[6]) +
+                       a[2] * (a[3] * a[7] - a[4] * a[6]);
+    if (std::fabs(det) < 1e-12) return false;
+    const double id = 1.0 / det;
+    const double inv[9] = {
+        (a[4] * a[8] - a[5] * a[7]) * id, (a[2] * a[7] - a[1] * a[8]) * id,
+        (a[1] * a[5] - a[2] * a[4]) * id, (a[5] * a[6] - a[3] * a[8]) * id,
+        (a[0] * a[8] - a[2] * a[6]) * id, (a[2] * a[3] - a[0] * a[5]) * id,
+        (a[3] * a[7] - a[4] * a[6]) * id, (a[1] * a[6] - a[0] * a[7]) * id,
+        (a[0] * a[4] - a[1] * a[3]) * id};
+    for (int i = 0; i < 9; ++i) m[i] = (f32)inv[i];
+    return true;
 }
 
 // Guide RGB -> linear sRGB, in place. Off-diagonals produce negatives;
@@ -456,7 +502,9 @@ static bool rob_color_space_active(const Config& cfg) {
 // clamp) handles them.
 static void transform_guide_srgb(Image& guide, const Config& cfg, int num_threads) {
     if (guide.c != 3) return;
-    const f32* m = cfg.cam_to_srgb;
+    f32 mm[9];
+    if (!rob_srgb_matrix(cfg, mm)) return;
+    const f32* m = mm;
     parallel_rows(guide.h, num_threads, [&](int y) {
         for (int x = 0; x < guide.w; ++x) {
             const f32 r = guide.at(y, x, 0);
@@ -479,9 +527,12 @@ static const NoiseCurves& mask_noise_curves_channel_space(const Config& cfg, int
         return mask_noise_curves_channel(cfg, ch);
     if (cfg.debug_noise_model_disabled)
         return make_noise_curves_channel(0.f, 0.f, ch);
+    f32 mm[9];
+    if (!rob_srgb_matrix(cfg, mm))
+        return mask_noise_curves_channel(cfg, ch);  // matches the no-op transform
     f32 a = 0.f, b = 0.f;
     for (int j = 0; j < 3; ++j) {
-        const f32 m = cfg.cam_to_srgb[ch * 3 + j];
+        const f32 m = mm[ch * 3 + j];
         a += m * m * cfg.noise_alpha_ch_robustness(j);
         b += m * m * cfg.noise_beta_ch_robustness(j);
     }
