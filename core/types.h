@@ -1313,6 +1313,16 @@ struct Config {
     // blending, no adaptivity, by design.
     bool merge_uncovered_passthrough = false;
 
+    // 832f7b8's soften_inv_cov, restored as a toggle: rescale the inverse
+    // covariance whenever its largest entry exceeds 32, capping the merge
+    // kernel's sharpness at sigma ~ 1/sqrt(32) ~ 0.18 raw px on EVERY fetch
+    // (ref and comp). At edge kernels (k_detail/k_shrink ~ 0.125) that is a
+    // ~40% widening; round kernels at k_detail >= 0.18 pass untouched. Part
+    // of the 832f7b8 rendition alongside the hard selection law
+    // (kernel_selection_hard); removed by the match-python-z purge, brought
+    // back because the capped look is a legitimate taste target.
+    bool merge_soften_inv_cov = false;
+
     CFA cfa;
 
     // JPEG / preview rendering. Never affects the linear DNG, which is always

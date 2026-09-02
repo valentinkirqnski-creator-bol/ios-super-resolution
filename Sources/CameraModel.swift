@@ -216,6 +216,9 @@ struct TuningParams: Equatable, Codable {
     /// anisotropy lerps continuously with A, so ordinary textured content
     /// gets thin oriented kernels -- crisper, can read as oversharpened.
     var kernel_selection_hard: Bool = false
+    /// 832f7b8's soften_inv_cov: cap merge kernel sharpness at sigma ~ 0.18
+    /// raw px on every fetch. The other half of the 832f7b8 rendition.
+    var merge_soften_inv_cov: Bool = false
     /// HDR+ mode: replace the whole super-resolution pipeline with the HDR+
     /// burst align + merge (hdr-plus-master's Halide implementation, ported
     /// to the core with a Metal path). A denoiser, not an upscaler: the
@@ -318,7 +321,7 @@ struct TuningParams: Equatable, Codable {
         case merge_chroma_difference
         case merge_kernel_iso
         case merge_uncovered_passthrough
-        case kernel_selection_hard
+        case kernel_selection_hard, merge_soften_inv_cov
         case hdrplus_mode
         case isa_mode
         case robustness_color_space
@@ -395,6 +398,7 @@ struct TuningParams: Equatable, Codable {
         merge_kernel_iso = try c.decodeIfPresent(Bool.self, forKey: .merge_kernel_iso) ?? merge_kernel_iso
         merge_uncovered_passthrough = try c.decodeIfPresent(Bool.self, forKey: .merge_uncovered_passthrough) ?? merge_uncovered_passthrough
         kernel_selection_hard = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_hard) ?? kernel_selection_hard
+        merge_soften_inv_cov = try c.decodeIfPresent(Bool.self, forKey: .merge_soften_inv_cov) ?? merge_soften_inv_cov
         hdrplus_mode = try c.decodeIfPresent(Bool.self, forKey: .hdrplus_mode) ?? hdrplus_mode
         isa_mode = try c.decodeIfPresent(Bool.self, forKey: .isa_mode) ?? isa_mode
         robustness_color_space = try c.decodeIfPresent(Bool.self, forKey: .robustness_color_space) ?? robustness_color_space
@@ -2186,6 +2190,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_kernel_iso": NSNumber(value: tuningParams.merge_kernel_iso),
             "merge_uncovered_passthrough": NSNumber(value: tuningParams.merge_uncovered_passthrough),
             "kernel_selection_hard": NSNumber(value: tuningParams.kernel_selection_hard),
+            "merge_soften_inv_cov": NSNumber(value: tuningParams.merge_soften_inv_cov),
             "hdrplus_mode": NSNumber(value: tuningParams.hdrplus_mode),
             "isa_mode": NSNumber(value: tuningParams.isa_mode),
             "robustness_color_space": NSNumber(value: tuningParams.robustness_color_space),

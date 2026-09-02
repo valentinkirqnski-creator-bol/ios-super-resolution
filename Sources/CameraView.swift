@@ -776,6 +776,9 @@ struct CameraView: View {
              Measured on a grey step edge (any colour in the output is pure artifact): worst              case 113.9 -> 12.3 levels, mean 1.50 -> 0.00, and no longer sensitive to kernel              sharpness. Costs some accuracy on genuinely fine coloured texture.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Kernel Sharpness Cap (832f7b8)", isOn: $cam.tuningParams.merge_soften_inv_cov)
+        Text("Caps merge kernel sharpness at sigma ~ 0.18 raw px on every fetch (832f7b8's soften_inv_cov). Blunts the very thinnest kernels -- edge kernels widen ~40% -- without touching round ones. Combine with Hard Anisotropy Threshold for the full 832f7b8 rendition.")
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Hard Anisotropy Threshold", isOn: $cam.tuningParams.kernel_selection_hard)
         Text("Eq. 4 selection law. On: kernels stay round everywhere except near-perfectly coherent edges (A > 1.95) -- the smooth, homogeneous rendition of commit 832f7b8. Off (default): the linear law -- anisotropy grows continuously with gradient coherence, so ordinary textured content gets thin oriented kernels; crisper, can read as oversharpened.")
             .font(.caption2).foregroundColor(.secondary)
