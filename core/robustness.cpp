@@ -658,6 +658,49 @@ Image compute_guide(const Image& raw, const Config& cfg) {
 
 namespace {
 
+// Robust per-channel noise-floor scale from measured local stats vs the
+// model's sigma_t at matching brightness (Config::r_noise_floor_autoscale).
+// Flat cells sit at ratio ~ true_sigma/sigma_t; textured cells only inflate
+// the UPPER quantiles, so the 25th percentile tracks the floor as long as a
+// quarter of the sampled cells are texture-poor (true of nearly any
+// photograph). The 9-sample std is itself noisy -- its 25th percentile
+// under Gaussian noise is sqrt(chi2_8@0.25 / 9) ~ 0.75 of the true sigma --
+// so the quantile is divided by 0.75 to unbias. Clamped to
+// [1, r_noise_scale_max]: the data is never trusted MORE than the model.
+static void noise_scale_from_stats(const Image& means, const Image& vars,
+                                   const NoiseCurves* const nc_ch[3],
+                                   const Config& cfg, f32 out[3]) {
+    out[0] = out[1] = out[2] = 1.f;
+    if (!cfg.r_noise_floor_autoscale || cfg.debug_noise_model_disabled) return;
+    const int nc = std::min(3, means.c);
+    std::vector<f32> ratios;
+    for (int ch = 0; ch < nc; ++ch) {
+        const NoiseCurves& curve = *nc_ch[ch];
+        if (curve.std_curve.empty()) continue;
+        ratios.clear();
+        ratios.reserve((size_t)(means.h / 2 + 1) * (size_t)(means.w / 2 + 1));
+        for (int y = 1; y < means.h - 1; y += 2) {
+            for (int x = 1; x < means.w - 1; x += 2) {
+                const f32 m = means.at(y, x, ch);
+                const f32 v = vars.at(y, x, ch);
+                // Exclude clipped/black cells (their variance says nothing
+                // about the live noise floor) and degenerate stats.
+                if (!(m > 0.02f && m < 0.85f) || !(v > 0.f)) continue;
+                const size_t id =
+                    noise_curve_index(m, curve.std_curve.size());
+                const f32 st = curve.std_curve[id];
+                if (!(st > 0.f)) continue;
+                ratios.push_back(std::sqrt(v) / st);
+            }
+        }
+        if (ratios.size() < 64) continue;
+        const size_t q = ratios.size() / 4; // 25th percentile
+        std::nth_element(ratios.begin(), ratios.begin() + q, ratios.end());
+        const f32 scale = ratios[q] / 0.75f;
+        out[ch] = clampf(scale, 1.f, std::max(1.f, cfg.r_noise_scale_max));
+    }
+}
+
 static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
     means = Image(guide.h, guide.w, guide.c);
     vars  = Image(guide.h, guide.w, guide.c);
@@ -801,7 +844,8 @@ static Image upscale_warp_stats(const Image& guide_stats,
 static constexpr f32 kMeanUnits = 2.f / 9.f;
 
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves* const nc_ch[3], Image& z) {
+                              const NoiseCurves* const nc_ch[3], Image& z,
+                              const f32 sscale[3]) {
     const int n_ch = ref_means.c;
     z = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
@@ -819,8 +863,10 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = 0;
                 else if (id_noise >= (int)nc.std_curve.size())
                     id_noise = (int)nc.std_curve.size() - 1;
-                f32 sigma_t = nc.std_curve[(size_t)id_noise];
-                f32 d_t = nc.diff_curve[(size_t)id_noise];
+                // Noise-floor autoscale (see noise_scale_from_stats): both
+                // the floor and the Wiener d_t scale linearly with sigma.
+                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sscale[ch];
+                f32 d_t = nc.diff_curve[(size_t)id_noise] * sscale[ch];
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 f32 d_p_sq = d_p.at(y, x, ch) * d_p.at(y, x, ch);
                 f32 sigma_ch_sq = std::max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
@@ -870,7 +916,8 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
-                                    Image& z, int num_threads) {
+                                    Image& z, int num_threads,
+                                    const f32 sscale[3]) {
     const int n_ch = ref_means.c;
     z = Image(ref_means.h, ref_means.w, 1);
     parallel_rows(ref_means.h, num_threads, [&](int y) {
@@ -886,8 +933,8 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                     id_noise = 0;
                 else if (id_noise >= (int)nc.std_curve.size())
                     id_noise = (int)nc.std_curve.size() - 1;
-                f32 sigma_t = nc.std_curve[(size_t)id_noise];
-                f32 d_t = nc.diff_curve[(size_t)id_noise];
+                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sscale[ch];
+                f32 d_t = nc.diff_curve[(size_t)id_noise] * sscale[ch];
                 const f32 comp = comp_means.at(y, x, ch);
                 f32 d_p_ = std::isfinite(comp)
                     ? std::fabs(brightness - comp)
@@ -933,7 +980,7 @@ static Image compute_fine_z(const Image& ref_guide, const Image& ref_means,
                             const Image& ref_vars, const Image& comp_guide,
                             const FlowField& flow, int tile_size,
                             const NoiseCurves* const nc_ch[3], const Config& cfg,
-                            bool sample_flow_bilinear) {
+                            bool sample_flow_bilinear, const f32 sscale[3]) {
     const int h = ref_guide.h, w = ref_guide.w, nc = ref_guide.c;
     Image zf(h, w, 1);
     const f32 kappa = std::max(0.f, cfg.r_fine_kappa);
@@ -980,7 +1027,7 @@ static Image compute_fine_z(const Image& ref_guide, const Image& ref_means,
                     id_noise = 0;
                 else if (id_noise >= (int)nc_.std_curve.size())
                     id_noise = (int)nc_.std_curve.size() - 1;
-                const f32 sigma_t = nc_.std_curve[(size_t)id_noise];
+                const f32 sigma_t = nc_.std_curve[(size_t)id_noise] * sscale[ch];
                 const f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 const f32 den = std::max(kappa * sigma_t * sigma_t,
                                          phi2 * sigma_p_sq);
@@ -1071,6 +1118,58 @@ static Image local_min_5x5(const Image& R) {
 // safety margin is Wronski's own, on Wronski's own grid.
 static Image local_min_5x5_on_guide(const Image& R);
 
+// Shared by CPU init_robustness (via noise_scale_from_stats on its full
+// stats) and the Metal host, which has no host-side stats -- this builds
+// the guide and samples 3x3 window stats inline at stride 4, which is
+// plenty for a quantile over ~100k cells and costs ~10ms once per burst.
+void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
+                                  f32 out_scale[3]) {
+    out_scale[0] = out_scale[1] = out_scale[2] = 1.f;
+    if (!cfg.r_noise_floor_autoscale || cfg.debug_noise_model_disabled ||
+        !cfg.robustness_enabled || ref_raw.h <= 0 || ref_raw.w <= 0)
+        return;
+    Image guide = compute_guide(ref_raw, cfg);
+    if (rob_color_space_active(cfg))
+        transform_guide_srgb(guide, cfg, cfg.num_threads);
+    const int nc = guide.c;
+    const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
+    if (nc == 3) {
+        for (int ch = 0; ch < 3; ++ch)
+            nc_ch[ch] = &mask_noise_curves_channel_space(cfg, ch);
+    } else {
+        nc_ch[0] = &mask_noise_curves(cfg);
+    }
+    std::vector<f32> ratios;
+    for (int ch = 0; ch < std::min(3, nc); ++ch) {
+        const NoiseCurves& curve = *nc_ch[ch];
+        if (curve.std_curve.empty()) continue;
+        ratios.clear();
+        for (int y = 1; y < guide.h - 1; y += 4) {
+            for (int x = 1; x < guide.w - 1; x += 4) {
+                f32 s = 0.f, s2 = 0.f;
+                for (int i = -1; i <= 1; ++i)
+                    for (int j = -1; j <= 1; ++j) {
+                        const f32 v = guide.at(y + i, x + j, ch);
+                        s += v;
+                        s2 += v * v;
+                    }
+                const f32 m = s / 9.f;
+                const f32 var = s2 / 9.f - m * m;
+                if (!(m > 0.02f && m < 0.85f) || !(var > 0.f)) continue;
+                const f32 st =
+                    curve.std_curve[noise_curve_index(m, curve.std_curve.size())];
+                if (!(st > 0.f)) continue;
+                ratios.push_back(std::sqrt(var) / st);
+            }
+        }
+        if (ratios.size() < 64) continue;
+        const size_t q = ratios.size() / 4;
+        std::nth_element(ratios.begin(), ratios.begin() + q, ratios.end());
+        out_scale[ch] = clampf(ratios[q] / 0.75f, 1.f,
+                               std::max(1.f, cfg.r_noise_scale_max));
+    }
+}
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
@@ -1096,6 +1195,18 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // Keep the guide itself for the fine-scale term (see RefStats::guide).
     if (cfg.robustness_fine_active())
         st.guide = std::move(guide);
+    // Noise-floor autoscale from the reference's own full stats (the Metal
+    // host measures the same quantity through robustness_noise_floor_scale).
+    if (cfg.r_noise_floor_autoscale && !cfg.debug_noise_model_disabled) {
+        const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
+        if (st.means.c == 3) {
+            for (int ch = 0; ch < 3; ++ch)
+                nc_ch[ch] = &mask_noise_curves_channel_space(cfg, ch);
+        } else {
+            nc_ch[0] = &mask_noise_curves(cfg);
+        }
+        noise_scale_from_stats(st.means, st.stds, nc_ch, cfg, st.sigma_scale);
+    }
     if (cfg.robustness_raw_resolution_active()) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
@@ -1189,7 +1300,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 !ref_stats.means.data.empty() && !ref_stats.stds.data.empty()) {
                 zf = compute_fine_z(ref_stats.guide, ref_stats.means,
                                     ref_stats.stds, guide, flow, tile_size,
-                                    nc_ch, cfg, merge_samples_flow);
+                                    nc_ch, cfg, merge_samples_flow,
+                                    ref_stats.sigma_scale);
             }
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
@@ -1206,7 +1318,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
 
     Image z;
     apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, z,
-                            cfg.num_threads);
+                            cfg.num_threads, ref_stats.sigma_scale);
 
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
@@ -1348,7 +1460,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         ref_stats.guide.c == guide.c && !ref_stats.means.data.empty() &&
         !ref_stats.stds.data.empty()) {
         zf = compute_fine_z(ref_stats.guide, ref_stats.means, ref_stats.stds,
-                            guide, flow, tile_size, nc_ch, cfg, sample_flow_g);
+                            guide, flow, tile_size, nc_ch, cfg, sample_flow_g,
+                            ref_stats.sigma_scale);
     }
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
@@ -1390,7 +1503,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image z;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, z);
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, z,
+                      ref_stats.sigma_scale);
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);

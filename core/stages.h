@@ -138,6 +138,9 @@ struct RefStats {
     // measured on the raw guide samples. CPU path only -- the Metal host
     // pins its own GPU-resident copy instead of a host image.
     Image guide;
+    // Per-channel multiplier on sigma_t/d_t, measured from the reference
+    // frame (Config::r_noise_floor_autoscale). 1 = trust the model as-is.
+    f32 sigma_scale[3] = {1.f, 1.f, 1.f};
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
@@ -161,6 +164,14 @@ Image robustness_local_min_on_guide(const Image& R);
 
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer mode).
 Image compute_guide(const Image& raw, const Config& cfg);
+
+// Measure the per-channel noise-floor scale (Config::r_noise_floor_autoscale)
+// from the reference raw: builds the guide, samples local 3x3 stats, and
+// takes a robust low quantile of measured-sigma / model-sigma_t at matching
+// brightness. out[3] filled with clamped scales (all 1 when disabled or
+// unmeasurable). Shared by CPU init_robustness and the Metal host.
+void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
+                                  f32 out_scale[3]);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);

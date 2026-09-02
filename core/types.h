@@ -925,11 +925,29 @@ struct Config {
     // rejects. Needs a live noise floor: gated off when
     // debug_noise_model_disabled (sigma_t = 0 would reject all noise).
     bool robustness_fine_term = true;
-    f32  r_fine_kappa = 8.8f;
+    // 12 (~5.3 sigma of the sample difference) rather than the 8.8 the
+    // Gaussian derivation gives (4.5 sigma): real sensor noise has fatter
+    // tails than the MC model, and every false seed erodes into a ~12 px
+    // blob, so the operating point carries tail margin.
+    f32  r_fine_kappa = 12.f;
     f32  r_fine_phi   = 0.5f;
     bool robustness_fine_active() const {
         return robustness_fine_term && !debug_noise_model_disabled;
     }
+    // Self-calibrating noise floor: the DNG NoiseProfile's alpha/beta
+    // routinely UNDERSTATE real noise (no PRNU, pattern noise, or
+    // processing gain), and both the sigma_t floor and the fine term sit at
+    // multi-sigma operating points where a 20-30% sigma_t shortfall
+    // multiplies false rejections a hundredfold -- measured on device as
+    // "noise read as misalignment". When enabled, init_robustness measures
+    // the per-channel ratio of the reference frame's local sigma to the
+    // model's sigma_t at matching brightness and scales sigma_t/d_t by a
+    // robust low quantile of that ratio (flat regions sit at the noise
+    // floor; textured cells only inflate the upper quantiles). The model
+    // keeps its brightness SHAPE; reality sets its LEVEL. Clamped to
+    // [1, r_noise_scale_max]: never trusts the data less than the model.
+    bool r_noise_floor_autoscale = true;
+    f32  r_noise_scale_max = 4.f;
     // Sample the per-tile flow BILINEARLY between tile centres wherever it is
     // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
     // mask -- instead of taking the containing tile's vector. Removes the
