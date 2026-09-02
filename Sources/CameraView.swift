@@ -739,9 +739,28 @@ struct CameraView: View {
                 + "neighbourhood. Measured against ground truth on synthetic bursts built "
                 + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
+        Toggle("Fine Detail Rejection", isOn: $cam.tuningParams.robustness_fine_term)
+        Text("Raw-resolution mask only. Adds a per-sample distance that catches sub-3-px edge misalignments -- but it also scores on the reference's own edge contrast, so at WELL-ALIGNED edges and texture it can over-reject. Turn OFF for the plain box statistic (closest to the classic behaviour); if kept on and well-aligned detail is being rejected, raise Fine Rejection Forgiveness below.")
+            .font(.caption2).foregroundColor(.secondary)
+        if cam.tuningParams.robustness_fine_term {
+            HStack {
+                Text("Fine Rejection Forgiveness (kappa)")
+                Spacer()
+                Text(String(format: "%.0f", cam.tuningParams.r_fine_kappa))
+            }
+            Slider(value: $cam.tuningParams.r_fine_kappa, in: 6...40, step: 1)
+        }
+        HStack {
+            Text("Noise Floor Forgiveness (max scale)")
+            Spacer()
+            Text(String(format: "%.1f", cam.tuningParams.r_noise_scale_max))
+        }
+        Slider(value: $cam.tuningParams.r_noise_scale_max, in: 1...8, step: 0.5)
+        Text("How far measured reference noise may raise the model's floor. Raise if FLAT or BRIGHT well-aligned areas (sky) are rejected; 1 trusts the noise model exactly.")
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
-             Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
+             Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Runs on both the FFT and Decimate greys. This is              also the ONLY path that carries the newer mask statistic (unit-invariant              aggregation + Fine Detail Rejection above); OFF = the classic guide-resolution              mask. ~4x the pixel count for the mask itself.
              """)
             .font(.caption2).foregroundColor(.secondary)
     }

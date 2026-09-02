@@ -174,6 +174,20 @@ struct TuningParams: Equatable, Codable {
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
     var robustness_raw_resolution_enabled: Bool = false
+    /// Fine-scale robustness term (raw-resolution mask only). Adds a
+    /// per-guide-sample distance that catches sub-3-px edge misalignments
+    /// the box-mean statistic averages away -- but it scores partly on the
+    /// reference's own contrast, so at well-aligned edges/texture it can
+    /// over-reject. Turn OFF to fall back to the pure box statistic.
+    var robustness_fine_term: Bool = true
+    /// Fine-term noise operating point (higher = more forgiving). 12 ~ 5.3
+    /// sigma of the sample difference; raise toward 20-30 if well-aligned
+    /// detail is being rejected.
+    var r_fine_kappa: Float = 12.0
+    /// Max noise-floor autoscale: how far the measured reference noise may
+    /// raise the model's floor (1 = trust the model exactly, higher = more
+    /// forgiving of under-modelled noise). Raise if flat/bright areas reject.
+    var r_noise_scale_max: Float = 4.0
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -229,6 +243,7 @@ struct TuningParams: Equatable, Codable {
         case align_ica_per_level_fft, use_neural_flow
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
+        case robustness_fine_term, r_fine_kappa, r_noise_scale_max
         case flow_bilinear_sampling
         case use_neural_robustness
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -304,6 +319,9 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
+        robustness_fine_term = try c.decodeIfPresent(Bool.self, forKey: .robustness_fine_term) ?? robustness_fine_term
+        r_fine_kappa = try c.decodeIfPresent(Float.self, forKey: .r_fine_kappa) ?? r_fine_kappa
+        r_noise_scale_max = try c.decodeIfPresent(Float.self, forKey: .r_noise_scale_max) ?? r_noise_scale_max
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
         acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
@@ -1921,6 +1939,9 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
+            "robustness_fine_term": NSNumber(value: tuningParams.robustness_fine_term),
+            "r_fine_kappa": NSNumber(value: tuningParams.r_fine_kappa),
+            "r_noise_scale_max": NSNumber(value: tuningParams.r_noise_scale_max),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
             "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
