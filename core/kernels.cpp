@@ -94,12 +94,6 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
-        // Stability floor -- see Config::merge_kernel_min: below it the
-        // fast-weights z>16 cutoff can zero a channel's den entirely
-        // (green/NaN speckle). Deliberate deviation from python-z, whose
-        // unfloored kernels hit the same degeneracy at k_denoise ~ 0.
-        k1 = std::max(k1, cfg.merge_kernel_min);
-        k2 = std::max(k2, cfg.merge_kernel_min);
     };
 
     // python-z order: GAT the raw, then decimate to grey (kernels.py:80, :84).

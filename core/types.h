@@ -1302,25 +1302,6 @@ struct Config {
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
 
-    // Stability floor on the final k1/k2. Small kernels sit in a
-    // NON-MONOTONIC hazard window: below ~0.06 the covariance goes
-    // numerically singular and interp_inv_cov's ref branch falls back to
-    // the identity (a sigma=1 isotropic kernel -- fine); between ~0.06 and
-    // ~0.2 the inverse is huge but finite, so every same-channel tap's
-    // weight w = exp(-0.5 z) UNDERFLOWS -- to 0 in fp32 past z ~ 174, and
-    // far earlier in the device's fp16 accumulator (w < ~1e-7, z > ~37) --
-    // and that channel's den lands at EXACTLY 0. Green usually keeps a tap
-    // (two sites per quad); red/blue lose theirs; the normalize's 0/0 is
-    // the green/NaN speckle. Reachable simply by lowering k_detail or
-    // k_denoise; the comp path's fast-weights z > 16 skip and its raw
-    // 1/det (inf on singular) live in the same window. 0.3 keeps the
-    // worst-orientation nearest tap (dist ~ 1.41 raw) at z ~ 22, w ~ 2e-5:
-    // comfortably normal even in fp16, while a 0.3-sigma Gaussian is
-    // visually a delta -- no meaningful spatial smoothing. Applies in
-    // compute_k on both CPU and Metal, so no tuning combination can
-    // collapse the kernel.
-    float merge_kernel_min = 0.3f;
-
     CFA cfa;
 
     // JPEG / preview rendering. Never affects the linear DNG, which is always
