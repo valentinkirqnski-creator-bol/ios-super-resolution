@@ -672,37 +672,10 @@ struct Config {
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
-    // which one gates it. (Current-mask port: the Decimate-only gate is
-    // lifted -- the raw-res mask runs on the FFT grey too, as on the main
-    // branch.)
+    // which one gates it.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled;
+        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
     }
-
-    // ---- Current-mask port (from feat/shape-confidence @ 769c7b3+) ------
-    // Fine-scale robustness term: a second distance measured on the raw
-    // GUIDE SAMPLES (2-raw-px scale) against max(kappa*sigma_t^2,
-    // (phi*sigma_p)^2), combined as z = max(z_box, z_fine). Catches the
-    // sub-3-px edge misalignments the box-mean statistic averages away.
-    // kappa = 12 ~ 5.3 sigma of the sample difference (tail margin for
-    // non-Gaussian sensor noise); phi = 0.5 forgives ~0.5 px of subpixel
-    // sampling phase at edges. Gated off when the noise model is disabled
-    // (sigma_t = 0 would reject all noise).
-    bool robustness_fine_term = true;
-    f32  r_fine_kappa = 12.f;
-    f32  r_fine_phi   = 0.5f;
-    bool robustness_fine_active() const {
-        return robustness_fine_term && !debug_noise_model_disabled;
-    }
-    // Self-calibrating noise floor: DNG NoiseProfiles routinely UNDERSTATE
-    // real noise (no PRNU/pattern noise, fat tails); at multi-sigma
-    // operating points a 20-30% sigma_t shortfall multiplies false
-    // rejections a hundredfold. init_robustness measures the per-channel
-    // 25th percentile of measured-local-sigma / model-sigma_t at matching
-    // brightness on the reference frame and scales sigma_t/d_t by it,
-    // clamped to [1, r_noise_scale_max].
-    bool r_noise_floor_autoscale = true;
-    f32  r_noise_scale_max = 4.f;
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
     // missing feature (or aperture) then no shift is applied at all." When a

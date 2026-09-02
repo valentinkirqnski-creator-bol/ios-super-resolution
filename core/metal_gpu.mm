@@ -160,7 +160,7 @@ static MetalCtx& ctx() {
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
             "merge_accumulate_comp", "merge_accumulate_ref",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
-            "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson", "rob_fine_z",
+            "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
@@ -1139,10 +1139,8 @@ struct RobMaskParamsCPU {
     // _pad1). Must match the merge's setting: the mask has to score the
     // correspondence the merge actually fetches.
     uint32_t flow_bilinear = 0;
-    // CURRENT-MASK PORT: 1 = rob_fine_z output bound at buffer 16.
-    uint32_t fine_enabled = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 100, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1164,18 +1162,9 @@ struct RobMaskRawParamsCPU {
     float beta = 0.f;
     float motion_edge_noise_floor_multiplier = 0.f;
     uint32_t motion_edge_neighborhood_radius = 0;
-    // CURRENT-MASK PORT: 1 = rob_fine_z output bound at buffer 14 (was _pad0).
-    uint32_t fine_enabled = 0;
+    uint32_t _pad0 = 0;
 };
 static_assert(sizeof(RobMaskRawParamsCPU) == 104, "RobMaskRawParamsCPU");
-
-// CURRENT-MASK PORT: keep in lockstep with RobFineZParams in HHSRKernels.metal.
-struct RobFineZParamsCPU {
-    uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, flow_bilinear;
-    float kappa, phi2;
-    uint32_t _pad0 = 0, _pad1 = 0;
-};
-static_assert(sizeof(RobFineZParamsCPU) == 48, "RobFineZParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1420,12 +1409,6 @@ static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
 static bool g_rob_curve_pixel4a = false;
 static int g_rob_curve_pixel4a_iso = 0;
-// CURRENT-MASK PORT: reference guide image pinned for the fine-scale term,
-// and the per-channel noise-floor autoscale baked into the uploaded curve
-// copies (g_rob_curve_sscale tracks what the current upload carries).
-static id<MTLBuffer> g_rob_ref_guide = nil;
-static float g_rob_sigma_scale[3] = {1.f, 1.f, 1.f};
-static float g_rob_curve_sscale[3] = {1.f, 1.f, 1.f};
 
 static void clear_rob_ref_gpu() {
     g_rob_ref_hf = nil;
@@ -1443,56 +1426,9 @@ static void clear_rob_ref_gpu() {
     for (int i = 0; i < 3; ++i) {
         g_rob_curve_alpha[i] = std::numeric_limits<float>::quiet_NaN();
         g_rob_curve_beta[i]  = std::numeric_limits<float>::quiet_NaN();
-        g_rob_sigma_scale[i] = 1.f;
-        g_rob_curve_sscale[i] = 1.f;
     }
-    g_rob_ref_guide = nil;
     g_rob_curve_pixel4a = false;
     g_rob_curve_pixel4a_iso = 0;
-}
-
-// CURRENT-MASK PORT: encode one rob_fine_z dispatch (guide resolution) into
-// cmd. Returns the zf buffer, or nil when a required input is missing --
-// callers then leave fine_enabled at 0 (graceful skip).
-static id<MTLBuffer> rob_fine_z_dispatch(id<MTLBuffer> b_guide_comp,
-                                         int gh, int gw, int nch,
-                                         const FlowField& flow, int tile_size,
-                                         const Config& cfg,
-                                         id<MTLCommandBuffer> cmd) {
-    auto& c = ctx();
-    if (!g_rob_ref_guide || !g_rob_ref_m || !g_rob_ref_v ||
-        !g_rob_std_curve || g_rob_curve_n == 0 ||
-        !b_guide_comp || gh <= 0 || gw <= 0 ||
-        flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty())
-        return nil;
-    const size_t zf_b = (size_t)gh * (size_t)gw * sizeof(float);
-    id<MTLBuffer> b_zf = buf(nullptr, zf_b);
-    id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    if (!b_zf || !b_flow) return nil;
-    RobFineZParamsCPU fp{};
-    fp.h = (uint32_t)gh;
-    fp.w = (uint32_t)gw;
-    fp.nch = (uint32_t)nch;
-    fp.tile_size = (uint32_t)std::max(1, tile_size);
-    fp.flow_ny = (uint32_t)flow.ny;
-    fp.flow_nx = (uint32_t)flow.nx;
-    fp.curve_n = (uint32_t)g_rob_curve_n;
-    fp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
-    fp.kappa = cfg.r_fine_kappa;
-    fp.phi2 = cfg.r_fine_phi * cfg.r_fine_phi;
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return nil;
-    [enc setBuffer:b_zf offset:0 atIndex:0];
-    [enc setBuffer:g_rob_ref_guide offset:0 atIndex:1];
-    [enc setBuffer:b_guide_comp offset:0 atIndex:2];
-    [enc setBuffer:g_rob_ref_m offset:0 atIndex:3];
-    [enc setBuffer:g_rob_ref_v offset:0 atIndex:4];
-    [enc setBuffer:g_rob_std_curve offset:0 atIndex:5];
-    [enc setBuffer:b_flow offset:0 atIndex:6];
-    [enc setBytes:&fp length:sizeof(fp) atIndex:7];
-    dispatch2(enc, c.pipe("rob_fine_z"), (NSUInteger)gw, (NSUInteger)gh);
-    [enc endEncoding];
-    return b_zf;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -1554,12 +1490,6 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     g_rob_ref_v_hires = b_vars_hires;
     g_rob_ref_hires_h = hires_h;
     g_rob_ref_hires_w = hires_w;
-    // CURRENT-MASK PORT: pin the reference guide for the fine-scale term,
-    // and measure the noise-floor autoscale on the CPU from the raw
-    // (robustness_noise_floor_scale self-gates to 1s when disabled).
-    if (cfg.robustness_fine_active())
-        g_rob_ref_guide = b_guide;
-    robustness_noise_floor_scale(ref_raw, cfg, g_rob_sigma_scale);
 
     RefStats st;
     // Keep only dimensions on the CPU. The actual reference means/vars/HF loss
@@ -1677,9 +1607,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
-        if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b ||
-            g_rob_curve_sscale[std::min(ch, 2)] != g_rob_sigma_scale[std::min(ch, 2)])
-            curves_stale = true;
+        if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b) curves_stale = true;
     }
     if (curves_stale) {
         std::vector<f32> std_all, diff_all;
@@ -1698,17 +1626,10 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
             } else if (std_curve.size() != n || diff_curve.size() != n) {
                 return Image();
             }
-            // CURRENT-MASK PORT: noise-floor autoscale baked into the
-            // uploaded copies (sigma_t and d_t both scale linearly with
-            // sigma) -- kernels stay untouched.
-            const f32 sc832 = g_rob_sigma_scale[std::min(ch, 2)];
-            for (size_t i = 0; i < n; ++i) {
-                std_all[(size_t)ch * n + i] = std_curve[i] * sc832;
-                diff_all[(size_t)ch * n + i] = diff_curve[i] * sc832;
-            }
+            std::copy(std_curve.begin(), std_curve.end(), std_all.begin() + (size_t)ch * n);
+            std::copy(diff_curve.begin(), diff_curve.end(), diff_all.begin() + (size_t)ch * n);
             g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
             g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
-            g_rob_curve_sscale[std::min(ch, 2)] = sc832;
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
@@ -1781,15 +1702,6 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
 
-    // CURRENT-MASK PORT: fine-scale term at guide resolution (comp b_guide
-    // from rob_run_guide_stats above; ref guide pinned at init).
-    id<MTLBuffer> b_zf = nil;
-    if (cfg.robustness_fine_active())
-        b_zf = rob_fine_z_dispatch(b_guide, gh, gw, nch, flow, tile_size, cfg, cmd);
-    id<MTLBuffer> b_zf_bind = b_zf ? b_zf : buf(nullptr, sizeof(float));
-    if (!b_zf_bind) return Image();
-    mp.fine_enabled = b_zf ? 1u : 0u;
-
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
@@ -1806,7 +1718,6 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:b_magnitude offset:0 atIndex:11];
     [enc setBuffer:b_motion offset:0 atIndex:12];
     [enc setBuffer:b_ref_hf offset:0 atIndex:13];
-    [enc setBuffer:b_zf_bind offset:0 atIndex:14];
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1901,9 +1812,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
-        if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b ||
-            g_rob_curve_sscale[std::min(ch, 2)] != g_rob_sigma_scale[std::min(ch, 2)])
-            curves_stale = true;
+        if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b) curves_stale = true;
     }
     if (curves_stale) {
         std::vector<f32> std_all, diff_all;
@@ -1922,17 +1831,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             } else if (std_curve.size() != n || diff_curve.size() != n) {
                 return Image();
             }
-            // CURRENT-MASK PORT: noise-floor autoscale baked into the
-            // uploaded copies (sigma_t and d_t both scale linearly with
-            // sigma) -- kernels stay untouched.
-            const f32 sc832 = g_rob_sigma_scale[std::min(ch, 2)];
-            for (size_t i = 0; i < n; ++i) {
-                std_all[(size_t)ch * n + i] = std_curve[i] * sc832;
-                diff_all[(size_t)ch * n + i] = diff_curve[i] * sc832;
-            }
+            std::copy(std_curve.begin(), std_curve.end(), std_all.begin() + (size_t)ch * n);
+            std::copy(diff_curve.begin(), diff_curve.end(), diff_all.begin() + (size_t)ch * n);
             g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
             g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
-            g_rob_curve_sscale[std::min(ch, 2)] = sc832;
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
@@ -2007,15 +1909,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         : b_motion;
     if (!b_match_amb) return Image();
 
-    // CURRENT-MASK PORT: fine-scale term at this path's native (guide)
-    // resolution -- comp b_guide from rob_run_guide_stats above.
-    id<MTLBuffer> b_zf = nil;
-    if (cfg.robustness_fine_active())
-        b_zf = rob_fine_z_dispatch(b_guide, gh, gw, nch, flow, tile_size, cfg, cmd);
-    id<MTLBuffer> b_zf_bind = b_zf ? b_zf : buf(nullptr, sizeof(float));
-    if (!b_zf_bind) return Image();
-    mp.fine_enabled = b_zf ? 1u : 0u;
-
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     if (aperture_reject_on) {
@@ -2048,7 +1941,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
     [enc setBuffer:b_s_select offset:0 atIndex:14];
     [enc setBuffer:b_match_amb offset:0 atIndex:15];
-    [enc setBuffer:b_zf_bind offset:0 atIndex:16];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -3790,13 +3682,6 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
         p.cov_w = hit->cov_w > 0 ? (uint32_t)hit->cov_w : 1u;
-        // CURRENT-MASK PORT (172b65e): this resident branch left
-        // raw_res_robustness at its 0 default, so a RAW-resolution mask was
-        // consumed with the guide-scale (lr-0.5)/2 transform -- the top-left
-        // quadrant stretched over the whole frame, i.e. random colored
-        // misalignment speckle exclusive to the streamed GPU path.
-        p.raw_res_robustness =
-            (hit->rob_h == hit->lr_h && hit->rob_w == hit->lr_w) ? 1u : 0u;
     }
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
