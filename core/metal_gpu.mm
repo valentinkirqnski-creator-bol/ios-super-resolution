@@ -1490,12 +1490,11 @@ static float g_rob_curve_alpha[3] = {std::numeric_limits<float>::quiet_NaN(),
 static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
-// Per-channel, per-brightness-band noise-floor autoscale measured once per
-// burst from the reference frame (robustness_noise_floor_scale); baked into
-// the uploaded curve copies bin by bin. g_rob_curve_sscale tracks what the
-// current upload carries.
-static RobSigmaScale g_rob_sigma_scale;
-static RobSigmaScale g_rob_curve_sscale;
+// Per-channel noise-floor autoscale measured once per burst from the
+// reference frame (robustness_noise_floor_scale); baked into the uploaded
+// curve copies. g_rob_curve_sscale tracks what the current upload carries.
+static float g_rob_sigma_scale[3] = {1.f, 1.f, 1.f};
+static float g_rob_curve_sscale[3] = {1.f, 1.f, 1.f};
 
 // Reference guide IMAGE (not its stats), pinned for the fine-scale term
 // (Config::robustness_fine_term) -- the GPU twin of RefStats::guide.
@@ -1516,9 +1515,9 @@ static void clear_rob_ref_gpu() {
     for (int i = 0; i < 3; ++i) {
         g_rob_curve_alpha[i] = std::numeric_limits<float>::quiet_NaN();
         g_rob_curve_beta[i]  = std::numeric_limits<float>::quiet_NaN();
+        g_rob_sigma_scale[i] = 1.f;
+        g_rob_curve_sscale[i] = 1.f;
     }
-    g_rob_sigma_scale = RobSigmaScale{};
-    g_rob_curve_sscale = RobSigmaScale{};
 }
 
 // Encode one rob_fine_z dispatch (guide resolution) into cmd. Returns the
@@ -1711,9 +1710,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
         if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b ||
-            std::memcmp(g_rob_curve_sscale.s[std::min(ch, 2)],
-                        g_rob_sigma_scale.s[std::min(ch, 2)],
-                        sizeof(g_rob_sigma_scale.s[0])) != 0)
+            g_rob_curve_sscale[ch] != g_rob_sigma_scale[ch])
             curves_stale = true;
     }
     if (curves_stale) {
@@ -1735,19 +1732,15 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
             }
             // Noise-floor autoscale baked into the uploaded copies (the
             // kernels stay untouched); sigma_t and d_t both scale linearly
-            // with sigma, and the per-brightness-band scale is interpolated
-            // per bin. See robustness_noise_floor_scale.
-            const int sch = std::min(ch, 2);
-            const f32 inv_last = (n > 1) ? 1.f / (f32)(n - 1) : 0.f;
+            // with sigma. See robustness_noise_floor_scale.
+            const f32 sc = g_rob_sigma_scale[std::min(ch, 2)];
             for (size_t i = 0; i < n; ++i) {
-                const f32 sc = g_rob_sigma_scale.at(sch, (f32)i * inv_last);
                 std_all[(size_t)ch * n + i] = std_curve[i] * sc;
                 diff_all[(size_t)ch * n + i] = diff_curve[i] * sc;
             }
             g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
             g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
-            std::memcpy(g_rob_curve_sscale.s[sch], g_rob_sigma_scale.s[sch],
-                        sizeof(g_rob_sigma_scale.s[0]));
+            g_rob_curve_sscale[ch] = sc;
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
@@ -1895,9 +1888,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
         if (g_rob_curve_alpha[ch] != a || g_rob_curve_beta[ch] != b ||
-            std::memcmp(g_rob_curve_sscale.s[std::min(ch, 2)],
-                        g_rob_sigma_scale.s[std::min(ch, 2)],
-                        sizeof(g_rob_sigma_scale.s[0])) != 0)
+            g_rob_curve_sscale[ch] != g_rob_sigma_scale[ch])
             curves_stale = true;
     }
     if (curves_stale) {
@@ -1919,19 +1910,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             }
             // Noise-floor autoscale baked into the uploaded copies (the
             // kernels stay untouched); sigma_t and d_t both scale linearly
-            // with sigma, and the per-brightness-band scale is interpolated
-            // per bin. See robustness_noise_floor_scale.
-            const int sch = std::min(ch, 2);
-            const f32 inv_last = (n > 1) ? 1.f / (f32)(n - 1) : 0.f;
+            // with sigma. See robustness_noise_floor_scale.
+            const f32 sc = g_rob_sigma_scale[std::min(ch, 2)];
             for (size_t i = 0; i < n; ++i) {
-                const f32 sc = g_rob_sigma_scale.at(sch, (f32)i * inv_last);
                 std_all[(size_t)ch * n + i] = std_curve[i] * sc;
                 diff_all[(size_t)ch * n + i] = diff_curve[i] * sc;
             }
             g_rob_curve_alpha[ch] = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
             g_rob_curve_beta[ch] = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
-            std::memcpy(g_rob_curve_sscale.s[sch], g_rob_sigma_scale.s[sch],
-                        sizeof(g_rob_sigma_scale.s[0]));
+            g_rob_curve_sscale[ch] = sc;
         }
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
