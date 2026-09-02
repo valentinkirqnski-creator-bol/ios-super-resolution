@@ -506,6 +506,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.prealign_enabled = tuning[@"prealign_enabled"].boolValue;
     if (tuning[@"merge_chroma_difference"])
         cfg.merge_chroma_difference = tuning[@"merge_chroma_difference"].boolValue;
+    if (tuning[@"kernel_selection_hard"])
+        cfg.selection = tuning[@"kernel_selection_hard"].boolValue
+                            ? hhsr::SelectionLaw::HardThreshold
+                            : hhsr::SelectionLaw::Linear;
     if (tuning[@"merge_uncovered_passthrough"])
         cfg.merge_uncovered_passthrough =
             tuning[@"merge_uncovered_passthrough"].boolValue;

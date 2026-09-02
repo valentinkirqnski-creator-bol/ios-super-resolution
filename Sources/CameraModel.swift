@@ -209,6 +209,13 @@ struct TuningParams: Equatable, Codable {
     /// coverage -- expect visible texture change at coverage boundaries and
     /// blocky chroma at edges inside rejected regions.
     var merge_uncovered_passthrough: Bool = false
+    /// Eq. 4 selection law. On = the hard A > 1.95 threshold (commit
+    /// 832f7b8's behaviour): kernels stay ROUND everywhere except at
+    /// near-perfectly coherent edges, giving the smooth homogeneous
+    /// rendition. Off = python-z's 12ce005 linear law (the default):
+    /// anisotropy lerps continuously with A, so ordinary textured content
+    /// gets thin oriented kernels -- crisper, can read as oversharpened.
+    var kernel_selection_hard: Bool = false
     /// HDR+ mode: replace the whole super-resolution pipeline with the HDR+
     /// burst align + merge (hdr-plus-master's Halide implementation, ported
     /// to the core with a Metal path). A denoiser, not an upscaler: the
@@ -311,6 +318,7 @@ struct TuningParams: Equatable, Codable {
         case merge_chroma_difference
         case merge_kernel_iso
         case merge_uncovered_passthrough
+        case kernel_selection_hard
         case hdrplus_mode
         case isa_mode
         case robustness_color_space
@@ -386,6 +394,7 @@ struct TuningParams: Equatable, Codable {
         merge_chroma_difference = try c.decodeIfPresent(Bool.self, forKey: .merge_chroma_difference) ?? merge_chroma_difference
         merge_kernel_iso = try c.decodeIfPresent(Bool.self, forKey: .merge_kernel_iso) ?? merge_kernel_iso
         merge_uncovered_passthrough = try c.decodeIfPresent(Bool.self, forKey: .merge_uncovered_passthrough) ?? merge_uncovered_passthrough
+        kernel_selection_hard = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_hard) ?? kernel_selection_hard
         hdrplus_mode = try c.decodeIfPresent(Bool.self, forKey: .hdrplus_mode) ?? hdrplus_mode
         isa_mode = try c.decodeIfPresent(Bool.self, forKey: .isa_mode) ?? isa_mode
         robustness_color_space = try c.decodeIfPresent(Bool.self, forKey: .robustness_color_space) ?? robustness_color_space
@@ -2176,6 +2185,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_chroma_difference": NSNumber(value: tuningParams.merge_chroma_difference),
             "merge_kernel_iso": NSNumber(value: tuningParams.merge_kernel_iso),
             "merge_uncovered_passthrough": NSNumber(value: tuningParams.merge_uncovered_passthrough),
+            "kernel_selection_hard": NSNumber(value: tuningParams.kernel_selection_hard),
             "hdrplus_mode": NSNumber(value: tuningParams.hdrplus_mode),
             "isa_mode": NSNumber(value: tuningParams.isa_mode),
             "robustness_color_space": NSNumber(value: tuningParams.robustness_color_space),

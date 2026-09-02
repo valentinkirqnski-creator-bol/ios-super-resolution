@@ -776,6 +776,9 @@ struct CameraView: View {
              Measured on a grey step edge (any colour in the output is pure artifact): worst              case 113.9 -> 12.3 levels, mean 1.50 -> 0.00, and no longer sensitive to kernel              sharpness. Costs some accuracy on genuinely fine coloured texture.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Hard Anisotropy Threshold", isOn: $cam.tuningParams.kernel_selection_hard)
+        Text("Eq. 4 selection law. On: kernels stay round everywhere except near-perfectly coherent edges (A > 1.95) -- the smooth, homogeneous rendition of commit 832f7b8. Off (default): the linear law -- anisotropy grows continuously with gradient coherence, so ordinary textured content gets thin oriented kernels; crisper, can read as oversharpened.")
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Uncovered = Plain Reference", isOn: $cam.tuningParams.merge_uncovered_passthrough)
         Text("Where every comparison frame was rejected (R = 0), output the nearest reference sample per colour instead of the Gaussian kernel reconstruction: the plain reference, noise and all, with no interpolation smoothing. Hard switch on zero coverage -- expect a visible texture change at coverage boundaries and blocky chroma at edges inside rejected regions.")
             .font(.caption2).foregroundColor(.secondary)
