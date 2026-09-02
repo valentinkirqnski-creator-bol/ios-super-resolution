@@ -752,8 +752,14 @@ static Image upscale_warp_stats(const Image& guide_stats,
 static constexpr f32 kMeanUnits = 2.f / 9.f;
 
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq) {
+                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq,
+                              bool mean_units_fix) {
     const int n_ch = ref_means.c;
+    // Off (default): the raw measured sigma_p^2 -- Wronski Eq. 6 exactly.
+    // On: sigma_p^2 rescaled to d's mean-difference units (see
+    // Config::robustness_mean_units_fix). The noise floor sigma_t^2 is NOT
+    // scaled, so the flat-region operating point is untouched.
+    const f32 sp_scale = mean_units_fix ? kMeanUnits : 1.f;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
@@ -774,7 +780,7 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                sigma_ms_sq += ref_vars.at(y, x, ch);
+                sigma_ms_sq += sp_scale * ref_vars.at(y, x, ch);
                 sigma_md_sq += sigma_t * sigma_t;
                 f32 d_p_ = d_p.at(y, x, ch);
                 d_ms_sq += d_p_ * d_p_;
@@ -1719,7 +1725,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
+                      cfg.robustness_mean_units_fix);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(

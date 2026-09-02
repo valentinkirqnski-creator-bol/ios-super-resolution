@@ -679,6 +679,20 @@ struct Config {
         return robustness_raw_resolution_enabled;
     }
 
+    // d/sigma UNIT-MISMATCH FIX for the classic (guide-resolution, Wronski
+    // Eq. 6) mask. d is the difference of two 3x3 box MEANS; sigma_p^2
+    // (ref_vars) is the PER-SAMPLE patch variance. Under noise the variance
+    // of a difference of two 9-sample means is (2/9)*sigma_sample^2, so the
+    // raw sigma_p^2 denominator is ~4.5x too large for d's scale -- d^2/sigma^2
+    // comes out ~4.5x too small everywhere, R stays spuriously high, and
+    // edge misalignments (where sigma_p^2 = contrast dominates) leak through.
+    // The fix scales ONLY the measured sigma_p^2 by 2/9 to put it in d's
+    // mean-difference units; the noise floor sigma_t^2 stays unscaled, so the
+    // flat-region operating point s1/s2/t were tuned against is preserved.
+    // A deliberate correction to Wronski's formula, off by default so the
+    // classic mask stays bit-exact until asked for.
+    bool robustness_mean_units_fix = false;
+
     // ---- Current-mask port (from feat/shape-confidence @ 769c7b3+) ------
     // Fine-scale robustness term: a second distance measured on the raw
     // GUIDE SAMPLES (2-raw-px scale) against max(kappa*sigma_t^2,

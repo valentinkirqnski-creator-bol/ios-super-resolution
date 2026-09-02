@@ -1544,6 +1544,7 @@ struct RobMaskParams {
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
+    uint mean_units_fix; // 1 = scale measured sigma_p^2 by 2/9 (d/sigma unit fix)
 };
 
 // CURRENT-MASK PORT: keep in lockstep with RobFineZParamsCPU in metal_gpu.mm.
@@ -2046,7 +2047,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
+        // d/sigma unit fix: scale measured sigma_p^2 into d's mean-diff
+        // units (RobMaskParams::mean_units_fix); noise floor stays unscaled.
+        sigma_ms_sq += (p.mean_units_fix != 0u ? kMeanUnits : 1.f) * ref_vars[o];
         sigma_md_sq += sigma_t * sigma_t;
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);

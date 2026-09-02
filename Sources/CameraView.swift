@@ -739,6 +739,9 @@ struct CameraView: View {
                 + "neighbourhood. Measured against ground truth on synthetic bursts built "
                 + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
+        Toggle("Fix d/sigma Units (edge rejection)", isOn: $cam.tuningParams.robustness_mean_units_fix)
+        Text("Corrects a unit mismatch in Wronski's robustness formula: the color difference d is a mean of 9 samples but the variance it is divided by is the per-sample patch variance, ~4.5x too large -- so d^2/sigma^2 stays too small and R too high, letting edge misalignments through. On: scales the measured variance into d's units (noise floor untouched, so flat areas are unchanged). Off: bit-exact Wronski Eq. 6. Applies to the classic (Raw Resolution OFF) mask.")
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Fine Detail Rejection", isOn: $cam.tuningParams.robustness_fine_term)
         Text("Raw-resolution mask only. Adds a per-sample distance that catches sub-3-px edge misalignments -- but it also scores on the reference's own edge contrast, so at WELL-ALIGNED edges and texture it can over-reject. Turn OFF for the plain box statistic (closest to the classic behaviour); if kept on and well-aligned detail is being rejected, raise Fine Rejection Forgiveness below.")
             .font(.caption2).foregroundColor(.secondary)
