@@ -901,6 +901,35 @@ struct Config {
     bool robustness_raw_resolution_active() const {
         return robustness_raw_resolution_enabled;
     }
+
+    // Fine-scale robustness term. The box-mean d (difference of 3x3-guide-
+    // cell means = ~6x6 raw px boxes) is structurally blind to edge
+    // misalignments below ~3 raw px: for a step edge of amplitude A shifted
+    // by delta px, d ~ A*delta/6 while sigma_p ~ 0.47*A, so the amplitude
+    // cancels and z ~ delta^2/1.8 (after the mean-units correction below) --
+    // rejection needs delta >= ~2.9 px no matter the edge contrast. This
+    // second distance is measured on the raw GUIDE SAMPLES (2-raw-px scale):
+    // z_fine = max_ch d_fine^2 / max(kappa*sigma_t^2, (phi*sigma_p)^2), and
+    // the mask takes max(z_box, z_fine). kappa sets the pure-noise operating
+    // point. d_fine is the DIFFERENCE of two noisy samples, so its own std
+    // is ~sqrt(2)*sigma_t; rejection at z >= ln(s2/t) = 4.6 with kappa = 8.8
+    // fires at |d_fine| ~ 6.4 sigma_t = 4.5 sigma of the difference -- a
+    // per-sample false-positive rate of ~5e-6 per channel, which survives
+    // the 25x spread of the 5x5 erosion. (Measured on the synthetic repro:
+    // kappa = 4.4 -- calibrated against sigma_t instead of the difference's
+    // sigma -- rejected 18% of a perfectly aligned noisy background.)
+    // phi re-introduces a FRACTION of the contrast forgiveness: two
+    // perfectly aligned frames legitimately differ at single-sample scale at
+    // an edge by ~(residual subpixel phase)*A, so phi = 0.5 forgives up to
+    // ~0.5 px of sampling phase while a >=1 px shift of a strong edge
+    // rejects. Needs a live noise floor: gated off when
+    // debug_noise_model_disabled (sigma_t = 0 would reject all noise).
+    bool robustness_fine_term = true;
+    f32  r_fine_kappa = 8.8f;
+    f32  r_fine_phi   = 0.5f;
+    bool robustness_fine_active() const {
+        return robustness_fine_term && !debug_noise_model_disabled;
+    }
     // Sample the per-tile flow BILINEARLY between tile centres wherever it is
     // consumed -- merge, Eq. 6's d, upscale_warp_stats, the raw-resolution
     // mask -- instead of taking the containing tile's vector. Removes the

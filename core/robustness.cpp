@@ -769,18 +769,37 @@ static Image upscale_warp_stats(const Image& guide_stats,
 // than all channels sharing one built from the cross-channel mean of
 // alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
 // make_noise_curves_channel.
-// Outputs z = (1/n) * sum_ch d_ch^2*shrink_ch^2 / max(sigma_p_ch^2,
-// sigma_t_ch^2); R is then s*exp(-z) - t. UNIT-INVARIANT aggregation: a
-// per-channel rescale of the guide multiplies d_ch^2 and sigma_ch^2
-// identically, so each ratio -- and R -- no longer depends on which units
-// the guide happens to live in. The previous ratio-of-sums
-// (sum d^2 / sum sigma^2) weighted every channel's vote by its numeric
-// magnitude squared: in the WB-undone guide, R/B votes shrank by wb_c^2
-// (~4x red at daylight WB) and R degenerated into a green-difference
-// detector that under-rejected chroma ghosts. When all per-channel ratios
-// agree the mean equals the old ratio-of-sums exactly, so the s1/s2/t
-// calibration is unchanged for achromatic differences. Each channel still
-// gets its OWN noise floor and its OWN Wiener shrink from its own curve.
+// Outputs z = max_ch d_ch^2*shrink_ch^2 / max(kMeanUnits*sigma_p_ch^2,
+// sigma_t_ch^2); R is then s*exp(-z) - t.
+//
+// UNIT-INVARIANT aggregation (max over per-channel ratios): a per-channel
+// rescale of the guide multiplies d_ch^2 and sigma_ch^2 identically, so
+// each ratio -- and R -- does not depend on which units the guide happens
+// to live in. The original ratio-of-sums (sum d^2 / sum sigma^2) weighted
+// every channel's vote by its numeric magnitude squared: in the WB-undone
+// guide, R/B votes shrank by wb_c^2 (~4x red at daylight WB) and R
+// degenerated into a green-difference detector. max (not mean) so that
+// evidence isolated in ONE channel -- a chroma fringe -- counts at full
+// strength instead of being divided by the channel count.
+//
+// kMeanUnits = 2/9 puts the MEASURED variance in the same statistical
+// units as d: d is the difference of two 9-sample means, whose variance
+// under per-sample variance sigma_p^2 is (2/9)*sigma_p^2 -- dividing by the
+// raw per-sample sigma_p^2 made the test ~4.5x less sensitive than a
+// unit-consistent z-test, which is what left step edges unrejectable below
+// ~6 raw px of shift (the amplitude cancels between d and sigma_p, leaving
+// z ~ delta^2/8; with the correction, z ~ delta^2/1.8 and rejection starts
+// at ~2.9 px). sigma_t deliberately stays UNSCALED: it is the noise floor,
+// and at flat pixels max(kMeanUnits*sigma_p^2, sigma_t^2) = sigma_t^2
+// keeps the pure-noise operating point exactly where the s/t calibration
+// put it (rejection at ~4.5 sigma of the mean difference); the Wiener
+// shrink (d_t, already in mean-difference units) does the fine-grained
+// noise forgiveness. With the noise model DISABLED (sigma_t = 0) the mask
+// is deliberately stricter by the same 4.5x -- that mode is a probe, not a
+// calibrated operating point. Each channel still gets its OWN floor and
+// its OWN shrink from its own curve.
+static constexpr f32 kMeanUnits = 2.f / 9.f;
+
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
                               const NoiseCurves* const nc_ch[3], Image& z) {
     const int n_ch = ref_means.c;
@@ -804,11 +823,35 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 f32 d_p_sq = d_p.at(y, x, ch) * d_p.at(y, x, ch);
-                f32 sigma_ch_sq = std::max(sigma_p_sq, sigma_t * sigma_t);
-                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
+                f32 sigma_ch_sq = std::max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
+                // No noise floor (model disabled): fall back to the UNSCALED
+                // measured variance. Without sigma_t the measured sigma_p is
+                // the only thing keeping plain noise from rejecting, and the
+                // mean-units correction there put the flat operating point at
+                // 2.1 sigma of the mean difference -- measured 60% of an
+                // aligned noisy background dark. The old per-sample floor is
+                // 4.5 sigma there, which is the calibrated rate; edges lose
+                // the correction only in this diagnostic mode.
+                if (sigma_t <= 0.f)
+                    sigma_ch_sq = std::max(sigma_ch_sq, sigma_p_sq);
+                // Explicit degenerate cases -- std::max silently drops NaN,
+                // so 0/0 must be decided here, and decided correctly: an
+                // exact match (d = 0, reachable with the noise model off in
+                // clipped/flat areas) is NO evidence, not a rejection (the
+                // old sum-aggregation turned it into R = 0 via NaN); an OOB
+                // comp sample (d = +inf) must stay +inf so R lands at 0.
+                f32 term;
+                if (d_p_sq == 0.f) {
+                    term = 0.f;
+                } else if (!std::isfinite(d_p_sq)) {
+                    term = d_p_sq; // +inf
+                } else {
+                    f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                    term = d_p_sq * shrink * shrink / sigma_ch_sq;
+                }
+                z_ = std::max(z_, term);
             }
-            z.at(y, x) = z_ / (f32)n_ch;
+            z.at(y, x) = z_;
         }
     }
 }
@@ -820,10 +863,10 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 // very next stage -- the single biggest allocation in the raw-resolution
 // robustness path, and the one that pushed a multi-frame burst past the
 // memory ceiling. Arithmetic is identical to apply_noise_model above:
-// unit-invariant mean of per-channel ratios, each channel with its own
-// noise floor and its own Wiener shrink -- see that function's comment. An
-// out-of-bounds Dodgson sample arrives as +inf in comp_means and must stay
-// +inf in the difference so R lands at 0 downstream.
+// unit-invariant max of per-channel ratios with the kMeanUnits correction
+// on the measured variance -- see that function's comment. An out-of-bounds
+// Dodgson sample arrives as +inf in comp_means and must stay +inf in the
+// difference so R lands at 0 downstream.
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
@@ -851,13 +894,114 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                     : std::numeric_limits<f32>::infinity();
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 f32 d_p_sq = d_p_ * d_p_;
-                f32 sigma_ch_sq = std::max(sigma_p_sq, sigma_t * sigma_t);
-                f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
+                f32 sigma_ch_sq = std::max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
+                // Same no-noise-floor fallback as apply_noise_model.
+                if (sigma_t <= 0.f)
+                    sigma_ch_sq = std::max(sigma_ch_sq, sigma_p_sq);
+                // Same explicit degenerate cases as apply_noise_model.
+                f32 term;
+                if (d_p_sq == 0.f) {
+                    term = 0.f;
+                } else if (!std::isfinite(d_p_sq)) {
+                    term = d_p_sq; // +inf
+                } else {
+                    f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                    term = d_p_sq * shrink * shrink / sigma_ch_sq;
+                }
+                z_ = std::max(z_, term);
             }
-            z.at(y, x) = z_ / (f32)n_ch;
+            z.at(y, x) = z_;
         }
     });
+}
+
+// Fine-scale robustness distance (Config::robustness_fine_term): z_fine at
+// GUIDE resolution, measured on the raw guide SAMPLES rather than their 3x3
+// means. The box-mean d is structurally blind to edge misalignments below
+// ~3 raw px (the mean averages the shifted band away while sigma_p carries
+// the full edge contrast, so the amplitude cancels); a single guide sample
+// at an edge sees a >=1 px shift at nearly full amplitude. Denominator:
+// max(kappa*sigma_t^2, (phi*sigma_p)^2) -- kappa sets the pure-noise
+// operating point (~4.5 sigma_t at the default), phi keeps a FRACTION of
+// the contrast forgiveness so the legitimate single-sample differences of
+// two well-aligned frames (residual subpixel sampling phase at an edge)
+// survive. Combined downstream as z = max(z_box, z_fine), which equals
+// R = min(R_box, R_fine) since s/t are shared and exp is monotone.
+// Callers gate on Config::robustness_fine_active(): with the noise model
+// disabled sigma_t = 0 and the term would reject plain noise everywhere.
+static Image compute_fine_z(const Image& ref_guide, const Image& ref_means,
+                            const Image& ref_vars, const Image& comp_guide,
+                            const FlowField& flow, int tile_size,
+                            const NoiseCurves* const nc_ch[3], const Config& cfg,
+                            bool sample_flow_bilinear) {
+    const int h = ref_guide.h, w = ref_guide.w, nc = ref_guide.c;
+    Image zf(h, w, 1);
+    const f32 kappa = std::max(0.f, cfg.r_fine_kappa);
+    const f32 phi2 = cfg.r_fine_phi * cfg.r_fine_phi;
+    const bool bayer3 = (nc == 3);
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            // Same flow fetch as the guide-resolution mask path: guide cell
+            // (y, x) sits at raw (2y+0.5, 2x+0.5) for Bayer, (y, x) otherwise.
+            f32 flow_x = 0.f, flow_y = 0.f;
+            if (bayer3) {
+                if (sample_flow_bilinear) {
+                    f32 rdx, rdy;
+                    flow.sample_bilinear(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
+                                         tile_size, rdx, rdy);
+                    flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+                } else {
+                    const int py = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
+                    const int px = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
+                    if (py >= 0 && py < flow.ny && px >= 0 && px < flow.nx) {
+                        flow_x = 0.5f * flow.dx(py, px);
+                        flow_y = 0.5f * flow.dy(py, px);
+                    }
+                }
+            } else {
+                if (sample_flow_bilinear) {
+                    flow.sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
+                } else {
+                    const int py = y / tile_size, px = x / tile_size;
+                    if (py >= 0 && py < flow.ny && px >= 0 && px < flow.nx) {
+                        flow_x = flow.dx(py, px);
+                        flow_y = flow.dy(py, px);
+                    }
+                }
+            }
+            const f32 sy = (f32)y + flow_y;
+            const f32 sx = (f32)x + flow_x;
+            f32 z_ = 0.f;
+            for (int ch = 0; ch < nc; ++ch) {
+                const NoiseCurves& nc_ = *nc_ch[ch];
+                f32 brightness = ref_means.at(y, x, ch);
+                int id_noise = (int)std::lround(1000.f * brightness);
+                if (!std::isfinite(brightness) || id_noise < 0)
+                    id_noise = 0;
+                else if (id_noise >= (int)nc_.std_curve.size())
+                    id_noise = (int)nc_.std_curve.size() - 1;
+                const f32 sigma_t = nc_.std_curve[(size_t)id_noise];
+                const f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                const f32 den = std::max(kappa * sigma_t * sigma_t,
+                                         phi2 * sigma_p_sq);
+                const f32 comp = sample_bilinear_or_inf(comp_guide, sy, sx, ch);
+                const f32 d = std::isfinite(comp)
+                    ? std::fabs(ref_guide.at(y, x, ch) - comp)
+                    : std::numeric_limits<f32>::infinity();
+                f32 term;
+                if (d == 0.f) {
+                    term = 0.f;
+                } else if (!std::isfinite(d) || den <= 0.f) {
+                    term = std::numeric_limits<f32>::infinity();
+                } else {
+                    term = d * d / den;
+                }
+                z_ = std::max(z_, term);
+            }
+            zf.at(y, x) = z_;
+        }
+    });
+    return zf;
 }
 
 static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
@@ -949,6 +1093,9 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
     st.stds  = std::move(vars);
+    // Keep the guide itself for the fine-scale term (see RefStats::guide).
+    if (cfg.robustness_fine_active())
+        st.guide = std::move(guide);
     if (cfg.robustness_raw_resolution_active()) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
@@ -1006,7 +1153,23 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // never materialised at all (folded into apply_noise_model_fused), so the
     // peak is the upscaled comp_means plus the two scalar outputs rather than
     // the whole chain at once.
+    // Checker follows doer: warp the comparison stats with the SAME
+    // flow field the merge will apply -- the exact gate accumulate_comp
+    // uses (flow_bilinear_sampling, or the dense-lattice trusted
+    // pairing when a fine lattice exists). R certifying one flow while
+    // the merge fetches samples with another means merged samples were
+    // never verified at all between tile centres. When the toggle is
+    // off this is nearest per-tile, which is also python-z parity
+    // (cuda_uspcale_dogson's bare patch_idy = int(y // tile_size) --
+    // python-z has no interpolation option, but its merge consumes the
+    // same nearest flow, so checker == doer holds there too).
+    const bool merge_samples_flow =
+        cfg.flow_bilinear_sampling ||
+        ((cfg.flow_dense_lattice_trusted() || cfg.overlap_merge_active()) &&
+         flow.has_fine());
+
     Image comp_means;
+    Image zf; // fine-scale z at guide res; empty when the term is gated off
     {
         Image comp_means_guide;
         {
@@ -1015,21 +1178,20 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 transform_guide_srgb(guide, cfg, cfg.num_threads);
             Image comp_vars_guide; // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
+            // Fine-scale term while the comp guide is alive. Uses the
+            // GUIDE-res ref stats (RefStats::means/stds) for the curve
+            // index and the contrast forgiveness -- the hires upscales are
+            // box statistics of the same cells.
+            if (cfg.robustness_fine_active() &&
+                ref_stats.guide.h == guide.h && ref_stats.guide.w == guide.w &&
+                ref_stats.guide.c == guide.c &&
+                ref_stats.means.h == guide.h && ref_stats.means.w == guide.w &&
+                !ref_stats.means.data.empty() && !ref_stats.stds.data.empty()) {
+                zf = compute_fine_z(ref_stats.guide, ref_stats.means,
+                                    ref_stats.stds, guide, flow, tile_size,
+                                    nc_ch, cfg, merge_samples_flow);
+            }
         }
-        // Checker follows doer: warp the comparison stats with the SAME
-        // flow field the merge will apply -- the exact gate accumulate_comp
-        // uses (flow_bilinear_sampling, or the dense-lattice trusted
-        // pairing when a fine lattice exists). R certifying one flow while
-        // the merge fetches samples with another means merged samples were
-        // never verified at all between tile centres. When the toggle is
-        // off this is nearest per-tile, which is also python-z parity
-        // (cuda_uspcale_dogson's bare patch_idy = int(y // tile_size) --
-        // python-z has no interpolation option, but its merge consumes the
-        // same nearest flow, so checker == doer holds there too).
-        const bool merge_samples_flow =
-            cfg.flow_bilinear_sampling ||
-            ((cfg.flow_dense_lattice_trusted() || cfg.overlap_merge_active()) &&
-             flow.has_fine());
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads,
                                         /*bilinear_flow=*/merge_samples_flow);
@@ -1067,14 +1229,21 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            f32 r_val = clampf(s * std::exp(-z.at(y, x)) - cfg.r_t, 0.f, 1.f);
+            f32 z_eff = z.at(y, x);
+            if (zf.h > 0) {
+                // Fine-scale term, nearest-mapped from guide cells. Bayer:
+                // raw y covers guide y/2 (centre convention); non-Bayer:
+                // the guide IS the raw plane, direct mapping.
+                const bool half = (zf.h * 2 == h);
+                const int gy = std::min(zf.h - 1, half ? (y >> 1) : y);
+                const int gx = std::min(zf.w - 1, half ? (x >> 1) : x);
+                z_eff = std::max(z_eff, zf.at(gy, gx));
+            }
+            f32 r_val = clampf(s * std::exp(-z_eff) - cfg.r_t, 0.f, 1.f);
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
-            // design ("infinite will imply R = 0"), which makes the Wiener
-            // shrink inf/inf = NaN and z NaN, so r_val is NaN. The Python
-            // clamp (CUDA fmaxf/fminf) returns the non-NaN operand and yields
-            // the intended 0; clampf's comparisons are both false for NaN and
-            // would return NaN, poisoning every merge accumulator that touches
-            // this pixel.
+            // design ("infinite will imply R = 0"), which makes z +inf and
+            // r_val 0 through the exp; the guard also catches any residual
+            // NaN so it cannot poison the merge accumulators.
             if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
         }
@@ -1171,6 +1340,16 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     const bool sample_flow_g =
         cfg.flow_bilinear_sampling ||
         (cfg.overlap_merge_active() && flow.has_fine());
+
+    // Fine-scale term at this path's native (guide) resolution.
+    Image zf;
+    if (cfg.robustness_fine_active() &&
+        ref_stats.guide.h == guide.h && ref_stats.guide.w == guide.w &&
+        ref_stats.guide.c == guide.c && !ref_stats.means.data.empty() &&
+        !ref_stats.stds.data.empty()) {
+        zf = compute_fine_z(ref_stats.guide, ref_stats.means, ref_stats.stds,
+                            guide, flow, tile_size, nc_ch, cfg, sample_flow_g);
+    }
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             f32 flow_x = 0.f, flow_y = 0.f;
@@ -1232,12 +1411,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            f32 r_val = clampf(s * std::exp(-z.at(y, x)) - cfg.r_t, 0.f, 1.f);
+            f32 z_eff = z.at(y, x);
+            if (zf.h > 0) z_eff = std::max(z_eff, zf.at(y, x));
+            f32 r_val = clampf(s * std::exp(-z_eff) - cfg.r_t, 0.f, 1.f);
             // Same NaN-to-0 guard as the raw-res path: an OOB comp sample
-            // (+inf) or a 0/0 Wiener shrink with the noise model disabled
-            // makes z NaN, and clampf would pass the NaN straight into
-            // local_min and the merge accumulators. This path previously
-            // lacked the guard.
+            // (+inf) makes z +inf (r 0 through the exp); the guard also
+            // catches any residual NaN so it cannot poison local_min and
+            // the merge accumulators.
             if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
         }

@@ -165,7 +165,7 @@ static MetalCtx& ctx() {
             "merge_acc_half_to_float",
             "kernel_gat", "kernel_gat_raw", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
-            "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
+            "rob_make_mask", "rob_make_mask_raw", "rob_fine_z", "rob_local_min_5x5",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
@@ -1259,8 +1259,11 @@ struct RobMaskParamsCPU {
     // match the merge's setting: the mask has to score the correspondence the
     // merge actually fetches.
     uint32_t flow_bilinear = 0;
+    // 1 = a rob_fine_z output is bound at buffer 10 and folded in as
+    // z = max(z_box, z_fine). See Config::robustness_fine_term.
+    uint32_t fine_enabled = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 48, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 52, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1271,9 +1274,19 @@ struct RobMaskRawParamsCPU {
     uint32_t chain_reject_enabled = 0;
     float r_s_chain = 0.f;
     uint32_t motion_magnitude_veto_enabled = 0;
-    uint32_t _pad0 = 0;
+    // 1 = a rob_fine_z output (GUIDE resolution) is bound at buffer 11 and
+    // folded in as z = max(z_box, z_fine[y/2, x/2]) (was _pad0).
+    uint32_t fine_enabled = 0;
 };
 static_assert(sizeof(RobMaskRawParamsCPU) == 56, "RobMaskRawParamsCPU");
+
+// Keep in lockstep with RobFineZParams in HHSRKernels.metal.
+struct RobFineZParamsCPU {
+    uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, flow_bilinear;
+    float kappa, phi2;
+    uint32_t _pad0 = 0, _pad1 = 0;
+};
+static_assert(sizeof(RobFineZParamsCPU) == 48, "RobFineZParamsCPU");
 
 static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
                                       std::vector<uint32_t>* irregular_out = nullptr) {
@@ -1478,6 +1491,10 @@ static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
 
+// Reference guide IMAGE (not its stats), pinned for the fine-scale term
+// (Config::robustness_fine_term) -- the GPU twin of RefStats::guide.
+static id<MTLBuffer> g_rob_ref_guide = nil;
+
 static void clear_rob_ref_gpu() {
     g_rob_ref_m = nil;
     g_rob_ref_v = nil;
@@ -1486,6 +1503,7 @@ static void clear_rob_ref_gpu() {
     g_rob_ref_m_hires = nil;
     g_rob_ref_v_hires = nil;
     g_rob_ref_hires_h = g_rob_ref_hires_w = 0;
+    g_rob_ref_guide = nil;
     g_rob_std_curve = nil;
     g_rob_diff_curve = nil;
     g_rob_curve_n = 0;
@@ -1493,6 +1511,52 @@ static void clear_rob_ref_gpu() {
         g_rob_curve_alpha[i] = std::numeric_limits<float>::quiet_NaN();
         g_rob_curve_beta[i]  = std::numeric_limits<float>::quiet_NaN();
     }
+}
+
+// Encode one rob_fine_z dispatch (guide resolution) into cmd. Returns the
+// zf buffer, or nil when a required input is missing -- callers then leave
+// fine_enabled at 0, which is a graceful skip, not an error. b_flow carries
+// whatever grid the CALLER's mask kernel indexes (coarse or fine lattice)
+// so the fine term scores the same correspondence -- checker follows doer.
+static id<MTLBuffer> rob_fine_z_dispatch(id<MTLBuffer> b_guide_comp,
+                                         int gh, int gw, int nch,
+                                         id<MTLBuffer> b_flow,
+                                         int fg_ny, int fg_nx, int fg_ts,
+                                         uint32_t flow_mode,
+                                         const Config& cfg,
+                                         id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    if (!g_rob_ref_guide || !g_rob_ref_m || !g_rob_ref_v ||
+        !g_rob_std_curve || g_rob_curve_n == 0 ||
+        !b_guide_comp || !b_flow || gh <= 0 || gw <= 0)
+        return nil;
+    const size_t zf_b = (size_t)gh * (size_t)gw * sizeof(float);
+    id<MTLBuffer> b_zf = buf(nullptr, zf_b);
+    if (!b_zf) return nil;
+    RobFineZParamsCPU fp{};
+    fp.h = (uint32_t)gh;
+    fp.w = (uint32_t)gw;
+    fp.nch = (uint32_t)nch;
+    fp.tile_size = (uint32_t)std::max(1, fg_ts);
+    fp.flow_ny = (uint32_t)std::max(0, fg_ny);
+    fp.flow_nx = (uint32_t)std::max(0, fg_nx);
+    fp.curve_n = (uint32_t)g_rob_curve_n;
+    fp.flow_bilinear = flow_mode;
+    fp.kappa = cfg.r_fine_kappa;
+    fp.phi2 = cfg.r_fine_phi * cfg.r_fine_phi;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return nil;
+    [enc setBuffer:b_zf offset:0 atIndex:0];
+    [enc setBuffer:g_rob_ref_guide offset:0 atIndex:1];
+    [enc setBuffer:b_guide_comp offset:0 atIndex:2];
+    [enc setBuffer:g_rob_ref_m offset:0 atIndex:3];
+    [enc setBuffer:g_rob_ref_v offset:0 atIndex:4];
+    [enc setBuffer:g_rob_std_curve offset:0 atIndex:5];
+    [enc setBuffer:b_flow offset:0 atIndex:6];
+    [enc setBytes:&fp length:sizeof(fp) atIndex:7];
+    dispatch2(enc, c.pipe("rob_fine_z"), (NSUInteger)gw, (NSUInteger)gh);
+    [enc endEncoding];
+    return b_zf;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -1539,6 +1603,11 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     g_rob_ref_w = gw;
     g_rob_ref_c = nch;
     g_rob_ref_bytes = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
+    // Pin the reference guide image itself for the fine-scale term (GPU twin
+    // of RefStats::guide; ~3ch guide floats, held for the burst like the
+    // stats above).
+    if (cfg.robustness_fine_active())
+        g_rob_ref_guide = b_guide;
     g_rob_ref_m_hires = b_means_hires;
     g_rob_ref_v_hires = b_vars_hires;
     g_rob_ref_hires_h = hires_h;
@@ -1677,6 +1746,32 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     if (!b_S || !b_R || !b_match_amb || !b_chain || !b_magnitude)
         return Image();
 
+    // Fine-scale term at guide resolution (Config::robustness_fine_term).
+    // The flow grid mirrors rob_dogson's own binding above so the fine term
+    // scores the same correspondence the comparison stats were warped with.
+    id<MTLBuffer> b_zf = nil;
+    if (cfg.robustness_fine_active()) {
+        const f32* ffg = nullptr;
+        size_t ffg_b = 0;
+        int ffg_ny = 0, ffg_nx = 0, ffg_ts = tile_size;
+        if (rob_dogson_mode != 0u) {
+            (void)flow_gpu_grid(flow, tile_size, ffg, ffg_b, ffg_ny, ffg_nx, ffg_ts);
+        } else {
+            ffg = flow.flow.data();
+            ffg_b = flow.flow.size() * sizeof(float);
+            ffg_ny = flow.ny;
+            ffg_nx = flow.nx;
+            ffg_ts = tile_size;
+        }
+        id<MTLBuffer> b_fflow = (ffg && ffg_b) ? buf(ffg, ffg_b) : nil;
+        if (b_fflow)
+            b_zf = rob_fine_z_dispatch(b_guide, gh, gw, nch, b_fflow,
+                                       ffg_ny, ffg_nx, ffg_ts,
+                                       rob_dogson_mode, cfg, cmd);
+    }
+    id<MTLBuffer> b_zf_bind = b_zf ? b_zf : buf(nullptr, sizeof(float));
+    if (!b_zf_bind) return Image();
+
     RobMaskRawParamsCPU mp{};
     mp.h = (uint32_t)ch_h;
     mp.w = (uint32_t)ch_w;
@@ -1691,6 +1786,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
+    mp.fine_enabled = b_zf ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1705,6 +1801,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:b_match_amb offset:0 atIndex:8];
     [enc setBuffer:b_chain offset:0 atIndex:9];
     [enc setBuffer:b_magnitude offset:0 atIndex:10];
+    [enc setBuffer:b_zf_bind offset:0 atIndex:11];
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -1855,6 +1952,17 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     if (cfg.overlap_merge_active() && mp.flow_bilinear == 0u)
         mp.flow_bilinear = 1u;
 
+    // Fine-scale term (Config::robustness_fine_term), on the SAME flow grid
+    // and sample mode the mask kernel itself uses.
+    id<MTLBuffer> b_zf = nil;
+    if (cfg.robustness_fine_active())
+        b_zf = rob_fine_z_dispatch(b_guide, gh, gw, nch, b_flow,
+                                   fg_ny, fg_nx, fg_ts, mp.flow_bilinear,
+                                   cfg, cmd);
+    id<MTLBuffer> b_zf_bind = b_zf ? b_zf : buf(nullptr, sizeof(float));
+    if (!b_zf_bind) return Image();
+    mp.fine_enabled = b_zf ? 1u : 0u;
+
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_R offset:0 atIndex:0];
@@ -1867,6 +1975,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_flow offset:0 atIndex:7];
     [enc setBytes:&mp length:sizeof(mp) atIndex:8];
     [enc setBuffer:b_match_amb offset:0 atIndex:9];
+    [enc setBuffer:b_zf_bind offset:0 atIndex:10];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

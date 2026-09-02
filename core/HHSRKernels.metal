@@ -1851,6 +1851,18 @@ struct RobMaskParams {
     // metal_gpu.mm, which static_asserts the size.
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint flow_bilinear;  // 1 = interpolate the tile flow
+    uint fine_enabled;   // 1 = rob_fine_z output bound at buffer 10
+};
+
+// Keep in lockstep with RobFineZParamsCPU in metal_gpu.mm.
+struct RobFineZParams {
+    uint h, w, nch;
+    uint tile_size;
+    uint flow_ny, flow_nx;
+    uint curve_n;
+    uint flow_bilinear;
+    float kappa, phi2;
+    uint _pad0, _pad1;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1859,6 +1871,12 @@ inline float dogson_quadratic(float x) {
     if (ax <= 1.5f) return ax * ax - 2.5f * ax + 1.5f;
     return 0.f;
 }
+
+// d in the R test is the difference of two 9-sample means, whose variance
+// under per-sample variance sigma_p^2 is (2/9)*sigma_p^2 -- the mean-units
+// correction. See apply_noise_model in robustness.cpp (the CPU twin) for
+// the full derivation and the sigma_t-floor / model-off fallback rules.
+constant float kMeanUnits = 2.f / 9.f;
 
 inline int clamp_edge(int v, int hi) {
     float f = clamp(float(v), 0.f, float(hi));
@@ -1992,6 +2010,82 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     }
 }
 
+// Fine-scale robustness distance at GUIDE resolution -- twin of
+// compute_fine_z in robustness.cpp; see that function and Config::
+// robustness_fine_term for the derivation. Measured on the raw guide
+// SAMPLES (2-raw-px scale) rather than their 3x3 means, so edge
+// misalignments the box-mean d averages away (below ~3 raw px) still
+// register. Denominator max(kappa*sigma_t^2, phi2*sigma_p^2); combined by
+// the mask kernels as z = max(z_box, z_fine).
+kernel void rob_fine_z(device float* zf [[buffer(0)]],
+                       device const float* guide_ref [[buffer(1)]],
+                       device const float* guide_comp [[buffer(2)]],
+                       device const float* ref_means [[buffer(3)]],
+                       device const float* ref_vars [[buffer(4)]],
+                       device const float* std_curve [[buffer(5)]],
+                       device const float* flow [[buffer(6)]],
+                       constant RobFineZParams& p [[buffer(7)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    int y = int(gid.y), x = int(gid.x);
+    float flow_x = 0.f, flow_y = 0.f;
+    if (p.nch == 3u) {
+        // Guide cell (y, x) sits at raw (2y+0.5, 2x+0.5); flow is raw px.
+        if (p.flow_bilinear != 0u) {
+            float rdx, rdy;
+            flow_sample(flow, p.flow_ny, p.flow_nx,
+                        2.f * float(y) + 0.5f, 2.f * float(x) + 0.5f,
+                        float(p.tile_size), p.flow_bilinear, rdx, rdy);
+            flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+        } else {
+            int py = int((2.f * float(y) + 0.5f) / float(p.tile_size));
+            int px = int((2.f * float(x) + 0.5f) / float(p.tile_size));
+            if (py >= 0 && py < int(p.flow_ny) && px >= 0 && px < int(p.flow_nx)) {
+                uint fi = (uint(py) * p.flow_nx + uint(px)) * 2u;
+                flow_x = 0.5f * flow[fi + 0u];
+                flow_y = 0.5f * flow[fi + 1u];
+            }
+        }
+    } else {
+        if (p.flow_bilinear != 0u) {
+            flow_sample(flow, p.flow_ny, p.flow_nx, float(y), float(x),
+                        float(p.tile_size), p.flow_bilinear, flow_x, flow_y);
+        } else {
+            int py = y / int(p.tile_size);
+            int px = x / int(p.tile_size);
+            if (py >= 0 && py < int(p.flow_ny) && px >= 0 && px < int(p.flow_nx)) {
+                uint fi = (uint(py) * p.flow_nx + uint(px)) * 2u;
+                flow_x = flow[fi + 0u];
+                flow_y = flow[fi + 1u];
+            }
+        }
+    }
+    float sy = float(y) + flow_y;
+    float sx = float(x) + flow_x;
+    float z_ = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+        float brightness = ref_means[o];
+        int id_noise = lround_away(1000.f * brightness);
+        if (!isfinite(brightness) || id_noise < 0)
+            id_noise = 0;
+        else if (id_noise >= int(p.curve_n))
+            id_noise = int(p.curve_n) - 1;
+        float sigma_t = std_curve[ch * p.curve_n + uint(id_noise)];
+        float sigma_p_sq = ref_vars[o];
+        float den = max(p.kappa * sigma_t * sigma_t, p.phi2 * sigma_p_sq);
+        float comp = rob_sample_bilinear_or_inf(guide_comp, p.h, p.w, p.nch,
+                                                sy, sx, ch);
+        float d = isfinite(comp) ? fabs(guide_ref[o] - comp) : INFINITY;
+        float term;
+        if (d == 0.f) term = 0.f;
+        else if (!isfinite(d) || den <= 0.f) term = INFINITY;
+        else term = d * d / den;
+        z_ = max(z_, term);
+    }
+    zf[gid.y * p.w + gid.x] = z_;
+}
+
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(2)]],
@@ -2002,6 +2096,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* flow [[buffer(7)]],
                           constant RobMaskParams& p [[buffer(8)]],
                           device const uint* match_ambiguous [[buffer(9)]],
+                          device const float* zf [[buffer(10)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     int patch_idy;
@@ -2041,11 +2136,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float sample_x = float(gid.x) + flow_x;
     float sample_y = float(gid.y) + flow_y;
     // Unit-invariant aggregation, twin of apply_noise_model (robustness.cpp):
-    // z = (1/n) * sum_ch d_ch^2*shrink^2 / max(sigma_p^2, sigma_t^2), each
-    // channel with its OWN noise floor and its OWN Wiener shrink. A
-    // per-channel rescale of the guide cancels inside each ratio, so R no
-    // longer depends on the guide's units the way the old ratio-of-sums did
-    // (which down-weighted R/B votes by wb^2 in the WB-undone guide).
+    // z = max_ch d_ch^2*shrink^2 / max(kMeanUnits*sigma_p^2, sigma_t^2),
+    // each channel with its OWN noise floor and its OWN Wiener shrink. max
+    // (not mean/sum) so isolated-channel evidence -- a chroma fringe --
+    // counts at full strength; kMeanUnits puts the measured variance in d's
+    // mean-difference units. See the CPU twin for the derivation and the
+    // model-off fallback.
     float z_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
@@ -2071,11 +2167,22 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
-        float sigma_ch_sq = max(sigma_p_sq, sigma_t * sigma_t);
-        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-        z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
+        float sigma_ch_sq = max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
+        if (sigma_t <= 0.f)
+            sigma_ch_sq = max(sigma_ch_sq, sigma_p_sq);
+        // Explicit degenerate cases -- max() drops NaN, so 0/0 is decided
+        // here: an exact match is NO evidence; an OOB sample is +inf.
+        float term;
+        if (d_p_sq == 0.f) term = 0.f;
+        else if (!isfinite(d_p_sq)) term = d_p_sq;
+        else {
+            float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+            term = d_p_sq * shrink * shrink / sigma_ch_sq;
+        }
+        z_ = max(z_, term);
     }
-    z_ /= float(p.nch);
+    if (p.fine_enabled != 0u)
+        z_ = max(z_, zf[gid.y * p.w + gid.x]);
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
     // Two near-equal minima in the block-matching cost surface: the offset that
@@ -2127,6 +2234,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const uint* match_ambiguous [[buffer(8)]],
                               device const uint* chain_inconsistent [[buffer(9)]],
                               device const uint* motion_magnitude_reject [[buffer(10)]],
+                              device const float* zf [[buffer(11)]],
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2139,10 +2247,10 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
     // Unit-invariant aggregation, twin of apply_noise_model_fused
-    // (robustness.cpp): mean of per-channel d^2*shrink^2 / max(sigma_p^2,
-    // sigma_t^2) ratios, each channel with its own noise floor and its own
-    // Wiener shrink. See that function's comment for why the old
-    // ratio-of-sums depended on the guide's per-channel units.
+    // (robustness.cpp): max of per-channel d^2*shrink^2 /
+    // max(kMeanUnits*sigma_p^2, sigma_t^2) ratios, each channel with its own
+    // noise floor and its own Wiener shrink. See the CPU twin for the
+    // derivation, the model-off fallback and the degenerate-case rules.
     float z_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
@@ -2161,11 +2269,31 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
-        float sigma_ch_sq = max(ref_vars[o], sigma_t * sigma_t);
-        float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-        z_ += d_p_sq * shrink * shrink / sigma_ch_sq;
+        float sigma_ch_sq = max(kMeanUnits * ref_vars[o], sigma_t * sigma_t);
+        if (sigma_t <= 0.f)
+            sigma_ch_sq = max(sigma_ch_sq, ref_vars[o]);
+        float term;
+        if (d_p_sq == 0.f) term = 0.f;
+        else if (!isfinite(d_p_sq)) term = d_p_sq;
+        else {
+            float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+            term = d_p_sq * shrink * shrink / sigma_ch_sq;
+        }
+        z_ = max(z_, term);
     }
-    z_ /= float(p.nch);
+    if (p.fine_enabled != 0u) {
+        // zf lives at GUIDE resolution; for Bayer that is h/2 x w/2 (raw
+        // row y covers guide row y/2 under the centre convention), for
+        // non-Bayer the guide IS the raw plane, so the mapping is direct.
+        if (p.nch == 3u) {
+            uint fh = max(1u, p.h / 2u), fw = max(1u, p.w / 2u);
+            uint fy = min(gid.y / 2u, fh - 1u);
+            uint fx = min(gid.x / 2u, fw - 1u);
+            z_ = max(z_, zf[fy * fw + fx]);
+        } else {
+            z_ = max(z_, zf[out_o]);
+        }
+    }
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)

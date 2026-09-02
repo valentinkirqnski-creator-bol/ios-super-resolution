@@ -131,6 +131,13 @@ struct RefStats {
     // change. Empty unless that toggle is on.
     Image means_hires;
     Image stds_hires;
+    // The reference GUIDE IMAGE itself (not its 3x3 stats) at guide
+    // resolution, for the fine-scale robustness term (Config::
+    // robustness_fine_term): the box-mean d cannot see edge misalignments
+    // below ~3 raw px (the mean averages them away), so a second distance is
+    // measured on the raw guide samples. CPU path only -- the Metal host
+    // pins its own GPU-resident copy instead of a host image.
+    Image guide;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
