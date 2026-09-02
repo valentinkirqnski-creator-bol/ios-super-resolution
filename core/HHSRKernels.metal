@@ -1642,6 +1642,10 @@ struct KernelEstParams {
     // Twin of the per-site apply_gat in kernels.cpp -- keep in step.
     float wbk0, wbk1, wbk2;
     uint cfa_packed;
+    // Stability floor on k1/k2 (Config::merge_kernel_min) -- keep in step
+    // with KernelEstParamsCPU in metal_gpu.mm.
+    float k_min;
+    uint _pad3;
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1714,6 +1718,10 @@ inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2
     }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
+    // Stability floor, twin of compute_k in kernels.cpp -- see
+    // Config::merge_kernel_min (den-collapse -> green/NaN speckle).
+    k1 = max(k1, p.k_min);
+    k2 = max(k2, p.k_min);
 }
 
 kernel void kernel_gat(device float* out [[buffer(0)]],

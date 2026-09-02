@@ -1125,8 +1125,11 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         // (see KernelEstParams in HHSRKernels.metal -- keep in step).
         float wbk0 = 1.f, wbk1 = 1.f, wbk2 = 1.f;
         uint32_t cfa_packed = 0;
+        // Stability floor on k1/k2 (Config::merge_kernel_min).
+        float k_min = 0.f;
+        uint32_t _pad3 = 0;
     };
-    static_assert(sizeof(KernelEstParamsCPU) == 72, "KernelEstParamsCPU layout");
+    static_assert(sizeof(KernelEstParamsCPU) == 80, "KernelEstParamsCPU layout");
 
     const bool bayer = cfg.bayer_mode;
     const int grey_h = bayer ? raw.h / 2 : raw.h;
@@ -1151,6 +1154,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.wbk2 = cfg.noise_wb_gain(2);
     p.cfa_packed = (uint32_t)cfg.cfa.p[0][0] | ((uint32_t)cfg.cfa.p[0][1] << 8) |
                    ((uint32_t)cfg.cfa.p[1][0] << 16) | ((uint32_t)cfg.cfa.p[1][1] << 24);
+    p.k_min = cfg.merge_kernel_min;
     p.k_detail = cfg.k_detail;
     p.k_denoise = cfg.k_denoise;
     p.D_th = cfg.D_th;
