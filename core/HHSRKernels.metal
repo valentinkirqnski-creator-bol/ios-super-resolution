@@ -1574,10 +1574,13 @@ inline void merge_accumulate_ref_body(device AccT* num,
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
-    // Nearest same-colour tap per channel, for the uncovered passthrough --
-    // twin of accumulate_ref in merge.cpp.
-    float near_c[3] = {0.f, 0.f, 0.f};
-    float near_d2[3] = {1e30f, 1e30f, 1e30f};
+    // Fixed-kernel accumulators for the uncovered passthrough: NON-ADAPTIVE
+    // iso Gaussian, sigma = 0.45 raw px -- twin of accumulate_ref in
+    // merge.cpp (see the comment there; nearest-sample stair-stepping read
+    // as oversharpened edges).
+    constexpr float kPassInvSig2 = 1.f / (0.45f * 0.45f);
+    float pval[3] = {0.f, 0.f, 0.f};
+    float pacc[3] = {0.f, 0.f, 0.f};
     for (int di = -rad; di <= rad; ++di) {
         for (int dj = -rad; dj <= rad; ++dj) {
             int j = center_j + dj;
@@ -1591,9 +1594,10 @@ inline void merge_accumulate_ref_body(device AccT* num,
             float dist_x = float(j) - coarse_x;
             float dist_y = float(i) - coarse_y;
             float d2 = dist_x * dist_x + dist_y * dist_y;
-            if (d2 < near_d2[channel]) {
-                near_d2[channel] = d2;
-                near_c[channel] = c;
+            if (p.uncovered_passthrough != 0u) {
+                float wp = fast::exp(-0.5f * d2 * kPassInvSig2);
+                pval[channel] += c * wp;
+                pacc[channel] += wp;
             }
             float y;
             if (p.iso) y = max(0.f, 2.f * d2);
@@ -1615,17 +1619,18 @@ inline void merge_accumulate_ref_body(device AccT* num,
     uint base = (local_i * p.Ws + hr_j) * p.nch;
 
     // Uncovered passthrough (Config::merge_uncovered_passthrough): zero
-    // comparison coverage -> nearest same-colour reference sample, weight 1.
-    // Twin of accumulate_ref in merge.cpp; hard switch on exact zero.
+    // comparison coverage -> the fixed non-adaptive kernel stands in for
+    // the shaped one. Twin of accumulate_ref in merge.cpp; hard switch on
+    // exact zero.
     if (p.uncovered_passthrough != 0u) {
         float comp_cov = 0.f;
         for (uint ch = 0u; ch < p.nch; ++ch)
             comp_cov += float(den[base + ch]);
         if (comp_cov <= 0.f) {
             for (uint ch = 0u; ch < p.nch && ch < 3u; ++ch) {
-                if (near_d2[ch] < 1e30f) {
-                    num[base + ch] = AccT(near_c[ch]);
-                    den[base + ch] = AccT(1.f);
+                if (pacc[ch] > 0.f) {
+                    num[base + ch] = AccT(pval[ch]);
+                    den[base + ch] = AccT(pacc[ch]);
                 } else {
                     float v = (ch == 0u) ? val0 : (ch == 1u) ? val1 : val2;
                     float a = (ch == 0u) ? acc0 : (ch == 1u) ? acc1 : acc2;

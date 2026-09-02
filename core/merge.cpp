@@ -493,10 +493,17 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             const int center_i = std::min(std::max(cuda_round_to_int(coarse_y), 0), lr_h - 1);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
-            // Nearest same-colour tap per channel, for the uncovered
-            // passthrough (Config::merge_uncovered_passthrough).
-            f32 near_c[3] = {0, 0, 0};
-            f32 near_d2[3] = {1e30f, 1e30f, 1e30f};
+            // Fixed-kernel accumulators for the uncovered passthrough
+            // (Config::merge_uncovered_passthrough): a NON-ADAPTIVE iso
+            // Gaussian, sigma = 0.45 raw px (~bilinear-grade support). The
+            // first passthrough shipped nearest-sample instead, and its
+            // stair-stepped edges read as oversharpening; this keeps the
+            // point -- no kernel shaping, no k_denoise, no adaptivity, noise
+            // essentially intact (the centre tap dominates at ~10:1) --
+            // while edges resample the way any plain viewer would show the
+            // reference.
+            constexpr f32 kPassInvSig2 = 1.f / (0.45f * 0.45f);
+            f32 pval[3] = {0, 0, 0}, pacc[3] = {0, 0, 0};
             for (int di = -rad; di <= rad; ++di) {
                 for (int dj = -rad; dj <= rad; ++dj) {
                     const int j = center_j + dj;
@@ -511,9 +518,10 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     const f32 dist_x = (f32)j - coarse_x;
                     const f32 dist_y = (f32)i - coarse_y;
                     const f32 d2 = dist_x * dist_x + dist_y * dist_y;
-                    if (d2 < near_d2[channel]) {
-                        near_d2[channel] = d2;
-                        near_c[channel] = c;
+                    if (cfg.merge_uncovered_passthrough) {
+                        const f32 wp = std::exp(-0.5f * d2 * kPassInvSig2);
+                        pval[channel] += c * wp;
+                        pacc[channel] += wp;
                     }
                     f32 y;
                     if (iso) y = std::max(0.f, 2.f * d2);
@@ -528,19 +536,18 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             }
 
             // Uncovered passthrough: where the comparison frames contributed
-            // EXACTLY zero weight, the reference's nearest same-colour sample
-            // stands in for the kernel reconstruction -- the plain reference,
-            // noise and all, instead of a Gaussian-resampled version of it.
-            // Hard switch on zero coverage by design (see Config comment).
+            // EXACTLY zero weight, the fixed non-adaptive kernel stands in
+            // for the shaped one. Hard switch on zero coverage by design
+            // (see Config comment).
             if (cfg.merge_uncovered_passthrough) {
                 f32 comp_cov = 0.f;
                 for (int ch = 0; ch < nch; ++ch)
                     comp_cov += den.at(local_i, hr_j, ch);
                 if (comp_cov <= 0.f) {
                     for (int ch = 0; ch < nch; ++ch) {
-                        if (near_d2[ch] < 1e30f) {
-                            num.at(local_i, hr_j, ch) = near_c[ch];
-                            den.at(local_i, hr_j, ch) = 1.f;
+                        if (pacc[ch] > 0.f) {
+                            num.at(local_i, hr_j, ch) = pval[ch];
+                            den.at(local_i, hr_j, ch) = pacc[ch];
                         } else {
                             num.at(local_i, hr_j, ch) = val[ch];
                             den.at(local_i, hr_j, ch) = acc[ch];
