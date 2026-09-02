@@ -658,46 +658,81 @@ Image compute_guide(const Image& raw, const Config& cfg) {
 
 namespace {
 
-// Robust per-channel noise-floor scale from measured local stats vs the
-// model's sigma_t at matching brightness (Config::r_noise_floor_autoscale).
-// Flat cells sit at ratio ~ true_sigma/sigma_t; textured cells only inflate
-// the UPPER quantiles, so the 25th percentile tracks the floor as long as a
-// quarter of the sampled cells are texture-poor (true of nearly any
-// photograph). The 9-sample std is itself noisy -- its 25th percentile
-// under Gaussian noise is sqrt(chi2_8@0.25 / 9) ~ 0.75 of the true sigma --
+// Robust per-channel, per-brightness-band noise-floor scale from measured
+// local stats vs the model's sigma_t at matching brightness
+// (Config::r_noise_floor_autoscale). Flat cells sit at ratio ~
+// true_sigma/sigma_t; textured cells only inflate the UPPER quantiles, so
+// the 25th percentile tracks the floor as long as a quarter of a band's
+// cells are texture-poor. Banded by brightness because the model error is
+// brightness-dependent (PRNU grows with signal, read-noise floors dominate
+// shadows) -- a single mid-tone scalar left bright flat regions (the sky)
+// under-floored. The 9-sample std is itself noisy: its 25th percentile
+// under Gaussian noise is sqrt(chi2_8@0.25 / 9) ~ 0.75 of the true sigma,
 // so the quantile is divided by 0.75 to unbias. Clamped to
 // [1, r_noise_scale_max]: the data is never trusted MORE than the model.
+// Bands without enough samples inherit the nearest measured band.
+
+static int rob_scale_band(f32 m) {
+    int b = (int)(m * (f32)RobSigmaScale::kBands);
+    if (b < 0) b = 0;
+    if (b >= RobSigmaScale::kBands) b = RobSigmaScale::kBands - 1;
+    return b;
+}
+
+static void rob_scale_from_bands(std::vector<f32> band_ratios[],
+                                 f32 max_scale, f32 out[RobSigmaScale::kBands]) {
+    const int nb = RobSigmaScale::kBands;
+    bool measured[RobSigmaScale::kBands] = {};
+    for (int b = 0; b < nb; ++b) {
+        out[b] = 1.f;
+        std::vector<f32>& r = band_ratios[b];
+        if (r.size() < 64) continue;
+        const size_t q = r.size() / 4; // 25th percentile
+        std::nth_element(r.begin(), r.begin() + q, r.end());
+        out[b] = clampf(r[q] / 0.75f, 1.f, std::max(1.f, max_scale));
+        measured[b] = true;
+    }
+    // Fill unmeasured bands from the nearest measured one.
+    for (int b = 0; b < nb; ++b) {
+        if (measured[b]) continue;
+        int best = -1, best_d = nb + 1;
+        for (int o = 0; o < nb; ++o) {
+            if (!measured[o]) continue;
+            const int d = std::abs(o - b);
+            if (d < best_d) { best_d = d; best = o; }
+        }
+        if (best >= 0) out[b] = out[best];
+    }
+}
+
 static void noise_scale_from_stats(const Image& means, const Image& vars,
                                    const NoiseCurves* const nc_ch[3],
-                                   const Config& cfg, f32 out[3]) {
-    out[0] = out[1] = out[2] = 1.f;
+                                   const Config& cfg, RobSigmaScale& out) {
+    out = RobSigmaScale{};
     if (!cfg.r_noise_floor_autoscale || cfg.debug_noise_model_disabled) return;
     const int nc = std::min(3, means.c);
-    std::vector<f32> ratios;
     for (int ch = 0; ch < nc; ++ch) {
         const NoiseCurves& curve = *nc_ch[ch];
         if (curve.std_curve.empty()) continue;
-        ratios.clear();
-        ratios.reserve((size_t)(means.h / 2 + 1) * (size_t)(means.w / 2 + 1));
+        std::vector<f32> band_ratios[RobSigmaScale::kBands];
         for (int y = 1; y < means.h - 1; y += 2) {
             for (int x = 1; x < means.w - 1; x += 2) {
                 const f32 m = means.at(y, x, ch);
                 const f32 v = vars.at(y, x, ch);
-                // Exclude clipped/black cells (their variance says nothing
-                // about the live noise floor) and degenerate stats.
-                if (!(m > 0.02f && m < 0.85f) || !(v > 0.f)) continue;
+                // Exclude black/clipped cells and degenerate stats; the
+                // upper bound is generous so bright sky still contributes
+                // to its own band (hard-clipped cells have var ~ 0 and drag
+                // their band's quantile down, where the clamp-to->=1 and
+                // the d=0-is-no-evidence rule make that harmless).
+                if (!(m > 0.01f && m < 0.98f) || !(v > 0.f)) continue;
                 const size_t id =
                     noise_curve_index(m, curve.std_curve.size());
                 const f32 st = curve.std_curve[id];
                 if (!(st > 0.f)) continue;
-                ratios.push_back(std::sqrt(v) / st);
+                band_ratios[rob_scale_band(m)].push_back(std::sqrt(v) / st);
             }
         }
-        if (ratios.size() < 64) continue;
-        const size_t q = ratios.size() / 4; // 25th percentile
-        std::nth_element(ratios.begin(), ratios.begin() + q, ratios.end());
-        const f32 scale = ratios[q] / 0.75f;
-        out[ch] = clampf(scale, 1.f, std::max(1.f, cfg.r_noise_scale_max));
+        rob_scale_from_bands(band_ratios, cfg.r_noise_scale_max, out.s[ch]);
     }
 }
 
@@ -845,7 +880,7 @@ static constexpr f32 kMeanUnits = 2.f / 9.f;
 
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
                               const NoiseCurves* const nc_ch[3], Image& z,
-                              const f32 sscale[3]) {
+                              const RobSigmaScale& sscale) {
     const int n_ch = ref_means.c;
     z = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
@@ -865,8 +900,9 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = (int)nc.std_curve.size() - 1;
                 // Noise-floor autoscale (see noise_scale_from_stats): both
                 // the floor and the Wiener d_t scale linearly with sigma.
-                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sscale[ch];
-                f32 d_t = nc.diff_curve[(size_t)id_noise] * sscale[ch];
+                const f32 sc = sscale.at(ch, (f32)id_noise * 0.001f);
+                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sc;
+                f32 d_t = nc.diff_curve[(size_t)id_noise] * sc;
                 f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 f32 d_p_sq = d_p.at(y, x, ch) * d_p.at(y, x, ch);
                 f32 sigma_ch_sq = std::max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
@@ -917,7 +953,7 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
                                     Image& z, int num_threads,
-                                    const f32 sscale[3]) {
+                                    const RobSigmaScale& sscale) {
     const int n_ch = ref_means.c;
     z = Image(ref_means.h, ref_means.w, 1);
     parallel_rows(ref_means.h, num_threads, [&](int y) {
@@ -933,8 +969,9 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                     id_noise = 0;
                 else if (id_noise >= (int)nc.std_curve.size())
                     id_noise = (int)nc.std_curve.size() - 1;
-                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sscale[ch];
-                f32 d_t = nc.diff_curve[(size_t)id_noise] * sscale[ch];
+                const f32 sc = sscale.at(ch, (f32)id_noise * 0.001f);
+                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sc;
+                f32 d_t = nc.diff_curve[(size_t)id_noise] * sc;
                 const f32 comp = comp_means.at(y, x, ch);
                 f32 d_p_ = std::isfinite(comp)
                     ? std::fabs(brightness - comp)
@@ -980,7 +1017,8 @@ static Image compute_fine_z(const Image& ref_guide, const Image& ref_means,
                             const Image& ref_vars, const Image& comp_guide,
                             const FlowField& flow, int tile_size,
                             const NoiseCurves* const nc_ch[3], const Config& cfg,
-                            bool sample_flow_bilinear, const f32 sscale[3]) {
+                            bool sample_flow_bilinear,
+                            const RobSigmaScale& sscale) {
     const int h = ref_guide.h, w = ref_guide.w, nc = ref_guide.c;
     Image zf(h, w, 1);
     const f32 kappa = std::max(0.f, cfg.r_fine_kappa);
@@ -1027,7 +1065,8 @@ static Image compute_fine_z(const Image& ref_guide, const Image& ref_means,
                     id_noise = 0;
                 else if (id_noise >= (int)nc_.std_curve.size())
                     id_noise = (int)nc_.std_curve.size() - 1;
-                const f32 sigma_t = nc_.std_curve[(size_t)id_noise] * sscale[ch];
+                const f32 sigma_t = nc_.std_curve[(size_t)id_noise] *
+                                    sscale.at(ch, (f32)id_noise * 0.001f);
                 const f32 sigma_p_sq = ref_vars.at(y, x, ch);
                 const f32 den = std::max(kappa * sigma_t * sigma_t,
                                          phi2 * sigma_p_sq);
@@ -1123,8 +1162,8 @@ static Image local_min_5x5_on_guide(const Image& R);
 // the guide and samples 3x3 window stats inline at stride 4, which is
 // plenty for a quantile over ~100k cells and costs ~10ms once per burst.
 void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
-                                  f32 out_scale[3]) {
-    out_scale[0] = out_scale[1] = out_scale[2] = 1.f;
+                                  RobSigmaScale& out_scale) {
+    out_scale = RobSigmaScale{};
     if (!cfg.r_noise_floor_autoscale || cfg.debug_noise_model_disabled ||
         !cfg.robustness_enabled || ref_raw.h <= 0 || ref_raw.w <= 0)
         return;
@@ -1139,11 +1178,10 @@ void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
     } else {
         nc_ch[0] = &mask_noise_curves(cfg);
     }
-    std::vector<f32> ratios;
     for (int ch = 0; ch < std::min(3, nc); ++ch) {
         const NoiseCurves& curve = *nc_ch[ch];
         if (curve.std_curve.empty()) continue;
-        ratios.clear();
+        std::vector<f32> band_ratios[RobSigmaScale::kBands];
         for (int y = 1; y < guide.h - 1; y += 4) {
             for (int x = 1; x < guide.w - 1; x += 4) {
                 f32 s = 0.f, s2 = 0.f;
@@ -1155,18 +1193,15 @@ void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
                     }
                 const f32 m = s / 9.f;
                 const f32 var = s2 / 9.f - m * m;
-                if (!(m > 0.02f && m < 0.85f) || !(var > 0.f)) continue;
+                if (!(m > 0.01f && m < 0.98f) || !(var > 0.f)) continue;
                 const f32 st =
                     curve.std_curve[noise_curve_index(m, curve.std_curve.size())];
                 if (!(st > 0.f)) continue;
-                ratios.push_back(std::sqrt(var) / st);
+                band_ratios[rob_scale_band(m)].push_back(std::sqrt(var) / st);
             }
         }
-        if (ratios.size() < 64) continue;
-        const size_t q = ratios.size() / 4;
-        std::nth_element(ratios.begin(), ratios.begin() + q, ratios.end());
-        out_scale[ch] = clampf(ratios[q] / 0.75f, 1.f,
-                               std::max(1.f, cfg.r_noise_scale_max));
+        rob_scale_from_bands(band_ratios, cfg.r_noise_scale_max,
+                             out_scale.s[ch]);
     }
 }
 

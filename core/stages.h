@@ -121,6 +121,30 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
 void clear_align_ref_ica_cache();
 
 // ---- robustness.cpp -----------------------------------------------------
+// Noise-floor autoscale (Config::r_noise_floor_autoscale) as a per-channel,
+// per-brightness-band multiplier on sigma_t/d_t. Banded rather than one
+// global scalar because the model error is brightness-dependent (PRNU grows
+// with signal, read-noise floors dominate shadows): a single mid-tone scale
+// left bright flat regions -- the sky -- under-floored and reading as
+// misalignment. Bands are quantiles of the guide brightness axis;
+// at() interpolates piecewise-linearly between band centres so sigma_t has
+// no seams at band boundaries.
+struct RobSigmaScale {
+    static constexpr int kBands = 8;
+    f32 s[3][kBands] = {{1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f},
+                        {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f},
+                        {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f}};
+    f32 at(int ch, f32 b) const {
+        if (ch < 0 || ch > 2) return 1.f;
+        f32 t = b * (f32)kBands - 0.5f;
+        if (!(t > 0.f)) return s[ch][0];
+        if (t >= (f32)(kBands - 1)) return s[ch][kBands - 1];
+        const int i = (int)t;
+        const f32 f = t - (f32)i;
+        return s[ch][i] + (s[ch][i + 1] - s[ch][i]) * f;
+    }
+};
+
 struct RefStats {
     Image means;
     Image stds;
@@ -138,9 +162,10 @@ struct RefStats {
     // measured on the raw guide samples. CPU path only -- the Metal host
     // pins its own GPU-resident copy instead of a host image.
     Image guide;
-    // Per-channel multiplier on sigma_t/d_t, measured from the reference
-    // frame (Config::r_noise_floor_autoscale). 1 = trust the model as-is.
-    f32 sigma_scale[3] = {1.f, 1.f, 1.f};
+    // Per-channel, per-brightness-band multiplier on sigma_t/d_t, measured
+    // from the reference frame (Config::r_noise_floor_autoscale).
+    // 1 = trust the model as-is.
+    RobSigmaScale sigma_scale;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 
@@ -165,13 +190,14 @@ Image robustness_local_min_on_guide(const Image& R);
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer mode).
 Image compute_guide(const Image& raw, const Config& cfg);
 
-// Measure the per-channel noise-floor scale (Config::r_noise_floor_autoscale)
-// from the reference raw: builds the guide, samples local 3x3 stats, and
-// takes a robust low quantile of measured-sigma / model-sigma_t at matching
-// brightness. out[3] filled with clamped scales (all 1 when disabled or
-// unmeasurable). Shared by CPU init_robustness and the Metal host.
+// Measure the per-channel, per-brightness-band noise-floor scale
+// (Config::r_noise_floor_autoscale) from the reference raw: builds the
+// guide, samples local 3x3 stats, and takes a robust low quantile of
+// measured-sigma / model-sigma_t per brightness band (bands without enough
+// samples inherit the nearest measured band's scale). All 1 when disabled
+// or unmeasurable. Shared by CPU init_robustness and the Metal host.
 void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
-                                  f32 out_scale[3]);
+                                  RobSigmaScale& out_scale);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
