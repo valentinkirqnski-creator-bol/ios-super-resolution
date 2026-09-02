@@ -783,7 +783,7 @@ struct CameraView: View {
         Text("Eq. 4 selection law. On: kernels stay round everywhere except near-perfectly coherent edges (A > 1.95) -- the smooth, homogeneous rendition of commit 832f7b8. Off (default): the linear law -- anisotropy grows continuously with gradient coherence, so ordinary textured content gets thin oriented kernels; crisper, can read as oversharpened.")
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Uncovered = Plain Reference", isOn: $cam.tuningParams.merge_uncovered_passthrough)
-        Text("Where every comparison frame was rejected (R = 0), output the nearest reference sample per colour instead of the Gaussian kernel reconstruction: the plain reference, noise and all, with no interpolation smoothing. Hard switch on zero coverage -- expect a visible texture change at coverage boundaries and blocky chroma at edges inside rejected regions.")
+        Text("Where every comparison frame was rejected (R = 0), reconstruct from the reference with a FIXED non-adaptive kernel (iso Gaussian, sigma 0.45 raw px, ~bilinear-grade) instead of the shaped/denoising kernels: the plain reference as an ordinary viewer would resample it -- noise essentially intact, no k_denoise, no adaptivity, no nearest-sample edge aliasing. Hard switch on zero coverage.")
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Isotropic Merge Kernels", isOn: $cam.tuningParams.merge_kernel_iso)
         Text("""

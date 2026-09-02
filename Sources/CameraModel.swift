@@ -203,11 +203,12 @@ struct TuningParams: Equatable, Codable {
     /// the cause is upstream (alignment/robustness).
     var merge_kernel_iso: Bool = false
     /// Where the comparison frames contributed exactly zero weight (every
-    /// frame rejected, R = 0), write the nearest reference sample per colour
-    /// instead of the Gaussian kernel reconstruction: the plain reference,
-    /// noise and all, with no interpolation smoothing. Hard switch on zero
-    /// coverage -- expect visible texture change at coverage boundaries and
-    /// blocky chroma at edges inside rejected regions.
+    /// frame rejected, R = 0), reconstruct from the reference with a FIXED
+    /// non-adaptive kernel (iso Gaussian, sigma 0.45 raw px) instead of the
+    /// shaped/denoising kernels: the plain reference as an ordinary viewer
+    /// would resample it -- noise essentially intact, no k_denoise, no
+    /// adaptivity, no nearest-sample edge aliasing. Hard switch on zero
+    /// coverage.
     var merge_uncovered_passthrough: Bool = false
     /// Eq. 4 selection law. On = the hard A > 1.95 threshold (commit
     /// 832f7b8's behaviour): kernels stay ROUND everywhere except at
