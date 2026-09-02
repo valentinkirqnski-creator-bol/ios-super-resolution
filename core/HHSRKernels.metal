@@ -2211,7 +2211,9 @@ struct RobMaskRawParams {
     uint chain_reject_enabled;
     float r_s_chain;
     uint motion_magnitude_veto_enabled;
-    uint _pad0;
+    // 1 = rob_fine_z output (GUIDE resolution) bound at buffer 11 (was
+    // _pad0). Keep in lockstep with RobMaskRawParamsCPU in metal_gpu.mm.
+    uint fine_enabled;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
