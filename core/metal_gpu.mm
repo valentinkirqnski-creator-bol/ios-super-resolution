@@ -3118,8 +3118,10 @@ struct MergeRefParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t chroma_diff = 0;     // 1 = accumulate R-G / B-G
+    // 1 = uncovered passthrough (Config::merge_uncovered_passthrough).
+    uint32_t uncovered_passthrough = 0;
 };
-static_assert(sizeof(MergeRefParamsCPU) == 100, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 104, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -4056,6 +4058,7 @@ static bool merge_ref_band_metal_impl(const Image& ref_raw, const CovField& covs
     p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
     p.max_frame_count = cfg.acc_rob_max_frame_count;
     p.chroma_diff = (cfg.merge_chroma_difference && cfg.bayer_mode) ? 1u : 0u;
+    p.uncovered_passthrough = cfg.merge_uncovered_passthrough ? 1u : 0u;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];

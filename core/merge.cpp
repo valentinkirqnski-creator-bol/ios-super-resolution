@@ -468,6 +468,10 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             const int center_i = std::min(std::max(cuda_round_to_int(coarse_y), 0), lr_h - 1);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
+            // Nearest same-colour tap per channel, for the uncovered
+            // passthrough (Config::merge_uncovered_passthrough).
+            f32 near_c[3] = {0, 0, 0};
+            f32 near_d2[3] = {1e30f, 1e30f, 1e30f};
             for (int di = -rad; di <= rad; ++di) {
                 for (int dj = -rad; dj <= rad; ++dj) {
                     const int j = center_j + dj;
@@ -481,8 +485,13 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
                     const f32 dist_x = (f32)j - coarse_x;
                     const f32 dist_y = (f32)i - coarse_y;
+                    const f32 d2 = dist_x * dist_x + dist_y * dist_y;
+                    if (d2 < near_d2[channel]) {
+                        near_d2[channel] = d2;
+                        near_c[channel] = c;
+                    }
                     f32 y;
-                    if (iso) y = std::max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
+                    if (iso) y = std::max(0.f, 2.f * d2);
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;
@@ -490,6 +499,35 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 
                     val[channel] += c * w;
                     acc[channel] += w;
+                }
+            }
+
+            // Uncovered passthrough: where the comparison frames contributed
+            // EXACTLY zero weight, the reference's nearest same-colour sample
+            // stands in for the kernel reconstruction -- the plain reference,
+            // noise and all, instead of a Gaussian-resampled version of it.
+            // Hard switch on zero coverage by design (see Config comment).
+            if (cfg.merge_uncovered_passthrough) {
+                f32 comp_cov = 0.f;
+                for (int ch = 0; ch < nch; ++ch)
+                    comp_cov += den.at(local_i, hr_j, ch);
+                if (comp_cov <= 0.f) {
+                    for (int ch = 0; ch < nch; ++ch) {
+                        if (near_d2[ch] < 1e30f) {
+                            num.at(local_i, hr_j, ch) = near_c[ch];
+                            den.at(local_i, hr_j, ch) = 1.f;
+                        } else {
+                            num.at(local_i, hr_j, ch) = val[ch];
+                            den.at(local_i, hr_j, ch) = acc[ch];
+                        }
+                    }
+                    if (chroma_diff && nch >= 3) {
+                        const f32 dG = den.at(local_i, hr_j, 1);
+                        const f32 G = (dG > 0.f) ? num.at(local_i, hr_j, 1) / dG : 0.f;
+                        num.at(local_i, hr_j, 0) += G * den.at(local_i, hr_j, 0);
+                        num.at(local_i, hr_j, 2) += G * den.at(local_i, hr_j, 2);
+                    }
+                    continue;
                 }
             }
 

@@ -202,6 +202,13 @@ struct TuningParams: Equatable, Codable {
     /// fringing survives with this on, kernel estimation is exonerated and
     /// the cause is upstream (alignment/robustness).
     var merge_kernel_iso: Bool = false
+    /// Where the comparison frames contributed exactly zero weight (every
+    /// frame rejected, R = 0), write the nearest reference sample per colour
+    /// instead of the Gaussian kernel reconstruction: the plain reference,
+    /// noise and all, with no interpolation smoothing. Hard switch on zero
+    /// coverage -- expect visible texture change at coverage boundaries and
+    /// blocky chroma at edges inside rejected regions.
+    var merge_uncovered_passthrough: Bool = false
     /// HDR+ mode: replace the whole super-resolution pipeline with the HDR+
     /// burst align + merge (hdr-plus-master's Halide implementation, ported
     /// to the core with a Metal path). A denoiser, not an upscaler: the
@@ -303,6 +310,7 @@ struct TuningParams: Equatable, Codable {
         case prealign_enabled
         case merge_chroma_difference
         case merge_kernel_iso
+        case merge_uncovered_passthrough
         case hdrplus_mode
         case isa_mode
         case robustness_color_space
@@ -377,6 +385,7 @@ struct TuningParams: Equatable, Codable {
         prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_enabled) ?? prealign_enabled
         merge_chroma_difference = try c.decodeIfPresent(Bool.self, forKey: .merge_chroma_difference) ?? merge_chroma_difference
         merge_kernel_iso = try c.decodeIfPresent(Bool.self, forKey: .merge_kernel_iso) ?? merge_kernel_iso
+        merge_uncovered_passthrough = try c.decodeIfPresent(Bool.self, forKey: .merge_uncovered_passthrough) ?? merge_uncovered_passthrough
         hdrplus_mode = try c.decodeIfPresent(Bool.self, forKey: .hdrplus_mode) ?? hdrplus_mode
         isa_mode = try c.decodeIfPresent(Bool.self, forKey: .isa_mode) ?? isa_mode
         robustness_color_space = try c.decodeIfPresent(Bool.self, forKey: .robustness_color_space) ?? robustness_color_space
@@ -2166,6 +2175,7 @@ final class CameraModel: NSObject, ObservableObject {
             "prealign_enabled": NSNumber(value: tuningParams.prealign_enabled),
             "merge_chroma_difference": NSNumber(value: tuningParams.merge_chroma_difference),
             "merge_kernel_iso": NSNumber(value: tuningParams.merge_kernel_iso),
+            "merge_uncovered_passthrough": NSNumber(value: tuningParams.merge_uncovered_passthrough),
             "hdrplus_mode": NSNumber(value: tuningParams.hdrplus_mode),
             "isa_mode": NSNumber(value: tuningParams.isa_mode),
             "robustness_color_space": NSNumber(value: tuningParams.robustness_color_space),

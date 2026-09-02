@@ -943,7 +943,10 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
-    uint chroma_diff;     // 1 = accumulate R-G / B-G (100 bytes)
+    uint chroma_diff;     // 1 = accumulate R-G / B-G
+    // 1 = uncovered passthrough (Config::merge_uncovered_passthrough):
+    // zero comparison coverage -> nearest same-colour reference sample.
+    uint uncovered_passthrough;   // (104 bytes)
 };
 
 // std::lround half-away-from-zero.
@@ -1545,6 +1548,10 @@ inline void merge_accumulate_ref_body(device AccT* num,
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    // Nearest same-colour tap per channel, for the uncovered passthrough --
+    // twin of accumulate_ref in merge.cpp.
+    float near_c[3] = {0.f, 0.f, 0.f};
+    float near_d2[3] = {1e30f, 1e30f, 1e30f};
     for (int di = -rad; di <= rad; ++di) {
         for (int dj = -rad; dj <= rad; ++dj) {
             int j = center_j + dj;
@@ -1557,8 +1564,13 @@ inline void merge_accumulate_ref_body(device AccT* num,
                 c -= bayer_green_at(img, p.lr_w, p.lr_h, i, j);
             float dist_x = float(j) - coarse_x;
             float dist_y = float(i) - coarse_y;
+            float d2 = dist_x * dist_x + dist_y * dist_y;
+            if (d2 < near_d2[channel]) {
+                near_d2[channel] = d2;
+                near_c[channel] = c;
+            }
             float y;
-            if (p.iso) y = max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
+            if (p.iso) y = max(0.f, 2.f * d2);
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
@@ -1575,6 +1587,35 @@ inline void merge_accumulate_ref_body(device AccT* num,
     bool overwrite = p.adaptive == 0u && p.robustness_denoise &&
                      (local_acc_r < p.max_frame_count);
     uint base = (local_i * p.Ws + hr_j) * p.nch;
+
+    // Uncovered passthrough (Config::merge_uncovered_passthrough): zero
+    // comparison coverage -> nearest same-colour reference sample, weight 1.
+    // Twin of accumulate_ref in merge.cpp; hard switch on exact zero.
+    if (p.uncovered_passthrough != 0u) {
+        float comp_cov = 0.f;
+        for (uint ch = 0u; ch < p.nch; ++ch)
+            comp_cov += float(den[base + ch]);
+        if (comp_cov <= 0.f) {
+            for (uint ch = 0u; ch < p.nch && ch < 3u; ++ch) {
+                if (near_d2[ch] < 1e30f) {
+                    num[base + ch] = AccT(near_c[ch]);
+                    den[base + ch] = AccT(1.f);
+                } else {
+                    float v = (ch == 0u) ? val0 : (ch == 1u) ? val1 : val2;
+                    float a = (ch == 0u) ? acc0 : (ch == 1u) ? acc1 : acc2;
+                    num[base + ch] = AccT(v);
+                    den[base + ch] = AccT(a);
+                }
+            }
+            if (p.chroma_diff != 0u && p.nch >= 3) {
+                const float dG = float(den[base + 1]);
+                const float G = (dG > 0.f) ? float(num[base + 1]) / dG : 0.f;
+                num[base + 0] = AccT(float(num[base + 0]) + G * float(den[base + 0]));
+                num[base + 2] = AccT(float(num[base + 2]) + G * float(den[base + 2]));
+            }
+            return;
+        }
+    }
     if (overwrite) {
         if (p.nch >= 1) { num[base + 0] = AccT(val0); den[base + 0] = AccT(acc0); }
         if (p.nch >= 2) { num[base + 1] = AccT(val1); den[base + 1] = AccT(acc1); }

@@ -776,6 +776,9 @@ struct CameraView: View {
              Measured on a grey step edge (any colour in the output is pure artifact): worst              case 113.9 -> 12.3 levels, mean 1.50 -> 0.00, and no longer sensitive to kernel              sharpness. Costs some accuracy on genuinely fine coloured texture.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Uncovered = Plain Reference", isOn: $cam.tuningParams.merge_uncovered_passthrough)
+        Text("Where every comparison frame was rejected (R = 0), output the nearest reference sample per colour instead of the Gaussian kernel reconstruction: the plain reference, noise and all, with no interpolation smoothing. Hard switch on zero coverage -- expect a visible texture change at coverage boundaries and blocky chroma at edges inside rejected regions.")
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Isotropic Merge Kernels", isOn: $cam.tuningParams.merge_kernel_iso)
         Text("""
              python-z's merging.kernel=iso, byte-for-byte: every pixel of every frame              merges with the same fixed round Gaussian (z = 2*(dx^2+dy^2), sigma ~0.71 px)              and the covariance fetch is skipped entirely, so the whole kernel-estimation              chain (structure tensor, A, D, k_detail/k_denoise/k_stretch/k_shrink, the              selection law) is bypassed -- those sliders do nothing while this is on.              Diagnostic mode: if the magenta/green edge fringes SURVIVE with this on, the              kernel code is exonerated and the cause is upstream (alignment + robustness).              If they vanish, that alone does not prove a kernel bug -- iso is also just a              wider kernel across edges, and wider kernels dilute misalignment artifacts              without fixing them. Costs sharpness: no edge-adaptive shaping at all.

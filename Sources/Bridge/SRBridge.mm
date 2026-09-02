@@ -506,6 +506,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.prealign_enabled = tuning[@"prealign_enabled"].boolValue;
     if (tuning[@"merge_chroma_difference"])
         cfg.merge_chroma_difference = tuning[@"merge_chroma_difference"].boolValue;
+    if (tuning[@"merge_uncovered_passthrough"])
+        cfg.merge_uncovered_passthrough =
+            tuning[@"merge_uncovered_passthrough"].boolValue;
     if (tuning[@"merge_kernel_iso"])
         cfg.kernel = tuning[@"merge_kernel_iso"].boolValue ? hhsr::KernelShape::Iso
                                                            : hhsr::KernelShape::Steerable;

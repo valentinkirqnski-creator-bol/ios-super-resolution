@@ -1302,6 +1302,17 @@ struct Config {
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
 
+    // "Just the reference where nothing merged": at output pixels where the
+    // comparison frames contributed EXACTLY zero weight (every frame fully
+    // rejected -- the R = 0 case), write the nearest same-colour reference
+    // sample with weight 1 instead of the Gaussian kernel reconstruction.
+    // Nearest-sample keeps the reference's noise untouched (no kernel, no
+    // interpolation smoothing beyond sample replication); the trade is
+    // blocky chroma at edges inside those regions, which is the honest
+    // single-frame content. Hard switch on exact zero coverage -- no
+    // blending, no adaptivity, by design.
+    bool merge_uncovered_passthrough = false;
+
     CFA cfa;
 
     // JPEG / preview rendering. Never affects the linear DNG, which is always
