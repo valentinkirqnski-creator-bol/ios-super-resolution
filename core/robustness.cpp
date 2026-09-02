@@ -746,36 +746,20 @@ static Image upscale_warp_stats(const Image& guide_stats,
 // than all channels sharing one built from the cross-channel mean of
 // alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
 // make_noise_curves_channel.
-// CURRENT-MASK PORT (feat/shape-confidence math on the 832f7b8 base):
-// the output contract is kept -- d_sq/sigma_sq images -- but d_sq now holds
-// z = max_ch d_ch^2*shrink_ch^2 / max(kMeanUnits*sigma_p_ch^2, sigma_t_ch^2)
-// and sigma_sq is all-ones, so every downstream consumer (R = s*exp(-d/sig),
-// the ratio-based diagnostic gates) works unchanged while R itself is the
-// current statistic:
-//  - max over per-channel ratios: unit-invariant, chroma evidence at full
-//    strength (the old max-of-sums weighted channel votes by magnitude).
-//  - kMeanUnits = 2/9: d is a difference of two 9-sample means, whose
-//    variance under per-sample sigma_p^2 is (2/9)*sigma_p^2 -- dividing by
-//    the raw per-sample variance made the test ~4.5x less sensitive and
-//    left step edges unrejectable below ~6 raw px of shift. sigma_t stays
-//    UNSCALED as the noise floor (flat-region operating point preserved);
-//    with the model disabled (sigma_t = 0) the unscaled sigma_p floor is
-//    restored, or plain noise rejects wholesale.
-//  - explicit degenerate terms (max drops NaN): d = 0 is NO evidence;
-//    d = +inf (OOB Dodgson sample) stays a rejection.
-//  - sscale: per-channel noise-floor autoscale (see
-//    robustness_noise_floor_scale), multiplying sigma_t AND d_t.
+// GUIDE-RESOLUTION path: UNCHANGED 832f7b8 math (Eq. 6 max-of-sums with a
+// single shrink). Only the RAW-resolution path below carries the
+// current-mask statistic -- see apply_noise_model_fused.
 static constexpr f32 kMeanUnits = 2.f / 9.f;
 
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq,
-                              const f32 sscale[3]) {
+                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            f32 z_ = 0.f;
+            f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+            f32 d_ms_sq = 0.f, d_md_sq = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -788,27 +772,19 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = 0;
                 else if (id_noise >= (int)nc.std_curve.size())
                     id_noise = (int)nc.std_curve.size() - 1;
-                f32 sigma_t = nc.std_curve[(size_t)id_noise] * sscale[ch];
-                f32 d_t = nc.diff_curve[(size_t)id_noise] * sscale[ch];
-                f32 sigma_p_sq = ref_vars.at(y, x, ch);
+                f32 sigma_t = nc.std_curve[(size_t)id_noise];
+                f32 d_t = nc.diff_curve[(size_t)id_noise];
+                sigma_ms_sq += ref_vars.at(y, x, ch);
+                sigma_md_sq += sigma_t * sigma_t;
                 f32 d_p_ = d_p.at(y, x, ch);
-                f32 d_p_sq = d_p_ * d_p_;
-                f32 sigma_ch_sq = std::max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
-                if (sigma_t <= 0.f)
-                    sigma_ch_sq = std::max(sigma_ch_sq, sigma_p_sq);
-                f32 term;
-                if (d_p_sq == 0.f) {
-                    term = 0.f;
-                } else if (!std::isfinite(d_p_sq)) {
-                    term = d_p_sq; // +inf
-                } else {
-                    f32 shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                    term = d_p_sq * shrink * shrink / sigma_ch_sq;
-                }
-                z_ = std::max(z_, term);
+                d_ms_sq += d_p_ * d_p_;
+                d_md_sq += d_t * d_t;
             }
-            d_sq.at(y, x) = z_;
-            sigma_sq.at(y, x) = 1.f;
+            f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
+            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+            f32 d_sq_ = d_ms_sq * shrink * shrink;
+            d_sq.at(y, x) = d_sq_;
+            sigma_sq.at(y, x) = sigma_sq_;
         }
     }
 }
@@ -823,8 +799,16 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 // (same sum-across-channels-then-combine-once order); an out-of-bounds
 // Dodgson sample arrives as +inf in comp_means and must stay +inf in the
 // difference so R lands at 0 downstream.
-// Fused variant -- same current-mask z statistic as apply_noise_model
-// above (see its comment), with |ref - comp| derived inline.
+// RAW-RESOLUTION path only -- CURRENT-MASK statistic (ported from
+// feat/shape-confidence): d_sq holds z = max_ch d^2*shrink^2 /
+// max(kMeanUnits*sigma_p^2, sigma_t^2) and sigma_sq is all-ones, so
+// R = s*exp(-d_sq/sig) and the ratio-based diagnostic gates work
+// unchanged. max over per-channel ratios (unit-invariant, chroma at full
+// strength); kMeanUnits = 2/9 puts the measured variance in d's
+// mean-difference units (edge blindness ~6px -> ~3px); sigma_t stays
+// unscaled as the floor, with the unscaled sigma_p fallback when the
+// noise model is off; explicit degenerate terms (d=0 no evidence,
+// d=inf reject); sscale = per-channel noise-floor autoscale.
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
@@ -1690,17 +1674,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
 
-    // CURRENT-MASK PORT: fine-scale term at this path's native resolution.
-    Image zf;
-    if (cfg.robustness_fine_active() &&
-        ref_stats.guide.h == guide.h && ref_stats.guide.w == guide.w &&
-        ref_stats.guide.c == guide.c && !ref_stats.means.data.empty() &&
-        !ref_stats.stds.data.empty()) {
-        zf = compute_fine_z(ref_stats.guide, ref_stats.means, ref_stats.stds,
-                            guide, flow, tile_size, nc_ch, cfg,
-                            ref_stats.sigma_scale);
-    }
-
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
     for (int y = 0; y < h; ++y) {
@@ -1746,13 +1719,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
-                      ref_stats.sigma_scale);
-    // Fold the fine term into z (d_sq holds z; sigma_sq is 1). Same grid.
-    if (zf.h == d_sq.h && zf.w == d_sq.w)
-        for (int y = 0; y < d_sq.h; ++y)
-            for (int x = 0; x < d_sq.w; ++x)
-                d_sq.at(y, x) = std::max(d_sq.at(y, x), zf.at(y, x));
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(
@@ -1853,10 +1820,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
-            // CURRENT-MASK PORT: NaN-to-0 guard (an OOB comp sample makes z
-            // +inf -- r 0 through the exp; the guard also catches residual
-            // NaN so it cannot poison local_min and the merge accumulators).
-            if (!std::isfinite(r_val)) r_val = 0.f;
             R.at(y, x) = r_val;
             // Compared against r_s1 rather than recomputing the conditions, so
             // the record cannot drift from the value actually used above.
