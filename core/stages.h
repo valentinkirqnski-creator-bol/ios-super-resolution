@@ -96,8 +96,23 @@ struct RefStats {
     // change. Empty unless that toggle is on.
     Image means_hires;
     Image stds_hires;
+    // Current-mask port: the reference GUIDE IMAGE itself, for the
+    // fine-scale term (Config::robustness_fine_term). CPU path only -- the
+    // Metal host pins its own GPU-resident copy.
+    Image guide;
+    // Per-channel multiplier on sigma_t/d_t, measured from the reference
+    // frame (Config::r_noise_floor_autoscale). 1 = trust the model as-is.
+    f32 sigma_scale[3] = {1.f, 1.f, 1.f};
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
+
+// Current-mask port: measure the per-channel noise-floor scale
+// (Config::r_noise_floor_autoscale) from the reference raw -- robust 25th
+// percentile of measured-sigma / model-sigma_t at matching brightness over
+// sampled guide cells. All 1 when disabled or unmeasurable. Shared by CPU
+// init_robustness and the Metal host.
+void robustness_noise_floor_scale(const Image& ref_raw, const Config& cfg,
+                                  f32 out_scale[3]);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
 // lattice, 5x5 min there (Wronski's 10x10-raw footprint on Wronski's grid),
 // nearest-upsample back to raw. Shared by the CPU path and the Metal host

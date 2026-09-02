@@ -1544,6 +1544,18 @@ struct RobMaskParams {
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
+    uint fine_enabled;   // 1 = rob_fine_z output bound at buffer 16
+};
+
+// CURRENT-MASK PORT: keep in lockstep with RobFineZParamsCPU in metal_gpu.mm.
+struct RobFineZParams {
+    uint h, w, nch;
+    uint tile_size;
+    uint flow_ny, flow_nx;
+    uint curve_n;
+    uint flow_bilinear;
+    float kappa, phi2;
+    uint _pad0, _pad1;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1557,6 +1569,11 @@ inline int clamp_edge(int v, int hi) {
     float f = clamp(float(v), 0.f, float(hi));
     return int(f);
 }
+
+// CURRENT-MASK PORT: d is the difference of two 9-sample means, whose
+// variance under per-sample sigma_p^2 is (2/9)*sigma_p^2 -- see
+// apply_noise_model in robustness.cpp for the full derivation.
+constant float kMeanUnits = 2.f / 9.f;
 
 inline float rob_edge_strength_sq(device const float* means,
                                   uint h, uint w, uint nch,
@@ -1867,6 +1884,78 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
     tile_high[pidx] = high_count >= need ? 1u : 0u;
 }
 
+// CURRENT-MASK PORT: fine-scale robustness distance at GUIDE resolution --
+// twin of compute_fine_z in robustness.cpp; see that function and
+// Config::robustness_fine_term.
+kernel void rob_fine_z(device float* zf [[buffer(0)]],
+                       device const float* guide_ref [[buffer(1)]],
+                       device const float* guide_comp [[buffer(2)]],
+                       device const float* ref_means [[buffer(3)]],
+                       device const float* ref_vars [[buffer(4)]],
+                       device const float* std_curve [[buffer(5)]],
+                       device const float* flow [[buffer(6)]],
+                       constant RobFineZParams& p [[buffer(7)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    int y = int(gid.y), x = int(gid.x);
+    float flow_x = 0.f, flow_y = 0.f;
+    if (p.nch == 3u) {
+        // Guide cell (y, x) sits at raw (2y+0.5, 2x+0.5); flow is raw px.
+        if (p.flow_bilinear != 0u) {
+            float rdx, rdy;
+            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx,
+                                 2.f * float(y) + 0.5f, 2.f * float(x) + 0.5f,
+                                 float(p.tile_size), rdx, rdy);
+            flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+        } else {
+            int py = int((2.f * float(y) + 0.5f) / float(p.tile_size));
+            int px = int((2.f * float(x) + 0.5f) / float(p.tile_size));
+            if (py >= 0 && py < int(p.flow_ny) && px >= 0 && px < int(p.flow_nx)) {
+                uint fi = (uint(py) * p.flow_nx + uint(px)) * 2u;
+                flow_x = 0.5f * flow[fi + 0u];
+                flow_y = 0.5f * flow[fi + 1u];
+            }
+        }
+    } else {
+        if (p.flow_bilinear != 0u) {
+            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(y), float(x),
+                                 float(p.tile_size), flow_x, flow_y);
+        } else {
+            int py = y / int(p.tile_size);
+            int px = x / int(p.tile_size);
+            if (py >= 0 && py < int(p.flow_ny) && px >= 0 && px < int(p.flow_nx)) {
+                uint fi = (uint(py) * p.flow_nx + uint(px)) * 2u;
+                flow_x = flow[fi + 0u];
+                flow_y = flow[fi + 1u];
+            }
+        }
+    }
+    float sy = float(y) + flow_y;
+    float sx = float(x) + flow_x;
+    float z_ = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+        float brightness = ref_means[o];
+        int id_noise = lround_away(1000.f * brightness);
+        if (!isfinite(brightness) || id_noise < 0)
+            id_noise = 0;
+        else if (id_noise >= int(p.curve_n))
+            id_noise = int(p.curve_n) - 1;
+        float sigma_t = std_curve[ch * p.curve_n + uint(id_noise)];
+        float sigma_p_sq = ref_vars[o];
+        float den = max(p.kappa * sigma_t * sigma_t, p.phi2 * sigma_p_sq);
+        float comp = rob_sample_bilinear_or_inf(guide_comp, p.h, p.w, p.nch,
+                                                sy, sx, ch);
+        float d = isfinite(comp) ? fabs(guide_ref[o] - comp) : INFINITY;
+        float term;
+        if (d == 0.f) term = 0.f;
+        else if (!isfinite(d) || den <= 0.f) term = INFINITY;
+        else term = d * d / den;
+        z_ = max(z_, term);
+    }
+    zf[gid.y * p.w + gid.x] = z_;
+}
+
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(3)]],
@@ -1882,6 +1971,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const uint* tile_residual_high [[buffer(13)]],
                           device float* s_select [[buffer(14)]],
                           device const uint* match_ambiguous [[buffer(15)]],
+                          device const float* zf [[buffer(16)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -1924,23 +2014,18 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     int new_idy = lround_away(sample_y);
     bool inbound = (0 <= new_idx && new_idx < int(p.w) &&
                     0 <= new_idy && new_idy < int(p.h));
-    // Eq. 6 aggregates each term into ONE scalar across channels first
-    // (sigma = sqrt(sum of per-channel variances); d/d_ms/d_md are bare
-    // per-pixel scalars, not per-channel), and only then applies max()/
-    // shrinkage once -- see the mirrored comment in apply_noise_model
-    // (robustness.cpp). Summing per-channel max(measured, noise-floor)
-    // instead of max-of-sums is not the same computation and is
-    // systematically more forgiving whenever which term dominates differs
-    // across channels (e.g. a colored edge).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // CURRENT-MASK PORT -- twin of apply_noise_model (robustness.cpp):
+    // d_sq_ holds z = max_ch d^2*shrink^2 / max(kMeanUnits*sigma_p^2,
+    // sigma_t^2) and sigma_sq_ is 1, so the ratio-based gates below and
+    // exp(-d_sq_/sig) work unchanged. Curves arrive pre-multiplied by the
+    // noise-floor autoscale (baked at upload -- see metal_gpu.mm).
+    float z_agg = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
         // Python: id_noise = round(1000 * brightness) — no clamp.
         int id_noise = lround_away(1000.f * brightness);
         // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
-        // Finite brightness in [0,1] -> id in [0,1000] unchanged (same as Python).
         if (!isfinite(brightness))
             id_noise = 0;
         else if (id_noise < 0)
@@ -1948,23 +2033,30 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         else if (id_noise >= int(p.curve_n))
             id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
-        // std_curve/diff_curve hold up to 3 concatenated per-channel curves
-        // (metal_gpu.mm), each ch its own -- not one shared by every guide
-        // channel. See Config::noise_alpha_ch/noise_beta_ch (types.h).
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        float sigma_ch_sq = max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
+        if (sigma_t <= 0.f)
+            sigma_ch_sq = max(sigma_ch_sq, sigma_p_sq);
+        float term;
+        if (d_p_sq == 0.f) term = 0.f;
+        else if (!isfinite(d_p_sq)) term = d_p_sq;
+        else {
+            float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+            term = d_p_sq * shrink * shrink / sigma_ch_sq;
+        }
+        z_agg = max(z_agg, term);
     }
-    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    d_sq_ = d_ms_sq * shrink * shrink;
+    if (p.fine_enabled != 0u)
+        z_agg = max(z_agg, zf[gid.y * p.w + gid.x]);
+    d_sq_ = z_agg;
+    sigma_sq_ = 1.f;
     float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
@@ -2042,6 +2134,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    // CURRENT-MASK PORT: NaN-to-0 guard (Metal clamp propagates NaN).
+    if (!isfinite(r_val)) r_val = 0.f;
     R[gid.y * p.w + gid.x] = r_val;
     // Which prior this pixel ended up on. Compared against r_s1 rather than
     // recomputing the conditions, so the record cannot drift from the value
@@ -2072,7 +2166,7 @@ struct RobMaskRawParams {
     float beta;
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
-    uint _pad0;
+    uint fine_enabled;  // CURRENT-MASK PORT: rob_fine_z at buffer 14 (was _pad0)
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2107,6 +2201,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const uint* motion_magnitude_reject [[buffer(11)]],
                               device const uint* motion_irregular [[buffer(12)]],
                               device const float* ref_hf_loss [[buffer(13)]],
+                              device const float* zf [[buffer(14)]],
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2119,11 +2214,10 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
-    // Same aggregate-then-max / aggregate-then-shrink as rob_make_mask's
-    // fixed form -- see the comment there and in apply_noise_model
-    // (robustness.cpp).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // CURRENT-MASK PORT -- twin of apply_noise_model_fused (robustness.cpp):
+    // d_sq_ = z (max of per-channel mean-units ratios + fine term),
+    // sigma_sq_ = 1; the ratio gates below work unchanged.
+    float z_agg = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2138,16 +2232,36 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        float sigma_ch_sq = max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
+        if (sigma_t <= 0.f)
+            sigma_ch_sq = max(sigma_ch_sq, sigma_p_sq);
+        float term;
+        if (d_p_sq == 0.f) term = 0.f;
+        else if (!isfinite(d_p_sq)) term = d_p_sq;
+        else {
+            float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+            term = d_p_sq * shrink * shrink / sigma_ch_sq;
+        }
+        z_agg = max(z_agg, term);
     }
-    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    float d_sq_ = d_ms_sq * shrink * shrink;
+    if (p.fine_enabled != 0u) {
+        // zf is GUIDE resolution; raw row y covers guide row y/2 (Bayer),
+        // direct mapping otherwise.
+        if (p.nch == 3u) {
+            uint fh = max(1u, p.h / 2u), fw = max(1u, p.w / 2u);
+            uint fy = min(gid.y / 2u, fh - 1u);
+            uint fx = min(gid.x / 2u, fw - 1u);
+            z_agg = max(z_agg, zf[fy * fw + fx]);
+        } else {
+            z_agg = max(z_agg, zf[out_o]);
+        }
+    }
+    float sigma_sq_ = 1.f;
+    float d_sq_ = z_agg;
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
