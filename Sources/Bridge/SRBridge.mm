@@ -419,16 +419,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_bilinear_sampling = tuning[@"flow_bilinear_sampling"].boolValue;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
-    if (tuning[@"robustness_isa"])
-        cfg.robustness_isa = tuning[@"robustness_isa"].boolValue;
-    if (tuning[@"r_isa_threshold_m"])
-        cfg.r_isa_threshold_m = tuning[@"r_isa_threshold_m"].floatValue;
-    if (tuning[@"robustness_mean_units_fix"])
-        cfg.robustness_mean_units_fix = tuning[@"robustness_mean_units_fix"].boolValue;
-    if (tuning[@"robustness_fine_term"])
-        cfg.robustness_fine_term = tuning[@"robustness_fine_term"].boolValue;
-    if (tuning[@"r_fine_kappa"]) cfg.r_fine_kappa = tuning[@"r_fine_kappa"].floatValue;
-    if (tuning[@"r_noise_scale_max"]) cfg.r_noise_scale_max = tuning[@"r_noise_scale_max"].floatValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"acc_rob_max_frame_count"])

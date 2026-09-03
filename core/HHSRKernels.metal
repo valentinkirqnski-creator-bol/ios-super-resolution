@@ -858,7 +858,7 @@ struct MergeCompParams {
     // conversion below (was _pad0).
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint rob_nch;        // channels in the robustness mask (3 = ISA per-channel; was _pad2)
+    uint _pad2;
     uint _pad3;
 };
 
@@ -1039,30 +1039,6 @@ inline float sample_robustness_bilinear(device const float* robustness,
     return top + (bot - top) * fy;
 }
 
-// Per-channel bilinear sample of an interleaved robustness mask (nch planes
-// interleaved). ISA robustness carries nch == 3 (per-colour R); scalar masks
-// pass nch == 1 and index ch 0 -- bit-identical to sample_robustness_bilinear.
-inline float sample_robustness_bilinear_ch(device const float* robustness,
-                                           uint h, uint w, uint nch,
-                                           float y, float x, uint ch) {
-    if (h == 0u || w == 0u) return 0.f;
-    y = clamp(y, 0.f, float(h - 1u));
-    x = clamp(x, 0.f, float(w - 1u));
-    int y0 = int(floor(y));
-    int x0 = int(floor(x));
-    int y1 = min(y0 + 1, int(h) - 1);
-    int x1 = min(x0 + 1, int(w) - 1);
-    float fy = y - float(y0);
-    float fx = x - float(x0);
-    uint o00 = (uint(y0) * w + uint(x0)) * nch + ch;
-    uint o01 = (uint(y0) * w + uint(x1)) * nch + ch;
-    uint o10 = (uint(y1) * w + uint(x0)) * nch + ch;
-    uint o11 = (uint(y1) * w + uint(x1)) * nch + ch;
-    float top = robustness[o00] + (robustness[o01] - robustness[o00]) * fx;
-    float bot = robustness[o10] + (robustness[o11] - robustness[o10]) * fx;
-    return top + (bot - top) * fy;
-}
-
 // Alg. 4 — merge.cpp accumulate_comp
 // One comparison frame's contribution at one output pixel.
 //
@@ -1106,20 +1082,17 @@ static inline void merge_comp_contrib(device const float* img,
         rob_y = (lr_y - 0.5f) / 2.f;
         rob_x = (lr_x - 0.5f) / 2.f;
     }
-    // ISA (rob_nch == 3) carries per-channel R; scalar masks (rob_nch <= 1)
-    // sample ch 0 for every channel -- bit-identical to the old single sample.
-    uint rob_nch = max(1u, p.rob_nch);
-    float local_r_ch[3];
-    if (rob_nch >= 3u) {
-        local_r_ch[0] = sample_robustness_bilinear_ch(robustness, p.rob_h, p.rob_w, rob_nch, rob_y, rob_x, 0u);
-        local_r_ch[1] = sample_robustness_bilinear_ch(robustness, p.rob_h, p.rob_w, rob_nch, rob_y, rob_x, 1u);
-        local_r_ch[2] = sample_robustness_bilinear_ch(robustness, p.rob_h, p.rob_w, rob_nch, rob_y, rob_x, 2u);
-    } else {
-        float s0 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
-        local_r_ch[0] = local_r_ch[1] = local_r_ch[2] = s0;
-    }
-    // Nothing to accumulate where the frame is fully rejected in every channel.
-    if (local_r_ch[0] <= 0.f && local_r_ch[1] <= 0.f && local_r_ch[2] <= 0.f) return;
+    float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
+                                               rob_y, rob_x);
+    // Nothing to accumulate where the frame is fully rejected. Every
+    // contribution is w * local_r * c or w * local_r, so all nine taps produce
+    // exactly zero and the caller's running totals are unchanged.
+    //
+    // Exact, including in floating point: num and den start at +0 (blit-filled)
+    // and every term added is non-negative, since w = exp(...) > 0, local_r >= 0
+    // and the normalized Bayer samples are >= 0. So no -0 can arise, and x + 0
+    // is bit-identical to x for every value these accumulators can hold.
+    if (local_r <= 0.f) return;
 
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
@@ -1165,9 +1138,8 @@ static inline void merge_comp_contrib(device const float* img,
             // ~1e-7, far below one 16-bit LSB; tools/compare_dng.py gates it.
             float w = fast::exp(-0.5f * z);
 
-            float lr_ch = local_r_ch[channel];
-            float contrib_v = w * lr_ch * c;
-            float contrib_a = w * lr_ch;
+            float contrib_v = w * local_r * c;
+            float contrib_a = w * local_r;
             if (channel == 0)      { val0 += contrib_v; acc0 += contrib_a; }
             else if (channel == 1) { val1 += contrib_v; acc1 += contrib_a; }
             else                   { val2 += contrib_v; acc2 += contrib_a; }
@@ -1572,21 +1544,6 @@ struct RobMaskParams {
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint mean_units_fix; // 1 = scale measured sigma_p^2 by 2/9 (d/sigma unit fix)
-};
-
-// CURRENT-MASK PORT: keep in lockstep with RobFineZParamsCPU in metal_gpu.mm.
-// sscale0-2: per-channel noise-floor autoscale, applied in-kernel so the
-// shared curve upload stays byte-identical to 832f7b8 for the guide path.
-struct RobFineZParams {
-    uint h, w, nch;
-    uint tile_size;
-    uint flow_ny, flow_nx;
-    uint curve_n;
-    uint flow_bilinear;
-    float kappa, phi2;
-    float sscale0, sscale1, sscale2;
-    uint _pad0;
 };
 
 inline float dogson_quadratic(float x) {
@@ -1600,11 +1557,6 @@ inline int clamp_edge(int v, int hi) {
     float f = clamp(float(v), 0.f, float(hi));
     return int(f);
 }
-
-// CURRENT-MASK PORT: d is the difference of two 9-sample means, whose
-// variance under per-sample sigma_p^2 is (2/9)*sigma_p^2 -- see
-// apply_noise_model in robustness.cpp for the full derivation.
-constant float kMeanUnits = 2.f / 9.f;
 
 inline float rob_edge_strength_sq(device const float* means,
                                   uint h, uint w, uint nch,
@@ -1915,79 +1867,6 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
     tile_high[pidx] = high_count >= need ? 1u : 0u;
 }
 
-// CURRENT-MASK PORT: fine-scale robustness distance at GUIDE resolution --
-// twin of compute_fine_z in robustness.cpp; see that function and
-// Config::robustness_fine_term.
-kernel void rob_fine_z(device float* zf [[buffer(0)]],
-                       device const float* guide_ref [[buffer(1)]],
-                       device const float* guide_comp [[buffer(2)]],
-                       device const float* ref_means [[buffer(3)]],
-                       device const float* ref_vars [[buffer(4)]],
-                       device const float* std_curve [[buffer(5)]],
-                       device const float* flow [[buffer(6)]],
-                       constant RobFineZParams& p [[buffer(7)]],
-                       uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.w || gid.y >= p.h) return;
-    int y = int(gid.y), x = int(gid.x);
-    float flow_x = 0.f, flow_y = 0.f;
-    if (p.nch == 3u) {
-        // Guide cell (y, x) sits at raw (2y+0.5, 2x+0.5); flow is raw px.
-        if (p.flow_bilinear != 0u) {
-            float rdx, rdy;
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx,
-                                 2.f * float(y) + 0.5f, 2.f * float(x) + 0.5f,
-                                 float(p.tile_size), rdx, rdy);
-            flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
-        } else {
-            int py = int((2.f * float(y) + 0.5f) / float(p.tile_size));
-            int px = int((2.f * float(x) + 0.5f) / float(p.tile_size));
-            if (py >= 0 && py < int(p.flow_ny) && px >= 0 && px < int(p.flow_nx)) {
-                uint fi = (uint(py) * p.flow_nx + uint(px)) * 2u;
-                flow_x = 0.5f * flow[fi + 0u];
-                flow_y = 0.5f * flow[fi + 1u];
-            }
-        }
-    } else {
-        if (p.flow_bilinear != 0u) {
-            flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(y), float(x),
-                                 float(p.tile_size), flow_x, flow_y);
-        } else {
-            int py = y / int(p.tile_size);
-            int px = x / int(p.tile_size);
-            if (py >= 0 && py < int(p.flow_ny) && px >= 0 && px < int(p.flow_nx)) {
-                uint fi = (uint(py) * p.flow_nx + uint(px)) * 2u;
-                flow_x = flow[fi + 0u];
-                flow_y = flow[fi + 1u];
-            }
-        }
-    }
-    float sy = float(y) + flow_y;
-    float sx = float(x) + flow_x;
-    float z_ = 0.f;
-    for (uint ch = 0u; ch < p.nch; ++ch) {
-        uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-        float brightness = ref_means[o];
-        int id_noise = lround_away(1000.f * brightness);
-        if (!isfinite(brightness) || id_noise < 0)
-            id_noise = 0;
-        else if (id_noise >= int(p.curve_n))
-            id_noise = int(p.curve_n) - 1;
-        float sc = (ch == 0u) ? p.sscale0 : (ch == 1u) ? p.sscale1 : p.sscale2;
-        float sigma_t = std_curve[ch * p.curve_n + uint(id_noise)] * sc;
-        float sigma_p_sq = ref_vars[o];
-        float den = max(p.kappa * sigma_t * sigma_t, p.phi2 * sigma_p_sq);
-        float comp = rob_sample_bilinear_or_inf(guide_comp, p.h, p.w, p.nch,
-                                                sy, sx, ch);
-        float d = isfinite(comp) ? fabs(guide_ref[o] - comp) : INFINITY;
-        float term;
-        if (d == 0.f) term = 0.f;
-        else if (!isfinite(d) || den <= 0.f) term = INFINITY;
-        else term = d * d / den;
-        z_ = max(z_, term);
-    }
-    zf[gid.y * p.w + gid.x] = z_;
-}
-
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(3)]],
@@ -2075,9 +1954,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        // d/sigma unit fix: scale measured sigma_p^2 into d's mean-diff
-        // units (RobMaskParams::mean_units_fix); noise floor stays unscaled.
-        sigma_ms_sq += (p.mean_units_fix != 0u ? kMeanUnits : 1.f) * ref_vars[o];
+        sigma_ms_sq += ref_vars[o];
         sigma_md_sq += sigma_t * sigma_t;
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
@@ -2195,11 +2072,7 @@ struct RobMaskRawParams {
     float beta;
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
-    uint fine_enabled;  // CURRENT-MASK PORT: rob_fine_z at buffer 14 (was _pad0)
-    // Per-channel noise-floor autoscale, applied IN-KERNEL to sigma_t/d_t so
-    // the shared curve upload stays 832f7b8-identical for the guide path.
-    float sscale0, sscale1, sscale2;
-    uint _pad1;
+    uint _pad0;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2234,7 +2107,6 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const uint* motion_magnitude_reject [[buffer(11)]],
                               device const uint* motion_irregular [[buffer(12)]],
                               device const float* ref_hf_loss [[buffer(13)]],
-                              device const float* zf [[buffer(14)]],
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2247,10 +2119,11 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
-    // CURRENT-MASK PORT -- twin of apply_noise_model_fused (robustness.cpp):
-    // d_sq_ = z (max of per-channel mean-units ratios + fine term),
-    // sigma_sq_ = 1; the ratio gates below work unchanged.
-    float z_agg = 0.f;
+    // Same aggregate-then-max / aggregate-then-shrink as rob_make_mask's
+    // fixed form -- see the comment there and in apply_noise_model
+    // (robustness.cpp).
+    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+    float d_ms_sq = 0.f, d_md_sq = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2263,39 +2136,18 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
             id_noise = int(p.curve_n) - 1;
         uint id = uint(id_noise);
         uint curve_id = ch * p.curve_n + id;
-        float sc = (ch == 0u) ? p.sscale0 : (ch == 1u) ? p.sscale1 : p.sscale2;
-        float sigma_t = std_curve[curve_id] * sc;
-        float d_t = diff_curve[curve_id] * sc;
-        float sigma_p_sq = ref_vars[o];
+        float sigma_t = std_curve[curve_id];
+        float d_t = diff_curve[curve_id];
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        float d_p_sq = d_p_ * d_p_;
-        float sigma_ch_sq = max(kMeanUnits * sigma_p_sq, sigma_t * sigma_t);
-        if (sigma_t <= 0.f)
-            sigma_ch_sq = max(sigma_ch_sq, sigma_p_sq);
-        float term;
-        if (d_p_sq == 0.f) term = 0.f;
-        else if (!isfinite(d_p_sq)) term = d_p_sq;
-        else {
-            float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-            term = d_p_sq * shrink * shrink / sigma_ch_sq;
-        }
-        z_agg = max(z_agg, term);
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
     }
-    if (p.fine_enabled != 0u) {
-        // zf is GUIDE resolution; raw row y covers guide row y/2 (Bayer),
-        // direct mapping otherwise.
-        if (p.nch == 3u) {
-            uint fh = max(1u, p.h / 2u), fw = max(1u, p.w / 2u);
-            uint fy = min(gid.y / 2u, fh - 1u);
-            uint fx = min(gid.x / 2u, fw - 1u);
-            z_agg = max(z_agg, zf[fy * fw + fx]);
-        } else {
-            z_agg = max(z_agg, zf[out_o]);
-        }
-    }
-    float sigma_sq_ = 1.f;
-    float d_sq_ = z_agg;
+    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    float d_sq_ = d_ms_sq * shrink * shrink;
 
     float s = S[pidx];
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)

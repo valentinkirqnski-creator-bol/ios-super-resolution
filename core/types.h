@@ -668,74 +668,14 @@ struct Config {
     // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
     bool use_neural_robustness = false;
 
-    // ImageStackAlignator (Michael Kunz) robustness, reimplemented from
-    // RobustnessModell.cu -- a from-scratch alternative to the Wronski Eq. 6
-    // path, NOT sharing its code. Differences from Wronski (all reproduced):
-    //  - PER-CHANNEL R (RGB), each colour scored and merged independently
-    //    (the merge applies R_r to red, R_g to green, R_b to blue).
-    //  - analytic noise std sigma_MD = sqrt(alpha*mu + beta) (green /sqrt2),
-    //    no Monte-Carlo curve.
-    //  - texture-based Wiener shrink d *= stdRef^2/(stdRef^2 + sigma_MD^2),
-    //    not d^2/(d^2 + d_noise^2).
-    //  - motion term M = |flow-span| * 0.5 * mean_colour_diff (coupled to the
-    //    residual, unlike Wronski's flow-only Mt); s = 1.5, hard 0 when
-    //    M > r_isa_threshold_m.
-    //  - no 5x5 local-min erosion.
-    // Guide-resolution only; consumes the same guide stats as the classic
-    // path. When on, robustness_raw_resolution / fine term / mean-units fix
-    // are all bypassed.
-    bool robustness_isa = false;
-    f32  r_isa_threshold_m = 0.10f; // M above this -> s = 0 (hard reject)
-
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
-    // which one gates it. (Current-mask port: the Decimate-only gate is
-    // lifted -- the raw-res mask runs on the FFT grey too, as on the main
-    // branch.)
+    // which one gates it.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled;
+        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
     }
-
-    // d/sigma UNIT-MISMATCH FIX for the classic (guide-resolution, Wronski
-    // Eq. 6) mask. d is the difference of two 3x3 box MEANS; sigma_p^2
-    // (ref_vars) is the PER-SAMPLE patch variance. Under noise the variance
-    // of a difference of two 9-sample means is (2/9)*sigma_sample^2, so the
-    // raw sigma_p^2 denominator is ~4.5x too large for d's scale -- d^2/sigma^2
-    // comes out ~4.5x too small everywhere, R stays spuriously high, and
-    // edge misalignments (where sigma_p^2 = contrast dominates) leak through.
-    // The fix scales ONLY the measured sigma_p^2 by 2/9 to put it in d's
-    // mean-difference units; the noise floor sigma_t^2 stays unscaled, so the
-    // flat-region operating point s1/s2/t were tuned against is preserved.
-    // A deliberate correction to Wronski's formula, off by default so the
-    // classic mask stays bit-exact until asked for.
-    bool robustness_mean_units_fix = false;
-
-    // ---- Current-mask port (from feat/shape-confidence @ 769c7b3+) ------
-    // Fine-scale robustness term: a second distance measured on the raw
-    // GUIDE SAMPLES (2-raw-px scale) against max(kappa*sigma_t^2,
-    // (phi*sigma_p)^2), combined as z = max(z_box, z_fine). Catches the
-    // sub-3-px edge misalignments the box-mean statistic averages away.
-    // kappa = 12 ~ 5.3 sigma of the sample difference (tail margin for
-    // non-Gaussian sensor noise); phi = 0.5 forgives ~0.5 px of subpixel
-    // sampling phase at edges. Gated off when the noise model is disabled
-    // (sigma_t = 0 would reject all noise).
-    bool robustness_fine_term = true;
-    f32  r_fine_kappa = 12.f;
-    f32  r_fine_phi   = 0.5f;
-    bool robustness_fine_active() const {
-        return robustness_fine_term && !debug_noise_model_disabled;
-    }
-    // Self-calibrating noise floor: DNG NoiseProfiles routinely UNDERSTATE
-    // real noise (no PRNU/pattern noise, fat tails); at multi-sigma
-    // operating points a 20-30% sigma_t shortfall multiplies false
-    // rejections a hundredfold. init_robustness measures the per-channel
-    // 25th percentile of measured-local-sigma / model-sigma_t at matching
-    // brightness on the reference frame and scales sigma_t/d_t by it,
-    // clamped to [1, r_noise_scale_max].
-    bool r_noise_floor_autoscale = true;
-    f32  r_noise_scale_max = 4.f;
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
     // missing feature (or aperture) then no shift is applied at all." When a
