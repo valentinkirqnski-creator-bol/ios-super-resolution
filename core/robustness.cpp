@@ -549,6 +549,20 @@ Image compute_guide(const Image& raw, const Config& cfg) {
         const int n = cfg.cfa.count((uint8_t)c);
         inv[c] = (n > 0) ? 1.f / (f32)n : 0.f;
     }
+    // 1.4 parity: 1.4 builds the guide from the UN-prewhitened raw. The port's
+    // loader prewhitens (site *= white_balance[c]/white_balance[1]) and the
+    // rest of the pipeline depends on that, so undo it HERE, in the guide
+    // only, to recover sqrt(raw) exactly as 1.4's cuda_compute_guide_image
+    // sees it. undo = wb[1]/wb[c] (green = 1); disabled when the raw was not
+    // prewhitened. This makes the noise-off mask's guide domain match 1.4.
+    f32 wbu[3] = {1.f, 1.f, 1.f};
+    if (cfg.raw_prewhitened) {
+        const f32 g = cfg.white_balance[1];
+        for (int c = 0; c < 3; ++c) {
+            const f32 wc = cfg.white_balance[c];
+            wbu[c] = (std::isfinite(g) && std::isfinite(wc) && wc > 0.f) ? (g / wc) : 1.f;
+        }
+    }
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {
             f32 sum[3] = {0.f, 0.f, 0.f};
@@ -558,13 +572,14 @@ Image compute_guide(const Image& raw, const Config& cfg) {
                     if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
                 }
             }
-            // 1.4 parity: sqrt of the (green-averaged) site value -- see
-            // Config::robustness_guide_sqrt. Matches cuda_compute_guide_image.
+            // 1.4 parity: un-prewhiten, then sqrt of the (green-averaged) site
+            // value -- matches cuda_compute_guide_image. See
+            // Config::robustness_guide_sqrt.
             if (cfg.robustness_guide_sqrt)
                 for (int c = 0; c < 3; ++c)
-                    guide.at(y, x, c) = std::sqrt(std::max(0.f, sum[c] * inv[c]));
+                    guide.at(y, x, c) = std::sqrt(std::max(0.f, sum[c] * inv[c] * wbu[c]));
             else
-                for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c];
+                for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c] * wbu[c];
         }
     }
     return guide;

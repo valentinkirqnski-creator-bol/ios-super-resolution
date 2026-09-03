@@ -1302,11 +1302,23 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        // Guide stays in WB space (eca686c convention): the kernel's wb
-        // multipliers are unity no-ops.
-        gp.wb0 = 1.f;
-        gp.wb1 = 1.f;
-        gp.wb2 = 1.f;
+        // 1.4 parity: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1)
+        // so it is sqrt(raw), matching 1.4's cuda_compute_guide_image -- the
+        // CPU compute_guide twin does the same. Unity when raw not prewhitened.
+        if (cfg.raw_prewhitened) {
+            const float g = cfg.white_balance[1];
+            auto undo = [&](int c) {
+                const float wc = cfg.white_balance[c];
+                return (std::isfinite(g) && std::isfinite(wc) && wc > 0.f) ? (g / wc) : 1.f;
+            };
+            gp.wb0 = undo(0);
+            gp.wb1 = undo(1);
+            gp.wb2 = undo(2);
+        } else {
+            gp.wb0 = 1.f;
+            gp.wb1 = 1.f;
+            gp.wb2 = 1.f;
+        }
         gp.sqrt_guide = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
