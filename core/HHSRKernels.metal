@@ -858,7 +858,7 @@ struct MergeCompParams {
     // conversion below (was _pad0).
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint _pad2;
+    uint rob_nch;        // channels in the robustness mask (3 = ISA per-channel; was _pad2)
     uint _pad3;
 };
 
@@ -1039,6 +1039,30 @@ inline float sample_robustness_bilinear(device const float* robustness,
     return top + (bot - top) * fy;
 }
 
+// Per-channel bilinear sample of an interleaved robustness mask (nch planes
+// interleaved). ISA robustness carries nch == 3 (per-colour R); scalar masks
+// pass nch == 1 and index ch 0 -- bit-identical to sample_robustness_bilinear.
+inline float sample_robustness_bilinear_ch(device const float* robustness,
+                                           uint h, uint w, uint nch,
+                                           float y, float x, uint ch) {
+    if (h == 0u || w == 0u) return 0.f;
+    y = clamp(y, 0.f, float(h - 1u));
+    x = clamp(x, 0.f, float(w - 1u));
+    int y0 = int(floor(y));
+    int x0 = int(floor(x));
+    int y1 = min(y0 + 1, int(h) - 1);
+    int x1 = min(x0 + 1, int(w) - 1);
+    float fy = y - float(y0);
+    float fx = x - float(x0);
+    uint o00 = (uint(y0) * w + uint(x0)) * nch + ch;
+    uint o01 = (uint(y0) * w + uint(x1)) * nch + ch;
+    uint o10 = (uint(y1) * w + uint(x0)) * nch + ch;
+    uint o11 = (uint(y1) * w + uint(x1)) * nch + ch;
+    float top = robustness[o00] + (robustness[o01] - robustness[o00]) * fx;
+    float bot = robustness[o10] + (robustness[o11] - robustness[o10]) * fx;
+    return top + (bot - top) * fy;
+}
+
 // Alg. 4 — merge.cpp accumulate_comp
 // One comparison frame's contribution at one output pixel.
 //
@@ -1082,17 +1106,20 @@ static inline void merge_comp_contrib(device const float* img,
         rob_y = (lr_y - 0.5f) / 2.f;
         rob_x = (lr_x - 0.5f) / 2.f;
     }
-    float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
-                                               rob_y, rob_x);
-    // Nothing to accumulate where the frame is fully rejected. Every
-    // contribution is w * local_r * c or w * local_r, so all nine taps produce
-    // exactly zero and the caller's running totals are unchanged.
-    //
-    // Exact, including in floating point: num and den start at +0 (blit-filled)
-    // and every term added is non-negative, since w = exp(...) > 0, local_r >= 0
-    // and the normalized Bayer samples are >= 0. So no -0 can arise, and x + 0
-    // is bit-identical to x for every value these accumulators can hold.
-    if (local_r <= 0.f) return;
+    // ISA (rob_nch == 3) carries per-channel R; scalar masks (rob_nch <= 1)
+    // sample ch 0 for every channel -- bit-identical to the old single sample.
+    uint rob_nch = max(1u, p.rob_nch);
+    float local_r_ch[3];
+    if (rob_nch >= 3u) {
+        local_r_ch[0] = sample_robustness_bilinear_ch(robustness, p.rob_h, p.rob_w, rob_nch, rob_y, rob_x, 0u);
+        local_r_ch[1] = sample_robustness_bilinear_ch(robustness, p.rob_h, p.rob_w, rob_nch, rob_y, rob_x, 1u);
+        local_r_ch[2] = sample_robustness_bilinear_ch(robustness, p.rob_h, p.rob_w, rob_nch, rob_y, rob_x, 2u);
+    } else {
+        float s0 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
+        local_r_ch[0] = local_r_ch[1] = local_r_ch[2] = s0;
+    }
+    // Nothing to accumulate where the frame is fully rejected in every channel.
+    if (local_r_ch[0] <= 0.f && local_r_ch[1] <= 0.f && local_r_ch[2] <= 0.f) return;
 
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
@@ -1138,8 +1165,9 @@ static inline void merge_comp_contrib(device const float* img,
             // ~1e-7, far below one 16-bit LSB; tools/compare_dng.py gates it.
             float w = fast::exp(-0.5f * z);
 
-            float contrib_v = w * local_r * c;
-            float contrib_a = w * local_r;
+            float lr_ch = local_r_ch[channel];
+            float contrib_v = w * lr_ch * c;
+            float contrib_a = w * lr_ch;
             if (channel == 0)      { val0 += contrib_v; acc0 += contrib_a; }
             else if (channel == 1) { val1 += contrib_v; acc1 += contrib_a; }
             else                   { val2 += contrib_v; acc2 += contrib_a; }

@@ -3069,7 +3069,8 @@ struct MergeCompParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
-    uint32_t _pad2 = 0, _pad3 = 0;
+    uint32_t rob_nch = 1;         // robustness channels (3 = ISA; was _pad2)
+    uint32_t _pad3 = 0;
 };
 static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
 
@@ -3108,7 +3109,7 @@ struct MergeInflight {
 struct MergeFrameGpu {
     int key = -1; // >=0: frame_id; -1: pointer-keyed
     int lr_h = 0, lr_w = 0;
-    int rob_h = 0, rob_w = 0;
+    int rob_h = 0, rob_w = 0, rob_nch = 1;
     int flow_ny = 0, flow_nx = 0;
     int cov_h = 0, cov_w = 0;
     const f32* img = nullptr;
@@ -3306,6 +3307,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.lr_h = img.h;
             e.lr_w = img.w;
             e.rob_h = rob.h;
+            e.rob_nch = std::max(1, rob.c);
             e.rob_w = rob.w;
             e.flow_ny = flow.ny;
             e.flow_nx = flow.nx;
@@ -3751,6 +3753,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)comp_raw.w;
         p.rob_h = (uint32_t)robustness.h;
         p.rob_w = (uint32_t)robustness.w;
+        p.rob_nch = (uint32_t)std::max(1, robustness.c);
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_ny = (uint32_t)flow.ny;
@@ -3767,6 +3770,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)hit->lr_w;
         p.rob_h = (uint32_t)std::max(1, hit->rob_h);
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
+        p.rob_nch = (uint32_t)std::max(1, hit->rob_nch);
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
@@ -3921,6 +3925,17 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
         return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg,
                                              s_select_out);
     }
+}
+
+// ISA robustness: no dedicated GPU kernel yet -- return empty so
+// compute_robustness (robustness.cpp) falls back to the CPU golden path,
+// which reads the (GPU-resident, then host-fetched) ref stats and runs the
+// half-resolution ISA mask on the CPU. The per-channel result still flows
+// into the GPU merge (MergeCompParams::rob_nch). Kept a separate entry point
+// so a GPU kernel can drop in here later without touching the caller.
+Image compute_robustness_isa_metal(const Image&, const RefStats&,
+                                   const FlowField&, int, const Config&) {
+    return Image();
 }
 
 bool align_metal(const Pyramid& ref_pyr, const Image& ref_grey,

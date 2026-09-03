@@ -112,6 +112,12 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
                                const FlowField& flow, int tile_size, const Config& cfg,
                                Image* s_select_out = nullptr);
 
+// ImageStackAlignator robustness on GPU (Config::robustness_isa): per-channel
+// R (RGB) at guide resolution. Empty on failure so the caller falls back to
+// the CPU golden path.
+Image compute_robustness_isa_metal(const Image& comp_raw, const RefStats& ref_stats,
+                                   const FlowField& flow, int tile_size, const Config& cfg);
+
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
 // No CPU fallback. Host caches per-frame GPU buffers across bands and batches

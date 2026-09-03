@@ -651,7 +651,24 @@ static void append_merge_summary(std::ostringstream& ss, const MergeDebugStats& 
     }
 }
 
-static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) {
+// ISA robustness is per-channel (rob.c == 3); the accumulator (denoiser
+// input + saved .rob mask) is a 1-channel summary, so collapse to the
+// per-pixel channel MEAN first. Scalar masks pass through unchanged.
+static Image rob_scalar_view(const Image& rob) {
+    if (rob.c == 1) return rob;
+    Image out(rob.h, rob.w, 1);
+    const f32 inv = 1.f / (f32)rob.c;
+    for (int y = 0; y < rob.h; ++y)
+        for (int x = 0; x < rob.w; ++x) {
+            f32 s = 0.f;
+            for (int c = 0; c < rob.c; ++c) s += rob.at(y, x, c);
+            out.at(y, x) = s * inv;
+        }
+    return out;
+}
+
+static void absorb_robustness_sum(Image& acc_rob, const Image& rob_in, bool& have) {
+    const Image rob = rob_scalar_view(rob_in);
     if (!have) {
         acc_rob = Image(rob.h, rob.w, 1);
         acc_rob.data = rob.data;

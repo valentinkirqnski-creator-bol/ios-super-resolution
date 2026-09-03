@@ -739,6 +739,17 @@ struct CameraView: View {
                 + "neighbourhood. Measured against ground truth on synthetic bursts built "
                 + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
+        Toggle("ISA Robustness (ImageStackAlignator)", isOn: $cam.tuningParams.robustness_isa)
+        Text("Replaces the Wronski robustness mask with a from-scratch port of ImageStackAlignator's RobustnessModell.cu: PER-CHANNEL R (each colour rejected independently at merge time), analytic noise std sqrt(alpha*mu+beta), a texture-based Wiener shrink, and a motion term that couples flow irregularity WITH the colour residual (so jittery flow that produces no actual difference is not rejected). No 5x5 erosion. When on, the raw-resolution / fine-term / d-sigma-fix options are ignored.")
+            .font(.caption2).foregroundColor(.secondary)
+        if cam.tuningParams.robustness_isa {
+            HStack {
+                Text("ISA Motion Threshold")
+                Spacer()
+                Text(String(format: "%.2f", cam.tuningParams.r_isa_threshold_m))
+            }
+            Slider(value: $cam.tuningParams.r_isa_threshold_m, in: 0.01...0.5, step: 0.01)
+        }
         Toggle("Fix d/sigma Units (edge rejection)", isOn: $cam.tuningParams.robustness_mean_units_fix)
         Text("Corrects a unit mismatch in Wronski's robustness formula: the color difference d is a mean of 9 samples but the variance it is divided by is the per-sample patch variance, ~4.5x too large -- so d^2/sigma^2 stays too small and R too high, letting edge misalignments through. On: scales the measured variance into d's units (noise floor untouched, so flat areas are unchanged). Off: bit-exact Wronski Eq. 6. Applies to the classic (Raw Resolution OFF) mask.")
             .font(.caption2).foregroundColor(.secondary)

@@ -184,6 +184,14 @@ struct TuningParams: Equatable, Codable {
     /// units of d, so d^2/sigma^2 is ~4.5x larger and edge misalignments
     /// that leak through at high R are rejected. Off = pure Wronski Eq. 6.
     var robustness_mean_units_fix: Bool = false
+    /// ImageStackAlignator robustness (Michael Kunz's RobustnessModell.cu),
+    /// reimplemented from scratch. Per-channel R, analytic noise, texture
+    /// shrink, motion term coupled to the colour residual. Replaces the
+    /// Wronski mask entirely when on.
+    var robustness_isa: Bool = false
+    /// ISA motion threshold: where the flow-span x colour-residual term
+    /// exceeds this, that tile is hard-rejected (s = 0). Lower = stricter.
+    var r_isa_threshold_m: Float = 0.10
     var robustness_fine_term: Bool = true
     /// Fine-term noise operating point (higher = more forgiving). 12 ~ 5.3
     /// sigma of the sample difference; raise toward 20-30 if well-aligned
@@ -250,6 +258,7 @@ struct TuningParams: Equatable, Codable {
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case robustness_fine_term, r_fine_kappa, r_noise_scale_max
         case robustness_mean_units_fix
+        case robustness_isa, r_isa_threshold_m
         case flow_bilinear_sampling
         case use_neural_robustness
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -326,6 +335,8 @@ struct TuningParams: Equatable, Codable {
         flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         robustness_mean_units_fix = try c.decodeIfPresent(Bool.self, forKey: .robustness_mean_units_fix) ?? robustness_mean_units_fix
+        robustness_isa = try c.decodeIfPresent(Bool.self, forKey: .robustness_isa) ?? robustness_isa
+        r_isa_threshold_m = try c.decodeIfPresent(Float.self, forKey: .r_isa_threshold_m) ?? r_isa_threshold_m
         robustness_fine_term = try c.decodeIfPresent(Bool.self, forKey: .robustness_fine_term) ?? robustness_fine_term
         r_fine_kappa = try c.decodeIfPresent(Float.self, forKey: .r_fine_kappa) ?? r_fine_kappa
         r_noise_scale_max = try c.decodeIfPresent(Float.self, forKey: .r_noise_scale_max) ?? r_noise_scale_max
@@ -1947,6 +1958,8 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "robustness_mean_units_fix": NSNumber(value: tuningParams.robustness_mean_units_fix),
+            "robustness_isa": NSNumber(value: tuningParams.robustness_isa),
+            "r_isa_threshold_m": NSNumber(value: tuningParams.r_isa_threshold_m),
             "robustness_fine_term": NSNumber(value: tuningParams.robustness_fine_term),
             "r_fine_kappa": NSNumber(value: tuningParams.r_fine_kappa),
             "r_noise_scale_max": NSNumber(value: tuningParams.r_noise_scale_max),

@@ -142,6 +142,12 @@ void fetch_noise_curves(const Config& cfg,
 void fetch_noise_curves_channel(const Config& cfg, int ch,
                                 std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 
+// ImageStackAlignator robustness (Config::robustness_isa): per-channel R
+// (RGB) at guide resolution, reimplemented from RobustnessModell.cu. Empty
+// when the ref stats are unavailable.
+Image compute_robustness_isa(const Image& comp_raw, const RefStats& ref_stats,
+                             const FlowField& flow, int tile_size, const Config& cfg);
+
 // Robustness mask r at raw resolution [h, w, 1].
 //
 // s_select_out, when non-null, also receives a per-pixel record of which motion

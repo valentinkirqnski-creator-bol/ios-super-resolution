@@ -668,6 +668,25 @@ struct Config {
     // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
     bool use_neural_robustness = false;
 
+    // ImageStackAlignator (Michael Kunz) robustness, reimplemented from
+    // RobustnessModell.cu -- a from-scratch alternative to the Wronski Eq. 6
+    // path, NOT sharing its code. Differences from Wronski (all reproduced):
+    //  - PER-CHANNEL R (RGB), each colour scored and merged independently
+    //    (the merge applies R_r to red, R_g to green, R_b to blue).
+    //  - analytic noise std sigma_MD = sqrt(alpha*mu + beta) (green /sqrt2),
+    //    no Monte-Carlo curve.
+    //  - texture-based Wiener shrink d *= stdRef^2/(stdRef^2 + sigma_MD^2),
+    //    not d^2/(d^2 + d_noise^2).
+    //  - motion term M = |flow-span| * 0.5 * mean_colour_diff (coupled to the
+    //    residual, unlike Wronski's flow-only Mt); s = 1.5, hard 0 when
+    //    M > r_isa_threshold_m.
+    //  - no 5x5 local-min erosion.
+    // Guide-resolution only; consumes the same guide stats as the classic
+    // path. When on, robustness_raw_resolution / fine term / mean-units fix
+    // are all bypassed.
+    bool robustness_isa = false;
+    f32  r_isa_threshold_m = 0.10f; // M above this -> s = 0 (hard reject)
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

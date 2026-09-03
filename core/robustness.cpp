@@ -1543,6 +1543,88 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     return feat;
 }
 
+// ImageStackAlignator robustness (RobustnessModell.cu, reimplemented from
+// scratch -- see Config::robustness_isa). Guide resolution, PER-CHANNEL R
+// (RGB). Consumes the same ref guide stats (ref_stats.means = 3x3 box mean,
+// ref_stats.stds = 3x3 variance) the classic path builds.
+Image compute_robustness_isa(const Image& comp_raw, const RefStats& ref_stats,
+                             const FlowField& flow, int tile_size, const Config& cfg) {
+    if (ref_stats.means.data.empty() || ref_stats.stds.data.empty()) return Image();
+    Image guide = compute_guide(comp_raw, cfg);
+    Image comp_means, comp_vars; // comp variance unused by ISA
+    local_stats_3x3(guide, comp_means, comp_vars);
+
+    const Image& ref_means = ref_stats.means;
+    const Image& ref_vars  = ref_stats.stds;
+    const int gh = ref_means.h, gw = ref_means.w, nc = ref_means.c;
+    if (comp_means.h != gh || comp_means.w != gw || comp_means.c != nc) return Image();
+
+    Image R(gh, gw, nc);
+    const f32 alpha = cfg.noise_alpha_robustness(); // 0 when noise model disabled
+    const f32 beta  = cfg.noise_beta_robustness();
+    const f32 thr_m = cfg.r_isa_threshold_m;
+    const f32 t     = cfg.r_t;
+
+    // Flow (raw px) at the raw centre of a guide pixel.
+    auto flow_raw = [&](int gy, int gx, f32& dx, f32& dy) {
+        flow.sample_bilinear(2.f * (f32)gy + 0.5f, 2.f * (f32)gx + 0.5f, tile_size, dx, dy);
+    };
+
+    parallel_rows(gh, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < gw; ++x) {
+            f32 sfx, sfy; flow_raw(y, x, sfx, sfy);
+            f32 maxx = sfx, maxy = sfy, minx = sfx, miny = sfy;
+            for (int j = -2; j <= 2; ++j)
+                for (int i = -2; i <= 2; ++i) {
+                    const int ny = std::min(std::max(y + j, 0), gh - 1);
+                    const int nx = std::min(std::max(x + i, 0), gw - 1);
+                    f32 sx, sy; flow_raw(ny, nx, sx, sy);
+                    // ISA-VERBATIM (RobustnessModell.cu:67-70): each neighbour
+                    // is compared to the CENTRE and overwrites, so after the
+                    // loop only the last sample and the centre survive -- not
+                    // the true 5x5 range. Reproduced faithfully.
+                    maxx = std::max(sx, sfx); maxy = std::max(sy, sfy);
+                    minx = std::min(sx, sfx); miny = std::min(sy, sfy);
+                }
+            const int shx = (int)std::lround(sfx * 0.5f);
+            const int shy = (int)std::lround(sfy * 0.5f);
+
+            f32 mref[3], mmov[3], meandist = 0.f;
+            for (int ch = 0; ch < nc; ++ch) {
+                mref[ch] = ref_means.at(y, x, ch);
+                const int my = std::min(std::max(y + shy, 0), gh - 1);
+                const int mx = std::min(std::max(x + shx, 0), gw - 1);
+                mmov[ch] = comp_means.at(my, mx, ch);
+                meandist += std::fabs(mref[ch] - mmov[ch]);
+            }
+            meandist /= (f32)nc;
+
+            const f32 dsx = (maxx - minx) * 0.5f * meandist;
+            const f32 dsy = (maxy - miny) * 0.5f * meandist;
+            const f32 M = std::sqrt(dsx * dsx + dsy * dsy);
+            const f32 s = (M > thr_m) ? 0.f : 1.5f;
+
+            for (int ch = 0; ch < nc; ++ch) {
+                const f32 std_ref = std::sqrt(std::max(0.f, ref_vars.at(y, x, ch)));
+                f32 sig_md = std::sqrt(std::max(0.f, alpha * mref[ch] + beta));
+                if (nc == 3 && ch == 1) sig_md *= 0.70710678f; // two greens averaged
+                f32 dist = std::fabs(mref[ch] - mmov[ch]);
+                const f32 sr2 = std_ref * std_ref, sm2 = sig_md * sig_md;
+                const f32 denom = sr2 + sm2;
+                dist *= (denom > 0.f) ? (sr2 / denom) : 0.f; // texture-based shrink
+                const f32 sigma = std::max(sig_md, std_ref);
+                f32 rv;
+                if (sigma > 0.f)
+                    rv = clampf(s * std::exp(-dist * dist / (sigma * sigma)) - t, 0.f, 1.f);
+                else
+                    rv = clampf((dist > 0.f ? 0.f : s) - t, 0.f, 1.f);
+                R.at(y, x, ch) = rv;
+            }
+        }
+    });
+    return R;
+}
+
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out) {
@@ -1564,6 +1646,28 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         std::fill(r.data.begin(), r.data.end(), 0.f);
         if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
+    }
+
+    // ImageStackAlignator robustness (Config::robustness_isa), scored on the
+    // GPU when available, else on the CPU golden path. On Apple the ref guide
+    // stats are GPU-resident by design, so bring them across once per burst
+    // (cached in ref_stats) before the CPU path reads them -- same handshake
+    // the learned mask uses.
+    if (cfg.robustness_isa) {
+#ifdef __APPLE__
+        Image gpu = compute_robustness_isa_metal(comp_raw, ref_stats, flow, tile_size, cfg);
+        if (gpu.h > 0 && gpu.w > 0) {
+            if (s_select_out) *s_select_out = Image(gpu.h, gpu.w, 1);
+            return gpu;
+        }
+        RefStats* mut = const_cast<RefStats*>(&ref_stats);
+        if (mut->means.data.empty()) (void)metal_fetch_host_ref_stats(*mut);
+#endif
+        Image r_isa = compute_robustness_isa(comp_raw, ref_stats, flow, tile_size, cfg);
+        if (r_isa.h > 0 && r_isa.w > 0) {
+            if (s_select_out) *s_select_out = Image(r_isa.h, r_isa.w, 1);
+            return r_isa;
+        }
     }
 
     // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both

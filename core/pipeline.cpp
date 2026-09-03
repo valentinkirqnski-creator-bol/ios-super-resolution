@@ -41,6 +41,21 @@ bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
     return (bool)out;
 }
 
+// ISA robustness is per-channel (c == 3); collapse to a 1-channel per-pixel
+// mean for the accumulator (denoiser + saved mask). Scalar masks unchanged.
+static Image rob_scalar_view(const Image& rob) {
+    if (rob.c == 1) return rob;
+    Image out(rob.h, rob.w, 1);
+    const f32 inv = 1.f / (f32)rob.c;
+    for (int y = 0; y < rob.h; ++y)
+        for (int x = 0; x < rob.w; ++x) {
+            f32 s = 0.f;
+            for (int c = 0; c < rob.c; ++c) s += rob.at(y, x, c);
+            out.at(y, x) = s * inv;
+        }
+    return out;
+}
+
 Image pad_image_circular(const Image& img, int tile_size) {
     int pad_h = (tile_size - img.h % tile_size) % tile_size;
     int pad_w = (tile_size - img.w % tile_size) % tile_size;
@@ -111,7 +126,8 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
                                      comp_grey.h, comp_grey.w, tile_size,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(tile_size));
-        Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work);
+        Image rob_full = compute_robustness(comp, ref_stats, flow, tile_size, work);
+        Image rob = rob_scalar_view(rob_full);
         if (accumulate_r) {
             if (!have_acc_rob) {
                 acc_rob = Image(rob.h, rob.w, 1);
@@ -123,7 +139,7 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
             }
         }
         CovField covs = estimate_kernels(comp, work);
-        merge_comp(comp, flow, covs, rob, tile_size, num, den, work);
+        merge_comp(comp, flow, covs, rob_full, tile_size, num, den, work);
     }
 
     report("Reference: merge", 0.92f);
@@ -192,13 +208,14 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
         fd.robustness = compute_robustness(burst[k], ref_stats, fd.flow, tile_size, work);
         fd.covs = estimate_kernels(burst[k], work);
         if (accumulate_r) {
+            const Image rob_s = rob_scalar_view(fd.robustness);
             if (!have_acc_rob) {
-                acc_rob = Image(fd.robustness.h, fd.robustness.w, 1);
-                acc_rob.data = fd.robustness.data;
+                acc_rob = Image(rob_s.h, rob_s.w, 1);
+                acc_rob.data = rob_s.data;
                 have_acc_rob = true;
             } else {
-                for (size_t i = 0; i < fd.robustness.data.size(); ++i)
-                    acc_rob.data[i] += fd.robustness.data[i];
+                for (size_t i = 0; i < rob_s.data.size(); ++i)
+                    acc_rob.data[i] += rob_s.data[i];
             }
         }
     }
