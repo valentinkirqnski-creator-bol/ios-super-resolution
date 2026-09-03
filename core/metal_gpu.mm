@@ -3728,11 +3728,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // not from the config flag -- the raw-res path can silently fall back to
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
-    // Mode 3 = overlapped-tile merge (Config::flow_overlap_merge): blend the
-    // <=4 covering tiles' Hann-windowed results. The mask keeps mode 1 (bilinear
-    // expectation). See merge_comp_contrib in HHSRKernels.metal.
-    p.flow_bilinear = cfg.overlap_merge_active() ? 3u
-                        : (cfg.flow_bilinear_sampling ? 1u : 0u);
+    p.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

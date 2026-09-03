@@ -714,16 +714,6 @@ struct CameraView: View {
              differ upstream). Off keeps the current 460 behaviour.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Overlapped Tile Merge (HDR+)", isOn: $cam.tuningParams.flow_overlap_merge)
-        Text("""
-             Blends each output pixel from the <=4 tiles that cover it, each warped \
-             under its own vector, with a Hann window (a partition of unity). The \
-             window gives continuity across tile boundaries by construction, so tile \
-             seams disappear even with per-tile flow. Smooth regions cost the same \
-             (identical tile vectors are merged); only disagreeing tiles pay up to 4x \
-             the merge gathers. Requires bilinear sampling. Off by default.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
         Text("""
              Replaces the block-matching pyramid with a PWCNet model run on-device via \

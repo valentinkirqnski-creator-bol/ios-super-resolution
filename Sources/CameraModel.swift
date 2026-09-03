@@ -145,12 +145,6 @@ struct TuningParams: Equatable, Codable {
     /// three-candidate re-match), and per-level ICA on the FFT grey. Off keeps
     /// the 460-derived behaviour. Algorithm parity, not bit parity.
     var align_match_14: Bool = false
-    /// Overlapped-tile merge (HDR+ scheme): each output pixel blends the <=4
-    /// covering tiles' results under their own vectors with a Hann window
-    /// (partition of unity), instead of warping one interpolated vector. The
-    /// window gives C0 continuity across tile boundaries, removing tile seams.
-    /// Requires bilinear sampling. Off by default.
-    var flow_overlap_merge: Bool = false
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -237,7 +231,7 @@ struct TuningParams: Equatable, Codable {
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, align_match_14, flow_overlap_merge, use_neural_flow
+        case align_ica_per_level_fft, align_match_14, use_neural_flow
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
@@ -311,7 +305,6 @@ struct TuningParams: Equatable, Codable {
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
-        flow_overlap_merge = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_merge) ?? flow_overlap_merge
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -1930,7 +1923,6 @@ final class CameraModel: NSObject, ObservableObject {
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
-            "flow_overlap_merge": NSNumber(value: tuningParams.flow_overlap_merge),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
