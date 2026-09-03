@@ -668,6 +668,20 @@ struct Config {
     // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
     bool use_neural_robustness = false;
 
+    // Handheld-Multi-Frame-Super-Resolution-1.4 parity: build the robustness
+    // GUIDE as sqrt(raw) (a variance-stabilizing transform) instead of the
+    // linear channel average, exactly as 1.4's cuda_compute_guide_image does.
+    // This equalizes the per-channel noise units and makes the noise nearly
+    // brightness-flat, which is 1.4's defining robustness change over the
+    // python-z/paper implementation. It is COUPLED to the noise model: the
+    // robustness noise curves must be regenerated in the sqrt domain (a
+    // SEPARATE cache from the linear curves SNR/kernel tuning share), and the
+    // brightness used to index them is the guide mean SQUARED (the guide is
+    // now sqrt(latent), so latent = mean^2). All of that is handled behind
+    // this one flag. No visible toggle; flip via the tuning dict if it ever
+    // misbehaves on device. Only the robustness path changes.
+    bool robustness_guide_sqrt = true;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

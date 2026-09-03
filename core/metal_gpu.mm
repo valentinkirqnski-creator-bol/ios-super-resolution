@@ -1094,7 +1094,7 @@ struct RobGuideParamsCPU {
     uint32_t bayer;
     uint32_t cfa00, cfa01, cfa10, cfa11;
     float wb0, wb1, wb2;
-    uint32_t _pad0 = 0;
+    uint32_t sqrt_guide = 0; // 1 = sqrt VST guide (1.4); was _pad0
 };
 static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
 
@@ -1139,8 +1139,9 @@ struct RobMaskParamsCPU {
     // _pad1). Must match the merge's setting: the mask has to score the
     // correspondence the merge actually fetches.
     uint32_t flow_bilinear = 0;
+    uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide, 1.4)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 100, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1162,7 +1163,7 @@ struct RobMaskRawParamsCPU {
     float beta = 0.f;
     float motion_edge_noise_floor_multiplier = 0.f;
     uint32_t motion_edge_neighborhood_radius = 0;
-    uint32_t _pad0 = 0;
+    uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide; was _pad0)
 };
 static_assert(sizeof(RobMaskRawParamsCPU) == 104, "RobMaskRawParamsCPU");
 
@@ -1306,6 +1307,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.wb0 = 1.f;
         gp.wb1 = 1.f;
         gp.wb2 = 1.f;
+        gp.sqrt_guide = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];
@@ -1701,6 +1703,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
+    mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1904,6 +1907,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;

@@ -135,9 +135,14 @@ static void get_non_linearity_bound(f32 alpha, f32 beta, f32 tol, f32& xmin, f32
     xmax = (f32)((2.0 + tol_sq * a - std::sqrt(std::max(0.0, inner))) / 2.0);
 }
 
-static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean) {
+static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean,
+                       bool sqrt_domain = false) {
     // Same estimator as fast_monte_carlo.unitary_MC (population std, |Δμ|),
     // same draw order (all patch1 then all patch2). RNG seed is C++-only.
+    // sqrt_domain: 1.4's cuda_compute_guide_image applies sqrt to the clipped
+    // raw before the 3x3 patch statistics, so the curve here must too --
+    // stored at the LATENT brightness bin b; the mask indexes it by the guide
+    // mean SQUARED (guide = sqrt(latent)). See Config::robustness_guide_sqrt.
     const double bd = (double)b;
     const double scale = std::sqrt(std::max(0.0, (double)alpha * bd + (double)beta));
     const uint32_t seed = 1337u + (uint32_t)std::lround(bd * (double)k_n_brightness);
@@ -152,7 +157,9 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
             double m = 0.0;
             for (int j = 0; j < 9; ++j) {
                 double v = bd + scale * rng.rk_gauss();
-                p[j] = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+                v = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+                if (sqrt_domain) v = std::sqrt(v);
+                p[j] = v;
                 m += p[j];
             }
             m /= 9.0;
@@ -290,13 +297,26 @@ static bool load_bundled_pixel4a_noise_curves(int iso, NoiseCurves& nc) {
 
 // Pure builder, no caching -- shared by the single-slot and per-channel
 // cache wrappers below so the ~1e5-patch Monte Carlo logic exists once.
-static NoiseCurves build_noise_curves(f32 alpha, f32 beta) {
+// sqrt_domain: build the curve in 1.4's sqrt-guide domain (a separate LUT
+// from the linear one SNR/kernel tuning use). The linear-curve interpolation
+// shortcut and the Python-dump load are linear-only, so sqrt runs the full
+// MC over every bin.
+static NoiseCurves build_noise_curves(f32 alpha, f32 beta, bool sqrt_domain = false) {
     NoiseCurves nc;
-    if (try_load_python_noise_curves(alpha, beta, nc))
+    if (!sqrt_domain && try_load_python_noise_curves(alpha, beta, nc))
         return nc;
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
+
+    if (sqrt_domain) {
+        parallel_rows(k_n_brightness + 1, 0, [&](int i) {
+            f32 b = i / (f32)k_n_brightness;
+            unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i],
+                       /*sqrt_domain=*/true);
+        });
+        return nc;
+    }
 
     f32 xmin, xmax;
     get_non_linearity_bound(alpha, beta, k_tol, xmin, xmax);
@@ -397,23 +417,59 @@ static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
                                      cfg.noise_beta_ch_robustness(ch), ch);
 }
 
+// 1.4 sqrt-guide parity: SEPARATE sqrt-domain caches (single-slot and
+// per-channel), so the robustness curves live in the sqrt domain while the
+// linear curves SNR/kernel tuning share stay untouched.
+static const NoiseCurves& make_noise_curves_sqrt(f32 alpha, f32 beta) {
+    static NoiseCurves cached;
+    static f32 ca = std::numeric_limits<f32>::quiet_NaN();
+    static f32 cb = std::numeric_limits<f32>::quiet_NaN();
+    if (alpha == ca && beta == cb) return cached;
+    cached = build_noise_curves(alpha, beta, /*sqrt_domain=*/true);
+    ca = alpha; cb = beta;
+    return cached;
+}
+static const NoiseCurves& make_noise_curves_channel_sqrt(f32 alpha, f32 beta, int ch) {
+    static NoiseCurves cached[3];
+    static f32 ca[3] = {std::numeric_limits<f32>::quiet_NaN(),
+                        std::numeric_limits<f32>::quiet_NaN(),
+                        std::numeric_limits<f32>::quiet_NaN()};
+    static f32 cb[3] = {std::numeric_limits<f32>::quiet_NaN(),
+                        std::numeric_limits<f32>::quiet_NaN(),
+                        std::numeric_limits<f32>::quiet_NaN()};
+    ch = std::max(0, std::min(2, ch));
+    if (alpha == ca[ch] && beta == cb[ch]) return cached[ch];
+    cached[ch] = build_noise_curves(alpha, beta, /*sqrt_domain=*/true);
+    ca[ch] = alpha; cb[ch] = beta;
+    return cached[ch];
+}
+
 // Mask-only variants: honour Config::debug_noise_model_disabled by building
 // the curves from alpha = beta = 0 (so sigma_t = d_t = 0 in every bin),
 // while make_noise_curves(cfg) itself stays ungated -- it is shared with SNR
 // auto-tuning via noise_std_at_brightness, and gating it there changed the
 // alignment tile size and merge constants along with the mask (measured:
 // tile 16 -> 32), which is exactly what a diagnostic probe must not do.
+// robustness_guide_sqrt routes to the sqrt-domain caches (1.4 parity).
 static const NoiseCurves& mask_noise_curves(const Config& cfg) {
+    const bool sq = cfg.robustness_guide_sqrt;
     if (cfg.debug_noise_model_disabled)
-        return make_noise_curves(0.f, 0.f);
+        return sq ? make_noise_curves_sqrt(0.f, 0.f) : make_noise_curves(0.f, 0.f);
     if (cfg.debug_pixel4a_noise_profile)
-        return make_noise_curves(cfg);
-    return make_noise_curves(cfg.noise_alpha_robustness(), cfg.noise_beta_robustness());
+        return make_noise_curves(cfg); // bundled table is linear-domain only
+    const f32 a = cfg.noise_alpha_robustness(), b = cfg.noise_beta_robustness();
+    return sq ? make_noise_curves_sqrt(a, b) : make_noise_curves(a, b);
 }
 static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
+    const bool sq = cfg.robustness_guide_sqrt;
     if (cfg.debug_noise_model_disabled)
-        return make_noise_curves_channel(0.f, 0.f, ch);
-    return make_noise_curves_channel(cfg, ch);
+        return sq ? make_noise_curves_channel_sqrt(0.f, 0.f, ch)
+                  : make_noise_curves_channel(0.f, 0.f, ch);
+    if (cfg.debug_pixel4a_noise_profile)
+        return make_noise_curves_channel(cfg, ch);
+    return sq ? make_noise_curves_channel_sqrt(cfg.noise_alpha_ch_robustness(ch),
+                                               cfg.noise_beta_ch_robustness(ch), ch)
+              : make_noise_curves_channel(cfg, ch);
 }
 
 } // namespace
@@ -496,7 +552,13 @@ Image compute_guide(const Image& raw, const Config& cfg) {
                     if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
                 }
             }
-            for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c];
+            // 1.4 parity: sqrt of the (green-averaged) site value -- see
+            // Config::robustness_guide_sqrt. Matches cuda_compute_guide_image.
+            if (cfg.robustness_guide_sqrt)
+                for (int c = 0; c < 3; ++c)
+                    guide.at(y, x, c) = std::sqrt(std::max(0.f, sum[c] * inv[c]));
+            else
+                for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c];
         }
     }
     return guide;
@@ -747,7 +809,8 @@ static Image upscale_warp_stats(const Image& guide_stats,
 // alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
 // make_noise_curves_channel.
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
-                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq) {
+                              const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq,
+                              bool sqrt_index = false) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
@@ -770,10 +833,12 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
-                // Python: id_noise = round(1000 * brightness) — no clamp.
-                int id_noise = (int)std::lround(1000.f * brightness);
+                // sqrt guide (1.4): the curve is keyed by LATENT brightness,
+                // and the guide mean is sqrt(latent), so index by mean^2.
+                f32 bidx = sqrt_index ? brightness * brightness : brightness;
+                int id_noise = (int)std::lround(1000.f * bidx);
                 // Host: same bins as Python for finite brightness in range; avoid crash on +inf.
-                if (!std::isfinite(brightness))
+                if (!std::isfinite(bidx))
                     id_noise = 0;
                 else if (id_noise < 0)
                     id_noise = 0;
@@ -809,7 +874,8 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
 static void apply_noise_model_fused(const Image& ref_means, const Image& comp_means,
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
-                                    Image& d_sq, Image& sigma_sq, int num_threads) {
+                                    Image& d_sq, Image& sigma_sq, int num_threads,
+                                    bool sqrt_index = false) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
@@ -820,8 +886,10 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
-                int id_noise = (int)std::lround(1000.f * brightness);
-                if (!std::isfinite(brightness))
+                // sqrt guide (1.4): index by mean^2 -- see apply_noise_model.
+                f32 bidx = sqrt_index ? brightness * brightness : brightness;
+                int id_noise = (int)std::lround(1000.f * bidx);
+                if (!std::isfinite(bidx))
                     id_noise = 0;
                 else if (id_noise < 0)
                     id_noise = 0;
@@ -1075,7 +1143,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
 
     Image d_sq, sigma_sq;
     apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
-                            cfg.num_threads);
+                            cfg.num_threads, cfg.robustness_guide_sqrt);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(
@@ -1498,7 +1566,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq);
+    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
+                      cfg.robustness_guide_sqrt);
     std::vector<uint32_t> tile_residual_high;
     if (cfg.flow_reject_1d_enabled) {
         tile_residual_high = compute_tile_residual_high(

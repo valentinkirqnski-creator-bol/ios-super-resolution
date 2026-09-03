@@ -1502,7 +1502,7 @@ struct RobGuideParams {
     uint bayer; // 1 = Bayer → RGB guide
     uint cfa00, cfa01, cfa10, cfa11;
     float wb0, wb1, wb2;
-    uint _pad0;
+    uint sqrt_guide; // 1 = sqrt VST (1.4 parity, Config::robustness_guide_sqrt); was _pad0
 };
 
 struct RobStatsParams {
@@ -1544,6 +1544,7 @@ struct RobMaskParams {
     uint save_s_select;  // 1 = also emit the per-pixel s1/s2 selector
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
+    uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide, 1.4)
 };
 
 inline float dogson_quadratic(float x) {
@@ -1646,8 +1647,11 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     // space -- see Config::guide_wb_undo and compute_guide in robustness.cpp,
     // which this mirrors.
     float undo[3] = {p.wb0, p.wb1, p.wb2};
-    for (uint c = 0u; c < 3u; ++c)
-        guide[o + c] = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
+    for (uint c = 0u; c < 3u; ++c) {
+        float v = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
+        // 1.4 parity: sqrt VST on the guide (see rob compute_guide, CPU twin).
+        guide[o + c] = (p.sqrt_guide != 0u) ? sqrt(max(0.f, v)) : v;
+    }
 }
 
 // Parameters for the high-frequency variance-loss map.
@@ -1834,7 +1838,8 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
             for (uint ch = 0u; ch < p.nch; ++ch) {
                 uint o = (uint(y) * p.w + uint(x)) * p.nch + ch;
                 float brightness = ref_means[o];
-                int id_noise = lround_away(1000.f * brightness);
+                float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+                int id_noise = lround_away(1000.f * bidx);
                 if (!isfinite(brightness))
                     id_noise = 0;
                 else if (id_noise < 0)
@@ -1938,7 +1943,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
         // Python: id_noise = round(1000 * brightness) — no clamp.
-        int id_noise = lround_away(1000.f * brightness);
+        float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+        int id_noise = lround_away(1000.f * bidx);
         // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
         // Finite brightness in [0,1] -> id in [0,1000] unchanged (same as Python).
         if (!isfinite(brightness))
@@ -2072,7 +2078,7 @@ struct RobMaskRawParams {
     float beta;
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
-    uint _pad0;
+    uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide; was _pad0)
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2127,7 +2133,8 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
-        int id_noise = lround_away(1000.f * brightness);
+        float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+        int id_noise = lround_away(1000.f * bidx);
         if (!isfinite(brightness))
             id_noise = 0;
         else if (id_noise < 0)
