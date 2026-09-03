@@ -1969,14 +1969,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_add_cpu("out:dng-close(flush)", prof_now_ms() - t_close);
     const double t_tail = prof_now_ms();
     if (work.robustness_save_mask && have_acc_rob) {
-        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
+        // Save at raw resolution (nearest-upsampled from the guide grid),
+        // matching 1.4's full-res mask export. No-op if already raw-res.
+        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", ref.h, ref.w))
             report("Wrote robustness mask", 0.985f);
         // Same normalisation as the combined mask, so the three are directly
         // comparable: a pixel is bright in exactly one of _s1 and _s2, at the
         // value it contributed to the combined one.
         if (want_s_masks && have_acc_rob_split) {
-            write_robustness_mask_pgm(acc_rob_s1, n - 1, dng_path, "_s1");
-            write_robustness_mask_pgm(acc_rob_s2, n - 1, dng_path, "_s2");
+            write_robustness_mask_pgm(acc_rob_s1, n - 1, dng_path, "_s1", ref.h, ref.w);
+            write_robustness_mask_pgm(acc_rob_s2, n - 1, dng_path, "_s2", ref.h, ref.w);
             report("Wrote s1/s2 robustness masks", 0.986f);
         }
     }

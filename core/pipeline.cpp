@@ -15,7 +15,8 @@ namespace hhsr {
 
 bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
                                const std::string& dng_path,
-                               const char* name_suffix) {
+                               const char* name_suffix,
+                               int target_h, int target_w) {
     if (acc_rob.data.empty() || acc_rob.h <= 0 || acc_rob.w <= 0) return false;
     const std::string tail =
         std::string("_robustness") + (name_suffix ? name_suffix : "") + ".pgm";
@@ -27,14 +28,22 @@ bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
     else
         path += tail;
 
+    // 1.4 parity (cli.py cv2.resize INTER_NEAREST): the mask is computed at
+    // guide resolution but saved nearest-upsampled to the raw/output size,
+    // so the file is full-res (e.g. 12 MP) rather than the 3 MP guide grid.
+    // A no-op when target matches the native size or is unset.
+    const int out_h = (target_h > 0) ? target_h : acc_rob.h;
+    const int out_w = (target_w > 0) ? target_w : acc_rob.w;
     const f32 inv_n = 1.f / (f32)std::max(1, n_comp_frames);
     std::ofstream out(path, std::ios::binary);
     if (!out) return false;
-    out << "P5\n" << acc_rob.w << " " << acc_rob.h << "\n255\n";
-    for (int y = 0; y < acc_rob.h; ++y) {
-        for (int x = 0; x < acc_rob.w; ++x) {
+    out << "P5\n" << out_w << " " << out_h << "\n255\n";
+    for (int y = 0; y < out_h; ++y) {
+        const int sy = std::min(acc_rob.h - 1, (int)((int64_t)y * acc_rob.h / out_h));
+        for (int x = 0; x < out_w; ++x) {
+            const int sx = std::min(acc_rob.w - 1, (int)((int64_t)x * acc_rob.w / out_w));
             // Mean robustness in [0,1] → 8-bit (white = fully trusted)
-            f32 v = clampf(acc_rob.at(y, x) * inv_n, 0.f, 1.f);
+            f32 v = clampf(acc_rob.at(sy, sx) * inv_n, 0.f, 1.f);
             out.put((char)(unsigned char)(v * 255.f + 0.5f));
         }
     }
@@ -286,7 +295,9 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
 
     writer.close();
     if (work.robustness_save_mask && have_acc_rob) {
-        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path))
+        // Save at raw resolution (nearest-upsampled from the guide grid),
+        // matching 1.4's full-res mask export.
+        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", ref.h, ref.w))
             report("Wrote robustness mask", 0.99f);
     }
     report("Done", 1.0f);

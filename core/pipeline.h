@@ -53,8 +53,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 // Write accumulated robustness as 8-bit PGM (mean R over comps → gray).
 // Path: replace ".dng" with "_robustness<name_suffix>.pgm", or append that.
 // name_suffix is "" for the combined mask, "_s1"/"_s2" for the split ones.
+// target_h/target_w: when > 0, the mask is NEAREST-upsampled to that size
+// before writing (guide-resolution R -> raw resolution, matching 1.4's
+// cli.py cv2.resize(..., INTER_NEAREST) to the output). 0 = write native.
 bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
                                const std::string& dng_path,
-                               const char* name_suffix = "");
+                               const char* name_suffix = "",
+                               int target_h = 0, int target_w = 0);
 
 } // namespace hhsr
