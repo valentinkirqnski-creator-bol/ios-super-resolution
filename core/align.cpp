@@ -1181,6 +1181,72 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
     return flow;
 }
 
+// Overlapping-tile re-measurement (Config::flow_overlap_tiles). The IPOL
+// author's suggestion: keep the window Ts but halve the stride to Ts/2, so the
+// tiles overlap 50% and there are 2x as many. Each cell is block-matched on its
+// own Ts-wide window centred on it, seeded by the coarse flow so the search
+// stays local, giving a real per-cell measurement (motion varying inside a Ts
+// tile is captured, not averaged). Returns a flow field on the Ts/2 grid; the
+// caller consumes it at tile_size/2. window_ts is in grey pixels.
+static FlowField block_match_overlap(const Image& ref, const Image& moving,
+                                     const FlowField& seed, int window_ts,
+                                     const Config& cfg) {
+    const int stride = std::max(1, window_ts / 2);
+    const int ny = ref.h / stride, nx = ref.w / stride;
+    if (ny <= 0 || nx <= 0 || seed.ny <= 0 || seed.nx <= 0) return seed;
+    FlowField out(ny, nx);
+    const bool l1 = !cfg.bm_metrics.empty() && cfg.bm_metrics[0] == "L1";
+    const int R = std::max(1, cfg.overlap_search_radius);
+    const int wmaxy = std::max(0, ref.h - window_ts);
+    const int wmaxx = std::max(0, ref.w - window_ts);
+    parallel_rows(ny, cfg.num_threads, [&](int cy) {
+        for (int cx = 0; cx < nx; ++cx) {
+            // Ts window centred on the cell, clamped fully in-bounds so the
+            // reference side is always valid (moving side is bounds-checked).
+            int oy = cy * stride - (window_ts - stride) / 2;
+            int ox = cx * stride - (window_ts - stride) / 2;
+            oy = oy < 0 ? 0 : (oy > wmaxy ? wmaxy : oy);
+            ox = ox < 0 ? 0 : (ox > wmaxx ? wmaxx : ox);
+            // Seed = coarse flow at the cell centre (nearest coarse tile). Its
+            // fractional (ICA-refined) part is kept; the search adds an integer
+            // local refinement on top.
+            const f32 cen_y = ((f32)cy + 0.5f) * (f32)stride;
+            const f32 cen_x = ((f32)cx + 0.5f) * (f32)stride;
+            const int sty = std::max(0, std::min(seed.ny - 1, (int)(cen_y / (f32)window_ts)));
+            const int stx = std::max(0, std::min(seed.nx - 1, (int)(cen_x / (f32)window_ts)));
+            const f32 sfx = seed.dx(sty, stx), sfy = seed.dy(sty, stx);
+            const int base_fx = cuda_round_to_int(sfx);
+            const int base_fy = cuda_round_to_int(sfy);
+            f32 min_dist = std::numeric_limits<f32>::infinity();
+            int msx = 0, msy = 0;
+            for (int sdy = -R; sdy <= R; ++sdy) {
+                for (int sdx = -R; sdx <= R; ++sdx) {
+                    f32 dist = 0.f;
+                    bool valid = true;
+                    for (int i = 0; i < window_ts && valid; ++i) {
+                        for (int j = 0; j < window_ts; ++j) {
+                            const int rx = ox + j, ry = oy + i;
+                            const int mx = rx + base_fx + sdx;
+                            const int my = ry + base_fy + sdy;
+                            if (!(mx >= 0 && mx < moving.w && my >= 0 && my < moving.h)) {
+                                valid = false;
+                                break;
+                            }
+                            const f32 d = ref.at(ry, rx) - moving.at(my, mx);
+                            dist += l1 ? std::fabs(d) : d * d;
+                        }
+                    }
+                    if (!valid) continue;
+                    if (dist < min_dist) { min_dist = dist; msx = sdx; msy = sdy; }
+                }
+            }
+            out.dx(cy, cx) = sfx + (f32)msx;
+            out.dy(cy, cx) = sfy + (f32)msy;
+        }
+    });
+    return out;
+}
+
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
@@ -1195,6 +1261,12 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
                         initial_dx, initial_dy, initial_rotation_rad)) {
+            // Overlapping-tile re-measurement runs on the CPU here, so it covers
+            // the GPU align path too -- the 2x flow then feeds the Metal merge/
+            // robustness unchanged (they just get the denser grid + tile_size/2).
+            if (cfg.overlap_tiles_active())
+                flow_gpu = block_match_overlap(ref_grey, moving_grey, flow_gpu,
+                                               cfg.grey_tile_size(tile_size), cfg);
             if (cfg.flow_reject_1d_enabled) {
                 Image gx = compute_sobel_gradx(ref_grey);
                 Image gy = compute_sobel_grady(ref_grey);
@@ -1331,8 +1403,15 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                          cfg.ica_n_iter, cfg.num_threads,
                          ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
     }
+    // Overlapping-tile re-measurement: 2x-denser flow on a Ts/2 grid, measured
+    // per cell on its own Ts window. Done before the mark passes so they run on
+    // the grid the pipeline consumes.
+    if (cfg.overlap_tiles_active())
+        flow = block_match_overlap(ref_grey, moving_grey, flow,
+                                   cfg.grey_tile_size(tile_size), cfg);
     const HessianField* mark_hess = nullptr;
-    if (!finest_hess.data.empty()) {
+    if (!finest_hess.data.empty() && finest_hess.ny == flow.ny &&
+        finest_hess.nx == flow.nx) {
         mark_hess = &finest_hess;
     } else if (!g_ref_ica_cache.levels.empty() &&
                g_ref_ica_cache.levels[0].hess.ny == flow.ny &&

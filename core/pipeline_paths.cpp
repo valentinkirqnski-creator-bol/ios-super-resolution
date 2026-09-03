@@ -1090,6 +1090,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+    // Overlapping-tile alignment (Config::flow_overlap_tiles) returns a flow on
+    // a Ts/2 grid (2x as many tiles), so every flow CONSUMER -- the grey->raw
+    // regrid, robustness, and the merge -- must index it at tile_size/2. align()
+    // still gets the full tile_size for its pyramid. cons_ts == tile_size when
+    // the feature is off, so the default path is unchanged.
+    const int cons_ts = (work.overlap_tiles_active() && tile_size >= 2)
+                        ? tile_size / 2 : tile_size;
     // Output dimensions are known as soon as the reference is, and the online
     // merge needs its accumulator before the first frame is analyzed.
     const int out_h = (int)std::lround(work.scale * (f32)ref_h);
@@ -1348,10 +1355,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // it as raw_coordinate / tile_size and add raw pixels. Convert
             // here, before anything downstream sees it. No-op when the grey
             // is full resolution, so the FFT path is unaffected.
+            // cons_ts (== tile_size/2 under flow_overlap_tiles) is the grid the
+            // 2x flow lives on. No-op on the FFT grey (grey == raw), so its args
+            // are moot there; on the decimate grey it regrids at the finer stride.
             flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
-                                         comp_grey.h, comp_grey.w, tile_size,
+                                         comp_grey.h, comp_grey.w, cons_ts,
                                          work.r_Mt, work.num_threads,
-                                         work.grey_tile_size(tile_size));
+                                         work.grey_tile_size(cons_ts));
         }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
@@ -1378,7 +1388,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
-                                                  tile_size, work,
+                                                  cons_ts, work,
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr);
@@ -1406,7 +1416,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
-                                                  tile_size, work,
+                                                  cons_ts, work,
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr);
@@ -1441,7 +1451,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 online_skip_rejected++;
             } else if (comp.h <= 0 || comp.w <= 0) {
                 online_skip_nodata++;
-            } else if (!merge_comp_band(comp, flow, covs, rob, tile_size,
+            } else if (!merge_comp_band(comp, flow, covs, rob, cons_ts,
                                         num_sink, den_sink, 0, work, k)) {
                 // The GPU refused the frame -- geometry, an allocation, or the
                 // upload. Dropping that silently is how a burst ends up as the
@@ -1825,12 +1835,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     continue;
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
-                    merge_comp_band(empty, meta.flow, meta.covs, meta.rob, tile_size,
+                    merge_comp_band(empty, meta.flow, meta.covs, meta.rob, cons_ts,
                                     num_band, den_band, y0, work, meta.index);
                     continue;
                 }
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
-                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, cons_ts,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
@@ -1841,12 +1851,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     continue;
                 if (metal_merge_has_frame(fc.index)) {
                     Image empty;
-                    merge_comp_band(empty, fc.flow, fc.covs, fc.rob, tile_size,
+                    merge_comp_band(empty, fc.flow, fc.covs, fc.rob, cons_ts,
                                     num_band, den_band, y0, work, fc.index);
                     continue;
                 }
                 if (fc.comp.h <= 0) continue;
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, cons_ts,
                                 num_band, den_band, y0, work, fc.index);
             }
         }
@@ -1933,7 +1943,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                     work.scale, work.bayer_mode))
                     continue;
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
-                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, tile_size,
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, cons_ts,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
@@ -1942,7 +1952,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
                                                     work.scale, work.bayer_mode))
                     continue;
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, tile_size,
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, cons_ts,
                                 num_band, den_band, y0, work, fc.index);
             }
         }

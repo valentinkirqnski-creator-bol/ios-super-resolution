@@ -749,6 +749,24 @@ struct Config {
     // correspondence the merge never fetches.
     bool  flow_bilinear_sampling = true;
 
+    // Overlapping tiles for alignment (the IPOL author's suggestion): instead of
+    // Ts=16 at stride 16, use Ts=16 at stride 8 (a 50% overlap). After the
+    // normal coarse-to-fine align, the finest flow is RE-MEASURED on a grid at
+    // stride Ts/2 -- twice as many tiles, each block-matched on its own Ts-wide
+    // window centred on the cell and seeded by the coarse flow. Motion that
+    // varies inside a 16px tile is then captured instead of averaged. The flow
+    // field returned is 2x denser; the pipeline consumes it at tile_size/2, so
+    // every downstream stage (merge, robustness) samples the same denser grid.
+    // Runs on the CPU in align() for both align backends, so no GPU kernel
+    // changes are needed -- the Metal merge/robustness just get a 2x flow buffer
+    // and the halved tile size. Off by default.
+    bool  flow_overlap_tiles = false;
+    // Local search radius (grey px) for the overlapping re-measurement. The
+    // seed is the already-refined coarse flow, so a small window suffices.
+    int   overlap_search_radius = 2;
+
+    bool overlap_tiles_active() const { return flow_overlap_tiles; }
+
     bool  align_ambiguous_fallback_enabled = false;
 
     // Test switch from the aperture experiments: force merge robustness to zero

@@ -714,6 +714,15 @@ struct CameraView: View {
              differ upstream). Off keeps the current 460 behaviour.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Overlapping Tiles (align, Ts/2)", isOn: $cam.tuningParams.flow_overlap_tiles)
+        Text("""
+             After alignment, re-measure the finest flow on twice as many tiles \
+             (Ts=16 at stride 8, a 50% overlap), each block-matched on its own \
+             16px window. Motion that varies inside a tile is captured instead of \
+             averaged, so tile-scale warping at motion edges is reduced. The flow \
+             feeds merge and robustness at the finer grid. Runs on CPU; off by default.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
         Text("""
              Replaces the block-matching pyramid with a PWCNet model run on-device via \
