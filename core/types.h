@@ -749,6 +749,36 @@ struct Config {
     // correspondence the merge never fetches.
     bool  flow_bilinear_sampling = true;
 
+    // Overlapped-tile merge (HDR+ scheme), the IPOL author's suggested
+    // experiment. Instead of interpolating ONE flow vector per output pixel and
+    // warping once, the merge treats the <=4 tiles that cover the pixel as
+    // separate hypotheses -- each warped under its OWN vector -- and crossfades
+    // the RESULTS with a raised-cosine window. At 50% overlap that window is a
+    // Hann crossfade on the tile-centre lattice fraction (cos^2/sin^2 per axis,
+    // a partition of unity), so 'result x window, accumulate, divide' maps onto
+    // the num/den accumulator as up-to-4 kernel-regression gathers, each under
+    // one tile's vector, weighted by its window value. Because the window is a
+    // partition of unity the merged field is C0-continuous across tile
+    // boundaries BY CONSTRUCTION -- the "window-only continuity" that removes
+    // the tile-grid seams even though the flow is per-tile. Identical
+    // hypotheses are deduplicated, so smooth regions cost exactly one gather as
+    // today; only tiles that disagree pay the extra <=3 gathers.
+    //
+    // The blend on the shared accumulator is sum(w_t num_t)/sum(w_t den_t)
+    // rather than HDR+'s sum(w_t (num_t/den_t)) -- identical when the
+    // hypotheses' den agree (the usual case) and robustness-aware when they do
+    // not. The mask keeps sampling the same lattice bilinearly (the hypotheses'
+    // expectation); with several correspondences per pixel there is no single
+    // fetch to grade. Off by default.
+    bool  flow_overlap_merge = false;
+
+    // True when the overlapped-tile merge should run. Requires bilinear
+    // sampling so the mask grades the hypotheses' (bilinear) expectation and
+    // the tile-centre lattice convention is shared with sample_bilinear.
+    bool overlap_merge_active() const {
+        return flow_overlap_merge && flow_bilinear_sampling;
+    }
+
     bool  align_ambiguous_fallback_enabled = false;
 
     // Test switch from the aperture experiments: force merge robustness to zero

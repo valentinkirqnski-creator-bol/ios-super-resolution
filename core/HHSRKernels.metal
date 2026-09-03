@@ -1064,13 +1064,45 @@ static inline void merge_comp_contrib(device const float* img,
     // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
     int px = int(lr_x / float(p.tile_size));
     int py = int(lr_y / float(p.tile_size));
-    float flowx, flowy;
-    if (p.flow_bilinear != 0u) {
+    // Flow hypotheses. flow_bilinear == 3 is the overlapped-tile merge
+    // (Config::flow_overlap_merge): the <=4 covering tiles' OWN vectors on the
+    // tile-centre lattice, Hann-crossfaded (cos^2/sin^2 per axis, a partition
+    // of unity), deduplicated so smooth pixels stay a single gather. 1 = one
+    // bilinear-sampled vector; 0 = the containing tile's vector.
+    float hx[4], hy[4], hw[4] = {1.f, 0.f, 0.f, 0.f};
+    int nhyp = 1;
+    if (p.flow_bilinear == 3u) {
+        float P = float(p.tile_size);
+        float tcy = lr_y / P - 0.5f;
+        float tcx = lr_x / P - 0.5f;
+        int cy0i = int(floor(tcy)), cx0i = int(floor(tcx));
+        float ay = tcy - float(cy0i), ax = tcx - float(cx0i);
+        int iy0 = clamp(cy0i,     0, int(p.flow_ny) - 1);
+        int iy1 = clamp(cy0i + 1, 0, int(p.flow_ny) - 1);
+        int ix0 = clamp(cx0i,     0, int(p.flow_nx) - 1);
+        int ix1 = clamp(cx0i + 1, 0, int(p.flow_nx) - 1);
+        float sy = sin(1.57079632679f * ay), sx = sin(1.57079632679f * ax);
+        float wy1 = sy * sy, wy0 = 1.f - wy1, wx1 = sx * sx, wx0 = 1.f - wx1;
+        int iyv[4] = {iy0, iy0, iy1, iy1};
+        int ixv[4] = {ix0, ix1, ix0, ix1};
+        float w4[4] = {wy0 * wx0, wy0 * wx1, wy1 * wx0, wy1 * wx1};
+        for (int a = 0; a < 4; ++a) {
+            uint o = (uint(iyv[a]) * p.flow_nx + uint(ixv[a])) * 2u;
+            hx[a] = flow[o + 0u]; hy[a] = flow[o + 1u]; hw[a] = w4[a];
+        }
+        for (int a = 1; a < 4; ++a)
+            for (int b = 0; b < a; ++b)
+                if (hw[a] > 0.f && hw[b] > 0.f &&
+                    fabs(hx[a] - hx[b]) < 1e-3f && fabs(hy[a] - hy[b]) < 1e-3f) {
+                    hw[b] += hw[a]; hw[a] = 0.f; break;
+                }
+        nhyp = 4;
+    } else if (p.flow_bilinear != 0u) {
         flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
-                             float(p.tile_size), flowx, flowy);
+                             float(p.tile_size), hx[0], hy[0]);
     } else {
-        flowx = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
-        flowy = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
+        hx[0] = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 0u];
+        hy[0] = flow[(uint(py) * p.flow_nx + uint(px)) * 2u + 1u];
     }
 
     // p.raw_res_robustness: robustness is raw resolution this run (Config::
@@ -1094,11 +1126,16 @@ static inline void merge_comp_contrib(device const float* img,
     // is bit-identical to x for every value these accumulators can hold.
     if (local_r <= 0.f) return;
 
+    float val0 = 0.f, val1 = 0.f, val2 = 0.f;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    for (int h = 0; h < nhyp; ++h) {
+    if (hw[h] <= 0.f) continue;
+    float flowx = hx[h], flowy = hy[h], wsc = hw[h];
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
     if (!(lr_mov_x >= 0.f && lr_mov_x < float(p.lr_w) &&
           lr_mov_y >= 0.f && lr_mov_y < float(p.lr_h)))
-        return;
+        continue;
 
     float ixx = 0.f, ixy = 0.f, iyy = 0.f;
     if (!p.iso) {
@@ -1116,8 +1153,6 @@ static inline void merge_comp_contrib(device const float* img,
     int center_j = lround_away(lr_mov_x);
     int center_i = lround_away(lr_mov_y);
 
-    float val0 = 0.f, val1 = 0.f, val2 = 0.f;
-    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
     for (int di = -1; di <= 1; ++di) {
         for (int dj = -1; dj <= 1; ++dj) {
             int j = center_j + dj;
@@ -1138,13 +1173,14 @@ static inline void merge_comp_contrib(device const float* img,
             // ~1e-7, far below one 16-bit LSB; tools/compare_dng.py gates it.
             float w = fast::exp(-0.5f * z);
 
-            float contrib_v = w * local_r * c;
-            float contrib_a = w * local_r;
+            float contrib_v = w * local_r * wsc * c;
+            float contrib_a = w * local_r * wsc;
             if (channel == 0)      { val0 += contrib_v; acc0 += contrib_a; }
             else if (channel == 1) { val1 += contrib_v; acc1 += contrib_a; }
             else                   { val2 += contrib_v; acc2 += contrib_a; }
         }
     }
+    } // hypothesis loop
 
     n0 += val0; n1 += val1; n2 += val2;
     d0 += acc0; d1 += acc1; d2 += acc2;
