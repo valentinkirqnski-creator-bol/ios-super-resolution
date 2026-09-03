@@ -298,25 +298,29 @@ static bool load_bundled_pixel4a_noise_curves(int iso, NoiseCurves& nc) {
 // Pure builder, no caching -- shared by the single-slot and per-channel
 // cache wrappers below so the ~1e5-patch Monte Carlo logic exists once.
 // sqrt_domain: build the curve in 1.4's sqrt-guide domain (a separate LUT
-// from the linear one SNR/kernel tuning use). The linear-curve interpolation
-// shortcut and the Python-dump load are linear-only, so sqrt runs the full
-// MC over every bin.
+// from the linear one SNR/kernel tuning use). The interpolation shortcut is
+// domain-agnostic (it lerps sigma^2/d^2 between the MC'd non-linear ends),
+// so sqrt uses it too; only the Python-dump load is linear-only.
 static NoiseCurves build_noise_curves(f32 alpha, f32 beta, bool sqrt_domain = false) {
     NoiseCurves nc;
+
+    // No noise model (alpha = beta = 0, e.g. Disable Noise Model): every
+    // sample equals the brightness, so patch std and diff are exactly 0 in
+    // both domains. Return zeros WITHOUT running the ~1e5-patch MC over 1001
+    // bins -- that build produced only zeros yet stalled the first
+    // comparison frame ("Frame 2: analyze" hang), most visibly on the sqrt
+    // path, which used to force the full-bin MC.
+    if (!(alpha > 0.f) && !(beta > 0.f)) {
+        nc.std_curve.assign((size_t)k_n_brightness + 1, 0.f);
+        nc.diff_curve.assign((size_t)k_n_brightness + 1, 0.f);
+        return nc;
+    }
+
     if (!sqrt_domain && try_load_python_noise_curves(alpha, beta, nc))
         return nc;
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
-
-    if (sqrt_domain) {
-        parallel_rows(k_n_brightness + 1, 0, [&](int i) {
-            f32 b = i / (f32)k_n_brightness;
-            unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i],
-                       /*sqrt_domain=*/true);
-        });
-        return nc;
-    }
 
     f32 xmin, xmax;
     get_non_linearity_bound(alpha, beta, k_tol, xmin, xmax);
@@ -330,14 +334,16 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta, bool sqrt_domain = fa
     if (full_mc) {
         parallel_rows(k_n_brightness + 1, 0, [&](int i) {
             f32 b = i / (f32)k_n_brightness;
-            unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i]);
+            unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i],
+                       sqrt_domain);
         });
     } else {
         // MC on non-linear parts: [0, imin] and [imax, 1000]
         parallel_rows(k_n_brightness + 1, 0, [&](int i) {
             if (i <= imin || i >= imax) {
                 f32 b = i / (f32)k_n_brightness;
-                unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i]);
+                unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i],
+                           sqrt_domain);
             }
         });
         // Overwrite [imin, imax] inclusive (matches run_fast_MC)
