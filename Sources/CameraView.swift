@@ -704,6 +704,16 @@ struct CameraView: View {
              the extra reference gradients to about a quarter of a frame.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Match 1.4 Alignment", isOn: $cam.tuningParams.align_match_14)
+        Text("""
+             Switches the three places the aligner (a 460-main derivative) diverges from \
+             Handheld-Multi-Frame-Super-Resolution-1.4: finest search radius drops to 1, \
+             inter-level flow upscaling becomes a plain bilinear resize (not the 460 \
+             three-candidate re-match), and ICA runs on every pyramid level of the FFT grey. \
+             Algorithm parity with 1.4, not bit parity (the FFT and GPU float order still \
+             differ upstream). Off keeps the current 460 behaviour.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
         Text("""
              Replaces the block-matching pyramid with a PWCNet model run on-device via \

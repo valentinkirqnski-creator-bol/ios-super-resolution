@@ -506,11 +506,41 @@ struct Config {
     // gradients are currently rebuilt per frame.
     bool align_ica_per_level_fft = false;
 
+    // Match the alignment stage to Handheld-Multi-Frame-Super-Resolution-1.4
+    // exactly, in the three places the port (a 460-main derivative) diverges
+    // from 1.4:
+    //   1. finest-level block-match search radius -> 1 (1.4 ships [1,4,4,4];
+    //      the port defaults the finest to 3). See search_radius_for_level().
+    //   2. inter-level flow upscaling -> a plain bilinear resize of the flow
+    //      field (1.4 upscale_lvl = F.interpolate(mode="bilinear") *
+    //      upsample_factor, zero-padded) instead of the 460 three-candidate
+    //      re-match. See upscale_flow_bilinear_14() / align_upscale_flow_bilinear.
+    //   3. per-level ICA on the FFT grey (1.4 runs ICA at every pyramid level;
+    //      the port's FFT path runs it once at the finest). Folded into
+    //      ica_every_level()/ica_per_level_coarse_only() below, so it reuses the
+    //      memory-safe coarse-only cache path already built for the FFT grey.
+    // Gated + reversible; off by default keeps the 460-derived behaviour so any
+    // regression is one flag flip away from being ruled out. Bit-identity with
+    // 1.4 is still not reachable (different FFT + GPU/CPU float order upstream);
+    // this makes the ALGORITHM identical, which is what the flow diff was.
+    bool align_match_14 = false;
+
+    // Block-match search radius for a pyramid level, fine (0) to coarse.
+    // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
+    // finest-radius override lands on the CPU and the device identically.
+    int search_radius_for_level(int lvl) const {
+        int r = (lvl >= 0 && lvl < (int)bm_search_radii.size())
+                    ? bm_search_radii[(size_t)lvl] : 2;
+        if (align_match_14 && lvl == 0) r = 1; // 1.4 ships [1,4,4,4]
+        return r;
+    }
+
     // True when ICA should run on every pyramid level rather than only the
     // finest.
     bool ica_every_level() const {
         return align_ica_per_level &&
-               (grey_method == GreyMethod::Decimate || align_ica_per_level_fft);
+               (grey_method == GreyMethod::Decimate || align_ica_per_level_fft
+                || align_match_14);
     }
 
     // On the FFT grey, run per-level ICA on the COARSE levels only and leave
@@ -529,7 +559,8 @@ struct Config {
     // they are where the benefit is -- integer-only flow originates on the
     // coarse levels, and that is what arrives at level 0 with its budget spent.
     bool ica_per_level_coarse_only() const {
-        return align_ica_per_level_fft && grey_method == GreyMethod::FFT;
+        return (align_ica_per_level_fft || align_match_14)
+               && grey_method == GreyMethod::FFT;
     }
 
     // How many RAW pixels one alignment-grey pixel spans. The FFT grey is

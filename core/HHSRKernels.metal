@@ -2872,6 +2872,46 @@ kernel void align_upscale_flow(device const float* in_flow [[buffer(0)]],
     }
 }
 
+// upscale_lvl bilinear — Handheld-Multi-Frame-Super-Resolution-1.4.
+// F.interpolate(mode="bilinear", align_corners=False) then scale by
+// upsample_factor; pad the uncovered bottom/right strip with 0. Twin of
+// upscale_flow_bilinear_14() in align.cpp. Only dispatched under align_match_14.
+kernel void align_upscale_flow_bilinear(device const float* in_flow [[buffer(0)]],
+                                        device float* out_flow [[buffer(1)]],
+                                        constant AlignUpscaleParams& p [[buffer(2)]],
+                                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.target_nx || gid.y >= p.target_ny) return;
+    uint o = (gid.y * p.target_nx + gid.x) * 2u;
+    if (gid.y < p.up_ny && gid.x < p.up_nx) {
+        float inv_r = 1.f / float(p.repeat_factor);
+        float sy = (float(gid.y) + 0.5f) * inv_r - 0.5f;
+        if (sy < 0.f) sy = 0.f;
+        float sx = (float(gid.x) + 0.5f) * inv_r - 0.5f;
+        if (sx < 0.f) sx = 0.f;
+        int y0 = int(floor(sy)); float wy1 = sy - float(y0);
+        int x0 = int(floor(sx)); float wx1 = sx - float(x0);
+        uint y0c = min(uint(y0),      p.in_ny - 1u);
+        uint y1c = min(uint(y0 + 1),  p.in_ny - 1u);
+        uint x0c = min(uint(x0),      p.in_nx - 1u);
+        uint x1c = min(uint(x0 + 1),  p.in_nx - 1u);
+        float wy0 = 1.f - wy1, wx0 = 1.f - wx1;
+        uint s00 = (y0c * p.in_nx + x0c) * 2u;
+        uint s01 = (y0c * p.in_nx + x1c) * 2u;
+        uint s10 = (y1c * p.in_nx + x0c) * 2u;
+        uint s11 = (y1c * p.in_nx + x1c) * 2u;
+        float sfac = float(p.upsample_factor);
+        float dx = wy0 * (wx0 * in_flow[s00 + 0u] + wx1 * in_flow[s01 + 0u])
+                 + wy1 * (wx0 * in_flow[s10 + 0u] + wx1 * in_flow[s11 + 0u]);
+        float dy = wy0 * (wx0 * in_flow[s00 + 1u] + wx1 * in_flow[s01 + 1u])
+                 + wy1 * (wx0 * in_flow[s10 + 1u] + wx1 * in_flow[s11 + 1u]);
+        out_flow[o + 0u] = dx * sfac;
+        out_flow[o + 1u] = dy * sfac;
+    } else {
+        out_flow[o + 0u] = 0.f;
+        out_flow[o + 1u] = 0.f;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // merge normalize — 1:1 encode_band_rows num/den → RGB16 (DNG band)
 // ---------------------------------------------------------------------------

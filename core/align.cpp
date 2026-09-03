@@ -958,6 +958,63 @@ static FlowField upscale_flow(const FlowField& in, int target_ny, int target_nx,
     return out;
 }
 
+// upscale_lvl — Handheld-Multi-Frame-Super-Resolution-1.4.
+//
+//   upsampled = F.interpolate(flow, scale_factor=repeat_factor,
+//                             mode="bilinear")          # align_corners=False
+//   upsampled *= upsample_factor
+//   pad bottom/right to (target_ny, target_nx) with 0 flow
+//
+// No reference/moving image, no candidate re-match: a pure bilinear resize of
+// the flow field. Only reached under Config::align_match_14. The bilinear
+// weights reproduce PyTorch's area_pixel_compute_source_index for
+// align_corners=False: src = (dst + 0.5)/r - 0.5, clamped at 0, indices
+// clamped to the top edge. float math to mirror the Metal kernel twin.
+static FlowField upscale_flow_bilinear_14(const FlowField& in,
+                                          int target_ny, int target_nx,
+                                          int upsample_factor, int new_tile_size,
+                                          int prev_tile_size) {
+    int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
+    int repeat_factor = upsample_factor / std::max(1, tile_ratio);
+    if (repeat_factor < 1) repeat_factor = 1;
+
+    const int up_ny = in.ny * repeat_factor;
+    const int up_nx = in.nx * repeat_factor;
+    const f32 inv_r = 1.f / (f32)repeat_factor;
+    const f32 sfac  = (f32)upsample_factor;
+
+    FlowField out(target_ny, target_nx); // constructed zero -> pad is free
+    for (int oy = 0; oy < up_ny && oy < target_ny; ++oy) {
+        f32 sy = ((f32)oy + 0.5f) * inv_r - 0.5f;
+        if (sy < 0.f) sy = 0.f;
+        int y0 = (int)std::floor(sy);
+        f32 wy1 = sy - (f32)y0;
+        int y0c = std::min(y0, in.ny - 1);
+        int y1c = std::min(y0 + 1, in.ny - 1);
+        f32 wy0 = 1.f - wy1;
+        for (int ox = 0; ox < up_nx && ox < target_nx; ++ox) {
+            f32 sx = ((f32)ox + 0.5f) * inv_r - 0.5f;
+            if (sx < 0.f) sx = 0.f;
+            int x0 = (int)std::floor(sx);
+            f32 wx1 = sx - (f32)x0;
+            int x0c = std::min(x0, in.nx - 1);
+            int x1c = std::min(x0 + 1, in.nx - 1);
+            f32 wx0 = 1.f - wx1;
+
+            f32 dx = wy0 * (wx0 * in.dx(y0c, x0c) + wx1 * in.dx(y0c, x1c))
+                   + wy1 * (wx0 * in.dx(y1c, x0c) + wx1 * in.dx(y1c, x1c));
+            f32 dy = wy0 * (wx0 * in.dy(y0c, x0c) + wx1 * in.dy(y0c, x1c))
+                   + wy1 * (wx0 * in.dy(y1c, x0c) + wx1 * in.dy(y1c, x1c));
+            out.dx(oy, ox) = dx * sfac;
+            out.dy(oy, ox) = dy * sfac;
+        }
+    }
+    // aperture_limited / match_ambiguous are port-only extras with no 1.4
+    // analogue; leave them unset here (the mark_* passes rebuild them, and the
+    // fresh flow starts uncommitted), matching 1.4's flow-only upscale.
+    return out;
+}
+
 static FlowField upscale_flow_460(const Image& ref, const Image& moving,
                                   const FlowField& in, int target_ny, int target_nx,
                                   int upsample_factor, int new_tile_size,
@@ -1207,8 +1264,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         // is built on the alignment grey. See Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = (lvl < (int)cfg.bm_search_radii.size())
-                     ? cfg.bm_search_radii[lvl] : 2;
+        int radius = cfg.search_radius_for_level(lvl);
 
         // Tile grid from padded ref level (Python: h // tile_size)
         int ny = r.h / ts;
@@ -1227,9 +1283,13 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1])
                           : ts;
-            flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts,
-                                    cfg.align_ambiguous_fallback_enabled,
-                                    clamped_ambiguity_ratio(cfg));
+            if (cfg.align_match_14)
+                flow = upscale_flow_bilinear_14(flow, ny, nx, upsample_factor,
+                                                ts, prev_ts);
+            else
+                flow = upscale_flow_460(r, m, flow, ny, nx, upsample_factor, ts, prev_ts,
+                                        cfg.align_ambiguous_fallback_enabled,
+                                        clamped_ambiguity_ratio(cfg));
         }
 
         std::string metric = "L2";
@@ -1265,8 +1325,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         finest_hess = compute_hessian(gx, gy, cfg.grey_tile_size(tile_size));
         debug_dump_bin("cpp_gradx_ica", gx.data.data(), gx.data.size());
         debug_dump_bin("cpp_grady_ica", gy.data.data(), gy.data.size());
-        const int finest_radius = cfg.bm_search_radii.empty() ? 1
-                                                              : cfg.bm_search_radii[0];
+        const int finest_radius = cfg.search_radius_for_level(0);
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow,
                          cfg.grey_tile_size(tile_size),
                          cfg.ica_n_iter, cfg.num_threads,

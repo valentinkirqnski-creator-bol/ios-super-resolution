@@ -167,6 +167,7 @@ static MetalCtx& ctx() {
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460",
+            "align_upscale_flow_bilinear",
             "merge_normalize_rgb16",
             nullptr};
         for (int i = 0; need[i]; ++i) {
@@ -2683,6 +2684,52 @@ static bool upscale_flow_460_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
     return true;
 }
 
+// upscale_lvl bilinear — 1.4 (Config::align_match_14). Twin of
+// upscale_flow_bilinear_14() in align.cpp: a pure bilinear resize of the flow
+// field, no ref/moving, no ambiguity carry (the caller reallocates a fresh
+// zero ambiguity buffer for the resized grid, matching 1.4's flow-only path).
+static bool upscale_flow_bilinear_bufs(id<MTLBuffer> b_in, int in_ny, int in_nx,
+                                       __strong id<MTLBuffer>& b_out,
+                                       int target_ny, int target_nx,
+                                       int upsample_factor, int new_tile_size,
+                                       int prev_tile_size) {
+    auto& c = ctx();
+    int tile_ratio = new_tile_size / std::max(1, prev_tile_size);
+    int repeat_factor = upsample_factor / std::max(1, tile_ratio);
+    if (repeat_factor < 1) repeat_factor = 1;
+    int up_ny = in_ny * repeat_factor;
+    int up_nx = in_nx * repeat_factor;
+    const size_t out_b = (size_t)target_ny * (size_t)target_nx * 2u * sizeof(float);
+    b_out = buf(nullptr, out_b);
+    if (!b_out) return false;
+
+    AlignUpscaleParamsCPU p{};
+    p.in_ny = (uint32_t)in_ny;
+    p.in_nx = (uint32_t)in_nx;
+    p.target_ny = (uint32_t)target_ny;
+    p.target_nx = (uint32_t)target_nx;
+    p.upsample_factor = (uint32_t)upsample_factor;
+    p.repeat_factor = (uint32_t)repeat_factor;
+    p.up_ny = (uint32_t)up_ny;
+    p.up_nx = (uint32_t)up_nx;
+    p.ts = (int32_t)new_tile_size;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    id<MTLComputePipelineState> pipe = c.pipe("align_upscale_flow_bilinear");
+    if (!pipe) return false;
+    [enc setBuffer:b_in offset:0 atIndex:0];
+    [enc setBuffer:b_out offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, pipe, (NSUInteger)target_nx, (NSUInteger)target_ny);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "align:upscale-flow");
+    align_commit(cmd);
+    return true;
+}
+
 } // namespace
 
 static bool g_dumped_ref_grads = false;
@@ -2762,7 +2809,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // align() in align.cpp; see Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = (lvl < (int)cfg.bm_search_radii.size()) ? cfg.bm_search_radii[lvl] : 2;
+        int radius = cfg.search_radius_for_level(lvl);
 
         id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
         if (!b_ref) return false;
@@ -2789,14 +2836,25 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1]) : ts;
             id<MTLBuffer> b_up = nil;
             id<MTLBuffer> b_amb_up = nil;
-            if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
-                                       b_up, ny, nx, upsample_factor, ts, prev_ts,
-                                       r.h, r.w, m.h, m.w,
-                                       want_amb ? b_ambiguity : nil,
-                                       want_amb ? &b_amb_up : nullptr,
-                                       cfg.align_ambiguous_fallback_enabled,
-                                       cfg.flow_reject_1d_ambiguity_ratio) || !b_up)
-                return false;
+            if (cfg.align_match_14) {
+                // 1.4: bilinear flow resize, no ambiguity carry. The stale
+                // b_ambiguity (coarse-grid sized) is left to the realloc-on-
+                // mismatch guard just below, which hands the next level fresh
+                // zeros -- matching 1.4's flow-only upscale.
+                if (!upscale_flow_bilinear_bufs(b_flow, flow_ny, flow_nx, b_up,
+                                                ny, nx, upsample_factor, ts,
+                                                prev_ts) || !b_up)
+                    return false;
+            } else {
+                if (!upscale_flow_460_bufs(b_flow, flow_ny, flow_nx, b_ref, m.img,
+                                           b_up, ny, nx, upsample_factor, ts, prev_ts,
+                                           r.h, r.w, m.h, m.w,
+                                           want_amb ? b_ambiguity : nil,
+                                           want_amb ? &b_amb_up : nullptr,
+                                           cfg.align_ambiguous_fallback_enabled,
+                                           cfg.flow_reject_1d_ambiguity_ratio) || !b_up)
+                    return false;
+            }
             b_flow = b_up;
             if (want_amb && b_amb_up) {
                 b_ambiguity = b_amb_up;
@@ -2893,8 +2951,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
                   flow_ny, flow_nx, tile_size, cfg.ica_n_iter,
                   ica_damp_ratio_metal(cfg),
-                  ica_max_step_metal(cfg, cfg.bm_search_radii.empty()
-                                              ? 1 : cfg.bm_search_radii[0])))
+                  ica_max_step_metal(cfg, cfg.search_radius_for_level(0))))
         return false;
     }
 

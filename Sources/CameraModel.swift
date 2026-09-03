@@ -140,6 +140,11 @@ struct TuningParams: Equatable, Codable {
     /// correction budget is already spent when level 0 starts. Costs roughly
     /// +120MB at 12MP, because the reference gradient cache goes resident.
     var align_ica_per_level_fft: Bool = false
+    /// Match the alignment stage to Handheld-Multi-Frame-Super-Resolution-1.4:
+    /// finest search radius -> 1, bilinear inter-level flow upscale (not the 460
+    /// three-candidate re-match), and per-level ICA on the FFT grey. Off keeps
+    /// the 460-derived behaviour. Algorithm parity, not bit parity.
+    var align_match_14: Bool = false
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -226,7 +231,7 @@ struct TuningParams: Equatable, Codable {
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, use_neural_flow
+        case align_ica_per_level_fft, align_match_14, use_neural_flow
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
@@ -299,6 +304,7 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
+        align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -1916,6 +1922,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
+            "align_match_14": NSNumber(value: tuningParams.align_match_14),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),

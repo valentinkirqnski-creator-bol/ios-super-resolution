@@ -409,6 +409,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
     if (tuning[@"align_ica_per_level_fft"])
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
+    if (tuning[@"align_match_14"])
+        cfg.align_match_14 = tuning[@"align_match_14"].boolValue;
     if (tuning[@"use_neural_flow"])
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
