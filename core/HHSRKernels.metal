@@ -1082,8 +1082,16 @@ static inline void merge_comp_contrib(device const float* img,
         rob_y = (lr_y - 0.5f) / 2.f;
         rob_x = (lr_x - 0.5f) / 2.f;
     }
-    float local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w,
-                                               rob_y, rob_x);
+    // 1.4 parity: nearest R when the flow is nearest (p.flow_bilinear == 0), so
+    // R grades the same tile the merge fetches. Bilinear otherwise.
+    float local_r;
+    if (p.flow_bilinear != 0u) {
+        local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
+    } else {
+        int iy = clamp(int(floor(rob_y + 0.5f)), 0, int(p.rob_h) - 1);
+        int ix = clamp(int(floor(rob_x + 0.5f)), 0, int(p.rob_w) - 1);
+        local_r = robustness[uint(iy) * p.rob_w + uint(ix)];
+    }
     // Nothing to accumulate where the frame is fully rejected. Every
     // contribution is w * local_r * c or w * local_r, so all nine taps produce
     // exactly zero and the caller's running totals are unchanged.

@@ -186,7 +186,10 @@ struct TuningParams: Equatable, Codable {
     var debug_noise_model_disabled: Bool = false
     /// Sample the per-tile flow bilinearly between tile centres everywhere it
     /// is consumed, instead of taking the containing tile's vector.
-    var flow_bilinear_sampling: Bool = true
+    // Default false = 1.4 / HDR+ parity: consume the flow (and the robustness
+    // map) NEAREST-per-tile so R grades the tile-constant warp and can reject
+    // rotation misalignment. Bilinear smooths the warp so R can't reject it.
+    var flow_bilinear_sampling: Bool = false
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay

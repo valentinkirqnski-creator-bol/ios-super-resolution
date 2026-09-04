@@ -781,9 +781,22 @@ struct Config {
     // mask -- instead of taking the containing tile's vector. Removes the
     // piecewise-constant staircase that rotation turns into a visible tile
     // grid. See FlowField::sample_bilinear for why rotation and not
-    // translation. All consumers switch together or the mask would grade a
-    // correspondence the merge never fetches.
-    bool  flow_bilinear_sampling = true;
+    // translation. All consumers switch together (incl. the merge's robustness
+    // map sample) or the mask would grade a correspondence the merge never
+    // fetches.
+    //
+    // DEFAULT FALSE = 1.4 / HDR+ parity, and it is the intended behaviour: 1.4
+    // consumes the flow NEAREST-per-tile in both the merge (alignments[py,px])
+    // and the robustness warp (cuda_warp_dogson: patch = x//tile_size), and
+    // nearest-samples R. That is not a limitation -- it is what lets robustness
+    // WORK under rotation. Bilinear made each pixel's warp approximate the true
+    // rotation, so the aligned comp matched the reference (d small) and R kept
+    // it -- but the raw-scale residual of that approximation still merged,
+    // surfacing as tile-shaped ghosting R never rejected. Nearest keeps the
+    // tile-constant warp visible to R: at the tile edges the warp is wrong, d is
+    // large, R drops, and the reference shows through instead of a smeared-but-
+    // wrong merge. Rejection is the mechanism; bilinear disabled it.
+    bool  flow_bilinear_sampling = false;
 
     // Overlapping tiles for alignment (the IPOL author's suggestion): instead of
     // Ts=16 at stride 16, use Ts=16 at stride 8 (a 50% overlap). After the
