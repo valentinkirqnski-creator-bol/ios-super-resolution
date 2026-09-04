@@ -723,6 +723,15 @@ struct CameraView: View {
              feeds merge and robustness at the finer grid. Runs on CPU; off by default.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Per-Pixel Robustness s (paper)", isOn: $cam.tuningParams.robustness_per_pixel_s)
+        Text("""
+             Wronski computes the motion scale s per PIXEL; the port computes one s \
+             per 16px tile and, since s2=12 saturates R, that broadcasts one R over \
+             the whole tile. This samples s bilinearly per pixel so it varies \
+             smoothly, removing the tile-block look. Foundation for lowering s2; on \
+             its own it won't reject a smooth aperture slide. Off by default.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Guide: Keep White Balance", isOn: $cam.tuningParams.guide_white_balance)
         Toggle("Guide: Colour Matrix (→sRGB)", isOn: $cam.tuningParams.guide_color_matrix)
         Picker("Guide Curve", selection: $cam.tuningParams.guide_curve) {

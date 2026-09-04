@@ -161,6 +161,10 @@ struct TuningParams: Equatable, Codable {
     var guide_color_matrix: Bool = false
     /// -1 auto (follow sqrt guide), 0 none, 1 sqrt, 2 gamma, 3 srgb.
     var guide_curve: Int = -1
+    /// Per-pixel motion scale s (Wronski's per-pixel M): sample s bilinearly per
+    /// pixel instead of one value per 16px tile, removing the tile-block R the
+    /// paper never had. Off by default.
+    var robustness_per_pixel_s: Bool = false
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -250,6 +254,7 @@ struct TuningParams: Equatable, Codable {
         case align_ica_per_level_fft, align_match_14, use_neural_flow
         case flow_overlap_tiles, overlap_search_radius
         case guide_white_balance, guide_color_matrix, guide_curve
+        case robustness_per_pixel_s
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
@@ -328,6 +333,7 @@ struct TuningParams: Equatable, Codable {
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
+        robustness_per_pixel_s = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_pixel_s) ?? robustness_per_pixel_s
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -1951,6 +1957,7 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
+            "robustness_per_pixel_s": NSNumber(value: tuningParams.robustness_per_pixel_s),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),

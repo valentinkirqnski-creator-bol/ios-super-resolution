@@ -1052,6 +1052,25 @@ static std::vector<f32> compute_s(const FlowField& flow, f32 Mt, f32 s1, f32 s2,
     return S;
 }
 
+// Bilinear sample of the per-tile motion scale S at a tile coordinate (already
+// tile-centred: tc = raw_pos/tile_size - 0.5, same convention as
+// FlowField::sample_bilinear). Turns the per-tile s into the per-pixel s the
+// paper specifies (Config::robustness_per_pixel_s), removing the tile-block seam.
+static inline f32 sample_s_bilinear(const std::vector<f32>& S, int ny, int nx,
+                                    f32 tcy, f32 tcx) {
+    if (ny <= 0 || nx <= 0) return 0.f;
+    const int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+    const f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+    const int iy0 = cl(y0, ny), iy1 = cl(y0 + 1, ny);
+    const int ix0 = cl(x0, nx), ix1 = cl(x0 + 1, nx);
+    const f32 s00 = S[(size_t)iy0 * nx + ix0], s01 = S[(size_t)iy0 * nx + ix1];
+    const f32 s10 = S[(size_t)iy1 * nx + ix0], s11 = S[(size_t)iy1 * nx + ix1];
+    const f32 top = s00 + (s01 - s00) * ax;
+    const f32 bot = s10 + (s11 - s10) * ax;
+    return top + (bot - top) * ay;
+}
+
 static Image local_min_5x5(const Image& R) {
     Image r(R.h, R.w, 1);
     const f32 inf = std::numeric_limits<f32>::infinity();
@@ -1223,7 +1242,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 if (s_select_out) s_select_out->at(y, x) = 0.f;
                 continue;
             }
-            f32 s = S[pidx];
+            // Per-pixel s: bilinear over the tile grid (see the guide-res path).
+            // Raw resolution -> tile coordinate is a plain raw/tile_size - 0.5.
+            f32 s;
+            if (cfg.robustness_per_pixel_s) {
+                const f32 tcy = (f32)y / (f32)tile_size - 0.5f;
+                const f32 tcx = (f32)x / (f32)tile_size - 0.5f;
+                s = sample_s_bilinear(S, flow.ny, flow.nx, tcy, tcx);
+            } else {
+                s = S[pidx];
+            }
             f32 sig = sigma_sq.at(y, x);
             const f32 ratio = (sig > 0.f && std::isfinite(sig))
                 ? d_sq.at(y, x) / sig
@@ -1661,7 +1689,19 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const int new_x = (int)std::lround((f32)x + flow_x);
             const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
-            f32 s = S[pidx];
+            // Per-pixel s (Wronski's per-pixel M): bilinearly sample the per-tile
+            // S at this pixel's tile coordinate instead of the nearest tile, so
+            // s varies smoothly rather than in 16px blocks. Same tile coordinate
+            // the flow was sampled at above.
+            f32 s;
+            if (cfg.robustness_per_pixel_s) {
+                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
+                const f32 tcy = (sc * (f32)y + 0.5f * (sc - 1.f)) / (f32)tile_size - 0.5f;
+                const f32 tcx = (sc * (f32)x + 0.5f * (sc - 1.f)) / (f32)tile_size - 0.5f;
+                s = sample_s_bilinear(S, flow.ny, flow.nx, tcy, tcx);
+            } else {
+                s = S[pidx];
+            }
             f32 sig = sigma_sq.at(y, x);
             const f32 ratio = (sig > 0.f && std::isfinite(sig))
                 ? d_sq.at(y, x) / sig

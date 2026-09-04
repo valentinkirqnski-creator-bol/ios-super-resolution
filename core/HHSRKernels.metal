@@ -1562,7 +1562,25 @@ struct RobMaskParams {
     uint ambiguous_enabled;  // 1 = demote tiles whose BM match was ambiguous
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide, 1.4)
+    uint per_pixel_s;  // 1 = sample s bilinearly per pixel (Wronski per-pixel M)
 };
+
+// Bilinear sample of the per-tile motion scale S at a tile coordinate (already
+// tile-centred). Twin of sample_s_bilinear in robustness.cpp.
+inline float rob_sample_s_bilinear(device const float* S, uint fny, uint fnx,
+                                   float tcy, float tcx) {
+    int y0 = int(floor(tcy)), x0 = int(floor(tcx));
+    float ay = tcy - float(y0), ax = tcx - float(x0);
+    uint iy0 = uint(clamp(y0,     0, int(fny) - 1));
+    uint iy1 = uint(clamp(y0 + 1, 0, int(fny) - 1));
+    uint ix0 = uint(clamp(x0,     0, int(fnx) - 1));
+    uint ix1 = uint(clamp(x0 + 1, 0, int(fnx) - 1));
+    float s00 = S[iy0 * fnx + ix0], s01 = S[iy0 * fnx + ix1];
+    float s10 = S[iy1 * fnx + ix0], s11 = S[iy1 * fnx + ix1];
+    float top = s00 + (s01 - s00) * ax;
+    float bot = s10 + (s11 - s10) * ax;
+    return top + (bot - top) * ay;
+}
 
 inline float dogson_quadratic(float x) {
     float ax = fabs(x);
@@ -1997,7 +2015,17 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
     float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
     d_sq_ = d_ms_sq * shrink * shrink;
-    float s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
+    // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
+    // pixel's tile coordinate, matching the flow sampling above. Else nearest.
+    float s;
+    if (p.per_pixel_s != 0u) {
+        float sc = (p.nch == 1u) ? 1.f : 2.f;
+        float tcy = (sc * float(gid.y) + 0.5f * (sc - 1.f)) / float(p.tile_size) - 0.5f;
+        float tcx = (sc * float(gid.x) + 0.5f * (sc - 1.f)) / float(p.tile_size) - 0.5f;
+        s = rob_sample_s_bilinear(S, p.flow_ny, p.flow_nx, tcy, tcx);
+    } else {
+        s = S[uint(patch_idy) * p.flow_nx + uint(patch_idx)];
+    }
     float sig = sigma_sq_;
     uint pidx = uint(patch_idy) * p.flow_nx + uint(patch_idx);
     float ratio = (sig > 0.f && isfinite(sig))
@@ -2105,6 +2133,7 @@ struct RobMaskRawParams {
     float motion_edge_noise_floor_multiplier;
     uint motion_edge_neighborhood_radius;
     uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide; was _pad0)
+    uint per_pixel_s;  // 1 = sample s bilinearly per pixel (Wronski per-pixel M)
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2182,7 +2211,16 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
     float d_sq_ = d_ms_sq * shrink * shrink;
 
-    float s = S[pidx];
+    // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
+    // raw pixel's tile coordinate. Else nearest. Raw res -> tc = gid/ts - 0.5.
+    float s;
+    if (p.per_pixel_s != 0u) {
+        float tcy = float(gid.y) / float(p.tile_size) - 0.5f;
+        float tcx = float(gid.x) / float(p.tile_size) - 0.5f;
+        s = rob_sample_s_bilinear(S, p.flow_ny, p.flow_nx, tcy, tcx);
+    } else {
+        s = S[pidx];
+    }
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
         s = min(s, p.r_s1);
     if (p.chain_reject_enabled != 0u && chain_inconsistent[pidx] != 0u)

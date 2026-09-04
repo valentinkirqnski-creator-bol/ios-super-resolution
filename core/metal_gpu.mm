@@ -1144,8 +1144,9 @@ struct RobMaskParamsCPU {
     // correspondence the merge actually fetches.
     uint32_t flow_bilinear = 0;
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide, 1.4)
+    uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 100, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1168,8 +1169,9 @@ struct RobMaskRawParamsCPU {
     float motion_edge_noise_floor_multiplier = 0.f;
     uint32_t motion_edge_neighborhood_radius = 0;
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide; was _pad0)
+    uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 104, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 108, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1728,6 +1730,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
+    mp.per_pixel_s = cfg.robustness_per_pixel_s ? 1u : 0u; // Wronski per-pixel M
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1932,6 +1935,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
+    mp.per_pixel_s = cfg.robustness_per_pixel_s ? 1u : 0u; // Wronski per-pixel M
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;

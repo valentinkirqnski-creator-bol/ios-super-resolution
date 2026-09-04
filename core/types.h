@@ -732,6 +732,19 @@ struct Config {
     // noise model disabled (debug_noise_model_disabled), where sigma is measured
     // contrast and d measured colour distance in the SAME processed space. All
     // default off / -1, so the guide is byte-identical until a flag is flipped.
+    // Per-pixel motion scale s (Wronski Eq. 5/8). The paper evaluates the
+    // motion prior M -- and therefore s -- PER PIXEL; the port (following the
+    // IPOL code) computes one s per alignment tile and fetches it by nearest
+    // tile index (S[pidx]), so a whole 16px tile shares one s. Since s2=12
+    // amplifies exp(-d^2/sigma^2) and saturates R, that broadcasts one R over
+    // the tile ("the whole tile got the same R"). With this on, s is sampled
+    // BILINEARLY from the per-tile S field at each pixel, so it varies smoothly
+    // -- the per-pixel s the paper specifies, without the tile-block seam. The
+    // per-tile S is still measured on the correct (grey) grid; only its
+    // consumption becomes per-pixel. Off by default. Does not by itself reject
+    // a smooth aperture slide (M stays low there) -- pair with a lower r_s2.
+    bool robustness_per_pixel_s = false;
+
     bool guide_white_balance = false;  // keep WB in the guide (skip un-prewhiten)
     bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB
     int  guide_curve = -1;             // -1 auto, 0 none, 1 sqrt, 2 gamma, 3 srgb
