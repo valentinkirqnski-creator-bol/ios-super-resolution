@@ -732,6 +732,14 @@ struct CameraView: View {
              some burst samples for artifact-free output. Lower threshold rejects more.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        HStack {
+            Text("Geom Threshold")
+            Spacer()
+            Text(String(format: "%.3f", cam.tuningParams.motion_geom_reject_threshold))
+        }
+        Slider(value: $cam.tuningParams.motion_geom_reject_threshold, in: 0.005...0.06)
+        Text("~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner, fewer samples kept.")
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Per-Pixel Robustness s (paper)", isOn: $cam.tuningParams.robustness_per_pixel_s)
         Text("""
              Wronski computes the motion scale s per PIXEL; the port computes one s \
