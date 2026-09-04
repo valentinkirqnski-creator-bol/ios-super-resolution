@@ -925,7 +925,11 @@ struct Config {
     // A rejection ("hiding") fix -- it discards misaligned samples rather than
     // aligning them. Off by default.
     bool  motion_geom_reject_enabled = false;
-    float motion_geom_reject_threshold = 0.03f; // intensity units (|grad I|*|E|)
+    // intensity units (|grad I|*|E|). At a strong rotation edge the metric is
+    // only ~0.02-0.03 on the sqrt guide, so this must be LOW to reject anything:
+    // ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
+    // drops more burst samples.
+    float motion_geom_reject_threshold = 0.02f;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
     float motion_edge_noise_floor_multiplier = 1.0f;

@@ -171,8 +171,10 @@ struct TuningParams: Equatable, Codable {
     /// to the reference); inert under one-direction motion. A hiding fix — it
     /// trades some burst samples for artifact-free output. Off by default.
     var motion_geom_reject_enabled: Bool = false
-    /// |∇I|·|E| threshold (intensity units). Lower rejects more. ~0.03–0.1.
-    var motion_geom_reject_threshold: Float = 0.06
+    /// |∇I|·|E| threshold (intensity units). Must be LOW to reject anything:
+    /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
+    /// drops more burst samples.
+    var motion_geom_reject_threshold: Float = 0.02
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical

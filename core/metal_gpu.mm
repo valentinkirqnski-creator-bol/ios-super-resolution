@@ -1146,7 +1146,7 @@ struct RobMaskParamsCPU {
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide, 1.4)
     uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
     uint32_t geom_reject_enabled = 0; // 1 = geometry-aware rejection
-    float    geom_reject_threshold = 0.03f;
+    float    geom_reject_threshold = 0.02f;
 };
 static_assert(sizeof(RobMaskParamsCPU) == 112, "RobMaskParamsCPU");
 
