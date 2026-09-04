@@ -61,4 +61,13 @@ bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
                                const char* name_suffix = "",
                                int target_h = 0, int target_w = 0);
 
+// Write a per-tile optical-flow field as a colour PPM for diagnosis, next to
+// the DNG ("<dng>_flow.ppm"). Middlebury-style colour wheel: hue = flow
+// DIRECTION, brightness = MAGNITUDE (self-scaled to the field's max). A smooth
+// hue gradient means smooth flow (e.g. an aperture slide); hard colour bands/
+// blocks mean the flow field itself is broken. Nearest-upsampled to
+// target_h/target_w when given (so it overlays the mask), else native tile grid.
+bool write_flow_ppm(const FlowField& flow, const std::string& dng_path,
+                    int target_h = 0, int target_w = 0);
+
 } // namespace hhsr

@@ -2025,6 +2025,9 @@ final class CameraModel: NSObject, ObservableObject {
             var maskSuffixes: [String] = []
             if tuningParams.robustness_save_mask {
                 maskSuffixes.append("_robustness.pgm")
+                // Colour optical-flow diagnostic (write_flow_ppm), saved next to
+                // the mask. Hue = flow direction, brightness = magnitude.
+                maskSuffixes.append("_flow.ppm")
                 if tuningParams.robustness_save_s_masks {
                     maskSuffixes.append("_robustness_s1.pgm")
                     maskSuffixes.append("_robustness_s2.pgm")
@@ -2043,7 +2046,8 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    /// Load 8-bit binary PGM (P5) written by the C++ robustness export.
+    /// Load 8-bit binary PGM (P5 grayscale) or PPM (P6 colour) written by the
+    /// C++ robustness / flow export.
     private static func uiImageFromPGM(url: URL) -> UIImage? {
         guard let data = try? Data(contentsOf: url), data.count > 16 else { return nil }
         var i = 0
@@ -2069,21 +2073,28 @@ final class CameraModel: NSObject, ObservableObject {
             guard i > start else { return nil }
             return String(bytes: data[start..<i], encoding: .ascii)
         }
-        guard nextToken() == "P5",
+        guard let magic = nextToken(), magic == "P5" || magic == "P6",
               let ws = nextToken(), let hs = nextToken(), let ms = nextToken(),
               let w = Int(ws), let h = Int(hs), let maxv = Int(ms), maxv == 255,
               w > 0, h > 0 else { return nil }
+        let color = (magic == "P6")
         // Single whitespace after maxval, then raw bytes
         while i < data.count && (data[i] == 0x20 || data[i] == 0x09 || data[i] == 0x0d) { i += 1 }
         if i < data.count && data[i] == 0x0a { i += 1 }
-        let need = w * h
+        let need = w * h * (color ? 3 : 1)
         guard i + need <= data.count else { return nil }
-        var rgba = [UInt8](repeating: 255, count: need * 4)
-        for p in 0..<need {
-            let g = data[i + p]
-            rgba[p * 4 + 0] = g
-            rgba[p * 4 + 1] = g
-            rgba[p * 4 + 2] = g
+        var rgba = [UInt8](repeating: 255, count: w * h * 4)
+        for p in 0..<(w * h) {
+            if color {
+                rgba[p * 4 + 0] = data[i + p * 3 + 0]
+                rgba[p * 4 + 1] = data[i + p * 3 + 1]
+                rgba[p * 4 + 2] = data[i + p * 3 + 2]
+            } else {
+                let g = data[i + p]
+                rgba[p * 4 + 0] = g
+                rgba[p * 4 + 1] = g
+                rgba[p * 4 + 2] = g
+            }
             rgba[p * 4 + 3] = 255
         }
         let cs = CGColorSpaceCreateDeviceRGB()

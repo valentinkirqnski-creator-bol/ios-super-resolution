@@ -1367,6 +1367,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
+        // Diagnostic: dump the first comparison frame's flow as a colour PPM
+        // next to the mask ("<dng>_flow.ppm"). Rides the mask-save toggle so it
+        // appears whenever the robustness mask is saved. Hue = direction,
+        // brightness = magnitude -- a smooth gradient is a smooth (possibly
+        // aperture-slid) flow; hard bands are a broken flow field.
+        if (work.robustness_save_mask && pos == 0)
+            write_flow_ppm(flow, dng_path, comp.h, comp.w);
         const double t_freeg = prof_now_ms();
         comp_grey = Image(); // free before robustness/kernels peak
         prof_add_cpu("comp:free-grey", prof_now_ms() - t_freeg);

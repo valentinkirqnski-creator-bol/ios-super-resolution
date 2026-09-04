@@ -50,6 +50,74 @@ bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
     return (bool)out;
 }
 
+// h in [0,1) hue, s/v in [0,1] -> 8-bit RGB. Standard HSV conversion.
+static void hsv_to_rgb8(f32 h, f32 s, f32 v, unsigned char& r,
+                        unsigned char& g, unsigned char& b) {
+    const f32 hh = (h - std::floor(h)) * 6.f;
+    const int i = (int)hh;
+    const f32 f = hh - (f32)i;
+    const f32 p = v * (1.f - s);
+    const f32 q = v * (1.f - s * f);
+    const f32 t = v * (1.f - s * (1.f - f));
+    f32 rf, gf, bf;
+    switch (i % 6) {
+        case 0: rf = v; gf = t; bf = p; break;
+        case 1: rf = q; gf = v; bf = p; break;
+        case 2: rf = p; gf = v; bf = t; break;
+        case 3: rf = p; gf = q; bf = v; break;
+        case 4: rf = t; gf = p; bf = v; break;
+        default: rf = v; gf = p; bf = q; break;
+    }
+    r = (unsigned char)(clampf(rf, 0.f, 1.f) * 255.f + 0.5f);
+    g = (unsigned char)(clampf(gf, 0.f, 1.f) * 255.f + 0.5f);
+    b = (unsigned char)(clampf(bf, 0.f, 1.f) * 255.f + 0.5f);
+}
+
+bool write_flow_ppm(const FlowField& flow, const std::string& dng_path,
+                    int target_h, int target_w) {
+    if (flow.flow.empty() || flow.ny <= 0 || flow.nx <= 0) return false;
+    std::string path = dng_path;
+    const std::string suf = ".dng";
+    const std::string tail = "_flow.ppm";
+    if (path.size() >= suf.size() &&
+        path.compare(path.size() - suf.size(), suf.size(), suf) == 0)
+        path.replace(path.size() - suf.size(), suf.size(), tail);
+    else
+        path += tail;
+
+    // Self-scale magnitude to the field's own max so the structure is visible
+    // regardless of the burst's motion size. Guard against an all-zero field.
+    f32 max_mag = 1e-6f;
+    for (int ty = 0; ty < flow.ny; ++ty)
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const f32 dx = flow.dx(ty, tx), dy = flow.dy(ty, tx);
+            if (std::isfinite(dx) && std::isfinite(dy))
+                max_mag = std::max(max_mag, std::sqrt(dx * dx + dy * dy));
+        }
+
+    const int out_h = (target_h > 0) ? target_h : flow.ny;
+    const int out_w = (target_w > 0) ? target_w : flow.nx;
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    out << "P6\n" << out_w << " " << out_h << "\n255\n";
+    const f32 two_pi = 6.28318530718f;
+    for (int y = 0; y < out_h; ++y) {
+        const int ty = std::min(flow.ny - 1, (int)((int64_t)y * flow.ny / out_h));
+        for (int x = 0; x < out_w; ++x) {
+            const int tx = std::min(flow.nx - 1, (int)((int64_t)x * flow.nx / out_w));
+            f32 dx = flow.dx(ty, tx), dy = flow.dy(ty, tx);
+            if (!std::isfinite(dx) || !std::isfinite(dy)) { dx = 0.f; dy = 0.f; }
+            const f32 mag = std::sqrt(dx * dx + dy * dy);
+            const f32 hue = (std::atan2(dy, dx) + 3.14159265359f) / two_pi; // [0,1)
+            const f32 val = clampf(mag / max_mag, 0.f, 1.f);                // brightness = magnitude
+            unsigned char r, g, b;
+            hsv_to_rgb8(hue, 1.f, val, r, g, b);
+            out.put((char)r); out.put((char)g); out.put((char)b);
+        }
+    }
+    return (bool)out;
+}
+
 Image pad_image_circular(const Image& img, int tile_size) {
     int pad_h = (tile_size - img.h % tile_size) % tile_size;
     int pad_w = (tile_size - img.w % tile_size) % tile_size;
