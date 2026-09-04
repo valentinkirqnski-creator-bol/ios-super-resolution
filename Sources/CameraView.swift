@@ -723,6 +723,15 @@ struct CameraView: View {
              feeds merge and robustness at the finer grid. Runs on CPU; off by default.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Geometry Rejection (rotation)", isOn: $cam.tuningParams.motion_geom_reject_enabled)
+        Text("""
+             Rejects pixels where the per-tile translation is a poor model of the \
+             local motion (flow gradient × distance from tile centre, weighted by \
+             edge strength) — the rotation tile-ghosts. Rejected pixels fall back to \
+             the reference. Inert under one-direction motion. A hiding fix: trades \
+             some burst samples for artifact-free output. Lower threshold rejects more.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Per-Pixel Robustness s (paper)", isOn: $cam.tuningParams.robustness_per_pixel_s)
         Text("""
              Wronski computes the motion scale s per PIXEL; the port computes one s \

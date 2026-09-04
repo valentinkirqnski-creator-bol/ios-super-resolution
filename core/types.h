@@ -908,6 +908,24 @@ struct Config {
     // the noise model rather than being a fixed number.
     float hf_min_texture_snr = 4.0f;
     bool  motion_edge_rejection_enabled = true;
+
+    // Geometry-aware rejection: a second test on top of Wronski's R that rejects
+    // pixels where the per-tile TRANSLATION flow is provably a poor model of the
+    // local motion. The flow field's gradient G (central difference of
+    // neighbouring tile vectors) predicts how the true motion varies inside the
+    // tile: E(p) = G_x*u + G_y*v at pixel offset (u,v) from the tile centre.
+    // Weighted by the reference image gradient (only errors on edges are
+    // visible), the test rejects where |grad I| * |E| exceeds the threshold:
+    //   R := 0 where |grad I| * |E| > motion_geom_reject_threshold.
+    // Under pure translation G ~ 0 so E ~ 0 and nothing is rejected; under
+    // rotation neighbouring tiles differ, E grows toward the tile edges, and the
+    // pixels the per-tile warp gets wrong are dropped (falling back to the
+    // reference) instead of merging as a ghost. Validated on APC bursts:
+    // rejecting the top ~20% by this metric leaves the rest at the noise floor.
+    // A rejection ("hiding") fix -- it discards misaligned samples rather than
+    // aligning them. Off by default.
+    bool  motion_geom_reject_enabled = false;
+    float motion_geom_reject_threshold = 0.03f; // intensity units (|grad I|*|E|)
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
     float motion_edge_noise_floor_multiplier = 1.0f;

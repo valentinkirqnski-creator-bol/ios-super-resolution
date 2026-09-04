@@ -1750,7 +1750,36 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            const bool hard_reject = hf_reject || edge_reject;
+            // Geometry-aware rejection (Config::motion_geom_reject_enabled):
+            // reject where the per-tile TRANSLATION is a poor model of the local
+            // motion. E = flow-gradient * offset-from-tile-centre (within-tile
+            // motion variation, from neighbouring tile vectors), weighted by the
+            // reference gradient so only visible-edge errors reject. Inert under
+            // translation (flow gradient ~ 0). Validated on APC bursts.
+            bool geom_reject = false;
+            if (cfg.motion_geom_reject_enabled && flow.ny >= 3 && flow.nx >= 3) {
+                auto clt = [](int a, int hi) { return a < 0 ? 0 : (a >= hi ? hi - 1 : a); };
+                const int ptu = clt(patch_idy - 1, flow.ny), ptd = clt(patch_idy + 1, flow.ny);
+                const int pxl = clt(patch_idx - 1, flow.nx), pxr = clt(patch_idx + 1, flow.nx);
+                const f32 inv2ts = 1.f / (2.f * (f32)tile_size);
+                const f32 gdxdx = (flow.dx(patch_idy, pxr) - flow.dx(patch_idy, pxl)) * inv2ts;
+                const f32 gdydx = (flow.dy(patch_idy, pxr) - flow.dy(patch_idy, pxl)) * inv2ts;
+                const f32 gdxdy = (flow.dx(ptd, patch_idx) - flow.dx(ptu, patch_idx)) * inv2ts;
+                const f32 gdydy = (flow.dy(ptd, patch_idx) - flow.dy(ptu, patch_idx)) * inv2ts;
+                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
+                const f32 rawx = sc * (f32)x + 0.5f * (sc - 1.f);
+                const f32 rawy = sc * (f32)y + 0.5f * (sc - 1.f);
+                const f32 u = rawx - ((f32)patch_idx + 0.5f) * (f32)tile_size;
+                const f32 v = rawy - ((f32)patch_idy + 0.5f) * (f32)tile_size;
+                const f32 ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v;
+                const f32 Emag = std::sqrt(ex * ex + ey * ey);
+                const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
+                const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
+                const f32 gix = 0.5f * (ref_stats.means.at(y, xr, 0) - ref_stats.means.at(y, xl, 0)) / sc;
+                const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
+                geom_reject = (std::sqrt(gix * gix + giy * giy) * Emag) > cfg.motion_geom_reject_threshold;
+            }
+            const bool hard_reject = hf_reject || edge_reject || geom_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);

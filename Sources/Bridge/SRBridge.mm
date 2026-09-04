@@ -423,6 +423,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"robustness_per_pixel_s"])
         cfg.robustness_per_pixel_s = tuning[@"robustness_per_pixel_s"].boolValue;
+    if (tuning[@"motion_geom_reject_enabled"])
+        cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
+    if (tuning[@"motion_geom_reject_threshold"])
+        cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"use_neural_flow"])
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])

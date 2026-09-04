@@ -165,6 +165,14 @@ struct TuningParams: Equatable, Codable {
     /// pixel instead of one value per 16px tile, removing the tile-block R the
     /// paper never had. Off by default.
     var robustness_per_pixel_s: Bool = false
+    /// Geometry-aware rejection: drop pixels where the per-tile translation is a
+    /// poor model of local motion (flow-gradient × offset, weighted by |∇I|).
+    /// Cleans rotation tile-ghosts by rejecting the worst pixels (they fall back
+    /// to the reference); inert under one-direction motion. A hiding fix — it
+    /// trades some burst samples for artifact-free output. Off by default.
+    var motion_geom_reject_enabled: Bool = false
+    /// |∇I|·|E| threshold (intensity units). Lower rejects more. ~0.03–0.1.
+    var motion_geom_reject_threshold: Float = 0.06
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -258,6 +266,7 @@ struct TuningParams: Equatable, Codable {
         case flow_overlap_tiles, overlap_search_radius
         case guide_white_balance, guide_color_matrix, guide_curve
         case robustness_per_pixel_s
+        case motion_geom_reject_enabled, motion_geom_reject_threshold
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
@@ -337,6 +346,8 @@ struct TuningParams: Equatable, Codable {
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_pixel_s = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_pixel_s) ?? robustness_per_pixel_s
+        motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
+        motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -1961,6 +1972,8 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_pixel_s": NSNumber(value: tuningParams.robustness_per_pixel_s),
+            "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
+            "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),

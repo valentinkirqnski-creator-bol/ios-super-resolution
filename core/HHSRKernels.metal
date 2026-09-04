@@ -1571,6 +1571,8 @@ struct RobMaskParams {
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
     uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide, 1.4)
     uint per_pixel_s;  // 1 = sample s bilinearly per pixel (Wronski per-pixel M)
+    uint geom_reject_enabled;   // 1 = geometry-aware rejection (Config::motion_geom_reject)
+    float geom_reject_threshold;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2106,7 +2108,30 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // offset was chosen for producing a small difference.
     if (p.ambiguous_enabled != 0u && match_ambiguous[pidx] != 0u)
         s = min(s, p.r_s1);
-    bool hard_reject = hf_reject || edge_reject;
+    // Geometry-aware rejection: reject where the per-tile translation is a poor
+    // model of the local motion (flow-gradient * offset from tile centre,
+    // weighted by |grad I|). Twin of compute_robustness in robustness.cpp.
+    bool geom_reject = false;
+    if (p.geom_reject_enabled != 0u && p.flow_ny >= 3u && p.flow_nx >= 3u) {
+        int ptu = clamp(patch_idy - 1, 0, int(p.flow_ny) - 1), ptd = clamp(patch_idy + 1, 0, int(p.flow_ny) - 1);
+        int pxl = clamp(patch_idx - 1, 0, int(p.flow_nx) - 1), pxr = clamp(patch_idx + 1, 0, int(p.flow_nx) - 1);
+        float i2 = 1.0f / (2.0f * float(p.tile_size));
+        uint fr = (uint(patch_idy) * p.flow_nx + uint(pxr)) * 2u, fl = (uint(patch_idy) * p.flow_nx + uint(pxl)) * 2u;
+        uint fd = (uint(ptd) * p.flow_nx + uint(patch_idx)) * 2u, fu = (uint(ptu) * p.flow_nx + uint(patch_idx)) * 2u;
+        float gdxdx = (flow[fr + 0u] - flow[fl + 0u]) * i2, gdydx = (flow[fr + 1u] - flow[fl + 1u]) * i2;
+        float gdxdy = (flow[fd + 0u] - flow[fu + 0u]) * i2, gdydy = (flow[fd + 1u] - flow[fu + 1u]) * i2;
+        float sc = (p.nch == 3u) ? 2.0f : 1.0f;
+        float rawx = sc * float(gid.x) + 0.5f * (sc - 1.0f), rawy = sc * float(gid.y) + 0.5f * (sc - 1.0f);
+        float u = rawx - (float(patch_idx) + 0.5f) * float(p.tile_size);
+        float v = rawy - (float(patch_idy) + 0.5f) * float(p.tile_size);
+        float ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v; float Emag = sqrt(ex * ex + ey * ey);
+        int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
+        int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
+        float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
+        float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
+        geom_reject = (sqrt(gix * gix + giy * giy) * Emag) > p.geom_reject_threshold;
+    }
+    bool hard_reject = hf_reject || edge_reject || geom_reject;
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);

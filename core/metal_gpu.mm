@@ -1145,8 +1145,10 @@ struct RobMaskParamsCPU {
     uint32_t flow_bilinear = 0;
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide, 1.4)
     uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
+    uint32_t geom_reject_enabled = 0; // 1 = geometry-aware rejection
+    float    geom_reject_threshold = 0.03f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 112, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1936,6 +1938,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = cfg.robustness_per_pixel_s ? 1u : 0u; // Wronski per-pixel M
+    mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
+    mp.geom_reject_threshold = cfg.motion_geom_reject_threshold;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;
