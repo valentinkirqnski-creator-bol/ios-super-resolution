@@ -723,6 +723,25 @@ struct CameraView: View {
              feeds merge and robustness at the finer grid. Runs on CPU; off by default.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Guide: Keep White Balance", isOn: $cam.tuningParams.guide_white_balance)
+        Toggle("Guide: Colour Matrix (→sRGB)", isOn: $cam.tuningParams.guide_color_matrix)
+        Picker("Guide Curve", selection: $cam.tuningParams.guide_curve) {
+            Text("Auto").tag(-1)
+            Text("None").tag(0)
+            Text("Sqrt").tag(1)
+            Text("Gamma").tag(2)
+            Text("sRGB").tag(3)
+        }
+        .pickerStyle(.segmented)
+        Text("""
+             Render the robustness guide as a real display RGB before the colour \
+             distance is measured: keep white balance, apply the camera→sRGB matrix, \
+             and a transfer curve. Separates true colour mismatches from noise. Run \
+             with the noise model OFF — the noise LUT is calibrated in the sqrt-raw \
+             guide domain and won't match once WB/matrix change it. All off/Auto = \
+             unchanged.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
         Text("""
              Replaces the block-matching pyramid with a PWCNet model run on-device via \

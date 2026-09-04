@@ -153,6 +153,14 @@ struct TuningParams: Equatable, Codable {
     var flow_overlap_tiles: Bool = false
     /// Local search radius (grey px) for the overlapping re-measurement.
     var overlap_search_radius: Int = 2
+    /// Render the robustness guide as a real display RGB before d/sigma: keep
+    /// white balance, apply the camera->sRGB matrix, and a transfer curve. Makes
+    /// the colour distance separate true mismatches from noise. Run with the
+    /// noise model off (the LUT is calibrated in the sqrt-raw guide domain).
+    var guide_white_balance: Bool = false
+    var guide_color_matrix: Bool = false
+    /// -1 auto (follow sqrt guide), 0 none, 1 sqrt, 2 gamma, 3 srgb.
+    var guide_curve: Int = -1
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -241,6 +249,7 @@ struct TuningParams: Equatable, Codable {
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
         case align_ica_per_level_fft, align_match_14, use_neural_flow
         case flow_overlap_tiles, overlap_search_radius
+        case guide_white_balance, guide_color_matrix, guide_curve
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
@@ -316,6 +325,9 @@ struct TuningParams: Equatable, Codable {
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
         flow_overlap_tiles = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_tiles) ?? flow_overlap_tiles
         overlap_search_radius = try c.decodeIfPresent(Int.self, forKey: .overlap_search_radius) ?? overlap_search_radius
+        guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
+        guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
+        guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -1936,6 +1948,9 @@ final class CameraModel: NSObject, ObservableObject {
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
             "flow_overlap_tiles": NSNumber(value: tuningParams.flow_overlap_tiles),
             "overlap_search_radius": NSNumber(value: tuningParams.overlap_search_radius),
+            "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
+            "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
+            "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),

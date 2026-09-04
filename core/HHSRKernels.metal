@@ -1503,7 +1503,24 @@ struct RobGuideParams {
     uint cfa00, cfa01, cfa10, cfa11;
     float wb0, wb1, wb2;
     uint sqrt_guide; // 1 = sqrt VST (1.4 parity, Config::robustness_guide_sqrt); was _pad0
+    // Guide colour processing (Config::guide_color_matrix / guide_curve). When
+    // guide_ccm != 0 the camera->sRGB matrix ccm is applied to the guide RGB;
+    // guide_curve (0 none, 1 sqrt, 2 gamma, 3 srgb) is the transfer curve the
+    // host already resolved from guide_curve/-1-auto. sqrt_guide is unused when
+    // guide_curve is set, kept for ABI.
+    uint guide_ccm;
+    int  guide_curve;
+    float ccm[9];
 };
+
+// Guide transfer curve -- twin of apply_guide_curve in robustness.cpp.
+inline float rob_guide_curve(float v, int curve) {
+    if (curve == 1) return sqrt(max(0.f, v));
+    else if (curve == 2) { float vc = clamp(v, 0.f, 1.f); return pow(vc, 1.f / 2.2f); }
+    else if (curve == 3) { float vc = clamp(v, 0.f, 1.f);
+        return vc <= 0.0031308f ? 12.92f * vc : 1.055f * pow(vc, 1.f / 2.4f) - 0.055f; }
+    else return v; // 0 = linear
+}
 
 struct RobStatsParams {
     uint h, w, nch;
@@ -1647,11 +1664,20 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     // space -- see Config::guide_wb_undo and compute_guide in robustness.cpp,
     // which this mirrors.
     float undo[3] = {p.wb0, p.wb1, p.wb2};
-    for (uint c = 0u; c < 3u; ++c) {
-        float v = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
-        // 1.4 parity: sqrt VST on the guide (see rob compute_guide, CPU twin).
-        guide[o + c] = (p.sqrt_guide != 0u) ? sqrt(max(0.f, v)) : v;
+    float rgb[3];
+    for (uint c = 0u; c < 3u; ++c)
+        rgb[c] = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
+    // Optional camera->sRGB colour matrix, then the transfer curve. Mirrors
+    // compute_guide in robustness.cpp. Default (guide_ccm 0, curve resolved to
+    // sqrt) is byte-identical to the old sqrt-VST path.
+    if (p.guide_ccm != 0u) {
+        float r = rgb[0], g = rgb[1], b = rgb[2];
+        rgb[0] = p.ccm[0] * r + p.ccm[1] * g + p.ccm[2] * b;
+        rgb[1] = p.ccm[3] * r + p.ccm[4] * g + p.ccm[5] * b;
+        rgb[2] = p.ccm[6] * r + p.ccm[7] * g + p.ccm[8] * b;
     }
+    for (uint c = 0u; c < 3u; ++c)
+        guide[o + c] = rob_guide_curve(rgb[c], p.guide_curve);
 }
 
 // Parameters for the high-frequency variance-loss map.

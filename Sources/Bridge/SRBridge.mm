@@ -415,6 +415,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_overlap_tiles = tuning[@"flow_overlap_tiles"].boolValue;
     if (tuning[@"overlap_search_radius"])
         cfg.overlap_search_radius = tuning[@"overlap_search_radius"].intValue;
+    if (tuning[@"guide_white_balance"])
+        cfg.guide_white_balance = tuning[@"guide_white_balance"].boolValue;
+    if (tuning[@"guide_color_matrix"])
+        cfg.guide_color_matrix = tuning[@"guide_color_matrix"].boolValue;
+    if (tuning[@"guide_curve"])
+        cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"use_neural_flow"])
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])

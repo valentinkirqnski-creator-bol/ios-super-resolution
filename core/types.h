@@ -713,6 +713,29 @@ struct Config {
     // misbehaves on device. Only the robustness path changes.
     bool robustness_guide_sqrt = true;
 
+    // --- Guide colour processing (IPOL-author suggestion) -------------------
+    // Render the robustness GUIDE as a real display RGB before d/sigma are
+    // measured, so the colour distance d separates true mismatches from noise
+    // instead of being dominated by camera-native channel imbalance. Mirrors
+    // raw2rgb.postprocess(): white balance -> camera->sRGB matrix -> curve.
+    //
+    // The port's loader PRE-whitens the raw (site *= wb[c]/wb[1]), so the guide
+    // is white-balanced already; guide_white_balance just keeps it (skips the
+    // 1.4-parity un-prewhiten) rather than re-applying it. guide_color_matrix
+    // applies cfg.cam_to_srgb (the same camera->linear-sRGB matrix the ISP uses,
+    // derived from the DNG colour matrix). guide_curve overrides the transfer
+    // curve; -1 = auto (follow robustness_guide_sqrt: sqrt when on, else linear).
+    //
+    // NOISE-MODEL CAVEAT: the noise curves are calibrated in the sqrt(raw) guide
+    // domain, per channel. WB rescales channels and the colour matrix mixes
+    // them, so with either on the LUT no longer matches -- run this with the
+    // noise model disabled (debug_noise_model_disabled), where sigma is measured
+    // contrast and d measured colour distance in the SAME processed space. All
+    // default off / -1, so the guide is byte-identical until a flag is flipped.
+    bool guide_white_balance = false;  // keep WB in the guide (skip un-prewhiten)
+    bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB
+    int  guide_curve = -1;             // -1 auto, 0 none, 1 sqrt, 2 gamma, 3 srgb
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and

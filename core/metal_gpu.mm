@@ -1096,8 +1096,11 @@ struct RobGuideParamsCPU {
     uint32_t cfa00, cfa01, cfa10, cfa11;
     float wb0, wb1, wb2;
     uint32_t sqrt_guide = 0; // 1 = sqrt VST guide (1.4); was _pad0
+    uint32_t guide_ccm = 0;  // 1 = apply cam_to_srgb to the guide RGB
+    int32_t  guide_curve = 1; // 0 none, 1 sqrt, 2 gamma, 3 srgb (host-resolved)
+    float    ccm[9] = {1,0,0, 0,1,0, 0,0,1};
 };
-static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
+static_assert(sizeof(RobGuideParamsCPU) == 96, "RobGuideParamsCPU");
 
 struct RobStatsParamsCPU {
     uint32_t h, w, nch, _pad0 = 0;
@@ -1303,10 +1306,11 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        // 1.4 parity: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1)
-        // so it is sqrt(raw), matching 1.4's cuda_compute_guide_image -- the
-        // CPU compute_guide twin does the same. Unity when raw not prewhitened.
-        if (cfg.raw_prewhitened) {
+        // 1.4 parity: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1) so
+        // it is sqrt(raw), matching 1.4's cuda_compute_guide_image -- the CPU
+        // compute_guide twin does the same. Skipped when guide_white_balance is
+        // on (a real-RGB guide keeps WB) or the raw was not prewhitened.
+        if (cfg.raw_prewhitened && !cfg.guide_white_balance) {
             const float g = cfg.white_balance[1];
             auto undo = [&](int c) {
                 const float wc = cfg.white_balance[c];
@@ -1320,7 +1324,14 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
             gp.wb1 = 1.f;
             gp.wb2 = 1.f;
         }
-        gp.sqrt_guide = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
+        gp.sqrt_guide = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity (unused when curve set)
+        // Guide colour processing: camera->sRGB matrix + transfer curve. Curve
+        // -1 auto follows robustness_guide_sqrt so the default is unchanged.
+        int gcurve = cfg.guide_curve;
+        if (gcurve < 0) gcurve = cfg.robustness_guide_sqrt ? 1 : 0;
+        gp.guide_curve = (int32_t)gcurve;
+        gp.guide_ccm = (cfg.guide_color_matrix && cfg.has_cam_to_srgb) ? 1u : 0u;
+        for (int k = 0; k < 9; ++k) gp.ccm[k] = cfg.cam_to_srgb[k];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];

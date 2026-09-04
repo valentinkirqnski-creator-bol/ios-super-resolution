@@ -530,6 +530,19 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
 // Not in the anonymous namespace below: neural_flow's caller (pipeline_paths.cpp)
 // needs the exact same guide image the classical robustness path scores
 // against, rather than re-deriving its own and risking the two drifting.
+// Guide transfer curve: 0 linear, 1 sqrt (variance-stabilizing, 1.4), 2 gamma
+// 1/2.2, 3 IEC sRGB. Twin of _apply_guide_curve in the Metal kernel.
+static inline f32 apply_guide_curve(f32 v, int curve) {
+    switch (curve) {
+        case 1: return std::sqrt(std::max(0.f, v));
+        case 2: { f32 vc = std::min(std::max(v, 0.f), 1.f); return std::pow(vc, 1.f / 2.2f); }
+        case 3: { f32 vc = std::min(std::max(v, 0.f), 1.f);
+                  return vc <= 0.0031308f ? 12.92f * vc
+                                          : 1.055f * std::pow(vc, 1.f / 2.4f) - 0.055f; }
+        default: return v; // 0 = linear
+    }
+}
+
 Image compute_guide(const Image& raw, const Config& cfg) {
     if (!cfg.bayer_mode) {
         // Python: guide_img = raw.reshape((1, H, W))
@@ -555,14 +568,23 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     // only, to recover sqrt(raw) exactly as 1.4's cuda_compute_guide_image
     // sees it. undo = wb[1]/wb[c] (green = 1); disabled when the raw was not
     // prewhitened. This makes the noise-off mask's guide domain match 1.4.
+    // Un-prewhiten to camera-native (1.4 parity) UNLESS the guide is asked to
+    // keep white balance (guide_white_balance) -- a real-RGB guide wants WB, and
+    // the port's raw is already white-balanced by the loader's prewhitening.
     f32 wbu[3] = {1.f, 1.f, 1.f};
-    if (cfg.raw_prewhitened) {
+    if (cfg.raw_prewhitened && !cfg.guide_white_balance) {
         const f32 g = cfg.white_balance[1];
         for (int c = 0; c < 3; ++c) {
             const f32 wc = cfg.white_balance[c];
             wbu[c] = (std::isfinite(g) && std::isfinite(wc) && wc > 0.f) ? (g / wc) : 1.f;
         }
     }
+    // Effective transfer curve: -1 auto follows robustness_guide_sqrt so the
+    // default (no colour flags) stays byte-identical.
+    int curve = cfg.guide_curve;
+    if (curve < 0) curve = cfg.robustness_guide_sqrt ? 1 : 0;
+    const bool apply_ccm = cfg.guide_color_matrix && cfg.has_cam_to_srgb;
+    const float* M = cfg.cam_to_srgb; // camera -> linear sRGB (same as the ISP)
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {
             f32 sum[3] = {0.f, 0.f, 0.f};
@@ -572,14 +594,17 @@ Image compute_guide(const Image& raw, const Config& cfg) {
                     if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
                 }
             }
-            // 1.4 parity: un-prewhiten, then sqrt of the (green-averaged) site
-            // value -- matches cuda_compute_guide_image. See
-            // Config::robustness_guide_sqrt.
-            if (cfg.robustness_guide_sqrt)
-                for (int c = 0; c < 3; ++c)
-                    guide.at(y, x, c) = std::sqrt(std::max(0.f, sum[c] * inv[c] * wbu[c]));
-            else
-                for (int c = 0; c < 3; ++c) guide.at(y, x, c) = sum[c] * inv[c] * wbu[c];
+            f32 rgb[3] = {sum[0] * inv[0] * wbu[0],
+                          sum[1] * inv[1] * wbu[1],
+                          sum[2] * inv[2] * wbu[2]};
+            if (apply_ccm) {
+                const f32 r = rgb[0], gr = rgb[1], b = rgb[2];
+                rgb[0] = M[0] * r + M[1] * gr + M[2] * b;
+                rgb[1] = M[3] * r + M[4] * gr + M[5] * b;
+                rgb[2] = M[6] * r + M[7] * gr + M[8] * b;
+            }
+            for (int c = 0; c < 3; ++c)
+                guide.at(y, x, c) = apply_guide_curve(rgb[c], curve);
         }
     }
     return guide;
