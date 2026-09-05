@@ -291,7 +291,8 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                      work.bayer_mode ? work.white_balance : nullptr,
                      work.bake_srgb, "HandheldSR",
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
-                     work.raw_prewhitened)) {
+                     work.raw_prewhitened && !dng_unwhiten_active(work, nch),
+                     work.dng_lossless_jpeg)) {
         report("Error: cannot open output DNG", 1.0f);
         return Image();
     }
@@ -348,9 +349,12 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                 } else {
                     outc[0] = outc[1] = outc[2] = cn[0];
                 }
+                float sgw[3];
+                dng_unwhiten_gains(work, nch, sgw);
                 for (int k = 0; k < 3; ++k) {
                     f32 v = work.bake_srgb ? to_srgb(outc[k]) : clampf(outc[k], 0.f, 1.f);
-                    row16[base + k] = (uint16_t)(v * 65535.f + 0.5f);
+                    const f32 vs = work.bake_srgb ? v : clampf(outc[k] * sgw[k], 0.f, 1.f);
+                    row16[base + k] = (uint16_t)(vs * 65535.f + 0.5f);
                     if (k == 0) preview.at(py, std::min(pw - 1, (int)(x * pscale)), 0) = v;
                     else if (k == 1) preview.at(py, std::min(pw - 1, (int)(x * pscale)), 1) = v;
                     else preview.at(py, std::min(pw - 1, (int)(x * pscale)), 2) = v;

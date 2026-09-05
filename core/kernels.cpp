@@ -24,13 +24,20 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         }
         return out;
     };
-    // Matches 460-main kernels.py compute_k.
+    // Matches 1.4 kernels.py compute_k. selection_law: linear (1.4 default)
+    // ramps anisotropy continuously over A in [1,2]; hard_threshold (460-main)
+    // snaps isotropic below A=1.95, fully anisotropic above. Both share the
+    // k_detail/D/k_denoise outer blend; they coincide at A=1 and A=2.
     auto compute_k = [](f32 l1, f32 l2, f32& k1, f32& k2, const Config& cfg) {
         f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
-        else           { kk1 = 1.f; kk2 = 1.f; }
+        if (cfg.kernel_linear_law) {
+            // linear(): (2-A) + (A-1)/k_shrink ; (2-A) + (A-1)*k_stretch
+            kk1 = (2.f - A) + (A - 1.f) / cfg.k_shrink;
+            kk2 = (2.f - A) + (A - 1.f) * cfg.k_stretch;
+        } else if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
+        else                  { kk1 = 1.f; kk2 = 1.f; }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };

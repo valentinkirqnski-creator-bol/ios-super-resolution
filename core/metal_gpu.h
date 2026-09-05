@@ -170,7 +170,16 @@ bool metal_merge_wait_inflight();
 // Drop one frame's cached GPU upload. Online merges a frame once, so its
 // buffers are dead the moment its command buffer completes.
 void metal_merge_release_frame(int frame_id);
-void metal_merge_begin_online(int out_h, int out_w, int nch);
+// half_acc stores the online accumulator as fp16 (arithmetic stays fp32 in
+// the kernels). Halves its footprint and the merge's dominant traffic;
+// output changes by ~1-2 LSB of the 16-bit result from storage quantisation.
+void metal_merge_begin_online(int out_h, int out_w, int nch, bool half_acc);
+
+// One horizontal band of the finished accumulator, as float, regardless of
+// storage mode. Replaces metal_merge_map_online for readers (which now
+// refuses in half mode rather than returning punned bytes).
+bool metal_merge_read_band_float(int y0, int rows, const float** num,
+                                 const float** den);
 // Wait for the merge and hand back the accumulator where it already lives.
 // Shared storage means it is CPU addressable in place, so the caller never
 // needs a full-size host copy of it.

@@ -749,6 +749,45 @@ struct CameraView: View {
              its own it won't reject a smooth aperture slide. Off by default.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Linear Kernel Law (1.4 default)", isOn: $cam.tuningParams.kernel_linear_law)
+        Text("""
+             Merge-kernel anisotropy law. On (linear, the 1.4 default): the kernel \
+             elongates continuously with edge strength A over [1,2]. Off \
+             (hard_threshold, 460-main): stays isotropic until A>1.95 then snaps \
+             fully anisotropic — no shaping on moderate edges. Both agree at flat \
+             regions and strong clean edges. Linear = sharper, less stair-stepping.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("DNG Highlight Headroom", isOn: $cam.tuningParams.dng_store_unwhitened)
+        Text("""
+             Store the output DNG un-white-balanced (real AsShotNeutral) instead \
+             of baking the WB gains into the pixels. The merge runs in \
+             pre-white-balanced space, so red/blue gains clipped highlights at the \
+             16-bit write even when the sensor didn't. This restores ~1 stop of \
+             highlight headroom; the editor re-applies WB in float. On by default. \
+             Only affects DNG output.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("Lossless DNG (smaller, faster)", isOn: $cam.tuningParams.dng_lossless_jpeg)
+        Text("""
+             Writes the output DNG with lossless-JPEG tiles (Compression 7, the \
+             standard DNG codec -- what Apple ProRAW uses). Pixels are \
+             bit-identical to the uncompressed file; size drops to roughly a \
+             third (~100MB, varies with scene content) and saving is faster \
+             because far fewer bytes hit storage. Off = uncompressed strips.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
+        Toggle("fp16 Merge Accumulator", isOn: $cam.tuningParams.merge_fp16_accumulator)
+        Text("""
+             Stores the online merge accumulator as 16-bit floats instead of \
+             32-bit. All arithmetic stays float32 in the kernels; only what \
+             lands in memory narrows. At 2x output this halves the pipeline's \
+             single largest allocation (1116 -> 558 MB) and the merge's \
+             dominant memory traffic, which it is bandwidth-bound on. Cost is \
+             storage quantisation ~0.05% per store -- roughly 1-2 LSB of the \
+             16-bit output. Off = bit-exact fp32 at the old memory and speed.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         Toggle("Guide: Keep White Balance", isOn: $cam.tuningParams.guide_white_balance)
         Toggle("Guide: Colour Matrix (→sRGB)", isOn: $cam.tuningParams.guide_color_matrix)
         Picker("Guide Curve", selection: $cam.tuningParams.guide_curve) {
@@ -1093,6 +1132,14 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
 
                     if cam.tuningParams.isp_enabled {
+                        Toggle("HDR+ Finishing (JPEG ISP)", isOn: $cam.tuningParams.jpeg_hdrplus_finish)
+                        Text(cam.tuningParams.jpeg_hdrplus_finish
+                             ? "JPEG/preview finished with the HDR+ pipeline (IPOL 5.2): exposure-fusion local tone map, sin S-curve, sRGB, triple-scale unsharp. The sliders below apply to the per-pixel ISP, not this path."
+                             : "Off: the per-pixel ISP below finishes the JPEG instead.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+
+                    if cam.tuningParams.isp_enabled && !cam.tuningParams.jpeg_hdrplus_finish {
                         ispRow("Exposure (EV)", $cam.tuningParams.isp_exposure_ev, -2.0...2.0, "%+.2f")
                         ispRow("Highlight Recovery", $cam.tuningParams.isp_highlight_knee, 0.60...1.0, "%.2f")
                         ispRow("Colour Noise", $cam.tuningParams.isp_chroma_denoise, 0.0...1.0)

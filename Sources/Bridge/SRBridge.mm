@@ -15,6 +15,7 @@
 #include "core/mps_fft.h"
 #include "core/preset_lut.h"
 #include "core/render_isp.h"
+#include "core/render_hdrplus.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -224,6 +225,10 @@ static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
 // take only a path -- there is no Config to thread through -- so the values are
 // parked here when the tuning dictionary is parsed.
 static hhsr::IspParams g_isp;
+// When true (and the ISP is enabled) the JPEG/preview is finished with the
+// HDR+ pipeline (render_hdrplus) instead of the per-pixel ISP. Parked here
+// like g_isp because the export entry points take only a path.
+static bool g_jpeg_hdrplus_finish = true;
 
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
@@ -303,6 +308,70 @@ static inline void render_linear_dng_pixel(float r, float g, float b,
         sb = wb_;
     }
     tone_map_legacy_camera_rgb(sr, sg, sb);
+}
+
+// Linear scene RGB for the HDR+ finishing pipeline: white balance and the
+// colour matrix ONLY, no tone curve and no gamma. This is the state rawpy's
+// postprocess() hands finish() in the reference (demosaiced, WB'd, colour
+// corrected, linear), and hdrplus_finish does every tonal step from here on.
+// Deliberately does NOT take the preset-LUT branch render_linear_dng_pixel
+// offers: that table already has a tone curve and gamma baked in, so feeding
+// its output to the HDR+ pipeline would tone-map twice.
+static inline void render_linear_scene_rgb(float r, float g, float b,
+                                           const float wb[3], const float m[9],
+                                           bool has_color,
+                                           float& sr, float& sg, float& sb) {
+    if (has_color && render_wb_is_neutral(wb)) {
+        // Same matrix the calibrated branch uses -- our SR output is already
+        // pre-white-balanced, so the DNG camera matrix would double-push it.
+        constexpr float kDisplayMatrix[9] = {
+             1.2466443f, -0.4477117f, -0.1773365f,
+            -0.1616100f,  0.8074801f, -0.0321825f,
+            -0.1166101f, -0.1502432f,  0.8686564f
+        };
+        sr = kDisplayMatrix[0] * r + kDisplayMatrix[1] * g + kDisplayMatrix[2] * b;
+        sg = kDisplayMatrix[3] * r + kDisplayMatrix[4] * g + kDisplayMatrix[5] * b;
+        sb = kDisplayMatrix[6] * r + kDisplayMatrix[7] * g + kDisplayMatrix[8] * b;
+    } else {
+        const float wr = r * wb[0], wg = g * wb[1], wbb = b * wb[2];
+        if (has_color) {
+            sr = m[0] * wr + m[1] * wg + m[2] * wbb;
+            sg = m[3] * wr + m[4] * wg + m[5] * wbb;
+            sb = m[6] * wr + m[7] * wg + m[8] * wbb;
+        } else {
+            sr = wr; sg = wg; sb = wbb;
+        }
+    }
+    // The matrix can send a channel slightly negative on saturated colour.
+    // rawpy clamps at 0 before finish() sees it, so match that.
+    sr = sr < 0.f ? 0.f : sr;
+    sg = sg < 0.f ? 0.f : sg;
+    sb = sb < 0.f ? 0.f : sb;
+}
+
+// Build the linear scene-RGB image the HDR+ finishing pipeline expects, run
+// it, and hand back display-referred sRGB in [0,1]. src is the 16-bit linear
+// DNG RGB the render path already decoded.
+static void RunHdrPlusFinish(const std::vector<uint16_t>& src, int W, int H,
+                             const float wb[3], const float m[9], bool has_color,
+                             hhsr::Image& out) {
+    out = hhsr::Image(H, W, 3);
+    hhsr::parallel_rows(H, 0, [&](int y) {
+        const size_t row = (size_t)y * (size_t)W;
+        for (int x = 0; x < W; ++x) {
+            const size_t i = row + (size_t)x;
+            const float r = src[i * 3 + 0] * (1.f / 65535.f);
+            const float g = src[i * 3 + 1] * (1.f / 65535.f);
+            const float b = src[i * 3 + 2] * (1.f / 65535.f);
+            float sr, sg, sb;
+            render_linear_scene_rgb(r, g, b, wb, m, has_color, sr, sg, sb);
+            out.data[i * 3 + 0] = sr;
+            out.data[i * 3 + 1] = sg;
+            out.data[i * 3 + 2] = sb;
+        }
+    });
+    hhsr::HdrPlusFinishParams hp;   // params.py 'finishing' defaults
+    hhsr::hdrplus_finish(out, hp);
 }
 
 static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
@@ -423,6 +492,17 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"robustness_per_pixel_s"])
         cfg.robustness_per_pixel_s = tuning[@"robustness_per_pixel_s"].boolValue;
+    if (tuning[@"kernel_linear_law"])
+        cfg.kernel_linear_law = tuning[@"kernel_linear_law"].boolValue;
+    if (tuning[@"merge_fp16_accumulator"])
+        cfg.merge_fp16_accumulator = tuning[@"merge_fp16_accumulator"].boolValue;
+    if (tuning[@"dng_store_unwhitened"])
+        cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
+    if (tuning[@"dng_lossless_jpeg"])
+        cfg.dng_lossless_jpeg = tuning[@"dng_lossless_jpeg"].boolValue;
+    if (tuning[@"jpeg_hdrplus_finish"])
+        cfg.jpeg_hdrplus_finish = tuning[@"jpeg_hdrplus_finish"].boolValue;
+    g_jpeg_hdrplus_finish = cfg.jpeg_hdrplus_finish;
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
@@ -880,14 +960,19 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         W <= 0 || H <= 0)
         return NO;
 
+    // HDR+ finishing (IPOL 5.2) is a whole-image pipeline -- exposure fusion
+    // and the three blur scales are neighbourhood ops -- so it runs once up
+    // front rather than folding into the per-pixel loop the ISP path uses.
+    const bool use_hdrplus = g_isp.enabled && g_jpeg_hdrplus_finish;
+
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
     // Before isp_analyse, so the automatic exposure and the local gain map are
     // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
+    if (g_isp.enabled && !use_hdrplus)
         hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
-    const bool use_isp = g_isp.enabled &&
+    const bool use_isp = g_isp.enabled && !use_hdrplus &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
     // Row-parallel: 48MP through a scalar loop on one core was the difference
@@ -897,25 +982,41 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // it, so at 48MP it cost 48MB of allocation and a quarter of the store
     // traffic for nothing.
     std::vector<uint8_t> srgb((size_t)W * (size_t)H * 3);
-    hhsr::parallel_rows(H, 0, [&](int y) {
-        const size_t row = (size_t)y * (size_t)W;
-        for (int x = 0; x < W; ++x) {
-            const size_t i = row + (size_t)x;
-            float r = rgb[i * 3 + 0] * (1.f / 65535.f);
-            float g = rgb[i * 3 + 1] * (1.f / 65535.f);
-            float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-            float sr, sg, sb;
-            if (use_isp)
-                hhsr::isp_render(isp, r, g, b, x, y, sr, sg, sb);
-            else
-                render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-            srgb[i * 3 + 0] = (uint8_t)std::lround(sr * 255.f);
-            srgb[i * 3 + 1] = (uint8_t)std::lround(sg * 255.f);
-            srgb[i * 3 + 2] = (uint8_t)std::lround(sb * 255.f);
-        }
-    });
-    rgb.clear();
-    rgb.shrink_to_fit();
+    if (use_hdrplus) {
+        hhsr::Image fin;
+        RunHdrPlusFinish(rgb, W, H, wb, m, has_color, fin);
+        rgb.clear();
+        rgb.shrink_to_fit();
+        hhsr::parallel_rows(H, 0, [&](int y) {
+            const size_t row = (size_t)y * (size_t)W;
+            for (int x = 0; x < W; ++x) {
+                const size_t i = row + (size_t)x;
+                for (int c = 0; c < 3; ++c)
+                    srgb[i * 3 + c] =
+                        (uint8_t)std::lround(fin.data[i * 3 + c] * 255.f);
+            }
+        });
+    } else {
+        hhsr::parallel_rows(H, 0, [&](int y) {
+            const size_t row = (size_t)y * (size_t)W;
+            for (int x = 0; x < W; ++x) {
+                const size_t i = row + (size_t)x;
+                float r = rgb[i * 3 + 0] * (1.f / 65535.f);
+                float g = rgb[i * 3 + 1] * (1.f / 65535.f);
+                float b = rgb[i * 3 + 2] * (1.f / 65535.f);
+                float sr, sg, sb;
+                if (use_isp)
+                    hhsr::isp_render(isp, r, g, b, x, y, sr, sg, sb);
+                else
+                    render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+                srgb[i * 3 + 0] = (uint8_t)std::lround(sr * 255.f);
+                srgb[i * 3 + 1] = (uint8_t)std::lround(sg * 255.f);
+                srgb[i * 3 + 2] = (uint8_t)std::lround(sb * 255.f);
+            }
+        });
+        rgb.clear();
+        rgb.shrink_to_fit();
+    }
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!cs) cs = CGColorSpaceCreateDeviceRGB();
@@ -971,22 +1072,32 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     const int ow = std::max(1, (int)std::lround(W * scale));
     const int oh = std::max(1, (int)std::lround(H * scale));
 
-    // Analysed at full resolution even though the preview is downscaled, so the
-    // thumbnail and the exported JPEG get the same exposure and gain map and
-    // cannot disagree about how the shot looks.
+    // Finished at full resolution even though the preview is downscaled, so the
+    // thumbnail and the exported JPEG get the same auto gain and tonal result
+    // and cannot disagree about how the shot looks. HDR+ finishing is a
+    // whole-image pipeline, so it runs once up front rather than per sample.
     // Before isp_analyse, so the automatic exposure and the local gain map are
     // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
+    const bool use_hdrplus = g_isp.enabled && g_jpeg_hdrplus_finish;
+    if (g_isp.enabled && !use_hdrplus)
         hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
-    const bool use_isp = g_isp.enabled &&
+    const bool use_isp = g_isp.enabled && !use_hdrplus &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
+    hhsr::Image fin;
+    if (use_hdrplus) RunHdrPlusFinish(rgb, W, H, wb, m, has_color, fin);
 
     std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
     auto sample_tonemap = [&](int sx, int sy, float& sr, float& sg, float& sb) {
         sx = std::max(0, std::min(W - 1, sx));
         sy = std::max(0, std::min(H - 1, sy));
         size_t i = (size_t)sy * (size_t)W + (size_t)sx;
+        if (use_hdrplus) {
+            sr = fin.data[i * 3 + 0];
+            sg = fin.data[i * 3 + 1];
+            sb = fin.data[i * 3 + 2];
+            return;
+        }
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);

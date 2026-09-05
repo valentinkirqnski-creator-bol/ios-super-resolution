@@ -870,6 +870,14 @@ struct Config {
     // so the flag has to survive from where the mistake is made to where the
     // mask is applied. upscale_flow_460 already propagates it.
     bool  flow_reject_ambiguous_enabled = true;
+    // Store the ONLINE merge accumulator as fp16 instead of fp32. Kernel
+    // arithmetic stays float32; only the stored num/den narrow. At 48 MP this
+    // halves the pipeline largest allocation (1116 -> 558 MB) and the
+    // bandwidth-bound merge dominant traffic (585 -> ~292 MB/frame).
+    // OUTPUT CHANGES: storage quantisation is ~0.05% relative per store,
+    // about 1-2 LSB of the 16-bit result -- the accepted trade. The banded
+    // path and the host reference stay fp32 regardless.
+    bool  merge_fp16_accumulator = true;
     // A 1D tile is rejected only when enough pixels in that tile have
     // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
     // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.
@@ -973,6 +981,9 @@ struct Config {
     float D_tr      = 1.12f;  // overwritten by SNR lerp [1.24, 1.0]
     float k_stretch = 4.0f;
     float k_shrink  = 2.0f;
+    // Kernel anisotropy selection law. true = linear (1.4 default, continuous
+    // ramp over A in [1,2]); false = hard_threshold (460-main, snap at A=1.95).
+    bool  kernel_linear_law = true;
 
     CFA cfa;
 
@@ -997,6 +1008,28 @@ struct Config {
     bool  has_cam_to_srgb = false;
     float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
     bool  bake_srgb = false;
+    // Store the output DNG UN-white-balanced (real AsShotNeutral) instead of
+    // baking the WB gains into the pixels. The pipeline merges in
+    // pre-white-balanced space (Python utils_dng order), so gains of R~2.06 /
+    // B~1.84 were applied BEFORE the 16-bit ceiling: any red highlight above
+    // ~0.49 of raw full scale clipped at the DNG write even though the sensor
+    // never clipped. Dividing the stored rows by the gains (and emitting
+    // AsShotNeutral = 1/gain) restores ~1 stop of highlight headroom; editors
+    // re-apply WB in float. Settings toggle 'DNG Highlight Headroom'.
+    bool  dng_store_unwhitened = true;
+    // Write the output DNG with lossless-JPEG tiles (Compression=7, the
+    // standard DNG codec every reader ships -- Apple ProRAW's own LinearRaw
+    // DNGs use it) instead of uncompressed strips. Bit-identical pixels;
+    // typically 2-3x smaller (size depends on scene content -- entropy
+    // coding), and the save gets faster because ~100MB of encoded tiles
+    // beats pushing ~293MB uncached to NAND; tiles encode in parallel.
+    bool  dng_lossless_jpeg = true;
+    // Finish the exported/preview JPEG with the HDR+ finishing pipeline
+    // (Monod/Delon/Veit, IPOL 5.2: local tone-map exposure fusion -> global
+    // sin S-curve -> sRGB -> triple-scale unsharp) instead of the per-pixel
+    // tone-map ISP. Whole-image (fusion + blur scales are neighbourhood ops).
+    // Only affects JPEG/preview output, never the DNG.
+    bool  jpeg_hdrplus_finish = true;
     // Direct RAW app path: full-res streaming can reload the captured uint16 RAW
     // file instead of spilling/reloading an extra normalized-float cache copy.
     bool  stream_comp_raw_from_loader = false;

@@ -165,6 +165,11 @@ struct TuningParams: Equatable, Codable {
     /// pixel instead of one value per 16px tile, removing the tile-block R the
     /// paper never had. Off by default.
     var robustness_per_pixel_s: Bool = false
+    var kernel_linear_law: Bool = true
+    var merge_fp16_accumulator: Bool = true
+    var dng_store_unwhitened: Bool = true
+    var dng_lossless_jpeg: Bool = true
+    var jpeg_hdrplus_finish: Bool = true
     /// Geometry-aware rejection: drop pixels where the per-tile translation is a
     /// poor model of local motion (flow-gradient × offset, weighted by |∇I|).
     /// Cleans rotation tile-ghosts by rejecting the worst pixels (they fall back
@@ -268,6 +273,11 @@ struct TuningParams: Equatable, Codable {
         case flow_overlap_tiles, overlap_search_radius
         case guide_white_balance, guide_color_matrix, guide_curve
         case robustness_per_pixel_s
+        case kernel_linear_law
+        case merge_fp16_accumulator
+        case dng_store_unwhitened
+        case dng_lossless_jpeg
+        case jpeg_hdrplus_finish
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
@@ -348,6 +358,11 @@ struct TuningParams: Equatable, Codable {
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_pixel_s = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_pixel_s) ?? robustness_per_pixel_s
+        kernel_linear_law = try c.decodeIfPresent(Bool.self, forKey: .kernel_linear_law) ?? kernel_linear_law
+        merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
+        dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
+        dng_lossless_jpeg = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_jpeg) ?? dng_lossless_jpeg
+        jpeg_hdrplus_finish = try c.decodeIfPresent(Bool.self, forKey: .jpeg_hdrplus_finish) ?? jpeg_hdrplus_finish
         motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
@@ -1974,6 +1989,11 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_pixel_s": NSNumber(value: tuningParams.robustness_per_pixel_s),
+            "kernel_linear_law": NSNumber(value: tuningParams.kernel_linear_law),
+            "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
+            "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
+            "dng_lossless_jpeg": NSNumber(value: tuningParams.dng_lossless_jpeg),
+            "jpeg_hdrplus_finish": NSNumber(value: tuningParams.jpeg_hdrplus_finish),
             "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
