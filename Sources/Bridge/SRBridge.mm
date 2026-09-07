@@ -224,6 +224,11 @@ static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
 // take only a path -- there is no Config to thread through -- so the values are
 // parked here when the tuning dictionary is parsed.
 static hhsr::IspParams g_isp;
+// When true, exportJPEGFromLinearDNG / the preview render the frame with
+// Python 1.4's postprocess (render_match_python14) instead of the calibrated
+// Lightroom-fitted path. Parked here like g_isp (the export entry points take
+// only a path).
+static bool g_jpeg_match_14 = false;
 
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
@@ -388,6 +393,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
     if (tuning[@"acc_rob_adaptive"])
         cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
+    if (tuning[@"jpeg_match_python14"]) cfg.jpeg_match_python14 = tuning[@"jpeg_match_python14"].boolValue;
+    g_jpeg_match_14 = cfg.jpeg_match_python14;
     if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
     if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
     if (tuning[@"isp_highlight_knee"]) cfg.isp.highlight_knee = tuning[@"isp_highlight_knee"].floatValue;
@@ -880,6 +887,18 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         W <= 0 || H <= 0)
         return NO;
 
+    std::vector<uint8_t> srgb;
+    if (g_jpeg_match_14) {
+        // Python-1.4 parity: whole-image postprocess (matrix -> clip -> unsharp
+        // r=3/a=1.5 -> clip -> sRGB), no tone-map / preset LUT. The SR DNG is
+        // pre-white-balanced (wb reads back neutral), so the WB step is a no-op,
+        // matching 1.4 applying wb to its non-WB camera RGB.
+        hhsr::render_match_python14(rgb.data(), W, H, wb, m, has_color,
+                                    /*unsharp_radius*/ 3.f, /*unsharp_amount*/ 1.5f,
+                                    /*do_srgb*/ true, srgb);
+        rgb.clear();
+        rgb.shrink_to_fit();
+    } else {
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
     // Before isp_analyse, so the automatic exposure and the local gain map are
@@ -896,7 +915,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // RGB, not RGBA. The alpha byte was 255 everywhere and JPEG has no use for
     // it, so at 48MP it cost 48MB of allocation and a quarter of the store
     // traffic for nothing.
-    std::vector<uint8_t> srgb((size_t)W * (size_t)H * 3);
+    srgb.resize((size_t)W * (size_t)H * 3);
     hhsr::parallel_rows(H, 0, [&](int y) {
         const size_t row = (size_t)y * (size_t)W;
         for (int x = 0; x < W; ++x) {
@@ -916,6 +935,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     });
     rgb.clear();
     rgb.shrink_to_fit();
+    }
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!cs) cs = CGColorSpaceCreateDeviceRGB();

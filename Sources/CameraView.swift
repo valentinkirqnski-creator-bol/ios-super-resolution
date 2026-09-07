@@ -1086,6 +1086,16 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Rendering \u{2014} Tone")) {
+                    Toggle("Match Python 1.4 JPEG", isOn: $cam.tuningParams.jpeg_match_python14)
+                    Text("""
+                         Finishes the exported JPEG/PNG exactly like Python 1.4's \
+                         postprocess: camera→linear-sRGB matrix, clip, unsharp mask \
+                         (radius 3, amount 1.5), clip, sRGB gamma — no tone mapping, \
+                         no calibrated grade. Overrides the render below. The merge \
+                         differs from 1.4, so images aren't pixel-identical, but the \
+                         finishing is; compare on a PNG save.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
                     Text(cam.tuningParams.isp_enabled
                          ? "Local tone mapping, contrast and vibrance, applied to the JPEG and the DNG preview only. The DNG itself always stays the unmodified linear merge."

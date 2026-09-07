@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "parallel.h"
+#include "stages.h"   // gaussian_blur, Image (for the Python-1.4 unsharp mask)
 
 namespace hhsr {
 namespace {
@@ -586,6 +587,75 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
     sr = clampf(sr, 0.f, 1.f);
     sg = clampf(sg, 0.f, 1.f);
     sb = clampf(sb, 0.f, 1.f);
+}
+
+// ============================================================================
+// Python-1.4 parity render (handheld_super_resolution/raw2rgb.py::postprocess).
+// Reproduces 1.4's finishing exactly in ORDER and math:
+//   (already-WB) camera RGB -> WB (green-norm, no-op if neutral) -> camera->
+//   linear-sRGB matrix -> clip -> unsharp_mask(radius=sigma, amount) -> clip ->
+//   IEC sRGB transfer -> 8-bit round. No tone-map, no preset LUT (1.4 has none).
+// The SR DNG is pre-white-balanced, so wb reads back neutral and the WB step is
+// a no-op -- exactly matching 1.4 applying wb to its non-WB camera RGB, since
+// the port baked the same green-normalised gains in already.
+// Not bit-identical to 1.4 (skimage's Gaussian vs gaussian_blur here for the
+// unsharp, and the image encoder differ); identical in pipeline and, on a PNG
+// save, in pixels to within Gaussian-border/rounding differences.
+// ============================================================================
+void render_match_python14(const uint16_t* rgb16, int W, int H,
+                           const float wb[3], const float cam2srgb[9], bool has_color,
+                           float unsharp_radius, float unsharp_amount, bool do_srgb,
+                           std::vector<uint8_t>& out_rgb8) {
+    if (W <= 0 || H <= 0 || !rgb16) { out_rgb8.clear(); return; }
+    const f32 g = (wb && wb[1] > 1e-8f) ? wb[1] : 1.f;
+    const f32 wr = (wb ? wb[0] : 1.f) / g, wgc = 1.f, wbb = (wb ? wb[2] : 1.f) / g;
+    const bool do_wb = wb && (std::fabs(wr - 1.f) > 1e-6f || std::fabs(wbb - 1.f) > 1e-6f);
+
+    Image img(H, W, 3);
+    parallel_rows(H, 0, [&](int y) {
+        for (int x = 0; x < W; ++x) {
+            const size_t i = ((size_t)y * (size_t)W + (size_t)x);
+            f32 r = rgb16[i * 3 + 0] * (1.f / 65535.f);
+            f32 gg = rgb16[i * 3 + 1] * (1.f / 65535.f);
+            f32 b = rgb16[i * 3 + 2] * (1.f / 65535.f);
+            if (do_wb) { r *= wr; gg *= wgc; b *= wbb; }
+            f32 sr, sg, sb;
+            if (has_color) {
+                sr = cam2srgb[0] * r + cam2srgb[1] * gg + cam2srgb[2] * b;
+                sg = cam2srgb[3] * r + cam2srgb[4] * gg + cam2srgb[5] * b;
+                sb = cam2srgb[6] * r + cam2srgb[7] * gg + cam2srgb[8] * b;
+            } else { sr = r; sg = gg; sb = b; }
+            img.at(y, x, 0) = clampf(sr, 0.f, 1.f);
+            img.at(y, x, 1) = clampf(sg, 0.f, 1.f);
+            img.at(y, x, 2) = clampf(sb, 0.f, 1.f);
+        }
+    });
+
+    // skimage.filters.unsharp_mask: image + amount*(image - gaussian(image,
+    // sigma=radius)), then the caller clips. channel_axis=2 -> per-channel,
+    // which gaussian_blur already is.
+    if (unsharp_amount > 0.f && unsharp_radius > 0.f) {
+        Image blur = gaussian_blur(img, unsharp_radius);
+        for (size_t k = 0; k < img.data.size(); ++k)
+            img.data[k] = clampf(img.data[k] + unsharp_amount * (img.data[k] - blur.data[k]),
+                                 0.f, 1.f);
+    }
+
+    out_rgb8.resize((size_t)W * (size_t)H * 3u);
+    parallel_rows(H, 0, [&](int y) {
+        for (int x = 0; x < W; ++x) {
+            const size_t i = ((size_t)y * (size_t)W + (size_t)x);
+            for (int c = 0; c < 3; ++c) {
+                f32 v = img.data[i * 3 + (size_t)c];
+                if (do_srgb) {
+                    v = clampf(v, 0.f, 1.f);
+                    v = (v <= 0.0031308f) ? 12.92f * v
+                                          : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+                }
+                out_rgb8[i * 3 + (size_t)c] = (uint8_t)std::lround(clampf(v, 0.f, 1.f) * 255.f);
+            }
+        }
+    });
 }
 
 }  // namespace hhsr

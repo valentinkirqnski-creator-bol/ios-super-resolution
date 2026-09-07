@@ -75,4 +75,13 @@ bool isp_analyse(const uint16_t* rgb16, int W, int H,
 void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
                 f32& sr, f32& sg, f32& sb);
 
+// Python-1.4 parity render (raw2rgb.py::postprocess): whole-image WB ->
+// camera->linear-sRGB matrix -> clip -> unsharp(radius,amount) -> clip -> sRGB
+// -> 8-bit. rgb16 is the linear (pre-white-balanced) DNG RGB; cam2srgb the
+// camera->sRGB matrix; wb applied only if non-neutral. Writes W*H*3 8-bit RGB.
+void render_match_python14(const uint16_t* rgb16, int W, int H,
+                           const float wb[3], const float cam2srgb[9], bool has_color,
+                           float unsharp_radius, float unsharp_amount, bool do_srgb,
+                           std::vector<uint8_t>& out_rgb8);
+
 }  // namespace hhsr

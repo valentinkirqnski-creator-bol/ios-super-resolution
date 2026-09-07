@@ -997,6 +997,12 @@ struct Config {
     bool  has_cam_to_srgb = false;
     float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
     bool  bake_srgb = false;
+    // Render the exported JPEG/PNG identically to Python 1.4's postprocess
+    // (raw2rgb.py): camera->linear-sRGB matrix -> clip -> unsharp(r=3,a=1.5) ->
+    // clip -> sRGB, no tone-map / preset LUT. Bypasses the calibrated
+    // Lightroom-fitted render. See render_match_python14. Only affects the
+    // JPEG/preview, never the DNG.
+    bool  jpeg_match_python14 = false;
     // Direct RAW app path: full-res streaming can reload the captured uint16 RAW
     // file instead of spilling/reloading an extra normalized-float cache copy.
     bool  stream_comp_raw_from_loader = false;
