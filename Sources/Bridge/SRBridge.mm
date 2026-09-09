@@ -366,6 +366,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     }
     if (tuning[@"global_prealignment_enabled"])
         cfg.global_prealignment_enabled = tuning[@"global_prealignment_enabled"].boolValue;
+    if (tuning[@"global_homography_warp"])
+        cfg.global_homography_warp = tuning[@"global_homography_warp"].boolValue;
     if (tuning[@"global_prealignment_choose_reference"])
         cfg.global_prealignment_choose_reference =
             tuning[@"global_prealignment_choose_reference"].boolValue;

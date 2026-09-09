@@ -588,6 +588,13 @@ struct Config {
     // With this false the plan stays empty, so every frame enters align() with a
     // zero initial transform and frame 0 stays the reference.
     bool global_prealignment_enabled = false;
+    // Global homography warp-then-refine: estimate one 3x3 homography between
+    // the reference and comparison greys, WARP the comparison grey into the
+    // reference frame (removing global roll/scale/perspective), run the
+    // existing per-tile block-match/ICA on the warped grey for residual
+    // translation, then compose H back so the merge samples the original raw.
+    // Independent of global_prealignment_enabled; supersedes it when on.
+    bool global_homography_warp = false;
     // Off by default: it is the only thing that forces the pre-alignment pass
     // to decode every frame up front, and with it off the transform is computed
     // in the analysis loop from the buffer already decoded there -- the stage

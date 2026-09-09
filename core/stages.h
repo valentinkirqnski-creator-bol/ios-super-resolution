@@ -81,6 +81,18 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 int tile_size,
                 f32 initial_dx = 0.f, f32 initial_dy = 0.f,
                 f32 initial_rotation_rad = 0.f);
+
+// Global homography warp-then-refine (Config::global_homography_warp).
+// estimate_global_homography fits a 3x3 H (reference grey -> comparison grey)
+// by direct multi-scale Lucas-Kanade; warp_grey_by_homography remaps the
+// comparison grey into the reference frame so the existing block-match/ICA
+// only has to find residual translation; compose_homography_flow folds H back
+// into that residual so the merge samples the original comparison raw. See
+// align.cpp.
+void estimate_global_homography(const Image& ref_grey, const Image& moving_grey,
+                                const Config& cfg, f32 H_out[9]);
+Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]);
+FlowField compose_homography_flow(const FlowField& resid, const f32 H[9], int tile_size);
 // Free cached ref Sobel/Hessian (call when reference pyramid is released).
 void clear_align_ref_ica_cache();
 

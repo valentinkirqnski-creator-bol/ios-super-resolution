@@ -175,7 +175,16 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
         const Image& comp = burst[k];
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
 
-        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        FlowField flow;
+        if (work.global_homography_warp) {
+            f32 Hg[9];
+            estimate_global_homography(ref_grey, comp_grey, work, Hg);
+            Image comp_grey_warped = warp_grey_by_homography(comp_grey, Hg);
+            FlowField resid = align(ref_pyr, ref_grey, comp_grey_warped, work, tile_size);
+            flow = compose_homography_flow(resid, Hg, work.grey_tile_size(tile_size));
+        } else {
+            flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        }
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the field is on a grey tile grid carrying grey-pixel
         // displacements, while compute_robustness and merge_comp both index it
@@ -261,7 +270,15 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                0.03f + 0.50f * (float)(k - 1) / std::max(1, n - 1));
         Image comp_grey = compute_grey(burst[k], work.bayer_mode, work.grey_method);
         FrameData& fd = frames[k - 1];
-        fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        if (work.global_homography_warp) {
+            f32 Hg[9];
+            estimate_global_homography(ref_grey, comp_grey, work, Hg);
+            Image comp_grey_warped = warp_grey_by_homography(comp_grey, Hg);
+            FlowField resid = align(ref_pyr, ref_grey, comp_grey_warped, work, tile_size);
+            fd.flow = compose_homography_flow(resid, Hg, work.grey_tile_size(tile_size));
+        } else {
+            fd.flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size);
+        }
         fd.flow = flow_to_raw_tile_grid(fd.flow, burst[k].h, burst[k].w,
                                         comp_grey.h, comp_grey.w, tile_size,
                                         work.r_Mt, work.num_threads,

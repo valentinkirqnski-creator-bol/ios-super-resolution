@@ -946,6 +946,10 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
+                    Toggle("Global Homography Warp (roll)", isOn: $cam.tuningParams.global_homography_warp)
+                    Text("Estimates one 3×3 homography between the reference and each frame's grayscale, WARPS the frame into the reference's coordinates (removing global roll/scale/perspective), then lets the normal per-tile block-match + ICA find only the small residual shift — and composes the homography back so the merge samples the original raw. For large camera roll the per-tile translation model can't handle. Independent of Global Pre-Alignment.")
+                        .font(.caption).foregroundColor(.secondary)
+
                     Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
 
                     if cam.tuningParams.global_prealignment_enabled {

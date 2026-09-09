@@ -108,6 +108,7 @@ struct TuningParams: Equatable, Codable {
     var snr_auto_tune: Bool = true
     var debug_pixel4a_noise_profile: Bool = false
     var alignment_tile_size: Int = 0
+    var global_homography_warp: Bool = false
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -258,6 +259,7 @@ struct TuningParams: Equatable, Codable {
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
         case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
+        case global_homography_warp
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
@@ -312,6 +314,7 @@ struct TuningParams: Equatable, Codable {
         debug_pixel4a_noise_profile = try c.decodeIfPresent(
             Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
+        global_homography_warp = try c.decodeIfPresent(Bool.self, forKey: .global_homography_warp) ?? global_homography_warp
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
         global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
@@ -1941,6 +1944,7 @@ final class CameraModel: NSObject, ObservableObject {
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
+            "global_homography_warp": NSNumber(value: tuningParams.global_homography_warp),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
             "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),

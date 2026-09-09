@@ -1344,7 +1344,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
         }
 #endif
-        if (!used_neural_flow) {
+        if (!used_neural_flow && work.global_homography_warp) {
+            // Warp-then-refine: estimate one homography, warp the comp grey into
+            // the reference frame, refine residual translation with the existing
+            // aligner, then compose H back so the merge samples the original raw.
+            f32 Hg[9];
+            estimate_global_homography(ref_grey, comp_grey, work, Hg);
+            Image comp_grey_warped = warp_grey_by_homography(comp_grey, Hg);
+            FlowField resid = align(ref_pyr, ref_grey, comp_grey_warped, work, tile_size);
+            flow = compose_homography_flow(resid, Hg, work.grey_tile_size(tile_size));
+            flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
+                                         comp_grey.h, comp_grey.w, cons_ts,
+                                         work.r_Mt, work.num_threads,
+                                         work.grey_tile_size(cons_ts));
+        } else if (!used_neural_flow) {
             flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
                         init.dx * grey_scale_x,
                         init.dy * grey_scale_y,
