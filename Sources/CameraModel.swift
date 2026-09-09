@@ -108,7 +108,7 @@ struct TuningParams: Equatable, Codable {
     var snr_auto_tune: Bool = true
     var debug_pixel4a_noise_profile: Bool = false
     var alignment_tile_size: Int = 0
-    var global_prealignment_enabled: Bool = true
+    var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
     var global_prealignment_choose_reference: Bool = false
