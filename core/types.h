@@ -412,8 +412,6 @@ struct Config {
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
     // curves use the bundled 460-main Pixel 4a .npy tables at the rounded ISO.
-    bool  debug_pixel4a_noise_profile = false;
-    int   debug_pixel4a_noise_curve_iso = 0;
 
     // Alignment (coarse-to-fine handled internally).
     std::vector<int> bm_factors      = {1, 2, 4, 4};
@@ -455,7 +453,6 @@ struct Config {
     // of it. Falls back to the classical path per-frame if neural_flow_
     // available() is false (model missing/failed to load) or the guide
     // image isn't the fixed size the bundled model was converted for.
-    bool use_neural_flow = false;
 
     int  ica_n_iter = 3;
     // Run ICA after block matching on EVERY pyramid level, not only the finest.
@@ -485,7 +482,6 @@ struct Config {
     // accumulated error and that +/-1 budget are twice as coarse in scene terms
     // as on the full-res FFT grey -- and keeping FFT on the single finest-level
     // refinement leaves its output bit-identical to before.
-    bool align_ica_per_level = true;
 
     // Extend per-level ICA to the full-res FFT grey as well.
     //
@@ -504,7 +500,6 @@ struct Config {
     // resident for the burst, and the FFT grey has 4x the pixels of the
     // decimate grey, so roughly +120MB at 12MP. It saves compute, since those
     // gradients are currently rebuilt per frame.
-    bool align_ica_per_level_fft = false;
 
     // Match the alignment stage to Handheld-Multi-Frame-Super-Resolution-1.4
     // exactly, in the three places the port (a 460-main derivative) diverges
@@ -538,9 +533,7 @@ struct Config {
     // True when ICA should run on every pyramid level rather than only the
     // finest.
     bool ica_every_level() const {
-        return align_ica_per_level &&
-               (grey_method == GreyMethod::Decimate || align_ica_per_level_fft
-                || align_match_14);
+        return grey_method == GreyMethod::Decimate || align_match_14;
     }
 
     // On the FFT grey, run per-level ICA on the COARSE levels only and leave
@@ -559,8 +552,7 @@ struct Config {
     // they are where the benefit is -- integer-only flow originates on the
     // coarse levels, and that is what arrives at level 0 with its budget spent.
     bool ica_per_level_coarse_only() const {
-        return (align_ica_per_level_fft || align_match_14)
-               && grey_method == GreyMethod::FFT;
+        return align_match_14 && grey_method == GreyMethod::FFT;
     }
 
     // How many RAW pixels one alignment-grey pixel spans. The FFT grey is
@@ -594,7 +586,6 @@ struct Config {
     // existing per-tile block-match/ICA on the warped grey for residual
     // translation, then compose H back so the merge samples the original raw.
     // Independent of global_prealignment_enabled; supersedes it when on.
-    bool global_homography_warp = false;
     // Off by default: it is the only thing that forces the pre-alignment pass
     // to decode every frame up front, and with it off the transform is computed
     // in the analysis loop from the buffer already decoded there -- the stage
@@ -650,7 +641,6 @@ struct Config {
     //
     // Off by default: it costs one extra full-resolution float buffer per
     // comparison frame while the mask is being built.
-    bool  robustness_save_s_masks = false;
 
     float r_t  = 0.12f;
     float r_s1 = 2.0f;
@@ -750,7 +740,6 @@ struct Config {
     // per-tile S is still measured on the correct (grey) grid; only its
     // consumption becomes per-pixel. Off by default. Does not by itself reject
     // a smooth aperture slide (M stays low there) -- pair with a lower r_s2.
-    bool robustness_per_pixel_s = false;
 
     bool guide_white_balance = false;  // keep WB in the guide (skip un-prewhiten)
     bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB
@@ -803,7 +792,6 @@ struct Config {
     // tile-constant warp visible to R: at the tile edges the warp is wrong, d is
     // large, R drops, and the reference shows through instead of a smeared-but-
     // wrong merge. Rejection is the mechanism; bilinear disabled it.
-    bool  flow_bilinear_sampling = false;
 
     // Overlapping tiles for alignment (the IPOL author's suggestion): instead of
     // Ts=16 at stride 16, use Ts=16 at stride 8 (a 50% overlap). After the
@@ -816,19 +804,15 @@ struct Config {
     // Runs on the CPU in align() for both align backends, so no GPU kernel
     // changes are needed -- the Metal merge/robustness just get a 2x flow buffer
     // and the halved tile size. Off by default.
-    bool  flow_overlap_tiles = false;
     // Local search radius (grey px) for the overlapping re-measurement. The
     // seed is the already-refined coarse flow, so a small window suffices.
-    int   overlap_search_radius = 2;
 
-    bool overlap_tiles_active() const { return flow_overlap_tiles; }
 
     bool  align_ambiguous_fallback_enabled = false;
 
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
     // high. This does not repair flow; it rejects unsafe 1D tiles.
-    bool  flow_reject_1d_enabled = false;
     // A tile is considered one-dimensional when lambda2/lambda1 is below this
     // ratio. Higher catches more edge-like tiles; lower limits rejection to
     // very purely one-dimensional tiles.
@@ -880,7 +864,6 @@ struct Config {
     // A 1D tile is rejected only when enough pixels in that tile have
     // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
     // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.
-    float flow_reject_1d_residual_threshold = 2.5f;
     // Scales the estimated sensor noise variance subtracted before the HF
     // loss ratio. >1 assumes more noise, so less of the local variance counts
     // as signal and fewer areas are flagged as high-frequency detail; <1 is
@@ -903,12 +886,10 @@ struct Config {
     // high-frequency signal, so condition 1 spares it.
     //
     // Off by default: it changes which pixels merge, so enable it deliberately.
-    bool  hf_artifact_removal_enabled = false;
     // loss = 1 - variance_lowpass / variance_original, both noise-corrected.
     // Above this the patch counts as high-frequency. Reference points measured
     // on typical content: flat wall ~0.04, face ~0.19, brick ~0.83,
     // checkerboard ~0.92.
-    float hf_variance_loss_threshold = 0.75f;
     // The patch is skipped unless its signal variance exceeds this multiple of
     // the estimated sensor noise variance. This is what stops ISO 6400 noise
     // reading as high-frequency detail, and it scales with brightness through
@@ -972,7 +953,10 @@ struct Config {
 
     // Merge / steerable kernels.
     KernelShape  kernel = KernelShape::Steerable;
-    SelectionLaw selection = SelectionLaw::HardThreshold;
+    // Merge-kernel selection law. Python 1.4 defaults to 'linear' (a continuous
+    // anisotropy ramp); 460-main uses 'hard_threshold' (snap past A=1.95). They
+    // coincide at A==1 and A==2 and differ only for moderately anisotropic tiles.
+    SelectionLaw selection = SelectionLaw::Linear;
     bool  snr_auto_tune = true; // Python always runs update_snr_config
     float k_detail  = 0.17f;  // SNR lerp [0.33, 0.25] when snr_auto_tune
     float k_denoise = 0.0f;   // SNR lerp [5.0, 3.0] when snr_auto_tune
@@ -1048,7 +1032,6 @@ inline void apply_pixel4a_noise_profile(Config& cfg, f32 iso) {
         cfg.beta_dng[c] = b;
     }
     cfg.has_noise_profile = true;
-    cfg.debug_pixel4a_noise_curve_iso = round_pixel4a_noise_curve_iso(iso);
 }
 
 inline f32 smoothstepf(f32 edge0, f32 edge1, f32 x) {

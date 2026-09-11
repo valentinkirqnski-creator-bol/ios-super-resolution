@@ -695,15 +695,6 @@ struct CameraView: View {
 
     @ViewBuilder
     private var fineAlignmentSection: some View {
-        Toggle("ICA Per Level In FFT Mode", isOn: $cam.tuningParams.align_ica_per_level_fft)
-        Text("""
-             Extends the above to the full-res FFT grey. Without it that path feeds \
-             integer-only flow into a finest level that can only search +/-1 pixel, so the \
-             correction budget is spent before it starts and tile-shaped displacements \
-             survive. Coarse levels only -- the finest is refined either way -- which keeps \
-             the extra reference gradients to about a quarter of a frame.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Match 1.4 Alignment", isOn: $cam.tuningParams.align_match_14)
         Text("""
              Switches the three places the aligner (a 460-main derivative) diverges from \
@@ -712,15 +703,6 @@ struct CameraView: View {
              three-candidate re-match), and ICA runs on every pyramid level of the FFT grey. \
              Algorithm parity with 1.4, not bit parity (the FFT and GPU float order still \
              differ upstream). Off keeps the current 460 behaviour.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Overlapping Tiles (align, Ts/2)", isOn: $cam.tuningParams.flow_overlap_tiles)
-        Text("""
-             After alignment, re-measure the finest flow on twice as many tiles \
-             (Ts=16 at stride 8, a 50% overlap), each block-matched on its own \
-             16px window. Motion that varies inside a tile is captured instead of \
-             averaged, so tile-scale warping at motion edges is reduced. The flow \
-             feeds merge and robustness at the finer grid. Runs on CPU; off by default.
              """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Geometry Rejection (rotation)", isOn: $cam.tuningParams.motion_geom_reject_enabled)
@@ -739,15 +721,6 @@ struct CameraView: View {
         }
         Slider(value: $cam.tuningParams.motion_geom_reject_threshold, in: 0.0...0.06)
         Text("~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner, fewer samples kept.")
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Per-Pixel Robustness s (paper)", isOn: $cam.tuningParams.robustness_per_pixel_s)
-        Text("""
-             Wronski computes the motion scale s per PIXEL; the port computes one s \
-             per 16px tile and, since s2=12 saturates R, that broadcasts one R over \
-             the whole tile. This samples s bilinearly per pixel so it varies \
-             smoothly, removing the tile-block look. Foundation for lowering s2; on \
-             its own it won't reject a smooth aperture slide. Off by default.
-             """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Guide: Keep White Balance", isOn: $cam.tuningParams.guide_white_balance)
         Toggle("Guide: Colour Matrix (→sRGB)", isOn: $cam.tuningParams.guide_color_matrix)
@@ -768,25 +741,14 @@ struct CameraView: View {
              unchanged.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Use Neural Flow (PWCNet)", isOn: $cam.tuningParams.use_neural_flow)
-        Text("""
-             Replaces the block-matching pyramid with a PWCNet model run on-device via \
-             Core ML, feeding the same robustness/merge math either way. Falls back to the \
-             classical path per-frame if the bundled model is missing or fails to load. \
-             Experimental -- not yet validated against real bursts on-device.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Ambiguous-Match Fallback", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
         Text("""
              ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Smooth Tile Flow (bilinear)", isOn: $cam.tuningParams.flow_bilinear_sampling)
+        Toggle("Linear Kernel Selection (1.4)", isOn: $cam.tuningParams.kernel_selection_linear)
         Text("""
-             Block matching produces ONE displacement per 16-pixel tile, and consuming it              nearest makes the warp piecewise constant -- v(x,y) = v_ij across each tile,              jumping at every boundary.
-             For pure translation that is exact: every tile carries the same vector, so              there is nothing to jump. For ROTATION it is not -- the true field varies              continuously with position, so a per-tile constant is a staircase, stepping              by about theta x tile_size at each seam (0.28 raw px at 1 degree, 0.84 at 3).
-             Those steps are sub-pixel, so Eq. 6 barely registers them: its 3x3 guide means              average over 6x6 raw pixels. But the eye detects DISCONTINUITY far more              readily than magnitude, so a sub-pixel error that flips at every tile boundary              reads as a grid, while the same error spread smoothly would not be seen. That              is why the artifact sits below the mask's threshold and above yours.
-             This interpolates between the four surrounding tile-centre vectors in ALL              consumers together -- merge, Eq. 6's d, the upscaled/warped statistics, and              the raw-resolution mask. They switch together by necessity: the mask must              score the correspondence the merge actually fetches, so an interpolated merge              with a nearest mask would grade a fetch nobody performs.
+             Merge steerable-kernel selection law. ON = 'linear' (Python 1.4 default):              the kernel anisotropy ramps continuously with the local structure A.              OFF = 'hard_threshold' (460-main): round kernels until A>1.95, then snap to              full stretch. The two agree at A=1 and A=2 and differ only for moderately              anisotropic detail. ON = exact 1.4 parity.
              """)
             .font(.caption2).foregroundColor(.secondary)
         Toggle("Disable Noise Model (Robustness)", isOn: $cam.tuningParams.debug_noise_model_disabled)
@@ -859,42 +821,6 @@ struct CameraView: View {
                          ? "Full-res FFT low-pass. Slower."
                          : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
                         .font(.caption2).foregroundColor(.secondary)
-                    Toggle("HF Artifact Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
-                    Text("Rejects repetitive fine texture that block matching cannot align (aperture problem). Needs high-frequency content AND unstable flow, so hair and noise are spared.")
-                        .font(.caption2).foregroundColor(.secondary)
-
-                    if cam.tuningParams.hf_artifact_removal_enabled {
-                        HStack {
-                            Text("Variance Loss")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.hf_variance_loss_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.hf_variance_loss_threshold, in: 0.50...0.99, step: 0.01)
-
-                        HStack {
-                            Text("Min Texture SNR")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.hf_min_texture_snr))
-                        }
-                        Slider(value: $cam.tuningParams.hf_min_texture_snr, in: 1.0...30.0, step: 0.5)
-                    }
-
-                    Toggle("Reject 1D Tiles", isOn: $cam.tuningParams.flow_reject_1d_enabled)
-                    Text("Rejects one-dimensional tiles only when their aligned residual is high.")
-                        .font(.caption2).foregroundColor(.secondary)
-
-                    if cam.tuningParams.flow_reject_1d_enabled {
-                        HStack {
-                            Text("1D Residual")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.flow_reject_1d_residual_threshold))
-                                .monospacedDigit()
-                        }
-                        Slider(value: $cam.tuningParams.flow_reject_1d_residual_threshold,
-                               in: 0.0...8.0,
-                               step: 0.05)
-                    }
-
                     Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
 
                     if cam.tuningParams.motion_edge_rejection_enabled {
@@ -941,14 +867,6 @@ struct CameraView: View {
     private var kernelsSection: some View {
                 Section(header: Text("Steerable Kernels (Merging)")) {
                     Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
-                    Toggle("Debug Pixel 4a Noise", isOn: $cam.tuningParams.debug_pixel4a_noise_profile)
-                    Text("Ignores the captured DNG NoiseProfile and uses bundled Pixel 4a correction curves at the rounded ISO. For Python parity/debugging only.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Toggle("Global Homography Warp (roll)", isOn: $cam.tuningParams.global_homography_warp)
-                    Text("Estimates one 3×3 homography between the reference and each frame's grayscale, WARPS the frame into the reference's coordinates (removing global roll/scale/perspective), then lets the normal per-tile block-match + ICA find only the small residual shift — and composes the homography back so the merge samples the original raw. For large camera roll the per-tile translation model can't handle. Independent of Global Pre-Alignment.")
-                        .font(.caption).foregroundColor(.secondary)
 
                     Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
 
@@ -1161,12 +1079,6 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
-                    if cam.tuningParams.robustness_save_mask {
-                        Toggle("Save s1/s2 Split Masks", isOn: $cam.tuningParams.robustness_save_s_masks)
-                        Text("Also writes _robustness_s1.pgm and _robustness_s2.pgm next to the DNG. s1 is the strict motion prior, applied where the flow field varies sharply or the tile is aperture-limited; s2 is the permissive default. A pixel is bright in exactly one of the two, at the value it contributed to the combined mask, so the pair shows precisely which regions used which.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                    }
                 }
 
                 Section(header: Text("Fallback Denoiser")) {
@@ -1188,12 +1100,6 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
                         
-                        Toggle("ICA Every Pyramid Level", isOn: $cam.tuningParams.align_ica_per_level)
-                        Text("Refines sub-pixel alignment after block matching at every "
-                             + "pyramid level, as the reference does, instead of only the "
-                             + "finest. 2x2 decimate grey only unless the switch below is on.")
-                            .font(.caption2).foregroundColor(.secondary)
-
                         fineAlignmentSection
 
                         Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)

@@ -982,7 +982,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // Same sum, partitioned by which motion prior scored each pixel. Debug only,
     // and only meaningful alongside the combined mask, so it follows the same
     // save flag. Accumulated in the loop for the same reason acc_rob is.
-    const bool want_s_masks = work.robustness_save_mask && work.robustness_save_s_masks;
+    const bool want_s_masks = false; // s1/s2 split-mask output removed
     Image acc_rob_s1, acc_rob_s2;
     bool have_acc_rob_split = false;
 
@@ -1090,13 +1090,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     const int n = frame_count;
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
-    // Overlapping-tile alignment (Config::flow_overlap_tiles) returns a flow on
-    // a Ts/2 grid (2x as many tiles), so every flow CONSUMER -- the grey->raw
-    // regrid, robustness, and the merge -- must index it at tile_size/2. align()
-    // still gets the full tile_size for its pyramid. cons_ts == tile_size when
-    // the feature is off, so the default path is unchanged.
-    const int cons_ts = (work.overlap_tiles_active() && tile_size >= 2)
-                        ? tile_size / 2 : tile_size;
+    // Grid the flow consumers (grey->raw regrid, robustness, merge) index at.
+    const int cons_ts = tile_size;
     // Output dimensions are known as soon as the reference is, and the online
     // merge needs its accumulator before the first frame is analyzed.
     const int out_h = (int)std::lround(work.scale * (f32)ref_h);
@@ -1148,11 +1143,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // compute_guide(ref, ...) doesn't change per comp frame. Only touched
     // when the Settings toggle is on and the model actually loaded, so this
     // costs nothing on the classical path.
-#if defined(__APPLE__)
-    Image ref_guide_neural;
-    if (work.use_neural_flow && neural_flow_available())
-        ref_guide_neural = compute_guide(ref, work);
-#endif
 
     // Keep ref Bayer in RAM for merge (avoids a second LibRaw decode).
     // Peak during analyze ≈ ref + one comparison (+ optional prefetch on 2×).
@@ -1322,71 +1312,24 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_add_cpu("prealign#grey-dx-abs-sum",
                      std::fabs((double)(init.dx * grey_scale_x)));
         const double t_align = prof_now_ms();
-        FlowField flow;
-        bool used_neural_flow = false;
-#if defined(__APPLE__)
-        // Settings "Use Neural Flow": PWCNet via Core ML in place of the
-        // block-matching pyramid. Feeds the exact same downstream path
-        // (flow_from_dense_guide mirrors flow_to_raw_tile_grid's grey/raw
-        // scaling) -- only the source of the flow field changes. Falls back
-        // to the classical path below on any failure (model unavailable,
-        // guide size mismatch, Core ML prediction error) rather than
-        // producing a frame with no flow at all.
-        if (work.use_neural_flow && ref_guide_neural.h > 0) {
-            Image comp_guide_neural = compute_guide(comp, work);
-            std::vector<f32> dense_flow;
-            if (neural_flow_estimate(ref_guide_neural, comp_guide_neural, dense_flow)) {
-                flow = flow_from_dense_guide(dense_flow.data(),
-                                             ref_guide_neural.h, ref_guide_neural.w,
-                                             comp.h, comp.w, tile_size,
-                                             work.r_Mt, work.num_threads);
-                used_neural_flow = true;
-            }
-        }
-#endif
-        if (!used_neural_flow && work.global_homography_warp) {
-            // Warp-then-refine: estimate one homography, warp the comp grey into
-            // the reference frame, refine residual translation with the existing
-            // aligner, then compose H back so the merge samples the original raw.
-            f32 Hg[9];
-            estimate_global_homography(ref_grey, comp_grey, work, Hg);
-            Image comp_grey_warped = warp_grey_by_homography(comp_grey, Hg);
-            FlowField resid = align(ref_pyr, ref_grey, comp_grey_warped, work, tile_size);
-            flow = compose_homography_flow(resid, Hg, work.grey_tile_size(tile_size));
-            flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
-                                         comp_grey.h, comp_grey.w, cons_ts,
-                                         work.r_Mt, work.num_threads,
-                                         work.grey_tile_size(cons_ts));
-        } else if (!used_neural_flow) {
-            flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
-                        init.dx * grey_scale_x,
-                        init.dy * grey_scale_y,
-                        init.angle);
-            // Alignment ran on the grey. With the Bayer quad average that is
-            // half resolution, so the flow is on a half-res tile grid with
-            // half-res displacements, while robustness and merge both index
-            // it as raw_coordinate / tile_size and add raw pixels. Convert
-            // here, before anything downstream sees it. No-op when the grey
-            // is full resolution, so the FFT path is unaffected.
-            // cons_ts (== tile_size/2 under flow_overlap_tiles) is the grid the
-            // 2x flow lives on. No-op on the FFT grey (grey == raw), so its args
-            // are moot there; on the decimate grey it regrids at the finer stride.
-            flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
-                                         comp_grey.h, comp_grey.w, cons_ts,
-                                         work.r_Mt, work.num_threads,
-                                         work.grey_tile_size(cons_ts));
-        }
+        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
+                               init.dx * grey_scale_x,
+                               init.dy * grey_scale_y,
+                               init.angle);
+        // Alignment ran on the grey. With the Bayer quad average that is half
+        // resolution, so the flow is on a half-res tile grid with half-res
+        // displacements, while robustness and merge both index it as
+        // raw_coordinate / tile_size and add raw pixels. Convert here, before
+        // anything downstream sees it. No-op when the grey is full resolution,
+        // so the FFT path is unaffected.
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w,
+                                     comp_grey.h, comp_grey.w, cons_ts,
+                                     work.r_Mt, work.num_threads,
+                                     work.grey_tile_size(cons_ts));
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
-        // Diagnostic: dump the first comparison frame's flow as a colour PPM
-        // next to the mask ("<dng>_flow.ppm"). Rides the mask-save toggle so it
-        // appears whenever the robustness mask is saved. Hue = direction,
-        // brightness = magnitude -- a smooth gradient is a smooth (possibly
-        // aperture-slid) flow; hard bands are a broken flow field.
-        if (work.robustness_save_mask && pos == 0)
-            write_flow_ppm(flow, dng_path, comp.h, comp.w);
         const double t_freeg = prof_now_ms();
         comp_grey = Image(); // free before robustness/kernels peak
         prof_add_cpu("comp:free-grey", prof_now_ms() - t_freeg);

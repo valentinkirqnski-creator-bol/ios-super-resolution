@@ -89,13 +89,9 @@ struct TuningParams: Equatable, Codable {
     var r_Mt: Float = 0.8
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
     var alignment_grey_fft: Bool = true
-    var hf_artifact_removal_enabled: Bool = false
-    var hf_variance_loss_threshold: Float = 0.75
     var hf_min_texture_snr: Float = 4.0
-    var flow_reject_1d_enabled: Bool = false
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
-    var flow_reject_1d_residual_threshold: Float = 2.5
     var motion_edge_rejection_enabled: Bool = true
     var motion_edge_threshold: Float = 0.025
     var motion_edge_residual_threshold: Float = 2.5
@@ -106,9 +102,7 @@ struct TuningParams: Equatable, Codable {
     var k_stretch: Float = 4.0
     var k_shrink: Float = 2.0
     var snr_auto_tune: Bool = true
-    var debug_pixel4a_noise_profile: Bool = false
     var alignment_tile_size: Int = 0
-    var global_homography_warp: Bool = false
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -123,7 +117,6 @@ struct TuningParams: Equatable, Codable {
     /// Also write _robustness_s1.pgm and _robustness_s2.pgm, splitting the
     /// accumulated mask by which motion prior scored each pixel. Costs one extra
     /// full-resolution buffer per comparison frame while the mask is built.
-    var robustness_save_s_masks: Bool = false
     var accumulated_robustness_denoiser_enabled: Bool = true
     /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
     /// band, 2 = always merge online. Online keeps memory flat in frame count
@@ -135,12 +128,10 @@ struct TuningParams: Equatable, Codable {
     /// Run ICA after block matching on every pyramid level, as the reference
     /// implementation does, instead of only on the finest. Half-res 2x2 grey
     /// only -- the full-res FFT path is unaffected either way.
-    var align_ica_per_level: Bool = true
     /// Extend the above to the full-res FFT grey. Without it that path feeds
     /// integer-only flow into a finest level whose search radius is 1, so the
     /// correction budget is already spent when level 0 starts. Costs roughly
     /// +120MB at 12MP, because the reference gradient cache goes resident.
-    var align_ica_per_level_fft: Bool = false
     /// Match the alignment stage to Handheld-Multi-Frame-Super-Resolution-1.4:
     /// finest search radius -> 1, bilinear inter-level flow upscale (not the 460
     /// three-candidate re-match), and per-level ICA on the FFT grey. Off keeps
@@ -151,9 +142,7 @@ struct TuningParams: Equatable, Codable {
     /// 50% overlap), each cell block-matched on its own Ts window. Captures
     /// motion that varies inside a 16px tile instead of averaging it. Runs on
     /// CPU for both align backends. Off by default.
-    var flow_overlap_tiles: Bool = false
     /// Local search radius (grey px) for the overlapping re-measurement.
-    var overlap_search_radius: Int = 2
     /// Render the robustness guide as a real display RGB before d/sigma: keep
     /// white balance, apply the camera->sRGB matrix, and a transfer curve. Makes
     /// the colour distance separate true mismatches from noise. Run with the
@@ -165,7 +154,6 @@ struct TuningParams: Equatable, Codable {
     /// Per-pixel motion scale s (Wronski's per-pixel M): sample s bilinearly per
     /// pixel instead of one value per 16px tile, removing the tile-block R the
     /// paper never had. Off by default.
-    var robustness_per_pixel_s: Bool = false
     /// Geometry-aware rejection: drop pixels where the per-tile translation is a
     /// poor model of local motion (flow-gradient × offset, weighted by |∇I|).
     /// Cleans rotation tile-ghosts by rejecting the worst pixels (they fall back
@@ -180,7 +168,6 @@ struct TuningParams: Equatable, Codable {
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
     /// path per-frame if the model isn't bundled or fails to load.
-    var use_neural_flow: Bool = false
     /// ImageStackAlignator's rule for unreliable block matches: when a
     /// tile's best and second-best costs are near-tied (flat patch, aperture,
     /// repetition -- no precise shift determinable), apply NO shift and keep
@@ -200,7 +187,11 @@ struct TuningParams: Equatable, Codable {
     // Default false = 1.4 / HDR+ parity: consume the flow (and the robustness
     // map) NEAREST-per-tile so R grades the tile-constant warp and can reject
     // rotation misalignment. Bilinear smooths the warp so R can't reject it.
-    var flow_bilinear_sampling: Bool = false
+    /// Merge-kernel selection law. true = 'linear' (Python 1.4 default, a
+    /// continuous anisotropy ramp); false = 'hard_threshold' (460-main, snap
+    /// past A=1.95). They coincide at A==1 and A==2 and differ only for
+    /// moderately anisotropic tiles. Default true = 1.4 parity.
+    var kernel_selection_linear: Bool = true
     /// Computes d^2/sigma^2/R at RAW resolution (Dodgson-quadratic upscale +
     /// flow-warp of the guide-resolution local stats) instead of directly at
     /// guide resolution, which this port otherwise does. The statistics stay
@@ -251,30 +242,26 @@ struct TuningParams: Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case r_t, r_s1, r_s2, r_Mt
         case alignment_grey_fft
-        case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case hf_min_texture_snr
-        case flow_reject_1d_enabled, flow_regularize_aperture_ratio
-        case flow_reject_1d_ambiguity_ratio, flow_reject_1d_residual_threshold
+        case flow_regularize_aperture_ratio
+        case flow_reject_1d_ambiguity_ratio
         case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
         case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, debug_pixel4a_noise_profile, alignment_tile_size
-        case global_homography_warp
+        case snr_auto_tune, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
-        case robustness_enabled, robustness_save_mask, robustness_save_s_masks
+        case robustness_enabled, robustness_save_mask
         case accumulated_robustness_denoiser_enabled
         case merge_arch
-        case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
-        case align_ica_per_level_fft, align_match_14, use_neural_flow
-        case flow_overlap_tiles, overlap_search_radius
+        case acc_rob_adaptive, acc_rob_max_frame_count
+        case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
-        case robustness_per_pixel_s
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
-        case flow_bilinear_sampling
+        case kernel_selection_linear
         case use_neural_robustness
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -294,13 +281,9 @@ struct TuningParams: Equatable, Codable {
         r_s2 = try c.decodeIfPresent(Float.self, forKey: .r_s2) ?? r_s2
         r_Mt = try c.decodeIfPresent(Float.self, forKey: .r_Mt) ?? r_Mt
         alignment_grey_fft = try c.decodeIfPresent(Bool.self, forKey: .alignment_grey_fft) ?? alignment_grey_fft
-        hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
-        hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
-        flow_reject_1d_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_reject_1d_enabled) ?? flow_reject_1d_enabled
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
         flow_reject_1d_ambiguity_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_ambiguity_ratio) ?? flow_reject_1d_ambiguity_ratio
-        flow_reject_1d_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_residual_threshold) ?? flow_reject_1d_residual_threshold
         motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
         motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
         motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
@@ -311,10 +294,7 @@ struct TuningParams: Equatable, Codable {
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
-        debug_pixel4a_noise_profile = try c.decodeIfPresent(
-            Bool.self, forKey: .debug_pixel4a_noise_profile) ?? debug_pixel4a_noise_profile
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
-        global_homography_warp = try c.decodeIfPresent(Bool.self, forKey: .global_homography_warp) ?? global_homography_warp
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
         global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
@@ -322,7 +302,6 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
-        robustness_save_s_masks = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_s_masks) ?? robustness_save_s_masks
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
@@ -345,21 +324,15 @@ struct TuningParams: Equatable, Codable {
         isp_saturation = try c.decodeIfPresent(Float.self, forKey: .isp_saturation) ?? isp_saturation
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
-        align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
-        align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
-        flow_overlap_tiles = try c.decodeIfPresent(Bool.self, forKey: .flow_overlap_tiles) ?? flow_overlap_tiles
-        overlap_search_radius = try c.decodeIfPresent(Int.self, forKey: .overlap_search_radius) ?? overlap_search_radius
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
-        robustness_per_pixel_s = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_pixel_s) ?? robustness_per_pixel_s
         motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
-        use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
-        flow_bilinear_sampling = try c.decodeIfPresent(Bool.self, forKey: .flow_bilinear_sampling) ?? flow_bilinear_sampling
+        kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
@@ -1925,13 +1898,9 @@ final class CameraModel: NSObject, ObservableObject {
             "r_s2": NSNumber(value: tuningParams.r_s2),
             "r_Mt": NSNumber(value: tuningParams.r_Mt),
             "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
-            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
-            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
-            "flow_reject_1d_enabled": NSNumber(value: tuningParams.flow_reject_1d_enabled),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
             "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
-            "flow_reject_1d_residual_threshold": NSNumber(value: tuningParams.flow_reject_1d_residual_threshold),
             "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
             "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
             "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
@@ -1942,9 +1911,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
-            "debug_pixel4a_noise_profile": NSNumber(value: tuningParams.debug_pixel4a_noise_profile),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
-            "global_homography_warp": NSNumber(value: tuningParams.global_homography_warp),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
             "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
@@ -1952,7 +1919,6 @@ final class CameraModel: NSObject, ObservableObject {
             "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
-            "robustness_save_s_masks": NSNumber(value: tuningParams.robustness_save_s_masks),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
@@ -1973,21 +1939,15 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_saturation": NSNumber(value: tuningParams.isp_saturation),
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
-            "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
-            "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
-            "flow_overlap_tiles": NSNumber(value: tuningParams.flow_overlap_tiles),
-            "overlap_search_radius": NSNumber(value: tuningParams.overlap_search_radius),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
-            "robustness_per_pixel_s": NSNumber(value: tuningParams.robustness_per_pixel_s),
             "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
-            "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
-            "flow_bilinear_sampling": NSNumber(value: tuningParams.flow_bilinear_sampling),
+            "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
@@ -2051,13 +2011,6 @@ final class CameraModel: NSObject, ObservableObject {
             var maskSuffixes: [String] = []
             if tuningParams.robustness_save_mask {
                 maskSuffixes.append("_robustness.pgm")
-                // Colour optical-flow diagnostic (write_flow_ppm), saved next to
-                // the mask. Hue = flow direction, brightness = magnitude.
-                maskSuffixes.append("_flow.ppm")
-                if tuningParams.robustness_save_s_masks {
-                    maskSuffixes.append("_robustness_s1.pgm")
-                    maskSuffixes.append("_robustness_s2.pgm")
-                }
             }
             let base = outURL.deletingPathExtension().path
             let robURLs = maskSuffixes

@@ -367,25 +367,6 @@ static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
 }
 
 static const NoiseCurves& make_noise_curves(const Config& cfg) {
-    if (cfg.debug_pixel4a_noise_profile) {
-        static NoiseCurves cached_pixel4a;
-        static int cached_iso = 0;
-        int iso = cfg.debug_pixel4a_noise_curve_iso > 0
-            ? cfg.debug_pixel4a_noise_curve_iso
-            : 100;
-        iso = closest_pixel4a_curve_iso(iso);
-        if (!cached_pixel4a.std_curve.empty() && cached_iso == iso)
-            return cached_pixel4a;
-
-        NoiseCurves nc;
-        if (load_bundled_pixel4a_noise_curves(iso, nc)) {
-            cached_pixel4a = std::move(nc);
-            cached_iso = iso;
-            std::printf("[noise] Loaded bundled Pixel 4a ISO %d curves (%d bins)\n",
-                        iso, pixel4a_noise::kBins);
-            return cached_pixel4a;
-        }
-    }
     return make_noise_curves(cfg.noise_alpha(), cfg.noise_beta());
 }
 
@@ -415,8 +396,6 @@ static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch)
 }
 
 static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
-    if (cfg.debug_pixel4a_noise_profile)
-        return make_noise_curves(cfg);
     // WB-scaled per-channel alpha/beta, matching the WB'd guide. Only mask
     // paths call this wrapper.
     return make_noise_curves_channel(cfg.noise_alpha_ch_robustness(ch),
@@ -461,8 +440,6 @@ static const NoiseCurves& mask_noise_curves(const Config& cfg) {
     const bool sq = cfg.robustness_guide_sqrt;
     if (cfg.debug_noise_model_disabled)
         return sq ? make_noise_curves_sqrt(0.f, 0.f) : make_noise_curves(0.f, 0.f);
-    if (cfg.debug_pixel4a_noise_profile)
-        return make_noise_curves(cfg); // bundled table is linear-domain only
     const f32 a = cfg.noise_alpha_robustness(), b = cfg.noise_beta_robustness();
     return sq ? make_noise_curves_sqrt(a, b) : make_noise_curves(a, b);
 }
@@ -471,8 +448,6 @@ static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
     if (cfg.debug_noise_model_disabled)
         return sq ? make_noise_curves_channel_sqrt(0.f, 0.f, ch)
                   : make_noise_curves_channel(0.f, 0.f, ch);
-    if (cfg.debug_pixel4a_noise_profile)
-        return make_noise_curves_channel(cfg, ch);
     return sq ? make_noise_curves_channel_sqrt(cfg.noise_alpha_ch_robustness(ch),
                                                cfg.noise_beta_ch_robustness(ch), ch)
               : make_noise_curves_channel(cfg, ch);
@@ -1117,22 +1092,14 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
     st.stds  = std::move(vars);
-    if (cfg.hf_artifact_removal_enabled) {
-        Image lp_guide = local_lowpass_gaussian5x5(guide);
-        Image lp_means, lp_vars;
-        local_stats_3x3(lp_guide, lp_means, lp_vars);
-        st.hf_loss = high_frequency_loss_map_adaptive(st.means, st.stds, lp_vars, cfg);
-    }
     if (cfg.robustness_raw_resolution_active()) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
         // burst here, not once per comparison frame.
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
-                                            0, cfg.num_threads,
-                                            cfg.flow_bilinear_sampling);
+                                            0, cfg.num_threads, false);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
-                                           0, cfg.num_threads,
-                                           cfg.flow_bilinear_sampling);
+                                           0, cfg.num_threads, false);
     }
     return st;
 #endif
@@ -1195,8 +1162,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
-                                        tile_size, cfg.num_threads,
-                                        cfg.flow_bilinear_sampling);
+                                        tile_size, cfg.num_threads, false);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -1209,23 +1175,13 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     Image d_sq, sigma_sq;
     apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
                             cfg.num_threads, cfg.robustness_guide_sqrt);
-    std::vector<uint32_t> tile_residual_high;
-    if (cfg.flow_reject_1d_enabled) {
-        tile_residual_high = compute_tile_residual_high(
-            d_sq, sigma_sq, flow, tile_size, ref_stats.means.c,
-            cfg.flow_reject_1d_residual_threshold, /*already_raw_res=*/true);
-    }
-
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   (cfg.motion_edge_rejection_enabled ||
-                                    cfg.hf_artifact_removal_enabled)
+                                   cfg.motion_edge_rejection_enabled
                                        ? &motion_irregular
                                        : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+    if (!cfg.motion_edge_rejection_enabled)
         motion_irregular.assign(S.size(), 0u);
-
-    const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
 
     Image R(h, w, 1);
     if (s_select_out) *s_select_out = Image(h, w, 1);
@@ -1242,49 +1198,23 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 if (s_select_out) s_select_out->at(y, x) = 0.f;
                 continue;
             }
-            // Per-pixel s: bilinear over the tile grid (see the guide-res path).
-            // Raw resolution -> tile coordinate is a plain raw/tile_size - 0.5.
-            f32 s;
-            if (cfg.robustness_per_pixel_s) {
-                const f32 tcy = (f32)y / (f32)tile_size - 0.5f;
-                const f32 tcx = (f32)x / (f32)tile_size - 0.5f;
-                s = sample_s_bilinear(S, flow.ny, flow.nx, tcy, tcx);
-            } else {
-                s = S[pidx];
-            }
+            f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
             const f32 ratio = (sig > 0.f && std::isfinite(sig))
                 ? d_sq.at(y, x) / sig
                 : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            const bool residual_high =
-                std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
-            (void)residual_high;
-            const int gy = std::min(std::max(y / 2, 0), std::max(0, ref_stats.hf_loss.h - 1));
-            const int gx = std::min(std::max(x / 2, 0), std::max(0, ref_stats.hf_loss.w - 1));
-            const bool hf_reject =
-                cfg.hf_artifact_removal_enabled &&
-                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
-                have_hf_loss &&
-                ref_stats.hf_loss.at(gy, gx) > cfg.hf_variance_loss_threshold;
             // comp_means is already warped into the reference's coordinate
             // frame (the Dodgson upscale above), so the "moved" position for
             // the edge-strength neighbourhood lookup is just (y,x) again.
             const bool edge_reject =
                 motion_edge_reject(ref_means, comp_means, motion_irregular,
                                    pidx, y, x, y, x, ratio, cfg);
-            const bool aperture_limited =
-                cfg.flow_reject_1d_enabled &&
-                pidx < flow.aperture_limited.size() &&
-                pidx < tile_residual_high.size() &&
-                flow.aperture_limited[pidx] != 0u &&
-                tile_residual_high[pidx] != 0u;
-            if (aperture_limited) s = std::min(s, cfg.r_s1);
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            const bool hard_reject = hf_reject || edge_reject;
+            const bool hard_reject = edge_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
@@ -1523,8 +1453,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 // Dodgson upscale + flow warp into the reference frame, the
                 // same transform the analytic raw-res path applies.
                 Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
-                                                 tile_size, cfg.num_threads,
-                                                 cfg.flow_bilinear_sampling);
+                                                 tile_size, cfg.num_threads, false);
                 cm_nn = std::move(hires);
             }
         }
@@ -1606,25 +1535,13 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             if (d_p.c == 1) {
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
-                if (cfg.flow_bilinear_sampling)
-                    flow.sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
-                else {
-                    flow_x = flow.dx(patch_idy, patch_idx);
-                    flow_y = flow.dy(patch_idy, patch_idx);
-                }
+                flow_x = flow.dx(patch_idy, patch_idx);
+                flow_y = flow.dy(patch_idy, patch_idx);
             } else {
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
-                if (cfg.flow_bilinear_sampling) {
-                    // guide pixel -> its raw centre, then raw px -> guide px
-                    f32 rdx, rdy;
-                    flow.sample_bilinear(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
-                                         tile_size, rdx, rdy);
-                    flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
-                } else {
-                    flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                    flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
-                }
+                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
             }
 
             const f32 sample_x = (f32)x + flow_x;
@@ -1642,20 +1559,12 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     Image d_sq, sigma_sq;
     apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
                       cfg.robustness_guide_sqrt);
-    std::vector<uint32_t> tile_residual_high;
-    if (cfg.flow_reject_1d_enabled) {
-        tile_residual_high = compute_tile_residual_high(
-            d_sq, sigma_sq, flow, tile_size, ref_stats.means.c,
-            cfg.flow_reject_1d_residual_threshold);
-    }
-
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   (cfg.motion_edge_rejection_enabled ||
-                                    cfg.hf_artifact_removal_enabled)
+                                   cfg.motion_edge_rejection_enabled
                                        ? &motion_irregular
                                        : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+    if (!cfg.motion_edge_rejection_enabled)
         motion_irregular.assign(S.size(), 0u);
 
     Image R(h, w, 1);
@@ -1670,16 +1579,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
             }
-            // Same sampling as the merge and Eq. 6's d.
-            f32 flow_x = 0.f, flow_y = 0.f;
-            if (cfg.flow_bilinear_sampling) {
-                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
-                f32 rdx, rdy;
-                flow.sample_bilinear(sc * (f32)y + 0.5f * (sc - 1.f),
-                                     sc * (f32)x + 0.5f * (sc - 1.f),
-                                     tile_size, rdx, rdy);
-                flow_x = rdx / sc; flow_y = rdy / sc;
-            } else if (ref_stats.means.c == 3) {
+            // Nearest per-tile flow, same sampling as the merge and Eq. 6's d.
+            f32 flow_x, flow_y;
+            if (ref_stats.means.c == 3) {
                 flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
                 flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
             } else {
@@ -1689,56 +1591,14 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
             const int new_x = (int)std::lround((f32)x + flow_x);
             const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
-            // Per-pixel s (Wronski's per-pixel M): bilinearly sample the per-tile
-            // S at this pixel's tile coordinate instead of the nearest tile, so
-            // s varies smoothly rather than in 16px blocks. Same tile coordinate
-            // the flow was sampled at above.
-            f32 s;
-            if (cfg.robustness_per_pixel_s) {
-                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
-                const f32 tcy = (sc * (f32)y + 0.5f * (sc - 1.f)) / (f32)tile_size - 0.5f;
-                const f32 tcx = (sc * (f32)x + 0.5f * (sc - 1.f)) / (f32)tile_size - 0.5f;
-                s = sample_s_bilinear(S, flow.ny, flow.nx, tcy, tcx);
-            } else {
-                s = S[pidx];
-            }
+            f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
             const f32 ratio = (sig > 0.f && std::isfinite(sig))
                 ? d_sq.at(y, x) / sig
                 : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            const bool residual_high =
-                std::isfinite(ratio) && ratio > cfg.motion_edge_residual_threshold;
-            // Both required: an almost-entirely-high-frequency patch, and a
-            // large local variation in the alignment vector field -- "the same
-            // as used in the motion prior", i.e. the r_Mt test. Hair is
-            // high-frequency but tracks cleanly; a noisy flat wall varies but
-            // has no real high-frequency signal.
-            const bool hf_reject =
-                cfg.hf_artifact_removal_enabled &&
-                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
-                !ref_stats.hf_loss.data.empty() &&
-                ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold;
             const bool edge_reject =
                 motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
                                    pidx, y, x, new_y, new_x, ratio, cfg);
-            // Aperture-limited tiles are demoted to the irregular-motion prior
-            // rather than discarded. The tile is not wrong, it is unverifiable:
-            // the gradient constrains motion across the edge but not along it,
-            // so one component of the flow is unmeasured rather than measured
-            // badly. Zeroing threw away the component that WAS measured, and on
-            // scenes with long edges -- architecture, horizons, railings -- that
-            // removed enough of the burst to cost real detail. s1 keeps the tile
-            // contributing while holding it to the same standard as any other
-            // tile whose motion estimate is not trusted.
-            const bool aperture_limited =
-                cfg.flow_reject_1d_enabled &&
-                pidx < flow.aperture_limited.size() &&
-                pidx < tile_residual_high.size() &&
-                flow.aperture_limited[pidx] != 0u &&
-                tile_residual_high[pidx] != 0u;
-            // min, not assignment: a tile already flagged motion-irregular must
-            // not be promoted, and lower s is strictly stricter here.
-            if (aperture_limited) s = std::min(s, cfg.r_s1);
             // Block matching found two near-equal minima here, so the offset it
             // picked is not distinguishable from at least one other. Demote to
             // the strict prior. This is the one input to the mask that does not
@@ -1779,13 +1639,11 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
                 geom_reject = (std::sqrt(gix * gix + giy * giy) * Emag) > cfg.motion_geom_reject_threshold;
             }
-            const bool hard_reject = hf_reject || edge_reject || geom_reject;
+            const bool hard_reject = edge_reject || geom_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             R.at(y, x) = r_val;
-            // Compared against r_s1 rather than recomputing the conditions, so
-            // the record cannot drift from the value actually used above.
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }

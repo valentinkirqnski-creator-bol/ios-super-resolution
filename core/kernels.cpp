@@ -29,8 +29,24 @@ CovField estimate_kernels(const Image& raw, const Config& cfg) {
         f32 A = 1.f + std::sqrt((l1 - l2) / (l1 + l2));
         f32 D = std::min(1.f, std::max(0.f, 1.f - std::sqrt(l1) / cfg.D_tr + cfg.D_th));
         f32 kk1, kk2;
-        if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
-        else           { kk1 = 1.f; kk2 = 1.f; }
+        if (cfg.selection == SelectionLaw::HardThreshold) {
+            // 460-main: snap to full anisotropy past A=1.95, else isotropic. A is
+            // NaN on a flat patch (l1+l2==0); the > test is then false -> isotropic.
+            if (A > 1.95f) { kk1 = 1.f / cfg.k_shrink; kk2 = cfg.k_stretch; }
+            else           { kk1 = 1.f; kk2 = 1.f; }
+        } else {
+            // 1.4 default 'linear' (kernels.py::linear): a continuous ramp that
+            // coincides with hard_threshold at A==1 (isotropic) and A==2 (full
+            // stretch) but ramps in between instead of snapping at 1.95.
+            //   k1 = (2-A) + (A-1)/k_shrink ; k2 = (2-A) + (A-1)*k_stretch
+            // 1.4 leaves A=NaN (flat patch, l1+l2==0) unguarded, which poisons the
+            // covariance; fall back to isotropic there, matching hard_threshold's
+            // NaN behaviour and the intended flat-region kernel.
+            if (l1 + l2 > 0.f && std::isfinite(A)) {
+                kk1 = (2.f - A) + (A - 1.f) / cfg.k_shrink;
+                kk2 = (2.f - A) + (A - 1.f) * cfg.k_stretch;
+            } else { kk1 = 1.f; kk2 = 1.f; }
+        }
         k1 = cfg.k_detail * ((1.f - D) * kk1 + D * cfg.k_denoise);
         k2 = cfg.k_detail * ((1.f - D) * kk2 + D * cfg.k_denoise);
     };

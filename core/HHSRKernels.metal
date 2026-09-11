@@ -1358,7 +1358,7 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
 struct KernelEstParams {
     uint raw_h, raw_w, grey_h, grey_w;
     uint bayer;     // 1 = decimate 2x2 raw to grey before GAT
-    uint selection; // retained for CPU layout; 460-main always hard-thresholds
+    uint selection; // 0 = hard_threshold (460-main), 1 = linear (1.4 default)
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
     uint _pad0, _pad1; // 64 bytes total for setBytes
@@ -1411,14 +1411,25 @@ inline void eigen_elmts_2x2(float m00, float m01, float m10, float m11,
     }
 }
 
-// 460-main kernels.py compute_k
+// kernels.py compute_k. p.selection: 0 = hard_threshold (460-main), else linear
+// (1.4 default). Twin of the CPU compute_k in kernels.cpp.
 inline void compute_k_cpu(float l1, float l2, thread float& k1, thread float& k2,
                           constant KernelEstParams& p) {
     float A = 1.f + sqrt((l1 - l2) / (l1 + l2));
     float D = min(1.f, max(0.f, 1.f - sqrt(l1) / p.D_tr + p.D_th));
     float kk1, kk2;
-    if (A > 1.95f) { kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch; }
-    else           { kk1 = 1.f; kk2 = 1.f; }
+    if (p.selection == 0u) {
+        // hard_threshold: snap past A=1.95, else isotropic (NaN A -> isotropic).
+        if (A > 1.95f) { kk1 = 1.f / p.k_shrink; kk2 = p.k_stretch; }
+        else           { kk1 = 1.f; kk2 = 1.f; }
+    } else {
+        // linear (1.4 default): continuous ramp; guard the flat patch (A NaN when
+        // l1+l2==0) to isotropic, matching the CPU path.
+        if (l1 + l2 > 0.f && isfinite(A)) {
+            kk1 = (2.f - A) + (A - 1.f) / p.k_shrink;
+            kk2 = (2.f - A) + (A - 1.f) * p.k_stretch;
+        } else { kk1 = 1.f; kk2 = 1.f; }
+    }
     k1 = p.k_detail * ((1.f - D) * kk1 + D * p.k_denoise);
     k2 = p.k_detail * ((1.f - D) * kk2 + D * p.k_denoise);
 }

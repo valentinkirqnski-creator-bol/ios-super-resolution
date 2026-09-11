@@ -181,13 +181,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // constant, which rotation turns into a visible tile grid. The
             // mask samples the SAME way, so it still grades the fetch that
             // actually happens. See FlowField::sample_bilinear.
-            f32 flowx, flowy;
-            if (cfg.flow_bilinear_sampling) {
-                flow.sample_bilinear(lr_y, lr_x, tile_size, flowx, flowy);
-            } else {
-                flowx = flow.dx(py, px);
-                flowy = flow.dy(py, px);
-            }
+            f32 flowx = flow.dx(py, px);
+            f32 flowy = flow.dy(py, px);
 
             // Which coordinate space R lives in is decided by R's ACTUAL
             // dimensions, not Config::robustness_raw_resolution_active():
@@ -204,14 +199,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             }
             // 1.4 parity: with nearest flow, R is nearest-sampled too (blocky,
             // r[i_r,j_r]) so the mask grades the same tile the merge fetches.
-            f32 local_r;
-            if (cfg.flow_bilinear_sampling) {
-                local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
-            } else {
-                const int iy = std::min(robustness.h - 1, std::max(0, (int)std::floor(rob_y + 0.5f)));
-                const int ix = std::min(robustness.w - 1, std::max(0, (int)std::floor(rob_x + 0.5f)));
-                local_r = robustness.at(iy, ix);
-            }
+            const int iy = std::min(robustness.h - 1, std::max(0, (int)std::floor(rob_y + 0.5f)));
+            const int ix = std::min(robustness.w - 1, std::max(0, (int)std::floor(rob_x + 0.5f)));
+            const f32 local_r = robustness.at(iy, ix);
 
             const f32 lr_mov_x = lr_x + flowx;
             const f32 lr_mov_y = lr_y + flowy;

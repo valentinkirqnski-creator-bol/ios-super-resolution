@@ -1027,7 +1027,8 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     p.grey_h = (uint32_t)grey_h;
     p.grey_w = (uint32_t)grey_w;
     p.bayer = bayer ? 1u : 0u;
-    p.selection = 0u; // 460-main kernels.py always uses hard thresholding.
+    // 0 = hard_threshold (460-main), 1 = linear (1.4 default). See compute_k_cpu.
+    p.selection = (cfg.selection == SelectionLaw::HardThreshold) ? 0u : 1u;
     p.alpha = cfg.noise_alpha();
     p.beta = cfg.noise_beta();
     p.k_detail = cfg.k_detail;
@@ -1478,7 +1479,7 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // a silent no-op. This block previously sat after the commit, which crashed
     // as soon as high-frequency rejection was switched on.
     id<MTLBuffer> b_ref_hf_loss = nil;
-    if (cfg.hf_artifact_removal_enabled &&
+    if (false &&
         !rob_run_hf_loss(b_guide, b_means, b_vars, b_ref_hf_loss, gh, gw, nch, cfg, cmd))
         return RefStats();
 
@@ -1490,9 +1491,9 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd, cfg.flow_bilinear_sampling) ||
+                        nullptr, 0, mh, mw, cmd, false) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, cfg.flow_bilinear_sampling) ||
+                       nullptr, 0, vh, vw, cmd, false) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -1605,10 +1606,10 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
                                        (cfg.motion_edge_rejection_enabled ||
-                                        cfg.hf_artifact_removal_enabled)
+                                        false)
                                            ? &motion_irregular
                                            : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+    if (!cfg.motion_edge_rejection_enabled && !false)
         motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1625,15 +1626,15 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    cfg.flow_bilinear_sampling))
+                    false))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
 
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
-        g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
-        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_pixel4a != false ||
+        g_rob_curve_pixel4a_iso != 0;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -1664,8 +1665,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
         g_rob_curve_n = n;
-        g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
-        g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_pixel4a = false;
+        g_rob_curve_pixel4a_iso = 0;
     }
     if (g_rob_curve_n == 0) return Image();
 
@@ -1693,7 +1694,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // init_robustness alongside the guide-grid ref stats; the kernel reads
     // it at gid/2. Inert dummy when hf rejection is off.
     id<MTLBuffer> b_ref_hf = b_motion;
-    if (cfg.hf_artifact_removal_enabled) {
+    if (false) {
         const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
         if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
         b_ref_hf = g_rob_ref_hf;
@@ -1717,8 +1718,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
-    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
-    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.hf_enabled = false ? 1u : 0u;
+    mp.hf_variance_loss_threshold = 0.f;
     mp.hf_h = (uint32_t)gh;
     mp.hf_w = (uint32_t)gw;
     mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
@@ -1732,7 +1733,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
-    mp.per_pixel_s = cfg.robustness_per_pixel_s ? 1u : 0u; // Wronski per-pixel M
+    mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -1787,7 +1788,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // aperture/tile-residual rejection is not, so that flag alone still
     // falls back to the guide-resolution path below.
     if (cfg.robustness_raw_resolution_active() &&
-        !cfg.flow_reject_1d_enabled) {
+        !false) {
         Image raw_res = compute_robustness_metal_raw_res_impl(comp_raw, flow, tile_size,
                                                                cfg, s_select_out);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
@@ -1799,10 +1800,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
                                        (cfg.motion_edge_rejection_enabled ||
-                                        cfg.hf_artifact_removal_enabled)
+                                        false)
                                            ? &motion_irregular
                                            : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !cfg.hf_artifact_removal_enabled)
+    if (!cfg.motion_edge_rejection_enabled && !false)
         motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1839,8 +1840,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // meaningfully cheaper).
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
-        g_rob_curve_pixel4a != cfg.debug_pixel4a_noise_profile ||
-        g_rob_curve_pixel4a_iso != cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_pixel4a != false ||
+        g_rob_curve_pixel4a_iso != 0;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -1871,8 +1872,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         g_rob_std_curve = buf(std_all.data(), std_all.size() * sizeof(float));
         g_rob_diff_curve = buf(diff_all.data(), diff_all.size() * sizeof(float));
         g_rob_curve_n = n;
-        g_rob_curve_pixel4a = cfg.debug_pixel4a_noise_profile;
-        g_rob_curve_pixel4a_iso = cfg.debug_pixel4a_noise_curve_iso;
+        g_rob_curve_pixel4a = false;
+        g_rob_curve_pixel4a_iso = 0;
     }
     if (g_rob_curve_n == 0) return Image();
     id<MTLBuffer> b_std = g_rob_std_curve;
@@ -1881,7 +1882,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLBuffer> b_motion = buf(motion_irregular.data(), motion_irregular.size() * sizeof(uint32_t));
     const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     const bool aperture_reject_on =
-        cfg.flow_reject_1d_enabled &&
+        false &&
         flow.aperture_limited.size() == n_tiles;
     id<MTLBuffer> b_aperture = aperture_reject_on
         ? buf(flow.aperture_limited.data(), flow.aperture_limited.size() * sizeof(uint32_t))
@@ -1892,7 +1893,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_ref_hf = b_ref_v;
-    if (cfg.hf_artifact_removal_enabled) {
+    if (false) {
         if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
         b_ref_hf = g_rob_ref_hf;
     }
@@ -1918,8 +1919,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
-    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
-    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
+    mp.hf_enabled = false ? 1u : 0u;
+    mp.hf_variance_loss_threshold = 0.f;
     mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
     mp.motion_edge_threshold = cfg.motion_edge_threshold;
     mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
@@ -1928,16 +1929,16 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
     mp.motion_edge_neighborhood_radius =
         (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
-    mp.flow_reject_1d_residual_threshold = cfg.flow_reject_1d_residual_threshold;
+    mp.flow_reject_1d_residual_threshold = 0.f;
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;
     mp.save_s_select = want_s_select ? 1u : 0u;
     const bool amb_on = cfg.flow_reject_ambiguous_enabled &&
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
-    mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    mp.flow_bilinear = false ? 1u : 0u;
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
-    mp.per_pixel_s = cfg.robustness_per_pixel_s ? 1u : 0u; // Wronski per-pixel M
+    mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
     mp.geom_reject_threshold = cfg.motion_geom_reject_threshold;
     id<MTLBuffer> b_match_amb = amb_on
@@ -3747,7 +3748,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // not from the config flag -- the raw-res path can silently fall back to
     // guide resolution. See accumulate_comp in merge.cpp.
     p.raw_res_robustness = 0u;
-    p.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    p.flow_bilinear = false ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

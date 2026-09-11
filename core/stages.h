@@ -50,18 +50,6 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
 std::vector<uint32_t> compute_motion_irregular(const FlowField& flow, f32 Mt,
                                                f32 sx, f32 sy, int num_threads);
 
-// Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
-// field produced by an external neural flow estimator (PWCNet), as a
-// drop-in alternative to align()+flow_to_raw_tile_grid for any downstream
-// consumer. dense_flow: dx plane (guide_h*guide_w floats) followed by dy
-// plane (guide_h*guide_w floats), values in GUIDE-pixel units -- the layout
-// a Core ML (1,2,guide_h,guide_w) MLMultiArray output has. See align.cpp
-// for what's intentionally left unset (aperture_limited, match_ambiguous,
-// motion_irregular) and why.
-FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
-                                int raw_h, int raw_w, int tile_size,
-                                f32 r_Mt, int num_threads);
-
 struct Pyramid { std::vector<Image> levels; std::vector<int> abs_factors; };
 Pyramid build_pyramid(const Image& grey, const std::vector<int>& factors);
 
@@ -82,17 +70,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 f32 initial_dx = 0.f, f32 initial_dy = 0.f,
                 f32 initial_rotation_rad = 0.f);
 
-// Global homography warp-then-refine (Config::global_homography_warp).
-// estimate_global_homography fits a 3x3 H (reference grey -> comparison grey)
-// by direct multi-scale Lucas-Kanade; warp_grey_by_homography remaps the
-// comparison grey into the reference frame so the existing block-match/ICA
-// only has to find residual translation; compose_homography_flow folds H back
-// into that residual so the merge samples the original comparison raw. See
-// align.cpp.
-void estimate_global_homography(const Image& ref_grey, const Image& moving_grey,
-                                const Config& cfg, f32 H_out[9]);
-Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]);
-FlowField compose_homography_flow(const FlowField& resid, const f32 H[9], int tile_size);
 // Free cached ref Sobel/Hessian (call when reference pyramid is released).
 void clear_align_ref_ica_cache();
 

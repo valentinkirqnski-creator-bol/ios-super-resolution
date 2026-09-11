@@ -286,31 +286,11 @@ static void mark_motion_irregular_tiles(FlowField& flow, const Config& cfg) {
         compute_motion_irregular(flow, cfg.r_Mt, 1.f, 1.f, cfg.num_threads);
 }
 
-static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* hess,
-                                        const Config& cfg) {
+static void mark_aperture_limited_tiles(FlowField& flow, const HessianField* /*hess*/,
+                                        const Config& /*cfg*/) {
+    // Aperture-limited (1D) tile rejection removed; leave the field cleared.
     const size_t n = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
     flow.aperture_limited.assign(n, 0u);
-    if (!cfg.flow_reject_1d_enabled) return;
-    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return;
-    if (!hess || hess->ny != flow.ny || hess->nx != flow.nx ||
-        hess->data.size() < n * 4u)
-        return;
-
-    const f32 aperture_ratio = clamped_aperture_ratio(cfg);
-    std::atomic<long long> n_marked{0};
-    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
-        for (int tx = 0; tx < flow.nx; ++tx) {
-            if (hessian_tile_is_1d(*hess, ty, tx, aperture_ratio)) {
-                flow.aperture(ty, tx) = 1u;
-                n_marked.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    });
-    if (prof_enabled()) {
-        prof_add_cpu("flow1d#enabled", 1.0);
-        prof_add_cpu("flow1d#aperture-ratio", (double)aperture_ratio);
-        prof_add_cpu("flow1d#rejected-tiles", (double)n_marked.load());
-    }
 }
 
 } // namespace
@@ -1181,270 +1161,6 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
     return flow;
 }
 
-// Overlapping-tile re-measurement (Config::flow_overlap_tiles). The IPOL
-// author's suggestion: keep the window Ts but halve the stride to Ts/2, so the
-// tiles overlap 50% and there are 2x as many. Each cell is block-matched on its
-// own Ts-wide window centred on it, seeded by the coarse flow so the search
-// stays local, giving a real per-cell measurement (motion varying inside a Ts
-// tile is captured, not averaged). Returns a flow field on the Ts/2 grid; the
-// caller consumes it at tile_size/2. window_ts is in grey pixels.
-static FlowField block_match_overlap(const Image& ref, const Image& moving,
-                                     const FlowField& seed, int window_ts,
-                                     const Config& cfg) {
-    const int stride = std::max(1, window_ts / 2);
-    const int ny = ref.h / stride, nx = ref.w / stride;
-    if (ny <= 0 || nx <= 0 || seed.ny <= 0 || seed.nx <= 0) return seed;
-    FlowField out(ny, nx);
-    const bool l1 = !cfg.bm_metrics.empty() && cfg.bm_metrics[0] == "L1";
-    const int R = std::max(1, cfg.overlap_search_radius);
-    const int wmaxy = std::max(0, ref.h - window_ts);
-    const int wmaxx = std::max(0, ref.w - window_ts);
-    parallel_rows(ny, cfg.num_threads, [&](int cy) {
-        for (int cx = 0; cx < nx; ++cx) {
-            // Ts window centred on the cell, clamped fully in-bounds so the
-            // reference side is always valid (moving side is bounds-checked).
-            int oy = cy * stride - (window_ts - stride) / 2;
-            int ox = cx * stride - (window_ts - stride) / 2;
-            oy = oy < 0 ? 0 : (oy > wmaxy ? wmaxy : oy);
-            ox = ox < 0 ? 0 : (ox > wmaxx ? wmaxx : ox);
-            // Seed = coarse flow at the cell centre (nearest coarse tile). Its
-            // fractional (ICA-refined) part is kept; the search adds an integer
-            // local refinement on top.
-            const f32 cen_y = ((f32)cy + 0.5f) * (f32)stride;
-            const f32 cen_x = ((f32)cx + 0.5f) * (f32)stride;
-            const int sty = std::max(0, std::min(seed.ny - 1, (int)(cen_y / (f32)window_ts)));
-            const int stx = std::max(0, std::min(seed.nx - 1, (int)(cen_x / (f32)window_ts)));
-            const f32 sfx = seed.dx(sty, stx), sfy = seed.dy(sty, stx);
-            const int base_fx = cuda_round_to_int(sfx);
-            const int base_fy = cuda_round_to_int(sfy);
-            f32 min_dist = std::numeric_limits<f32>::infinity();
-            int msx = 0, msy = 0;
-            for (int sdy = -R; sdy <= R; ++sdy) {
-                for (int sdx = -R; sdx <= R; ++sdx) {
-                    f32 dist = 0.f;
-                    bool valid = true;
-                    for (int i = 0; i < window_ts && valid; ++i) {
-                        for (int j = 0; j < window_ts; ++j) {
-                            const int rx = ox + j, ry = oy + i;
-                            const int mx = rx + base_fx + sdx;
-                            const int my = ry + base_fy + sdy;
-                            if (!(mx >= 0 && mx < moving.w && my >= 0 && my < moving.h)) {
-                                valid = false;
-                                break;
-                            }
-                            const f32 d = ref.at(ry, rx) - moving.at(my, mx);
-                            dist += l1 ? std::fabs(d) : d * d;
-                        }
-                    }
-                    if (!valid) continue;
-                    if (dist < min_dist) { min_dist = dist; msx = sdx; msy = sdy; }
-                }
-            }
-            out.dx(cy, cx) = sfx + (f32)msx;
-            out.dy(cy, cx) = sfy + (f32)msy;
-        }
-    });
-    return out;
-}
-
-// ============================================================================
-// Global homography warp-then-refine pre-alignment.
-//   1. estimate a global 3x3 homography between the reference and comparison
-//      greys (direct multi-scale Lucas-Kanade, 8-DOF: translation, rotation,
-//      scale, shear, mild perspective);
-//   2. WARP the comparison grey by it into the reference frame (big geometric
-//      motion removed);
-//   3. run the EXISTING per-tile block-match/ICA on the warped grey to refine
-//      the small residual translation;
-//   4. compose the homography with the residual so the merge still samples the
-//      ORIGINAL comparison raw at the correct (rotated/warped) positions.
-// ============================================================================
-namespace {
-
-// 8x8 solve by Gaussian elimination with partial pivoting. false if singular.
-bool solve8x8(double A[8][8], const double b[8], double x[8]) {
-    double M[8][9];
-    for (int i = 0; i < 8; ++i) { for (int j = 0; j < 8; ++j) M[i][j] = A[i][j]; M[i][8] = b[i]; }
-    for (int col = 0; col < 8; ++col) {
-        int piv = col; double best = std::fabs(M[col][col]);
-        for (int r = col + 1; r < 8; ++r) { double v = std::fabs(M[r][col]); if (v > best) { best = v; piv = r; } }
-        if (best < 1e-12) return false;
-        if (piv != col) for (int j = 0; j < 9; ++j) std::swap(M[col][j], M[piv][j]);
-        const double inv = 1.0 / M[col][col];
-        for (int r = 0; r < 8; ++r) {
-            if (r == col) continue;
-            const double f = M[r][col] * inv;
-            if (f != 0.0) for (int j = col; j < 9; ++j) M[r][j] -= f * M[col][j];
-        }
-    }
-    for (int i = 0; i < 8; ++i) x[i] = M[i][8] / M[i][i];
-    return true;
-}
-
-inline bool grey_bilinear_s(const Image& g, f32 x, f32 y, f32& out) {
-    if (!(x >= 0.f && y >= 0.f && x <= (f32)(g.w - 1) && y <= (f32)(g.h - 1))) return false;
-    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
-    const int x1 = std::min(x0 + 1, g.w - 1), y1 = std::min(y0 + 1, g.h - 1);
-    const f32 fx = x - (f32)x0, fy = y - (f32)y0;
-    const f32 a = g.at(y0, x0), b = g.at(y0, x1), c = g.at(y1, x0), d = g.at(y1, x1);
-    out = (a * (1.f - fx) + b * fx) * (1.f - fy) + (c * (1.f - fx) + d * fx) * fy;
-    return true;
-}
-
-Image grey_downsample2(const Image& g) {
-    Image blur = gaussian_blur(g, 1.0f);
-    const int nh = std::max(1, g.h / 2), nw = std::max(1, g.w / 2);
-    Image out(nh, nw, 1);
-    for (int y = 0; y < nh; ++y)
-        for (int x = 0; x < nw; ++x)
-            out.at(y, x) = blur.at(std::min(2 * y, g.h - 1), std::min(2 * x, g.w - 1));
-    return out;
-}
-
-} // namespace
-
-inline bool apply_homography(const f32 H[9], f32 x, f32 y, f32& ox, f32& oy) {
-    const f32 wv = H[6] * x + H[7] * y + H[8];
-    if (std::fabs(wv) < 1e-8f) return false;
-    ox = (H[0] * x + H[1] * y + H[2]) / wv;
-    oy = (H[3] * x + H[4] * y + H[5]) / wv;
-    return true;
-}
-
-// H_out (row-major 3x3) maps REFERENCE grey pixels -> MOVING grey pixels, so
-// moving(H*p) ~ reference(p). Direct multi-scale Lucas-Kanade, 8-DOF.
-void estimate_global_homography(const Image& ref_grey, const Image& moving_grey,
-                                const Config& cfg, f32 H_out[9]) {
-    (void)cfg;
-    for (int i = 0; i < 9; ++i) H_out[i] = (i == 0 || i == 4 || i == 8) ? 1.f : 0.f;
-    if (ref_grey.h < 32 || ref_grey.w < 32 ||
-        moving_grey.h < 32 || moving_grey.w < 32) return;
-
-    std::vector<Image> rp, mp;
-    rp.push_back(ref_grey);  mp.push_back(moving_grey);
-    while ((int)rp.size() < 5 && std::min(rp.back().h, rp.back().w) >= 96) {
-        rp.push_back(grey_downsample2(rp.back()));
-        mp.push_back(grey_downsample2(mp.back()));
-    }
-    const int nlev = (int)rp.size();
-    double H[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    const int iters = 12;
-    for (int L = nlev - 1; L >= 0; --L) {
-        const Image& R = rp[(size_t)L];
-        const Image& M = mp[(size_t)L];
-        const f32 cx = 0.5f * (f32)(R.w - 1), cy = 0.5f * (f32)(R.h - 1);
-        const int stride = std::max(1, std::min(R.w, R.h) / 128);
-        for (int it = 0; it < iters; ++it) {
-            double A[8][8] = {{0}}, b[8] = {0};
-            int used = 0;
-            for (int ly = 1; ly < R.h - 1; ly += stride) {
-                for (int lx = 1; lx < R.w - 1; lx += stride) {
-                    const f32 u = (f32)lx - cx, v = (f32)ly - cy;
-                    const f32 D = (f32)(H[6] * u + H[7] * v + H[8]);
-                    if (std::fabs(D) < 1e-6f) continue;
-                    const f32 xp = (f32)(H[0] * u + H[1] * v + H[2]) / D;
-                    const f32 yp = (f32)(H[3] * u + H[4] * v + H[5]) / D;
-                    const f32 mx = xp + cx, my = yp + cy;
-                    f32 Iw, gxp, gxm, gyp, gym;
-                    if (!grey_bilinear_s(M, mx, my, Iw) ||
-                        !grey_bilinear_s(M, mx + 1.f, my, gxp) ||
-                        !grey_bilinear_s(M, mx - 1.f, my, gxm) ||
-                        !grey_bilinear_s(M, mx, my + 1.f, gyp) ||
-                        !grey_bilinear_s(M, mx, my - 1.f, gym)) continue;
-                    const f32 gx = 0.5f * (gxp - gxm), gy = 0.5f * (gyp - gym);
-                    const f32 r = Iw - R.at(ly, lx);
-                    const f32 invD = 1.f / D;
-                    const f32 gdp = gx * xp + gy * yp;
-                    f32 J[8];
-                    J[0] = gx * u * invD; J[1] = gx * v * invD; J[2] = gx * invD;
-                    J[3] = gy * u * invD; J[4] = gy * v * invD; J[5] = gy * invD;
-                    J[6] = -gdp * u * invD; J[7] = -gdp * v * invD;
-                    for (int i = 0; i < 8; ++i) {
-                        for (int j = 0; j < 8; ++j) A[i][j] += (double)J[i] * (double)J[j];
-                        b[i] += (double)J[i] * (double)(-r);
-                    }
-                    ++used;
-                }
-            }
-            if (used < 32) break;
-            for (int i = 0; i < 8; ++i) A[i][i] += 1e-3 * (A[i][i] + 1.0);  // LM damping
-            double dp[8];
-            if (!solve8x8(A, b, dp)) break;
-            H[0] += dp[0]; H[1] += dp[1]; H[2] += dp[2];
-            H[3] += dp[3]; H[4] += dp[4]; H[5] += dp[5];
-            H[6] += dp[6]; H[7] += dp[7];
-            double mag = 0; for (int i = 0; i < 8; ++i) mag += dp[i] * dp[i];
-            if (mag < 1e-10) break;
-        }
-        if (L > 0) { H[2] *= 2.0; H[5] *= 2.0; H[6] *= 0.5; H[7] *= 0.5; }
-    }
-
-    const double cx0 = 0.5 * (double)(ref_grey.w - 1), cy0 = 0.5 * (double)(ref_grey.h - 1);
-    const double Tm[9] = {1,0,-cx0, 0,1,-cy0, 0,0,1};
-    const double Tp[9] = {1,0, cx0, 0,1, cy0, 0,0,1};
-    auto mul3 = [](const double a[9], const double bb[9], double o[9]) {
-        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
-            o[i * 3 + j] = a[i * 3 + 0] * bb[0 * 3 + j] + a[i * 3 + 1] * bb[1 * 3 + j] + a[i * 3 + 2] * bb[2 * 3 + j];
-    };
-    double HT[9], HO[9];
-    mul3(H, Tm, HT);
-    mul3(Tp, HT, HO);
-    bool ok = std::fabs(HO[8]) > 1e-9;
-    if (ok) for (int i = 0; i < 9; ++i) { HO[i] /= HO[8]; if (!std::isfinite(HO[i])) ok = false; }
-    if (ok && (std::fabs(HO[0] - 1.0) > 0.5 || std::fabs(HO[4] - 1.0) > 0.5 ||
-               std::fabs(HO[1]) > 0.5 || std::fabs(HO[3]) > 0.5)) ok = false;
-    if (!ok) { for (int i = 0; i < 9; ++i) H_out[i] = (i == 0 || i == 4 || i == 8) ? 1.f : 0.f; return; }
-    for (int i = 0; i < 9; ++i) H_out[i] = (f32)HO[i];
-}
-
-// Warp the comparison grey into the reference frame: out(p) = comp(H*p). After
-// this the global roll/scale/perspective is removed and only small residual
-// translation remains for the existing block matcher. OOB samples clamp to the
-// edge so no artificial black borders mislead the match.
-Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]) {
-    Image out(comp_grey.h, comp_grey.w, 1);
-    const int W = comp_grey.w, Hh = comp_grey.h;
-    for (int y = 0; y < Hh; ++y) {
-        for (int x = 0; x < W; ++x) {
-            f32 ox, oy;
-            if (!apply_homography(H, (f32)x, (f32)y, ox, oy)) { out.at(y, x) = comp_grey.at(y, x); continue; }
-            ox = std::min(std::max(ox, 0.f), (f32)(W - 1));
-            oy = std::min(std::max(oy, 0.f), (f32)(Hh - 1));
-            f32 v = 0.f; grey_bilinear_s(comp_grey, ox, oy, v);
-            out.at(y, x) = v;
-        }
-    }
-    return out;
-}
-
-// Compose the global homography with the per-tile residual measured on the
-// warped grey. resid maps a reference tile centre c to the warped comp at
-// c+resid; warped comp(q) = comp(H*q); so the reference tile corresponds to the
-// original comp at H*(c+resid), and the total per-tile displacement (reference
-// grey -> comparison grey) is H*(c+resid) - c. tile_size is GREY pixels; the
-// result is a drop-in for flow_to_raw_tile_grid.
-FlowField compose_homography_flow(const FlowField& resid, const f32 H[9], int tile_size) {
-    FlowField out(resid.ny, resid.nx);
-    for (int ty = 0; ty < resid.ny; ++ty) {
-        for (int tx = 0; tx < resid.nx; ++tx) {
-            const f32 cxp = ((f32)tx + 0.5f) * (f32)tile_size;
-            const f32 cyp = ((f32)ty + 0.5f) * (f32)tile_size;
-            f32 ox, oy;
-            if (apply_homography(H, cxp + resid.dx(ty, tx), cyp + resid.dy(ty, tx), ox, oy)) {
-                out.dx(ty, tx) = ox - cxp;
-                out.dy(ty, tx) = oy - cyp;
-            } else {
-                out.dx(ty, tx) = resid.dx(ty, tx);
-                out.dy(ty, tx) = resid.dy(ty, tx);
-            }
-        }
-    }
-    out.aperture_limited = resid.aperture_limited;
-    out.match_ambiguous = resid.match_ambiguous;
-    out.motion_irregular = resid.motion_irregular;
-    return out;
-}
-
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
@@ -1459,20 +1175,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
                         initial_dx, initial_dy, initial_rotation_rad)) {
-            // Overlapping-tile re-measurement runs on the CPU here, so it covers
-            // the GPU align path too -- the 2x flow then feeds the Metal merge/
-            // robustness unchanged (they just get the denser grid + tile_size/2).
-            if (cfg.overlap_tiles_active())
-                flow_gpu = block_match_overlap(ref_grey, moving_grey, flow_gpu,
-                                               cfg.grey_tile_size(tile_size), cfg);
-            if (cfg.flow_reject_1d_enabled) {
-                Image gx = compute_sobel_gradx(ref_grey);
-                Image gy = compute_sobel_grady(ref_grey);
-                HessianField hess = compute_hessian(gx, gy, tile_size);
-                mark_aperture_limited_tiles(flow_gpu, &hess, cfg);
-            } else {
-                mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
-            }
+            mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
             mark_motion_irregular_tiles(flow_gpu, cfg);
             return flow_gpu;
         }
@@ -1601,12 +1304,6 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                          cfg.ica_n_iter, cfg.num_threads,
                          ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
     }
-    // Overlapping-tile re-measurement: 2x-denser flow on a Ts/2 grid, measured
-    // per cell on its own Ts window. Done before the mark passes so they run on
-    // the grid the pipeline consumes.
-    if (cfg.overlap_tiles_active())
-        flow = block_match_overlap(ref_grey, moving_grey, flow,
-                                   cfg.grey_tile_size(tile_size), cfg);
     const HessianField* mark_hess = nullptr;
     if (!finest_hess.data.empty() && finest_hess.ny == flow.ny &&
         finest_hess.nx == flow.nx) {
@@ -1688,68 +1385,6 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
         }
     }
     return out;
-}
-
-// Builds a raw-pixel tile-grid FlowField from a dense per-guide-pixel flow
-// field produced by an external neural flow estimator (PWCNet), re-using
-// flow_to_raw_tile_grid's grey-to-raw scaling so the result is a drop-in
-// replacement for align()'s output at any downstream consumer
-// (compute_robustness, merge, ...).
-//
-// dense_flow: dx plane (guide_h*guide_w floats) followed by dy plane
-// (guide_h*guide_w floats), values in GUIDE-pixel units -- the layout a
-// Core ML (1,2,guide_h,guide_w) MLMultiArray output has.
-//
-// aperture_limited / match_ambiguous are left unset (all zero): those are
-// specific to the block matcher's own candidate search and have no
-// equivalent for a dense CNN flow field -- match_ambiguous-based rejection
-// (robustness.cpp) simply never fires for tiles sourced this way.
-// motion_irregular is likewise left unmeasured here; flow_to_raw_tile_grid
-// only recomputes it when the input already carries one, so downstream
-// compute_s falls back to its own derivation from the raw-tile output, same
-// as any other flow source that doesn't pre-measure it.
-FlowField flow_from_dense_guide(const f32* dense_flow, int guide_h, int guide_w,
-                                int raw_h, int raw_w, int tile_size,
-                                f32 r_Mt, int num_threads) {
-    if (!dense_flow || guide_h <= 0 || guide_w <= 0 || raw_h <= 0 || raw_w <= 0 || tile_size <= 0)
-        return FlowField();
-
-    const f32* dx_plane = dense_flow;
-    const f32* dy_plane = dense_flow + (size_t)guide_h * (size_t)guide_w;
-
-    const int gny = (guide_h + tile_size - 1) / tile_size;
-    const int gnx = (guide_w + tile_size - 1) / tile_size;
-    FlowField flow_guide(gny, gnx);
-
-    // Average-pool the dense flow into tile_size x tile_size guide-pixel
-    // blocks -- the same granularity flow_to_raw_tile_grid expects an input
-    // tile grid to already be at (it re-derives the grey/raw ratio from
-    // guide_h/guide_w and this same tile_size).
-    parallel_rows(gny, num_threads, [&](int ty) {
-        const int y0 = ty * tile_size;
-        const int y1 = std::min(guide_h, y0 + tile_size);
-        for (int tx = 0; tx < gnx; ++tx) {
-            const int x0 = tx * tile_size;
-            const int x1 = std::min(guide_w, x0 + tile_size);
-            double sum_dx = 0.0, sum_dy = 0.0;
-            int n = 0;
-            for (int y = y0; y < y1; ++y) {
-                for (int x = x0; x < x1; ++x) {
-                    const size_t idx = (size_t)y * guide_w + x;
-                    sum_dx += dx_plane[idx];
-                    sum_dy += dy_plane[idx];
-                    ++n;
-                }
-            }
-            if (n > 0) {
-                flow_guide.dx(ty, tx) = (f32)(sum_dx / n);
-                flow_guide.dy(ty, tx) = (f32)(sum_dy / n);
-            }
-        }
-    });
-
-    return flow_to_raw_tile_grid(flow_guide, raw_h, raw_w, guide_h, guide_w,
-                                 tile_size, r_Mt, num_threads, tile_size);
 }
 
 } // namespace hhsr
