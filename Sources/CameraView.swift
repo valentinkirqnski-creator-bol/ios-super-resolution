@@ -1079,6 +1079,16 @@ struct CameraView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
+                    Toggle("DNG Highlight Headroom", isOn: $cam.tuningParams.dng_store_unwhitened)
+                    Text("Stores the output DNG un-white-balanced (real AsShotNeutral) instead of baking the WB gains into the pixels. The merge runs pre-white-balanced (R×2.06, B×1.84), which used to clip red highlights above ~49% of raw scale and skew them magenta — about a stop of headroom the sensor captured but the file threw away. Editors then apply WB in float and their highlight recovery sees everything. The in-app JPEG/preview re-applies the gains on load and renders identically. On by default.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Toggle("Lossless DNG (smaller)", isOn: $cam.tuningParams.dng_lossless_compress)
+                    Text("Compresses the output DNG with lossless Adobe Deflate (ZIP). Identical pixels — same quality — roughly 1.2–1.5× smaller (about −90MB at 48MP). Costs ~8s extra per frame (single-threaded zlib). Off = uncompressed and fastest to write.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                 }
 
                 Section(header: Text("Fallback Denoiser")) {

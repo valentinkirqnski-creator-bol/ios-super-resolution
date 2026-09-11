@@ -114,6 +114,13 @@ struct TuningParams: Equatable, Codable {
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
     var robustness_save_mask: Bool = true
+    /// Lossless-compress the output DNG (Adobe Deflate / ZIP). Identical decoded
+    /// pixels, ~1.2-1.5x smaller file, at the cost of ~8.6s of zlib per 48MP
+    /// frame. Off = uncompressed/fast (current behaviour).
+    var dng_lossless_compress: Bool = false
+    /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
+    /// keep the sensor's full highlight headroom (~1 stop of R/B).
+    var dng_store_unwhitened: Bool = true
     /// Also write _robustness_s1.pgm and _robustness_s2.pgm, splitting the
     /// accumulated mask by which motion prior scored each pixel. Costs one extra
     /// full-resolution buffer per comparison frame while the mask is built.
@@ -253,6 +260,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
         case robustness_enabled, robustness_save_mask
+        case dng_lossless_compress, dng_store_unwhitened
         case accumulated_robustness_denoiser_enabled
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count
@@ -302,6 +310,8 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
+        dng_lossless_compress = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress) ?? dng_lossless_compress
+        dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
@@ -1919,6 +1929,8 @@ final class CameraModel: NSObject, ObservableObject {
             "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
+            "dng_lossless_compress": NSNumber(value: tuningParams.dng_lossless_compress),
+            "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),

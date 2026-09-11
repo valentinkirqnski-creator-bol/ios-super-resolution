@@ -29,6 +29,30 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
 
 // Streaming LinearRaw RGB DNG with fast lossless Deflate (ZIP), no predictor.
 // Same decoded pixels as before; write path optimized for merge latency.
+//
+// Highlight headroom (Config::dng_store_unwhitened): whether the encoder should
+// divide the stored rows by the WB gains, and those gains. One definition so
+// the writer's AsShotNeutral branch and every encoder make the same decision.
+// Active only for the linear (non-baked) RGB DNG of a pre-whitened merge with
+// valid gains.
+inline bool dng_unwhiten_active(const Config& cfg, int nch) {
+    if (!cfg.dng_store_unwhitened || !cfg.raw_prewhitened || cfg.bake_srgb ||
+        nch < 3)
+        return false;
+    for (int i = 0; i < 3; ++i)
+        if (!(cfg.white_balance[i] > 1e-6f) ||
+            !std::isfinite(cfg.white_balance[i]))
+            return false;
+    return true;
+}
+// Per-channel multipliers applied to the stored rows: 1/gain, G-normalised.
+inline void dng_unwhiten_gains(const Config& cfg, int nch, float g[3]) {
+    const bool on = dng_unwhiten_active(cfg, nch);
+    g[0] = on ? cfg.white_balance[1] / cfg.white_balance[0] : 1.f;
+    g[1] = 1.f;
+    g[2] = on ? cfg.white_balance[1] / cfg.white_balance[2] : 1.f;
+}
+
 class DngStreamWriter {
 public:
     // colorMatrixXYZtoCam: 9 floats row-major (optional).
@@ -45,7 +69,8 @@ public:
               bool bakedSrgb = false,
               const std::string& camera_make = "HandheldSR",
               const float* camToSrgb = nullptr,
-              bool pixelsPrewhitened = false);
+              bool pixelsPrewhitened = false,
+              bool lossless = false);
 
     bool write_rows(const uint16_t* rgb16, int nrows);
     bool close();
@@ -57,6 +82,7 @@ private:
     long rows_written_ = 0;
     uint32_t strip_byte_counts_offset_ = 0; // file offset of StripByteCounts LONG
     uint32_t compressed_bytes_ = 0;
+    bool compress_ = false;                // Deflate (Compression=8) vs uncompressed
     void* z_stream_ = nullptr;             // z_stream*
     std::vector<uint8_t> z_out_;
     bool deflate_ok_ = false;

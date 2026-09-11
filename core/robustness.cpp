@@ -829,6 +829,56 @@ static Image upscale_warp_stats(const Image& guide_stats,
 // than all channels sharing one built from the cross-channel mean of
 // alpha'/beta'. See Config::noise_alpha_ch/noise_beta_ch and
 // make_noise_curves_channel.
+// Precomputed 1.4 single-curve noise LUT (monte_carlo.py NoiseLut). sigma_sq /
+// d_sq already encode the 3-channel SUM, indexed by the mean sqrt-domain guide
+// brightness. Loaded once from a raw .bin (magic "N14L", int32 bins, f32
+// alpha_rgbg[4], f32 beta_rgbg[4], f32 sigma_noise_sq[bins], f32 d_noise_sq[bins]).
+struct NoiseLut14 {
+    bool valid = false;
+    int  bins = 0;
+    f32  alpha_rgbg[4] = {0,0,0,0};
+    f32  beta_rgbg[4]  = {0,0,0,0};
+    std::vector<f32> sigma_sq;
+    std::vector<f32> d_sq;
+};
+
+static bool load_noise_lut14_file(const std::string& path, NoiseLut14& lut) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[4]; int32_t bins = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "N14L", 4) == 0 &&
+              std::fread(&bins, sizeof(int32_t), 1, f) == 1 && bins > 1 && bins < 100000;
+    if (ok) {
+        lut.bins = bins;
+        lut.sigma_sq.resize((size_t)bins);
+        lut.d_sq.resize((size_t)bins);
+        ok = std::fread(lut.alpha_rgbg, sizeof(f32), 4, f) == 4 &&
+             std::fread(lut.beta_rgbg,  sizeof(f32), 4, f) == 4 &&
+             std::fread(lut.sigma_sq.data(), sizeof(f32), (size_t)bins, f) == (size_t)bins &&
+             std::fread(lut.d_sq.data(),     sizeof(f32), (size_t)bins, f) == (size_t)bins;
+    }
+    std::fclose(f);
+    lut.valid = ok;
+    return ok;
+}
+
+// Cached once: HHSR_NOISE_LUT14, else <noise_curves_search_dir>/noise_lut.bin.
+// Invalid (absent) -> the per-channel runtime model is used instead.
+static const NoiseLut14& active_noise_lut14() {
+    static NoiseLut14 lut;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        std::string path;
+        if (const char* e = std::getenv("HHSR_NOISE_LUT14")) path = e;
+        else path = noise_curves_search_dir() + "/noise_lut.bin";
+        if (load_noise_lut14_file(path, lut))
+            std::printf("[noise] Loaded 1.4 noise LUT (%d bins) from %s\n",
+                        lut.bins, path.c_str());
+    }
+    return lut;
+}
+
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
                               const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq,
                               bool sqrt_index = false) {
@@ -882,6 +932,46 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     }
 }
 
+// 1.4's noise correction (monte_carlo.py + cuda_compute_d_sigma) via the
+// precomputed single-curve LUT: d^2 = Σ_c (Δμ_c)^2 with a Wiener shrink toward
+// d_noise_sq(mean brightness); σ^2 = max(Σ_c var_c, sigma_noise_sq(mean
+// brightness)). The LUT curves already encode the 3-channel sum and are indexed
+// by the mean sqrt-domain guide brightness (round((bins-1)*mean)), so this is
+// bit-identical to 1.4 when the LUT is 1.4's own output. Drop-in for
+// apply_noise_model when a 1.4 LUT is loaded (per-channel model is the fallback).
+static void apply_noise_model_1p4(const Image& d_p, const Image& ref_means,
+                                  const Image& ref_vars, const NoiseLut14& lut,
+                                  Image& d_sq, Image& sigma_sq) {
+    const int n_ch = ref_means.c;
+    const int bins = lut.bins;
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    for (int y = 0; y < ref_means.h; ++y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 dq = 0.f, sq = 0.f, bright = 0.f;
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const f32 dpc = d_p.at(y, x, ch);
+                dq += dpc * dpc;
+                sq += ref_vars.at(y, x, ch);
+                bright += ref_means.at(y, x, ch);
+            }
+            bright /= (f32)n_ch;
+            if (!std::isfinite(bright)) bright = 0.f;
+            bright = bright < 0.f ? 0.f : (bright > 1.f ? 1.f : bright);
+            int idx = (int)std::lround((f32)(bins - 1) * bright);
+            if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
+            sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
+            // dq stays +inf for an out-of-bounds sample -> exp(-inf)=0 -> R=0.
+            if (std::isfinite(dq) && dq > 0.f) {
+                const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                dq *= shrink * shrink;
+            }
+            d_sq.at(y, x) = dq;
+            sigma_sq.at(y, x) = sq;
+        }
+    }
+}
+
 // Same computation as apply_noise_model, with the d_p array folded in: the
 // per-channel |ref - comp| is derived inline from ref_means/comp_means rather
 // than read from a materialised buffer. At raw resolution that buffer is
@@ -931,6 +1021,43 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
             f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
             d_sq.at(y, x) = d_ms_sq * shrink * shrink;
             sigma_sq.at(y, x) = sigma_sq_;
+        }
+    });
+}
+
+// 1.4 single-curve noise correction, fused (Δμ derived inline from ref/comp
+// means, no materialised d_p). Raw-resolution twin of apply_noise_model_1p4.
+static void apply_noise_model_fused_1p4(const Image& ref_means, const Image& comp_means,
+                                        const Image& ref_vars, const NoiseLut14& lut,
+                                        Image& d_sq, Image& sigma_sq, int num_threads) {
+    const int n_ch = ref_means.c;
+    const int bins = lut.bins;
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    parallel_rows(ref_means.h, num_threads, [&](int y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 dq = 0.f, sq = 0.f, bright = 0.f;
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const f32 r = ref_means.at(y, x, ch);
+                const f32 comp = comp_means.at(y, x, ch);
+                const f32 dpc = std::isfinite(comp) ? std::fabs(r - comp)
+                                                    : std::numeric_limits<f32>::infinity();
+                dq += dpc * dpc;
+                sq += ref_vars.at(y, x, ch);
+                bright += r;
+            }
+            bright /= (f32)n_ch;
+            if (!std::isfinite(bright)) bright = 0.f;
+            bright = bright < 0.f ? 0.f : (bright > 1.f ? 1.f : bright);
+            int idx = (int)std::lround((f32)(bins - 1) * bright);
+            if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
+            sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
+            if (std::isfinite(dq) && dq > 0.f) {
+                const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                dq *= shrink * shrink;
+            }
+            d_sq.at(y, x) = dq;
+            sigma_sq.at(y, x) = sq;
         }
     });
 }
@@ -1131,12 +1258,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
     }
 
+    const NoiseLut14& lut14 = active_noise_lut14();
+    const bool use_lut = lut14.valid && !cfg.debug_noise_model_disabled;
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
-    if (ref_stats.means.c == 3) {
-        for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
-    } else {
-        nc_ch[0] = &mask_noise_curves(cfg);
+    if (!use_lut) {
+        if (ref_stats.means.c == 3) {
+            for (int ch = 0; ch < 3; ++ch)
+                nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
+        } else {
+            nc_ch[0] = &mask_noise_curves(cfg);
+        }
     }
 
     // Comparison frame's own local stats, still built at guide resolution
@@ -1173,8 +1304,12 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
 
     Image d_sq, sigma_sq;
-    apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
-                            cfg.num_threads, cfg.robustness_guide_sqrt);
+    if (use_lut)
+        apply_noise_model_fused_1p4(ref_means, comp_means, ref_vars, lut14,
+                                    d_sq, sigma_sq, cfg.num_threads);
+    else
+        apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
+                                cfg.num_threads, cfg.robustness_guide_sqrt);
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
                                    cfg.motion_edge_rejection_enabled
@@ -1494,12 +1629,19 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
 #ifdef __APPLE__
-    // Metal GPU only — same Alg. robustness math as the CPU path below.
-    Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
-                                         s_select_out);
-    if (gpu.h > 0 && gpu.w > 0) return gpu;
-    return Image();
-#else
+    // Metal GPU path — same Alg. robustness math as the CPU path below. The
+    // Metal noise kernel only implements the per-channel model, so when a 1.4
+    // single-curve LUT is loaded (Config parity mode) skip Metal and run the
+    // VERIFIED CPU path below instead. Robustness then runs on CPU for this
+    // frame, but the expensive runtime Monte-Carlo curve build is skipped (the
+    // LUT replaces it), so it is not necessarily slower overall.
+    if (!active_noise_lut14().valid) {
+        Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
+                                             s_select_out);
+        if (gpu.h > 0 && gpu.w > 0) return gpu;
+        return Image();
+    }
+#endif
     if (cfg.robustness_raw_resolution_active()) {
         Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
                                                     cfg, s_select_out);
@@ -1509,15 +1651,22 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         // started).
     }
 
+    // 1.4 single-curve LUT (parity) vs the per-channel runtime model. When the
+    // LUT is used the per-channel Monte-Carlo curves are NOT built at all, so
+    // the runtime MC cost disappears.
+    const NoiseLut14& lut14 = active_noise_lut14();
+    const bool use_lut = lut14.valid && !cfg.debug_noise_model_disabled;
     // One curve per guide channel (3 for Bayer, matching R/(G1+G2)/2/B; 1
     // otherwise) rather than one curve shared by all channels -- see
     // Config::noise_alpha_ch/noise_beta_ch and make_noise_curves_channel.
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
-    if (ref_stats.means.c == 3) {
-        for (int ch = 0; ch < 3; ++ch)
-            nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
-    } else {
-        nc_ch[0] = &mask_noise_curves(cfg);
+    if (!use_lut) {
+        if (ref_stats.means.c == 3) {
+            for (int ch = 0; ch < 3; ++ch)
+                nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
+        } else {
+            nc_ch[0] = &mask_noise_curves(cfg);
+        }
     }
 
     Image guide = compute_guide(comp_raw, cfg);
@@ -1557,8 +1706,12 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     }
 
     Image d_sq, sigma_sq;
-    apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
-                      cfg.robustness_guide_sqrt);
+    // 1.4 parity: use the LUT's exact single-curve correction, else per-channel.
+    if (use_lut)
+        apply_noise_model_1p4(d_p, ref_stats.means, ref_stats.stds, lut14, d_sq, sigma_sq);
+    else
+        apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
+                          cfg.robustness_guide_sqrt);
     std::vector<uint32_t> motion_irregular;
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
                                    cfg.motion_edge_rejection_enabled
@@ -1648,7 +1801,6 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         }
     }
     return local_min_5x5(R);
-#endif
 }
 
 } // namespace hhsr

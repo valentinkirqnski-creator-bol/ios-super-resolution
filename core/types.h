@@ -206,12 +206,14 @@ struct IspParams {
     // which is what made the render look flat. Back to the full measured matrix.
     float colour_strength = 1.0f;
     // S-curve in display space, applied to luminance so hue is preserved.
-    float contrast = 0.55f;
+    // Raised for a punchier, more contrasty JPEG (tune on device).
+    float contrast = 0.70f;
     // Saturation-dependent boost: muted colours gain, already-saturated ones
-    // barely move. This is what separates vibrance from RGB *= k.
-    float vibrance = 0.50f;
+    // barely move. This is what separates vibrance from RGB *= k. Raised hard
+    // for a much more vibrant look (tune on device; skin_protect guards faces).
+    float vibrance = 0.80f;
     // Flat multiplier applied after vibrance.
-    float saturation = 1.0f;
+    float saturation = 1.08f;
     // Re-adds the detail layer above unity for local micro-contrast. Distinct
     // from sharpening: no high-pass, no halos, no noise amplification.
     float local_contrast = 0.20f;
@@ -988,6 +990,26 @@ struct Config {
     bool  has_cam_to_srgb = false;
     float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
     bool  bake_srgb = false;
+    // Lossless-compress the output DNG (Adobe Deflate / ZIP, Compression=8).
+    // Byte-for-byte identical decoded pixels to the uncompressed DNG, ~1.2-1.5x
+    // smaller on 16-bit linear photographic data (roughly -90MB at 48MP). Costs
+    // ~8.6s of single-threaded zlib per 48MP frame (a serial deflate stream), so
+    // it trades write latency for file size. Off by default = uncompressed/fast.
+    bool  dng_lossless_compress = false;
+    // Store the output DNG UN-white-balanced (real AsShotNeutral) instead of
+    // baking the WB gains into the pixels. The pipeline merges in
+    // pre-white-balanced space (Python utils_dng order), so gains of R~2.06 /
+    // B~1.84 were applied BEFORE the 16-bit ceiling: any red highlight above
+    // ~0.49 of raw full scale clipped at the DNG write even though the sensor
+    // never clipped it -- about 1.05 stops of red and 0.9 of blue headroom lost
+    // vs the input DNGs, with a magenta cast where it clipped. With this on the
+    // encoder divides each channel by its gain before the clamp and the writer
+    // emits AsShotNeutral=1/gain (its existing non-prewhitened branch), so
+    // editors apply WB in float and their highlight recovery sees everything the
+    // sensor saw. The merge is untouched -- only the container changes -- and the
+    // app's JPEG/preview re-multiplies the gains on load (self-describing via the
+    // private WB tag), so it renders bit-identically.
+    bool  dng_store_unwhitened = true;
     // Render the exported JPEG/PNG identically to Python 1.4's postprocess
     // (raw2rgb.py): camera->linear-sRGB matrix -> clip -> unsharp(r=3,a=1.5) ->
     // clip -> sRGB, no tone-map / preset LUT. Bypasses the calibrated

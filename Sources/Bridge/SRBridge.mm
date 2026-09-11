@@ -169,7 +169,7 @@ static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
     const float mx0 = std::max(sr, std::max(sg, sb));
     const float mn0 = std::min(sr, std::min(sg, sb));
     const float sat = (mx0 > 1e-6f) ? (mx0 - mn0) / (mx0 + 1e-6f) : 0.f;
-    const float vibrance = 1.f + 0.18f * (1.f - sat);
+    const float vibrance = 1.f + 0.35f * (1.f - sat); // raised for a more vibrant JPEG (tune on device)
     sr = y + (sr - y) * vibrance;
     sg = y + (sg - y) * vibrance;
     sb = y + (sb - y) * vibrance;
@@ -236,6 +236,48 @@ static inline bool render_wb_is_neutral(const float wb[3]) {
            std::fabs(wb[2] - 1.f) < 1e-4f;
 }
 
+// An un-white-balanced DNG (Config::dng_store_unwhitened) stores true
+// camera-space raw with the real gains in the private WB tag. The render chain
+// was calibrated for PRE-white-balanced input, so re-apply the gains here and
+// hand it neutral wb: the rendered JPEG/preview is then bit-identical to what
+// the old prewhitened container produced. Old prewhitened DNGs carry wb={1,1,1}
+// and pass through untouched.
+static void ReapplyWhiteBalanceIfStored(std::vector<uint16_t>& rgb, int W, int H,
+                                        float wb[3]) {
+    if (rgb.empty() || W <= 0 || H <= 0) return;
+    if (!(wb[1] > 1e-6f)) return;
+    const float g0 = wb[0] / wb[1], g2 = wb[2] / wb[1];
+    if (std::fabs(g0 - 1.f) < 1e-4f && std::fabs(g2 - 1.f) < 1e-4f) return;
+    // Re-apply the stored gains, but instead of hard-clipping the over-range at
+    // white (which threw the recovered highlight headroom away and skewed the
+    // clip magenta), SOFT-ROLL-OFF using the brightest channel so the whole
+    // pixel compresses toward white together -- hue preserved, highlight detail
+    // kept as compressed tone that both render paths then see. kKnee below is
+    // where the rolloff starts (tuning knob).
+    constexpr float kKnee = 0.80f;
+    const float span = 1.f - kKnee;
+    hhsr::parallel_rows(H, 0, [&](int y) {
+        uint16_t* row = rgb.data() + (size_t)y * (size_t)W * 3u;
+        for (int x = 0; x < W; ++x) {
+            const float inv = 1.f / 65535.f;
+            float rn = row[x * 3 + 0] * g0 * inv;   // white-balanced, may exceed 1
+            float gn = row[x * 3 + 1] * inv;         // green gain == 1
+            float bn = row[x * 3 + 2] * g2 * inv;
+            const float mx = std::max(rn, std::max(gn, bn));
+            if (mx > kKnee) {
+                const float over = mx - kKnee;
+                const float rolled = kKnee + span * (over / (over + span)); // ->1
+                const float f = rolled / mx;         // same factor for all -> hue kept
+                rn *= f; gn *= f; bn *= f;
+            }
+            row[x * 3 + 0] = (uint16_t)std::min(65535.f, rn * 65535.f + 0.5f);
+            row[x * 3 + 1] = (uint16_t)std::min(65535.f, gn * 65535.f + 0.5f);
+            row[x * 3 + 2] = (uint16_t)std::min(65535.f, bn * 65535.f + 0.5f);
+        }
+    });
+    wb[0] = wb[1] = wb[2] = 1.f;
+}
+
 static inline void tone_map_calibrated_display_rgb(float& sr, float& sg, float& sb) {
     sr = std::max(0.f, sr);
     sg = std::max(0.f, sg);
@@ -252,6 +294,13 @@ static inline void tone_map_calibrated_display_rgb(float& sr, float& sg, float& 
             sb *= inv;
         }
     }
+
+    // Punchier JPEG (tune on device): saturation-preserving vibrance, then a
+    // mild contrast S-curve, before the display gamma.
+    apply_vibrance_rgb(sr, sg, sb, 0.55f);
+    sr = tone_s_curve(sr);
+    sg = tone_s_curve(sg);
+    sb = tone_s_curve(sb);
 
     sr = to_srgb_gamma(sr);
     sg = to_srgb_gamma(sg);
@@ -373,6 +422,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_enabled = tuning[@"robustness_enabled"].boolValue;
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
+    if (tuning[@"dng_lossless_compress"])
+        cfg.dng_lossless_compress = tuning[@"dng_lossless_compress"].boolValue;
+    if (tuning[@"dng_store_unwhitened"])
+        cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
     if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
         cfg.accumulated_robustness_denoiser_enabled =
             tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
@@ -855,6 +908,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     std::vector<uint8_t> srgb;
     if (g_jpeg_match_14) {
@@ -953,6 +1007,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)

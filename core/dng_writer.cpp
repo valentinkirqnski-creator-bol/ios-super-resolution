@@ -229,11 +229,10 @@ static bool is_identity_3x3(const float* m) {
 // Deflate of a 48MP LinearRaw strip measured ~8.6s of single-threaded zlib —
 // the single largest item in a burst, and unparallelizable because a zlib
 // stream is inherently serial. On 16-bit linear photographic data it only buys
-// ~1.2-1.5x, so storing uncompressed trades ~90MB of file size for those 8.6s.
-// Decoded pixels are identical either way, and load_linear_dng_rgb16 already
-// handles Compression=1. Flip to true to restore Deflate (the zlib path below
-// is kept intact); a multi-strip parallel Deflate is the eventual middle ground.
-static constexpr bool kDngCompress = false;
+// ~1.2-1.5x, so uncompressed trades ~90MB of file size for those 8.6s. Decoded
+// pixels are identical either way, and load_linear_dng_rgb16 handles both
+// Compression=1 and =8. Runtime-selected per burst via DngStreamWriter's
+// `compress_` (Config::dng_lossless_compress); the zlib path below is intact.
 
 // Builds DNG header. StripByteCounts left as 0 — patched once the strip is done.
 // Private tag 65000: 12×f32 LE = wb[3] + cam_to_srgb[9] for JPEG export.
@@ -246,6 +245,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              bool baked_srgb,
                                              const float* cam_to_srgb,
                                              bool pixels_prewhitened,
+                                             bool compress,
                                              uint32_t& strip_offset_out,
                                              uint32_t& strip_byte_counts_offset_out) {
     float derived_cam_to_srgb[9];
@@ -268,7 +268,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(257, (uint32_t)H);
     ifd.shorts(258, {16, 16, 16});
     // 8 = Adobe Deflate (lossless ZIP), 1 = uncompressed. Same decoded pixels.
-    ifd.shortv(259, kDngCompress ? 8 : 1);
+    ifd.shortv(259, compress ? 8 : 1);
     if (baked_srgb)
         ifd.shortv(262, 2);            // RGB
     else
@@ -419,10 +419,11 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
                            const std::string& camera_make, const float* camToSrgb,
-                           bool pixelsPrewhitened) {
+                           bool pixelsPrewhitened, bool lossless) {
     if (W <= 0 || H <= 0) return false;
     W_ = W; H_ = H; rows_written_ = 0;
     compressed_bytes_ = 0;
+    compress_ = lossless;
     strip_byte_counts_offset_ = 0;
     deflate_ok_ = false;
 
@@ -430,6 +431,7 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
                                                    bakedSrgb, camToSrgb, pixelsPrewhitened,
+                                                   compress_,
                                                    strip_offset, strip_byte_counts_offset_);
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
@@ -447,7 +449,7 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
         return false;
     }
 
-    if (!kDngCompress) {
+    if (!compress_) {
         // Uncompressed: rows go straight to disk, no zlib state at all.
         deflate_ok_ = true;
         return true;
@@ -472,7 +474,7 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
 
-    if (!kDngCompress) {
+    if (!compress_) {
         const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
         if (fwrite(rgb16, 1, nbytes, f_) != nbytes) return false;
         compressed_bytes_ += (uint32_t)nbytes;
@@ -512,9 +514,9 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
 
 bool DngStreamWriter::close() {
     if (!f_) return false;
-    bool ok = rows_written_ == H_ && deflate_ok_ && (!kDngCompress || z_stream_);
+    bool ok = rows_written_ == H_ && deflate_ok_ && (!compress_ || z_stream_);
 
-    if (ok && kDngCompress) {
+    if (ok && compress_) {
         auto* zs = static_cast<z_stream*>(z_stream_);
         int ret;
         do {
