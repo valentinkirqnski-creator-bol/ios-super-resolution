@@ -171,6 +171,13 @@ struct TuningParams: Equatable, Codable {
     /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     /// drops more burst samples.
     var motion_geom_reject_threshold: Float = 0.02
+    /// Exposure-invariant geometry rejection: weight the within-tile error by
+    /// contrast (∇g/g, noise-floor-subtracted) instead of absolute gradient, so
+    /// misalignments are caught equally in bright and low light. Uses the
+    /// relative threshold below.
+    var motion_geom_relative: Bool = true
+    var motion_geom_noise_floor_mult: Float = 1.5
+    var motion_geom_reject_threshold_relative: Float = 0.04
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -267,6 +274,7 @@ struct TuningParams: Equatable, Codable {
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
         case motion_geom_reject_enabled, motion_geom_reject_threshold
+        case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case kernel_selection_linear
@@ -340,6 +348,9 @@ struct TuningParams: Equatable, Codable {
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
+        motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
+        motion_geom_noise_floor_mult = try c.decodeIfPresent(Float.self, forKey: .motion_geom_noise_floor_mult) ?? motion_geom_noise_floor_mult
+        motion_geom_reject_threshold_relative = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold_relative) ?? motion_geom_reject_threshold_relative
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
@@ -766,6 +777,24 @@ final class CameraModel: NSObject, ObservableObject {
         applyShutter()
         exposureSyncTimer?.invalidate()
         exposureSyncTimer = nil
+    }
+
+    /// Drag handler for the shutter slider (exposure bar above the viewfinder).
+    /// Flipping to manual FIRST is what fixes the "value won't change" bug: while
+    /// shutterIsAuto the 0.2s auto-exposure poll overwrites shutterSlider ~5x/sec,
+    /// so a drag that stayed in auto was reverted before it could take effect.
+    func setShutterFromSlider(_ v: Double) {
+        guard !isBusy else { return }
+        shutterSlider = min(1.0, max(0.0, v))
+        applyManualShutterFromSlider()   // flips to manual, applies, stops the poll
+    }
+
+    /// Drag handler for the ISO slider. isoIsAuto's and isoSlider's didSets apply
+    /// the exposure, but only once ISO is manual — so switch first, then set.
+    func setISOFromSlider(_ v: Double) {
+        guard !isBusy else { return }
+        if isoIsAuto { isoIsAuto = false }       // didSet -> applyShutter()
+        isoSlider = min(1.0, max(0.0, v))        // didSet -> applyShutter() (now manual)
     }
 
     private func persistShutterState() {
@@ -1957,6 +1986,9 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
+            "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
+            "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
+            "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),

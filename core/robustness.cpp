@@ -1790,7 +1790,24 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
                 const f32 gix = 0.5f * (ref_stats.means.at(y, xr, 0) - ref_stats.means.at(y, xl, 0)) / sc;
                 const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
-                geom_reject = (std::sqrt(gix * gix + giy * giy) * Emag) > cfg.motion_geom_reject_threshold;
+                const f32 gmag = std::sqrt(gix * gix + giy * giy);
+                // Absolute criterion (|grad I| * |E|): preserves the good-light
+                // behaviour exactly -- the bright-scene rejections you already get
+                // stay. ALWAYS applied.
+                geom_reject = (gmag * Emag) > cfg.motion_geom_reject_threshold;
+                // Relative (exposure-invariant) criterion ADDED on top: contrast
+                // (|grad g|/g, noise-floor-subtracted) * |E|. This is what catches
+                // the low-light misalignments the absolute form misses (its
+                // gradient shrinks in dim scenes). Union, so nothing good-light is
+                // lost. bri = local guide mean; nsig = per-raw-pixel guide noise
+                // sigma (same 1/sc units as gmag). See types.h.
+                if (!geom_reject && cfg.motion_geom_relative) {
+                    const f32 bri = guide_brightness(ref_stats.means, y, x);
+                    const f32 nsig = std::sqrt(guide_noise_var(cfg, ref_stats.means.c, 0, bri)) / sc;
+                    const f32 gmag_dn = std::max(0.f, gmag - cfg.motion_geom_noise_floor_mult * nsig);
+                    geom_reject = (gmag_dn / (bri + 1e-4f)) * Emag >
+                                  cfg.motion_geom_reject_threshold_relative;
+                }
             }
             const bool hard_reject = edge_reject || geom_reject;
             f32 r_val = hard_reject

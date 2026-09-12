@@ -95,3 +95,4 @@ targets:
       - sdk: CoreImage.framework
       - sdk: ImageIO.framework
       - sdk: CoreML.framework
+      - sdk: StoreKit.framework

@@ -1584,6 +1584,11 @@ struct RobMaskParams {
     uint per_pixel_s;  // 1 = sample s bilinearly per pixel (Wronski per-pixel M)
     uint geom_reject_enabled;   // 1 = geometry-aware rejection (Config::motion_geom_reject)
     float geom_reject_threshold;
+    // Exposure-invariant geom rejection (Config::motion_geom_relative): weight |E|
+    // by contrast |grad g|/g (noise-floor-subtracted) instead of absolute |grad g|.
+    uint geom_relative;
+    float geom_noise_floor_mult;
+    float geom_reject_threshold_relative;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2140,7 +2145,17 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
         float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
         float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
-        geom_reject = (sqrt(gix * gix + giy * giy) * Emag) > p.geom_reject_threshold;
+        float gmag = sqrt(gix * gix + giy * giy);
+        // Absolute criterion (preserves good-light behaviour), always applied.
+        geom_reject = (gmag * Emag) > p.geom_reject_threshold;
+        // Relative (exposure-invariant) criterion added on top for low light:
+        // contrast |grad g|/g, noise-floor-subtracted. Union. See compute_robustness.
+        if (!geom_reject && p.geom_relative != 0u) {
+            float bri = rob_brightness(ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x));
+            float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f)) / sc;
+            float gmag_dn = max(0.f, gmag - p.geom_noise_floor_mult * nsig);
+            geom_reject = (gmag_dn / (bri + 1e-4f)) * Emag > p.geom_reject_threshold_relative;
+        }
     }
     bool hard_reject = hf_reject || edge_reject || geom_reject;
     float r_val = hard_reject

@@ -139,6 +139,38 @@ static inline void apply_vibrance_rgb(float& r, float& g, float& b, float amount
     b = clampf(y + (b - y) * boost, 0.f, 1.f);
 }
 
+// Luminance-preserving gamut mapping for the final display pixel. Channels that
+// fall outside [0,1] -- from the colour matrix, a fitted preset LUT, vibrance,
+// or merge over-range -- are pulled toward the pixel's own luminance (neutral)
+// by the SMALLEST amount that brings every channel back into gamut, preserving
+// luminance and hue direction while reducing saturation. A fully blown colour
+// highlight therefore desaturates toward white instead of having one channel
+// clipped on its own (which shifts hue into the pink/magenta highlight cast the
+// DNG never shows). Pixels already inside [0,1] are returned unchanged (t == 0).
+//
+// This also closes a real defect at the call sites: the uint8 cast was
+// lround(c*255) with NO clamp, so an out-of-range channel (e.g. 1.2 -> 306)
+// WRAPPED modulo 256 to a low value while the in-range channels stayed high --
+// a bright highlight flipping to saturated pink/cyan. Running this first
+// guarantees [0,1] before the cast.
+static inline void finalize_display_rgb(float& r, float& g, float& b) {
+    float Y = clampf(0.2126f * r + 0.7152f * g + 0.0722f * b, 0.f, 1.f);
+    const float mx = std::max(r, std::max(g, b));
+    const float mn = std::min(r, std::min(g, b));
+    float t = 0.f;
+    if (mx > 1.f) t = std::max(t, (mx - 1.f) / std::max(mx - Y, 1e-6f));
+    if (mn < 0.f) t = std::max(t, (-mn)      / std::max(Y - mn, 1e-6f));
+    t = clampf(t, 0.f, 1.f);
+    if (t > 0.f) {
+        r = Y + (r - Y) * (1.f - t);
+        g = Y + (g - Y) * (1.f - t);
+        b = Y + (b - Y) * (1.f - t);
+    }
+    r = clampf(r, 0.f, 1.f);
+    g = clampf(g, 0.f, 1.f);
+    b = clampf(b, 0.f, 1.f);
+}
+
 // Legacy fallback for non-app DNGs with non-neutral WB metadata.
 static inline void tone_map_legacy_camera_rgb(float& sr, float& sg, float& sb) {
     sr = std::max(0.f, sr);
@@ -296,8 +328,13 @@ static inline void tone_map_calibrated_display_rgb(float& sr, float& sg, float& 
     }
 
     // Punchier JPEG (tune on device): saturation-preserving vibrance, then a
-    // mild contrast S-curve, before the display gamma.
-    apply_vibrance_rgb(sr, sg, sb, 0.55f);
+    // mild contrast S-curve, before the display gamma. Vibrance is faded to zero
+    // in the brightest tones: a near-clip highlight that the block above just
+    // desaturated toward neutral must NOT be re-saturated here, or any residual
+    // channel imbalance (the magenta/pink highlight cast) gets amplified back in.
+    const float vib_y = render_luminance(sr, sg, sb);
+    const float vib = 0.55f * (1.f - smoothstepf(0.60f, 0.95f, vib_y));
+    apply_vibrance_rgb(sr, sg, sb, vib);
     sr = tone_s_curve(sr);
     sg = tone_s_curve(sg);
     sb = tone_s_curve(sb);
@@ -464,6 +501,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
+    if (tuning[@"motion_geom_relative"])
+        cfg.motion_geom_relative = tuning[@"motion_geom_relative"].boolValue;
+    if (tuning[@"motion_geom_noise_floor_mult"])
+        cfg.motion_geom_noise_floor_mult = tuning[@"motion_geom_noise_floor_mult"].floatValue;
+    if (tuning[@"motion_geom_reject_threshold_relative"])
+        cfg.motion_geom_reject_threshold_relative = tuning[@"motion_geom_reject_threshold_relative"].floatValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
@@ -951,6 +994,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 hhsr::isp_render(isp, r, g, b, x, y, sr, sg, sb);
             else
                 render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+            // Luminance-preserving gamut map + clamp: desaturate out-of-gamut
+            // highlights toward white (no pink cast) and guarantee [0,1] before
+            // the cast, which would otherwise wrap an over-range channel.
+            finalize_display_rgb(sr, sg, sb);
             srgb[i * 3 + 0] = (uint8_t)std::lround(sr * 255.f);
             srgb[i * 3 + 1] = (uint8_t)std::lround(sg * 255.f);
             srgb[i * 3 + 2] = (uint8_t)std::lround(sb * 255.f);
@@ -1044,6 +1091,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
             int sx = (scale < 1.f) ? (int)((x + 0.5f) / scale) : x;
             float sr, sg, sb;
             sample_tonemap(sx, sy, sr, sg, sb);
+            // See the 48MP path: gamut-map toward white + clamp before the cast.
+            finalize_display_rgb(sr, sg, sb);
             size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 4;
             srgb[o + 0] = (uint8_t)std::lround(sr * 255.f);
             srgb[o + 1] = (uint8_t)std::lround(sg * 255.f);

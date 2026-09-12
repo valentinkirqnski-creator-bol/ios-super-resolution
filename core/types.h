@@ -920,6 +920,21 @@ struct Config {
     // ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     // drops more burst samples.
     float motion_geom_reject_threshold = 0.02f;
+    // Exposure-invariant geometry rejection. The absolute form above weights the
+    // within-tile error |E| by the ABSOLUTE reference gradient |grad I|, which
+    // shrinks in dim scenes (sqrt guide: a scene at 1/4 the light has ~half the
+    // gradient for the same edge), so the same misalignment drops under the fixed
+    // threshold in low light and merges as a ghost while being caught in good
+    // light. Relative mode weights by CONTRAST instead -- |grad g|/g (~Weber
+    // contrast), which is the same for an edge regardless of exposure -- so one
+    // threshold catches the misalignment at any light level. The raw gradient has
+    // the noise floor subtracted first (k * sigma_noise) so dividing by a small
+    // brightness in a dark, noisy flat region does not amplify noise into false
+    // rejections. motion_geom_reject_threshold_relative is unitless*px and needs
+    // its own value (the absolute threshold's units no longer apply).
+    bool  motion_geom_relative = true;
+    float motion_geom_noise_floor_mult = 1.5f;
+    float motion_geom_reject_threshold_relative = 0.04f;
     float motion_edge_threshold = 0.025f;
     float motion_edge_residual_threshold = 2.5f;
     float motion_edge_noise_floor_multiplier = 1.0f;

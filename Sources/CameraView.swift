@@ -3,8 +3,10 @@ import UniformTypeIdentifiers
 
 struct CameraView: View {
     @StateObject private var cam = CameraModel()
+    @StateObject private var store = StoreManager.shared
     @Environment(\.scenePhase) private var scenePhase
     @State private var showViewer = false
+    @State private var showPaywall = false
     @State private var showSettings = false
     @State private var pinchBaseZoom: CGFloat?
     @State private var focusPoint: CGPoint?
@@ -19,6 +21,7 @@ struct CameraView: View {
     var body: some View {
         GeometryReader { geo in
             let topBarH: CGFloat = 88
+            let exposureBarH: CGFloat = 58
             let bottomH: CGFloat = 96
             let vfWidth = geo.size.width
             // One value for the space below the controls, used both to reserve
@@ -29,7 +32,7 @@ struct CameraView: View {
             // ran under the home indicator. The extra 10 lifts it clear rather
             // than merely flush.
             let bottomInset = geo.safeAreaInsets.bottom + 10
-            let maxVFHeight = geo.size.height - topBarH - bottomH - bottomInset
+            let maxVFHeight = geo.size.height - topBarH - exposureBarH - bottomH - bottomInset
             // Slightly taller than square (4:3) — uses more screen without ultra-wide chrome.
             let vfHeight = min(maxVFHeight, vfWidth * 4 / 3)
 
@@ -43,6 +46,9 @@ struct CameraView: View {
                         topStrip
                             .padding(.top, geo.safeAreaInsets.top + 4)
                             .frame(height: topBarH + geo.safeAreaInsets.top)
+                            .background(Color.black)
+
+                        exposureBar
                             .background(Color.black)
 
                         viewfinder(width: vfWidth, height: vfHeight)
@@ -65,11 +71,13 @@ struct CameraView: View {
         .onDisappear { cam.stop() }
         .onChange(of: scenePhase) { phase in
             cam.setAppActive(phase == .active)
+            if phase == .active { store.refreshDayRollover() }
         }
         .onChange(of: showViewer) { open in
             cam.setPreviewSuspended(open)
         }
         .sheet(isPresented: $showViewer) { resultViewer }
+        .sheet(isPresented: $showPaywall) { PaywallView(store: store) }
         .sheet(isPresented: $showGallery) { GalleryView() }
         .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: [.image],
@@ -123,25 +131,8 @@ struct CameraView: View {
                 .frame(width: width, height: height)
                 .allowsHitTesting(false)
 
-            // Exposure controls sit on the frame edges rather than in a bar
-            // above it, so the preview keeps the full height.
-            HStack {
-                edgeSlider(value: $cam.isoSlider,
-                           symbol: "circle.lefthalf.fill",   // .filled variant is iOS 16+
-                           active: !cam.isoIsAuto,
-                           height: height * 0.42,
-                           toggle: { cam.isoIsAuto.toggle() },
-                           goManual: { cam.isoIsAuto = false })
-                Spacer()
-                edgeSlider(value: $cam.shutterSlider,
-                           symbol: "sun.max",
-                           active: !cam.shutterIsAuto,
-                           height: height * 0.42,
-                           toggle: { cam.setShutterAuto(!cam.shutterIsAuto) },
-                           goManual: { cam.applyManualShutterFromSlider() })
-            }
-            .padding(.horizontal, 14)
-            .frame(width: width, height: height)
+            // ISO/shutter controls live in the exposure bar ABOVE the viewfinder
+            // (see `exposureBar`), so nothing covers the preview here.
 
             VStack {
                 Spacer()
@@ -194,6 +185,60 @@ struct CameraView: View {
             }
             .stroke(Color.white.opacity(0.28), lineWidth: 0.5)
         }
+    }
+
+    // MARK: - Exposure bar (above the viewfinder)
+
+    /// ISO + shutter, side by side, above the viewfinder. Tap a label to toggle
+    /// Auto/Manual; drag a slider to set a manual value. Dragging commits through
+    /// setISOFromSlider / setShutterFromSlider, which flip to manual FIRST so the
+    /// auto-exposure poll can't revert the change (the old "won't change" bug).
+    private var exposureBar: some View {
+        HStack(spacing: 10) {
+            exposureControl(
+                title: "ISO",
+                valueLabel: cam.isoLabel,
+                isAuto: cam.isoIsAuto,
+                slider: Binding(get: { cam.isoSlider },
+                                set: { cam.setISOFromSlider($0) }),
+                toggle: { cam.isoIsAuto.toggle() })
+            Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: 34)
+            exposureControl(
+                title: "SHUTTER",
+                valueLabel: cam.shutterLabel,
+                isAuto: cam.shutterIsAuto,
+                slider: Binding(get: { cam.shutterSlider },
+                                set: { cam.setShutterFromSlider($0) }),
+                toggle: { cam.toggleShutterAuto() })
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+    }
+
+    private func exposureControl(title: String, valueLabel: String, isAuto: Bool,
+                                 slider: Binding<Double>,
+                                 toggle: @escaping () -> Void) -> some View {
+        let accentC: Color = isAuto ? Color.white.opacity(0.45) : Color.yellow
+        return VStack(alignment: .leading, spacing: 2) {
+            Button(action: { if !cam.isBusy { toggle() } }) {
+                HStack(spacing: 5) {
+                    Text(title)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.5))
+                    Text(valueLabel)
+                        .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                        .foregroundColor(isAuto ? .white.opacity(0.75) : .yellow)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Slider(value: slider, in: 0...1)
+                .tint(accentC)
+                .disabled(cam.isBusy)
+        }
+        .frame(maxWidth: .infinity)
+        .opacity(cam.isBusy ? 0.4 : 1)
     }
 
     /// Vertical track with a round icon handle that rides it. Tapping the
@@ -430,9 +475,11 @@ struct CameraView: View {
                     lensChip(title: "1×", selected: cam.isAtZoom(1)) {
                         cam.setLensZoom(.wide1x)
                     }
-                    lensChip(title: "2×", selected: cam.isAtZoom(2)) {
-                        cam.setLensZoom(.wide2x)
-                    }
+                    // No hard-coded 2× chip: the lens buttons reflect only the
+                    // physical lenses this device actually has (ultra-wide 0.5×,
+                    // wide 1×, and the telephoto's native factor), so a base
+                    // iPhone shows 0.5/1 and a Pro shows 0.5/1/<tele>. The 2×
+                    // sensor-crop remains reachable via the zoom slider.
                 }
                 if cam.availableCameras.contains(.telephoto) {
                     lensChip(title: cam.telephotoLensLabel,
@@ -466,6 +513,7 @@ struct CameraView: View {
 
     private var bottomPanel: some View {
         VStack(spacing: 0) {
+            freeTierBanner
             if !cam.noiseDiagText.isEmpty, cam.isProcessing || !cam.isBusy {
                 Text(cam.noiseDiagText)
                     .font(.system(size: 10, weight: .semibold).monospacedDigit())
@@ -533,16 +581,34 @@ struct CameraView: View {
         .disabled(!enabled)
     }
 
+    /// True when a non-paying user has used the day's free captures.
+    private var outOfFreeCaptures: Bool {
+        !store.isUnlocked && store.photosRemainingToday == 0
+    }
+
     private var shutterButton: some View {
-        Button(action: { cam.captureBurst() }) {
+        Button(action: {
+            if cam.isBusy { return }
+            // Out of free captures: don't shoot, offer the unlock instead.
+            if outOfFreeCaptures { showPaywall = true; return }
+            cam.captureBurst()
+            store.registerCapture()
+        }) {
             ZStack {
                 Circle()
-                    .strokeBorder(Color.white.opacity(cam.isBusy ? 0.35 : 1), lineWidth: 5)
+                    .strokeBorder(Color.white.opacity(cam.isBusy || outOfFreeCaptures ? 0.35 : 1), lineWidth: 5)
                     .frame(width: 78, height: 78)
                 Circle()
-                    .fill(shutterFill)
+                    .fill(outOfFreeCaptures ? Color.white.opacity(0.25) : shutterFill)
                     .frame(width: cam.isCapturing ? 50 : 58, height: cam.isCapturing ? 50 : 58)
                     .animation(.spring(response: 0.22, dampingFraction: 0.6), value: cam.isCapturing)
+                if outOfFreeCaptures {
+                    // The shutter is "disabled" for capture — a lock marks that a
+                    // tap now opens the unlock sheet rather than shooting.
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.8))
+                }
                 if cam.isProcessing {
                     // Progress reads on the control the user is waiting on,
                     // rather than only in the status line above.
@@ -555,7 +621,34 @@ struct CameraView: View {
                 }
             }
         }
+        // Kept tappable when out of free captures so the tap can open the paywall;
+        // it will not start a capture in that state (handled in the action).
         .disabled(cam.isBusy)
+    }
+
+    /// Free-tier status: remaining count, or an unlock prompt once the daily
+    /// limit is hit. Hidden entirely for unlocked users.
+    @ViewBuilder private var freeTierBanner: some View {
+        if !store.isUnlocked {
+            if outOfFreeCaptures {
+                Button(action: { showPaywall = true }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "lock.fill").font(.system(size: 11, weight: .bold))
+                        Text("Daily limit reached · Unlock Unlimited — \(store.displayPrice)")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundColor(MD3.onPrimary)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(Capsule().fill(MD3.primary))
+                }
+                .padding(.bottom, 6)
+            } else {
+                Text("\(store.photosRemainingToday) of \(StoreManager.freeDailyLimit) free photos left today")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.55))
+                    .padding(.bottom, 4)
+            }
+        }
     }
 
     /// Small circular control on a translucent disc, used for the two utility
@@ -722,6 +815,27 @@ struct CameraView: View {
         Slider(value: $cam.tuningParams.motion_geom_reject_threshold, in: 0.0...0.06)
         Text("~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner, fewer samples kept.")
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("Also catch low-light (exposure-invariant)", isOn: $cam.tuningParams.motion_geom_relative)
+        Text(cam.tuningParams.motion_geom_relative
+             ? "Adds a CONTRAST criterion (∇g/g) on top of the absolute one above: the absolute test's gradient shrinks in dim scenes so it misses low-light misalignments, while contrast is the same at any exposure. Union — keeps every good-light rejection and adds the low-light ones."
+             : "Absolute edge strength only: tuned for good light; misses misalignments in low light where gradients are weaker.")
+            .font(.caption2).foregroundColor(.secondary)
+        if cam.tuningParams.motion_geom_relative {
+            HStack {
+                Text("Geom Threshold (relative)")
+                Spacer()
+                Text(String(format: "%.3f", cam.tuningParams.motion_geom_reject_threshold_relative))
+            }
+            Slider(value: $cam.tuningParams.motion_geom_reject_threshold_relative, in: 0.0...0.20)
+            HStack {
+                Text("Noise Floor ×")
+                Spacer()
+                Text(String(format: "%.2f", cam.tuningParams.motion_geom_noise_floor_mult))
+            }
+            Slider(value: $cam.tuningParams.motion_geom_noise_floor_mult, in: 0.0...4.0)
+            Text("Noise Floor × subtracts k·σ_noise from the gradient before dividing by brightness, so dark noisy flats don't falsely reject. Lower relative threshold rejects more.")
+                .font(.caption2).foregroundColor(.secondary)
+        }
         Toggle("Guide: Keep White Balance", isOn: $cam.tuningParams.guide_white_balance)
         Toggle("Guide: Colour Matrix (→sRGB)", isOn: $cam.tuningParams.guide_color_matrix)
         Picker("Guide Curve", selection: $cam.tuningParams.guide_curve) {
@@ -1136,11 +1250,15 @@ struct CameraView: View {
                     }
                 }
             }
-            .navigationTitle("Algorithm Tuning")
+            .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .md3FormChrome()
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { showSettings = false }
+                    Button(action: { showSettings = false }) {
+                        Text("Done").font(.system(size: 17, weight: .semibold))
+                    }
+                    .foregroundColor(MD3.primary)
                 }
             }
         }
