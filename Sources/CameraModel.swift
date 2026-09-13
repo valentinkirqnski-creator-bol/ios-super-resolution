@@ -95,6 +95,9 @@ struct TuningParams: Equatable, Codable {
     var k_detail: Float = 0.17
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
+    /// Store the online merge accumulator as fp16 (arithmetic stays fp32).
+    /// Halves its RAM and the merge's memory traffic; output shifts ~1-2 LSB.
+    var merge_fp16_accumulator: Bool = true
     var k_shrink: Float = 1.0
     var snr_auto_tune: Bool = false
     var alignment_tile_size: Int = 16
@@ -255,6 +258,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
+        case merge_fp16_accumulator
         case snr_auto_tune, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
@@ -296,6 +300,7 @@ struct TuningParams: Equatable, Codable {
         k_detail = try c.decodeIfPresent(Float.self, forKey: .k_detail) ?? k_detail
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
+        merge_fp16_accumulator = try c.decodeIfPresent(Bool.self, forKey: .merge_fp16_accumulator) ?? merge_fp16_accumulator
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
@@ -1945,6 +1950,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),
+            "merge_fp16_accumulator": NSNumber(value: tuningParams.merge_fp16_accumulator),
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
