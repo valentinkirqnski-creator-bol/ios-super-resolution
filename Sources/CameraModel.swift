@@ -770,6 +770,15 @@ final class CameraModel: NSObject, ObservableObject {
         if shutterIsAuto { startAutoExposureSyncIfNeeded() }
     }
 
+    /// Capture defaults forced once per app launch (like the shutter auto state
+    /// above, these deliberately do not carry a prior session's choice): 48MP
+    /// super-resolution output, DNG format, and 8-frame bursts.
+    func ensureCaptureDefaultsOnLaunch() {
+        outputResolutionMode = .super48mp
+        exportFormat = .dng
+        frameCount = 8
+    }
+
     func applyManualShutterFromSlider() {
         guard !isBusy else { return }
         if shutterIsAuto { shutterIsAuto = false }
@@ -1873,21 +1882,26 @@ final class CameraModel: NSObject, ObservableObject {
 
     /// Process a set of DNGs the user picked. Always at 2x, since importing is
     /// a deliberate act and the extra resolution is the reason to do it.
-    func processImportedDNGs(_ urls: [URL]) {
-        guard !isBusy else { return }
+    /// Returns true when processing actually started (so the caller can count it
+    /// against the free daily limit); false when it no-ops (busy, or < 2 DNGs).
+    @discardableResult
+    func processImportedDNGs(_ urls: [URL]) -> Bool {
+        guard !isBusy else { return false }
         let dngs = urls.filter { $0.pathExtension.lowercased() == "dng" }
         guard dngs.count >= 2 else {
             finish(success: false, message: "Pick at least 2 DNG files")
-            return
+            return false
         }
         importedDNGs = Array(dngs.prefix(Self.maxFrameCount))
-        outputResolutionMode = .super48mp
+        // Honour the user's 12MP/48MP selection (the resolution control) for
+        // imports too, instead of forcing 48MP and silently overwriting it.
         isBusy = true
         isCapturing = false
         isProcessing = true
         progress = 0
         statusText = "Processing \(importedDNGs.count) imported DNGs"
         processingQueue.async { [weak self] in self?.processBurst() }
+        return true
     }
 
     private func processBurst() {

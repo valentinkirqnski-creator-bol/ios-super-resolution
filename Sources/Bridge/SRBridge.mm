@@ -262,6 +262,19 @@ static hhsr::IspParams g_isp;
 // only a path).
 static bool g_jpeg_match_14 = false;
 
+// Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
+// sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only
+// receive a path, not a Config -- this session cache is how the JPEG gets the
+// same Make/Model/ISO/shutter/etc. without re-parsing the DNG's own tags.
+// Populated in FillReferenceMetadataFromRawFrame; g_capture_meta_path is set to
+// the output DNG once a capture succeeds, and gates the cache by path.
+struct CaptureMetaCache {
+    std::string make, model, lens_model, datetime;
+    float iso = 0.f, exposure_seconds = 0.f, f_number = 0.f, focal_length_mm = 0.f;
+};
+static CaptureMetaCache g_capture_meta;
+static std::string g_capture_meta_path;
+
 static inline bool render_wb_is_neutral(const float wb[3]) {
     return std::fabs(wb[0] - 1.f) < 1e-4f &&
            std::fabs(wb[1] - 1.f) < 1e-4f &&
@@ -594,6 +607,50 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
         (__bridge NSString *)kCGImagePropertyTIFFModel, @"Model"
     ]));
 
+    // Capture-time EXIF → Config::capture_* → the output DNG's Exif sub-IFD, so
+    // the merged file records the ISO / shutter / aperture / lens / date it was
+    // actually shot at, like any camera's own raw output.
+    id isoVal = FirstValueForKeys(exif, @[
+        (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings, @"ISOSpeedRatings"
+    ]);
+    if ([isoVal isKindOfClass:NSArray.class] && [(NSArray *)isoVal count] > 0)
+        isoVal = ((NSArray *)isoVal).firstObject;
+    if ([isoVal isKindOfClass:NSNumber.class]) cfg.capture_iso = [(NSNumber *)isoVal floatValue];
+
+    id expVal = FirstValueForKeys(exif, @[
+        (__bridge NSString *)kCGImagePropertyExifExposureTime, @"ExposureTime"
+    ]);
+    if ([expVal isKindOfClass:NSNumber.class]) cfg.capture_exposure_seconds = [(NSNumber *)expVal floatValue];
+
+    id fVal = FirstValueForKeys(exif, @[
+        (__bridge NSString *)kCGImagePropertyExifFNumber, @"FNumber"
+    ]);
+    if ([fVal isKindOfClass:NSNumber.class]) cfg.capture_f_number = [(NSNumber *)fVal floatValue];
+
+    id flVal = FirstValueForKeys(exif, @[
+        (__bridge NSString *)kCGImagePropertyExifFocalLength, @"FocalLength"
+    ]);
+    if ([flVal isKindOfClass:NSNumber.class]) cfg.capture_focal_length_mm = [(NSNumber *)flVal floatValue];
+
+    cfg.capture_lens_model = NSStringToStd(FirstValueForKeys(exif, @[
+        (__bridge NSString *)kCGImagePropertyExifLensModel, @"LensModel"
+    ]));
+    cfg.capture_datetime = NSStringToStd(FirstValueForKeys(exif, @[
+        (__bridge NSString *)kCGImagePropertyExifDateTimeOriginal, @"DateTimeOriginal"
+    ]));
+
+    // Mirror into the JPEG-export session cache: this is the only point with the
+    // capture metadata dictionary in hand (the pipeline takes Config by value
+    // from here on, so cfg's fields don't reach the JPEG exporter otherwise).
+    g_capture_meta.make = cfg.camera_make;
+    g_capture_meta.model = cfg.camera_model;
+    g_capture_meta.iso = cfg.capture_iso;
+    g_capture_meta.exposure_seconds = cfg.capture_exposure_seconds;
+    g_capture_meta.f_number = cfg.capture_f_number;
+    g_capture_meta.focal_length_mm = cfg.capture_focal_length_mm;
+    g_capture_meta.lens_model = cfg.capture_lens_model;
+    g_capture_meta.datetime = cfg.capture_datetime;
+
     id orientation = FirstValueForKeys(metadata, @[
         (__bridge NSString *)kCGImagePropertyOrientation, @"Orientation"
     ]);
@@ -880,6 +937,9 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     if (preview.w <= 0) return NO;
 
+    // The capture succeeded and wrote `outPath`; let the JPEG exporter attach
+    // this shot's EXIF (matched by path in BuildJpegExportOpts).
+    g_capture_meta_path = outPath.UTF8String;
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
 }
@@ -932,12 +992,44 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     if (preview.w <= 0) return NO;
 
+    // The capture succeeded and wrote `outPath`; let the JPEG exporter attach
+    // this shot's EXIF (matched by path in BuildJpegExportOpts).
+    g_capture_meta_path = outPath.UTF8String;
     if (previewOut) *previewOut = UIImageFromPreview(preview);
     return YES;
 }
 
 + (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height {
     hhsr::mps_fft_prewarm((int)height, (int)width);
+}
+
+// Properties for CGImageDestinationAddImage: the compression quality, plus --
+// when dngPath is the just-finished capture (g_capture_meta_path) -- Make/Model/
+// ISO/shutter/aperture/focal length/lens/date, so the JPEG carries the same
+// metadata the DNG does. No match (e.g. an imported/older file) just means no
+// camera metadata on the JPEG; quality is always set.
+static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
+    NSMutableDictionary* opts = [NSMutableDictionary dictionaryWithObject:@(quality)
+        forKey:(__bridge NSString*)kCGImageDestinationLossyCompressionQuality];
+    if (!dngPath || g_capture_meta_path.empty() ||
+        g_capture_meta_path != std::string(dngPath.UTF8String))
+        return opts;
+    const CaptureMetaCache& m = g_capture_meta;
+    NSMutableDictionary* tiff = [NSMutableDictionary dictionary];
+    if (!m.make.empty())  tiff[(__bridge NSString*)kCGImagePropertyTIFFMake]  = @(m.make.c_str());
+    if (!m.model.empty()) tiff[(__bridge NSString*)kCGImagePropertyTIFFModel] = @(m.model.c_str());
+    if (!m.datetime.empty()) tiff[(__bridge NSString*)kCGImagePropertyTIFFDateTime] = @(m.datetime.c_str());
+    if (tiff.count) opts[(__bridge NSString*)kCGImagePropertyTIFFDictionary] = tiff;
+
+    NSMutableDictionary* exif = [NSMutableDictionary dictionary];
+    if (m.iso > 0.f)              exif[(__bridge NSString*)kCGImagePropertyExifISOSpeedRatings] = @[@(m.iso)];
+    if (m.exposure_seconds > 0.f) exif[(__bridge NSString*)kCGImagePropertyExifExposureTime]   = @(m.exposure_seconds);
+    if (m.f_number > 0.f)         exif[(__bridge NSString*)kCGImagePropertyExifFNumber]         = @(m.f_number);
+    if (m.focal_length_mm > 0.f)  exif[(__bridge NSString*)kCGImagePropertyExifFocalLength]     = @(m.focal_length_mm);
+    if (!m.lens_model.empty())    exif[(__bridge NSString*)kCGImagePropertyExifLensModel]       = @(m.lens_model.c_str());
+    if (!m.datetime.empty())      exif[(__bridge NSString*)kCGImagePropertyExifDateTimeOriginal] = @(m.datetime.c_str());
+    if (exif.count) opts[(__bridge NSString*)kCGImagePropertyExifDictionary] = exif;
+    return opts;
 }
 
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
@@ -1034,7 +1126,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // output, 0.82 lands at 46% of the size for 2.8 LSB RMS -- ImageIO drops to
     // 4:2:0 below ~0.90, which is where most of the saving comes from, and
     // chroma subsampling is not visible on a photograph at this resolution.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.82};
+    NSDictionary* opts = BuildJpegExportOpts(dngPath, 0.82f);
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
@@ -1127,7 +1219,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         return NO;
     }
     // Embedded DNG preview: a thumbnail source, so it can be leaner still.
-    NSDictionary* opts = @{(__bridge NSString*)kCGImageDestinationLossyCompressionQuality: @0.80};
+    NSDictionary* opts = BuildJpegExportOpts(dngPath, 0.80f);
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL enc_ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);

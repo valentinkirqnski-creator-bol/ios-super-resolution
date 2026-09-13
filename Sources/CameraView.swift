@@ -64,6 +64,7 @@ struct CameraView: View {
         .onAppear {
             if !didApplyLaunchShutter {
                 cam.ensureShutterAutoOnLaunch()
+                cam.ensureCaptureDefaultsOnLaunch()   // 48MP · DNG · 8 frames
                 didApplyLaunchShutter = true
             }
             cam.start()
@@ -86,7 +87,16 @@ struct CameraView: View {
                 // Picked files sit outside the sandbox and the pipeline reads
                 // them on a background queue, so the security scope must stay
                 // open past this closure; processImportedDNGs closes it.
-                cam.processImportedDNGs(urls.filter { $0.startAccessingSecurityScopedResource() })
+                let picked = urls.filter { $0.startAccessingSecurityScopedResource() }
+                guard !picked.isEmpty else { return }
+                // Importing from storage is "taking a photo" too, so it counts
+                // against the free daily limit exactly like a shutter press.
+                if outOfFreeCaptures {
+                    picked.forEach { $0.stopAccessingSecurityScopedResource() }
+                    showPaywall = true
+                } else if cam.processImportedDNGs(picked) {
+                    store.registerCapture()   // only count imports that actually start
+                }
             }
         }
         .sheet(isPresented: $showSettings) { tuningSettingsView }
@@ -323,16 +333,12 @@ struct CameraView: View {
                 Spacer()
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 14) {
                 frameCountControl
+                resolutionControl
                 Spacer()
-                Text("ISO " + cam.isoLabel)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.6))
-                Text(cam.shutterLabel)
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.85))
-                    .frame(minWidth: 44, alignment: .trailing)
+                // ISO/shutter now live in the exposure bar below the top strip,
+                // so they are not duplicated here.
             }
         }
         .padding(.horizontal, 20)
@@ -354,6 +360,28 @@ struct CameraView: View {
                 cam.frameCount += 1
             }
         }
+    }
+
+    /// Output upscale factor: 1× (12MP) or 2× (48MP super-resolution). Sits next
+    /// to the frame-count selector; governs both live capture and imports.
+    private var resolutionControl: some View {
+        HStack(spacing: 0) {
+            ForEach(OutputResolutionMode.allCases) { mode in
+                let selected = cam.outputResolutionMode == mode
+                Button(action: { if !cam.isBusy { cam.outputResolutionMode = mode } }) {
+                    Text(mode.label)   // "12MP" / "48MP"
+                        .font(.system(size: 11, weight: selected ? .bold : .medium, design: .rounded))
+                        .foregroundColor(selected ? .black : .white.opacity(0.8))
+                        .padding(.horizontal, 9)
+                        .frame(height: 26)
+                        .background(selected ? Color.white.opacity(0.92) : Color.clear)
+                }
+                .disabled(cam.isBusy)
+            }
+        }
+        .background(Capsule().fill(Color.white.opacity(0.12)))
+        .clipShape(Capsule())
+        .opacity(cam.isBusy ? 0.5 : 1)
     }
 
     private func miniStepper(_ symbol: String, enabled: Bool, action: @escaping () -> Void) -> some View {
