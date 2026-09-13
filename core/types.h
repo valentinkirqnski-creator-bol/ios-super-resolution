@@ -897,7 +897,6 @@ struct Config {
     // reading as high-frequency detail, and it scales with brightness through
     // the noise model rather than being a fixed number.
     float hf_min_texture_snr = 4.0f;
-    bool  motion_edge_rejection_enabled = true;
 
     // Geometry-aware rejection: a second test on top of Wronski's R that rejects
     // pixels where the per-tile TRANSLATION flow is provably a poor model of the
@@ -935,10 +934,6 @@ struct Config {
     bool  motion_geom_relative = true;
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
-    float motion_edge_threshold = 0.025f;
-    float motion_edge_residual_threshold = 2.5f;
-    float motion_edge_noise_floor_multiplier = 1.0f;
-    int   motion_edge_neighborhood_radius = 1;
 
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
     bool  accumulated_robustness_denoiser_enabled = true;

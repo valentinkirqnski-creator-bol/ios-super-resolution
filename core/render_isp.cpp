@@ -560,6 +560,12 @@ void isp_render(const IspState& st, f32 r, f32 g, f32 b, int x, int y,
         const f32 w = skin_weight(sr, sg, sb);
         amount *= (1.f - 0.75f * w);
     }
+    // Do NOT re-saturate highlights. The highlight/gamut steps above neutralise
+    // a near-white tone toward its luminance; vibrance would then amplify any
+    // residual channel imbalance the hardest precisely there (head is largest
+    // for low-saturation pixels), which is what paints clipped highlights
+    // magenta/pink. Fade the whole boost out as luminance approaches white.
+    amount *= (1.f - smoothstepf(0.78f, 0.98f, yl));
     if (std::fabs(amount) > 1e-4f) {
         const f32 k = 1.f + amount;
         sr = yl + (sr - yl) * k;

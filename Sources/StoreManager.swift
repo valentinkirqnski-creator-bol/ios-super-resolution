@@ -6,10 +6,10 @@ import StoreKit
 // Business rules (confirmed with the product owner):
 //   * One non-consumable purchase, `unlimitedProductID`, priced at $1.99/$2 tier,
 //     permanently unlocks unlimited capture.
-//   * Without it, the free tier allows `freeDailyLimit` completed captures per
-//     calendar day (local time); a burst merge counts as one. The count resets
-//     at local midnight. When it reaches the limit the shutter is disabled and
-//     the paywall is offered.
+//   * Without it, the free tier allows `freeTotalLimit` completed captures in
+//     TOTAL (lifetime, not per day); a burst merge counts as one, and an import
+//     from storage counts too. The count never resets. When it reaches the limit
+//     the shutter is disabled and the paywall is offered.
 //
 // SETUP REQUIRED (cannot be done from code):
 //   1. App Store Connect → create a Non-Consumable IAP with product id
@@ -26,22 +26,21 @@ final class StoreManager: ObservableObject {
     /// app's bundle-id prefix (com.handheldsr.camera) — change it there and here
     /// together if you use a different id.
     static let unlimitedProductID = "com.handheldsr.camera.unlimited"
-    /// Free captures per local day before the shutter locks.
-    static let freeDailyLimit = 5
+    /// Free captures TOTAL (lifetime, not per day) before the shutter locks and
+    /// the paywall is offered. Never resets.
+    static let freeTotalLimit = 10
 
     @Published private(set) var isUnlocked = false
     @Published private(set) var product: Product?
     @Published private(set) var purchaseInFlight = false
-    @Published private(set) var photosUsedToday = 0
+    @Published private(set) var photosUsed = 0
     @Published var lastErrorMessage: String?
 
     private let usedKey = "FreePhotosUsedCount"
-    private let dayKey  = "FreePhotosDayStamp"
     private var updatesTask: Task<Void, Never>?
 
     private init() {
-        rolloverIfNeeded()
-        photosUsedToday = UserDefaults.standard.integer(forKey: usedKey)
+        photosUsed = UserDefaults.standard.integer(forKey: usedKey)
         // Listen for transactions that arrive outside an explicit purchase()
         // (Ask to Buy approvals, purchases made on another device, refunds).
         updatesTask = Task { [weak self] in
@@ -56,45 +55,18 @@ final class StoreManager: ObservableObject {
 
     // MARK: Free-tier accounting
 
-    /// Captures still allowed today for a non-paying user (∞ shown as a large int
-    /// is avoided; callers check `isUnlocked` first).
-    var photosRemainingToday: Int { max(0, Self.freeDailyLimit - photosUsedToday) }
+    /// Captures still allowed for a non-paying user (callers check isUnlocked first).
+    var photosRemaining: Int { max(0, Self.freeTotalLimit - photosUsed) }
 
     /// True if a capture is allowed right now.
-    var canCapture: Bool { isUnlocked || photosRemainingToday > 0 }
+    var canCapture: Bool { isUnlocked || photosRemaining > 0 }
 
     /// Call exactly once per capture that actually starts. No-op when unlocked.
+    /// The count is a lifetime total and never resets.
     func registerCapture() {
         guard !isUnlocked else { return }
-        rolloverIfNeeded()
-        photosUsedToday = min(Self.freeDailyLimit, photosUsedToday + 1)
-        UserDefaults.standard.set(photosUsedToday, forKey: usedKey)
-    }
-
-    private func localDayStamp(_ date: Date = Date()) -> String {
-        var cal = Calendar.current
-        cal.timeZone = TimeZone.current
-        let c = cal.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
-    }
-
-    /// Reset the free counter when the local calendar day changes.
-    private func rolloverIfNeeded() {
-        let today = localDayStamp()
-        let saved = UserDefaults.standard.string(forKey: dayKey)
-        if saved != today {
-            UserDefaults.standard.set(today, forKey: dayKey)
-            UserDefaults.standard.set(0, forKey: usedKey)
-            photosUsedToday = 0
-        }
-    }
-
-    /// Re-check the day on foreground so a midnight crossing unlocks the shutter
-    /// without a relaunch.
-    func refreshDayRollover() {
-        let before = photosUsedToday
-        rolloverIfNeeded()
-        if photosUsedToday != before { objectWillChange.send() }
+        photosUsed = min(Self.freeTotalLimit, photosUsed + 1)
+        UserDefaults.standard.set(photosUsed, forKey: usedKey)
     }
 
     // MARK: StoreKit

@@ -20,7 +20,7 @@ struct PaywallView: View {
                                    "Pay once. No subscription, no recurring charge.")
                         Divider().overlay(MD3.outline.opacity(0.4))
                         benefitRow("lock.open.fill", "Keeps your work",
-                                   "The free \(StoreManager.freeDailyLimit)-per-day limit is lifted permanently.")
+                                   "The free \(StoreManager.freeTotalLimit)-photo limit is lifted permanently.")
                     }
 
                     VStack(spacing: 10) {
@@ -81,7 +81,7 @@ struct PaywallView: View {
             Text("Unlimited Capture")
                 .font(.system(size: 26, weight: .bold))
                 .foregroundColor(MD3.onSurface)
-            Text("You’ve used your \(StoreManager.freeDailyLimit) free photos for today. Unlock unlimited shooting with a single purchase.")
+            Text("You’ve used your \(StoreManager.freeTotalLimit) free photos. Unlock unlimited shooting with a single purchase.")
                 .font(.system(size: 14))
                 .foregroundColor(MD3.onSurfaceVariant)
                 .multilineTextAlignment(.center)

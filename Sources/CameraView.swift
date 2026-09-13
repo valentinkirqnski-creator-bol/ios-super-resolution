@@ -72,7 +72,6 @@ struct CameraView: View {
         .onDisappear { cam.stop() }
         .onChange(of: scenePhase) { phase in
             cam.setAppActive(phase == .active)
-            if phase == .active { store.refreshDayRollover() }
         }
         .onChange(of: showViewer) { open in
             cam.setPreviewSuspended(open)
@@ -611,7 +610,7 @@ struct CameraView: View {
 
     /// True when a non-paying user has used the day's free captures.
     private var outOfFreeCaptures: Bool {
-        !store.isUnlocked && store.photosRemainingToday == 0
+        !store.isUnlocked && store.photosRemaining == 0
     }
 
     private var shutterButton: some View {
@@ -662,7 +661,7 @@ struct CameraView: View {
                 Button(action: { showPaywall = true }) {
                     HStack(spacing: 6) {
                         Image(systemName: "lock.fill").font(.system(size: 11, weight: .bold))
-                        Text("Daily limit reached · Unlock Unlimited — \(store.displayPrice)")
+                        Text("Free limit reached · Unlock Unlimited — \(store.displayPrice)")
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .foregroundColor(MD3.onPrimary)
@@ -671,7 +670,7 @@ struct CameraView: View {
                 }
                 .padding(.bottom, 6)
             } else {
-                Text("\(store.photosRemainingToday) of \(StoreManager.freeDailyLimit) free photos left today")
+                Text("\(store.photosRemaining) of \(StoreManager.freeTotalLimit) free photos left")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white.opacity(0.55))
                     .padding(.bottom, 4)
@@ -963,45 +962,6 @@ struct CameraView: View {
                          ? "Full-res FFT low-pass. Slower."
                          : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
                         .font(.caption2).foregroundColor(.secondary)
-                    Toggle("Motion Edge Guard", isOn: $cam.tuningParams.motion_edge_rejection_enabled)
-
-                    if cam.tuningParams.motion_edge_rejection_enabled {
-                        HStack {
-                            Text("Edge Threshold")
-                            Spacer()
-                            Text(String(format: "%.3f", cam.tuningParams.motion_edge_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.motion_edge_threshold,
-                               in: 0.0...0.12,
-                               step: 0.001)
-
-                        HStack {
-                            Text("Residual Threshold")
-                            Spacer()
-                            Text(String(format: "%.2f", cam.tuningParams.motion_edge_residual_threshold))
-                        }
-                        Slider(value: $cam.tuningParams.motion_edge_residual_threshold,
-                               in: 0.0...8.0,
-                               step: 0.05)
-
-                        HStack {
-                            Text("Edge Noise Floor")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.motion_edge_noise_floor_multiplier))
-                        }
-                        Slider(value: $cam.tuningParams.motion_edge_noise_floor_multiplier,
-                               in: 0.0...2.0,
-                               step: 0.1)
-
-                        Stepper(value: $cam.tuningParams.motion_edge_neighborhood_radius,
-                                in: 0...2) {
-                            HStack {
-                                Text("Edge Neighborhood")
-                                Spacer()
-                                Text("\(cam.tuningParams.motion_edge_neighborhood_radius)")
-                            }
-                        }
-                    }
                 }
     }
 
@@ -1095,71 +1055,7 @@ struct CameraView: View {
     private var tuningSettingsView: some View {
         NavigationView {
             Form {
-                robustnessSection
-                
-                kernelsSection
-                
-                Section(header: Text("Capture")) {
-                    if cam.frameCount > 10 {
-                        Text("\(cam.frameCount) frames: every frame stays resident through the merge, so long bursts are memory-heavy. If a capture is killed mid-processing, reduce the count or switch to 12MP output.")
-                            .font(.footnote)
-                            .foregroundColor(.orange)
-                    }
-                    Toggle("Shutter Sound", isOn: $cam.shutterSoundEnabled)
-                    Text(cam.shutterSoundEnabled
-                         ? "Plays the system camera click when a burst starts."
-                         : "Silent. Some regions require a shutter sound by law; the system may override this.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Toggle("Zero Shutter Lag (ZSL)", isOn: $cam.zslEnabled)
-                    Text(cam.zslEnabled
-                         ? "Buffers \(cam.frameCount) RAW frames continuously. Tap shutter to grab them without holding still afterward. Ready: \(cam.zslBufferReady)/\(cam.frameCount)."
-                         : "Off — classic burst: frames are captured after you tap the shutter.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Export")) {
-                    Picker("Resolution", selection: $cam.outputResolutionMode) {
-                        ForEach(OutputResolutionMode.allCases) { mode in
-                            Text(mode.label).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(cam.cropZoom > 1.0001)
-                    Text(cam.cropZoom <= 1.0001
-                         ? (cam.outputResolutionMode == .super48mp
-                            ? "Super-resolves to 4x the pixel count. Slower and uses more memory."
-                            : "Merges at sensor resolution. Faster.")
-                         : "Only applies when nothing is cropped away. Any zoom is captured as a crop that super-resolution doubles, so it already merges at 2x.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Picker("Format", selection: $cam.exportFormat) {
-                        ForEach(ExportFormat.allCases) { fmt in
-                            Text(fmt.label).tag(fmt)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    Text(cam.exportFormat == .dng
-                         ? "LinearRaw DNG with embedded tone-mapped JPEG preview (Photos thumbnail; Lightroom reads the raw)."
-                         : "JPEG rendered by the ISP: auto exposure, local tone mapping, contrast and vibrance. No sharpening.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-
                 Section(header: Text("Rendering \u{2014} Tone")) {
-                    Toggle("Match Python 1.4 JPEG", isOn: $cam.tuningParams.jpeg_match_python14)
-                    Text("""
-                         Finishes the exported JPEG/PNG exactly like Python 1.4's \
-                         postprocess: camera→linear-sRGB matrix, clip, unsharp mask \
-                         (radius 3, amount 1.5), clip, sRGB gamma — no tone mapping, \
-                         no calibrated grade. Overrides the render below. The merge \
-                         differs from 1.4, so images aren't pixel-identical, but the \
-                         finishing is; compare on a PNG save.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
                     Text(cam.tuningParams.isp_enabled
                          ? "Local tone mapping, contrast and vibrance, applied to the JPEG and the DNG preview only. The DNG itself always stays the unmodified linear merge."
@@ -1192,85 +1088,7 @@ struct CameraView: View {
                     }
                 }
 
-                Section(header: Text("Merge Architecture")) {
-                    Picker("Merge", selection: $cam.tuningParams.merge_arch) {
-                        Text("Auto").tag(Int32(0))
-                        Text("Banded").tag(Int32(1))
-                        Text("Online").tag(Int32(2))
-                    }
-                    .pickerStyle(.segmented)
-                    Text(cam.tuningParams.merge_arch == 2
-                         ? "Forced. Online is used whatever the burst length or the memory left, including where Auto would have refused it, so this can run the app out of memory. Use Auto unless you are measuring."
-                         : (cam.tuningParams.merge_arch == 1
-                            ? "Forced. One band at a time, every frame resident until the last one — so memory grows with the burst, but the accumulator stays small."
-                            : "Online keeps one accumulator for the whole output and drops each frame as it merges, so memory stops growing with the burst. That accumulator scales with output pixels, so it costs four times as much at 48MP as at 12MP. Auto projects both peaks, needs at least 6 frames, and falls back to banding if the accumulator would not fit."))
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
 
-                Section(header: Text("Robustness")) {
-                    Toggle("Enable Robustness", isOn: $cam.tuningParams.robustness_enabled)
-                    Text(cam.tuningParams.robustness_enabled
-                         ? "Rejects misaligned regions before they merge. Leave on for normal shooting."
-                         : "OFF — every frame merges at full weight everywhere. Ghosting and misalignment will be visible. Diagnostic only: it shows what alignment actually produced, with no mask hiding the errors.")
-                        .font(.footnote)
-                        .foregroundColor(cam.tuningParams.robustness_enabled ? .secondary : .orange)
-
-                    Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
-                    Text("When on, also saves a grayscale robustness mask to Photos after processing.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Toggle("DNG Highlight Headroom", isOn: $cam.tuningParams.dng_store_unwhitened)
-                    Text("Stores the output DNG un-white-balanced (real AsShotNeutral) instead of baking the WB gains into the pixels. The merge runs pre-white-balanced (R×2.06, B×1.84), which used to clip red highlights above ~49% of raw scale and skew them magenta — about a stop of headroom the sensor captured but the file threw away. Editors then apply WB in float and their highlight recovery sees everything. The in-app JPEG/preview re-applies the gains on load and renders identically. On by default.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                    Toggle("Lossless DNG (smaller)", isOn: $cam.tuningParams.dng_lossless_compress)
-                    Text("Compresses the output DNG with lossless Adobe Deflate (ZIP). Identical pixels — same quality — roughly 1.2–1.5× smaller (about −90MB at 48MP). Costs ~8s extra per frame (single-threaded zlib). Off = uncompressed and fastest to write.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-
-                }
-
-                Section(header: Text("Fallback Denoiser")) {
-
-                    Toggle("Enable Motion Denoiser", isOn: $cam.tuningParams.accumulated_robustness_denoiser_enabled)
-                    
-                    if cam.tuningParams.accumulated_robustness_denoiser_enabled {
-                        HStack {
-                            Text("Radius Max")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.acc_rob_rad_max))
-                        }
-                        Slider(value: $cam.tuningParams.acc_rob_rad_max, in: 0.0...10.0)
-                        
-                        HStack {
-                            Text("Max Multiplier")
-                            Spacer()
-                            Text(String(format: "%.1f", cam.tuningParams.acc_rob_max_multiplier))
-                        }
-                        Slider(value: $cam.tuningParams.acc_rob_max_multiplier, in: 1.0...20.0)
-                        
-                        fineAlignmentSection
-
-                        Toggle("Adapt To Frame Count", isOn: $cam.tuningParams.acc_rob_adaptive)
-                        Text(cam.tuningParams.acc_rob_adaptive
-                             ? "Enlargement is derived from how many frames actually merged at each pixel, relative to the burst length. Nothing to set; Max Multiplier only caps it."
-                             : "Reference behaviour: full enlargement below the frame count below, none above, and the reference frame replaces the merged result there.")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-
-                        if !cam.tuningParams.acc_rob_adaptive {
-                            HStack {
-                                Text("Max Frame Count")
-                                Spacer()
-                                Text(String(format: "%.1f", cam.tuningParams.acc_rob_max_frame_count))
-                            }
-                            Slider(value: $cam.tuningParams.acc_rob_max_frame_count, in: 1.0...10.0)
-                        }
-                    }
-                }
 
                 Section {
                     Button("Reset") {

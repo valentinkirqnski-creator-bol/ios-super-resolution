@@ -1127,13 +1127,8 @@ struct RobMaskParamsCPU {
     float r_t;
     uint32_t hf_enabled = 0;
     float hf_variance_loss_threshold = 0.f;
-    uint32_t motion_edge_enabled = 0;
-    float motion_edge_threshold = 0.f;
-    float motion_edge_residual_threshold = 0.f;
     float alpha = 0.f;
     float beta = 0.f;
-    float motion_edge_noise_floor_multiplier = 1.f;
-    uint32_t motion_edge_neighborhood_radius = 0;
     // Keep in lockstep with RobMaskParams in HHSRKernels.metal: same fields,
     // same order. A mismatch here is silent on the shader side.
     float flow_reject_1d_residual_threshold = 0.f;
@@ -1154,7 +1149,7 @@ struct RobMaskParamsCPU {
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 124, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1169,17 +1164,12 @@ struct RobMaskRawParamsCPU {
     uint32_t hf_enabled = 0;
     float hf_variance_loss_threshold = 0.f;
     uint32_t hf_h = 0, hf_w = 0;    // guide-resolution dims of ref_hf_loss
-    uint32_t motion_edge_enabled = 0;
-    float motion_edge_threshold = 0.f;
-    float motion_edge_residual_threshold = 0.f;
     float alpha = 0.f;
     float beta = 0.f;
-    float motion_edge_noise_floor_multiplier = 0.f;
-    uint32_t motion_edge_neighborhood_radius = 0;
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide; was _pad0)
     uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 108, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 88, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -1609,13 +1599,10 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     auto& c = ctx();
 
     std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                       (cfg.motion_edge_rejection_enabled ||
-                                        false)
-                                           ? &motion_irregular
-                                           : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !false)
-        motion_irregular.assign(S.size(), 0u);
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
+    // Bound to the kernel but no longer populated (its only consumer, the
+    // motion-edge guard, was removed; the hf branch still reads it as zeros).
+    motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -1727,16 +1714,9 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.hf_variance_loss_threshold = 0.f;
     mp.hf_h = (uint32_t)gh;
     mp.hf_w = (uint32_t)gw;
-    mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
-    mp.motion_edge_threshold = cfg.motion_edge_threshold;
-    mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
-    // CPU motion_edge_reject reads the debug-gated accessors, so the noise
-    // floor drops out with the mask noise model -- keep that parity here.
+    // alpha/beta stay for the noise model (debug-gated accessors).
     mp.alpha = cfg.noise_alpha_robustness();
     mp.beta = cfg.noise_beta_robustness();
-    mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
-    mp.motion_edge_neighborhood_radius =
-        (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
 
@@ -1803,13 +1783,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     }
 
     std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                       (cfg.motion_edge_rejection_enabled ||
-                                        false)
-                                           ? &motion_irregular
-                                           : nullptr);
-    if (!cfg.motion_edge_rejection_enabled && !false)
-        motion_irregular.assign(S.size(), 0u);
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
+    // Bound to the kernel but no longer populated (its only consumer, the
+    // motion-edge guard, was removed; the hf branch still reads it as zeros).
+    motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -1926,14 +1903,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.r_t = cfg.r_t;
     mp.hf_enabled = false ? 1u : 0u;
     mp.hf_variance_loss_threshold = 0.f;
-    mp.motion_edge_enabled = cfg.motion_edge_rejection_enabled ? 1u : 0u;
-    mp.motion_edge_threshold = cfg.motion_edge_threshold;
-    mp.motion_edge_residual_threshold = cfg.motion_edge_residual_threshold;
     mp.alpha = cfg.noise_alpha();
     mp.beta = cfg.noise_beta();
-    mp.motion_edge_noise_floor_multiplier = cfg.motion_edge_noise_floor_multiplier;
-    mp.motion_edge_neighborhood_radius =
-        (uint32_t)std::max(0, std::min(2, cfg.motion_edge_neighborhood_radius));
     mp.flow_reject_1d_residual_threshold = 0.f;
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;

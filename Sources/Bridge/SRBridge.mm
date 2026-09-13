@@ -430,18 +430,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"flow_reject_1d_ambiguity_ratio"])
         cfg.flow_reject_1d_ambiguity_ratio =
             std::max(1.f, tuning[@"flow_reject_1d_ambiguity_ratio"].floatValue);
-    if (tuning[@"motion_edge_rejection_enabled"])
-        cfg.motion_edge_rejection_enabled = tuning[@"motion_edge_rejection_enabled"].boolValue;
-    if (tuning[@"motion_edge_threshold"])
-        cfg.motion_edge_threshold = tuning[@"motion_edge_threshold"].floatValue;
-    if (tuning[@"motion_edge_residual_threshold"])
-        cfg.motion_edge_residual_threshold = tuning[@"motion_edge_residual_threshold"].floatValue;
-    if (tuning[@"motion_edge_noise_floor_multiplier"])
-        cfg.motion_edge_noise_floor_multiplier =
-            tuning[@"motion_edge_noise_floor_multiplier"].floatValue;
-    if (tuning[@"motion_edge_neighborhood_radius"])
-        cfg.motion_edge_neighborhood_radius =
-            std::max(0, std::min(2, tuning[@"motion_edge_neighborhood_radius"].intValue));
     if (tuning[@"k_detail"]) cfg.k_detail = tuning[@"k_detail"].floatValue;
     if (tuning[@"k_denoise"]) cfg.k_denoise = tuning[@"k_denoise"].floatValue;
     if (tuning[@"k_stretch"]) cfg.k_stretch = tuning[@"k_stretch"].floatValue;

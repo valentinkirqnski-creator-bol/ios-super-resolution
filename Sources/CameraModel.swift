@@ -83,7 +83,7 @@ enum OutputResolutionMode: String, CaseIterable, Identifiable {
 /// Holds the C++ algorithm tuning parameters for live adjustments.
 struct TuningParams: Equatable, Codable {
     // Match 460-main params.py
-    var r_t: Float = 0.12
+    var r_t: Float = 0.20
     var r_s1: Float = 2.0
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
@@ -92,17 +92,12 @@ struct TuningParams: Equatable, Codable {
     var hf_min_texture_snr: Float = 4.0
     var flow_regularize_aperture_ratio: Float = 0.15
     var flow_reject_1d_ambiguity_ratio: Float = 1.10
-    var motion_edge_rejection_enabled: Bool = true
-    var motion_edge_threshold: Float = 0.025
-    var motion_edge_residual_threshold: Float = 2.5
-    var motion_edge_noise_floor_multiplier: Float = 1.0
-    var motion_edge_neighborhood_radius: Int = 1
     var k_detail: Float = 0.17
-    var k_denoise: Float = 0.0
-    var k_stretch: Float = 4.0
-    var k_shrink: Float = 2.0
-    var snr_auto_tune: Bool = true
-    var alignment_tile_size: Int = 0
+    var k_denoise: Float = 1.0
+    var k_stretch: Float = 3.0
+    var k_shrink: Float = 1.0
+    var snr_auto_tune: Bool = false
+    var alignment_tile_size: Int = 16
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -113,7 +108,7 @@ struct TuningParams: Equatable, Codable {
     /// Off merges every frame at full weight everywhere. Diagnostic: it shows
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
-    var robustness_save_mask: Bool = true
+    var robustness_save_mask: Bool = false
     /// Lossless-compress the output DNG (Adobe Deflate / ZIP). Identical decoded
     /// pixels, ~1.2-1.5x smaller file, at the cost of ~8.6s of zlib per 48MP
     /// frame. Off = uncompressed/fast (current behaviour).
@@ -129,7 +124,7 @@ struct TuningParams: Equatable, Codable {
     /// band, 2 = always merge online. Online keeps memory flat in frame count
     /// but its accumulator scales with output pixels, so it is not always the
     /// smaller of the two.
-    var merge_arch: Int32 = 0
+    var merge_arch: Int32 = 2   // always merge online
     /// Adapt the enlargement to the merged frame count instead of the
     /// reference implementation's step. Off reproduces the reference exactly.
     /// Run ICA after block matching on every pyramid level, as the reference
@@ -143,7 +138,7 @@ struct TuningParams: Equatable, Codable {
     /// finest search radius -> 1, bilinear inter-level flow upscale (not the 460
     /// three-candidate re-match), and per-level ICA on the FFT grey. Off keeps
     /// the 460-derived behaviour. Algorithm parity, not bit parity.
-    var align_match_14: Bool = false
+    var align_match_14: Bool = true
     /// Overlapping tiles for alignment (IPOL author's suggestion): after the
     /// normal align, re-measure the finest flow on a stride-Ts/2 grid (2x tiles,
     /// 50% overlap), each cell block-matched on its own Ts window. Captures
@@ -157,7 +152,7 @@ struct TuningParams: Equatable, Codable {
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
     /// -1 auto (follow sqrt guide), 0 none, 1 sqrt, 2 gamma, 3 srgb.
-    var guide_curve: Int = -1
+    var guide_curve: Int = 1   // Sqrt
     /// Per-pixel motion scale s (Wronski's per-pixel M): sample s bilinearly per
     /// pixel instead of one value per 16px tile, removing the tile-block R the
     /// paper never had. Off by default.
@@ -166,16 +161,16 @@ struct TuningParams: Equatable, Codable {
     /// Cleans rotation tile-ghosts by rejecting the worst pixels (they fall back
     /// to the reference); inert under one-direction motion. A hiding fix — it
     /// trades some burst samples for artifact-free output. Off by default.
-    var motion_geom_reject_enabled: Bool = false
+    var motion_geom_reject_enabled: Bool = true
     /// |∇I|·|E| threshold (intensity units). Must be LOW to reject anything:
     /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     /// drops more burst samples.
-    var motion_geom_reject_threshold: Float = 0.02
+    var motion_geom_reject_threshold: Float = 0.0045
     /// Exposure-invariant geometry rejection: weight the within-tile error by
     /// contrast (∇g/g, noise-floor-subtracted) instead of absolute gradient, so
     /// misalignments are caught equally in bright and low light. Uses the
     /// relative threshold below.
-    var motion_geom_relative: Bool = true
+    var motion_geom_relative: Bool = false
     var motion_geom_noise_floor_mult: Float = 1.5
     var motion_geom_reject_threshold_relative: Float = 0.04
     /// Route alignment through the bundled PWCNet Core ML model instead of
@@ -217,17 +212,17 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
-    var robustness_raw_resolution_enabled: Bool = false
+    var robustness_raw_resolution_enabled: Bool = true
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
     var jpeg_match_python14: Bool = false
     var isp_enabled: Bool = true
     var isp_exposure_ev: Float = 0.0
-    var isp_highlight_knee: Float = 0.88
+    var isp_highlight_knee: Float = 0.90   // highlight recovery
     var isp_local_strength: Float = 0.75
-    var isp_highlight: Float = 0.65
-    var isp_shadow: Float = 0.28
+    var isp_highlight: Float = 0.02        // highlight rolloff
+    var isp_shadow: Float = 0.86           // shadow lift
     var isp_black_point: Float = 0.065
     var isp_warmth: Float = 0.05
     var isp_colour_strength: Float = 1.0
@@ -241,9 +236,9 @@ struct TuningParams: Equatable, Codable {
     var isp_local_contrast: Float = 0.20
     var isp_skin_protect: Bool = true
 
-    var acc_rob_adaptive: Bool = true
+    var acc_rob_adaptive: Bool = false
     /// Only used when acc_rob_adaptive is off.
-    var acc_rob_max_frame_count: Float = 2.0
+    var acc_rob_max_frame_count: Float = 1.0
     var acc_rob_rad_max: Float = 2.0
     var acc_rob_max_multiplier: Float = 8.0
 
@@ -259,8 +254,6 @@ struct TuningParams: Equatable, Codable {
         case hf_min_texture_snr
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
-        case motion_edge_rejection_enabled, motion_edge_threshold, motion_edge_residual_threshold
-        case motion_edge_noise_floor_multiplier, motion_edge_neighborhood_radius
         case k_detail, k_denoise, k_stretch, k_shrink
         case snr_auto_tune, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
@@ -300,11 +293,6 @@ struct TuningParams: Equatable, Codable {
         hf_min_texture_snr = try c.decodeIfPresent(Float.self, forKey: .hf_min_texture_snr) ?? hf_min_texture_snr
         flow_regularize_aperture_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_regularize_aperture_ratio) ?? flow_regularize_aperture_ratio
         flow_reject_1d_ambiguity_ratio = try c.decodeIfPresent(Float.self, forKey: .flow_reject_1d_ambiguity_ratio) ?? flow_reject_1d_ambiguity_ratio
-        motion_edge_rejection_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_edge_rejection_enabled) ?? motion_edge_rejection_enabled
-        motion_edge_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_threshold) ?? motion_edge_threshold
-        motion_edge_residual_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_edge_residual_threshold) ?? motion_edge_residual_threshold
-        motion_edge_noise_floor_multiplier = try c.decodeIfPresent(Float.self, forKey: .motion_edge_noise_floor_multiplier) ?? motion_edge_noise_floor_multiplier
-        motion_edge_neighborhood_radius = try c.decodeIfPresent(Int.self, forKey: .motion_edge_neighborhood_radius) ?? motion_edge_neighborhood_radius
         k_detail = try c.decodeIfPresent(Float.self, forKey: .k_detail) ?? k_detail
         k_denoise = try c.decodeIfPresent(Float.self, forKey: .k_denoise) ?? k_denoise
         k_stretch = try c.decodeIfPresent(Float.self, forKey: .k_stretch) ?? k_stretch
@@ -407,8 +395,8 @@ final class CameraModel: NSObject, ObservableObject {
     /// Play a short click when the shutter fires. Defaults on; the key is
     /// stored inverted so an untouched install gets sound without needing a
     /// migration (UserDefaults.bool returns false for a missing key).
-    @Published var shutterSoundEnabled: Bool = !UserDefaults.standard.bool(forKey: "ShutterSoundOff") {
-        didSet { UserDefaults.standard.set(!shutterSoundEnabled, forKey: "ShutterSoundOff") }
+    @Published var shutterSoundEnabled: Bool = UserDefaults.standard.bool(forKey: "ShutterSoundOn") {
+        didSet { UserDefaults.standard.set(shutterSoundEnabled, forKey: "ShutterSoundOn") }
     }
 
     @Published var zslBufferReady = 0
@@ -1954,11 +1942,6 @@ final class CameraModel: NSObject, ObservableObject {
             "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
             "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
             "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
-            "motion_edge_rejection_enabled": NSNumber(value: tuningParams.motion_edge_rejection_enabled),
-            "motion_edge_threshold": NSNumber(value: tuningParams.motion_edge_threshold),
-            "motion_edge_residual_threshold": NSNumber(value: tuningParams.motion_edge_residual_threshold),
-            "motion_edge_noise_floor_multiplier": NSNumber(value: tuningParams.motion_edge_noise_floor_multiplier),
-            "motion_edge_neighborhood_radius": NSNumber(value: tuningParams.motion_edge_neighborhood_radius),
             "k_detail": NSNumber(value: tuningParams.k_detail),
             "k_denoise": NSNumber(value: tuningParams.k_denoise),
             "k_stretch": NSNumber(value: tuningParams.k_stretch),

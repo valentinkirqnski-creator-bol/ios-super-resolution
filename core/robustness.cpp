@@ -675,34 +675,6 @@ static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     return v;
 }
 
-static f32 guide_edge_strength_sq(const Image& means, int y, int x) {
-    if (means.h <= 0 || means.w <= 0 || means.c <= 0) return 0.f;
-    const int xm = (int)clampf((f32)(x - 1), 0.f, (f32)(means.w - 1));
-    const int xp = (int)clampf((f32)(x + 1), 0.f, (f32)(means.w - 1));
-    const int ym = (int)clampf((f32)(y - 1), 0.f, (f32)(means.h - 1));
-    const int yp = (int)clampf((f32)(y + 1), 0.f, (f32)(means.h - 1));
-    f32 edge_sq = 0.f;
-    for (int ch = 0; ch < means.c; ++ch) {
-        const f32 gx = 0.5f * (means.at(y, xp, ch) - means.at(y, xm, ch));
-        const f32 gy = 0.5f * (means.at(yp, x, ch) - means.at(ym, x, ch));
-        edge_sq = std::max(edge_sq, gx * gx + gy * gy);
-    }
-    return edge_sq;
-}
-
-static f32 guide_edge_strength_sq_neighborhood(const Image& means, int y, int x, int radius) {
-    radius = std::max(0, std::min(2, radius));
-    f32 edge_sq = 0.f;
-    for (int dy = -radius; dy <= radius; ++dy) {
-        const int yy = (int)clampf((f32)(y + dy), 0.f, (f32)(means.h - 1));
-        for (int dx = -radius; dx <= radius; ++dx) {
-            const int xx = (int)clampf((f32)(x + dx), 0.f, (f32)(means.w - 1));
-            edge_sq = std::max(edge_sq, guide_edge_strength_sq(means, yy, xx));
-        }
-    }
-    return edge_sq;
-}
-
 static f32 guide_brightness(const Image& means, int y, int x) {
     if (means.h <= 0 || means.w <= 0 || means.c <= 0 ||
         y < 0 || y >= means.h || x < 0 || x >= means.w)
@@ -727,36 +699,6 @@ static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
     const f32 bot = img.at(y1, x0, ch) +
                     (img.at(y1, x1, ch) - img.at(y1, x0, ch)) * fx;
     return top + (bot - top) * fy;
-}
-
-static bool motion_edge_reject(const Image& ref_means, const Image& comp_means,
-                               const std::vector<uint32_t>& motion_irregular,
-                               size_t pidx, int y, int x, int new_y, int new_x,
-                               f32 residual_ratio, const Config& cfg) {
-    if (!cfg.motion_edge_rejection_enabled) return false;
-    if (pidx >= motion_irregular.size() || motion_irregular[pidx] == 0u) return false;
-    if (!std::isfinite(residual_ratio) ||
-        residual_ratio <= cfg.motion_edge_residual_threshold)
-        return false;
-
-    const int edge_radius = std::max(0, cfg.motion_edge_neighborhood_radius);
-    f32 edge_sq = guide_edge_strength_sq_neighborhood(ref_means, y, x, edge_radius);
-    f32 brightness = guide_brightness(ref_means, y, x);
-    if (new_y >= 0 && new_y < comp_means.h && new_x >= 0 && new_x < comp_means.w)
-    {
-        edge_sq = std::max(edge_sq,
-                           guide_edge_strength_sq_neighborhood(comp_means, new_y, new_x,
-                                                               edge_radius));
-        brightness = std::max(brightness, guide_brightness(comp_means, new_y, new_x));
-    }
-    const f32 noise_var =
-        std::max(0.f, cfg.noise_alpha_robustness() * brightness +
-                          cfg.noise_beta_robustness());
-    const f32 noise_edge_floor =
-        std::max(0.f, cfg.motion_edge_noise_floor_multiplier) * std::sqrt(noise_var);
-    const f32 th = std::max(cfg.motion_edge_threshold, 0.f);
-    const f32 effective_th = std::max(th, noise_edge_floor);
-    return edge_sq > effective_th * effective_th;
 }
 
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
@@ -1244,9 +1186,8 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // hf_artifact_removal_enabled's noise floor still reads ref_stats.hf_loss,
 // which is guide-resolution (its own Dodgson upscale would be a further
 // feature, not built here) -- mapped down from the raw pixel to its parent
-// guide pixel for that one lookup. Neither that nor motion_edge_rejection_
-// enabled are the common case this toggle is meant for; both stay correct,
-// just at their existing granularity rather than the new one.
+// guide pixel for that one lookup. Not the common case this toggle is meant
+// for; it stays correct, just at its existing granularity rather than the new one.
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
                                         const FlowField& flow, int tile_size,
                                         const Config& cfg, Image* s_select_out) {
@@ -1310,13 +1251,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     else
         apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
                                 cfg.num_threads, cfg.robustness_guide_sqrt);
-    std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   cfg.motion_edge_rejection_enabled
-                                       ? &motion_irregular
-                                       : nullptr);
-    if (!cfg.motion_edge_rejection_enabled)
-        motion_irregular.assign(S.size(), 0u);
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
     if (s_select_out) *s_select_out = Image(h, w, 1);
@@ -1335,24 +1270,12 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             }
             f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
-            const f32 ratio = (sig > 0.f && std::isfinite(sig))
-                ? d_sq.at(y, x) / sig
-                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            // comp_means is already warped into the reference's coordinate
-            // frame (the Dodgson upscale above), so the "moved" position for
-            // the edge-strength neighbourhood lookup is just (y,x) again.
-            const bool edge_reject =
-                motion_edge_reject(ref_means, comp_means, motion_irregular,
-                                   pidx, y, x, y, x, ratio, cfg);
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            const bool hard_reject = edge_reject;
-            f32 r_val = hard_reject
-                ? 0.f
-                : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
             // design ("infinite will imply R = 0"), which makes d_sq +inf and
             // the Wiener shrink inf/inf = NaN, so r_val is NaN. The Python
@@ -1712,13 +1635,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
                           cfg.robustness_guide_sqrt);
-    std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
-                                   cfg.motion_edge_rejection_enabled
-                                       ? &motion_irregular
-                                       : nullptr);
-    if (!cfg.motion_edge_rejection_enabled)
-        motion_irregular.assign(S.size(), 0u);
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
     if (s_select_out) *s_select_out = Image(h, w, 1);
@@ -1732,26 +1649,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
             }
-            // Nearest per-tile flow, same sampling as the merge and Eq. 6's d.
-            f32 flow_x, flow_y;
-            if (ref_stats.means.c == 3) {
-                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
-            } else {
-                flow_x = flow.dx(patch_idy, patch_idx);
-                flow_y = flow.dy(patch_idy, patch_idx);
-            }
-            const int new_x = (int)std::lround((f32)x + flow_x);
-            const int new_y = (int)std::lround((f32)y + flow_y);
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
             f32 s = S[pidx];
             f32 sig = sigma_sq.at(y, x);
-            const f32 ratio = (sig > 0.f && std::isfinite(sig))
-                ? d_sq.at(y, x) / sig
-                : (d_sq.at(y, x) > 0.f ? std::numeric_limits<f32>::infinity() : 0.f);
-            const bool edge_reject =
-                motion_edge_reject(ref_stats.means, comp_means, motion_irregular,
-                                   pidx, y, x, new_y, new_x, ratio, cfg);
             // Block matching found two near-equal minima here, so the offset it
             // picked is not distinguishable from at least one other. Demote to
             // the strict prior. This is the one input to the mask that does not
@@ -1809,7 +1709,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                                   cfg.motion_geom_reject_threshold_relative;
                 }
             }
-            const bool hard_reject = edge_reject || geom_reject;
+            const bool hard_reject = geom_reject;
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
