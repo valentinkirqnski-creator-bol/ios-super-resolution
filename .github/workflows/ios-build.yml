@@ -1,8 +1,10 @@
 name: iOS unsigned build
 
-# Builds an UNSIGNED .ipa on a free GitHub-hosted macOS runner. Download it from
-# the run's Artifacts, then sign+install with your free Apple ID via
-# AltStore / Sideloadly (no $99 account needed for personal use).
+# Builds an UNSIGNED .ipa on a GitHub-hosted macOS runner.
+# The build uses Xcode 26+ and the iOS 26+ SDK.
+#
+# Download the resulting IPA from the run's Artifacts, then
+# sign/install it with your Apple ID via AltStore / Sideloadly.
 #
 # This assumes the repository root IS this iOS project (project.yml at the root).
 
@@ -13,46 +15,115 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
+
     env:
-      # Avoid the Homebrew auto-update + "tap trust" check that fails on the
-      # runner's pre-installed aws/tap (exit code 74).
+      # Avoid Homebrew auto-update + tap trust issues.
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select newest Xcode (must read XcodeGen's project format 77)
+      # ---------------------------------------------------------
+      # Select Xcode 26 and verify the iOS SDK
+      # ---------------------------------------------------------
+      - name: Select Xcode 26
         run: |
-          echo "Installed Xcodes:"; ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
-          if [ -z "$XC" ]; then XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1); fi
+          set -e
+
+          echo "Installed Xcodes:"
+          ls -d /Applications/Xcode*.app || true
+
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+
+          if [ -z "$XC" ]; then
+            echo "ERROR: Xcode 26 was not found on this runner."
+            exit 1
+          fi
+
           echo "Selecting: $XC"
+
           sudo xcode-select -s "$XC/Contents/Developer"
+
+          echo ""
+          echo "===== Xcode version ====="
           xcodebuild -version
 
+          echo ""
+          echo "===== iOS SDK version ====="
+          xcrun --sdk iphoneos --show-sdk-version
+
+          echo ""
+          echo "===== Xcode path ====="
+          xcode-select -p
+
+          # Verify Xcode major version is 26+
+          XCODE_MAJOR=$(xcodebuild -version | awk '/Xcode/ {print $2}' | cut -d. -f1)
+
+          if [ "$XCODE_MAJOR" -lt 26 ]; then
+            echo "ERROR: Xcode 26 or newer is required."
+            exit 1
+          fi
+
+          # Verify iOS SDK major version is 26+
+          IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          IOS_SDK_MAJOR=$(echo "$IOS_SDK" | cut -d. -f1)
+
+          if [ "$IOS_SDK_MAJOR" -lt 26 ]; then
+            echo "ERROR: iOS 26 SDK or newer is required."
+            exit 1
+          fi
+
+          echo ""
+          echo "Xcode $XCODE_MAJOR and iOS SDK $IOS_SDK verified."
+
+      # ---------------------------------------------------------
+      # Install XcodeGen
+      # ---------------------------------------------------------
       - name: Install XcodeGen (prebuilt binary, no Homebrew)
         run: |
           set -e
-          curl -fsSL -o xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+
+          curl -fsSL \
+            -o xcodegen.zip \
+            https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+
           unzip -q xcodegen.zip
+
           chmod +x xcodegen/bin/xcodegen
+
           echo "XCODEGEN=$PWD/xcodegen/bin/xcodegen" >> "$GITHUB_ENV"
+
           "$PWD/xcodegen/bin/xcodegen" --version
 
+      # ---------------------------------------------------------
+      # Vendor LibRaw
+      # ---------------------------------------------------------
       - name: Vendor LibRaw
         run: bash scripts/fetch_libraw.sh
 
+      # ---------------------------------------------------------
+      # Build neural flow Core ML model
+      # ---------------------------------------------------------
       - name: Build neural flow Core ML model
         run: bash scripts/build_neural_flow_model.sh
 
+      # ---------------------------------------------------------
+      # Generate Xcode project
+      # ---------------------------------------------------------
       - name: Generate Xcode project
-        run: $XCODEGEN generate --spec project.yml
+        run: |
+          "$XCODEGEN" generate --spec project.yml
 
+      # ---------------------------------------------------------
+      # Build unsigned iOS app
+      # ---------------------------------------------------------
       - name: Build (unsigned)
         run: |
           set -o pipefail
+
           xcodebuild \
             -project FuzeFrame.xcodeproj \
             -scheme FuzeFrame \
@@ -64,15 +135,35 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             clean build
 
+      # ---------------------------------------------------------
+      # Package unsigned .ipa
+      # ---------------------------------------------------------
       - name: Package unsigned .ipa
         run: |
-          APP_PATH="build/Build/Products/Release-iphoneos/FuzeFrame.app"
-          if [ ! -d "$APP_PATH" ]; then echo "App not found at $APP_PATH"; exit 1; fi
-          rm -rf Payload && mkdir Payload
-          cp -R "$APP_PATH" Payload/
-          zip -qr FuzeFrame-unsigned.ipa Payload
-          echo "Built FuzeFrame-unsigned.ipa"
+          set -e
 
+          APP_PATH="build/Build/Products/Release-iphoneos/FuzeFrame.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: App not found at:"
+            echo "$APP_PATH"
+            exit 1
+          fi
+
+          rm -rf Payload
+          mkdir Payload
+
+          cp -R "$APP_PATH" Payload/
+
+          zip -qr FuzeFrame-unsigned.ipa Payload
+
+          echo ""
+          echo "Built:"
+          ls -lh FuzeFrame-unsigned.ipa
+
+      # ---------------------------------------------------------
+      # Upload IPA as GitHub Actions artifact
+      # ---------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
