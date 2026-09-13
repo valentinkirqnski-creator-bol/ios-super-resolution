@@ -1088,11 +1088,7 @@ struct CameraView: View {
                     }
                 }
 
-                Section(header: Text("Performance")) {
-                    Toggle("fp16 Merge Accumulator", isOn: $cam.tuningParams.merge_fp16_accumulator)
-                    Text("Stores the merge accumulator as 16-bit floats instead of 32-bit. All arithmetic stays float32; only what lands in memory narrows. At 48MP this halves the pipeline's largest allocation (1.1GB \u{2192} 558MB) and the merge's dominant memory traffic, which it is bandwidth-bound on \u{2014} so it also runs faster. The cost is storage quantisation of about 0.05% (roughly 1\u{2013}2 LSB of the 16-bit output). Turn off to restore bit-exact fp32 accumulation at the old memory and speed.")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
+
 
                 Section {
                     Button("Reset") {

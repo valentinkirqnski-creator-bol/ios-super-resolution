@@ -935,15 +935,6 @@ struct Config {
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
 
-    // Store the ONLINE merge accumulator as fp16 instead of fp32. Kernel
-    // arithmetic stays float32; only the stored num/den narrow. At 48 MP this
-    // halves the pipeline largest allocation (1116 -> 558 MB) and the
-    // bandwidth-bound merge dominant traffic (585 -> ~292 MB/frame).
-    // OUTPUT CHANGES: storage quantisation is ~0.05% relative per store,
-    // about 1-2 LSB of the 16-bit result -- the accepted trade. The banded
-    // path and the host reference stay fp32 regardless.
-    bool merge_fp16_accumulator = true;
-
     // accumulated_robustness_denoiser.merge — on in 460-main params.py
     bool  accumulated_robustness_denoiser_enabled = true;
     float acc_rob_rad_max = 2.0f;
