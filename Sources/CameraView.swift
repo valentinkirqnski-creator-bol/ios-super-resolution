@@ -1088,7 +1088,11 @@ struct CameraView: View {
                     }
                 }
 
-
+                Section(header: Text("JPEG Rendering")) {
+                    Toggle("Adobe Color Match", isOn: $cam.tuningParams.jpeg_lightroom)
+                    Text("Renders the JPEG and preview with the calibrated Lightroom (Adobe Color) look instead of the built-in HDR ISP. Colour, tone, the profile look, Clarity and Colour NR are fitted to match Lightroom Mobile's render of this app's DNG. When on, the ISP tone/colour controls above do not apply.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
 
                 Section {
                     Button("Reset") {

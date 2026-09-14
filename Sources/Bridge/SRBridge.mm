@@ -15,6 +15,7 @@
 #include "core/mps_fft.h"
 #include "core/preset_lut.h"
 #include "core/render_isp.h"
+#include "core/LightroomRenderer.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -261,6 +262,11 @@ static hhsr::IspParams g_isp;
 // Lightroom-fitted path. Parked here like g_isp (the export entry points take
 // only a path).
 static bool g_jpeg_match_14 = false;
+// When true, exportJPEGFromLinearDNG / the preview render with the calibrated
+// LightroomRenderer (Adobe Color match) instead of the ISP or python14 paths.
+// It applies WB itself (via the fitted matrix using the DNG's own gains), so
+// this path must NOT go through ReapplyWhiteBalanceIfStored.
+static bool g_jpeg_lightroom = false;
 
 // Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
 // sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only
@@ -473,6 +479,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
     if (tuning[@"jpeg_match_python14"]) cfg.jpeg_match_python14 = tuning[@"jpeg_match_python14"].boolValue;
     g_jpeg_match_14 = cfg.jpeg_match_python14;
+    if (tuning[@"jpeg_lightroom"]) g_jpeg_lightroom = tuning[@"jpeg_lightroom"].boolValue;
     if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
     if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
     if (tuning[@"isp_highlight_knee"]) cfg.isp.highlight_knee = tuning[@"isp_highlight_knee"].floatValue;
@@ -1031,9 +1038,18 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
-    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
-
     std::vector<uint8_t> srgb;
+    if (g_jpeg_lightroom) {
+        // Calibrated Adobe Color match (core/LightroomRenderer). It applies WB
+        // itself via the fitted matrix using the DNG's own gains, so it renders
+        // the camera-native buffer directly and must NOT go through
+        // ReapplyWhiteBalanceIfStored. Output is already 8-bit sRGB.
+        hhsr::LightroomRenderOpts lopts; lopts.wb = wb;
+        hhsr::lightroom_render(rgb.data(), W, H, lopts, srgb);
+        rgb.clear();
+        rgb.shrink_to_fit();
+    } else {
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
     if (g_jpeg_match_14) {
         // Python-1.4 parity: whole-image postprocess (matrix -> clip -> unsharp
         // r=3/a=1.5 -> clip -> sRGB), no tone-map / preset LUT. The SR DNG is
@@ -1086,6 +1102,7 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     rgb.clear();
     rgb.shrink_to_fit();
     }
+    }
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!cs) cs = CGColorSpaceCreateDeviceRGB();
@@ -1134,7 +1151,7 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
-    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
+    if (!g_jpeg_lightroom) ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)
@@ -1142,15 +1159,24 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     const int ow = std::max(1, (int)std::lround(W * scale));
     const int oh = std::max(1, (int)std::lround(H * scale));
 
+    // Calibrated Adobe Color match: render the full-res frame once (it applies
+    // WB itself and is spatial), then the downscale loop samples it. Rendered
+    // BEFORE isp_denoise_chroma, which edits rgb in place.
+    std::vector<uint8_t> lr_full;
+    if (g_jpeg_lightroom) {
+        hhsr::LightroomRenderOpts lopts; lopts.wb = wb;
+        hhsr::lightroom_render(rgb.data(), W, H, lopts, lr_full);
+    }
+
     // Analysed at full resolution even though the preview is downscaled, so the
     // thumbnail and the exported JPEG get the same exposure and gain map and
     // cannot disagree about how the shot looks.
     // Before isp_analyse, so the automatic exposure and the local gain map are
     // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
+    if (!g_jpeg_lightroom && g_isp.enabled)
         hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
-    const bool use_isp = g_isp.enabled &&
+    const bool use_isp = !g_jpeg_lightroom && g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
     std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
@@ -1158,6 +1184,12 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
         sx = std::max(0, std::min(W - 1, sx));
         sy = std::max(0, std::min(H - 1, sy));
         size_t i = (size_t)sy * (size_t)W + (size_t)sx;
+        if (g_jpeg_lightroom) {
+            sr = lr_full[i * 3 + 0] * (1.f / 255.f);
+            sg = lr_full[i * 3 + 1] * (1.f / 255.f);
+            sb = lr_full[i * 3 + 2] * (1.f / 255.f);
+            return;
+        }
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);

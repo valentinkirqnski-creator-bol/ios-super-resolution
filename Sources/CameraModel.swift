@@ -217,6 +217,9 @@ struct TuningParams: Equatable, Codable {
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
     var jpeg_match_python14: Bool = false
+    /// Render the JPEG/preview with the calibrated Adobe Color match
+    /// (LightroomRenderer) instead of the HDR ISP look. Applies its own WB.
+    var jpeg_lightroom: Bool = false
     var isp_enabled: Bool = true
     var isp_exposure_ev: Float = 0.0
     var isp_highlight_knee: Float = 0.90   // highlight recovery
@@ -273,6 +276,7 @@ struct TuningParams: Equatable, Codable {
         case kernel_selection_linear
         case use_neural_robustness
         case jpeg_match_python14
+        case jpeg_lightroom
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -312,6 +316,7 @@ struct TuningParams: Equatable, Codable {
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
         jpeg_match_python14 = try c.decodeIfPresent(Bool.self, forKey: .jpeg_match_python14) ?? jpeg_match_python14
+        jpeg_lightroom = try c.decodeIfPresent(Bool.self, forKey: .jpeg_lightroom) ?? jpeg_lightroom
         isp_enabled = try c.decodeIfPresent(Bool.self, forKey: .isp_enabled) ?? isp_enabled
         isp_exposure_ev = try c.decodeIfPresent(Float.self, forKey: .isp_exposure_ev) ?? isp_exposure_ev
         isp_highlight_knee = try c.decodeIfPresent(Float.self, forKey: .isp_highlight_knee) ?? isp_highlight_knee
@@ -1961,6 +1966,7 @@ final class CameraModel: NSObject, ObservableObject {
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
             "jpeg_match_python14": NSNumber(value: tuningParams.jpeg_match_python14),
+            "jpeg_lightroom": NSNumber(value: tuningParams.jpeg_lightroom),
             "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
             "isp_exposure_ev": NSNumber(value: tuningParams.isp_exposure_ev),
             "isp_highlight_knee": NSNumber(value: tuningParams.isp_highlight_knee),
