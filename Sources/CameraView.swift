@@ -1055,6 +1055,42 @@ struct CameraView: View {
     private var tuningSettingsView: some View {
         NavigationView {
             Form {
+                Section(header: Text("Unlimited Shooting")) {
+                    if store.isUnlocked {
+                        HStack {
+                            Image(systemName: "checkmark.seal.fill")
+                                .foregroundColor(.green)
+                            Text("Unlimited shooting unlocked")
+                        }
+                    } else {
+                        HStack {
+                            Text("Free photos left")
+                            Spacer()
+                            Text("\(store.photosRemaining) of \(StoreManager.freeTotalLimit)")
+                                .foregroundColor(.secondary)
+                        }
+                        Button {
+                            Task { await store.purchase() }
+                        } label: {
+                            HStack {
+                                Text("Unlock Unlimited Shooting")
+                                Spacer()
+                                Text(store.displayPrice).foregroundColor(.secondary)
+                            }
+                        }
+                        .disabled(store.purchaseInFlight)
+                        Button("Restore Purchases") {
+                            Task { await store.restorePurchases() }
+                        }
+                        .disabled(store.purchaseInFlight)
+                        if let err = store.lastErrorMessage {
+                            Text(err).font(.footnote).foregroundColor(.red)
+                        }
+                    }
+                    Text("One-time \(store.displayPrice) purchase. Permanently removes the \(StoreManager.freeTotalLimit)-photo free limit.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Rendering \u{2014} Tone")) {
                     Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
                     Text(cam.tuningParams.isp_enabled
