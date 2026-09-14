@@ -1128,6 +1128,9 @@ struct CameraView: View {
                     Toggle("Adobe Color Match", isOn: $cam.tuningParams.jpeg_lightroom)
                     Text("Renders the JPEG and preview with the calibrated Lightroom (Adobe Color) look instead of the built-in HDR ISP. Colour, tone, the profile look, Clarity and Colour NR are fitted to match Lightroom Mobile's render of this app's DNG. When on, the ISP tone/colour controls above do not apply.")
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("HDR+ Finish", isOn: $cam.tuningParams.jpeg_hdrplus)
+                    Text("Renders with a reimplementation of Google HDR+'s finishing pipeline (colour matrix \u{2192} exposure-fusion tone map \u{2192} gamma \u{2192} contrast). Brighter, high-key look with lifted shadows and strong local contrast. If both this and Adobe Color Match are on, Adobe Color Match wins.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section {
