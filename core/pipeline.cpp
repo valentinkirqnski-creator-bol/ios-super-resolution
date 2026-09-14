@@ -113,8 +113,9 @@ Image process_burst(const std::vector<Image>& burst, const Config& cfg,
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);
 
-    const bool accumulate_r =
-        work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
+    // Only the save-mask debug path needs the accumulated robustness now that
+    // the adaptive denoiser is removed.
+    const bool accumulate_r = work.robustness_save_mask;
     Image acc_rob;
     bool have_acc_rob = false;
 
@@ -202,8 +203,9 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     RefStats ref_stats = init_robustness(ref, work);
     CovField ref_covs = estimate_kernels(ref, work);
 
-    const bool accumulate_r =
-        work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
+    // Only the save-mask debug path needs the accumulated robustness now that
+    // the adaptive denoiser is removed.
+    const bool accumulate_r = work.robustness_save_mask;
 
     struct FrameData { FlowField flow; Image robustness; CovField covs; };
     std::vector<FrameData> frames(n - 1);

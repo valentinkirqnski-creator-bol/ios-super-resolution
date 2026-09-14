@@ -116,10 +116,6 @@ struct TuningParams: Equatable, Codable {
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
-    /// Also write _robustness_s1.pgm and _robustness_s2.pgm, splitting the
-    /// accumulated mask by which motion prior scored each pixel. Costs one extra
-    /// full-resolution buffer per comparison frame while the mask is built.
-    var accumulated_robustness_denoiser_enabled: Bool = true
     /// 0 = pick the cheaper merge architecture by working-set size, 1 = always
     /// band, 2 = always merge online. Online keeps memory flat in frame count
     /// but its accumulator scales with output pixels, so it is not always the
@@ -239,12 +235,6 @@ struct TuningParams: Equatable, Codable {
     var isp_local_contrast: Float = 0.20
     var isp_skin_protect: Bool = true
 
-    var acc_rob_adaptive: Bool = false
-    /// Only used when acc_rob_adaptive is off.
-    var acc_rob_max_frame_count: Float = 1.0
-    var acc_rob_rad_max: Float = 2.0
-    var acc_rob_max_multiplier: Float = 8.0
-
     /// App defaults — also applied by the settings Reset button.
     static let appDefaults = TuningParams()
 
@@ -264,9 +254,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_max_shift
         case robustness_enabled, robustness_save_mask
         case dng_lossless_compress, dng_store_unwhitened
-        case accumulated_robustness_denoiser_enabled
         case merge_arch
-        case acc_rob_adaptive, acc_rob_max_frame_count
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
         case motion_geom_reject_enabled, motion_geom_reject_threshold
@@ -282,7 +270,6 @@ struct TuningParams: Equatable, Codable {
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
         case isp_chroma_denoise, isp_chroma_radius
         case isp_colour_strength, isp_highlight_knee
-        case acc_rob_rad_max, acc_rob_max_multiplier
     }
 
     init() {}
@@ -312,9 +299,7 @@ struct TuningParams: Equatable, Codable {
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         dng_lossless_compress = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress) ?? dng_lossless_compress
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
-        accumulated_robustness_denoiser_enabled = try c.decodeIfPresent(Bool.self, forKey: .accumulated_robustness_denoiser_enabled) ?? accumulated_robustness_denoiser_enabled
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
-        acc_rob_adaptive = try c.decodeIfPresent(Bool.self, forKey: .acc_rob_adaptive) ?? acc_rob_adaptive
         jpeg_match_python14 = try c.decodeIfPresent(Bool.self, forKey: .jpeg_match_python14) ?? jpeg_match_python14
         jpeg_lightroom = try c.decodeIfPresent(Bool.self, forKey: .jpeg_lightroom) ?? jpeg_lightroom
         isp_enabled = try c.decodeIfPresent(Bool.self, forKey: .isp_enabled) ?? isp_enabled
@@ -349,9 +334,6 @@ struct TuningParams: Equatable, Codable {
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
-        acc_rob_max_frame_count = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_frame_count) ?? acc_rob_max_frame_count
-        acc_rob_rad_max = try c.decodeIfPresent(Float.self, forKey: .acc_rob_rad_max) ?? acc_rob_rad_max
-        acc_rob_max_multiplier = try c.decodeIfPresent(Float.self, forKey: .acc_rob_max_multiplier) ?? acc_rob_max_multiplier
     }
 }
 
@@ -1962,9 +1944,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "dng_lossless_compress": NSNumber(value: tuningParams.dng_lossless_compress),
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
-            "accumulated_robustness_denoiser_enabled": NSNumber(value: tuningParams.accumulated_robustness_denoiser_enabled),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
-            "acc_rob_adaptive": NSNumber(value: tuningParams.acc_rob_adaptive),
             "jpeg_match_python14": NSNumber(value: tuningParams.jpeg_match_python14),
             "jpeg_lightroom": NSNumber(value: tuningParams.jpeg_lightroom),
             "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
@@ -1997,9 +1977,6 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
-            "acc_rob_max_frame_count": NSNumber(value: tuningParams.acc_rob_max_frame_count),
-            "acc_rob_rad_max": NSNumber(value: tuningParams.acc_rob_rad_max),
-            "acc_rob_max_multiplier": NSNumber(value: tuningParams.acc_rob_max_multiplier)
         ]
 
         var preview: UIImage?

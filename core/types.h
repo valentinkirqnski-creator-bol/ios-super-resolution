@@ -935,10 +935,8 @@ struct Config {
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
 
-    // accumulated_robustness_denoiser.merge — on in 460-main params.py
-    bool  accumulated_robustness_denoiser_enabled = true;
-    float acc_rob_rad_max = 2.0f;
-    float acc_rob_max_multiplier = 8.0f;
+    // The accumulated-robustness adaptive denoiser was removed; the reference
+    // merge no longer enlarges its kernel from the accumulated robustness.
     // How the burst is merged. 0 = pick by working-set size, 1 = force banded
     // (accumulate a band at a time, every frame resident across the merge),
     // 2 = force online (one full-size accumulator, each frame released as soon
@@ -948,15 +946,6 @@ struct Config {
     // pixels, so at 2x it costs four times what it does at 1x and loses to
     // banding until the burst is long. 0 compares the two and picks.
     int   merge_arch = 0;
-    // Adapt the reference-kernel enlargement continuously to the accumulated
-    // robustness, instead of the reference implementation's step. Off gives the
-    // reference behaviour exactly, including the accumulator overwrite, which is
-    // what tools/compare_dng.py needs to line up with the Python.
-    bool  acc_rob_adaptive = true;
-    // Only consulted when acc_rob_adaptive is false. 2 is the reference's own
-    // value for the merge variant; its median and gauss blocks say 8, and taking
-    // 8 from those is what made the step fire on every pixel of every burst.
-    float acc_rob_max_frame_count = 2.0f;
     // Total frames in the burst, filled in by the pipeline rather than tuned.
     // The reference-kernel enlargement is derived from this and the accumulated
     // robustness, so there is no threshold to set. 0 means unknown, which

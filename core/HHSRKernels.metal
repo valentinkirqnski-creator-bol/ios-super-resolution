@@ -1256,6 +1256,9 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
     float local_acc_r = 0.f;
     float additional_denoise_power = 1.f;
     int rad = 1;
+    // The accumulated-robustness adaptive denoiser was removed; the host now
+    // always passes p.robustness_denoise == 0, so this whole block is dead and
+    // the reference merge runs at a fixed radius-1 kernel (matches merge.cpp).
     if (p.robustness_denoise) {
         // C++ std::lround — Metal round() is half-away-from-zero (same for >=0)
         float acc_y = coarse_y, acc_x = coarse_x;

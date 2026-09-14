@@ -1587,8 +1587,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const int Hs = (int)std::lround(work.scale * ref.h);
     const int Ws = (int)std::lround(work.scale * ref.w);
 
-    const bool accumulate_r =
-        work.accumulated_robustness_denoiser_enabled || work.robustness_save_mask;
+    // Only the save-mask debug path needs the accumulated robustness now that
+    // the adaptive denoiser is removed.
+    const bool accumulate_r = work.robustness_save_mask;
     const double t_accrob = prof_now_ms();
     // Streamed frames were summed in the loop above, as each was released.
     if (!stream_comp_raw)

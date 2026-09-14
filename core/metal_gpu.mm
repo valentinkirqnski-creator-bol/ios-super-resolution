@@ -3795,8 +3795,11 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
 
     if (!ensure_acc_buffers((size_t)acc_h * acc_w * acc_c, start_band)) return false;
 
-    const bool denoise = cfg.accumulated_robustness_denoiser_enabled && acc_rob &&
-                         acc_rob->h > 0 && acc_rob->w > 0;
+    // Adaptive denoiser removed: the reference merge never enlarges its kernel,
+    // so denoise is always off and the acc_rob buffer is unused here. The kernel
+    // keeps the (now-dead) branch behind p.robustness_denoise == 0.
+    const bool denoise = false;
+    (void)acc_rob;
     id<MTLBuffer> b_img = nil, b_cov = nil, b_acc = nil;
     if (!acquire_ref_gpu(ref_raw, covs, acc_rob, denoise, b_img, b_cov, b_acc))
         return false;
@@ -3814,13 +3817,13 @@ bool merge_ref_band_metal(const Image& ref_raw, const CovField& covs,
     p.nch = (uint32_t)acc_c;
     p.bayer = cfg.bayer_mode ? 1u : 0u;
     p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
-    p.robustness_denoise = denoise ? 1u : 0u;
-    p.rad_max = (uint32_t)std::max(0, (int)cfg.acc_rob_rad_max);
+    p.robustness_denoise = 0u;
+    p.rad_max = 0u;
     p.scale = cfg.scale;
-    p.max_multiplier = cfg.acc_rob_max_multiplier;
+    p.max_multiplier = 1.f;
     p.burst_frames = (float)cfg.burst_frame_count;
-    p.adaptive = cfg.acc_rob_adaptive ? 1u : 0u;
-    p.max_frame_count = cfg.acc_rob_max_frame_count;
+    p.adaptive = 0u;
+    p.max_frame_count = 0.f;
     p.cfa00 = cfg.cfa.p[0][0];
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];

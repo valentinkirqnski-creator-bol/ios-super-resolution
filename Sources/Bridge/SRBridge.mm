@@ -470,13 +470,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.dng_lossless_compress = tuning[@"dng_lossless_compress"].boolValue;
     if (tuning[@"dng_store_unwhitened"])
         cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
-    if (tuning[@"accumulated_robustness_denoiser_enabled"]) {
-        cfg.accumulated_robustness_denoiser_enabled =
-            tuning[@"accumulated_robustness_denoiser_enabled"].boolValue;
-    }
     if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
-    if (tuning[@"acc_rob_adaptive"])
-        cfg.acc_rob_adaptive = tuning[@"acc_rob_adaptive"].boolValue;
     if (tuning[@"jpeg_match_python14"]) cfg.jpeg_match_python14 = tuning[@"jpeg_match_python14"].boolValue;
     g_jpeg_match_14 = cfg.jpeg_match_python14;
     if (tuning[@"jpeg_lightroom"]) g_jpeg_lightroom = tuning[@"jpeg_lightroom"].boolValue;
@@ -526,11 +520,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
-    if (tuning[@"acc_rob_max_frame_count"])
-        cfg.acc_rob_max_frame_count = tuning[@"acc_rob_max_frame_count"].floatValue;
-    if (tuning[@"acc_rob_rad_max"]) cfg.acc_rob_rad_max = tuning[@"acc_rob_rad_max"].floatValue;
-    if (tuning[@"acc_rob_max_multiplier"])
-        cfg.acc_rob_max_multiplier = tuning[@"acc_rob_max_multiplier"].floatValue;
 }
 
 static std::string NSStringToStd(id value) {

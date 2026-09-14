@@ -13,57 +13,11 @@ namespace hhsr {
 
 namespace {
 
-// Enlargement of the reference merge kernel, adapted to the accumulated
-// robustness -- "we locally enlarge the merging kernel of the reference frame
-// when the frame count is low".
-//
-// Derived rather than thresholded. Merging k frames cuts noise variance by 1/k;
-// averaging over a kernel of area A does the same by 1/A. Dividing the
-// Mahalanobis distance by m sends Sigma -> m*Sigma, so the kernel area scales as
-// m. Matching the two gives m = N/k. The reference frame always contributes, so
-// the effective frame count at a pixel is r_acc + 1, and N is the whole burst.
-//
-// Everything falls out of that: fully merged pixels get m = 1 and are left
-// alone, single-frame pixels get m = N, and it normalises itself to burst
-// length with no parameter to set. power_max is only a cap.
-//
-// The reference implementation uses a step -- power_max below a frame-count
-// threshold, 1 above -- which is a simplification of the same idea. A step also
-// puts a visible seam between enlarged and un-enlarged regions, which this
-// avoids.
-// Reference-implementation behaviour, kept for acc_rob_adaptive == false: full
-// enlargement below a frame-count threshold and none above, with the
-// accumulator overwritten below it.
-static inline f32 denoise_power_step(f32 r_acc, f32 power_max, f32 max_frame_count) {
-    return (r_acc <= max_frame_count) ? power_max : 1.f;
-}
-
-static inline int denoise_range_step(f32 r_acc, int rad_max, f32 max_frame_count) {
-    return (r_acc <= max_frame_count) ? rad_max : 1;
-}
-
-static inline f32 denoise_power_merge(f32 r_acc, f32 power_max, f32 burst_frames) {
-    if (!(burst_frames > 1.f)) return 1.f;
-    const f32 effective = std::max(1.f, r_acc + 1.f);
-    const f32 cap = std::max(1.f, power_max);
-    return std::min(std::max(burst_frames / effective, 1.f), cap);
-}
-
-// sigma grows as sqrt(m), so the window has to grow with it or the widened
-// kernel is truncated and the enlargement does nothing.
-//
-// Floored for pixels with under two contributing frames. The law above answers
-// a noise question, but chroma is a sampling one and does not scale with burst
-// length: a 3x3 window on a Bayer lattice holds as few as one red and one blue
-// sample, so a single-frame pixel reconstructs colour from one measurement
-// however short the burst was. 5x5 takes that to at least four. Without this a
-// 2-frame burst asks for m=2, which rounds back down to 3x3 in exactly the
-// case that is most prone to demosaicking artifacts.
-static inline int denoise_range_merge(f32 power, f32 r_acc, int rad_max) {
-    int r = (int)std::lround(std::sqrt(std::max(1.f, power)));
-    if (r_acc + 1.f < 2.f) r = std::max(r, rad_max);
-    return std::min(std::max(r, 1), std::max(1, rad_max));
-}
+// The accumulated-robustness adaptive denoiser (reference-kernel enlargement
+// driven by the per-pixel accumulated robustness) was removed: the reference
+// merge now always reconstructs with a fixed radius-1 kernel and no denoise
+// power, so no extra spatial smoothing is applied on top of the multi-frame
+// merge.
 
 // Guard against singular/near-singular covariance inversions producing
 // infinitely sharp kernels. That can leave R/B denominators at zero while G
@@ -264,12 +218,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     const bool iso = (cfg.kernel == KernelShape::Iso);
     const f32 scale = cfg.scale;
 
-    const bool robustness_denoise = cfg.accumulated_robustness_denoiser_enabled;
-    const int rad_max = (int)cfg.acc_rob_rad_max;
-    const f32 max_multiplier = cfg.acc_rob_max_multiplier;
-    const f32 burst_frames = (f32)cfg.burst_frame_count;
-    const bool adaptive = cfg.acc_rob_adaptive;
-    const f32 max_frame_count = cfg.acc_rob_max_frame_count;
+    (void)acc_rob;  // Adaptive denoiser removed: the reference merge is a fixed
+                    // radius-1 kernel with no accumulated-robustness enlargement.
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -278,36 +228,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             const f32 coarse_x = (f32)hr_j / scale;
             const f32 coarse_y = (f32)hr_i / scale;
 
-            f32 local_acc_r = 0.f;
-            f32 additional_denoise_power = 1.f;
-            int rad = 1;
-            if (robustness_denoise && acc_rob) {
-                // Python: acc_rob[min(round(coarse_y), h-1), min(round(coarse_x), w-1)]
-                // (high clamp only — no max(0,·))
-                f32 acc_y = coarse_y;
-                f32 acc_x = coarse_x;
-                // acc_rob inherits whatever resolution the per-frame R had --
-                // read that off its own dimensions rather than the config
-                // flag, same reasoning as accumulate_comp's rob_is_raw above.
-                const bool acc_is_raw =
-                    (acc_rob->h == lr_h && acc_rob->w == lr_w);
-                if (!acc_is_raw && cfg.bayer_mode) {
-                    acc_y = (coarse_y - 0.5f) / 2.f;
-                    acc_x = (coarse_x - 0.5f) / 2.f;
-                }
-                const int ay = std::min(std::max(cuda_round_to_int(acc_y), 0), acc_rob->h - 1);
-                const int ax = std::min(std::max(cuda_round_to_int(acc_x), 0), acc_rob->w - 1);
-                local_acc_r = acc_rob->at(ay, ax);
-                if (adaptive) {
-                    additional_denoise_power =
-                        denoise_power_merge(local_acc_r, max_multiplier, burst_frames);
-                    rad = denoise_range_merge(additional_denoise_power, local_acc_r, rad_max);
-                } else {
-                    additional_denoise_power =
-                        denoise_power_step(local_acc_r, max_multiplier, max_frame_count);
-                    rad = denoise_range_step(local_acc_r, rad_max, max_frame_count);
-                }
-            }
+            const f32 additional_denoise_power = 1.f;
+            const int rad = 1;
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
             if (!iso) {
@@ -352,24 +274,10 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                 }
             }
 
-            // The reference overwrites below its threshold, discarding whatever
-            // the comparison frames contributed. That is a no-op at both ends --
-            // where nothing merged their weights are exactly zero, since
-            // merge_comp_contrib returns early on r <= 0, and where everything
-            // merged the threshold is not met -- so it only ever bites in
-            // between, where it throws away real signal. The adaptive path
-            // therefore always accumulates: a hard data cliff in the middle of a
-            // continuous enlargement would defeat the point.
-            const bool overwrite = !adaptive && robustness_denoise && acc_rob &&
-                                   local_acc_r < max_frame_count;
+            // The reference frame always accumulates into the running merge.
             for (int ch = 0; ch < nch; ++ch) {
-                if (overwrite) {
-                    num.at(local_i, hr_j, ch) = val[ch];
-                    den.at(local_i, hr_j, ch) = acc[ch];
-                } else {
-                    num.at(local_i, hr_j, ch) += val[ch];
-                    den.at(local_i, hr_j, ch) += acc[ch];
-                }
+                num.at(local_i, hr_j, ch) += val[ch];
+                den.at(local_i, hr_j, ch) += acc[ch];
             }
         }
     });
