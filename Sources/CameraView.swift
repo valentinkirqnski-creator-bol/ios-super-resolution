@@ -1091,6 +1091,15 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("JPEG Rendering")) {
+                    Toggle("Match Python 1.4", isOn: $cam.tuningParams.jpeg_match_python14)
+                    Text(cam.tuningParams.jpeg_match_python14
+                         ? "The exported JPEG and the DNG preview use Python 1.4's postprocess exactly: camera\u{2192}sRGB matrix, clip, unsharp, sRGB gamma \u{2014} no tone mapping and no highlight recovery. The DNG itself is unchanged. Overrides the tone/colour settings below."
+                         : "Off: the app's own render (HDR tone mapping if enabled below, otherwise the legacy grade) is used.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
+                if !cam.tuningParams.jpeg_match_python14 {
                 Section(header: Text("Rendering \u{2014} Tone")) {
                     Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
                     Text(cam.tuningParams.isp_enabled
@@ -1123,6 +1132,7 @@ struct CameraView: View {
                             .font(.footnote).foregroundColor(.secondary)
                     }
                 }
+                } // end if !jpeg_match_python14
 
 
 

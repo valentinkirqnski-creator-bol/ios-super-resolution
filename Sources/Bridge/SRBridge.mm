@@ -409,6 +409,30 @@ static inline void render_linear_dng_pixel(float r, float g, float b,
     tone_map_legacy_camera_rgb(sr, sg, sb);
 }
 
+// Python-1.4 parity for the DISPLAY PREVIEW. Reproduces render_match_python14's
+// colour pipeline per pixel -- WB (green-normalised straight multiply) -> camera
+// ->sRGB matrix -> per-channel clip -> IEC sRGB transfer -- and deliberately
+// OMITS only the unsharp mask (a spatial op that is imperceptible on a
+// downscaled thumbnail and would otherwise force a full-res float buffer). No
+// tone map, no gamut desaturation: exactly like 1.4, so the preview shows the
+// same neutral (not magenta/pink) clipped highlights the exported 1.4 JPEG does.
+static inline void render_python14_pixel(float r, float g, float b,
+                                         const float wb[3], const float m[9],
+                                         bool has_color,
+                                         float& sr, float& sg, float& sb) {
+    const float gG = (wb && wb[1] > 1e-8f) ? wb[1] : 1.f;
+    const float wr = (wb ? wb[0] : 1.f) / gG, wgc = 1.f, wbb = (wb ? wb[2] : 1.f) / gG;
+    r *= wr; g *= wgc; b *= wbb;
+    if (has_color) {
+        sr = m[0] * r + m[1] * g + m[2] * b;
+        sg = m[3] * r + m[4] * g + m[5] * b;
+        sb = m[6] * r + m[7] * g + m[8] * b;
+    } else { sr = r; sg = g; sb = b; }
+    sr = to_srgb_gamma(clampf(sr, 0.f, 1.f));
+    sg = to_srgb_gamma(clampf(sg, 0.f, 1.f));
+    sb = to_srgb_gamma(clampf(sb, 0.f, 1.f));
+}
+
 static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
     if (!tuning) return;
     if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
@@ -1020,20 +1044,22 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
-    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     std::vector<uint8_t> srgb;
     if (g_jpeg_match_14) {
-        // Python-1.4 parity: whole-image postprocess (matrix -> clip -> unsharp
-        // r=3/a=1.5 -> clip -> sRGB), no tone-map / preset LUT. The SR DNG is
-        // pre-white-balanced (wb reads back neutral), so the WB step is a no-op,
-        // matching 1.4 applying wb to its non-WB camera RGB.
+        // Python-1.4 parity: whole-image postprocess (WB -> matrix -> clip ->
+        // unsharp r=3/a=1.5 -> clip -> sRGB), no tone-map / preset LUT. Pass the
+        // stored WB gains straight through so render_match_python14 applies them
+        // by multiply-then-hard-clip exactly like 1.4 -- do NOT run
+        // ReapplyWhiteBalanceIfStored, whose soft highlight roll-off is an app
+        // addition 1.4 has no equivalent of and would break the 1:1 match.
         hhsr::render_match_python14(rgb.data(), W, H, wb, m, has_color,
                                     /*unsharp_radius*/ 3.f, /*unsharp_amount*/ 1.5f,
                                     /*do_srgb*/ true, srgb);
         rgb.clear();
         rgb.shrink_to_fit();
     } else {
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
     // One analysis pass over the whole image before any pixel is rendered: the
     // ISP needs a global view for automatic exposure and the local gain map.
     // Before isp_analyse, so the automatic exposure and the local gain map are
@@ -1123,7 +1149,11 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return nil;
-    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
+    // In Python-1.4 mode the render applies the stored WB gains itself (straight
+    // multiply, matching 1.4); the soft roll-off is an app-only step 1.4 lacks,
+    // so skip it here to keep the preview 1:1 with the 1.4 JPEG.
+    if (!g_jpeg_match_14)
+        ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)
@@ -1136,10 +1166,13 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     // cannot disagree about how the shot looks.
     // Before isp_analyse, so the automatic exposure and the local gain map are
     // derived from the cleaned image rather than from the noise.
-    if (g_isp.enabled)
+    // Python-1.4 mode bypasses the ISP entirely (no analysis, no chroma
+    // denoise): 1.4 has no tone map or auto-exposure, so the preview must not
+    // run them either or it would not match the 1.4 JPEG.
+    if (g_isp.enabled && !g_jpeg_match_14)
         hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
-    const bool use_isp = g_isp.enabled &&
+    const bool use_isp = g_isp.enabled && !g_jpeg_match_14 &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
     std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
@@ -1150,8 +1183,9 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        if (use_isp) hhsr::isp_render(isp, r, g, b, sx, sy, sr, sg, sb);
-        else         render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+        if (g_jpeg_match_14) render_python14_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
+        else if (use_isp)    hhsr::isp_render(isp, r, g, b, sx, sy, sr, sg, sb);
+        else                 render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
     };
 
     hhsr::parallel_rows(oh, 0, [&](int y) {
@@ -1161,7 +1195,10 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
             float sr, sg, sb;
             sample_tonemap(sx, sy, sr, sg, sb);
             // See the 48MP path: gamut-map toward white + clamp before the cast.
-            finalize_display_rgb(sr, sg, sb);
+            // In 1.4 mode the pixel is already 1.4-clipped/gamma'd -- skip the
+            // gamut desaturation (1.4 has none) and just clamp.
+            if (g_jpeg_match_14) { sr = clampf(sr, 0.f, 1.f); sg = clampf(sg, 0.f, 1.f); sb = clampf(sb, 0.f, 1.f); }
+            else finalize_display_rgb(sr, sg, sb);
             size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 4;
             srgb[o + 0] = (uint8_t)std::lround(sr * 255.f);
             srgb[o + 1] = (uint8_t)std::lround(sg * 255.f);
