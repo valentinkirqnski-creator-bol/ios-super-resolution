@@ -918,6 +918,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     Config work = cfg;
     // Drives the reference-kernel enlargement; not a tuning knob.
     work.burst_frame_count = frame_count;
+    // Raise the robustness threshold r_t at higher ISO: from ISO 100 up, noise
+    // makes aligned tiles read as more different, so a larger threshold keeps
+    // them merged. capture_iso comes from the reference frame's EXIF (0 when
+    // unknown, e.g. imported files without the tag, which then keep the tuned
+    // r_t). Applied here so it reaches both the CPU and Metal robustness.
+    if (work.capture_iso >= 100.f) work.r_t = 0.25f;
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
     const bool debug = debug_dumps_enabled();
     std::ostringstream debug_summary;
