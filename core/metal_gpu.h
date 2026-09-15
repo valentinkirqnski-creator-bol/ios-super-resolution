@@ -112,6 +112,17 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
                                const FlowField& flow, int tile_size, const Config& cfg,
                                Image* s_select_out = nullptr);
 
+// GPU-resident robustness (Config::robustness_mask_gpu_resident). Runs the
+// analytic guide-resolution mask and leaves it on the GPU keyed by frame_id for
+// the merge to consume directly, returning only per-row activity (rows_out, one
+// byte per mask row) and the mask dims. Returns false -> caller falls back to
+// the host compute_robustness path. The caller must ensure the raw-resolution
+// and learned-mask paths are inactive.
+bool metal_robustness_resident(const Image& comp_raw, const RefStats& ref_stats,
+                               const FlowField& flow, int tile_size, const Config& cfg,
+                               int frame_id, std::vector<uint8_t>& rows_out,
+                               int& out_h, int& out_w);
+
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
 // No CPU fallback. Host caches per-frame GPU buffers across bands and batches

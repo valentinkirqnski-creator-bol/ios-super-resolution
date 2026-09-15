@@ -1351,14 +1351,38 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // running split. Only allocated when the debug masks are requested.
         Image rob_s_select;
         Image* rob_s_select_ptr = want_s_masks ? &rob_s_select : nullptr;
+        // GPU-resident mask (Config::robustness_mask_gpu_resident): keep the mask
+        // on the GPU for the merge and read back only per-row activity, skipping
+        // the full-mask readback + re-upload. Online + Metal only, and only when
+        // no host copy of the mask is needed (save-mask / s-split / neural /
+        // raw-resolution all fall back to the host path). Output is unchanged.
+        auto run_robustness = [&]() {
+            bool resident_ok = false;
+#if defined(__APPLE__)
+            if (use_online && work.robustness_mask_gpu_resident && !want_s_masks &&
+                !work.robustness_save_mask && !work.use_neural_robustness &&
+                !work.robustness_raw_resolution_active()) {
+                int rh = 0, rw = 0;
+                if (metal_robustness_resident(comp, ref_stats, flow, cons_ts, work, k,
+                                              rob_rows_nonzero, rh, rw)) {
+                    rob = Image();
+                    rob.h = rh; rob.w = rw; rob.c = 1;   // dims only; mask on GPU
+                    rob_has_nonzero = std::any_of(rob_rows_nonzero.begin(),
+                                                  rob_rows_nonzero.end(),
+                                                  [](uint8_t v) { return v != 0; });
+                    resident_ok = true;
+                }
+            }
+#endif
+            if (!resident_ok)
+                rob = compute_robustness_and_activity(comp, ref_stats, flow, cons_ts,
+                                                      work, rob_rows_nonzero,
+                                                      rob_has_nonzero, rob_s_select_ptr);
+        };
         if (full_res) {
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
-            rob = compute_robustness_and_activity(comp, ref_stats, flow,
-                                                  cons_ts, work,
-                                                  rob_rows_nonzero,
-                                                  rob_has_nonzero,
-                                                  rob_s_select_ptr);
+            run_robustness();
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1382,11 +1406,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // Same math; overlap only when peak RAM is affordable (2× crop).
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
-            rob = compute_robustness_and_activity(comp, ref_stats, flow,
-                                                  cons_ts, work,
-                                                  rob_rows_nonzero,
-                                                  rob_has_nonzero,
-                                                  rob_s_select_ptr);
+            run_robustness();
             covs = cov_fut.get();
         }
         // Folded in here rather than beside absorb_robustness_sum, because that

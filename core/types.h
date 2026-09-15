@@ -748,6 +748,15 @@ struct Config {
     int  guide_curve = -1;             // -1 auto, 0 none, 1 sqrt, 2 gamma, 3 srgb
 
     bool robustness_raw_resolution_enabled = false;
+    // Keep the per-frame robustness mask on the GPU: instead of reading the mask
+    // back to a host Image and re-uploading it in the merge, the robustness pass
+    // stashes its output buffer for the merge to consume directly, and computes
+    // the per-row activity (band-skip) with a GPU reduction. Removes two
+    // full-res copies per comparison frame and the host mask plane from the peak.
+    // Online + Metal only; falls back to the host path otherwise. Default off
+    // (opt-in, verify on device). Output is unchanged -- the merge sees the same
+    // mask bytes, just without the round trip.
+    bool robustness_mask_gpu_resident = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on

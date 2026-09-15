@@ -209,6 +209,9 @@ struct TuningParams: Equatable, Codable {
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
     var robustness_raw_resolution_enabled: Bool = true
+    /// Keep the per-frame robustness mask on the GPU (online + Metal), skipping
+    /// the mask readback + re-upload. Output unchanged; verify on device.
+    var robustness_mask_gpu_resident: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -261,6 +264,7 @@ struct TuningParams: Equatable, Codable {
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
+        case robustness_mask_gpu_resident
         case kernel_selection_linear
         case use_neural_robustness
         case jpeg_match_python14
@@ -333,6 +337,7 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
+        robustness_mask_gpu_resident = try c.decodeIfPresent(Bool.self, forKey: .robustness_mask_gpu_resident) ?? robustness_mask_gpu_resident
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
     }
 }
@@ -1976,6 +1981,7 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
+            "robustness_mask_gpu_resident": NSNumber(value: tuningParams.robustness_mask_gpu_resident),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
         ]
 

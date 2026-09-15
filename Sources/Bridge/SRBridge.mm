@@ -518,6 +518,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
             ? hhsr::SelectionLaw::Linear : hhsr::SelectionLaw::HardThreshold;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
+    if (tuning[@"robustness_mask_gpu_resident"])
+        cfg.robustness_mask_gpu_resident = tuning[@"robustness_mask_gpu_resident"].boolValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
 }

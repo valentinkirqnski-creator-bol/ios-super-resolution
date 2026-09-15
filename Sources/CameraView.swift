@@ -1130,6 +1130,12 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("Performance (Experimental)")) {
+                    Toggle("GPU-Resident Robustness Mask", isOn: $cam.tuningParams.robustness_mask_gpu_resident)
+                    Text("Keeps each frame's robustness mask on the GPU for the merge instead of copying it to the CPU and back, and reduces peak memory. Speeds up the online merge on large bursts. Output is unchanged. Experimental \u{2014} verify your photos look right before relying on it; turn off to revert.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section {
                     Button("Reset") {
                         cam.tuningParams = .appDefaults
