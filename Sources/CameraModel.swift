@@ -209,19 +209,10 @@ struct TuningParams: Equatable, Codable {
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
     var robustness_raw_resolution_enabled: Bool = true
-    /// Keep the per-frame robustness mask on the GPU (online + Metal), skipping
-    /// the mask readback + re-upload. Output unchanged; verify on device.
-    var robustness_mask_gpu_resident: Bool = false
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
     var jpeg_match_python14: Bool = false
-    /// Render the JPEG/preview with the calibrated Adobe Color match
-    /// (LightroomRenderer) instead of the HDR ISP look. Applies its own WB.
-    var jpeg_lightroom: Bool = false
-    /// Export the JPEG with the faithful hdrplus-python finish (HdrPlusPyFinish),
-    /// streamed from the DNG under a bounded memory budget. Export path only.
-    var jpeg_hdrplus_py: Bool = false
     var isp_enabled: Bool = true
     var isp_exposure_ev: Float = 0.0
     var isp_highlight_knee: Float = 0.90   // highlight recovery
@@ -267,12 +258,9 @@ struct TuningParams: Equatable, Codable {
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
-        case robustness_mask_gpu_resident
         case kernel_selection_linear
         case use_neural_robustness
         case jpeg_match_python14
-        case jpeg_lightroom
-        case jpeg_hdrplus_py
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
         case isp_vibrance, isp_saturation, isp_local_contrast, isp_skin_protect
@@ -309,8 +297,6 @@ struct TuningParams: Equatable, Codable {
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
         merge_arch = try c.decodeIfPresent(Int32.self, forKey: .merge_arch) ?? merge_arch
         jpeg_match_python14 = try c.decodeIfPresent(Bool.self, forKey: .jpeg_match_python14) ?? jpeg_match_python14
-        jpeg_lightroom = try c.decodeIfPresent(Bool.self, forKey: .jpeg_lightroom) ?? jpeg_lightroom
-        jpeg_hdrplus_py = try c.decodeIfPresent(Bool.self, forKey: .jpeg_hdrplus_py) ?? jpeg_hdrplus_py
         isp_enabled = try c.decodeIfPresent(Bool.self, forKey: .isp_enabled) ?? isp_enabled
         isp_exposure_ev = try c.decodeIfPresent(Float.self, forKey: .isp_exposure_ev) ?? isp_exposure_ev
         isp_highlight_knee = try c.decodeIfPresent(Float.self, forKey: .isp_highlight_knee) ?? isp_highlight_knee
@@ -342,7 +328,6 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
-        robustness_mask_gpu_resident = try c.decodeIfPresent(Bool.self, forKey: .robustness_mask_gpu_resident) ?? robustness_mask_gpu_resident
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
     }
 }
@@ -1956,8 +1941,6 @@ final class CameraModel: NSObject, ObservableObject {
             "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
             "merge_arch": NSNumber(value: tuningParams.merge_arch),
             "jpeg_match_python14": NSNumber(value: tuningParams.jpeg_match_python14),
-            "jpeg_lightroom": NSNumber(value: tuningParams.jpeg_lightroom),
-            "jpeg_hdrplus_py": NSNumber(value: tuningParams.jpeg_hdrplus_py),
             "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
             "isp_exposure_ev": NSNumber(value: tuningParams.isp_exposure_ev),
             "isp_highlight_knee": NSNumber(value: tuningParams.isp_highlight_knee),
@@ -1987,7 +1970,6 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
-            "robustness_mask_gpu_resident": NSNumber(value: tuningParams.robustness_mask_gpu_resident),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
         ]
 

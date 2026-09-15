@@ -1124,20 +1124,7 @@ struct CameraView: View {
                     }
                 }
 
-                Section(header: Text("JPEG Rendering")) {
-                    Toggle("Adobe Color Match", isOn: $cam.tuningParams.jpeg_lightroom)
-                    Text("Renders the JPEG and preview with the calibrated Lightroom (Adobe Color) look instead of the built-in HDR ISP. Colour, tone, the profile look, Clarity and Colour NR are fitted to match Lightroom Mobile's render of this app's DNG. When on, the ISP tone/colour controls above do not apply.")
-                        .font(.footnote).foregroundColor(.secondary)
-                    Toggle("HDR+ Finish (exact)", isOn: $cam.tuningParams.jpeg_hdrplus_py)
-                    Text("Exports the JPEG with a faithful port of the hdrplus-python finishing pipeline (auto-gain exposure-fusion tone map, S-curve contrast, triple unsharp). Streamed from the DNG under a bounded memory budget. Affects the saved JPEG only, not the live preview. A brighter, moodier HDR+ look distinct from Adobe Color.")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
 
-                Section(header: Text("Performance (Experimental)")) {
-                    Toggle("GPU-Resident Robustness Mask", isOn: $cam.tuningParams.robustness_mask_gpu_resident)
-                    Text("Keeps each frame's robustness mask on the GPU for the merge instead of copying it to the CPU and back, and reduces peak memory. Speeds up the online merge on large bursts. Output is unchanged. Experimental \u{2014} verify your photos look right before relying on it; turn off to revert.")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
 
                 Section {
                     Button("Reset") {

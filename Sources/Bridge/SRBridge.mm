@@ -15,9 +15,6 @@
 #include "core/mps_fft.h"
 #include "core/preset_lut.h"
 #include "core/render_isp.h"
-#include "core/LightroomRenderer.h"
-#include "core/HdrPlusPyFinish.h"
-#include "core/JpegStreamEncoder.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -264,17 +261,6 @@ static hhsr::IspParams g_isp;
 // Lightroom-fitted path. Parked here like g_isp (the export entry points take
 // only a path).
 static bool g_jpeg_match_14 = false;
-// When true, exportJPEGFromLinearDNG / the preview render with the calibrated
-// LightroomRenderer (Adobe Color match) instead of the ISP or python14 paths.
-// It applies WB itself (via the fitted matrix using the DNG's own gains), so
-// this path must NOT go through ReapplyWhiteBalanceIfStored.
-static bool g_jpeg_lightroom = false;
-// When true, exportJPEGFromLinearDNG renders with the faithful hdrplus-python
-// finish (HdrPlusPyFinish), streaming the DNG in bands to a streaming baseline
-// JPEG encoder so peak memory stays bounded (~<150 MB) instead of loading the
-// whole 292 MB rgb16 + 146 MB output that ImageIO would need. Only works on
-// uncompressed linear DNGs; falls back to the normal path otherwise.
-static bool g_jpeg_hdrplus_py = false;
 
 // Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
 // sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only
@@ -481,8 +467,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
     if (tuning[@"jpeg_match_python14"]) cfg.jpeg_match_python14 = tuning[@"jpeg_match_python14"].boolValue;
     g_jpeg_match_14 = cfg.jpeg_match_python14;
-    if (tuning[@"jpeg_lightroom"]) g_jpeg_lightroom = tuning[@"jpeg_lightroom"].boolValue;
-    if (tuning[@"jpeg_hdrplus_py"]) g_jpeg_hdrplus_py = tuning[@"jpeg_hdrplus_py"].boolValue;
     if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
     if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
     if (tuning[@"isp_highlight_knee"]) cfg.isp.highlight_knee = tuning[@"isp_highlight_knee"].floatValue;
@@ -527,8 +511,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
             ? hhsr::SelectionLaw::Linear : hhsr::SelectionLaw::HardThreshold;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
-    if (tuning[@"robustness_mask_gpu_resident"])
-        cfg.robustness_mask_gpu_resident = tuning[@"robustness_mask_gpu_resident"].boolValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
 }
@@ -1027,49 +1009,8 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     return opts;
 }
 
-// Faithful hdrplus-python finish, streamed. Reads the uncompressed linear DNG in
-// bands (never the whole 292 MB image) and writes JPEG scanlines as they finish
-// via JpegStreamEncoder, so peak memory is the finisher's ~80 MB working set,
-// not ImageIO's whole-image requirement. Returns NO (caller falls back) if the
-// DNG is compressed or the metadata can't be read.
-static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
-    int W = 0, H = 0, orientation = 1; long strip = 0;
-    float wb[3] = {1,1,1}, ccm[9] = {1,0,0,0,1,0,0,0,1};
-    bool has_color = false;
-    if (!hhsr::load_linear_dng_finish_meta(std::string(dngPath.UTF8String), W, H, strip,
-                                           wb, ccm, has_color, orientation) || W <= 0 || H <= 0)
-        return NO;
-    FILE* in = std::fopen(dngPath.UTF8String, "rb");
-    FILE* out = std::fopen(jpgPath.UTF8String, "wb");
-    if (!in || !out) { if (in) std::fclose(in); if (out) std::fclose(out); return NO; }
-    const size_t rowbytes = (size_t)W * 3 * 2;
-    std::vector<uint16_t> rowbuf((size_t)W * 3);
-    hhsr::JpegStreamEncoder enc(out, W, H, 95, orientation);
-    hhsr::LinearBandReader reader = [&](int y0, int bh, float* o) {
-        for (int yy = 0; yy < bh; ++yy) {
-            int sy = y0 + yy; sy = sy < 0 ? 0 : (sy >= H ? H - 1 : sy);
-            std::fseek(in, strip + (long)sy * (long)rowbytes, SEEK_SET);
-            (void)std::fread(rowbuf.data(), 2, (size_t)W * 3, in);
-            float* op = o + (size_t)yy * W * 3;
-            for (int i = 0; i < W * 3; ++i) op[i] = rowbuf[i] * (1.f / 65535.f);
-        }
-    };
-    hhsr::U8BandWriter writer = [&](int, int bh, const uint8_t* rgb8) { enc.write_rows(rgb8, bh); };
-    hhsr::HdrPlusPyParams p;
-    for (int i = 0; i < 3; ++i) p.wb[i] = wb[i];
-    for (int i = 0; i < 9; ++i) p.ccm[i] = ccm[i];
-    hhsr::hdrplus_py_finish(W, H, p, reader, writer);
-    const bool ok = enc.finish();
-    std::fclose(in); std::fclose(out);
-    return ok ? YES : NO;
-}
-
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
     if (dngPath.length == 0 || jpgPath.length == 0) return NO;
-
-    // HDR+ (hdrplus-python) finish: fully streamed, bounded memory. Falls
-    // through to the normal path if the DNG is compressed / unreadable.
-    if (g_jpeg_hdrplus_py && ExportHdrPlusPyJPEG(dngPath, jpgPath)) return YES;
 
     std::vector<uint16_t> rgb;
     int W = 0, H = 0;
@@ -1079,18 +1020,9 @@ static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
-    std::vector<uint8_t> srgb;
-    if (g_jpeg_lightroom) {
-        // Calibrated Adobe Color match (core/LightroomRenderer). It applies WB
-        // itself via the fitted matrix using the DNG's own gains, so it renders
-        // the camera-native buffer directly and must NOT go through
-        // ReapplyWhiteBalanceIfStored. Output is already 8-bit sRGB.
-        hhsr::LightroomRenderOpts lopts; lopts.wb = wb;
-        hhsr::lightroom_render(rgb.data(), W, H, lopts, srgb);
-        rgb.clear();
-        rgb.shrink_to_fit();
-    } else {
     ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
+
+    std::vector<uint8_t> srgb;
     if (g_jpeg_match_14) {
         // Python-1.4 parity: whole-image postprocess (matrix -> clip -> unsharp
         // r=3/a=1.5 -> clip -> sRGB), no tone-map / preset LUT. The SR DNG is
@@ -1143,7 +1075,6 @@ static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
     rgb.clear();
     rgb.shrink_to_fit();
     }
-    }
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!cs) cs = CGColorSpaceCreateDeviceRGB();
@@ -1192,7 +1123,7 @@ static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
         return NO;
-    if (!g_jpeg_lightroom) ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
+    ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)
@@ -1200,24 +1131,15 @@ static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
     const int ow = std::max(1, (int)std::lround(W * scale));
     const int oh = std::max(1, (int)std::lround(H * scale));
 
-    // Calibrated Adobe Color match: render the full-res frame once (it applies
-    // WB itself and is spatial), then the downscale loop samples it. Rendered
-    // BEFORE isp_denoise_chroma, which edits rgb in place.
-    std::vector<uint8_t> lr_full;
-    if (g_jpeg_lightroom) {
-        hhsr::LightroomRenderOpts lopts; lopts.wb = wb;
-        hhsr::lightroom_render(rgb.data(), W, H, lopts, lr_full);
-    }
-
     // Analysed at full resolution even though the preview is downscaled, so the
     // thumbnail and the exported JPEG get the same exposure and gain map and
     // cannot disagree about how the shot looks.
     // Before isp_analyse, so the automatic exposure and the local gain map are
     // derived from the cleaned image rather than from the noise.
-    if (!g_jpeg_lightroom && g_isp.enabled)
+    if (g_isp.enabled)
         hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
     hhsr::IspState isp;
-    const bool use_isp = !g_jpeg_lightroom && g_isp.enabled &&
+    const bool use_isp = g_isp.enabled &&
                          hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
 
     std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
@@ -1225,12 +1147,6 @@ static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
         sx = std::max(0, std::min(W - 1, sx));
         sy = std::max(0, std::min(H - 1, sy));
         size_t i = (size_t)sy * (size_t)W + (size_t)sx;
-        if (g_jpeg_lightroom) {
-            sr = lr_full[i * 3 + 0] * (1.f / 255.f);
-            sg = lr_full[i * 3 + 1] * (1.f / 255.f);
-            sb = lr_full[i * 3 + 2] * (1.f / 255.f);
-            return;
-        }
         float r = rgb[i * 3 + 0] * (1.f / 65535.f);
         float g = rgb[i * 3 + 1] * (1.f / 65535.f);
         float b = rgb[i * 3 + 2] * (1.f / 65535.f);

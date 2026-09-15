@@ -164,7 +164,6 @@ static MetalCtx& ctx() {
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
-            "rob_row_activity",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
@@ -1428,30 +1427,6 @@ static int g_rob_ref_hires_h = 0, g_rob_ref_hires_w = 0;
 static id<MTLBuffer> g_rob_std_curve = nil;
 static id<MTLBuffer> g_rob_diff_curve = nil;
 static size_t g_rob_curve_n = 0;
-
-// GPU-resident robustness masks (Config::robustness_mask_gpu_resident). The
-// robustness pass leaves its finished mask buffer here keyed by frame id;
-// acquire_frame_gpu consumes it in place instead of re-uploading a host copy,
-// removing the readback + re-upload round trip. Cleared with the burst / when a
-// frame's GPU buffers are released.
-struct RobGpuMask { int key = -1; __strong id<MTLBuffer> buf = nil; int h = 0, w = 0; };
-static std::vector<RobGpuMask> g_rob_gpu_masks;
-static void rob_gpu_stash(int key, id<MTLBuffer> buf, int h, int w) {
-    for (auto& e : g_rob_gpu_masks)
-        if (e.key == key) { e.buf = buf; e.h = h; e.w = w; return; }
-    g_rob_gpu_masks.push_back(RobGpuMask{key, buf, h, w});
-}
-static id<MTLBuffer> rob_gpu_lookup(int key, int& h, int& w) {
-    for (auto& e : g_rob_gpu_masks)
-        if (e.key == key && e.buf) { h = e.h; w = e.w; return e.buf; }
-    return nil;
-}
-static void rob_gpu_drop(int key) {
-    for (auto& e : g_rob_gpu_masks)
-        if (e.key == key) { e.buf = nil; e.key = -1; }
-}
-static void rob_gpu_clear_all() { g_rob_gpu_masks.clear(); }
-
 static float g_rob_curve_alpha[3] = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
@@ -1787,9 +1762,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
 static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
                                            const FlowField& flow, int tile_size, const Config& cfg,
-                                           Image* s_select_out,
-                                           int gpu_resident_frame = -1,
-                                           std::vector<uint8_t>* rows_out = nullptr) {
+                                           Image* s_select_out) {
     if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
@@ -1999,41 +1972,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
     [enc endEncoding];
 
-    // GPU-resident mask: reduce the finished b_out to per-row activity in the
-    // same command buffer, so the merge's band-skip needs only gh bytes back
-    // instead of the whole mask, and b_out itself is handed to the merge.
-    const bool resident = (gpu_resident_frame >= 0 && rows_out != nullptr);
-    id<MTLBuffer> b_rows = nil;
-    if (resident) {
-        b_rows = buf(nullptr, (size_t)gh);
-        if (b_rows) {
-            const uint32_t hw[2] = {(uint32_t)gh, (uint32_t)gw};
-            enc = [cmd computeCommandEncoder];
-            if (!enc) return Image();
-            [enc setBuffer:b_out offset:0 atIndex:0];
-            [enc setBuffer:b_rows offset:0 atIndex:1];
-            [enc setBytes:hw length:sizeof(hw) atIndex:2];
-            dispatch1(enc, c.pipe("rob_row_activity"), (size_t)gh);
-            [enc endEncoding];
-        } else {
-            return Image();  // fall back to the host path on allocation failure
-        }
-    }
-
     prof_tag_gpu(cmd, "robustness:all");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
-
-    if (resident) {
-        // Hand the mask buffer to the merge and return a dims-only Image (no
-        // full-res host plane). want_s_select is never set on this path.
-        rows_out->assign((size_t)gh, 0u);
-        memcpy(rows_out->data(), [b_rows contents], (size_t)gh);
-        rob_gpu_stash(gpu_resident_frame, b_out, gh, gw);
-        Image dims; dims.h = gh; dims.w = gw; dims.c = 1;  // data stays empty
-        return dims;
-    }
 
     Image r(gh, gw, 1);
     memcpy(r.data.data(), [b_out contents], mask_b);
@@ -3346,19 +3288,14 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             if (e.b_img && e.b_flow && e.b_rob) return finish(e);
             break;
         }
-        // GPU-resident mask (Config::robustness_mask_gpu_resident): the mask
-        // buffer is already on the GPU for this frame, so the host rob may be
-        // empty. Otherwise the host data is required to upload.
-        int stash_h = 0, stash_w = 0;
-        id<MTLBuffer> stashed_rob = rob_gpu_lookup(frame_key, stash_h, stash_w);
-        if (!ip || !fp || img_b == 0 || flow_b == 0) return false;
-        if (!stashed_rob && (!rp || rob_b == 0)) return false;
+        // Miss — need host data to upload.
+        if (!ip || !fp || !rp || img_b == 0 || flow_b == 0 || rob_b == 0) return false;
         auto upload_into = [&](MergeFrameGpu& e) -> bool {
             e.key = frame_key;
             e.lr_h = img.h;
             e.lr_w = img.w;
-            e.rob_h = rob.h > 0 ? rob.h : stash_h;
-            e.rob_w = rob.w > 0 ? rob.w : stash_w;
+            e.rob_h = rob.h;
+            e.rob_w = rob.w;
             e.flow_ny = flow.ny;
             e.flow_nx = flow.nx;
             e.cov_h = covs.h;
@@ -3374,9 +3311,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.b_img = buf(ip, img_b);
             e.b_flow = buf(fp, flow_b);
             e.b_cov = cov_b ? buf(cp, cov_b) : nil;
-            // Consume the GPU-resident mask (transfer ownership) or upload host.
-            e.b_rob = stashed_rob ? stashed_rob : buf(rp, rob_b);
-            if (stashed_rob) rob_gpu_drop(frame_key);
+            e.b_rob = buf(rp, rob_b);
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
             if (!e.b_cov) {
                 static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
@@ -3651,7 +3586,6 @@ void metal_merge_end_online() {
     (void)metal_merge_wait_inflight_impl();
     merge_band_cmd_reset();
     merge_release_acc_slots();
-    rob_gpu_clear_all();   // free any unconsumed GPU-resident masks
     g_merge_online = false;
     g_merge_online_zeroed = false;
     g_online_h = g_online_w = g_online_nch = 0;
@@ -3732,7 +3666,6 @@ void metal_merge_begin_burst(bool trim_analyze_scratch) {
     g_merge_online_zeroed = false;
     g_online_h = g_online_w = g_online_nch = 0;
     g_merge_frames.clear();
-    rob_gpu_clear_all();   // drop any GPU-resident masks from the previous burst
     g_merge_ref = {};
     // First band XORs to slot 0 when double-buffered.
     g_merge_write_slot = g_merge_single_slot ? 0 : 1;
@@ -3972,32 +3905,6 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
     @autoreleasepool {
         return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg,
                                              s_select_out);
-    }
-}
-
-// GPU-resident robustness (Config::robustness_mask_gpu_resident). Runs the same
-// guide-resolution mask as compute_robustness_metal but leaves the mask buffer
-// on the GPU for the merge (keyed by frame_id) and returns only per-row
-// activity, avoiding the full-mask readback + re-upload. Returns false (caller
-// falls back to the host path) if the mask could not be produced. The caller
-// must ensure the raw-resolution and learned-mask paths are inactive -- this
-// mirrors only the analytic guide-resolution path.
-bool metal_robustness_resident(const Image& comp_raw, const RefStats& ref_stats,
-                               const FlowField& flow, int tile_size, const Config& cfg,
-                               int frame_id, std::vector<uint8_t>& rows_out,
-                               int& out_h, int& out_w) {
-    @autoreleasepool {
-        rows_out.clear();
-        Image dims = compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size,
-                                                   cfg, /*s_select_out*/ nullptr,
-                                                   frame_id, &rows_out);
-        if (dims.h <= 0 || dims.w <= 0 || rows_out.empty()) {
-            rob_gpu_drop(frame_id);
-            return false;
-        }
-        out_h = dims.h;
-        out_w = dims.w;
-        return true;
     }
 }
 

@@ -2252,23 +2252,6 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
     out[gid.y * p.w + gid.x] = mn;
 }
 
-// Per-row activity of the finished robustness mask: rows[y] = 1 if any pixel in
-// row y is non-zero, else 0. One thread per row. Used by the GPU-resident mask
-// path to compute the merge's band-skip flags without reading the whole mask
-// back to the host (Config::robustness_mask_gpu_resident). hw = (h, w).
-kernel void rob_row_activity(device const float* mask [[buffer(0)]],
-                             device uchar* rows [[buffer(1)]],
-                             constant uint2& hw [[buffer(2)]],
-                             uint y [[thread_position_in_grid]]) {
-    if (y >= hw.x) return;
-    uchar any = 0;
-    uint base = y * hw.y;
-    for (uint x = 0; x < hw.y; ++x) {
-        if (mask[base + x] != 0.0f) { any = 1; break; }
-    }
-    rows[y] = any;
-}
-
 // L1 BM for ts==16: one thread per tile. Per-shift costs use the same
 // warp-then-block reduce order as align.cpp; argmin matches the Python
 // CUDA bug (err fixed at s_err[0], update when err < min_v).

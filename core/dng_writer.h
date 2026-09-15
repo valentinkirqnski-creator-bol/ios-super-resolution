@@ -39,16 +39,6 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                                  int& W, int& H, float wb[3], float cam_to_srgb[9],
                                  bool& has_color);
 
-// Metadata-only parse for the band-streamed finish path: reads just the TIFF
-// header (not the ~292 MB pixel strip), returning geometry, the byte offset of
-// the pixel strip, and WB/cam->sRGB. Only UNCOMPRESSED (Compression==1) linear
-// DNGs are band-readable, so this returns false for compressed files (the
-// caller falls back to the whole-image loader). strip_off is the file offset of
-// row 0; a row is W*3 uint16 (6 bytes/pixel).
-bool load_linear_dng_finish_meta(const std::string& path, int& W, int& H,
-                                 long& strip_off, float wb[3], float cam_to_srgb[9],
-                                 bool& has_color, int& orientation);
-
 // Streaming LinearRaw RGB DNG with fast lossless Deflate (ZIP), no predictor.
 // Same decoded pixels as before; write path optimized for merge latency.
 //
