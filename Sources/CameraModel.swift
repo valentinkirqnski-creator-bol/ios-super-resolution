@@ -2114,6 +2114,19 @@ final class CameraModel: NSObject, ObservableObject {
         return nil
     }
 
+    /// Downscaled thumbnail of an on-disk image, decoded straight to `maxSide`
+    /// via ImageIO so a 48MP JPEG is not fully decoded just to show a thumbnail.
+    private static func thumbnailImage(fromFile url: URL, maxSide: Int) -> UIImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
     private func saveToPhotos(url: URL, robustnessMasks: [URL], preview: UIImage?, burstDir: URL?) {
         let format = exportFormat
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
@@ -2130,14 +2143,23 @@ final class CameraModel: NSObject, ObservableObject {
 
             var saveURL = url
             var tempJPEG: URL?
+            // The tone-mapped image shown in-app. Rendered from the SAME ISP
+            // path Apple Photos (the embedded preview) and the exported JPEG
+            // use, so the in-app preview, the Photos preview and the JPEG all
+            // match -- and a shutter capture and a storage-import look identical,
+            // because both render the finished merged DNG the same way (the old
+            // in-app `preview` was a flatter, non-tone-mapped pipeline render).
+            var ispThumb: UIImage? = preview
             if format == .dng {
                 // DNG-only asset: embed tone-mapped JPEG SubIFD so Photos can
-                // thumbnail (ImageIO cannot decode Deflate LinearRaw IFD0).
-                _ = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 4096)
+                // thumbnail (ImageIO cannot decode Deflate LinearRaw IFD0), and
+                // reuse that exact render as the in-app thumbnail.
+                ispThumb = SRBridge.embedJPEGPreview(inDNG: url.path, maxSide: 4096) ?? preview
             } else if format == .jpg {
                 if let jpg = Self.renderExportJPEG(fromDNG: url) {
                     saveURL = jpg
                     tempJPEG = jpg
+                    ispThumb = Self.thumbnailImage(fromFile: jpg, maxSide: 1600) ?? preview
                 } else {
                     DispatchQueue.main.async {
                         self.lastThumbnail = preview
@@ -2196,7 +2218,7 @@ final class CameraModel: NSObject, ObservableObject {
                 for maskJPEG in maskJPEGs { try? FileManager.default.removeItem(at: maskJPEG) }
                 if let tempJPEG { try? FileManager.default.removeItem(at: tempJPEG) }
                 DispatchQueue.main.async {
-                    self.lastThumbnail = preview
+                    self.lastThumbnail = ispThumb
                     self.finish(success: success,
                                 message: success
                                     ? (savedMask

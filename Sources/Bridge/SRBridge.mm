@@ -1111,8 +1111,8 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     return ok;
 }
 
-+ (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath maxSide:(NSInteger)maxSide {
-    if (dngPath.length == 0) return NO;
++ (UIImage *)embedJPEGPreviewInDNG:(NSString *)dngPath maxSide:(NSInteger)maxSide {
+    if (dngPath.length == 0) return nil;
     if (maxSide < 256) maxSide = 256;
 
     std::vector<uint16_t> rgb;
@@ -1122,7 +1122,7 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     bool has_color = false;
     if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
         W <= 0 || H <= 0)
-        return NO;
+        return nil;
     ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
 
     const int long_side = std::max(W, H);
@@ -1174,7 +1174,7 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
 
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!cs) cs = CGColorSpaceCreateDeviceRGB();
-    if (!cs) return NO;
+    if (!cs) return nil;
     NSData* data = [NSData dataWithBytes:srgb.data() length:srgb.size()];
     srgb.clear();
     srgb.shrink_to_fit();
@@ -1186,27 +1186,30 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
         provider, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(provider);
     CGColorSpaceRelease(cs);
-    if (!cgOut) return NO;
+    if (!cgOut) return nil;
 
     NSMutableData* jpegData = [NSMutableData data];
     CGImageDestinationRef dest = CGImageDestinationCreateWithData(
         (__bridge CFMutableDataRef)jpegData, CFSTR("public.jpeg"), 1, NULL);
     if (!dest) {
         CGImageRelease(cgOut);
-        return NO;
+        return nil;
     }
     // Embedded DNG preview: a thumbnail source, so it can be leaner still.
     NSDictionary* opts = BuildJpegExportOpts(dngPath, 0.80f);
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL enc_ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
+    // The tone-mapped image the app shows in-app: identical render to the
+    // embedded Photos preview and the exported JPEG, so all three match.
+    UIImage* img = [UIImage imageWithCGImage:cgOut];
     CGImageRelease(cgOut);
-    if (!enc_ok || jpegData.length < 4) return NO;
+    if (!enc_ok || jpegData.length < 4) return nil;
 
-    return embed_dng_jpeg_preview(std::string(dngPath.UTF8String),
-                                  (const uint8_t*)jpegData.bytes,
-                                  (size_t)jpegData.length,
-                                  ow, oh) ? YES : NO;
+    const bool embedded = embed_dng_jpeg_preview(std::string(dngPath.UTF8String),
+                                                 (const uint8_t*)jpegData.bytes,
+                                                 (size_t)jpegData.length, ow, oh);
+    return embedded ? img : nil;
 }
 
 @end

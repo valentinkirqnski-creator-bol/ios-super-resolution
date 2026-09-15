@@ -42,8 +42,12 @@ NS_ASSUME_NONNULL_BEGIN
 // on the reference frame of the first burst. Safe to call repeatedly.
 + (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height;
 
-+ (BOOL)embedJPEGPreviewInDNG:(NSString *)dngPath
-                      maxSide:(NSInteger)maxSide;
+// Renders the tone-mapped (ISP) preview and embeds it as the DNG's JPEG SubIFD
+// so Apple Photos can thumbnail. Returns the rendered preview as a UIImage (nil
+// on failure) so the app can show the EXACT same tone-mapped image in-app that
+// Photos and the exported JPEG use -- the three then always match.
++ (UIImage *)embedJPEGPreviewInDNG:(NSString *)dngPath
+                           maxSide:(NSInteger)maxSide;
 
 @end
 
