@@ -52,7 +52,6 @@ targets:
           - "preset_lut.cpp"
           - "render_isp.cpp"
           - "LightroomRenderer.cpp"
-          - "HdrPlusFinish.cpp"
           - "metal_gpu.mm"
           - "mps_fft.mm"
           - "debug_utils.mm"
