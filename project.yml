@@ -53,6 +53,7 @@ targets:
           - "render_isp.cpp"
           - "LightroomRenderer.cpp"
           - "HdrPlusPyFinish.cpp"
+          - "JpegStreamEncoder.cpp"
           - "metal_gpu.mm"
           - "mps_fft.mm"
           - "debug_utils.mm"
