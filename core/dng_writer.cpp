@@ -1084,4 +1084,97 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
     return true;
 }
 
+bool load_linear_dng_finish_meta(const std::string& path, int& W, int& H,
+                                 long& strip_off, float wb[3], float cam_to_srgb[9],
+                                 bool& has_color, int& orientation) {
+    W = H = 0; strip_off = 0; has_color = false; orientation = 1;
+    wb[0] = wb[1] = wb[2] = 1.f;
+    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    // The IFD and all tag data sit before the pixel strip, so a small header
+    // read covers everything we parse here.
+    std::vector<uint8_t> file(65536);
+    const size_t got = fread(file.data(), 1, file.size(), f);
+    fclose(f);
+    file.resize(got);
+    if (got < 16 || file[0] != 'I' || file[1] != 'I' || r16(file.data() + 2) != 42) return false;
+
+    uint32_t ifd = r32(file.data() + 4);
+    if (ifd + 2 > file.size()) return false;
+    uint16_t nent = r16(file.data() + ifd);
+    if (ifd + 2u + (uint32_t)nent * 12u > file.size()) return false;
+
+    uint32_t width = 0, height = 0, so = 0, spp = 0, compression = 1;
+    bool private_color = false, has_color_matrix = false, has_analog_balance = false;
+    float color_matrix[9] = {0}; float analog_balance[3] = {1.f, 1.f, 1.f};
+    for (uint16_t i = 0; i < nent; ++i) {
+        const uint8_t* e = file.data() + ifd + 2 + i * 12;
+        uint16_t tag = r16(e), type = r16(e + 2);
+        uint32_t count = r32(e + 4), val = r32(e + 8);
+        auto as_long = [&](uint32_t fb) -> uint32_t {
+            if (type == T_LONG && count == 1) return val;
+            if (type == T_SHORT && count == 1) return val & 0xFFFF;
+            return fb;
+        };
+        switch (tag) {
+            case 256: width = as_long(width); break;
+            case 257: height = as_long(height); break;
+            case 259: compression = as_long(compression); break;
+            case 273: so = as_long(so); break;
+            case 274: orientation = (int)as_long((uint32_t)orientation); break;
+            case 277: spp = as_long(spp); break;
+            default: break;
+        }
+        if (tag == 65000 && type == T_BYTE && count >= 48) {
+            uint32_t off = (count <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 48 <= file.size()) {
+                auto rf = [&](uint32_t o) { uint32_t u = r32(file.data() + o); float v; std::memcpy(&v,&u,4); return v; };
+                for (int k = 0; k < 3; ++k) wb[k] = rf(off + (uint32_t)k*4);
+                for (int k = 0; k < 9; ++k) cam_to_srgb[k] = rf(off + 12 + (uint32_t)k*4);
+                private_color = true; has_color = true;
+            }
+        }
+        if (tag == 50721 && (type == T_SRATIONAL || type == T_RATIONAL) && count >= 9) {
+            uint32_t off = (count * type_size(type) <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 72 <= file.size()) {
+                bool ok = true;
+                for (int k = 0; k < 9; ++k) {
+                    const uint8_t* p = file.data() + off + (uint32_t)k*8;
+                    const int32_t num = (int32_t)r32(p); const int32_t den = (int32_t)r32(p+4);
+                    if (den == 0) { ok = false; break; }
+                    color_matrix[k] = (float)num/(float)den;
+                }
+                has_color_matrix = ok;
+            }
+        }
+        if (tag == 50727 && (type == T_RATIONAL || type == T_SRATIONAL) && count >= 3) {
+            uint32_t off = (count * type_size(type) <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 24 <= file.size()) {
+                bool ok = true;
+                for (int k = 0; k < 3; ++k) {
+                    const uint8_t* p = file.data() + off + (uint32_t)k*8;
+                    const int32_t num = (int32_t)r32(p); const int32_t den = (int32_t)r32(p+4);
+                    if (den == 0 || std::fabs((float)num/(float)den) < 1e-6f) { ok = false; break; }
+                    analog_balance[k] = (float)num/(float)den;
+                }
+                has_analog_balance = ok;
+            }
+        }
+    }
+    if (width == 0 || height == 0 || spp != 3 || so == 0) return false;
+    if (compression != 1) return false;   // only uncompressed is band-readable
+    if ((!private_color || is_identity_3x3(cam_to_srgb)) && has_color_matrix) {
+        float derived[9];
+        if (derive_cam_to_srgb_from_color_matrix(
+                color_matrix, has_analog_balance ? analog_balance : nullptr, derived)) {
+            for (int k = 0; k < 9; ++k) cam_to_srgb[k] = derived[k];
+            has_color = true;
+        }
+    }
+    W = (int)width; H = (int)height; strip_off = (long)so;
+    return true;
+}
+
 } // namespace hhsr

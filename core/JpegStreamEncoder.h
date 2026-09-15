@@ -19,8 +19,10 @@ namespace hhsr {
 
 class JpegStreamEncoder {
 public:
-    // Writes the JFIF header immediately. quality in [1,100].
-    JpegStreamEncoder(FILE* out, int width, int height, int quality);
+    // Writes the JFIF header immediately. quality in [1,100]. orientation is an
+    // EXIF orientation value (1..8); when != 1 an EXIF APP1 marker carrying it is
+    // written so viewers rotate the (un-rotated) pixels correctly.
+    JpegStreamEncoder(FILE* out, int width, int height, int quality, int orientation = 1);
 
     // Append `nrows` rows of interleaved RGB (8-bit). Rows are buffered into
     // 8-high MCU stripes and encoded as each stripe fills. Call repeatedly,
@@ -42,6 +44,7 @@ private:
 
     FILE* out_ = nullptr;
     int W_ = 0, H_ = 0;
+    int orientation_ = 1;
     int rows_in_ = 0;                      // rows supplied so far
     int stripe_fill_ = 0;                  // rows currently in the stripe buffer
     std::vector<uint8_t> stripe_;          // 8 * W * 3

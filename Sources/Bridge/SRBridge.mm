@@ -16,6 +16,8 @@
 #include "core/preset_lut.h"
 #include "core/render_isp.h"
 #include "core/LightroomRenderer.h"
+#include "core/HdrPlusPyFinish.h"
+#include "core/JpegStreamEncoder.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -267,6 +269,12 @@ static bool g_jpeg_match_14 = false;
 // It applies WB itself (via the fitted matrix using the DNG's own gains), so
 // this path must NOT go through ReapplyWhiteBalanceIfStored.
 static bool g_jpeg_lightroom = false;
+// When true, exportJPEGFromLinearDNG renders with the faithful hdrplus-python
+// finish (HdrPlusPyFinish), streaming the DNG in bands to a streaming baseline
+// JPEG encoder so peak memory stays bounded (~<150 MB) instead of loading the
+// whole 292 MB rgb16 + 146 MB output that ImageIO would need. Only works on
+// uncompressed linear DNGs; falls back to the normal path otherwise.
+static bool g_jpeg_hdrplus_py = false;
 
 // Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
 // sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only
@@ -474,6 +482,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"jpeg_match_python14"]) cfg.jpeg_match_python14 = tuning[@"jpeg_match_python14"].boolValue;
     g_jpeg_match_14 = cfg.jpeg_match_python14;
     if (tuning[@"jpeg_lightroom"]) g_jpeg_lightroom = tuning[@"jpeg_lightroom"].boolValue;
+    if (tuning[@"jpeg_hdrplus_py"]) g_jpeg_hdrplus_py = tuning[@"jpeg_hdrplus_py"].boolValue;
     if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
     if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
     if (tuning[@"isp_highlight_knee"]) cfg.isp.highlight_knee = tuning[@"isp_highlight_knee"].floatValue;
@@ -1018,8 +1027,49 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     return opts;
 }
 
+// Faithful hdrplus-python finish, streamed. Reads the uncompressed linear DNG in
+// bands (never the whole 292 MB image) and writes JPEG scanlines as they finish
+// via JpegStreamEncoder, so peak memory is the finisher's ~80 MB working set,
+// not ImageIO's whole-image requirement. Returns NO (caller falls back) if the
+// DNG is compressed or the metadata can't be read.
+static BOOL ExportHdrPlusPyJPEG(NSString* dngPath, NSString* jpgPath) {
+    int W = 0, H = 0, orientation = 1; long strip = 0;
+    float wb[3] = {1,1,1}, ccm[9] = {1,0,0,0,1,0,0,0,1};
+    bool has_color = false;
+    if (!hhsr::load_linear_dng_finish_meta(std::string(dngPath.UTF8String), W, H, strip,
+                                           wb, ccm, has_color, orientation) || W <= 0 || H <= 0)
+        return NO;
+    FILE* in = std::fopen(dngPath.UTF8String, "rb");
+    FILE* out = std::fopen(jpgPath.UTF8String, "wb");
+    if (!in || !out) { if (in) std::fclose(in); if (out) std::fclose(out); return NO; }
+    const size_t rowbytes = (size_t)W * 3 * 2;
+    std::vector<uint16_t> rowbuf((size_t)W * 3);
+    hhsr::JpegStreamEncoder enc(out, W, H, 95, orientation);
+    hhsr::LinearBandReader reader = [&](int y0, int bh, float* o) {
+        for (int yy = 0; yy < bh; ++yy) {
+            int sy = y0 + yy; sy = sy < 0 ? 0 : (sy >= H ? H - 1 : sy);
+            std::fseek(in, strip + (long)sy * (long)rowbytes, SEEK_SET);
+            (void)std::fread(rowbuf.data(), 2, (size_t)W * 3, in);
+            float* op = o + (size_t)yy * W * 3;
+            for (int i = 0; i < W * 3; ++i) op[i] = rowbuf[i] * (1.f / 65535.f);
+        }
+    };
+    hhsr::U8BandWriter writer = [&](int, int bh, const uint8_t* rgb8) { enc.write_rows(rgb8, bh); };
+    hhsr::HdrPlusPyParams p;
+    for (int i = 0; i < 3; ++i) p.wb[i] = wb[i];
+    for (int i = 0; i < 9; ++i) p.ccm[i] = ccm[i];
+    hhsr::hdrplus_py_finish(W, H, p, reader, writer);
+    const bool ok = enc.finish();
+    std::fclose(in); std::fclose(out);
+    return ok ? YES : NO;
+}
+
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
     if (dngPath.length == 0 || jpgPath.length == 0) return NO;
+
+    // HDR+ (hdrplus-python) finish: fully streamed, bounded memory. Falls
+    // through to the normal path if the DNG is compressed / unreadable.
+    if (g_jpeg_hdrplus_py && ExportHdrPlusPyJPEG(dngPath, jpgPath)) return YES;
 
     std::vector<uint16_t> rgb;
     int W = 0, H = 0;

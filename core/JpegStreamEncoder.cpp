@@ -120,10 +120,11 @@ void JpegStreamEncoder::write_bits(const uint16_t bs[2]) {
     }
 }
 
-JpegStreamEncoder::JpegStreamEncoder(FILE* out, int width, int height, int quality)
+JpegStreamEncoder::JpegStreamEncoder(FILE* out, int width, int height, int quality, int orientation)
     : out_(out), W_(width), H_(height) {
     ensure_ht();
     stripe_.assign((size_t)8 * W_ * 3, 0);
+    orientation_ = (orientation >= 1 && orientation <= 8) ? orientation : 1;
     write_header(quality);
 }
 
@@ -146,6 +147,18 @@ void JpegStreamEncoder::write_header(int quality) {
     // SOI, APP0(JFIF), DQT, SOF0, DHT, SOS
     static const uint8_t head[] = {0xFF,0xD8, 0xFF,0xE0,0,0x10,'J','F','I','F',0,1,1,0,0,1,0,1,0,0};
     for (uint8_t b : head) put_byte(b);
+    // EXIF APP1 carrying only the Orientation tag, so viewers rotate the
+    // un-rotated pixels. Little-endian TIFF, one IFD entry.
+    if (orientation_ != 1) {
+        const uint8_t app1[] = {
+            0xFF,0xE1, 0x00,0x22, 'E','x','i','f',0,0,
+            0x49,0x49, 0x2A,0x00, 0x08,0x00,0x00,0x00,   // II, 42, IFD @ 8
+            0x01,0x00,                                    // 1 entry
+            0x12,0x01, 0x03,0x00, 0x01,0x00,0x00,0x00,    // tag 0x0112, SHORT, count 1
+            (uint8_t)orientation_,0x00,0x00,0x00,         // value (LE short)
+            0x00,0x00,0x00,0x00 };                        // next IFD = 0
+        for (uint8_t b : app1) put_byte(b);
+    }
     put_byte(0xFF); put_byte(0xDB); put_word(0x84);
     put_byte(0); for (int i=0;i<64;++i) put_byte(YTable[i]);
     put_byte(1); for (int i=0;i<64;++i) put_byte(UVTable[i]);

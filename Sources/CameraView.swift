@@ -1128,6 +1128,9 @@ struct CameraView: View {
                     Toggle("Adobe Color Match", isOn: $cam.tuningParams.jpeg_lightroom)
                     Text("Renders the JPEG and preview with the calibrated Lightroom (Adobe Color) look instead of the built-in HDR ISP. Colour, tone, the profile look, Clarity and Colour NR are fitted to match Lightroom Mobile's render of this app's DNG. When on, the ISP tone/colour controls above do not apply.")
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("HDR+ Finish (exact)", isOn: $cam.tuningParams.jpeg_hdrplus_py)
+                    Text("Exports the JPEG with a faithful port of the hdrplus-python finishing pipeline (auto-gain exposure-fusion tone map, S-curve contrast, triple unsharp). Streamed from the DNG under a bounded memory budget. Affects the saved JPEG only, not the live preview. A brighter, moodier HDR+ look distinct from Adobe Color.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Performance (Experimental)")) {
