@@ -71,6 +71,10 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: FuzeFrame
+        # The app uses only the OS's standard TLS (via StoreKit); no custom or
+        # non-exempt encryption. Declaring this skips the export-compliance
+        # question on every App Store Connect submission.
+        ITSAppUsesNonExemptEncryption: NO
         NSCameraUsageDescription: "The camera is used to capture a short RAW burst for multi-frame super-resolution."
         NSPhotoLibraryAddUsageDescription: "Used to save the final super-resolution DNG or JPG to your photo library."
         NSPhotoLibraryUsageDescription: "Used to show your captures in the in-app gallery."
