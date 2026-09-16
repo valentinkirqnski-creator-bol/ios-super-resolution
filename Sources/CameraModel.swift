@@ -1980,14 +1980,11 @@ final class CameraModel: NSObject, ObservableObject {
         let progressBlock: (String, Float) -> Void = { [weak self] stage, frac in
             DispatchQueue.main.async {
                 self?.progress = 0.15 + frac * 0.85
-                if stage.hasPrefix("Noise ") {
-                    self?.noiseDiagText = stage
-                } else {
-                    // finish() replaces statusText with its own message, so an
-                    // error reported here would vanish before it could be read.
-                    if stage.hasPrefix("Error") { self?.lastPipelineError = stage }
-                    self?.statusText = stage
-                }
+                // The per-frame "Frame N: analyze" and "Noise ..." (alpha/beta/SNR)
+                // stage strings are no longer surfaced in the UI; only the progress
+                // bar advances and the sticky "Processing…" line stays. Errors are
+                // still captured so finish() can report them.
+                if stage.hasPrefix("Error") { self?.lastPipelineError = stage }
             }
         }
         let ok: Bool
@@ -2254,13 +2251,10 @@ final class CameraModel: NSObject, ObservableObject {
             self.isCapturing = false
             self.isProcessing = false
             self.progress = success ? 1 : 0
-            self.statusText = message
-            // Errors go next to the noise line, which is deliberately kept until
-            // the next burst, so a failure is still readable after Done.
-            if !success && !self.lastPipelineError.isEmpty {
-                self.noiseDiagText = self.lastPipelineError
-            }
-            // Keep noiseDiagText until next burst so you can read OK/FALLBACK after Done.
+            // On failure show the detailed pipeline error in the status line
+            // (the separate noise/diagnostic line was removed from the UI).
+            self.statusText = (!success && !self.lastPipelineError.isEmpty)
+                ? self.lastPipelineError : message
         }
         sessionQueue.async {
             self.resumeZSLAfterProcessing()

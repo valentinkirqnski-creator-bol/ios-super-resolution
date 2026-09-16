@@ -328,7 +328,6 @@ struct CameraView: View {
                 // A stack of frames collapsing into one output is the closest
                 // symbol to "merge several files into a larger image".
                 roundIconButton("square.stack.3d.down.right.fill") { showImporter = true }
-                formatButton
                 Spacer()
             }
 
@@ -541,18 +540,6 @@ struct CameraView: View {
     private var bottomPanel: some View {
         VStack(spacing: 0) {
             freeTierBanner
-            if !cam.noiseDiagText.isEmpty, cam.isProcessing || !cam.isBusy {
-                Text(cam.noiseDiagText)
-                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                    .foregroundColor(cam.noiseDiagText.contains("FALLBACK")
-                        ? .orange.opacity(0.95)
-                        : .white.opacity(0.7))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.7)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 4)
-            }
             if cam.isProcessing, !cam.statusText.isEmpty {
                 Text(cam.statusText)
                     .font(.system(size: 11, weight: .medium))
@@ -680,26 +667,6 @@ struct CameraView: View {
 
     /// Small circular control on a translucent disc, used for the two utility
     /// buttons that flank the shutter row.
-    /// DNG/JPG selector, sat alongside the other capture controls above the
-    /// frame count. Two states, so it toggles rather than opening a picker.
-    private var formatButton: some View {
-        Button {
-            cam.exportFormat = (cam.exportFormat == .dng) ? .jpg : .dng
-        } label: {
-            ZStack {
-                Capsule()
-                    .fill(Color.white.opacity(0.12))
-                    .frame(width: 58, height: 42)
-                Text(cam.exportFormat.label)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white)
-            }
-        }
-        .disabled(cam.isBusy)
-        .accessibilityLabel("Output format")
-        .accessibilityValue(cam.exportFormat.label)
-    }
-
     private func roundIconButton(_ symbol: String,
                                  action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -1091,15 +1058,6 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
-                Section(header: Text("JPEG Rendering")) {
-                    Toggle("Match Python 1.4", isOn: $cam.tuningParams.jpeg_match_python14)
-                    Text(cam.tuningParams.jpeg_match_python14
-                         ? "The exported JPEG and the DNG preview use Python 1.4's postprocess exactly: camera\u{2192}sRGB matrix, clip, unsharp, sRGB gamma \u{2014} no tone mapping and no highlight recovery. The DNG itself is unchanged. Overrides the tone/colour settings below."
-                         : "Off: the app's own render (HDR tone mapping if enabled below, otherwise the legacy grade) is used.")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                if !cam.tuningParams.jpeg_match_python14 {
                 Section(header: Text("Rendering \u{2014} Tone")) {
                     Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
                     Text(cam.tuningParams.isp_enabled
@@ -1130,15 +1088,6 @@ struct CameraView: View {
                         Toggle("Protect Skin Tones", isOn: $cam.tuningParams.isp_skin_protect)
                         Text("Holds back saturation in the skin hue band. There is no face detector, so this is what stops strong tone mapping turning skin orange.")
                             .font(.footnote).foregroundColor(.secondary)
-                    }
-                }
-                } // end if !jpeg_match_python14
-
-
-
-                Section {
-                    Button("Reset") {
-                        cam.tuningParams = .appDefaults
                     }
                 }
             }
