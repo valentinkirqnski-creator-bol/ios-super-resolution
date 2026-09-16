@@ -435,32 +435,52 @@ struct CameraView: View {
         let trackW = max(120, width - 96)
         let ticks = 29
         let accent = Color(red: 0.62, green: 0.85, blue: 0.88)
-        return VStack(spacing: 6) {
+        let pos = zoomPosition(cam.zoomFactor)
+        return VStack(spacing: 8) {
+            // Live magnification in a small tab that rides above the thumb.
             Text(Self.zoomLabel(cam.zoomFactor))
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundColor(.black)
-                .frame(width: 52, height: 34)
-                .background(Circle().fill(accent))
-                .offset(x: (zoomPosition(cam.zoomFactor) - 0.5) * trackW)
+                .padding(.horizontal, 9).padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous).fill(accent)
+                )
+                .offset(x: (pos - 0.5) * trackW)
 
+            // Tapered "spectrum" ruler: vertical bars that ramp taller toward the
+            // long end (a widening wedge that reads as increasing magnification),
+            // with a lozenge fader cap riding the track. Deliberately unlike the
+            // round-bubble-over-dots pattern.
             ZStack {
-                Capsule().fill(Color.black.opacity(0.55))
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(Color.white.opacity(0.16))
+                    .frame(height: 3)
                 HStack(spacing: 0) {
                     ForEach(0..<ticks, id: \.self) { i in
                         let t = CGFloat(i) / CGFloat(ticks - 1)
                         let onStop = zoomStops.contains {
                             abs(zoomPosition($0) - t) < 0.5 / CGFloat(ticks - 1)
                         }
-                        let near = abs(zoomPosition(cam.zoomFactor) - t) < 0.5 / CGFloat(ticks - 1)
-                        Circle()
-                            .fill(near ? accent
-                                       : (onStop ? accent.opacity(0.85) : Color.white.opacity(0.45)))
-                            .frame(width: near ? 7 : (onStop ? 5 : 3),
-                                   height: near ? 7 : (onStop ? 5 : 3))
+                        let ramp = 5 + 9 * t            // taller toward telephoto
+                        Rectangle()
+                            .fill(onStop ? accent.opacity(0.9) : Color.white.opacity(0.35))
+                            .frame(width: onStop ? 2.5 : 1.5,
+                                   height: onStop ? ramp + 5 : ramp)
                             .frame(maxWidth: .infinity)
                     }
                 }
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 8)
+
+                // Fader cap.
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(accent)
+                    .frame(width: 12, height: 28)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .stroke(Color.black.opacity(0.25), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                    .offset(x: (pos - 0.5) * trackW)
             }
             .frame(width: trackW, height: 34)
             .contentShape(Rectangle())
@@ -1056,39 +1076,6 @@ struct CameraView: View {
                     }
                     Text("One-time \(store.displayPrice) purchase. Permanently removes the \(StoreManager.freeTotalLimit)-photo free limit.")
                         .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Rendering \u{2014} Tone")) {
-                    Toggle("HDR Tone Mapping", isOn: $cam.tuningParams.isp_enabled)
-                    Text(cam.tuningParams.isp_enabled
-                         ? "Local tone mapping, contrast and vibrance, applied to the JPEG and the DNG preview only. The DNG itself always stays the unmodified linear merge."
-                         : "Off: the legacy fixed-grade render is used instead.")
-                        .font(.footnote).foregroundColor(.secondary)
-
-                    if cam.tuningParams.isp_enabled {
-                        ispRow("Exposure (EV)", $cam.tuningParams.isp_exposure_ev, -2.0...2.0, "%+.2f")
-                        ispRow("Highlight Recovery", $cam.tuningParams.isp_highlight_knee, 0.60...1.0, "%.2f")
-                        ispRow("Colour Noise", $cam.tuningParams.isp_chroma_denoise, 0.0...1.0)
-                        ispRow("Colour Noise Radius", $cam.tuningParams.isp_chroma_radius, 2.0...48.0, "%.0f")
-                        ispRow("Local Strength", $cam.tuningParams.isp_local_strength, 0.0...1.0)
-                        ispRow("Highlight Rolloff", $cam.tuningParams.isp_highlight, 0.0...1.0)
-                        ispRow("Shadow Lift", $cam.tuningParams.isp_shadow, 0.0...1.0)
-                        ispRow("Black Point", $cam.tuningParams.isp_black_point, 0.0...0.20, "%.3f")
-                        ispRow("Local Contrast", $cam.tuningParams.isp_local_contrast, 0.0...0.60)
-                    }
-                }
-
-                if cam.tuningParams.isp_enabled {
-                    Section(header: Text("Rendering \u{2014} Colour")) {
-                        ispRow("Colour Strength", $cam.tuningParams.isp_colour_strength, 0.0...1.0)
-                        ispRow("Contrast", $cam.tuningParams.isp_contrast, 0.0...1.0)
-                        ispRow("Vibrance", $cam.tuningParams.isp_vibrance, 0.0...1.5)
-                        ispRow("Saturation", $cam.tuningParams.isp_saturation, 0.5...1.5)
-                        ispRow("Warmth", $cam.tuningParams.isp_warmth, -0.15...0.15, "%+.3f")
-                        Toggle("Protect Skin Tones", isOn: $cam.tuningParams.isp_skin_protect)
-                        Text("Holds back saturation in the skin hue band. There is no face detector, so this is what stops strong tone mapping turning skin orange.")
-                            .font(.footnote).foregroundColor(.secondary)
-                    }
                 }
             }
             .navigationTitle("Settings")
