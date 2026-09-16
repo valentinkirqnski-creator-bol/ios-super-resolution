@@ -101,7 +101,8 @@ jobs:
       # Generate Xcode project
       # ---------------------------------------------------------
       - name: Generate Xcode project
-        run: "$XCODEGEN" generate --spec project.yml
+        run: |
+          "$XCODEGEN" generate --spec project.yml
 
       # ---------------------------------------------------------
       # Write the App Store Connect API key where xcodebuild/altool find it
