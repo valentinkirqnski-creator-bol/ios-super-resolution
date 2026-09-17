@@ -85,7 +85,10 @@ targets:
           - UIInterfaceOrientationPortrait
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.handheldsr.camera
+        # Must match the App Store Connect app record's bundle id exactly, or
+        # altool upload fails with "Cannot determine the Apple ID from Bundle ID".
+        # The ASC record was created as com.handheldsr.camera.39A6M852T7.
+        PRODUCT_BUNDLE_IDENTIFIER: com.handheldsr.camera.39A6M852T7
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_UIApplicationSupportsIndoorMaps: NO
