@@ -178,14 +178,29 @@ jobs:
       # ---------------------------------------------------------
       - name: Upload to App Store Connect
         run: |
-          set -e
+          set -eo pipefail
           IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
           echo "Uploading $IPA"
-          xcrun altool --upload-app \
-            --type ios \
-            --file "$IPA" \
-            --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID"
+          # altool can print an ERROR and still exit 0, which would make this
+          # step falsely green (as happened before). Capture the output and fail
+          # on a non-zero exit OR any ERROR line, so a failed upload shows red.
+          set +e
+          OUT=$(xcrun altool --upload-app \
+                  --type ios \
+                  --file "$IPA" \
+                  --apiKey "$ASC_KEY_ID" \
+                  --apiIssuer "$ASC_ISSUER_ID" 2>&1)
+          CODE=$?
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ] || echo "$OUT" | grep -qi "ERROR"; then
+            echo "::error::altool upload failed (exit $CODE). See output above."
+            echo "If it says 'Cannot determine the Apple ID from Bundle ID', the"
+            echo "app record for com.handheldsr.camera does not exist / is not"
+            echo "ready in App Store Connect, or the Paid Apps Agreement is not"
+            echo "active yet."
+            exit 1
+          fi
+          echo "Upload accepted by App Store Connect."
 
       # ---------------------------------------------------------
       # Also keep the signed .ipa as an artifact (handy for records)
