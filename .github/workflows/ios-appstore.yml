@@ -192,12 +192,15 @@ jobs:
                   --apiIssuer "$ASC_ISSUER_ID" 2>&1)
           CODE=$?
           echo "$OUT"
-          if [ "$CODE" -ne 0 ] || echo "$OUT" | grep -qi "ERROR"; then
+          # Treat it as success only when altool exited 0 AND printed its success
+          # banner. (Don't grep for "ERROR" -- that matches "no errors" in the
+          # success message. And altool has been known to exit 0 on real
+          # failures, so the positive check is what makes this reliable.)
+          if [ "$CODE" -ne 0 ] || ! echo "$OUT" | grep -q "UPLOAD SUCCEEDED"; then
             echo "::error::altool upload failed (exit $CODE). See output above."
             echo "If it says 'Cannot determine the Apple ID from Bundle ID', the"
-            echo "app record for com.handheldsr.camera does not exist / is not"
-            echo "ready in App Store Connect, or the Paid Apps Agreement is not"
-            echo "active yet."
+            echo "app record's bundle id does not match, or the Paid Apps"
+            echo "Agreement is not active yet."
             exit 1
           fi
           echo "Upload accepted by App Store Connect."
