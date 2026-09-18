@@ -1884,6 +1884,71 @@ final class CameraModel: NSObject, ObservableObject {
         return true
     }
 
+    /// The tuning parameters as the C++ core expects them. A property rather than
+    /// a local in processBurst because the capture path needs it too: the noise
+    /// curves depend only on the reference frame's NoiseProfile and white balance,
+    /// so they can start building the moment the first RAW frame lands instead of
+    /// after the whole burst has been captured and decoded.
+    var tuningDictionary: [String: NSNumber] {
+        return [
+                "r_t": NSNumber(value: tuningParams.r_t),
+                "r_s1": NSNumber(value: tuningParams.r_s1),
+                "r_s2": NSNumber(value: tuningParams.r_s2),
+                "r_Mt": NSNumber(value: tuningParams.r_Mt),
+                "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
+                "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
+                "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
+                "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
+                "k_detail": NSNumber(value: tuningParams.k_detail),
+                "k_denoise": NSNumber(value: tuningParams.k_denoise),
+                "k_stretch": NSNumber(value: tuningParams.k_stretch),
+                "k_shrink": NSNumber(value: tuningParams.k_shrink),
+                "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
+                "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
+                "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
+                "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
+                "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
+                "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
+                "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
+                "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
+                "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
+                "dng_lossless_compress": NSNumber(value: tuningParams.dng_lossless_compress),
+                "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
+                "merge_arch": NSNumber(value: tuningParams.merge_arch),
+                "jpeg_match_python14": NSNumber(value: tuningParams.jpeg_match_python14),
+                "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
+                "isp_exposure_ev": NSNumber(value: tuningParams.isp_exposure_ev),
+                "isp_highlight_knee": NSNumber(value: tuningParams.isp_highlight_knee),
+                "isp_local_strength": NSNumber(value: tuningParams.isp_local_strength),
+                "isp_highlight": NSNumber(value: tuningParams.isp_highlight),
+                "isp_shadow": NSNumber(value: tuningParams.isp_shadow),
+                "isp_black_point": NSNumber(value: tuningParams.isp_black_point),
+                "isp_warmth": NSNumber(value: tuningParams.isp_warmth),
+                "isp_colour_strength": NSNumber(value: tuningParams.isp_colour_strength),
+                "isp_contrast": NSNumber(value: tuningParams.isp_contrast),
+                "isp_vibrance": NSNumber(value: tuningParams.isp_vibrance),
+                "isp_chroma_denoise": NSNumber(value: tuningParams.isp_chroma_denoise),
+                "isp_chroma_radius": NSNumber(value: tuningParams.isp_chroma_radius),
+                "isp_saturation": NSNumber(value: tuningParams.isp_saturation),
+                "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
+                "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
+                "align_match_14": NSNumber(value: tuningParams.align_match_14),
+                "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
+                "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
+                "guide_curve": NSNumber(value: tuningParams.guide_curve),
+                "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
+                "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
+                "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
+                "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
+                "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),
+                "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
+                "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
+                "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
+                "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
+                "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
+        ]
+    }
+
     private func processBurst() {
         let rawFrames = capturedRawFrames
         var paths = capturedDNGs.map { $0.path }
@@ -1925,63 +1990,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.progress = 0.15
         }
 
-        let tuningDict: [String: NSNumber] = [
-            "r_t": NSNumber(value: tuningParams.r_t),
-            "r_s1": NSNumber(value: tuningParams.r_s1),
-            "r_s2": NSNumber(value: tuningParams.r_s2),
-            "r_Mt": NSNumber(value: tuningParams.r_Mt),
-            "alignment_grey_fft": NSNumber(value: tuningParams.alignment_grey_fft),
-            "hf_min_texture_snr": NSNumber(value: tuningParams.hf_min_texture_snr),
-            "flow_regularize_aperture_ratio": NSNumber(value: tuningParams.flow_regularize_aperture_ratio),
-            "flow_reject_1d_ambiguity_ratio": NSNumber(value: tuningParams.flow_reject_1d_ambiguity_ratio),
-            "k_detail": NSNumber(value: tuningParams.k_detail),
-            "k_denoise": NSNumber(value: tuningParams.k_denoise),
-            "k_stretch": NSNumber(value: tuningParams.k_stretch),
-            "k_shrink": NSNumber(value: tuningParams.k_shrink),
-            "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
-            "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
-            "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
-            "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
-            "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
-            "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
-            "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
-            "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
-            "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
-            "dng_lossless_compress": NSNumber(value: tuningParams.dng_lossless_compress),
-            "dng_store_unwhitened": NSNumber(value: tuningParams.dng_store_unwhitened),
-            "merge_arch": NSNumber(value: tuningParams.merge_arch),
-            "jpeg_match_python14": NSNumber(value: tuningParams.jpeg_match_python14),
-            "isp_enabled": NSNumber(value: tuningParams.isp_enabled),
-            "isp_exposure_ev": NSNumber(value: tuningParams.isp_exposure_ev),
-            "isp_highlight_knee": NSNumber(value: tuningParams.isp_highlight_knee),
-            "isp_local_strength": NSNumber(value: tuningParams.isp_local_strength),
-            "isp_highlight": NSNumber(value: tuningParams.isp_highlight),
-            "isp_shadow": NSNumber(value: tuningParams.isp_shadow),
-            "isp_black_point": NSNumber(value: tuningParams.isp_black_point),
-            "isp_warmth": NSNumber(value: tuningParams.isp_warmth),
-            "isp_colour_strength": NSNumber(value: tuningParams.isp_colour_strength),
-            "isp_contrast": NSNumber(value: tuningParams.isp_contrast),
-            "isp_vibrance": NSNumber(value: tuningParams.isp_vibrance),
-            "isp_chroma_denoise": NSNumber(value: tuningParams.isp_chroma_denoise),
-            "isp_chroma_radius": NSNumber(value: tuningParams.isp_chroma_radius),
-            "isp_saturation": NSNumber(value: tuningParams.isp_saturation),
-            "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
-            "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
-            "align_match_14": NSNumber(value: tuningParams.align_match_14),
-            "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
-            "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
-            "guide_curve": NSNumber(value: tuningParams.guide_curve),
-            "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
-            "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
-            "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
-            "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
-            "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),
-            "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
-            "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
-            "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
-            "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
-            "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
-        ]
+        let tuningDict = tuningDictionary
 
         var preview: UIImage?
         let inputURLs = capturedDNGs
@@ -2313,8 +2322,13 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                     let rawURL = dir.appendingPathComponent("frame_\(capturedRawFrames.count).raw16")
                     if let rawFrame = rawFrameDictionary(from: photo, writingTo: rawURL) {
                         burstInputMode = .directRaw
+                        let isFirstRawFrame = capturedRawFrames.isEmpty
                         capturedRawFrames.append(rawFrame)
                         storedFrame = true
+                        if isFirstRawFrame {
+                            SRBridge.prewarmNoiseCurves(forFrame: rawFrame,
+                                                        tuningParams: tuningDictionary)
+                        }
                     } else {
                         try? FileManager.default.removeItem(at: rawURL)
                         burstInputMode = .dngFallback
@@ -2327,8 +2341,20 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                         abortBurst("RAW pixel buffer unavailable")
                         return
                     }
+                    let isFirstRawFrame = capturedRawFrames.isEmpty
                     capturedRawFrames.append(rawFrame)
                     storedFrame = true
+                    if isFirstRawFrame {
+                        // The robustness mask's noise curves are a Monte Carlo over the
+                        // non-linear ends of the brightness range, and how much of that
+                        // range is non-linear grows with ISO -- measured at 83 bins per
+                        // curve on the wide and 546 on the ultrawide. They depend only on
+                        // this frame's NoiseProfile, white balance and CFA, so start them
+                        // now rather than after the remaining frames are captured and the
+                        // reference is decoded.
+                        SRBridge.prewarmNoiseCurves(forFrame: rawFrame,
+                                                    tuningParams: tuningDictionary)
+                    }
                 case .dngFallback:
                     storedFrame = appendDNGPhoto(photo, to: dir)
                 }

@@ -93,7 +93,16 @@ struct Plan {
     int h = 0, w = 0;
 };
 
-Plan g_plan;
+// Two slots, least-recently-built replaced.
+//
+// The plan is keyed on (h, w) and compiling one costs ~1100ms at 12MP. With a
+// single slot, switching between two lenses whose photo dimensions differ
+// recompiled on every switch, and the cost landed on the reference frame of the
+// next burst -- measured at 773ms of ref:grey(gpu) on the ultrawide against
+// 259ms on the wide.
+Plan g_plans[2];
+int g_plan_next = 0;
+int g_plan_cur = -1;
 id<MTLDevice> g_device = nil;
 id<MTLCommandQueue> g_queue = nil;
 // Pooled input/output. The first version allocated a fresh input buffer per
@@ -107,8 +116,33 @@ size_t g_buf_elems = 0;
 std::mutex g_mutex;
 
 API_AVAILABLE(ios(16.0), macos(13.0))
+void release_plan_slot(int i) {
+    Plan& p = g_plans[i];
+    @autoreleasepool {
+        // __bridge_transfer hands the retain from the raw pointers back to ARC,
+        // which releases them as these locals go out of scope.
+        if (p.graph) { MPSGraph* g = (__bridge_transfer MPSGraph*)p.graph; (void)g; }
+        if (p.in) { MPSGraphTensor* t = (__bridge_transfer MPSGraphTensor*)p.in; (void)t; }
+        if (p.out) { MPSGraphTensor* t = (__bridge_transfer MPSGraphTensor*)p.out; (void)t; }
+    }
+    p.graph = nullptr;
+    p.in = nullptr;
+    p.out = nullptr;
+    p.h = 0;
+    p.w = 0;
+}
+
+API_AVAILABLE(ios(16.0), macos(13.0))
 bool build_plan(int h, int w) {
-    if (g_plan.graph && g_plan.h == h && g_plan.w == w) return true;
+    for (int i = 0; i < 2; ++i) {
+        if (g_plans[i].graph && g_plans[i].h == h && g_plans[i].w == w) {
+            g_plan_cur = i;
+            return true;
+        }
+    }
+    const int slot = g_plan_next;
+    g_plan_next = (g_plan_next + 1) % 2;
+    release_plan_slot(slot);
 
     MPSGraph* graph = [[MPSGraph alloc] init];
     if (!graph) return false;
@@ -159,11 +193,12 @@ bool build_plan(int h, int w) {
                                                          name:nil];
     if (!out) return false;
 
-    g_plan.graph = (__bridge_retained void*)graph;
-    g_plan.in = (__bridge_retained void*)in;
-    g_plan.out = (__bridge_retained void*)out;
-    g_plan.h = h;
-    g_plan.w = w;
+    g_plans[slot].graph = (__bridge_retained void*)graph;
+    g_plans[slot].in = (__bridge_retained void*)in;
+    g_plans[slot].out = (__bridge_retained void*)out;
+    g_plans[slot].h = h;
+    g_plans[slot].w = w;
+    g_plan_cur = slot;
     return true;
 }
 
@@ -196,9 +231,11 @@ bool run_plan(const float* in, float* out, int h, int w,
               id<MTLBuffer> dst, id<MTLBuffer> src) {
     if (!build_plan(h, w)) return false;
 
-    MPSGraph* graph = (__bridge MPSGraph*)g_plan.graph;
-    MPSGraphTensor* inT = (__bridge MPSGraphTensor*)g_plan.in;
-    MPSGraphTensor* outT = (__bridge MPSGraphTensor*)g_plan.out;
+    if (g_plan_cur < 0 || g_plan_cur > 1) return false;
+    const Plan& plan = g_plans[g_plan_cur];
+    MPSGraph* graph = (__bridge MPSGraph*)plan.graph;
+    MPSGraphTensor* inT = (__bridge MPSGraphTensor*)plan.in;
+    MPSGraphTensor* outT = (__bridge MPSGraphTensor*)plan.out;
 
     const size_t n = (size_t)h * (size_t)w;
     if (!ensure_buffers(n, dst != nil, src != nil)) return false;
@@ -271,27 +308,9 @@ void mps_fft_release_buffers() {
 void mps_fft_release_all() {
     if (@available(iOS 16.0, macOS 13.0, *)) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        @autoreleasepool {
-            // __bridge_transfer hands the retain from the raw pointers back to
-            // ARC, which releases them as these locals go out of scope.
-            if (g_plan.graph) {
-                MPSGraph* g = (__bridge_transfer MPSGraph*)g_plan.graph;
-                (void)g;
-                g_plan.graph = nullptr;
-            }
-            if (g_plan.in) {
-                MPSGraphTensor* t = (__bridge_transfer MPSGraphTensor*)g_plan.in;
-                (void)t;
-                g_plan.in = nullptr;
-            }
-            if (g_plan.out) {
-                MPSGraphTensor* t = (__bridge_transfer MPSGraphTensor*)g_plan.out;
-                (void)t;
-                g_plan.out = nullptr;
-            }
-        }
-        g_plan.h = 0;
-        g_plan.w = 0;
+        for (int i = 0; i < 2; ++i) release_plan_slot(i);
+        g_plan_cur = -1;
+        g_plan_next = 0;
         g_in_buf = nil;
         g_out_buf = nil;
         g_buf_elems = 0;

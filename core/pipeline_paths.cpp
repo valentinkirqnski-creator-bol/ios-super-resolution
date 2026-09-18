@@ -1213,15 +1213,27 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // compiler cannot vectorize because float addition is not associative.
         // Reusing the result is bit-identical; a parallel reduction would not be.
         const f32 brightness = ref_brightness;
-        const f32 sigma = noise_std_at_brightness(brightness, work);
-        const f32 snr = (sigma > 1e-8f) ? brightness / sigma : 0.f;
+        // Deliberately the non-building lookup: forcing the linear curve here
+        // cost 546 bins of Monte Carlo on the ultrawide -- a quarter of the
+        // burst -- to print one number. With SNR auto-tuning on it is already
+        // built by then and this hits.
+        f32 sigma = 0.f;
+        const bool have_sigma = noise_std_at_brightness_cached(brightness, work, sigma);
+        const f32 snr = (have_sigma && sigma > 1e-8f) ? brightness / sigma : 0.f;
         char buf[288];
         const int t0 = work.bm_tile_sizes.size() > 0 ? work.bm_tile_sizes[0] : -1;
-        std::snprintf(buf, sizeof(buf),
-            "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f",
-            work.has_noise_profile ? "OK" : "FALLBACK",
-            work.noise_alpha(), work.noise_beta(), brightness, sigma, snr, t0,
-            work.r_t);
+        if (have_sigma) {
+            std::snprintf(buf, sizeof(buf),
+                "Noise %s α=%.3g β=%.3g  b=%.2f σ=%.2e SNR=%.1f  T=%d  r_t=%.2f",
+                work.has_noise_profile ? "OK" : "FALLBACK",
+                work.noise_alpha(), work.noise_beta(), brightness, sigma, snr, t0,
+                work.r_t);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "Noise %s α=%.3g β=%.3g  b=%.2f  T=%d  r_t=%.2f",
+                work.has_noise_profile ? "OK" : "FALLBACK",
+                work.noise_alpha(), work.noise_beta(), brightness, t0, work.r_t);
+        }
         report(buf, 0.065f);
     }
     (void)t_snr;

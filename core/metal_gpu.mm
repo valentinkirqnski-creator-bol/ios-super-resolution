@@ -4451,6 +4451,15 @@ void metal_trim_analyze_scratch() {
     c.kern_grad = nil; c.kern_cov = nil;
     c.kern_raw_b = c.kern_vst_b = c.kern_grey_b = 0;
     c.kern_grad_b = c.kern_cov_b = 0;
+    // Per-frame robustness and decode pools: ~230MB at 12MP, analysis-only, and
+    // left resident they were charged to the process between bursts -- measured
+    // as burst:begin rising from 195MB to ~397MB.
+    c.rob_guide = nil; c.rob_means = nil; c.rob_vars = nil;
+    c.rob_mask = nil; c.rob_mask_min = nil;
+    c.rob_guide_b = c.rob_means_b = c.rob_vars_b = 0;
+    c.rob_mask_b = c.rob_mask_min_b = 0;
+    c.decode_raw16 = nil; c.decode_out = nil;
+    c.decode_raw16_b = c.decode_out_b = 0;
     c.l2[0] = {};
     c.l2[1] = {};
     // Grey-FFT pools are analyze-only (~190MB at 12MP); merge must not inherit them.

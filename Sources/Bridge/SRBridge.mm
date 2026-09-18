@@ -1049,6 +1049,27 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     hhsr::mps_fft_prewarm((int)height, (int)width);
 }
 
++ (void)prewarmNoiseCurvesForFrame:(NSDictionary *)frame
+                      tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning {
+    if (![frame isKindOfClass:NSDictionary.class]) return;
+    // Mirror the order processRawFrames: builds the reference Config in, or the
+    // curves would be keyed on different parameters than the burst asks for and
+    // the work would be wasted rather than reused: bayer_mode, then the tuning
+    // overrides, then the frame's own metadata, then raw_prewhitened -- which
+    // noise_wb_gain reads, so it has to be set before the key is derived.
+    Config cfg;
+    cfg.bayer_mode = true;
+    cfg.bake_srgb = false;
+    cfg.use_gpu = false;
+    cfg.num_threads = 0;
+    ApplyTuningParams(tuning, cfg);
+    FillReferenceMetadataFromRawFrame(frame, cfg);
+    cfg.raw_prewhitened = true;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        hhsr::prewarm_noise_curves(cfg);
+    });
+}
+
 + (void)prewarmGPU {
     // metal_gpu_init builds the device, the library and ~62 MTLComputePipelineState
     // objects behind a std::once_flag. The first thing to call it was

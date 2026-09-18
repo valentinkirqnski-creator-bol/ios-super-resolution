@@ -104,6 +104,10 @@ Image compute_guide(const Image& raw, const Config& cfg);
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
 f32 noise_std_at_brightness(f32 brightness, const Config& cfg);
+// Same value, but only if the curve is already built; false without building it.
+// The linear curve is several seconds of Monte Carlo at high ISO and, unless SNR
+// auto-tuning is on, nothing but the status line reads it.
+bool noise_std_at_brightness_cached(f32 brightness, const Config& cfg, f32& out);
 
 // Full noise curves (1001 bins) for GPU upload — same cache as CPU robustness.
 void fetch_noise_curves(f32 alpha, f32 beta,

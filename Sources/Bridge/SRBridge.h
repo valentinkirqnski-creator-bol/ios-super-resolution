@@ -46,6 +46,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// the first capture. Idempotent; safe from any thread.
 + (void)prewarmGPU;
 
+/// Start building the robustness mask's noise curves for a captured RAW frame,
+/// on a background queue. They are a pure function of the frame's NoiseProfile,
+/// white balance and CFA, and at high ISO they are the single largest cost in a
+/// burst, so the earlier this runs the more of it the capture hides. Idempotent:
+/// the pipeline asks for the same curves later and finds them built.
++ (void)prewarmNoiseCurvesForFrame:(NSDictionary *)frame
+                      tuningParams:(NSDictionary<NSString *, NSNumber *> *)tuning;
+
 // Renders the tone-mapped (ISP) preview and embeds it as the DNG's JPEG SubIFD
 // so Apple Photos can thumbnail. Returns the rendered preview as a UIImage (nil
 // on failure) so the app can show the EXACT same tone-mapped image in-app that
