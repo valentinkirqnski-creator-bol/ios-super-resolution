@@ -30,9 +30,8 @@
 #if defined(__APPLE__)
 #include <pthread/qos.h>
 #endif
-#if defined(__APPLE__)
+// Not Apple-gated: the noise-curve prewarm below runs on every platform.
 #include <thread>
-#endif
 
 namespace fs = std::filesystem;
 
@@ -126,8 +125,24 @@ static Image compute_robustness_and_activity(const Image& comp,
                                              const Config& work,
                                              std::vector<uint8_t>& rows,
                                              bool& has_nonzero,
-                                             Image* s_select_out = nullptr) {
+                                             Image* s_select_out = nullptr,
+                                             int gpu_slot = -1) {
     Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work, s_select_out);
+#if defined(__APPLE__)
+    // The mask stayed in its slice, so read the per-row activity from there --
+    // a few KB, against pulling the whole 12MB plane back to test for non-zeros.
+    if (gpu_slot >= 0 && rob.h > 0 && rob.data.empty()) {
+        if (metal_frame_rob_rows(gpu_slot, rows, has_nonzero)) return rob;
+        // Could not read the flags. Assume the frame contributes rather than
+        // silently dropping it: robustness_row_activity on a mask with no host
+        // storage would report "all zero", which is a different burst.
+        rows.clear();
+        has_nonzero = true;
+        return rob;
+    }
+#else
+    (void)gpu_slot;
+#endif
     has_nonzero = robustness_row_activity(rob, rows);
     return rob;
 }
@@ -693,9 +708,72 @@ static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
     }
 }
 
+// dng_rows_done: the caller has already produced this band's 16-bit rows (the
+// GPU normalise wrote them straight out of the accumulator), so there is
+// nothing to encode here and only the sparse preview sample is left.
+// One preview sample, from NORMALIZED camera RGB.
+//
+// Shared by the num/den path and the fused merge, which hands back exactly these
+// three values for the sampled pixels because it never stores num/den. Keeping
+// one copy is what makes the two thumbnails identical rather than merely similar.
+static void preview_store_sample(Image& preview, int py, int px,
+                                 f32 cn0, f32 cn1, f32 cn2,
+                                 const Config& work, int nch) {
+    auto to_srgb = [](f32 v) {
+        v = clampf(v, 0.f, 1.f);
+        return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+    };
+    const bool bake = work.bake_srgb && nch >= 3;
+    const f32* m = work.cam_to_srgb;
+    const f32 wb0 = work.raw_prewhitened ? 1.f : work.white_balance[0];
+    const f32 wb1 = work.raw_prewhitened ? 1.f : work.white_balance[1];
+    const f32 wb2 = work.raw_prewhitened ? 1.f : work.white_balance[2];
+    const bool prev_color = !bake && nch >= 3 && work.has_cam_to_srgb;
+
+    f32 lin0, lin1, lin2;
+    if (bake) {
+        const f32 wr = cn0 * wb0, wg = cn1 * wb1, wbv = cn2 * wb2;
+        lin0 = m[0] * wr + m[1] * wg + m[2] * wbv;
+        lin1 = m[3] * wr + m[4] * wg + m[5] * wbv;
+        lin2 = m[6] * wr + m[7] * wg + m[8] * wbv;
+    } else if (nch >= 3) {
+        lin0 = cn0; lin1 = cn1; lin2 = cn2;
+    } else {
+        lin0 = lin1 = lin2 = cn0;
+    }
+
+    f32 preview_lin[3] = {lin0, lin1, lin2};
+    if (prev_color) {
+        const f32 wr = cn0 * wb0, wg = cn1 * wb1, wbv = cn2 * wb2;
+        preview_lin[0] = m[0] * wr + m[1] * wg + m[2] * wbv;
+        preview_lin[1] = m[3] * wr + m[4] * wg + m[5] * wbv;
+        preview_lin[2] = m[6] * wr + m[7] * wg + m[8] * wbv;
+    } else if (!bake && nch >= 3) {
+        preview_lin[0] = cn0 * wb0;
+        preview_lin[1] = cn1 * wb1;
+        preview_lin[2] = cn2 * wb2;
+    }
+
+    if (preset_lut_enabled()) {
+        // The LUT was fitted from the DNG's linear values straight to final sRGB,
+        // so it already contains white balance, the colour matrix and gamma. Feed
+        // it the unmodified merge rather than the matrixed preview_lin above, or
+        // those steps get applied twice.
+        const f32 dng_lin[3] = {lin0, lin1, lin2};
+        f32 srgb[3];
+        preset_lut_apply(dng_lin, srgb);
+        for (int k = 0; k < 3; ++k)
+            preview.at(py, px, k) = clampf(srgb[k], 0.f, 1.f);
+    } else {
+        for (int k = 0; k < 3; ++k)
+            preview.at(py, px, k) = to_srgb(clampf(preview_lin[k], 0.f, 1.f));
+    }
+}
+
 static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int bh,
                                  const Config& work, int nch, Image& preview, float pscale,
-                                 int ph, int pw, int Ws, std::vector<uint16_t>& row16) {
+                                 int ph, int pw, int Ws, std::vector<uint16_t>& row16,
+                                 bool dng_rows_done = false) {
     // Same num/den → RGB16 math as before; pointer loops + sparse preview only.
     auto to_srgb = [](f32 v) {
         v = clampf(v, 0.f, 1.f);
@@ -718,14 +796,73 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
 
 #if defined(__APPLE__)
     // Dense DNG band on GPU (1:1); sparse preview stays on CPU below.
-    const bool gpu_rgb = metal_normalize_band_rgb16_ptr(nump, denp, bh, Ws, nch, work, row16);
+    const bool gpu_rgb = dng_rows_done ||
+        metal_normalize_band_rgb16_ptr(nump, denp, bh, Ws, nch, work, row16);
 #else
-    const bool gpu_rgb = false;
+    const bool gpu_rgb = dng_rows_done;
+    (void)dng_rows_done;
 #endif
     uint16_t* outp = row16.data();
     if (!gpu_rgb) {
         row16.resize((size_t)bh * (size_t)Ws * 3u);
         outp = row16.data();
+    }
+
+    // num/den -> linear camera RGB for one output pixel. Shared by the dense and
+    // sparse passes below so the two cannot drift apart.
+    struct Lin { f32 cn0, cn1, cn2, l0, l1, l2; };
+    auto load_linear = [&](size_t pi) -> Lin {
+        Lin r;
+        f32 d0 = denp[pi];
+        r.cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
+        r.cn1 = 0.f;
+        r.cn2 = 0.f;
+        if (nch >= 2) {
+            f32 d1 = denp[pi + 1];
+            r.cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
+        }
+        if (nch >= 3) {
+            f32 d2 = denp[pi + 2];
+            r.cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
+        }
+        if (bake) {
+            f32 wr = r.cn0 * wb0, wg = r.cn1 * wb1, wbv = r.cn2 * wb2;
+            r.l0 = m[0] * wr + m[1] * wg + m[2] * wbv;
+            r.l1 = m[3] * wr + m[4] * wg + m[5] * wbv;
+            r.l2 = m[6] * wr + m[7] * wg + m[8] * wbv;
+        } else if (nch >= 3) {
+            r.l0 = r.cn0; r.l1 = r.cn1; r.l2 = r.cn2;
+        } else {
+            r.l0 = r.l1 = r.l2 = r.cn0;
+        }
+        return r;
+    };
+
+    auto store_preview = [&](int py, int px, const Lin& v) {
+        preview_store_sample(preview, py, px, v.cn0, v.cn1, v.cn2, work, nch);
+    };
+
+    if (gpu_rgb) {
+        // The dense DNG rows are already done on the GPU, so all that is left is
+        // the sparse preview sample -- 252 x 15 pixels of an 8064 x 480 band at a
+        // 256px preview. Walking all 3.9M pixels of the band and testing
+        // x % x_step to discard 99.9% of them cost 48.8M iterations and 48.8M
+        // integer modulos per burst. Stride straight to the sampled pixels: the
+        // same (py, px) set, the same values, nothing else read.
+        const int first = (y_step - (y0 % y_step)) % y_step;
+        const int nrows = (bh > first) ? ((bh - first + y_step - 1) / y_step) : 0;
+        parallel_rows(nrows, work.num_threads, [&](int k) {
+            const int i = first + k * y_step;
+            if (i >= bh) return;
+            const int gy = y0 + i;
+            const int py = std::min(ph - 1, (int)(gy * pscale));
+            const size_t row_off = (size_t)i * (size_t)Ws * (size_t)nch;
+            for (int x = 0; x < Ws; x += x_step) {
+                const int px = std::min(pw - 1, (int)(x * pscale));
+                store_preview(py, px, load_linear(row_off + (size_t)x * (size_t)nch));
+            }
+        });
+        return;
     }
 
     parallel_rows(bh, work.num_threads, [&](int i) {
@@ -734,70 +871,16 @@ static void encode_band_rows_ptr(const f32* nump, const f32* denp, int y0, int b
         const int py = std::min(ph - 1, (int)(gy * pscale));
         const size_t row_off = (size_t)i * (size_t)Ws * (size_t)nch;
         for (int x = 0; x < Ws; ++x) {
-            const bool need_prev = do_prev_row && (x % x_step) == 0;
-            if (gpu_rgb && !need_prev) continue;
-
-            const size_t pi = row_off + (size_t)x * (size_t)nch;
-            f32 d0 = denp[pi];
-            f32 cn0 = (d0 > 0.f) ? nump[pi] / d0 : 0.f;
-            f32 cn1 = 0.f, cn2 = 0.f;
-            if (nch >= 2) {
-                f32 d1 = denp[pi + 1];
-                cn1 = (d1 > 0.f) ? nump[pi + 1] / d1 : 0.f;
-            }
-            if (nch >= 3) {
-                f32 d2 = denp[pi + 2];
-                cn2 = (d2 > 0.f) ? nump[pi + 2] / d2 : 0.f;
-            }
-            f32 lin0, lin1, lin2;
-            if (bake) {
-                f32 wr = cn0 * wb0, wg = cn1 * wb1, wb = cn2 * wb2;
-                lin0 = m[0] * wr + m[1] * wg + m[2] * wb;
-                lin1 = m[3] * wr + m[4] * wg + m[5] * wb;
-                lin2 = m[6] * wr + m[7] * wg + m[8] * wb;
-            } else if (nch >= 3) {
-                lin0 = cn0; lin1 = cn1; lin2 = cn2;
-            } else {
-                lin0 = lin1 = lin2 = cn0;
-            }
-            if (!gpu_rgb) {
-                const f32 v0 = bake ? to_srgb(lin0) : clampf(lin0 * sg[0], 0.f, 1.f);
-                const f32 v1 = bake ? to_srgb(lin1) : clampf(lin1 * sg[1], 0.f, 1.f);
-                const f32 v2 = bake ? to_srgb(lin2) : clampf(lin2 * sg[2], 0.f, 1.f);
-                const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
-                outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
-                outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
-                outp[base + 2] = (uint16_t)(v2 * 65535.f + 0.5f);
-            }
-            if (need_prev) {
-                f32 preview_lin[3] = {lin0, lin1, lin2};
-                if (prev_color) {
-                    f32 wr = cn0 * wb0, wg = cn1 * wb1, wb = cn2 * wb2;
-                    preview_lin[0] = m[0] * wr + m[1] * wg + m[2] * wb;
-                    preview_lin[1] = m[3] * wr + m[4] * wg + m[5] * wb;
-                    preview_lin[2] = m[6] * wr + m[7] * wg + m[8] * wb;
-                } else if (!bake && nch >= 3) {
-                    preview_lin[0] = cn0 * wb0;
-                    preview_lin[1] = cn1 * wb1;
-                    preview_lin[2] = cn2 * wb2;
-                }
-                const int px = std::min(pw - 1, (int)(x * pscale));
-                if (preset_lut_enabled()) {
-                    // The LUT was fitted from the DNG's linear values straight
-                    // to final sRGB, so it already contains white balance, the
-                    // colour matrix and gamma. Feed it the unmodified merge
-                    // rather than the matrixed preview_lin above, or those
-                    // steps get applied twice.
-                    const f32 dng_lin[3] = {lin0, lin1, lin2};
-                    f32 srgb[3];
-                    preset_lut_apply(dng_lin, srgb);
-                    for (int k = 0; k < 3; ++k)
-                        preview.at(py, px, k) = clampf(srgb[k], 0.f, 1.f);
-                } else {
-                    for (int k = 0; k < 3; ++k)
-                        preview.at(py, px, k) = to_srgb(clampf(preview_lin[k], 0.f, 1.f));
-                }
-            }
+            const Lin v = load_linear(row_off + (size_t)x * (size_t)nch);
+            const f32 v0 = bake ? to_srgb(v.l0) : clampf(v.l0 * sg[0], 0.f, 1.f);
+            const f32 v1 = bake ? to_srgb(v.l1) : clampf(v.l1 * sg[1], 0.f, 1.f);
+            const f32 v2 = bake ? to_srgb(v.l2) : clampf(v.l2 * sg[2], 0.f, 1.f);
+            const size_t base = ((size_t)i * (size_t)Ws + (size_t)x) * 3u;
+            outp[base + 0] = (uint16_t)(v0 * 65535.f + 0.5f);
+            outp[base + 1] = (uint16_t)(v1 * 65535.f + 0.5f);
+            outp[base + 2] = (uint16_t)(v2 * 65535.f + 0.5f);
+            if (do_prev_row && (x % x_step) == 0)
+                store_preview(py, std::min(pw - 1, (int)(x * pscale)), v);
         }
     });
 }
@@ -961,6 +1044,32 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         mps_fft_prewarm(ref.h, ref.w);
     });
 
+    // The robustness mask's noise curves are a ~1e5-patch Monte Carlo per
+    // brightness bin, per guide channel, plus the linear curve the status line
+    // and SNR tuning read. Built lazily they landed on the first comparison
+    // frame -- measured at roughly 3s of a 14.4s burst, and invisible in the
+    // profile because comp:robustness averaged it over seven calls.
+    //
+    // They depend only on the reference frame's NoiseProfile, white balance and
+    // CFA, all of which the loader has just written into `work`, so start them
+    // here and let them overlap the reference grey, pyramid, statistics and
+    // kernels. prewarm_noise_curves holds the curve-cache lock across its
+    // build, so the first comparison frame waits for this rather than starting
+    // the same Monte Carlo again.
+    //
+    // Detached with a Config COPY, not a reference: the loader takes Config by
+    // non-const reference and comparison decodes write to it, and this must not
+    // observe that. The noise fields are final now -- only the reference decode
+    // fills them (FillReferenceMetadataFromRawFrame) -- so the copy carries the
+    // same keys the burst will ask for.
+    {
+        Config curve_cfg = work;
+        std::thread([curve_cfg]() {
+            worker_qos();
+            prewarm_noise_curves(curve_cfg);
+        }).detach();
+    }
+
     clear_align_ref_ica_cache();
     debug_dump_bin("cpp_raw_ref", ref.data.data(), ref.data.size());
     if (debug) append_image_summary(debug_summary, "raw_ref", ref);
@@ -989,6 +1098,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // than every mask being held until after the loop.
     Image acc_rob;
     bool have_acc_rob = false;
+    // The only consumers of the accumulated mask are the save-mask PGM export
+    // and the debug summary, both off by default. Summing it regardless read and
+    // rewrote a 3MP plane for every comparison frame to produce a value nothing
+    // looked at -- and it is the one stage that still needs the mask on the
+    // host, so gating it is what lets the mask stay GPU-resident.
+    const bool want_acc_rob = cfg.robustness_save_mask || debug_dumps_enabled();
     // Same sum, partitioned by which motion prior scored each pixel. Debug only,
     // and only meaningful alongside the combined mask, so it follows the same
     // save flag. Accumulated in the loop for the same reason acc_rob is.
@@ -1031,6 +1146,40 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const double t_snr_join = prof_now_ms();
     snr_fut.get();
     prof_add_cpu("setup:snr-join(residual)", prof_now_ms() - t_snr_join);
+
+    // The alignment tile size is final once the SNR scan is joined, and it sizes
+    // the flow slices, so the residency buffers open here -- before the first
+    // prefetch decode, which would otherwise miss its slice and fall back to the
+    // host path for that one frame.
+    const int frames_tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+    bool frames_resident = false;
+#if defined(__APPLE__)
+    // merge_arch == 2 is an explicit request for the online accumulator, which
+    // consumes the reference covariances from a HOST CovField. Residency hands
+    // those back dimensions-only, so the two cannot be combined -- an explicit
+    // online run keeps the whole pre-residency path.
+    frames_resident = (work.merge_arch != 2) &&
+                      metal_frames_begin(frame_count, ref.h, ref.w,
+                                         frames_tile_size, work);
+    if (frames_resident) {
+        // The reference decode kept its host pixels (tune_config_snr sums them,
+        // the pyramid is built from them), so its slice is seeded here. One
+        // memcpy per burst, against the merge otherwise uploading the plane again.
+        if (!metal_frame_put_raw(ref_index, ref)) {
+            metal_frames_end();
+            frames_resident = false;
+        }
+    }
+    prof_mark_memory(frames_resident ? "frames:resident-open" : "frames:host");
+    // The slices are the largest allocation in the burst, and this function has a
+    // dozen error exits. A guard frees them on all of them rather than leaving the
+    // next burst's metal_frames_begin to do it one shot late.
+    struct FramesGuard {
+        bool armed = false;
+        ~FramesGuard() { if (armed) metal_frames_end(); }
+    } frames_guard;
+    frames_guard.armed = frames_resident;
+#endif
 
     // Start the first comparison decode now. It used to run synchronously at
     // the top of the comparison loop (comp:decode(sync), ~187ms with nothing
@@ -1132,6 +1281,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     RefStats ref_stats;
     CovField ref_covs;
     const double t_ref_analyze = prof_now_ms();
+#if defined(__APPLE__)
+    // The reference's covariances belong in its slice: the fused merge reads them
+    // there, so nothing has to upload them again at merge time. init_robustness
+    // deliberately does not use the slot -- it pins its own means and variances
+    // for the whole burst.
+    if (frames_resident) metal_set_active_frame(ref_index);
+#endif
     if (full_res) {
         ref_stats = init_robustness(ref, work);
         ref_covs = estimate_kernels(ref, work);
@@ -1187,6 +1343,18 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     use_online = choose_online_merge(work.merge_arch, out_h, out_w, out_nch, n,
                                      cache_streamed_comp_raw, 480, ref_h, ref_w,
                                      work.grey_method == GreyMethod::FFT);
+    // Residency settles the architecture: with every frame already in GPU memory,
+    // the fused band merge costs one 22.5MB output buffer where online costs a
+    // 1.17GB num/den pair at 48MP, and it reads the accumulators from registers
+    // instead of pushing them through DRAM once per frame. Only an explicit
+    // merge_arch == 2 still asks for online.
+    if (frames_resident) use_online = false;   // never both (see metal_frames_begin)
+#endif
+    // Every comparison frame's slice has to be complete before the fused kernel
+    // can read them, which is only true on the resident path.
+    bool use_fused = false;
+#if defined(__APPLE__)
+    use_fused = frames_resident && !use_online;
 #endif
     // No host accumulator: the GPU buffer is shared storage, so it is read in
     // place. Allocating a matching host image would double the largest
@@ -1281,6 +1449,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             prof_add_cpu("comp:prefetch-launch", prof_now_ms() - t_pf);
         }
 
+#if defined(__APPLE__)
+        // Every stage below reads and writes this frame's slice. Set after the
+        // decode, which was handed its slot explicitly -- it runs on the prefetch
+        // thread for a different frame and must not consult this.
+        if (frames_resident) metal_set_active_frame(k);
+#endif
         const double t_comp_grey = prof_now_ms();
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
         prof_add_cpu("comp:grey", prof_now_ms() - t_comp_grey);
@@ -1349,6 +1523,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             continue;
         }
 
+#if defined(__APPLE__)
+        // The flow is the one per-frame analysis result the host still owns: the
+        // CPU genuinely reads it (compute_motion_irregular, rob_compute_s) and it
+        // is ~0.4MB. Copy it into the slice so the merge can reach it by offset.
+        if (frames_resident && !metal_frame_set_flow(k, flow)) {
+            report("Error: GPU frame state unavailable", 1.f);
+            return Image();
+        }
+#endif
         Image rob;
         CovField covs;
         std::vector<uint8_t> rob_rows_nonzero;
@@ -1364,7 +1547,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   cons_ts, work,
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
-                                                  rob_s_select_ptr);
+                                                  rob_s_select_ptr,
+                                                  frames_resident ? k : -1);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -1392,7 +1576,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   cons_ts, work,
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
-                                                  rob_s_select_ptr);
+                                                  rob_s_select_ptr,
+                                                  frames_resident ? k : -1);
             covs = cov_fut.get();
         }
         // Folded in here rather than beside absorb_robustness_sum, because that
@@ -1417,7 +1602,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 #if defined(__APPLE__)
             // Same frames in the same order the banded path walks, so the
             // robustness sum is float-for-float what it produces.
-            absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            if (want_acc_rob) absorb_robustness_sum(acc_rob, rob, have_acc_rob);
             bool merged = true;
             bool contributed = false;
             if (!rob_has_nonzero) {
@@ -1491,8 +1676,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             constexpr uint64_t kMinHeadroomForUpload = 700ull * 1024ull * 1024ull;
             const uint64_t avail = prof_available_bytes();
             const bool headroom_ok = (avail == 0) || (avail > kMinHeadroomForUpload);
-            if (rob_has_nonzero && comp.h > 0 && comp.w > 0 && headroom_ok)
+            // On the resident path the frame is already in its slice and the fused
+            // merge reads it there. Uploading it again into the per-frame merge
+            // cache would duplicate ~110MB per frame for nothing.
+            if (frames_resident) {
+                uploaded_to_gpu = true;
+            } else if (rob_has_nonzero && comp.h > 0 && comp.w > 0 && headroom_ok) {
                 uploaded_to_gpu = metal_merge_prefetch_frame(comp, flow, covs, rob, k);
+            }
 #endif
             if (uploaded_to_gpu) {
                 comp = Image();
@@ -1510,7 +1701,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
             // Same frames in the same order build_robustness_sum walked, so
             // the sum is float-for-float what it produced.
-            absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            if (want_acc_rob) absorb_robustness_sum(acc_rob, rob, have_acc_rob);
 
             CachedCompMeta meta;
             meta.index = k;
@@ -1598,7 +1789,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const bool accumulate_r = work.robustness_save_mask;
     const double t_accrob = prof_now_ms();
     // Streamed frames were summed in the loop above, as each was released.
-    if (!stream_comp_raw)
+    if (want_acc_rob && !stream_comp_raw)
         build_robustness_sum(cached, cached_meta, stream_comp_raw, acc_rob, have_acc_rob);
     prof_add_cpu("merge:acc-rob-sum", prof_now_ms() - t_accrob);
     const Image* acc_rob_ptr = (accumulate_r && have_acc_rob) ? &acc_rob : nullptr;
@@ -1658,7 +1849,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     band_rows = std::min(band_rows, Hs);
     // ~480 rows fits the 96MB per-slot budget at full-res scale-2 (2 slots).
     if (heavy_1x) band_rows = std::min(band_rows, 480);
-    std::vector<uint16_t> row16((size_t)band_rows * (size_t)Ws * 3u);
+    // Only the num/den paths stage 16-bit rows on the host; the fused merge hands
+    // back a pooled GPU buffer the writer reads in place.
+    std::vector<uint16_t> row16;
+    if (!use_fused) row16.resize((size_t)band_rows * (size_t)Ws * 3u);
     prof_add_cpu("merge:open+alloc", prof_now_ms() - t_open);
 
     Image comp_scratch;
@@ -1674,7 +1868,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // frames uploaded there. All that is still wanted here is the scratch trim
     // it used to do, so merge is not fighting the analyze temporaries.
     metal_trim_analyze_scratch();
-    if (stream_comp_raw) {
+    if (use_fused) {
+        // Nothing to prepare: every frame is in its slice, and the reload branch
+        // below would call the loader again and decode the burst a second time.
+    } else if (stream_comp_raw) {
         for (CachedCompMeta& meta : cached_meta) {
             if (!meta.rob_has_nonzero) continue;
             if (metal_merge_has_frame(meta.index)) {
@@ -1721,8 +1918,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // single GPU acc slot (ensure_acc waits/readbacks before reuse).
     Image num_bands[2], den_bands[2];
     std::vector<uint16_t> row16_async[2];
-    row16_async[0].resize(row16.size());
-    row16_async[1].resize(row16.size());
+    if (!use_fused && !use_online) {
+        row16_async[0].resize(row16.size());
+        row16_async[1].resize(row16.size());
+    }
     if (use_online) {
         // The reference is the last contribution, and it needs the accumulated
         // robustness, which only exists once every frame has been merged.
@@ -1752,24 +1951,125 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
             return Image();
         }
+        // Was untimed, and it is a serial scan of the whole output: 48.8M
+        // pixels, both accumulators, six isfinite tests each, to produce one
+        // status line. Now chunked inside accumulate_diag_ptr (counts, so any
+        // order gives the same numbers) and on the record.
+        const double t_diag = prof_now_ms();
         accumulate_diag_ptr(nump, denp, (size_t)Hs * (size_t)Ws, nch, diag);
+        prof_add_cpu("out:accum-diag", prof_now_ms() - t_diag);
+
         // Rows come out of one finished accumulator, so encoding is a plain
         // top-to-bottom sweep. Nothing to overlap it with -- the GPU is idle by
         // now -- which is the cost of not banding.
+        //
+        // This loop was the single largest untimed block in the burst. The
+        // normalise used to take the accumulator through
+        // metal_normalize_band_rgb16_ptr, which allocated a fresh 46.4MB buffer
+        // for num, another for den and a 23.2MB output, then memcpyd the
+        // accumulator into them -- from one Shared buffer into another, thirteen
+        // times over. metal_normalize_online_rows_rgb16 binds the accumulator
+        // where it already lives and hands back the 16-bit rows in a pooled GPU
+        // buffer the writer reads in place: no allocation, no copies, same bytes.
+        const double t_encode = prof_now_ms();
         const size_t stride = (size_t)Ws * (size_t)nch;
         for (int y0 = 0; y0 < Hs; y0 += band_rows) {
             const int bh = std::min(band_rows, Hs - y0);
-            if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
-                row16.resize((size_t)bh * (size_t)Ws * 3u);
-            encode_band_rows_ptr(nump + (size_t)y0 * stride,
-                                 denp + (size_t)y0 * stride,
-                                 y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
-            writer.write_rows(row16.data(), bh);
+            const uint16_t* gpu_rows = nullptr;
+#if defined(__APPLE__)
+            (void)metal_normalize_online_rows_rgb16(y0, bh, Ws, nch, work, &gpu_rows);
+#endif
+            if (gpu_rows) {
+                encode_band_rows_ptr(nump + (size_t)y0 * stride,
+                                     denp + (size_t)y0 * stride,
+                                     y0, bh, work, nch, preview, pscale, ph, pw, Ws,
+                                     row16, /*dng_rows_done*/true);
+                writer.write_rows(gpu_rows, bh);
+            } else {
+                if (row16.size() < (size_t)bh * (size_t)Ws * 3u)
+                    row16.resize((size_t)bh * (size_t)Ws * 3u);
+                encode_band_rows_ptr(nump + (size_t)y0 * stride,
+                                     denp + (size_t)y0 * stride,
+                                     y0, bh, work, nch, preview, pscale, ph, pw, Ws, row16);
+                writer.write_rows(row16.data(), bh);
+            }
             report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
         }
+        prof_add_cpu("out:online-encode+write", prof_now_ms() - t_encode);
         // Accumulator released with the burst, not before: nump/denp point
         // into it and are used above.
         metal_merge_end_online();
+    } else if (use_fused) {
+        // One dispatch per band: every comparison frame and then the reference,
+        // accumulated in registers and written straight out as 16-bit rows. No
+        // num/den anywhere, so the band accumulators and the host band images are
+        // both gone, and so is the read-modify-write traffic that dominated the
+        // merge's GPU time.
+        report("Merging output", 0.48f);
+        metal_merge_fused_reset_diag();
+
+        std::vector<int> fused_slots;
+        fused_slots.reserve(cached_meta.size() + cached.size());
+        for (const CachedCompMeta& meta : cached_meta)
+            if (meta.rob_has_nonzero) fused_slots.push_back(meta.index);
+        for (const CachedCompFrame& fc : cached)
+            if (fc.rob_has_nonzero) fused_slots.push_back(fc.index);
+
+        // Same sample grid the host loop used: step = ceil(1/pscale), and both
+        // preview indices truncated from the absolute output coordinate.
+        const int prev_step = std::max(1, (int)std::ceil(1.f / std::max(pscale, 1e-6f)));
+
+        // The DNG write runs on its own thread against the band the GPU has
+        // finished, while the next band is produced into the other pooled output
+        // buffer -- which is why metal_merge_band_fused takes a slot.
+        std::thread write_thr;
+        auto join_write = [&]() { if (write_thr.joinable()) write_thr.join(); };
+        bool fused_ok = true;
+        int band_index = 0;
+        const double t_fused = prof_now_ms();
+        for (int y0 = 0; y0 < Hs; y0 += band_rows, ++band_index) {
+            const int bh = std::min(band_rows, Hs - y0);
+            const uint16_t* rows = nullptr;
+            const bool got = metal_merge_band_fused(
+                fused_slots.data(), (int)fused_slots.size(), ref_index,
+                y0, bh, Hs, Ws, nch, cons_ts, work,
+                prev_step, ph, pw, pscale, band_index & 1, &rows);
+            if (!got || !rows) { fused_ok = false; break; }
+            // Wait for the write two bands back before handing out a new one: the
+            // buffer this band used is the one that write was reading.
+            join_write();
+            write_thr = std::thread([&writer, rows, bh]() {
+                worker_qos();
+                writer.write_rows(rows, bh);
+            });
+            report("Merging output", 0.48f + 0.50f * (float)(y0 + bh) / Hs);
+        }
+        join_write();
+        prof_add_cpu("merge:band-fused(total)", prof_now_ms() - t_fused);
+        prof_mark_memory("merge:band-fused");
+
+        if (!fused_ok) {
+            report("Error: GPU merge failed (memory?)", 1.f);
+            writer.close();
+            if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
+            return Image();
+        }
+
+        metal_merge_fused_read_diag(diag, (size_t)Hs * (size_t)Ws);
+
+        // The thumbnail, from the normalized camera RGB the kernel sampled. Same
+        // pixels, same transform as the num/den path -- see preview_store_sample.
+        if (const float* pv = metal_merge_fused_preview()) {
+            const double t_prev = prof_now_ms();
+            for (int py = 0; py < ph; ++py) {
+                for (int px = 0; px < pw; ++px) {
+                    const size_t o = ((size_t)py * (size_t)pw + (size_t)px) * 3u;
+                    preview_store_sample(preview, py, px, pv[o], pv[o + 1], pv[o + 2],
+                                         work, nch);
+                }
+            }
+            prof_add_cpu("out:preview-transform", prof_now_ms() - t_prev);
+        }
     } else {
     int cur = 0;
     bool have_ready = false;
@@ -1973,6 +2273,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     }
     cached.clear();
     cached_meta.clear();
+#if defined(__APPLE__)
+    // Frame slices are the largest allocation left by this point; the next burst
+    // must not start with them still charged to the process. Done here rather than
+    // left to the guard so the profile's memory marks show the drop.
+    metal_frames_end();
+    frames_guard.armed = false;
+    prof_mark_memory("frames:released");
+#endif
     ref = Image();
     ref_covs = CovField();
     if (cache_streamed_comp_raw) fs::remove_all(cache, ec);

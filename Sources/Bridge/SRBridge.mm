@@ -772,8 +772,13 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
     }
 }
 
+// gpu_slot is the burst frame index, so the decode can write straight into that
+// frame's resident slice. It has to be passed rather than read from a global:
+// the comparison prefetch decodes frame N+1 on its own thread while frame N is
+// being analysed, so "the active frame" is the wrong answer here.
 static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
-                                      bool is_reference, int crop_h, int crop_w) {
+                                      bool is_reference, int crop_h, int crop_w,
+                                      int gpu_slot) {
     Image img;
     NSData *data = frame[@"data"];
     if (![data isKindOfClass:NSData.class]) {
@@ -831,9 +836,43 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         }
     }
 
+    // Compose the two crops the host used to apply after decoding, so the decode
+    // kernel can read straight out of the cropped window: input_crop_zoom takes a
+    // centred, even-aligned box, and crop_h/crop_w then takes the TOP-LEFT of
+    // that. Composed, the origin is the zoom crop's and the extent is the
+    // element-wise minimum -- which is what the two sequential copies produced.
+    int src_y0 = 0, src_x0 = 0, out_h = h, out_w = w;
+    if (cfg.input_crop_zoom > 1.f) {
+        const float z = cfg.input_crop_zoom;
+        // Every extent and offset forced even: an odd origin shifts the Bayer
+        // phase, so the CFA under the crop would no longer be the CFA the
+        // pipeline is told it has. The epsilon stops an exact ratio landing just
+        // under the integer and losing two rows.
+        const int ch = (int)((float)h / z + 1e-4f) & ~1;
+        const int cw = (int)((float)w / z + 1e-4f) & ~1;
+        if (ch > 0 && cw > 0) {
+            src_y0 = ((h - ch) / 2) & ~1;
+            src_x0 = ((w - cw) / 2) & ~1;
+            out_h = ch;
+            out_w = cw;
+        }
+    }
+    if (crop_h > 0 && crop_w > 0 && (out_h > crop_h || out_w > crop_w)) {
+        out_h = std::min(out_h, crop_h);
+        out_w = std::min(out_w, crop_w);
+    }
+
+    // The reference keeps its host pixels: tune_config_snr sums them and the
+    // alignment pyramid is built from them. Comparison frames do not need them
+    // anywhere, so they come back as dimensions only.
+    const bool frames_resident = hhsr::metal_frames_active() && gpu_slot >= 0;
+    const int decode_slot = frames_resident ? gpu_slot : -1;
+
     const uint8_t *base = (const uint8_t *)data.bytes;
     if (!metal_decode_raw16_to_float(base, (size_t)data.length, h, w, bytes_per_row,
-                                     flat_black, flat_denom, flat_wb, img)) {
+                                     flat_black, flat_denom, flat_wb,
+                                     src_y0, src_x0, out_h, out_w,
+                                     decode_slot, /*keep_host*/is_reference, img)) {
         img = Image(h, w, 1);
         parallel_rows(h, 0, [&](int y) {
             const uint8_t *row = base + (size_t)y * (size_t)bytes_per_row;
@@ -851,6 +890,11 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
         });
     }
     cfg.raw_prewhitened = true;
+
+    // The Metal path cropped inside the kernel, so `img` is already the final
+    // extent (or dimensions-only). Only the CPU fallback, which decodes the whole
+    // plane, still needs these.
+    if (img.h == out_h && img.w == out_w) return img;
 
     if (cfg.input_crop_zoom > 1.f) {
         const float z = cfg.input_crop_zoom;
@@ -982,7 +1026,8 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
             if (index < 0 || index >= (int)heldFrames.count) return Image();
             NSDictionary *frame = heldFrames[(NSUInteger)index];
             if (![frame isKindOfClass:NSDictionary.class]) return Image();
-            return DecodeRawFrameDictionary(frame, work, is_reference, crop_h, crop_w);
+            return DecodeRawFrameDictionary(frame, work, is_reference, crop_h, crop_w,
+                                            index);
         };
 
     Image preview;
@@ -1002,6 +1047,13 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
 + (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height {
     hhsr::mps_fft_prewarm((int)height, (int)width);
+}
+
++ (void)prewarmGPU {
+    // metal_gpu_init builds the device, the library and ~62 MTLComputePipelineState
+    // objects behind a std::once_flag. The first thing to call it was
+    // processRawFrames:, i.e. after the shutter had already been pressed.
+    (void)hhsr::metal_gpu_init();
 }
 
 // Properties for CGImageDestinationAddImage: the compression quality, plus --

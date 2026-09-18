@@ -72,9 +72,23 @@ static void hsv_to_rgb8(f32 h, f32 s, f32 v, unsigned char& r,
     g = (unsigned char)(clampf(gf, 0.f, 1.f) * 255.f + 0.5f);
     b = (unsigned char)(clampf(bf, 0.f, 1.f) * 255.f + 0.5f);
 }
+// Returns 0 when `img` already tiles exactly, so callers can skip the copy.
+int pad_image_circular_amount(const Image& img, int tile_size) {
+    if (tile_size <= 0) return 0;
+    const int pad_h = (tile_size - img.h % tile_size) % tile_size;
+    const int pad_w = (tile_size - img.w % tile_size) % tile_size;
+    return pad_h | pad_w;
+}
+
 Image pad_image_circular(const Image& img, int tile_size) {
     int pad_h = (tile_size - img.h % tile_size) % tile_size;
     int pad_w = (tile_size - img.w % tile_size) % tile_size;
+    // `img` is a by-reference parameter, so copy elision does not apply to
+    // `return img` -- this returned a full copy of the plane to add no padding
+    // at all. At 4032x3024 with a 16px tile both paddings are zero, so every
+    // comparison frame paid 48.8MB of allocate-and-touch for nothing. Callers
+    // that care use pad_image_circular_amount and skip the call; this stays
+    // correct for the ones that do not.
     if (pad_h == 0 && pad_w == 0) return img;
     Image padded(img.h + pad_h, img.w + pad_w, img.c);
     for (int y = 0; y < padded.h; ++y) {

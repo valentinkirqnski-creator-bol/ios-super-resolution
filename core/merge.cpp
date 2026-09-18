@@ -326,10 +326,13 @@ void merge_ref(const Image& ref_raw, const CovField& covs,
     merge_ref_band(ref_raw, covs, num, den, 0, cfg, acc_rob);
 }
 
-void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
-                         int c, AccumDiag& d) {
+// Every field is a COUNT, so the order pixels are visited in cannot change the
+// result -- which is what makes the chunked form below exactly equal to the
+// serial one it replaces.
+static void accumulate_diag_span(const f32* nump, const f32* denp,
+                                 size_t first, size_t last, int c, AccumDiag& d) {
     const int nch = std::min(3, c);
-    for (size_t p = 0; p < n; ++p) {
+    for (size_t p = first; p < last; ++p) {
         ++d.pixels;
         f32 dens[3] = {0, 0, 0};
         for (int ch = 0; ch < nch; ++ch) {
@@ -346,6 +349,48 @@ void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
             else if (dens[0] == 0.f && dens[1] > 0.f && dens[2] == 0.f) ++d.only_green;
         }
     }
+}
+
+static void accumulate_diag_merge(AccumDiag& d, const AccumDiag& s) {
+    d.pixels += s.pixels;
+    for (int ch = 0; ch < 3; ++ch) {
+        d.den_zero[ch] += s.den_zero[ch];
+        d.den_tiny[ch] += s.den_tiny[ch];
+        d.den_nonfinite[ch] += s.den_nonfinite[ch];
+        d.num_nonfinite[ch] += s.num_nonfinite[ch];
+    }
+    d.only_green += s.only_green;
+    d.rgb_all_zero += s.rgb_all_zero;
+}
+
+// Chunked and row-parallel.
+//
+// The online merge calls this over the WHOLE output -- 48.8M pixels, reading
+// both accumulators -- where the banded path only ever saw one band. Serial and
+// branch-heavy, that was several hundred milliseconds of a burst, spent on a
+// diagnostic string and inside no profiler bucket.
+//
+// Exact, not approximate: the fields are counts and addition of counts is
+// associative, so chunking and summing gives the same numbers in any order.
+void accumulate_diag_ptr(const f32* nump, const f32* denp, size_t n,
+                         int c, AccumDiag& d) {
+    if (!nump || !denp || n == 0 || c <= 0) return;
+    // Below this the dispatch costs more than the scan.
+    constexpr size_t kSerialLimit = 1u << 16;
+    if (n <= kSerialLimit) {
+        accumulate_diag_span(nump, denp, 0, n, c, d);
+        return;
+    }
+    const int nchunks = 16;
+    const size_t chunk = (n + (size_t)nchunks - 1u) / (size_t)nchunks;
+    std::vector<AccumDiag> parts((size_t)nchunks);
+    parallel_rows(nchunks, 0, [&](int k) {
+        const size_t first = (size_t)k * chunk;
+        if (first >= n) return;
+        const size_t last = std::min(n, first + chunk);
+        accumulate_diag_span(nump, denp, first, last, c, parts[(size_t)k]);
+    });
+    for (const AccumDiag& p : parts) accumulate_diag_merge(d, p);
 }
 
 void accumulate_diag(const Image& num, const Image& den, AccumDiag& d) {

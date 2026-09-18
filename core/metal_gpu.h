@@ -17,13 +17,71 @@ namespace hhsr {
 // Returns false if MTL device / pipelines could not be created.
 bool metal_gpu_init();
 
+// ---------------------------------------------------------------------------
+// GPU-resident comparison frames.
+//
+// Every analysis stage and then the merge consume the same 12 MP planes, and
+// each one used to take its input from a host Image and put its output back into
+// one: nine crossings of the host/device boundary per frame, for buffers the CPU
+// never reads. Measured on an 8-frame 12 MP burst: 211 ms of GPU inside a
+// 1544 ms frame, the rest allocate-and-touch at about 1.24 GB/s.
+//
+// A burst opens one allocation per resource -- images, flows, covariances,
+// robustness masks -- divided into per-frame slices. Each producing kernel is
+// bound at its slice's offset, so nothing moves and no kernel changed; the merge
+// then binds four buffers however long the burst is and reaches each frame by
+// offset, which is what lets one dispatch cover all of them.
+//
+// The stage entry points keep their Image / CovField signatures so the portable
+// core and the CPU reference path are untouched. While residency is on they
+// return a DIMENSIONS-ONLY Image or CovField (h/w/c set, storage empty), the same
+// convention metal_release_host_ref_stats already uses.
+// ---------------------------------------------------------------------------
+
+// Size the burst's slice buffers. slot indices are the caller's frame indices,
+// 0..n_frames-1. Returns false if the allocation does not fit, in which case the
+// caller must run the host path.
+bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
+                        const Config& cfg);
+void metal_frames_end();
+
+// Which slot the stage calls below read from and write into. -1 disables
+// residency for the next call (the host path runs unchanged).
+void metal_set_active_frame(int slot);
+// Whether stage outputs stay resident. Off for the reference frame, whose host
+// pixels tune_config_snr and the pyramid still need.
+void metal_set_gpu_resident(bool on);
+bool metal_frames_active();
+
+// Copy one frame's flow field into its slice. This is the only per-frame
+// analysis result the host still owns -- it is ~0.4 MB and the CPU genuinely
+// reads it (compute_motion_irregular, rob_compute_s).
+bool metal_frame_set_flow(int slot, const FlowField& flow);
+
+// Per-row non-zero flags of a resident robustness mask, so the band-skip test
+// does not need the 12 MB mask on the host. Twin of robustness_row_activity.
+bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any);
+
+// Seed a slot from a host plane. Used for the reference, whose decode keeps its
+// host pixels because tune_config_snr sums them and the pyramid is built from
+// them, but whose plane the merge still reads from the GPU like any other.
+bool metal_frame_put_raw(int slot, const Image& img);
+
+// True once this slot holds everything the merge needs.
+bool metal_frame_merge_ready(int slot);
+
 // Direct RAW app path: uint16 Bayer -> normalized float Bayer with the same
 // black/WB/clamp math as DecodeRawFrameDictionary's CPU fallback.
+// src_y0/src_x0/out_h/out_w crop inside the source plane (origins must be even,
+// so the CFA phase is preserved). gpu_slot >= 0 writes the result into that
+// frame's resident slice; keep_host = false then returns a dimensions-only Image.
 bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
                                  int h, int w, int bytes_per_row,
                                  const float site_black[4],
                                  const float site_denom[4],
                                  const float site_wb[4],
+                                 int src_y0, int src_x0, int out_h, int out_w,
+                                 int gpu_slot, bool keep_host,
                                  Image& out);
 
 // Alg. 3 FFT grey on GPU. Empty image on failure.
@@ -83,6 +141,21 @@ bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
                                     const Config& cfg, std::vector<uint16_t>& row16);
 bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
                                 const Config& cfg, std::vector<uint16_t>& row16);
+
+// Normalize rows [y0, y0+bh) of the ONLINE accumulator with no staging copies.
+//
+// The pointer form above has to be handed host pointers, so for the online
+// merge it allocated a fresh 46.4MB buffer for num, another for den and an
+// output buffer, then memcpyd the accumulator into them -- out of one
+// MTLResourceStorageModeShared buffer and into another, once per band. This
+// binds the accumulator at a byte offset where it already lives and hands back
+// the 16-bit rows in a pooled GPU buffer the DNG writer reads in place.
+//
+// *out_rows stays valid until the next call or until the online merge ends.
+// Returns false (with *out_rows = nullptr) when the online accumulator is not
+// the source, so the caller falls back to the pointer form.
+bool metal_normalize_online_rows_rgb16(int y0, int bh, int Ws, int nch,
+                                       const Config& cfg, const uint16_t** out_rows);
 
 // Alg. 5 kernel covariance on GPU. Empty CovField on failure.
 CovField estimate_kernels_metal(const Image& raw, const Config& cfg);
@@ -159,6 +232,40 @@ void metal_merge_set_single_acc_slot(bool enabled);
 // band into its host images (so encode can overlap the next GPU band). Call this
 // to wait + readback the latest band before using its num/den. No-op if idle.
 bool metal_merge_wait_inflight();
+
+// ---------------------------------------------------------------------------
+// Fused band merge.
+//
+// One dispatch per band covering every resident comparison frame and then the
+// reference, accumulating num/den in REGISTERS and writing the band's 16-bit
+// rows directly. The accumulators never reach memory, so the full-output pair
+// (1.17 GB at 48 MP) stops existing and the per-band read-modify-write traffic
+// (2.34 GB per pass) goes away with it.
+//
+// Bit-identical to the per-dispatch form: comparison frames in index order then
+// the reference, the same order banded and online both used, and the same
+// merge_comp_contrib / merge_ref_contrib / normalise code. An f32 stored to
+// memory and reloaded is exact, which is why dropping the round trips cannot
+// move a value.
+//
+// *out_rows points into a pooled GPU buffer, valid until the next call.
+// prev_step / prev_h / prev_w / prev_scale describe the host thumbnail's sample
+// grid. The fused kernel has no num/den for the host to sample, so it writes the
+// sampled pixels' NORMALIZED camera RGB and the host applies the same colour
+// transform, curve and LUT it always did. prev_step 0 skips it.
+// out_slot alternates 0/1 between bands, so the DNG writer can read one band's
+// rows in place while the GPU produces the next.
+bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
+                            int y0, int bh, int Hs, int Ws, int nch,
+                            int tile_size, const Config& cfg,
+                            int prev_step, int prev_h, int prev_w, float prev_scale,
+                            int out_slot, const uint16_t** out_rows);
+// [prev_h][prev_w][3] normalized camera RGB, filled across the band loop.
+const float* metal_merge_fused_preview();
+// Zero the accumulator-health counters before the band loop, and read them back
+// after it. `pixels` is the output size; the kernel only counts anomalies.
+void metal_merge_fused_reset_diag();
+bool metal_merge_fused_read_diag(AccumDiag& diag, size_t pixels);
 
 // Online merge. One accumulator sized to the whole output, persisting across
 // command buffers, so a frame can be merged and released instead of staying

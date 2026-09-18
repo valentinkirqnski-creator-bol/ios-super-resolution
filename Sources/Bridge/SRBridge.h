@@ -42,6 +42,10 @@ NS_ASSUME_NONNULL_BEGIN
 // on the reference frame of the first burst. Safe to call repeatedly.
 + (void)prewarmFFTWidth:(NSInteger)width height:(NSInteger)height;
 
+/// Create the Metal device, library and every compute pipeline state ahead of
+/// the first capture. Idempotent; safe from any thread.
++ (void)prewarmGPU;
+
 // Renders the tone-mapped (ISP) preview and embeds it as the DNG's JPEG SubIFD
 // so Apple Photos can thumbnail. Returns the rendered preview as a UIImage (nil
 // on failure) so the app can show the EXACT same tone-mapped image in-app that

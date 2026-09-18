@@ -2,12 +2,15 @@
 #include "robustness_nn.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
+#include "prof.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <cmath>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <utility>
@@ -150,6 +153,9 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
 
     const int n = k_n_patches;
     auto fill_patch_stats = [&](std::vector<double>& means, std::vector<double>& stds) {
+        // resize() on an already-large vector is a no-op, which is the point:
+        // the four buffers below are thread_local scratch (see the call site),
+        // so a 70-bin curve stops allocating and freeing 4 x 800KB per bin.
         means.resize((size_t)n);
         stds.resize((size_t)n);
         for (int i = 0; i < n; ++i) {
@@ -174,7 +180,13 @@ static void unitary_MC(f32 alpha, f32 beta, f32 b, f32& diff_mean, f32& std_mean
     };
 
     // C-order (N,3,3): entire patch1 stream, then patch2 — same as NumPy randn.
-    std::vector<double> m1, s1, m2, s2;
+    //
+    // thread_local, not local: build_noise_curves_batch runs one bin per
+    // worker thread, and a 70-bin curve allocated and freed 4 x 800KB per bin
+    // on the same allocate-and-touch path that costs ~1.24 GB/s on device.
+    // Reused across bins on the same thread; the contents are fully
+    // overwritten by fill_patch_stats before any read, so nothing carries over.
+    static thread_local std::vector<double> m1, s1, m2, s2;
     fill_patch_stats(m1, s1);
     fill_patch_stats(m2, s2);
 
@@ -301,8 +313,24 @@ static bool load_bundled_pixel4a_noise_curves(int iso, NoiseCurves& nc) {
 // from the linear one SNR/kernel tuning use). The interpolation shortcut is
 // domain-agnostic (it lerps sigma^2/d^2 between the MC'd non-linear ends),
 // so sqrt uses it too; only the Python-dump load is linear-only.
-static NoiseCurves build_noise_curves(f32 alpha, f32 beta, bool sqrt_domain = false) {
-    NoiseCurves nc;
+// One curve to fill. Several are prepared together so their Monte-Carlo bins
+// can share a single parallel dispatch -- see build_noise_curves_batch.
+struct CurveBuildSpec {
+    NoiseCurves* out = nullptr;
+    f32 alpha = 0.f;
+    f32 beta = 0.f;
+    bool sqrt_domain = false;
+    bool needs_mc = false;   // false when zeros or a Python dump already filled it
+    bool full_mc = false;
+    int imin = 0;
+    int imax = 0;
+};
+
+// Everything that decides WHICH bins need the Monte Carlo, without running it.
+// Returns with spec.out already filled when no MC is needed at all.
+static void prepare_noise_curve_spec(CurveBuildSpec& spec) {
+    NoiseCurves& nc = *spec.out;
+    nc = NoiseCurves();
 
     // No noise model (alpha = beta = 0, e.g. Disable Noise Model): every
     // sample equals the brightness, so patch std and diff are exactly 0 in
@@ -310,60 +338,187 @@ static NoiseCurves build_noise_curves(f32 alpha, f32 beta, bool sqrt_domain = fa
     // bins -- that build produced only zeros yet stalled the first
     // comparison frame ("Frame 2: analyze" hang), most visibly on the sqrt
     // path, which used to force the full-bin MC.
-    if (!(alpha > 0.f) && !(beta > 0.f)) {
+    if (!(spec.alpha > 0.f) && !(spec.beta > 0.f)) {
         nc.std_curve.assign((size_t)k_n_brightness + 1, 0.f);
         nc.diff_curve.assign((size_t)k_n_brightness + 1, 0.f);
-        return nc;
+        spec.needs_mc = false;
+        return;
     }
 
-    if (!sqrt_domain && try_load_python_noise_curves(alpha, beta, nc))
-        return nc;
+    if (!spec.sqrt_domain && try_load_python_noise_curves(spec.alpha, spec.beta, nc)) {
+        spec.needs_mc = false;
+        return;
+    }
 
     nc.std_curve.resize((size_t)k_n_brightness + 1);
     nc.diff_curve.resize((size_t)k_n_brightness + 1);
 
     f32 xmin, xmax;
-    get_non_linearity_bound(alpha, beta, k_tol, xmin, xmax);
+    get_non_linearity_bound(spec.alpha, spec.beta, k_tol, xmin, xmax);
 
-    int imin = (int)std::ceil(xmin * (f32)k_n_brightness) + 1;
-    int imax = (int)std::floor(xmax * (f32)k_n_brightness) - 1;
-
+    spec.imin = (int)std::ceil(xmin * (f32)k_n_brightness) + 1;
+    spec.imax = (int)std::floor(xmax * (f32)k_n_brightness) - 1;
     // Python run_fast_MC: only this gate triggers full regular MC
-    const bool full_mc = (imin > k_n_brightness);
+    spec.full_mc = (spec.imin > k_n_brightness);
+    spec.needs_mc = true;
+}
 
-    if (full_mc) {
-        parallel_rows(k_n_brightness + 1, 0, [&](int i) {
-            f32 b = i / (f32)k_n_brightness;
-            unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i],
-                       sqrt_domain);
-        });
-    } else {
-        // MC on non-linear parts: [0, imin] and [imax, 1000]
-        parallel_rows(k_n_brightness + 1, 0, [&](int i) {
-            if (i <= imin || i >= imax) {
-                f32 b = i / (f32)k_n_brightness;
-                unitary_MC(alpha, beta, b, nc.diff_curve[(size_t)i], nc.std_curve[(size_t)i],
-                           sqrt_domain);
-            }
-        });
-        // Overwrite [imin, imax] inclusive (matches run_fast_MC)
-        interp_MC_range(nc, imin, imax);
+// Build any number of curves in ONE parallel dispatch over the bins that
+// actually run the Monte Carlo.
+//
+// The previous form dispatched 1001 iterations per curve, of which only the
+// non-linear ends -- about 70 bins at moderate ISO, ~210 at high ISO -- did
+// any work, and those sit at i <= imin and i >= imax, i.e. at the two ENDS of
+// the index range. dispatch_apply hands out contiguous ranges, so one or two
+// workers received every heavy bin while the rest returned immediately. With
+// three guide channels built one after another that happened three times over.
+//
+// Here the work is enumerated first and dispatched as a flat job list, so
+// every worker gets an equal share and all three channels overlap. Purely a
+// scheduling change: each job calls the same unitary_MC with the same
+// (alpha, beta, bin), whose RNG is seeded from the bin alone
+// (1337 + lround(b * 1000)), and writes only its own two slots. Bit-identical
+// to the serial result, in any execution order.
+static void build_noise_curves_batch(CurveBuildSpec* specs, int n) {
+    if (!specs || n <= 0) return;
+    const double t0 = prof_now_ms();
+
+    struct Job { int spec; int bin; };
+    std::vector<Job> jobs;
+    jobs.reserve((size_t)n * 256u);
+
+    for (int s = 0; s < n; ++s) {
+        prepare_noise_curve_spec(specs[s]);
+        if (!specs[s].needs_mc) continue;
+        const CurveBuildSpec& sp = specs[s];
+        for (int i = 0; i <= k_n_brightness; ++i) {
+            // Same predicate as the two branches it replaces.
+            if (sp.full_mc || i <= sp.imin || i >= sp.imax)
+                jobs.push_back(Job{s, i});
+        }
     }
 
-    return nc;
+    if (!jobs.empty()) {
+        parallel_rows((int)jobs.size(), 0, [&](int j) {
+            const Job& job = jobs[(size_t)j];
+            const CurveBuildSpec& sp = specs[job.spec];
+            const f32 b = job.bin / (f32)k_n_brightness;
+            unitary_MC(sp.alpha, sp.beta, b,
+                       sp.out->diff_curve[(size_t)job.bin],
+                       sp.out->std_curve[(size_t)job.bin],
+                       sp.sqrt_domain);
+        });
+    }
+
+    for (int s = 0; s < n; ++s) {
+        // Overwrite [imin, imax] inclusive (matches run_fast_MC)
+        if (specs[s].needs_mc && !specs[s].full_mc)
+            interp_MC_range(*specs[s].out, specs[s].imin, specs[s].imax);
+    }
+
+    if (!jobs.empty()) {
+        prof_add_cpu("robustness:noise-curves(mc)", prof_now_ms() - t0);
+        prof_add_cpu("robustness:noise-curves#bins", (double)jobs.size());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Curve cache.
+//
+// One append-only table keyed by (alpha, beta, sqrt_domain), shared by the
+// single-slot and per-channel accessors. Three properties matter:
+//
+//   Never evicted. The accessors hand back a reference that compute_robustness
+//   holds across a whole frame, so a slot that could be rebuilt underneath it
+//   would dangle. Entries are ~8KB (two 1001-float curves), so a session's
+//   worth costs well under a megabyte -- and a burst at an ISO already seen
+//   finds its curves built, which is most of what made repeat shots fast and
+//   first-of-a-new-ISO shots slow.
+//
+//   Deduplicated on the key, not the channel. The channel index only selects
+//   which alpha/beta to ask for; two channels with equal parameters (the
+//   debug_noise_model_disabled case, where both are 0) now share one build
+//   instead of producing two identical ones.
+//
+//   Locked across the build, not just the lookup. prewarm_noise_curves runs on
+//   a background thread while the first comparison frame may ask for the same
+//   curve on the pipeline thread; without the lock both would run the same
+//   Monte Carlo. Holding it means the pipeline thread waits for the prewarm
+//   rather than duplicating it, which is the intended behaviour.
+// ---------------------------------------------------------------------------
+struct CurveCacheEntry {
+    f32 alpha = 0.f;
+    f32 beta = 0.f;
+    bool sqrt_domain = false;
+    NoiseCurves nc;
+};
+
+static std::mutex g_curve_mu;
+// unique_ptr so appending cannot move the entries a caller already holds.
+static std::vector<std::unique_ptr<CurveCacheEntry>> g_curve_cache;
+
+static const NoiseCurves* curve_lookup_locked(f32 alpha, f32 beta, bool sqrt_domain) {
+    for (const auto& e : g_curve_cache) {
+        // Exact float equality, matching the previous per-slot caches: these
+        // keys are derived deterministically from the same Config fields.
+        if (e->alpha == alpha && e->beta == beta && e->sqrt_domain == sqrt_domain)
+            return &e->nc;
+    }
+    return nullptr;
+}
+
+// Build every requested key that is not cached yet, in ONE batch so their
+// Monte-Carlo bins share a single parallel dispatch. Caller holds g_curve_mu.
+static void curve_build_missing_locked(const f32* alphas, const f32* betas,
+                                       const bool* sqrts, int n) {
+    std::vector<CurveCacheEntry*> fresh;
+    std::vector<CurveBuildSpec> specs;
+    fresh.reserve((size_t)n);
+    specs.reserve((size_t)n);
+
+    for (int i = 0; i < n; ++i) {
+        if (curve_lookup_locked(alphas[i], betas[i], sqrts[i])) continue;
+        // Another entry queued in this same call with the same key.
+        bool dup = false;
+        for (CurveCacheEntry* f : fresh) {
+            if (f->alpha == alphas[i] && f->beta == betas[i] &&
+                f->sqrt_domain == sqrts[i]) { dup = true; break; }
+        }
+        if (dup) continue;
+        g_curve_cache.push_back(std::unique_ptr<CurveCacheEntry>(new CurveCacheEntry()));
+        CurveCacheEntry* e = g_curve_cache.back().get();
+        e->alpha = alphas[i];
+        e->beta = betas[i];
+        e->sqrt_domain = sqrts[i];
+        fresh.push_back(e);
+    }
+    if (fresh.empty()) return;
+
+    for (CurveCacheEntry* e : fresh) {
+        CurveBuildSpec spec;
+        spec.out = &e->nc;
+        spec.alpha = e->alpha;
+        spec.beta = e->beta;
+        spec.sqrt_domain = e->sqrt_domain;
+        specs.push_back(spec);
+    }
+    build_noise_curves_batch(specs.data(), (int)specs.size());
+}
+
+static const NoiseCurves& noise_curves_cached(f32 alpha, f32 beta, bool sqrt_domain) {
+    std::lock_guard<std::mutex> lk(g_curve_mu);
+    if (const NoiseCurves* hit = curve_lookup_locked(alpha, beta, sqrt_domain))
+        return *hit;
+    curve_build_missing_locked(&alpha, &beta, &sqrt_domain, 1);
+    const NoiseCurves* built = curve_lookup_locked(alpha, beta, sqrt_domain);
+    // curve_build_missing_locked always appends on a miss; the fallback keeps
+    // the reference valid rather than dereferencing null if that ever changes.
+    static const NoiseCurves kEmpty;
+    return built ? *built : kEmpty;
 }
 
 static const NoiseCurves& make_noise_curves(f32 alpha, f32 beta) {
-    // Cache like Python (curves built once per alpha/beta, reused every frame).
-    static NoiseCurves cached;
-    static f32 cached_alpha = std::numeric_limits<f32>::quiet_NaN();
-    static f32 cached_beta  = std::numeric_limits<f32>::quiet_NaN();
-    if (alpha == cached_alpha && beta == cached_beta)
-        return cached;
-    cached = build_noise_curves(alpha, beta);
-    cached_alpha = alpha;
-    cached_beta = beta;
-    return cached;
+    return noise_curves_cached(alpha, beta, /*sqrt_domain=*/false);
 }
 
 static const NoiseCurves& make_noise_curves(const Config& cfg) {
@@ -379,20 +534,10 @@ static const NoiseCurves& make_noise_curves(const Config& cfg) {
 // checks against the reference implementation), so every channel shares
 // that one curve, same as before this function existed.
 static const NoiseCurves& make_noise_curves_channel(f32 alpha, f32 beta, int ch) {
-    static NoiseCurves cached[3];
-    static f32 cached_alpha[3] = {std::numeric_limits<f32>::quiet_NaN(),
-                                  std::numeric_limits<f32>::quiet_NaN(),
-                                  std::numeric_limits<f32>::quiet_NaN()};
-    static f32 cached_beta[3] = {std::numeric_limits<f32>::quiet_NaN(),
-                                 std::numeric_limits<f32>::quiet_NaN(),
-                                 std::numeric_limits<f32>::quiet_NaN()};
-    ch = std::max(0, std::min(2, ch));
-    if (alpha == cached_alpha[ch] && beta == cached_beta[ch])
-        return cached[ch];
-    cached[ch] = build_noise_curves(alpha, beta);
-    cached_alpha[ch] = alpha;
-    cached_beta[ch] = beta;
-    return cached[ch];
+    // ch is no longer a cache dimension: the shared table keys on
+    // (alpha, beta, sqrt_domain), which is all the channel index ever selected.
+    (void)ch;
+    return noise_curves_cached(alpha, beta, /*sqrt_domain=*/false);
 }
 
 static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
@@ -406,27 +551,11 @@ static const NoiseCurves& make_noise_curves_channel(const Config& cfg, int ch) {
 // per-channel), so the robustness curves live in the sqrt domain while the
 // linear curves SNR/kernel tuning share stay untouched.
 static const NoiseCurves& make_noise_curves_sqrt(f32 alpha, f32 beta) {
-    static NoiseCurves cached;
-    static f32 ca = std::numeric_limits<f32>::quiet_NaN();
-    static f32 cb = std::numeric_limits<f32>::quiet_NaN();
-    if (alpha == ca && beta == cb) return cached;
-    cached = build_noise_curves(alpha, beta, /*sqrt_domain=*/true);
-    ca = alpha; cb = beta;
-    return cached;
+    return noise_curves_cached(alpha, beta, /*sqrt_domain=*/true);
 }
 static const NoiseCurves& make_noise_curves_channel_sqrt(f32 alpha, f32 beta, int ch) {
-    static NoiseCurves cached[3];
-    static f32 ca[3] = {std::numeric_limits<f32>::quiet_NaN(),
-                        std::numeric_limits<f32>::quiet_NaN(),
-                        std::numeric_limits<f32>::quiet_NaN()};
-    static f32 cb[3] = {std::numeric_limits<f32>::quiet_NaN(),
-                        std::numeric_limits<f32>::quiet_NaN(),
-                        std::numeric_limits<f32>::quiet_NaN()};
-    ch = std::max(0, std::min(2, ch));
-    if (alpha == ca[ch] && beta == cb[ch]) return cached[ch];
-    cached[ch] = build_noise_curves(alpha, beta, /*sqrt_domain=*/true);
-    ca[ch] = alpha; cb[ch] = beta;
-    return cached[ch];
+    (void)ch;   // see make_noise_curves_channel
+    return noise_curves_cached(alpha, beta, /*sqrt_domain=*/true);
 }
 
 // Mask-only variants: honour Config::debug_noise_model_disabled by building
@@ -500,6 +629,71 @@ void fetch_noise_curves_channel(const Config& cfg, int ch,
     const NoiseCurves& nc = mask_noise_curves_channel(cfg, ch);
     std_curve = nc.std_curve;
     diff_curve = nc.diff_curve;
+}
+
+// Build every noise curve this burst will ask for, in one batch, ahead of the
+// stage that needs it.
+//
+// This is the largest single cost in the burst and it used to land on the first
+// comparison frame: ~1.8 million seeded Gaussian draws per brightness bin,
+// over the ~70 non-linear bins (more at high ISO), once per guide channel,
+// plus the linear curve noise_std_at_brightness needs for the status line.
+// Neither was inside a profiler bucket.
+//
+// It is also why repeat shots were fast and the first shot at a new ISO was
+// slow: the cache key is the WB-scaled per-channel alpha/beta, so any change
+// in ISO or white balance was a miss.
+//
+// Nothing here depends on pixel data -- only on the reference frame's
+// NoiseProfile and white balance -- so the caller runs it on a background
+// thread as soon as the reference metadata is known, and it overlaps the
+// reference grey, pyramid, statistics and kernels. The cache lock makes the
+// first comparison frame wait for this rather than duplicate it.
+//
+// Idempotent, and bit-identical to building the curves lazily: same keys, same
+// per-bin seeds, same arithmetic.
+void prewarm_noise_curves(const Config& cfg) {
+    // Mirror exactly which keys the burst requests. Order does not matter --
+    // the batch dedupes -- but the set has to match, or a curve still builds
+    // on the shutter path.
+    // The linear curve goes first, in its own lock scope. The pipeline thread
+    // asks for it within milliseconds of this starting -- the status line calls
+    // noise_std_at_brightness, and so does tune_config_snr when SNR auto-tuning
+    // is on -- and it must not end up waiting behind the three mask curves it
+    // does not need. One batch under one lock would have done exactly that.
+    {
+        const f32 a0 = cfg.noise_alpha();
+        const f32 b0 = cfg.noise_beta();
+        const bool sq0 = false;
+        std::lock_guard<std::mutex> lk(g_curve_mu);
+        curve_build_missing_locked(&a0, &b0, &sq0, 1);
+    }
+
+    // The mask's curves: mask_noise_curves_channel / mask_noise_curves. Not
+    // needed until the first comparison frame is scored, which is several
+    // hundred milliseconds of reference work away.
+    f32 a[4], b[4];
+    bool sq[4];
+    int n = 0;
+    const bool msq = cfg.robustness_guide_sqrt;
+    if (cfg.debug_noise_model_disabled) {
+        a[n] = 0.f; b[n] = 0.f; sq[n] = msq; ++n;
+    } else if (cfg.bayer_mode) {
+        for (int ch = 0; ch < 3; ++ch) {
+            a[n] = cfg.noise_alpha_ch_robustness(ch);
+            b[n] = cfg.noise_beta_ch_robustness(ch);
+            sq[n] = msq;
+            ++n;
+        }
+    } else {
+        a[n] = cfg.noise_alpha_robustness();
+        b[n] = cfg.noise_beta_robustness();
+        sq[n] = msq;
+        ++n;
+    }
+
+    std::lock_guard<std::mutex> lk(g_curve_mu);
+    curve_build_missing_locked(a, b, sq, n);
 }
 
 // Not in the anonymous namespace below: neural_flow's caller (pipeline_paths.cpp)

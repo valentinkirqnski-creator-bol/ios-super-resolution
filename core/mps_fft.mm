@@ -168,17 +168,20 @@ bool build_plan(int h, int w) {
 }
 
 API_AVAILABLE(ios(16.0), macos(13.0))
-bool ensure_buffers(size_t n, bool caller_supplies_output) {
+bool ensure_buffers(size_t n, bool caller_supplies_output,
+                    bool caller_supplies_input) {
+    const bool have_in = caller_supplies_input || g_in_buf != nil;
     const bool have_out = caller_supplies_output || g_out_buf != nil;
-    if (g_in_buf && have_out && g_buf_elems >= n) return true;
+    if (have_in && have_out && g_buf_elems >= n) return true;
     const size_t bytes = n * sizeof(float);
-    if (!g_in_buf || g_buf_elems < n)
+    if (!caller_supplies_input && (!g_in_buf || g_buf_elems < n))
         g_in_buf = [g_device newBufferWithLength:bytes
                                          options:MTLResourceStorageModeShared];
     if (!caller_supplies_output && (!g_out_buf || g_buf_elems < n))
         g_out_buf = [g_device newBufferWithLength:bytes
                                           options:MTLResourceStorageModeShared];
-    if (!g_in_buf || (!caller_supplies_output && !g_out_buf)) {
+    if ((!caller_supplies_input && !g_in_buf) ||
+        (!caller_supplies_output && !g_out_buf)) {
         g_in_buf = nil;
         g_out_buf = nil;
         g_buf_elems = 0;
@@ -189,7 +192,8 @@ bool ensure_buffers(size_t n, bool caller_supplies_output) {
 }
 
 API_AVAILABLE(ios(16.0), macos(13.0))
-bool run_plan(const float* in, float* out, int h, int w, id<MTLBuffer> dst) {
+bool run_plan(const float* in, float* out, int h, int w,
+              id<MTLBuffer> dst, id<MTLBuffer> src) {
     if (!build_plan(h, w)) return false;
 
     MPSGraph* graph = (__bridge MPSGraph*)g_plan.graph;
@@ -197,15 +201,22 @@ bool run_plan(const float* in, float* out, int h, int w, id<MTLBuffer> dst) {
     MPSGraphTensor* outT = (__bridge MPSGraphTensor*)g_plan.out;
 
     const size_t n = (size_t)h * (size_t)w;
-    if (!ensure_buffers(n, dst != nil)) return false;
-    memcpy([g_in_buf contents], in, n * sizeof(float));
+    if (!ensure_buffers(n, dst != nil, src != nil)) return false;
+    // Read the caller's buffer when it supplied one; g_in_buf is then never
+    // allocated and the 48.8MB host copy never happens.
+    id<MTLBuffer> inBuf = src ? src : g_in_buf;
+    if (!inBuf || [inBuf length] < n * sizeof(float)) return false;
+    if (!src) {
+        if (!in) return false;
+        memcpy([g_in_buf contents], in, n * sizeof(float));
+    }
     // Write into the caller's buffer when it supplied one; g_out_buf is then
     // never allocated at all.
     id<MTLBuffer> outBuf = dst ? dst : g_out_buf;
     if (!outBuf || [outBuf length] < n * sizeof(float)) return false;
 
     MPSGraphTensorData* inData =
-        [[MPSGraphTensorData alloc] initWithMTLBuffer:g_in_buf
+        [[MPSGraphTensorData alloc] initWithMTLBuffer:inBuf
                                                 shape:@[ @(h), @(w) ]
                                              dataType:MPSDataTypeFloat32];
     MPSGraphTensorData* outData =
@@ -222,7 +233,9 @@ bool run_plan(const float* in, float* out, int h, int w, id<MTLBuffer> dst) {
                  targetOperations:nil
                 resultsDictionary:@{ outT : outData }];
 
-    memcpy(out, [outBuf contents], n * sizeof(float));
+    // Only when the caller actually wants the plane on the host. A resident frame
+    // does not: align_metal reads the same buffer.
+    if (out) memcpy(out, [outBuf contents], n * sizeof(float));
     return true;
 }
 
@@ -241,7 +254,7 @@ void mps_fft_prewarm(int h, int w) {
         }
         @autoreleasepool {
             (void)build_plan(h, w);
-            (void)ensure_buffers((size_t)h * (size_t)w, false);
+            (void)ensure_buffers((size_t)h * (size_t)w, false, false);
         }
     }
 }
@@ -286,8 +299,9 @@ void mps_fft_release_all() {
 }
 
 bool mps_grey_lowpass(const float* in, float* out, int h, int w,
-                      void* out_mtl_buffer) {
-    if (!in || !out || h <= 0 || w <= 0) return false;
+                      void* out_mtl_buffer, void* in_mtl_buffer) {
+    if (h <= 0 || w <= 0) return false;
+    if (!in && !in_mtl_buffer) return false;
     // Even dimensions only, matching the Stockham caller: the shift the mask is
     // derived from assumes them, and Bayer RAW is always even.
     if ((h & 1) || (w & 1)) return false;
@@ -302,7 +316,9 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w,
             if (!g_queue) return false;
         }
         @autoreleasepool {
-            return run_plan(in, out, h, w, (__bridge id<MTLBuffer>)out_mtl_buffer);
+            return run_plan(in, out, h, w,
+                            (__bridge id<MTLBuffer>)out_mtl_buffer,
+                            (__bridge id<MTLBuffer>)in_mtl_buffer);
         }
     }
     return false;
@@ -313,7 +329,7 @@ bool mps_grey_lowpass(const float* in, float* out, int h, int w,
 void mps_fft_prewarm(int, int) {}
 void mps_fft_release_all() {}
 void mps_fft_release_buffers() {}
-bool mps_grey_lowpass(const float*, float*, int, int, void*) { return false; }
+bool mps_grey_lowpass(const float*, float*, int, int, void*, void*) { return false; }
 
 #endif
 

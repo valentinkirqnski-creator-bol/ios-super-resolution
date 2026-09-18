@@ -9,10 +9,15 @@ using namespace metal;
 constant float PI = 3.14159265358979323846f;
 
 struct RawDecodeParams {
+    // h, w are the OUTPUT (cropped) extent; src_y0/src_x0 are the crop origin in
+    // the source plane. Both origins are forced even by the host, so the CFA
+    // phase of the output matches the source and `site` below is the same colour
+    // the uncropped decode would have read.
     uint h, w, stride_shorts, _pad0;
     float4 black;
     float4 denom;
     float4 wb;
+    uint src_y0, src_x0, _pad1, _pad2;
 };
 
 kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
@@ -21,7 +26,7 @@ kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
                                  uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint site = ((gid.y & 1u) << 1u) | (gid.x & 1u);
-    ushort rawv = raw[gid.y * p.stride_shorts + gid.x];
+    ushort rawv = raw[(p.src_y0 + gid.y) * p.stride_shorts + (p.src_x0 + gid.x)];
     float v = (float(rawv) - p.black[site]) / p.denom[site];
     v *= p.wb[site];
     if (!isfinite(v)) v = 0.f;
@@ -858,8 +863,20 @@ struct MergeCompParams {
     // conversion below (was _pad0).
     uint raw_res_robustness;
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad1)
-    uint _pad2;
+    // Number of floats in one covariance entry: 4 for the legacy xx,xy,yx,yy
+    // layout, 3 for xx,xy,yy. yx was written as a duplicate of xy and never
+    // read, so dropping it is a stride change with identical values.
+    uint cov_stride;
     uint _pad3;
+    // Element (not byte) offsets into the burst-wide image / flow / covariance /
+    // robustness buffers. Every comparison frame writes its analysis output into
+    // a slice of one allocation, so the merge binds four buffers however long the
+    // burst is and reaches each frame by offset -- which is what lets all of them
+    // share a single accumulation in registers.
+    uint img_off;
+    uint flow_off;
+    uint cov_off;
+    uint rob_off;
 };
 
 struct MergeRefParams {
@@ -890,6 +907,10 @@ struct MergeRefParams {
     // robustness_raw_resolution_active) -- skip the guide-scale conversion
     // below (was _pad0).
     uint raw_res_robustness;
+    uint cov_stride;    // see MergeCompParams::cov_stride
+    uint _pad1;
+    uint _pad2;
+    uint _pad3;         // 112 bytes, a multiple of 16 for setBytes
 };
 
 // std::lround half-away-from-zero.
@@ -897,8 +918,14 @@ inline int lround_away(float x) {
     return (x >= 0.f) ? int(floor(x + 0.5f)) : int(ceil(x - 0.5f));
 }
 
-inline float cov_at(device const float* covs, uint cov_w, int y, int x, int idx) {
-    return covs[(uint(y) * cov_w + uint(x)) * 4u + uint(idx)];
+// idx is the LOGICAL index into xx,xy,yx,yy. With stride 3 the stored layout is
+// xx,xy,yy, so yy moves from 3 to 2 and yx (2) resolves to xy (1) -- which is
+// what it always held.
+inline float cov_at(device const float* covs, uint cov_w, uint stride,
+                    int y, int x, int idx) {
+    uint slot = uint(idx);
+    if (stride == 3u) slot = (idx == 3) ? 2u : ((idx == 2) ? 1u : uint(idx));
+    return covs[(uint(y) * cov_w + uint(x)) * stride + slot];
 }
 
 inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& iyy) {
@@ -918,13 +945,13 @@ inline void soften_inv_cov(thread float& ixx, thread float& ixy, thread float& i
     iyy *= s;
 }
 
-inline float cov_lerp2(device const float* covs, uint cov_w,
+inline float cov_lerp2(device const float* covs, uint cov_w, uint stride,
                        int fy, int fx, int cy, int cx,
                        float frac_x, float frac_y, int idx) {
-    float tl = cov_at(covs, cov_w, fy, fx, idx);
-    float tr = cov_at(covs, cov_w, fy, cx, idx);
-    float bl = cov_at(covs, cov_w, cy, fx, idx);
-    float br = cov_at(covs, cov_w, cy, cx, idx);
+    float tl = cov_at(covs, cov_w, stride, fy, fx, idx);
+    float tr = cov_at(covs, cov_w, stride, fy, cx, idx);
+    float bl = cov_at(covs, cov_w, stride, cy, fx, idx);
+    float br = cov_at(covs, cov_w, stride, cy, cx, idx);
     float top = tl + frac_x * (tr - tl);
     float bot = bl + frac_x * (br - bl);
     return top + frac_y * (bot - top);
@@ -932,9 +959,11 @@ inline float cov_lerp2(device const float* covs, uint cov_w,
 
 // raw_det=true -> accumulate (comp); false -> accumulate_ref
 inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
+                           uint cov_stride,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
                            bool raw_det) {
+    const uint stride = (cov_stride == 3u) ? 3u : 4u;
     float frac_x = kmap_j - trunc(kmap_j);
     float frac_y = kmap_i - trunc(kmap_i);
     int fx, fy;
@@ -948,9 +977,9 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     int cx = min(fx + 1, int(cov_w) - 1);
     int cy = min(fy + 1, int(cov_h) - 1);
 
-    float xx = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 0);
-    float xy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 1);
-    float yy = cov_lerp2(covs, cov_w, fy, fx, cy, cx, frac_x, frac_y, 3);
+    float xx = cov_lerp2(covs, cov_w, stride, fy, fx, cy, cx, frac_x, frac_y, 0);
+    float xy = cov_lerp2(covs, cov_w, stride, fy, fx, cy, cx, frac_x, frac_y, 1);
+    float yy = cov_lerp2(covs, cov_w, stride, fy, fx, cy, cx, frac_x, frac_y, 3);
     if (raw_det) {
         float det = xx * yy - xy * xy;
         if (fabs(det) > 1e-10f) {
@@ -1118,7 +1147,8 @@ static inline void merge_comp_contrib(device const float* img,
             kmap_j = lr_mov_x - 0.5f;
             kmap_i = lr_mov_y - 0.5f;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, true);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, p.cov_stride,
+                       kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
     int center_j = lround_away(lr_mov_x);
@@ -1238,17 +1268,25 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     if (nch >= 3) { num[base + 2] = n2; den[base + 2] = e2; }
 }
 
-kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
-                                 device float* den [[buffer(1)]],
-                                 device const float* img [[buffer(2)]],
-                                 device const float* covs [[buffer(3)]],
-                                 device const float* acc_rob [[buffer(4)]],
-                                 constant MergeRefParams& p [[buffer(5)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
-    uint hr_j = gid.x;
-    uint local_i = gid.y;
-    if (hr_j >= p.Ws || local_i >= p.band_h) return;
-
+// Alg. 11 -- merge.cpp accumulate_ref, for one output pixel.
+//
+// Extracted verbatim from merge_accumulate_ref so the single-frame kernel and
+// the fused band kernel share one copy of the math, exactly as
+// merge_comp_contrib does for the comparison side. The nine (or (2rad+1)^2)
+// taps land in locals and are added to the caller's running totals once, at
+// the end, so the caller sees the same val/acc it would have had from a
+// separate dispatch.
+//
+// overwrite_out carries accumulate_ref's overwrite rule back to the caller; it
+// can only be true when p.robustness_denoise != 0, which the host never sets.
+static inline void merge_ref_contrib(device const float* img,
+                                     device const float* covs,
+                                     device const float* acc_rob,
+                                     constant MergeRefParams& p,
+                                     uint hr_j, uint local_i,
+                                     thread float& n0, thread float& n1, thread float& n2,
+                                     thread float& d0, thread float& d1, thread float& d2,
+                                     thread bool& overwrite_out) {
     int hr_i = int(p.y0 + local_i);
     float coarse_x = float(hr_j) / p.scale;
     float coarse_y = float(hr_i) / p.scale;
@@ -1307,7 +1345,8 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
             kmap_j = coarse_x;
             kmap_i = coarse_y;
         }
-        interp_inv_cov(covs, p.cov_h, p.cov_w, kmap_i, kmap_j, ixx, ixy, iyy, false);
+        interp_inv_cov(covs, p.cov_h, p.cov_w, p.cov_stride,
+                       kmap_i, kmap_j, ixx, ixy, iyy, false);
     }
 
     int center_j = int(round(coarse_x));
@@ -1340,8 +1379,29 @@ kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
 
     // See the matching note in accumulate_ref: the overwrite belongs to the
     // reference's step, and the adaptive path always accumulates.
-    bool overwrite = p.adaptive == 0u && p.robustness_denoise &&
-                     (local_acc_r < p.max_frame_count);
+    overwrite_out = p.adaptive == 0u && p.robustness_denoise &&
+                    (local_acc_r < p.max_frame_count);
+    n0 += val0; n1 += val1; n2 += val2;
+    d0 += acc0; d1 += acc1; d2 += acc2;
+}
+
+kernel void merge_accumulate_ref(device float* num [[buffer(0)]],
+                                 device float* den [[buffer(1)]],
+                                 device const float* img [[buffer(2)]],
+                                 device const float* covs [[buffer(3)]],
+                                 device const float* acc_rob [[buffer(4)]],
+                                 constant MergeRefParams& p [[buffer(5)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    uint hr_j = gid.x;
+    uint local_i = gid.y;
+    if (hr_j >= p.Ws || local_i >= p.band_h) return;
+
+    float val0 = 0.f, val1 = 0.f, val2 = 0.f;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    bool overwrite = false;
+    merge_ref_contrib(img, covs, acc_rob, p, hr_j, local_i,
+                      val0, val1, val2, acc0, acc1, acc2, overwrite);
+
     uint base = (local_i * p.Ws + hr_j) * p.nch;
     if (overwrite) {
         if (p.nch >= 1) { num[base + 0] = val0; den[base + 0] = acc0; }
@@ -1364,7 +1424,8 @@ struct KernelEstParams {
     uint selection; // 0 = hard_threshold (460-main), 1 = linear (1.4 default)
     float alpha, beta;
     float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-    uint _pad0, _pad1; // 64 bytes total for setBytes
+    uint cov_stride;   // 3 = xx,xy,yy (default); 4 = legacy xx,xy,yx,yy
+    uint _pad1;        // 64 bytes total for setBytes
 };
 
 inline float gat_sample(float v, float alpha, float beta) {
@@ -1508,11 +1569,19 @@ kernel void kernel_estimate_cov(device float* covs [[buffer(0)]],
     compute_k_cpu(l[0], l[1], k1, k2, p);
 
     float k1s = k1 * k1, k2s = k2 * k2;
-    uint base = (gid.y * p.grey_w + gid.x) * 4u;
-    covs[base + 0u] = k1s * e1[0] * e1[0] + k2s * e2[0] * e2[0];
-    covs[base + 1u] = k1s * e1[0] * e1[1] + k2s * e2[0] * e2[1];
-    covs[base + 2u] = covs[base + 1u];
-    covs[base + 3u] = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1];
+    const uint stride = (p.cov_stride == 3u) ? 3u : 4u;
+    uint base = (gid.y * p.grey_w + gid.x) * stride;
+    const float xx = k1s * e1[0] * e1[0] + k2s * e2[0] * e2[0];
+    const float xy = k1s * e1[0] * e1[1] + k2s * e2[0] * e2[1];
+    const float yy = k1s * e1[1] * e1[1] + k2s * e2[1] * e2[1];
+    covs[base + 0u] = xx;
+    covs[base + 1u] = xy;
+    if (stride == 4u) {
+        covs[base + 2u] = xy;   // yx, a duplicate of xy; never read
+        covs[base + 3u] = yy;
+    } else {
+        covs[base + 2u] = yy;
+    }
 }
 
 // =============================================================================
@@ -2232,6 +2301,21 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     R[out_o] = r_val;
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
+}
+
+kernel void rob_row_activity(device uint* rows [[buffer(0)]],
+                             device const float* R [[buffer(1)]],
+                             constant RobStatsParams& p [[buffer(2)]],
+                             uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.h) return;
+    const uint nch = max(1u, p.nch);
+    const uint base = gid * p.w * nch;
+    const uint count = p.w * nch;
+    uint any = 0u;
+    for (uint i = 0u; i < count; ++i) {
+        if (R[base + i] != 0.f) { any = 1u; break; }
+    }
+    rows[gid] = any;
 }
 
 kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
@@ -3037,6 +3121,16 @@ struct MergeNormParams {
     float wb0, wb1, wb2;
     float m00, m01, m02, m10, m11, m12, m20, m21, m22;
     float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
+    // Preview grid, for the fused kernel only. The host thumbnail used to be
+    // sampled from num/den, which the fused path never stores, so the sampled
+    // pixels' NORMALIZED camera RGB is written out here instead and the host
+    // applies the same colour transform, curve and LUT it always did.
+    // prev_step == 0 disables it (the standalone normalise kernel never sets it).
+    uint y0;
+    uint prev_step;
+    uint prev_h, prev_w;
+    float prev_scale;
+    uint _pad0, _pad1, _pad2, _pad3;   // 112 bytes, a multiple of 16 for setBytes
 };
 
 inline float norm_to_srgb(float v) {
@@ -3044,24 +3138,23 @@ inline float norm_to_srgb(float v) {
     return v <= 0.0031308f ? 12.92f * v : 1.055f * pow(v, 1.f / 2.4f) - 0.055f;
 }
 
-kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
-                                  device const float* den [[buffer(1)]],
-                                  device ushort* out [[buffer(2)]],
-                                  constant MergeNormParams& p [[buffer(3)]],
-                                  uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.Ws || gid.y >= p.bh) return;
-    uint pi = (gid.y * p.Ws + gid.x) * p.nch;
-    float d0 = den[pi];
-    float cn0 = (d0 > 0.f) ? num[pi] / d0 : 0.f;
+// num/den -> three 16-bit output samples. Extracted from
+// merge_normalize_rgb16 so the fused band kernel below, which never stores
+// num/den at all, runs the identical arithmetic on the values it already holds
+// in registers.
+inline void merge_norm_pixel(float n0, float n1, float n2,
+                             float d0, float d1, float d2,
+                             constant MergeNormParams& p,
+                             thread ushort& o0, thread ushort& o1, thread ushort& o2,
+                             thread float& out_cn0, thread float& out_cn1,
+                             thread float& out_cn2) {
+    float cn0 = (d0 > 0.f) ? n0 / d0 : 0.f;
     float cn1 = 0.f, cn2 = 0.f;
-    if (p.nch >= 2u) {
-        float d1 = den[pi + 1u];
-        cn1 = (d1 > 0.f) ? num[pi + 1u] / d1 : 0.f;
-    }
-    if (p.nch >= 3u) {
-        float d2 = den[pi + 2u];
-        cn2 = (d2 > 0.f) ? num[pi + 2u] / d2 : 0.f;
-    }
+    if (p.nch >= 2u) cn1 = (d1 > 0.f) ? n1 / d1 : 0.f;
+    if (p.nch >= 3u) cn2 = (d2 > 0.f) ? n2 / d2 : 0.f;
+    out_cn0 = cn0;
+    out_cn1 = cn1;
+    out_cn2 = cn2;
     float lin0, lin1, lin2;
     if (p.bake != 0u && p.nch >= 3u) {
         float wr = cn0 * p.wb0, wg = cn1 * p.wb1, wb = cn2 * p.wb2;
@@ -3076,8 +3169,138 @@ kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
     float v0 = (p.bake != 0u) ? norm_to_srgb(lin0) : clamp(lin0 * p.sg0, 0.f, 1.f);
     float v1 = (p.bake != 0u) ? norm_to_srgb(lin1) : clamp(lin1 * p.sg1, 0.f, 1.f);
     float v2 = (p.bake != 0u) ? norm_to_srgb(lin2) : clamp(lin2 * p.sg2, 0.f, 1.f);
+    o0 = ushort(v0 * 65535.f + 0.5f);
+    o1 = ushort(v1 * 65535.f + 0.5f);
+    o2 = ushort(v2 * 65535.f + 0.5f);
+}
+
+kernel void merge_normalize_rgb16(device const float* num [[buffer(0)]],
+                                  device const float* den [[buffer(1)]],
+                                  device ushort* out [[buffer(2)]],
+                                  constant MergeNormParams& p [[buffer(3)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.Ws || gid.y >= p.bh) return;
+    uint pi = (gid.y * p.Ws + gid.x) * p.nch;
+    float n1 = 0.f, n2 = 0.f, d1 = 0.f, d2 = 0.f;
+    if (p.nch >= 2u) { n1 = num[pi + 1u]; d1 = den[pi + 1u]; }
+    if (p.nch >= 3u) { n2 = num[pi + 2u]; d2 = den[pi + 2u]; }
+    ushort o0, o1, o2;
+    float cn0, cn1, cn2;
+    merge_norm_pixel(num[pi], n1, n2, den[pi], d1, d2, p, o0, o1, o2, cn0, cn1, cn2);
     uint o = (gid.y * p.Ws + gid.x) * 3u;
-    out[o + 0u] = ushort(v0 * 65535.f + 0.5f);
-    out[o + 1u] = ushort(v1 * 65535.f + 0.5f);
-    out[o + 2u] = ushort(v2 * 65535.f + 0.5f);
+    out[o + 0u] = o0;
+    out[o + 1u] = o1;
+    out[o + 2u] = o2;
+}
+
+// Accumulator health counters, laid out to match AccumDiag in merge.cpp:
+//   0-2   den_zero[3]        3-5   den_tiny[3]
+//   6-8   den_nonfinite[3]   9-11  num_nonfinite[3]
+//   12    only_green         13    rgb_all_zero
+// `pixels` is simply the band size and is filled in on the host. Only anomalies
+// increment, so a healthy burst pays nothing, and every field is a count, so
+// dispatch order cannot change the result.
+inline void merge_diag_count(device atomic_uint* diag, uint nch,
+                             float n0, float n1, float n2,
+                             float d0, float d1, float d2) {
+    float nv[3] = {n0, n1, n2};
+    float dv[3] = {d0, d1, d2};
+    const uint c = min(nch, 3u);
+    for (uint ch = 0u; ch < c; ++ch) {
+        if (!isfinite(nv[ch]))
+            atomic_fetch_add_explicit(&diag[9u + ch], 1u, memory_order_relaxed);
+        if (!isfinite(dv[ch]))
+            atomic_fetch_add_explicit(&diag[6u + ch], 1u, memory_order_relaxed);
+        else if (dv[ch] == 0.f)
+            atomic_fetch_add_explicit(&diag[ch], 1u, memory_order_relaxed);
+        else if (dv[ch] > 0.f && dv[ch] < 1e-12f)
+            atomic_fetch_add_explicit(&diag[3u + ch], 1u, memory_order_relaxed);
+    }
+    if (nch >= 3u) {
+        if (dv[0] == 0.f && dv[1] == 0.f && dv[2] == 0.f)
+            atomic_fetch_add_explicit(&diag[13u], 1u, memory_order_relaxed);
+        else if (dv[0] == 0.f && dv[1] > 0.f && dv[2] == 0.f)
+            atomic_fetch_add_explicit(&diag[12u], 1u, memory_order_relaxed);
+    }
+}
+
+// One band of the output, every comparison frame and the reference, normalised
+// and written as 16-bit rows -- in a single dispatch.
+//
+// The accumulators never reach memory. Banded merging used to read and rewrite
+// num/den once per fused group of four frames plus once for the reference, and
+// online merging once per frame over the WHOLE output: at 48MP that is 2.34GB of
+// traffic per pass. Here they are registers, so the band costs its gathers and
+// 22.5MB of output rows, and the full-size accumulator stops existing.
+//
+// Bit-identical to the per-dispatch form: the accumulation order per output
+// pixel is unchanged -- comparison frames in index order, then the reference --
+// and merge_comp_contrib / merge_ref_contrib / merge_norm_pixel are the same
+// code the other kernels call. A float32 stored to memory and reloaded is exact,
+// which is why removing those round trips cannot move a value.
+//
+// Every frame reads from a slice of one shared buffer (see
+// MergeCompParams::img_off and friends), so the binding count does not grow with
+// burst length. The host refuses this path when a reference overwrite could fire
+// (p.robustness_denoise != 0), because discarding the comparison contributions
+// mid-accumulation has no meaning once they are already summed in registers.
+kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
+                             constant MergeCompParams* ps  [[buffer(1)]],
+                             constant uint& nframes        [[buffer(2)]],
+                             device const float* imgs      [[buffer(3)]],
+                             device const float* flows     [[buffer(4)]],
+                             device const float* covs      [[buffer(5)]],
+                             device const float* robs      [[buffer(6)]],
+                             constant MergeRefParams& rp   [[buffer(7)]],
+                             device const float* ref_img   [[buffer(8)]],
+                             device const float* ref_cov   [[buffer(9)]],
+                             device const float* ref_acc   [[buffer(10)]],
+                             constant MergeNormParams& np  [[buffer(11)]],
+                             device atomic_uint* diag      [[buffer(12)]],
+                             device float* prev            [[buffer(13)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= np.Ws || gid.y >= np.bh) return;
+    const uint hr_j = gid.x;
+    const uint local_i = gid.y;
+
+    float n0 = 0.f, n1 = 0.f, n2 = 0.f;
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f;
+
+    for (uint g = 0u; g < nframes; ++g) {
+        merge_comp_contrib(imgs + ps[g].img_off,
+                           flows + ps[g].flow_off,
+                           covs + ps[g].cov_off,
+                           robs + ps[g].rob_off,
+                           ps[g], hr_j, local_i,
+                           n0, n1, n2, d0, d1, d2);
+    }
+
+    bool overwrite = false;
+    merge_ref_contrib(ref_img, ref_cov, ref_acc, rp, hr_j, local_i,
+                      n0, n1, n2, d0, d1, d2, overwrite);
+
+    merge_diag_count(diag, np.nch, n0, n1, n2, d0, d1, d2);
+
+    ushort o0, o1, o2;
+    float cn0, cn1, cn2;
+    merge_norm_pixel(n0, n1, n2, d0, d1, d2, np, o0, o1, o2, cn0, cn1, cn2);
+    const uint o = (local_i * np.Ws + hr_j) * 3u;
+    out16[o + 0u] = o0;
+    out16[o + 1u] = o1;
+    out16[o + 2u] = o2;
+
+    // Preview sample. Same predicate and same (py, px) mapping as the host loop
+    // in encode_band_rows_ptr -- absolute output row, both indices truncated --
+    // so the thumbnail is built from the same pixels it always was.
+    if (np.prev_step != 0u) {
+        const uint gy = np.y0 + local_i;
+        if ((gy % np.prev_step) == 0u && (hr_j % np.prev_step) == 0u) {
+            const uint py = min(np.prev_h - 1u, uint(float(gy) * np.prev_scale));
+            const uint px = min(np.prev_w - 1u, uint(float(hr_j) * np.prev_scale));
+            const uint po = (py * np.prev_w + px) * 3u;
+            prev[po + 0u] = cn0;
+            prev[po + 1u] = cn1;
+            prev[po + 2u] = cn2;
+        }
+    }
 }

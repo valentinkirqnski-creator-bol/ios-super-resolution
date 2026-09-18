@@ -58,6 +58,8 @@ Image gaussian_blur(const Image& src, float sigma);
 
 // Circular pad so height/width are multiples of tile_size (alignment.init_alignment).
 Image pad_image_circular(const Image& img, int tile_size);
+// 0 when no padding is needed, so a caller can skip the (full-plane) copy.
+int pad_image_circular_amount(const Image& img, int tile_size);
 
 // ---- align.cpp ----------------------------------------------------------
 FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor,
@@ -108,6 +110,14 @@ void fetch_noise_curves(f32 alpha, f32 beta,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
 void fetch_noise_curves(const Config& cfg,
                         std::vector<f32>& std_curve, std::vector<f32>& diff_curve);
+
+// Build and cache every noise curve this Config's burst will request, in one
+// batch. Depends only on the reference frame's NoiseProfile and white balance,
+// so it can run on a background thread the moment those are known -- which is
+// the point: built lazily, it lands on the first comparison frame and is the
+// single largest cost in the burst. Idempotent, and bit-identical to the lazy
+// build (same keys, same per-bin RNG seeds).
+void prewarm_noise_curves(const Config& cfg);
 
 // Per-guide-channel counterpart: ch's curve is built from Config::
 // noise_alpha_ch(ch)/noise_beta_ch(ch) rather than the cross-channel mean.

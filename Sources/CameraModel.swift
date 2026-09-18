@@ -120,7 +120,12 @@ struct TuningParams: Equatable, Codable {
     /// band, 2 = always merge online. Online keeps memory flat in frame count
     /// but its accumulator scales with output pixels, so it is not always the
     /// smaller of the two.
-    var merge_arch: Int32 = 2   // always merge online
+    /// 0 = pick by working-set size, 1 = band, 2 = force online. Banded is the
+    /// default now that every frame stays GPU-resident: the fused band kernel
+    /// keeps num/den in registers, so it needs one 22.5MB output buffer where
+    /// online needs a 1.17GB accumulator at 48MP -- and the frames it holds
+    /// instead are ones the analysis already produced.
+    var merge_arch: Int32 = 1   // banded + fused
     /// Adapt the enlargement to the merged frame count instead of the
     /// reference implementation's step. Off reproduces the reference exactly.
     /// Run ICA after block matching on every pyramid level, as the reference
@@ -464,11 +469,13 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var exposureMaxSec: Double = 1.0 / 15.0
 
     static let minFrameCount = 2
-    /// Long bursts trade memory for noise reduction. The pipeline keeps each
-    /// analyzed frame GPU-resident, so residency grows roughly 110MB per
-    /// comparison frame at 12MP; past a point the early upload backs off to
-    /// spilling rather than risking jetsam (see pipeline_paths.cpp).
-    static let maxFrameCount = 15
+    /// Long bursts trade memory for noise reduction. The banded merge holds every
+    /// analyzed frame at once -- roughly 98MB per comparison frame at 12MP once
+    /// image, covariances and mask are counted -- so residency is linear in this
+    /// number. 10 keeps the peak inside the jetsam budget with headroom to spare;
+    /// 15 did not once the full-size accumulator was removed in favour of frame
+    /// residency.
+    static let maxFrameCount = 10
     private static let frameCountDefaultsKey = "FrameCount"
     private static let shutterSliderDefaultsKey = "ShutterSlider"
 
@@ -1778,6 +1785,9 @@ final class CameraModel: NSObject, ObservableObject {
                 // scheduled onto efficiency cores and preempted, which is
                 // exactly wrong for something the first capture blocks on.
                 DispatchQueue.global(qos: .userInitiated).async {
+                    // 62 compute pipeline states, built behind a once_flag whose
+                    // first caller used to be the shutter itself.
+                    SRBridge.prewarmGPU()
                     SRBridge.prewarmFFTWidth(Int(dims.width), height: Int(dims.height))
                 }
             }

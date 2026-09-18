@@ -84,6 +84,36 @@ struct MetalCtx {
     // size of the largest batch it transforms (the row pass: h*w complex).
     id<MTLBuffer> fft_pp = nil;
     size_t fft_pp_b = 0;
+    // Pooled preview samples for the fused merge (normalized camera RGB at the
+    // thumbnail's sampled pixels).
+    id<MTLBuffer> merge_prev = nil;
+    size_t merge_prev_b = 0;
+    // Pooled robustness temps for COMPARISON frames: the guide plane and its
+    // local mean/variance, 36.6MB each at 12MP, plus the mask before and after
+    // the 5x5 minimum. All four were freshly allocated per frame -- 183MB of
+    // allocate-and-touch on the same ~1.24 GB/s path as everything else.
+    //
+    // Deliberately not used for the reference: init_robustness PINS its means and
+    // variances for the whole burst (g_rob_ref_m / g_rob_ref_v), so those must not
+    // come from a pool the comparison frames then reuse.
+    id<MTLBuffer> rob_guide = nil, rob_means = nil, rob_vars = nil;
+    size_t rob_guide_b = 0, rob_means_b = 0, rob_vars_b = 0;
+    id<MTLBuffer> rob_mask = nil, rob_mask_min = nil;
+    size_t rob_mask_b = 0, rob_mask_min_b = 0;
+    // Pooled decode staging: the uint16 source (24.4MB at 12MP) and, when the
+    // frame is not resident, the float output. Both were freshly allocated per
+    // frame.
+    id<MTLBuffer> decode_raw16 = nil;
+    size_t decode_raw16_b = 0;
+    id<MTLBuffer> decode_out = nil;
+    size_t decode_out_b = 0;
+    // Pooled 16-bit output rows for the band normalise. Sized once to a band
+    // and reused, so the DNG writer reads the kernel's output in place instead
+    // of the accumulator being copied into fresh buffers every band.
+    // Two of them: the DNG writer reads one band in place while the GPU produces
+    // the next into the other.
+    id<MTLBuffer> norm_out[2] = {nil, nil};
+    size_t norm_out_b[2] = {0, 0};
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
@@ -104,6 +134,22 @@ struct MetalCtx {
     static constexpr int kIcaSlots = 8;   // pyramids here are 4 levels
     IcaRefSlot ica[kIcaSlots];
     int ica_next = 0;
+    // Block-matching uploads of the reference pyramid levels.
+    //
+    // The reference does not change inside a burst, but b_ref was re-uploaded
+    // for every level of every comparison frame: 48.8 + 12.2 + 0.76 + 0.05 MB
+    // per frame, 433MB across an 8-frame burst, of bytes already sitting in GPU
+    // memory. The ICA slots above hold the same pixels but are keyed on levels
+    // ICA actually refines, and with per-level ICA coarse-only the finest level
+    // is not among them -- hence a cache of its own.
+    struct RefLevelSlot {
+        const void* key = nullptr;
+        id<MTLBuffer> buf = nil;
+        size_t bytes = 0;
+    };
+    static constexpr int kRefLevelSlots = 8;
+    RefLevelSlot ref_level[kRefLevelSlots];
+    int ref_level_next = 0;
     bool ok = false;
 
     id<MTLComputePipelineState> pipe(const char* name) {
@@ -159,11 +205,12 @@ static MetalCtx& ctx() {
             "l2_pack_tiles", "l2_conj_mul", "l2_argmin", "fftshift2d_real",
             "pack_tile_rows", "take_rfft_half", "write_rfft_cols_from_half",
             "write_half_from_cols", "expand_half_to_full_rows", "extract_real_tiles",
-            "merge_accumulate_comp", "merge_accumulate_ref",
+            "merge_accumulate_comp", "merge_accumulate_ref", "merge_band_fused",
             "kernel_gat", "kernel_decimate_grey", "kernel_gradients", "kernel_estimate_cov",
             "rob_guide_bayer", "rob_local_stats_3x3", "rob_upscale_dogson",
             "rob_lowpass_gaussian5x5", "rob_hf_loss_adaptive",
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
+            "rob_row_activity",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
@@ -187,6 +234,33 @@ static id<MTLBuffer> buf(const void* data, size_t bytes) {
         b = [c.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     else
         b = [c.device newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
+    return b;
+}
+
+// Upload one reference pyramid level once per burst. Keyed on the host pointer
+// and byte count, the same identity prep_level_ica_gpu uses; both caches are
+// dropped together by metal_clear_ref_ica_cache / metal_trim_analyze_scratch.
+static id<MTLBuffer> ref_level_buffer(const Image& r) {
+    auto& c = ctx();
+    if (r.data.empty()) return nil;
+    const void* key = (const void*)r.data.data();
+    const size_t bytes = r.data.size() * sizeof(float);
+    for (int i = 0; i < MetalCtx::kRefLevelSlots; ++i) {
+        const auto& sl = c.ref_level[i];
+        if (sl.key == key && sl.buf && sl.bytes == bytes) return sl.buf;
+    }
+    id<MTLBuffer> b = buf(r.data.data(), bytes);
+    if (!b) return nil;
+    int slot = -1;
+    for (int i = 0; i < MetalCtx::kRefLevelSlots && slot < 0; ++i)
+        if (c.ref_level[i].key == key) slot = i;
+    if (slot < 0) {
+        slot = c.ref_level_next;
+        c.ref_level_next = (c.ref_level_next + 1) % MetalCtx::kRefLevelSlots;
+    }
+    c.ref_level[slot].key = key;
+    c.ref_level[slot].buf = b;
+    c.ref_level[slot].bytes = bytes;
     return b;
 }
 
@@ -816,13 +890,248 @@ static bool l2_chunk(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer>
 
 } // namespace
 
+
+// ---------------------------------------------------------------------------
+// GPU-resident comparison frames. See metal_gpu.h for why this exists.
+//
+// One allocation per resource, divided into per-frame slices. Producing kernels
+// are bound at slice_offset_bytes(), so none of them changed: a kernel that
+// writes out[y*w + x] writes into its own slice. The merge binds the whole
+// buffer and indexes with the element offset carried in MergeCompParams.
+//
+// Slice strides are rounded up to 256 bytes. setBuffer:offset: only needs 4-byte
+// alignment on Apple silicon, but 256 keeps every slice on a cache-line and
+// page-friendly boundary, and the rounding is invisible to the kernels because
+// the offset shifts their base pointer.
+// ---------------------------------------------------------------------------
+static constexpr size_t kSliceAlign = 256;
+
+static inline size_t align_slice(size_t bytes) {
+    return (bytes + kSliceAlign - 1u) & ~(kSliceAlign - 1u);
+}
+
+struct BurstFrames {
+    bool open = false;
+    int n = 0;
+    int raw_h = 0, raw_w = 0;
+    int cov_h = 0, cov_w = 0;
+    int rob_h = 0, rob_w = 0;
+    int flow_ny = 0, flow_nx = 0;
+    int tile_size = 0;
+    // Floats per covariance entry. 3 = xx,xy,yy; the fourth element of the old
+    // layout was yx, written as a duplicate of xy and never read.
+    uint32_t cov_stride = 3;
+
+    // Per-slot stride in ELEMENTS (already rounded), and in bytes.
+    size_t raw_elems = 0, cov_elems = 0, rob_elems = 0, flow_elems = 0;
+
+    id<MTLBuffer> raws = nil;
+    id<MTLBuffer> covs = nil;
+    id<MTLBuffer> robs = nil;
+    id<MTLBuffer> flows = nil;
+    // Pooled, single-frame: the FFT input MPSGraph must own outright (its
+    // MPSGraphTensorData cannot take a buffer offset, so the frame's slice is
+    // blitted in), and the per-row mask activity readback.
+    id<MTLBuffer> fft_in = nil;
+    size_t fft_in_b = 0;
+    id<MTLBuffer> rob_rows = nil;
+    size_t rob_rows_b = 0;
+
+    std::vector<uint8_t> have_raw, have_cov, have_rob, have_flow;
+
+    bool valid_slot(int slot) const { return open && slot >= 0 && slot < n; }
+};
+
+static BurstFrames g_bf;
+static int g_active_slot = -1;
+static bool g_resident_out = false;
+
+static inline size_t bf_raw_off(int slot)  { return (size_t)slot * g_bf.raw_elems; }
+static inline size_t bf_cov_off(int slot)  { return (size_t)slot * g_bf.cov_elems; }
+static inline size_t bf_rob_off(int slot)  { return (size_t)slot * g_bf.rob_elems; }
+static inline size_t bf_flow_off(int slot) { return (size_t)slot * g_bf.flow_elems; }
+
+// The slot the next stage call should act on, or -1 when residency is off or the
+// burst buffers are not open.
+static int bf_active() {
+    return g_bf.valid_slot(g_active_slot) ? g_active_slot : -1;
+}
+
+// Resident float image for `slot`, or nil.
+static id<MTLBuffer> bf_raw_buffer(int slot) {
+    if (!g_bf.valid_slot(slot) || !g_bf.raws) return nil;
+    if (!g_bf.have_raw[(size_t)slot]) return nil;
+    return g_bf.raws;
+}
+
+static void bf_release() {
+    g_bf.raws = nil;
+    g_bf.covs = nil;
+    g_bf.robs = nil;
+    g_bf.flows = nil;
+    g_bf.fft_in = nil;
+    g_bf.rob_rows = nil;
+    g_bf.fft_in_b = 0;
+    g_bf.rob_rows_b = 0;
+    g_bf.have_raw.clear();
+    g_bf.have_cov.clear();
+    g_bf.have_rob.clear();
+    g_bf.have_flow.clear();
+    g_bf.open = false;
+    g_bf.n = 0;
+    g_active_slot = -1;
+    g_resident_out = false;
+}
+
 bool metal_gpu_init() { return ctx().ok; }
 
+
+bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
+                        const Config& cfg) {
+    bf_release();
+    if (!metal_gpu_init()) return false;
+    if (n_frames <= 0 || raw_h <= 0 || raw_w <= 0 || tile_size <= 0) return false;
+
+    // The robustness slice has to be sized before any mask is produced, and the
+    // raw-resolution path decides its own resolution at run time: it falls back to
+    // guide resolution whenever the reference's Dodgson-upscaled statistics were
+    // not ready. A slice sized for one and filled with the other would fail the
+    // merge outright, so that path keeps the pre-residency behaviour -- slower,
+    // but it is not the shipped configuration (it requires the Decimate grey).
+    if (cfg.robustness_raw_resolution_active()) return false;
+
+    auto& c = ctx();
+    g_bf.n = n_frames;
+    g_bf.raw_h = raw_h;
+    g_bf.raw_w = raw_w;
+    g_bf.tile_size = tile_size;
+    g_bf.cov_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
+    g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
+    g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
+    g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
+    g_bf.flow_ny = raw_h / tile_size;
+    g_bf.flow_nx = raw_w / tile_size;
+    g_bf.cov_stride = 3u;
+    if (g_bf.cov_h <= 0 || g_bf.cov_w <= 0 || g_bf.rob_h <= 0 || g_bf.rob_w <= 0 ||
+        g_bf.flow_ny <= 0 || g_bf.flow_nx <= 0)
+        return false;
+
+    const size_t f = sizeof(float);
+    g_bf.raw_elems  = align_slice((size_t)raw_h * (size_t)raw_w * f) / f;
+    g_bf.cov_elems  = align_slice((size_t)g_bf.cov_h * (size_t)g_bf.cov_w *
+                                  (size_t)g_bf.cov_stride * f) / f;
+    g_bf.rob_elems  = align_slice((size_t)g_bf.rob_h * (size_t)g_bf.rob_w * f) / f;
+    g_bf.flow_elems = align_slice((size_t)g_bf.flow_ny * (size_t)g_bf.flow_nx * 2u * f) / f;
+
+    const size_t nn = (size_t)n_frames;
+    g_bf.raws  = buf(nullptr, nn * g_bf.raw_elems  * f);
+    g_bf.covs  = buf(nullptr, nn * g_bf.cov_elems  * f);
+    g_bf.robs  = buf(nullptr, nn * g_bf.rob_elems  * f);
+    g_bf.flows = buf(nullptr, nn * g_bf.flow_elems * f);
+    g_bf.fft_in = c.scratch(g_bf.fft_in, g_bf.fft_in_b, (size_t)raw_h * (size_t)raw_w * f);
+    g_bf.rob_rows = c.scratch(g_bf.rob_rows, g_bf.rob_rows_b,
+                              (size_t)g_bf.rob_h * sizeof(uint32_t));
+    if (!g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows || !g_bf.fft_in ||
+        !g_bf.rob_rows) {
+        bf_release();
+        return false;
+    }
+
+    g_bf.have_raw.assign(nn, 0u);
+    g_bf.have_cov.assign(nn, 0u);
+    g_bf.have_rob.assign(nn, 0u);
+    g_bf.have_flow.assign(nn, 0u);
+    g_bf.open = true;
+    return true;
+}
+
+void metal_frames_end() { bf_release(); }
+
+void metal_set_active_frame(int slot) { g_active_slot = slot; }
+void metal_set_gpu_resident(bool on) { g_resident_out = on; }
+bool metal_frames_active() { return g_bf.open; }
+
+bool metal_frame_set_flow(int slot, const FlowField& flow) {
+    if (!g_bf.valid_slot(slot) || !g_bf.flows) return false;
+    if (flow.ny != g_bf.flow_ny || flow.nx != g_bf.flow_nx) return false;
+    const size_t bytes = flow.flow.size() * sizeof(float);
+    if (bytes == 0 || bytes > g_bf.flow_elems * sizeof(float)) return false;
+    memcpy((uint8_t*)[g_bf.flows contents] + bf_flow_off(slot) * sizeof(float),
+           flow.flow.data(), bytes);
+    g_bf.have_flow[(size_t)slot] = 1u;
+    return true;
+}
+
+bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
+    rows.clear();
+    any = false;
+    if (!g_bf.valid_slot(slot) || !g_bf.robs || !g_bf.rob_rows) return false;
+    if (!g_bf.have_rob[(size_t)slot]) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("rob_row_activity");
+    if (!pipe) return false;
+
+    struct RobStatsParamsLocal { uint32_t h, w, nch, pad; };
+    RobStatsParamsLocal sp{};
+    sp.h = (uint32_t)g_bf.rob_h;
+    sp.w = (uint32_t)g_bf.rob_w;
+    sp.nch = 1u;
+    sp.pad = 0u;
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:g_bf.rob_rows offset:0 atIndex:0];
+    [enc setBuffer:g_bf.robs offset:bf_rob_off(slot) * sizeof(float) atIndex:1];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+    dispatch1(enc, pipe, (NSUInteger)g_bf.rob_h);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:row-activity");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    const uint32_t* flags = (const uint32_t*)[g_bf.rob_rows contents];
+    if (!flags) return false;
+    rows.assign((size_t)g_bf.rob_h, 0u);
+    for (int y = 0; y < g_bf.rob_h; ++y) {
+        const uint8_t v = flags[y] ? 1u : 0u;
+        rows[(size_t)y] = v;
+        any = any || (v != 0u);
+    }
+    return true;
+}
+
+bool metal_frame_put_raw(int slot, const Image& img) {
+    if (!g_bf.valid_slot(slot) || !g_bf.raws) return false;
+    if (img.h != g_bf.raw_h || img.w != g_bf.raw_w || img.c != 1) return false;
+    const size_t bytes = (size_t)img.h * (size_t)img.w * sizeof(float);
+    if (img.data.size() * sizeof(float) < bytes) return false;
+    memcpy((uint8_t*)[g_bf.raws contents] + bf_raw_off(slot) * sizeof(float),
+           img.data.data(), bytes);
+    g_bf.have_raw[(size_t)slot] = 1u;
+    return true;
+}
+
+bool metal_frame_merge_ready(int slot) {
+    if (!g_bf.valid_slot(slot)) return false;
+    return g_bf.have_raw[(size_t)slot] && g_bf.have_cov[(size_t)slot] &&
+           g_bf.have_rob[(size_t)slot] && g_bf.have_flow[(size_t)slot];
+}
+
+// One decode may be in flight at a time, but it is not always on the pipeline
+// thread: the comparison prefetch decodes frame N+1 while frame N is still being
+// analysed. That is why the destination slot is a parameter rather than the
+// active-frame global -- the prefetch is decoding a different frame than the one
+// the stage globals point at.
 bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
                                  int h, int w, int bytes_per_row,
                                  const float site_black[4],
                                  const float site_denom[4],
                                  const float site_wb[4],
+                                 int src_y0, int src_x0, int out_h, int out_w,
+                                 int gpu_slot, bool keep_host,
                                  Image& out) {
     if (!metal_gpu_init() || !raw_data || h <= 0 || w <= 0 ||
         bytes_per_row < w * (int)sizeof(uint16_t) || (bytes_per_row & 1))
@@ -834,6 +1143,11 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
             !std::isfinite(site_black[i]) || !std::isfinite(site_wb[i]))
             return false;
     }
+    // Crop origins must be even or the CFA phase of the output would not match
+    // the pattern the pipeline is told it has.
+    if (src_y0 < 0 || src_x0 < 0 || (src_y0 & 1) || (src_x0 & 1)) return false;
+    if (out_h <= 0 || out_w <= 0) return false;
+    if (src_y0 + out_h > h || src_x0 + out_w > w) return false;
 
     auto& c = ctx();
     struct RawDecodeParamsCPU {
@@ -841,39 +1155,69 @@ bool metal_decode_raw16_to_float(const void* raw_data, size_t raw_bytes,
         float black[4];
         float denom[4];
         float wb[4];
+        uint32_t src_y0, src_x0, pad1, pad2;
     };
-    static_assert(sizeof(RawDecodeParamsCPU) == 64, "RawDecodeParamsCPU");
+    static_assert(sizeof(RawDecodeParamsCPU) == 80, "RawDecodeParamsCPU");
 
     RawDecodeParamsCPU p{};
-    p.h = (uint32_t)h;
-    p.w = (uint32_t)w;
+    p.h = (uint32_t)out_h;
+    p.w = (uint32_t)out_w;
     p.stride_shorts = (uint32_t)(bytes_per_row / (int)sizeof(uint16_t));
+    p.src_y0 = (uint32_t)src_y0;
+    p.src_x0 = (uint32_t)src_x0;
     for (int i = 0; i < 4; ++i) {
         p.black[i] = site_black[i];
         p.denom[i] = site_denom[i];
         p.wb[i] = site_wb[i];
     }
 
-    const size_t out_b = (size_t)h * (size_t)w * sizeof(float);
-    id<MTLBuffer> b_raw = buf(raw_data, need_raw);
-    id<MTLBuffer> b_out = buf(nullptr, out_b);
+    const size_t out_b = (size_t)out_h * (size_t)out_w * sizeof(float);
+
+    // Resident destination when the caller gave a slot whose geometry matches.
+    const bool resident = g_bf.valid_slot(gpu_slot) && g_bf.raws &&
+                          g_bf.raw_h == out_h && g_bf.raw_w == out_w;
+    id<MTLBuffer> b_out = nil;
+    size_t out_off_bytes = 0;
+    if (resident) {
+        b_out = g_bf.raws;
+        out_off_bytes = bf_raw_off(gpu_slot) * sizeof(float);
+    } else {
+        b_out = c.scratch(c.decode_out, c.decode_out_b, out_b);
+    }
+    // The uint16 source is pooled rather than allocated per frame: it is 24.4MB
+    // at 12MP and was a fresh newBufferWithBytes every time.
+    id<MTLBuffer> b_raw = c.scratch(c.decode_raw16, c.decode_raw16_b, need_raw);
     if (!b_raw || !b_out) return false;
+    memcpy([b_raw contents], raw_data, need_raw);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
     [enc setBuffer:b_raw offset:0 atIndex:0];
-    [enc setBuffer:b_out offset:0 atIndex:1];
+    [enc setBuffer:b_out offset:out_off_bytes atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
-    dispatch2(enc, c.pipe("raw16_to_float_bayer"), (NSUInteger)w, (NSUInteger)h);
+    dispatch2(enc, c.pipe("raw16_to_float_bayer"), (NSUInteger)out_w, (NSUInteger)out_h);
     [enc endEncoding];
+    prof_tag_gpu(cmd, "decode:raw16");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return false;
 
-    Image decoded(h, w, 1);
-    memcpy(decoded.data.data(), [b_out contents], out_b);
+    if (resident) g_bf.have_raw[(size_t)gpu_slot] = 1u;
+
+    if (!keep_host && resident) {
+        // Dimensions only: the plane stays in its slice and every consumer is a
+        // kernel. Same convention as metal_release_host_ref_stats.
+        out = Image();
+        out.h = out_h;
+        out.w = out_w;
+        out.c = 1;
+        return true;
+    }
+
+    Image decoded(out_h, out_w, 1);
+    memcpy(decoded.data.data(), (const uint8_t*)[b_out contents] + out_off_bytes, out_b);
     out = std::move(decoded);
     return true;
 }
@@ -897,13 +1241,53 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     // zero imaginary half, and it stores h x (w/2+1) instead of h x w. Falls
     // through to the Stockham path below on any failure or when unavailable
     // (the ops are iOS 16+, this project deploys to 15).
+    // A resident frame's plane is already in GPU memory; only the reference and
+    // the desktop/import paths arrive with host pixels.
+    const int bf_slot = bf_active();
+    id<MTLBuffer> resident_raw = (bf_slot >= 0) ? bf_raw_buffer(bf_slot) : nil;
+    const float* raw_host = nullptr;
+    if (!raw.data.empty()) {
+        raw_host = raw.data.data();
+    } else if (resident_raw) {
+        // Shared storage, so the slice is CPU addressable. Only a fallback: the
+        // blit below keeps the copy on the GPU.
+        raw_host = (const float*)[resident_raw contents] + bf_raw_off(bf_slot);
+    }
+    if (!raw_host) return Image();
+
     if (mps_fft_enabled()) {
         ProfStageScope prof_mps("grey:fft-mpsgraph");
+        // MPSGraphTensorData cannot carry a buffer offset, so a resident frame's
+        // slice is blitted into the pooled FFT input rather than bound in place.
+        // 48.8MB at GPU bandwidth, against the 48.8MB host memcpy it replaces.
+        id<MTLBuffer> in_buf = nil;
+        if (resident_raw && g_bf.fft_in) {
+            id<MTLCommandBuffer> bcmd = [c.queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = bcmd ? [bcmd blitCommandEncoder] : nil;
+            if (blit) {
+                [blit copyFromBuffer:resident_raw
+                        sourceOffset:bf_raw_off(bf_slot) * sizeof(float)
+                            toBuffer:g_bf.fft_in
+                   destinationOffset:0
+                                size:n * sizeof(float)];
+                [blit endEncoding];
+                prof_tag_gpu(bcmd, "grey:slice-blit");
+                [bcmd commit];
+                [bcmd waitUntilCompleted];
+                if (bcmd.status == MTLCommandBufferStatusCompleted) in_buf = g_bf.fft_in;
+            }
+        }
+
+        // The host copy of the grey is only wanted when something on the CPU will
+        // read it: the debug dumps, or a non-resident frame whose alignment has to
+        // upload it. align_metal otherwise reads the pinned buffer below.
+        const bool want_host = !resident_raw || debug_dumps_enabled();
         Image grey;
         grey.h = (int)h;
         grey.w = (int)w;
         grey.c = 1;
-        grey.data.resize(n);
+        if (want_host) grey.data.resize(n);
+
         // Hand the graph the buffer align_metal will pin, so the result lands
         // there directly. Saves a second full-frame staging buffer inside
         // mps_fft (~47MB held across the whole analysis) and one memcpy per
@@ -911,8 +1295,10 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
         // it has to be refreshed here either way -- leaving the previous
         // frame's buffer pinned would align against a stale grey.
         id<MTLBuffer> pinned = c.scratch(c.fft_out, c.fft_out_b, n * sizeof(float));
-        if (mps_grey_lowpass(raw.data.data(), grey.data.data(), (int)h, (int)w,
-                             (__bridge void*)pinned)) {
+        if (mps_grey_lowpass(in_buf ? nullptr : raw_host,
+                             want_host ? grey.data.data() : nullptr,
+                             (int)h, (int)w,
+                             (__bridge void*)pinned, (__bridge void*)in_buf)) {
             if (pinned) {
                 c.sticky_grey = pinned;
                 c.sticky_grey_h = (int)h;
@@ -940,7 +1326,7 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     // nil is tolerated: fft1d_gpu falls back to Bluestein without it.
     id<MTLBuffer> fft_pp = c.scratch(c.fft_pp, c.fft_pp_b, cbytes);
     if (!real_in || !c0 || !col_scratch) return Image();
-    memcpy([real_in contents], raw.data.data(), n * sizeof(float));
+    memcpy([real_in contents], raw_host, n * sizeof(float));
 
     // Forward FFT (one full complex + column strip scratch)
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1013,7 +1399,11 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
         uint32_t bayer, selection;
         float alpha, beta;
         float k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink;
-        uint32_t _pad0 = 0, _pad1 = 0;
+        // Floats per covariance entry. 4 keeps the legacy xx,xy,yx,yy layout the
+        // host CovField expects; the resident path asks for 3 (yx was a
+        // duplicate of xy that nothing read).
+        uint32_t cov_stride = 4;
+        uint32_t _pad1 = 0;
     };
     static_assert(sizeof(KernelEstParamsCPU) == 64, "KernelEstParamsCPU layout");
 
@@ -1044,13 +1434,37 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     const size_t grad_b = (size_t)(grey_h - 1) * (size_t)(grey_w - 1) * 2u * sizeof(float);
     const size_t cov_b = (size_t)grey_h * (size_t)grey_w * 4u * sizeof(float);
 
-    id<MTLBuffer> b_raw = c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
+    // Resident frame: bind the slice. This was the fourth upload of the same
+    // 48.8MB plane in one frame, and the covariances were then copied back out
+    // and straight into the merge again.
+    const int bf_slot = bf_active();
+    id<MTLBuffer> resident_raw = (bf_slot >= 0) ? bf_raw_buffer(bf_slot) : nil;
+    const size_t raw_off_bytes = resident_raw ? bf_raw_off(bf_slot) * sizeof(float) : 0;
+
+    const bool cov_resident = resident_raw && g_bf.covs &&
+                              g_bf.cov_h == grey_h && g_bf.cov_w == grey_w;
+    // 3 floats per entry in the resident layout (xx, xy, yy). The host CovField
+    // the non-resident path returns keeps the legacy 4-float layout, because
+    // merge.cpp's CPU accumulate indexes it with a stride of 4.
+    p.cov_stride = cov_resident ? 3u : 4u;
+    const size_t cov_b_resident =
+        (size_t)grey_h * (size_t)grey_w * (size_t)p.cov_stride * sizeof(float);
+
+    id<MTLBuffer> b_raw = resident_raw ? resident_raw
+                                       : c.scratch(c.kern_raw, c.kern_raw_b, raw_b);
     id<MTLBuffer> b_vst = c.scratch(c.kern_vst, c.kern_vst_b, grey_b);
     id<MTLBuffer> b_grey = c.scratch(c.kern_grey, c.kern_grey_b, grey_b);
     id<MTLBuffer> b_grad = c.scratch(c.kern_grad, c.kern_grad_b, grad_b);
-    id<MTLBuffer> b_cov = c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
+    id<MTLBuffer> b_cov = cov_resident
+        ? g_bf.covs
+        : c.scratch(c.kern_cov, c.kern_cov_b, cov_b);
+    const size_t cov_off_bytes = cov_resident ? bf_cov_off(bf_slot) * sizeof(float) : 0;
+    (void)cov_b_resident;
     if (!b_raw || !b_vst || !b_grey || !b_grad || !b_cov) return CovField();
-    memcpy([b_raw contents], raw.data.data(), raw_b);
+    if (!resident_raw) {
+        if (raw.data.empty()) return CovField();
+        memcpy([b_raw contents], raw.data.data(), raw_b);
+    }
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return CovField();
@@ -1060,7 +1474,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     if (!enc) return CovField();
 
     [enc setBuffer:b_grey offset:0 atIndex:0];
-    [enc setBuffer:b_raw offset:0 atIndex:1];
+    [enc setBuffer:b_raw offset:raw_off_bytes atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_decimate_grey"), p.grey_w, p.grey_h);
 
@@ -1074,7 +1488,7 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_gradients"), p.grey_w - 1u, p.grey_h - 1u);
 
-    [enc setBuffer:b_cov offset:0 atIndex:0];
+    [enc setBuffer:b_cov offset:cov_off_bytes atIndex:0];
     [enc setBuffer:b_grad offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof(p) atIndex:2];
     dispatch2(enc, c.pipe("kernel_estimate_cov"), p.grey_w, p.grey_h);
@@ -1084,6 +1498,17 @@ static CovField estimate_kernels_metal_impl(const Image& raw, const Config& cfg)
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return CovField();
+
+    if (cov_resident) {
+        g_bf.have_cov[(size_t)bf_slot] = 1u;
+        // Dimensions only: the field is 3-float packed in its slice and the merge
+        // reads it there. A host CovField would be the legacy 4-float layout and
+        // nothing on this path wants it.
+        CovField dims;
+        dims.h = grey_h;
+        dims.w = grey_w;
+        return dims;
+    }
 
     CovField covs(grey_h, grey_w);
     memcpy(covs.cov.data(), [b_cov contents], cov_b);
@@ -1274,31 +1699,50 @@ static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32
     return S;
 }
 
+// b_raw_in / raw_off_elems: when non-nil, the frame's plane is already resident
+// and is bound at that element offset instead of being uploaded from `raw`.
+// pooled: reuse the context's per-frame temps (comparison frames). The reference
+// must pass false -- init_robustness pins its means and variances for the burst.
 static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
                                 __strong id<MTLBuffer>& b_guide,
                                 __strong id<MTLBuffer>& b_means,
                                 __strong id<MTLBuffer>& b_vars,
                                 int& guide_h, int& guide_w, int& nch,
-                                id<MTLCommandBuffer> cmd) {
+                                id<MTLCommandBuffer> cmd,
+                                id<MTLBuffer> b_raw_in = nil,
+                                size_t raw_off_elems = 0,
+                                bool pooled = false) {
     auto& c = ctx();
     const bool bayer = cfg.bayer_mode;
-    guide_h = bayer ? raw.h / 2 : raw.h;
-    guide_w = bayer ? raw.w / 2 : raw.w;
+    const int raw_h = (raw.h > 0) ? raw.h : 0;
+    const int raw_w = (raw.w > 0) ? raw.w : 0;
+    guide_h = bayer ? raw_h / 2 : raw_h;
+    guide_w = bayer ? raw_w / 2 : raw_w;
     nch = bayer ? 3 : 1;
     if (guide_h < 1 || guide_w < 1) return false;
 
-    const size_t raw_b = raw.data.size() * sizeof(float);
     const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
-    id<MTLBuffer> b_raw = buf(raw.data.data(), raw_b);
-    b_guide = buf(nullptr, guide_b);
-    b_means = buf(nullptr, guide_b);
-    b_vars = buf(nullptr, guide_b);
+    const size_t raw_off_bytes = raw_off_elems * sizeof(float);
+    id<MTLBuffer> b_raw = b_raw_in;
+    if (!b_raw) {
+        if (raw.data.empty()) return false;
+        b_raw = buf(raw.data.data(), raw.data.size() * sizeof(float));
+    }
+    if (pooled) {
+        b_guide = c.scratch(c.rob_guide, c.rob_guide_b, guide_b);
+        b_means = c.scratch(c.rob_means, c.rob_means_b, guide_b);
+        b_vars  = c.scratch(c.rob_vars,  c.rob_vars_b,  guide_b);
+    } else {
+        b_guide = buf(nullptr, guide_b);
+        b_means = buf(nullptr, guide_b);
+        b_vars = buf(nullptr, guide_b);
+    }
     if (!b_raw || !b_guide || !b_means || !b_vars) return false;
 
     if (bayer) {
         RobGuideParamsCPU gp{};
-        gp.raw_h = (uint32_t)raw.h;
-        gp.raw_w = (uint32_t)raw.w;
+        gp.raw_h = (uint32_t)raw_h;
+        gp.raw_w = (uint32_t)raw_w;
         gp.guide_h = (uint32_t)guide_h;
         gp.guide_w = (uint32_t)guide_w;
         gp.bayer = 1u;
@@ -1335,12 +1779,22 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];
-        [enc setBuffer:b_raw offset:0 atIndex:1];
+        [enc setBuffer:b_raw offset:raw_off_bytes atIndex:1];
         [enc setBytes:&gp length:sizeof(gp) atIndex:2];
         dispatch2(enc, c.pipe("rob_guide_bayer"), gp.guide_w, gp.guide_h);
         [enc endEncoding];
     } else {
-        memcpy([b_guide contents], raw.data.data(), guide_b);
+        // Grey mode: the guide IS the plane. A blit keeps a resident frame on the
+        // GPU; the host copy is only for the non-resident path.
+        if (b_raw_in) {
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            if (!blit) return false;
+            [blit copyFromBuffer:b_raw sourceOffset:raw_off_bytes
+                        toBuffer:b_guide destinationOffset:0 size:guide_b];
+            [blit endEncoding];
+        } else {
+            memcpy([b_guide contents], raw.data.data(), guide_b);
+        }
     }
 
     RobStatsParamsCPU sp{};
@@ -1607,9 +2061,14 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
 
+    const int bf_slot_rr = bf_active();
+    id<MTLBuffer> resident_raw_rr = (bf_slot_rr >= 0) ? bf_raw_buffer(bf_slot_rr) : nil;
     id<MTLBuffer> b_guide = nil, b_gmeans = nil, b_gvars = nil;
     int gh = 0, gw = 0, nch = 0;
-    if (!rob_run_guide_stats(comp_raw, cfg, b_guide, b_gmeans, b_gvars, gh, gw, nch, cmd))
+    if (!rob_run_guide_stats(comp_raw, cfg, b_guide, b_gmeans, b_gvars, gh, gw, nch, cmd,
+                             resident_raw_rr,
+                             resident_raw_rr ? bf_raw_off(bf_slot_rr) : 0,
+                             /*pooled*/resident_raw_rr != nil))
         return Image();
     if (gh != g_rob_ref_h || gw != g_rob_ref_w || nch != g_rob_ref_c)
         return Image();
@@ -1791,9 +2250,16 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
 
+    // Resident frame: bind its slice instead of uploading the plane again. This
+    // was the third upload of the same 48.8MB in one frame's analysis.
+    const int bf_slot = bf_active();
+    id<MTLBuffer> resident_raw = (bf_slot >= 0) ? bf_raw_buffer(bf_slot) : nil;
+    const size_t resident_off = resident_raw ? bf_raw_off(bf_slot) : 0;
+
     id<MTLBuffer> b_guide = nil, b_gmeans = nil, b_gvars = nil;
     int gh = 0, gw = 0, nch = 0;
-    if (!rob_run_guide_stats(comp_raw, cfg, b_guide, b_gmeans, b_gvars, gh, gw, nch, cmd))
+    if (!rob_run_guide_stats(comp_raw, cfg, b_guide, b_gmeans, b_gvars, gh, gw, nch, cmd,
+                             resident_raw, resident_off, /*pooled*/resident_raw != nil))
         return Image();
 
     if (gh != ref_stats.means.h || gw != ref_stats.means.w || nch != ref_stats.means.c)
@@ -1880,8 +2346,17 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         b_ref_hf = g_rob_ref_hf;
     }
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
-    id<MTLBuffer> b_R = buf(nullptr, mask_b);
-    id<MTLBuffer> b_out = buf(nullptr, mask_b);
+    // The mask before the 5x5 minimum is scratch; the result goes into the
+    // frame's slice when it is resident, so the merge reads it where it lands.
+    id<MTLBuffer> b_R = resident_raw ? c.scratch(c.rob_mask, c.rob_mask_b, mask_b)
+                                     : buf(nullptr, mask_b);
+    const bool rob_resident = resident_raw && g_bf.robs &&
+                              g_bf.rob_h == gh && g_bf.rob_w == gw;
+    id<MTLBuffer> b_out = rob_resident
+        ? g_bf.robs
+        : (resident_raw ? c.scratch(c.rob_mask_min, c.rob_mask_min_b, mask_b)
+                        : buf(nullptr, mask_b));
+    const size_t out_off_bytes = rob_resident ? bf_rob_off(bf_slot) * sizeof(float) : 0;
     // Bound unconditionally because the kernel declares it; sized for real only
     // when asked, so the off case costs 4 bytes rather than a full mask plane.
     const bool want_s_select = (s_select_out != nullptr);
@@ -1966,7 +2441,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     sp.nch = 1u;
     enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
-    [enc setBuffer:b_out offset:0 atIndex:0];
+    [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
     [enc setBuffer:b_R offset:0 atIndex:1];
     [enc setBytes:&sp length:sizeof(sp) atIndex:2];
     dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
@@ -1977,8 +2452,23 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
+    if (rob_resident) g_bf.have_rob[(size_t)bf_slot] = 1u;
+
+    // The mask only comes back to the host when something on the CPU reads it:
+    // the save-mask PGM export, the debug dumps, or the s1/s2 split. The merge
+    // reads the slice.
+    const bool want_host = !rob_resident || want_s_select ||
+                           cfg.robustness_save_mask || debug_dumps_enabled();
+    if (!want_host) {
+        Image dims;
+        dims.h = gh;
+        dims.w = gw;
+        dims.c = 1;
+        return dims;
+    }
+
     Image r(gh, gw, 1);
-    memcpy(r.data.data(), [b_out contents], mask_b);
+    memcpy(r.data.data(), (const uint8_t*)[b_out contents] + out_off_bytes, mask_b);
     // Taken from rob_make_mask's output, not rob_local_min_5x5's: the selector
     // is a per-pixel record of which prior was applied, and eroding it would
     // smear the boundary between the two regions.
@@ -2761,9 +3251,31 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     // Drain any work left in flight by an early return from a previous call.
     (void)align_drain();
     auto& c = ctx();
-    Image moving_padded_grey = pad_image_circular(moving_grey, cfg.grey_tile_size(tile_size));
-    id<MTLBuffer> mov0 = buf(moving_padded_grey.data.data(),
-                             moving_padded_grey.data.size() * sizeof(float));
+    // The moving grey is already in GPU memory -- compute_grey_fft_metal_impl
+    // pinned it as sticky_grey, and this is the only consumer. At 4032x3024 with
+    // a 16px tile there is no padding to add either, so the previous form cost a
+    // 48.8MB host copy (pad_image_circular returns a by-reference parameter by
+    // value) plus a 48.8MB newBufferWithBytes, per comparison frame, to
+    // reproduce bytes that had not moved.
+    //
+    // Safe to hand the pooled FFT output to the pyramid here: nothing writes it
+    // again until the next frame's grey, and align_drain() below completes all
+    // of this call's work before returning.
+    const int grey_ts = cfg.grey_tile_size(tile_size);
+    Image moving_padded_grey;   // stays empty on the resident path
+    int mov0_h = moving_grey.h, mov0_w = moving_grey.w;
+    id<MTLBuffer> mov0 = nil;
+    if (pad_image_circular_amount(moving_grey, grey_ts) == 0 &&
+        c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
+        mov0 = c.sticky_grey;
+    } else {
+        moving_padded_grey = pad_image_circular(moving_grey, grey_ts);
+        mov0_h = moving_padded_grey.h;
+        mov0_w = moving_padded_grey.w;
+        mov0 = buf(moving_padded_grey.data.data(),
+                   moving_padded_grey.data.size() * sizeof(float));
+    }
     if (!mov0) return false;
 
     struct Lev {
@@ -2771,14 +3283,14 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         int h = 0, w = 0;
     };
     std::vector<Lev> mov_pyr((size_t)nlev);
-    mov_pyr[0] = {mov0, moving_padded_grey.h, moving_padded_grey.w};
+    mov_pyr[0] = {mov0, mov0_h, mov0_w};
     for (int i = 0; i < nlev; ++i) {
         int f = (i < (int)cfg.bm_factors.size()) ? cfg.bm_factors[i] : 1;
         if (i == 0 && f == 1) continue;
         if (i == 0) {
             id<MTLBuffer> dst = nil;
             int dh = 0, dw = 0;
-            if (!gpu_downsample_buf(mov0, moving_padded_grey.h, moving_padded_grey.w, f, dst, dh, dw))
+            if (!gpu_downsample_buf(mov0, mov0_h, mov0_w, f, dst, dh, dw))
                 return false;
             mov_pyr[0] = {dst, dh, dw};
         } else {
@@ -2810,7 +3322,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
         int radius = cfg.search_radius_for_level(lvl);
 
-        id<MTLBuffer> b_ref = buf(r.data.data(), r.data.size() * sizeof(float));
+        id<MTLBuffer> b_ref = ref_level_buffer(r);
         if (!b_ref) return false;
         int ny = r.h / ts;
         int nx = r.w / ts;
@@ -2939,12 +3451,18 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                        (size_t)ref_grey.h * (size_t)ref_grey.w);
         g_dumped_ref_grads = true;
     }
-    // Deliberately not reusing c.sticky_grey here. At this commit the grey FFT
-    // output buffer is pooled, and handing a pooled buffer to a later stage is
-    // the pattern that produced the corrupted pyramid earlier on this branch.
-    // A fresh upload costs one copy per frame and removes the hazard entirely.
-    id<MTLBuffer> b_mov_native = buf(moving_grey.data.data(),
-                                     moving_grey.data.size() * sizeof(float));
+    // The pooled grey-FFT output is exactly these pixels and nothing rewrites it
+    // before align_drain() below, so this reuses it rather than uploading the
+    // plane a third time. Falls back to an upload when the pin is stale (the
+    // Decimate grey path never sets one).
+    id<MTLBuffer> b_mov_native = nil;
+    if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
+        b_mov_native = c.sticky_grey;
+    } else {
+        b_mov_native = buf(moving_grey.data.data(),
+                           moving_grey.data.size() * sizeof(float));
+    }
     if (!b_mov_native) return false;
     if (!ica_bufs(b_ref_native, b_gx, b_gy, b_hess, b_mov_native, b_flow,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
@@ -2972,6 +3490,8 @@ void metal_clear_ref_ica_cache() {
     auto& c = ctx();
     for (int i = 0; i < MetalCtx::kIcaSlots; ++i) c.ica[i] = {};
     c.ica_next = 0;
+    for (int i = 0; i < MetalCtx::kRefLevelSlots; ++i) c.ref_level[i] = {};
+    c.ref_level_next = 0;
     g_dumped_ref_grads = false;
 }
 
@@ -2986,22 +3506,24 @@ bool metal_normalize_band_rgb16(const Image& num_band, const Image& den_band,
                                           bh, Ws, nch, cfg, row16);
 }
 
-bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
-                                    int bh, int Ws, int nch,
-                                    const Config& cfg, std::vector<uint16_t>& row16) {
-    if (!metal_gpu_init()) return false;
-    if (!num_p || !den_p || bh <= 0 || Ws <= 0 || nch < 1) return false;
-    const size_t n = (size_t)bh * (size_t)Ws * (size_t)nch;
+namespace {
 
-    row16.resize((size_t)bh * (size_t)Ws * 3u);
-    auto& c = ctx();
-    struct MergeNormParamsCPU {
-        uint32_t bh, Ws, nch, bake;
-        float wb0, wb1, wb2;
-        float m00, m01, m02, m10, m11, m12, m20, m21, m22;
-        float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
-    };
-    static_assert(sizeof(MergeNormParamsCPU) == 76, "MergeNormParamsCPU");
+struct MergeNormParamsCPU {
+    uint32_t bh, Ws, nch, bake;
+    float wb0, wb1, wb2;
+    float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+    float sg0, sg1, sg2;   // un-white-balance store gains (1 = off)
+    // Preview grid; zeroed for the standalone normalise kernel, which has no
+    // preview binding and never reads these.
+    uint32_t y0 = 0;
+    uint32_t prev_step = 0;
+    uint32_t prev_h = 0, prev_w = 0;
+    float prev_scale = 0.f;
+    uint32_t _pad0 = 0, _pad1 = 0, _pad2 = 0, _pad3 = 0;
+};
+static_assert(sizeof(MergeNormParamsCPU) == 112, "MergeNormParamsCPU");
+
+static MergeNormParamsCPU merge_norm_params(int bh, int Ws, int nch, const Config& cfg) {
     MergeNormParamsCPU p{};
     p.bh = (uint32_t)bh;
     p.Ws = (uint32_t)Ws;
@@ -3014,11 +3536,24 @@ bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
     p.m00 = m[0]; p.m01 = m[1]; p.m02 = m[2];
     p.m10 = m[3]; p.m11 = m[4]; p.m12 = m[5];
     p.m20 = m[6]; p.m21 = m[7]; p.m22 = m[8];
-    {
-        float sg[3];
-        dng_unwhiten_gains(cfg, nch, sg);
-        p.sg0 = sg[0]; p.sg1 = sg[1]; p.sg2 = sg[2];
-    }
+    float sg[3];
+    dng_unwhiten_gains(cfg, nch, sg);
+    p.sg0 = sg[0]; p.sg1 = sg[1]; p.sg2 = sg[2];
+    return p;
+}
+
+} // namespace
+
+bool metal_normalize_band_rgb16_ptr(const float* num_p, const float* den_p,
+                                    int bh, int Ws, int nch,
+                                    const Config& cfg, std::vector<uint16_t>& row16) {
+    if (!metal_gpu_init()) return false;
+    if (!num_p || !den_p || bh <= 0 || Ws <= 0 || nch < 1) return false;
+    const size_t n = (size_t)bh * (size_t)Ws * (size_t)nch;
+
+    row16.resize((size_t)bh * (size_t)Ws * 3u);
+    auto& c = ctx();
+    const MergeNormParamsCPU p = merge_norm_params(bh, Ws, nch, cfg);
 
     id<MTLBuffer> b_num = buf(num_p, n * sizeof(float));
     id<MTLBuffer> b_den = buf(den_p, n * sizeof(float));
@@ -3058,9 +3593,15 @@ struct MergeCompParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t flow_bilinear = 0;   // 1 = interpolate the tile flow (was _pad1)
-    uint32_t _pad2 = 0, _pad3 = 0;
+    // 4 = legacy xx,xy,yx,yy covariance entries, 3 = xx,xy,yy. 0 reads as 4 in
+    // the kernel, so a zero-initialised params block behaves as before.
+    uint32_t cov_stride = 4;
+    uint32_t _pad3 = 0;
+    // Element offsets into the burst-wide buffers, for the fused band kernel.
+    // Zero for the single-frame kernels, which bind each frame's slice directly.
+    uint32_t img_off = 0, flow_off = 0, cov_off = 0, rob_off = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 96, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 112, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -3075,8 +3616,10 @@ struct MergeRefParamsCPU {
     // 1 = acc_rob is raw resolution this run (Config::
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
+    uint32_t cov_stride = 4;      // see MergeCompParamsCPU::cov_stride
+    uint32_t _pad1 = 0, _pad2 = 0, _pad3 = 0;
 };
-static_assert(sizeof(MergeRefParamsCPU) == 96, "MergeRefParamsCPU layout");
+static_assert(sizeof(MergeRefParamsCPU) == 112, "MergeRefParamsCPU layout");
 
 // Double-buffered GPU accumulators so band N+1 can run while CPU encodes band N.
 struct MergeAccSlot {
@@ -3566,6 +4109,16 @@ void metal_merge_begin_online(int out_h, int out_w, int nch) {
 static void merge_release_acc_slots() {
     g_merge_acc[0] = {};
     g_merge_acc[1] = {};
+    // Pooled band-sized 16-bit output (23.2MB at 48MP) goes with them: it is
+    // merge-time only, and holding it across shots spends jetsam headroom the
+    // next burst needs.
+    auto& c = ctx();
+    for (int i = 0; i < 2; ++i) {
+        c.norm_out[i] = nil;
+        c.norm_out_b[i] = 0;
+    }
+    c.merge_prev = nil;
+    c.merge_prev_b = 0;
 }
 
 void metal_merge_end_online() {
@@ -3604,6 +4157,264 @@ bool metal_merge_map_online(const float** num, const float** den, size_t* nelem)
     *den = (const float*)[slot.den contents];
     if (nelem) *nelem = (size_t)g_online_h * (size_t)g_online_w * (size_t)g_online_nch;
     return *num != nullptr && *den != nullptr;
+}
+
+// Normalize straight out of the online accumulator. See the header: this exists
+// because the pointer form below has to be given host pointers and therefore
+// copies the accumulator into fresh buffers, which for a 48MP output is 232MB of
+// allocate-and-copy per band.
+bool metal_normalize_online_rows_rgb16(int y0, int bh, int Ws, int nch,
+                                      const Config& cfg, const uint16_t** out_rows) {
+    if (out_rows) *out_rows = nullptr;
+    if (!out_rows || !metal_gpu_init()) return false;
+    if (!g_merge_online) return false;
+    if (y0 < 0 || bh <= 0 || Ws <= 0 || nch < 1) return false;
+    MergeAccSlot& slot = g_merge_acc[0];
+    if (!slot.num || !slot.den) return false;
+
+    const size_t row_elems = (size_t)Ws * (size_t)nch;
+    // Always a multiple of 4 bytes, which is what setBuffer:offset: requires.
+    const size_t off_bytes = (size_t)y0 * row_elems * sizeof(float);
+    const size_t span_bytes = (size_t)bh * row_elems * sizeof(float);
+    if (off_bytes + span_bytes > slot.bytes) return false;
+
+    auto& c = ctx();
+    const size_t out_bytes = (size_t)bh * (size_t)Ws * 3u * sizeof(uint16_t);
+    id<MTLBuffer> b_out = c.scratch(c.norm_out[0], c.norm_out_b[0], out_bytes);
+    if (!b_out) return false;
+
+    const MergeNormParamsCPU p = merge_norm_params(bh, Ws, nch, cfg);
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:slot.num offset:off_bytes atIndex:0];
+    [enc setBuffer:slot.den offset:off_bytes atIndex:1];
+    [enc setBuffer:b_out offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    dispatch2(enc, c.pipe("merge_normalize_rgb16"), (NSUInteger)Ws, (NSUInteger)bh);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "merge:normalize-rgb16");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    *out_rows = (const uint16_t*)[b_out contents];
+    return *out_rows != nullptr;
+}
+
+
+// ---------------------------------------------------------------------------
+// Fused band merge. See metal_gpu.h.
+// ---------------------------------------------------------------------------
+static id<MTLBuffer> g_fused_diag = nil;
+static constexpr uint32_t kFusedDiagSlots = 14u;
+
+// The preview samples the fused kernel wrote, as normalized camera RGB in
+// [prev_h][prev_w][3]. Cleared by reset, filled across the band loop.
+const float* metal_merge_fused_preview() {
+    auto& c = ctx();
+    return c.merge_prev ? (const float*)[c.merge_prev contents] : nullptr;
+}
+
+void metal_merge_fused_reset_diag() {
+    if (!metal_gpu_init()) return;
+    auto& c = ctx();
+    if (!g_fused_diag) {
+        g_fused_diag = buf(nullptr, kFusedDiagSlots * sizeof(uint32_t));
+    }
+    if (!g_fused_diag) return;
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = cmd ? [cmd blitCommandEncoder] : nil;
+    if (!blit) return;
+    [blit fillBuffer:g_fused_diag
+               range:NSMakeRange(0, kFusedDiagSlots * sizeof(uint32_t))
+               value:0];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+}
+
+bool metal_merge_fused_read_diag(AccumDiag& diag, size_t pixels) {
+    if (!g_fused_diag) return false;
+    const uint32_t* v = (const uint32_t*)[g_fused_diag contents];
+    if (!v) return false;
+    // `pixels` is the output size: the kernel only counts anomalies, so counting
+    // every pixel with an atomic would have cost more than the merge.
+    diag.pixels += pixels;
+    for (int ch = 0; ch < 3; ++ch) {
+        diag.den_zero[ch]       += v[ch];
+        diag.den_tiny[ch]       += v[3 + ch];
+        diag.den_nonfinite[ch]  += v[6 + ch];
+        diag.num_nonfinite[ch]  += v[9 + ch];
+    }
+    diag.only_green   += v[12];
+    diag.rgb_all_zero += v[13];
+    return true;
+}
+
+bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
+                            int y0, int bh, int Hs, int Ws, int nch,
+                            int tile_size, const Config& cfg,
+                            int prev_step, int prev_h, int prev_w, float prev_scale,
+                            int out_slot, const uint16_t** out_rows) {
+    if (out_rows) *out_rows = nullptr;
+    if (!out_rows || !metal_gpu_init()) return false;
+    if (!g_bf.open || !g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows) return false;
+    if (n_comp < 0 || y0 < 0 || bh <= 0 || Ws <= 0 || nch < 1) return false;
+    // The reference needs its plane and its covariances; it never has a mask or a
+    // flow field, so metal_frame_merge_ready is the wrong test for it.
+    if (!g_bf.valid_slot(ref_slot)) return false;
+    if (!g_bf.have_raw[(size_t)ref_slot] || !g_bf.have_cov[(size_t)ref_slot])
+        return false;
+    // accumulate_ref's overwrite rule can only fire with the adaptive denoiser,
+    // which this build never enables (robustness_denoise is always 0 below).
+    // Discarding the comparison contributions would have no meaning here anyway:
+    // by that point they are already summed in registers.
+
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("merge_band_fused");
+    if (!pipe) return false;
+
+    const size_t out_bytes = (size_t)bh * (size_t)Ws * 3u * sizeof(uint16_t);
+    const int os = (out_slot & 1);
+    id<MTLBuffer> b_out = c.scratch(c.norm_out[os], c.norm_out_b[os], out_bytes);
+    if (!b_out) return false;
+    if (!g_fused_diag) g_fused_diag = buf(nullptr, kFusedDiagSlots * sizeof(uint32_t));
+    if (!g_fused_diag) return false;
+
+    // One params entry per comparison frame. Geometry fields are identical across
+    // frames -- merge_comp_contrib reads band_h / Ws / y0 / nch from whichever
+    // entry it is given, and the kernel takes the dispatch bounds from the
+    // normalise params -- so they are filled the same way for every slot.
+    std::vector<MergeCompParamsCPU> ps;
+    ps.reserve((size_t)std::max(1, n_comp));
+    for (int i = 0; i < n_comp; ++i) {
+        const int slot = comp_slots[i];
+        if (!metal_frame_merge_ready(slot)) return false;
+        MergeCompParamsCPU p{};
+        p.band_h = (uint32_t)bh;
+        p.Ws = (uint32_t)Ws;
+        p.y0 = (uint32_t)y0;
+        p.lr_h = (uint32_t)g_bf.raw_h;
+        p.lr_w = (uint32_t)g_bf.raw_w;
+        p.rob_h = (uint32_t)g_bf.rob_h;
+        p.rob_w = (uint32_t)g_bf.rob_w;
+        p.flow_ny = (uint32_t)g_bf.flow_ny;
+        p.flow_nx = (uint32_t)g_bf.flow_nx;
+        p.cov_h = (uint32_t)g_bf.cov_h;
+        p.cov_w = (uint32_t)g_bf.cov_w;
+        p.nch = (uint32_t)nch;
+        p.bayer = cfg.bayer_mode ? 1u : 0u;
+        p.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
+        p.tile_size = (uint32_t)tile_size;
+        p.scale = cfg.scale;
+        p.cfa00 = cfg.cfa.p[0][0];
+        p.cfa01 = cfg.cfa.p[0][1];
+        p.cfa10 = cfg.cfa.p[1][0];
+        p.cfa11 = cfg.cfa.p[1][1];
+        // Decided from the mask's ACTUAL dimensions, not the config flag -- the
+        // raw-resolution path can silently fall back. Same test as
+        // merge_comp_band_metal.
+        p.raw_res_robustness =
+            (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
+        p.flow_bilinear = 0u;
+        p.cov_stride = g_bf.cov_stride;
+        p.img_off  = (uint32_t)bf_raw_off(slot);
+        p.flow_off = (uint32_t)bf_flow_off(slot);
+        p.cov_off  = (uint32_t)bf_cov_off(slot);
+        p.rob_off  = (uint32_t)bf_rob_off(slot);
+        ps.push_back(p);
+    }
+    // Metal still requires the params binding to be non-empty.
+    if (ps.empty()) {
+        MergeCompParamsCPU p{};
+        p.band_h = (uint32_t)bh;
+        p.Ws = (uint32_t)Ws;
+        p.nch = (uint32_t)nch;
+        ps.push_back(p);
+    }
+    const uint32_t nframes = (uint32_t)std::max(0, n_comp);
+
+    // Reference params: the same values merge_ref_band_metal fills, with the
+    // adaptive denoiser off as it always is on this build.
+    MergeRefParamsCPU rp{};
+    rp.band_h = (uint32_t)bh;
+    rp.Ws = (uint32_t)Ws;
+    rp.y0 = (uint32_t)y0;
+    rp.lr_h = (uint32_t)g_bf.raw_h;
+    rp.lr_w = (uint32_t)g_bf.raw_w;
+    rp.cov_h = (uint32_t)g_bf.cov_h;
+    rp.cov_w = (uint32_t)g_bf.cov_w;
+    rp.acc_h = 1u;
+    rp.acc_w = 1u;
+    rp.nch = (uint32_t)nch;
+    rp.bayer = cfg.bayer_mode ? 1u : 0u;
+    rp.iso = (cfg.kernel == KernelShape::Iso) ? 1u : 0u;
+    rp.robustness_denoise = 0u;
+    rp.rad_max = 0u;
+    rp.scale = cfg.scale;
+    rp.max_multiplier = 1.f;
+    rp.burst_frames = (float)cfg.burst_frame_count;
+    rp.adaptive = 0u;
+    rp.max_frame_count = 0.f;
+    rp.cfa00 = cfg.cfa.p[0][0];
+    rp.cfa01 = cfg.cfa.p[0][1];
+    rp.cfa10 = cfg.cfa.p[1][0];
+    rp.cfa11 = cfg.cfa.p[1][1];
+    rp.raw_res_robustness = 0u;
+    rp.cov_stride = g_bf.cov_stride;
+
+    MergeNormParamsCPU np = merge_norm_params(bh, Ws, nch, cfg);
+    np.y0 = (uint32_t)y0;
+    np.prev_step = (uint32_t)std::max(0, prev_step);
+    np.prev_h = (uint32_t)std::max(0, prev_h);
+    np.prev_w = (uint32_t)std::max(0, prev_w);
+    np.prev_scale = prev_scale;
+
+    // Pooled preview target: the whole thumbnail, written sparsely across bands
+    // and read once at the end. ph*pw*3 floats -- under a megabyte at any preview
+    // size this app uses.
+    const size_t prev_bytes =
+        (size_t)std::max(1, prev_h) * (size_t)std::max(1, prev_w) * 3u * sizeof(float);
+    id<MTLBuffer> b_prev = c.scratch(c.merge_prev, c.merge_prev_b, prev_bytes);
+    if (!b_prev) return false;
+    // Bands write the preview sparsely, so it has to start clean or a previous
+    // burst's samples would show through wherever this one writes nothing. Safe
+    // on the CPU here: each band waits for its own dispatch before returning, so
+    // nothing is in flight against this buffer.
+    if (y0 == 0) memset([b_prev contents], 0, prev_bytes);
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_out offset:0 atIndex:0];
+    [enc setBytes:ps.data() length:ps.size() * sizeof(MergeCompParamsCPU) atIndex:1];
+    [enc setBytes:&nframes length:sizeof(nframes) atIndex:2];
+    [enc setBuffer:g_bf.raws offset:0 atIndex:3];
+    [enc setBuffer:g_bf.flows offset:0 atIndex:4];
+    [enc setBuffer:g_bf.covs offset:0 atIndex:5];
+    [enc setBuffer:g_bf.robs offset:0 atIndex:6];
+    [enc setBytes:&rp length:sizeof(rp) atIndex:7];
+    // The reference is reached by offset, so the kernel indexes it from zero.
+    [enc setBuffer:g_bf.raws offset:bf_raw_off(ref_slot) * sizeof(float) atIndex:8];
+    [enc setBuffer:g_bf.covs offset:bf_cov_off(ref_slot) * sizeof(float) atIndex:9];
+    // acc_rob is dead on this path (robustness_denoise == 0) but must be bound.
+    [enc setBuffer:g_bf.robs offset:0 atIndex:10];
+    [enc setBytes:&np length:sizeof(np) atIndex:11];
+    [enc setBuffer:g_fused_diag offset:0 atIndex:12];
+    [enc setBuffer:b_prev offset:0 atIndex:13];
+    dispatch2(enc, pipe, (NSUInteger)Ws, (NSUInteger)bh);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "merge:band-fused");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    (void)Hs;
+    *out_rows = (const uint16_t*)[b_out contents];
+    return *out_rows != nullptr;
 }
 
 bool metal_merge_flush_online() {
@@ -3653,6 +4464,8 @@ void metal_trim_analyze_scratch() {
     c.sticky_grey_h = c.sticky_grey_w = 0;
     for (int i = 0; i < MetalCtx::kIcaSlots; ++i) c.ica[i] = {};
     c.ica_next = 0;
+    for (int i = 0; i < MetalCtx::kRefLevelSlots; ++i) c.ref_level[i] = {};
+    c.ref_level_next = 0;
     clear_rob_ref_gpu();
 }
 

@@ -39,8 +39,15 @@ bool mps_fft_enabled();
 // that the graph writes into directly. The caller usually needs the result in a
 // Metal buffer anyway (align reuses it as the pinned moving grey), so supplying
 // it here avoids a second full-frame staging buffer and one memcpy per frame.
+// in_mtl_buffer: when non-null, the graph reads this MTLBuffer directly and `in`
+// is ignored -- which is how a GPU-resident frame avoids a 48.8MB host copy into
+// the staging buffer. It must hold at least h*w floats at offset 0 (the graph's
+// tensor data cannot carry an offset, which is why the caller blits its slice in
+// rather than binding it).
+// out may be null when the caller only wants the result in out_mtl_buffer; that
+// skips the matching copy back.
 bool mps_grey_lowpass(const float* in, float* out, int h, int w,
-                      void* out_mtl_buffer = nullptr);
+                      void* out_mtl_buffer, void* in_mtl_buffer);
 
 // Build and cache the graph for these dimensions ahead of time.
 //
