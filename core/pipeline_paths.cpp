@@ -2324,8 +2324,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                       "\nburst wall %.1f ms over %d frames (%.1f ms/frame)\n",
                       wall, n, wall / std::max(1, n));
         std::string prof = prof_report() + hdr;
-        if (!cfg.debug_string_capture.empty()) {
-            prof += "\n=== Metadata ===\n" + cfg.debug_string_capture + "\n";
+        // `work`, not `cfg`: the loader is handed the mutable copy and writes the
+        // capture's NoiseProfile / white balance / level log into THAT. Reading the
+        // caller's const Config meant this section was always empty, so whether a
+        // burst read a real noise profile or silently fell back to the built-in
+        // Pixel 4a one -- which is ISO-independent, and therefore decides how many
+        // Monte Carlo bins the robustness curves need -- has never been visible in
+        // a saved report.
+        if (!work.debug_string_capture.empty()) {
+            prof += "\n=== Metadata ===\n" + work.debug_string_capture + "\n";
         }
         std::printf("%s", prof.c_str());
         std::fflush(stdout);
