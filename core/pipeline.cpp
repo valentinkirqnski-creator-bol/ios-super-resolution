@@ -263,7 +263,7 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
                      work.bake_srgb, "HandheldSR",
                      work.has_cam_to_srgb ? work.cam_to_srgb : nullptr,
                      work.raw_prewhitened && !dng_unwhiten_active(work, nch),
-                     work.dng_lossless_compress, &dng_exif)) {
+                     work.dng_codec, &dng_exif, work.num_threads)) {
         report("Error: cannot open output DNG", 1.0f);
         return Image();
     }
