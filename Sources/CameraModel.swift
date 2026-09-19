@@ -468,6 +468,17 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
 
+    /// How much faster than metering the burst is actually exposed.
+    ///
+    /// Handheld multi-frame merging is only as sharp as its sharpest frames: motion
+    /// blur inside a single exposure cannot be recovered by aligning frames to each
+    /// other, because every frame carries it. Shortening the exposure trades that
+    /// blur for read noise, which is the one thing the merge does remove.
+    ///
+    /// Gain is raised by the same factor, so brightness is unchanged -- this is a
+    /// shutter/ISO trade, not an exposure offset. 1.0 disables it.
+    static let burstShutterSpeedUp: Double = 2.0
+
     static let minFrameCount = 2
     /// Long bursts trade memory for noise reduction. The banded merge holds every
     /// analyzed frame at once -- roughly 98MB per comparison frame at 12MP once
@@ -1671,9 +1682,10 @@ final class CameraModel: NSObject, ObservableObject {
             self.captureKind = .burst
             self.zslCapturing = false
 
-            self.lockForBurst()
-            self.captureNextRaw(isZSL: false)
-            self.ensureReadyBurstDir()
+            self.lockForBurst {
+                self.captureNextRaw(isZSL: false)
+                self.ensureReadyBurstDir()
+            }
         }
     }
 
@@ -1716,11 +1728,78 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func lockForBurst() {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+    /// Locks focus, white balance and exposure for the burst, then calls `start`.
+    ///
+    /// `start` is deliberately a completion rather than something the caller runs
+    /// next: when the exposure is being changed, the sensor is not at the new
+    /// duration until setExposureModeCustom's handler fires. Capturing before that
+    /// would put the first frames at the metered exposure and the rest at the
+    /// shortened one, and a photometric step partway through a burst is precisely
+    /// what the robustness mask is built to reject -- the affected frames would be
+    /// scored as motion and dropped, leaving the merge with fewer samples than it
+    /// captured.
+    private func lockForBurst(then start: @escaping () -> Void) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else {
+            // Same as before: a burst that cannot lock still runs, unlocked.
+            start()
+            return
+        }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-        if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+
+        // Only when metering chose the exposure. A manual shutter is the user's own
+        // number and applyShutterOnSessionQueue has already put the device in custom
+        // mode with it; overriding that here would fight them.
+        let speedUp = Self.burstShutterSpeedUp
+        guard shutterIsAuto, speedUp > 1.0, d.isExposureModeSupported(.custom) else {
+            if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+            d.unlockForConfiguration()
+            start()
+            return
+        }
+
+        let metered = d.exposureDuration
+        let meteredISO = d.iso
+        var wanted = CMTimeMultiplyByFloat64(metered, multiplier: 1.0 / speedUp)
+        let minD = d.activeFormat.minExposureDuration
+        let maxD = d.activeFormat.maxExposureDuration
+        if CMTimeCompare(wanted, minD) < 0 { wanted = minD }
+        if CMTimeCompare(wanted, maxD) > 0 { wanted = maxD }
+
+        // Compensate by the ratio the duration ACTUALLY moved by, not by speedUp:
+        // if minExposureDuration clamped the shortening, scaling gain by the
+        // requested factor would overexpose instead of holding brightness.
+        //
+        // Skipped when ISO is manual -- the user pinned the gain, so the shorter
+        // exposure is theirs to have asked for, darker frames included.
+        let meteredSec = CMTimeGetSeconds(metered)
+        let wantedSec = CMTimeGetSeconds(wanted)
+        var iso = meteredISO
+        if isoIsAuto, meteredSec > 0, wantedSec > 0 {
+            iso = Float(Double(meteredISO) * (meteredSec / wantedSec))
+        }
+        iso = min(max(d.activeFormat.minISO, iso), d.activeFormat.maxISO)
+
+        // One-shot, so neither route below can start the burst twice. Both run on
+        // sessionQueue, which serialises the check.
+        var started = false
+        let begin: () -> Void = {
+            if started { return }
+            started = true
+            start()
+        }
+
+        d.setExposureModeCustom(duration: wanted, iso: iso) { [weak self] _ in
+            guard let self = self else { return }
+            self.sessionQueue.async { begin() }
+        }
+        // Waiting on that callback is what makes the exposure uniform across the
+        // burst, but it also means a callback that never arrives would leave the
+        // shutter hung -- a failure mode the previous synchronous start did not
+        // have. An exposure change applies within a frame or two, so half a second
+        // is far past it: this only ever fires if the callback is genuinely lost.
+        sessionQueue.asyncAfter(deadline: .now() + 0.5) { begin() }
+
         d.unlockForConfiguration()
     }
 
