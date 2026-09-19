@@ -475,8 +475,11 @@ final class CameraModel: NSObject, ObservableObject {
     /// other, because every frame carries it. Shortening the exposure trades that
     /// blur for read noise, which is the one thing the merge does remove.
     ///
-    /// Gain is raised by the same factor, so brightness is unchanged -- this is a
-    /// shutter/ISO trade, not an exposure offset. 1.0 disables it.
+    /// Gain is deliberately NOT raised to match, so this is a real exposure
+    /// reduction: at 2.0 the frames are about one stop darker. Lifting that back
+    /// on the merged result costs less noise than paying for it in per-frame
+    /// sensor gain would, and it leaves a stop of highlight headroom.
+    /// 1.0 disables it.
     static let burstShutterSpeedUp: Double = 2.0
 
     static let minFrameCount = 2
@@ -1766,19 +1769,15 @@ final class CameraModel: NSObject, ObservableObject {
         if CMTimeCompare(wanted, minD) < 0 { wanted = minD }
         if CMTimeCompare(wanted, maxD) > 0 { wanted = maxD }
 
-        // Compensate by the ratio the duration ACTUALLY moved by, not by speedUp:
-        // if minExposureDuration clamped the shortening, scaling gain by the
-        // requested factor would overexpose instead of holding brightness.
+        // Gain stays exactly where metering put it. The shorter exposure is
+        // therefore a real reduction in light, not a shutter/ISO trade: the frames
+        // -- and the merged DNG -- come out about one stop darker at a 2x factor.
         //
-        // Skipped when ISO is manual -- the user pinned the gain, so the shorter
-        // exposure is theirs to have asked for, darker frames included.
-        let meteredSec = CMTimeGetSeconds(metered)
-        let wantedSec = CMTimeGetSeconds(wanted)
-        var iso = meteredISO
-        if isoIsAuto, meteredSec > 0, wantedSec > 0 {
-            iso = Float(Double(meteredISO) * (meteredSec / wantedSec))
-        }
-        iso = min(max(d.activeFormat.minISO, iso), d.activeFormat.maxISO)
+        // That is the intended behaviour, and for a raw workflow it is the better
+        // half of the trade: the exposure is lifted later on merged data, where the
+        // burst has already averaged the noise down, instead of being paid for per
+        // frame in sensor gain. It also buys a stop of highlight headroom.
+        let iso = min(max(d.activeFormat.minISO, meteredISO), d.activeFormat.maxISO)
 
         // One-shot, so neither route below can start the burst twice. Both run on
         // sessionQueue, which serialises the check.
