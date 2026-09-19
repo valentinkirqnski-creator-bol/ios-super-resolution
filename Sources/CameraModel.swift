@@ -767,10 +767,13 @@ final class CameraModel: NSObject, ObservableObject {
 
     /// Capture defaults forced once per app launch (like the shutter auto state
     /// above, these deliberately do not carry a prior session's choice): 48MP
-    /// super-resolution output, DNG format, and 8-frame bursts.
+    /// super-resolution output and 8-frame bursts.
+    ///
+    /// exportFormat is NOT reset here. It used to be, from before there was a
+    /// control for it; now that the top strip has a DNG/JPG button, resetting it
+    /// would silently undo what the user tapped last session.
     func ensureCaptureDefaultsOnLaunch() {
         outputResolutionMode = .super48mp
-        exportFormat = .dng
         frameCount = 8
     }
 
@@ -2136,13 +2139,14 @@ final class CameraModel: NSObject, ObservableObject {
         return UIImage(cgImage: cg)
     }
 
-    /// Lightroom-like finish from the SR DNG: Highlights −70, stronger contrast
-    /// + vibrance (no sharpen / NR). Uses our own Deflate LinearRaw decoder
-    /// (ImageIO cannot read these DNGs).
+    /// HDR finish from the SR DNG (core/finish_hdr): shadows lifted, highlights
+    /// compressed, sensor-clipped highlights rendered neutral instead of pink,
+    /// black level measured from the image, no sharpening. Uses our own Deflate
+    /// LinearRaw decoder (ImageIO cannot read these DNGs).
     private static func renderExportJPEG(fromDNG dngURL: URL) -> URL? {
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("handheld_sr_\(UUID().uuidString).jpg")
-        let ok = SRBridge.exportJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path)
+        let ok = SRBridge.exportHDRJPEG(fromLinearDNG: dngURL.path, toPath: outURL.path)
         if ok { return outURL }
         try? FileManager.default.removeItem(at: outURL)
         return nil
@@ -2193,6 +2197,8 @@ final class CameraModel: NSObject, ObservableObject {
                 if let jpg = Self.renderExportJPEG(fromDNG: url) {
                     saveURL = jpg
                     tempJPEG = jpg
+                    // Decoded back from the JPEG that was actually written, so
+                    // the thumbnail cannot drift from the saved file.
                     ispThumb = Self.thumbnailImage(fromFile: jpg, maxSide: 1600) ?? preview
                 } else {
                     DispatchQueue.main.async {

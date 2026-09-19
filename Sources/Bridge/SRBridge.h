@@ -34,6 +34,15 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)exportJPEGFromLinearDNG:(NSString *)dngPath
                          toPath:(NSString *)jpgPath;
 
+/// HDR finish (core/finish_hdr): decode the LinearRaw DNG in its own camera
+/// space and write a tone-mapped sRGB JPEG -- shadows lifted, highlights
+/// compressed, sensor-clipped highlights rendered neutral rather than pink, and
+/// no sharpening of any kind. Independent of exportJPEGFromLinearDNG, which
+/// keeps the older calibrated look. The JPEG is tagged with the DNG's own
+/// orientation.
++ (BOOL)exportHDRJPEGFromLinearDNG:(NSString *)dngPath
+                            toPath:(NSString *)jpgPath;
+
 /// Render the LinearRaw DNG (same look as export JPEG), encode a JPEG preview
 /// (longest side ≤ maxSide), and embed it as a DNG SubIFD so Photos can thumbnail
 /// a DNG-only asset. Lightroom still reads the LinearRaw IFD0.
