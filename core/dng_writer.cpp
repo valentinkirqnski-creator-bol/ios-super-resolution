@@ -1,5 +1,8 @@
 #include "dng_writer.h"
+#include "ljpeg.h"
+#include "parallel.h"
 #include <cstdio>
+#include <thread>
 #include <cstring>
 #include <vector>
 #include <cstdint>
@@ -113,15 +116,10 @@ static std::string now_tiff_datetime() {
     return std::string(buf);
 }
 
-// TIFF Predictor=2 horizontal differencing (chunky RGB16), in-place, right→left.
-static void apply_hdiff_rgb16(uint16_t* row, int W) {
-    for (int x = W - 1; x >= 1; --x) {
-        row[x * 3 + 0] = (uint16_t)(row[x * 3 + 0] - row[(x - 1) * 3 + 0]);
-        row[x * 3 + 1] = (uint16_t)(row[x * 3 + 1] - row[(x - 1) * 3 + 1]);
-        row[x * 3 + 2] = (uint16_t)(row[x * 3 + 2] - row[(x - 1) * 3 + 2]);
-    }
-}
-
+// TIFF Predictor=2, undo side only. The writer never emits Predictor=2 -- the
+// encode half sat here unused, since the Deflate path always wrote Predictor=1
+// and lossless JPEG does its own prediction -- but files from other tools can
+// carry it, so the reader still needs this.
 static void undo_hdiff_rgb16(uint16_t* row, int W) {
     for (int x = 1; x < W; ++x) {
         row[x * 3 + 0] = (uint16_t)(row[x * 3 + 0] + row[(x - 1) * 3 + 0]);
@@ -226,13 +224,23 @@ static bool is_identity_3x3(const float* m) {
 
 } // namespace
 
-// Deflate of a 48MP LinearRaw strip measured ~8.6s of single-threaded zlib —
-// the single largest item in a burst, and unparallelizable because a zlib
-// stream is inherently serial. On 16-bit linear photographic data it only buys
-// ~1.2-1.5x, so uncompressed trades ~90MB of file size for those 8.6s. Decoded
-// pixels are identical either way, and load_linear_dng_rgb16 handles both
-// Compression=1 and =8. Runtime-selected per burst via DngStreamWriter's
-// `compress_` (Config::dng_lossless_compress); the zlib path below is intact.
+// Why the default codec is lossless JPEG (Compression=7) and not Deflate.
+//
+// Measured on a real 48MP merge (8064x6048x3, 292.6MB of samples):
+//   uncompressed      292.6MB
+//   Deflate, zlib-1   294.6MB   <- LARGER than raw, for ~8.6s of serial CPU
+//   Deflate, zlib-6   256.8MB
+//   lossless JPEG     172.6MB   (-41.0%)
+//
+// zlib cannot model 16-bit photographic data: the low bits are sensor noise
+// (the odd/even code split measures 0.50, i.e. the LSB is a coin flip), and a
+// 32KB LZ77 window finds no matches in it. Lossless JPEG predicts each sample
+// from its left neighbour and entropy-codes the residual, which is exactly the
+// structure this data has. A zlib stream is also inherently serial, whereas
+// each JPEG strip here is a self-contained SOI..EOI bitstream, so encoding and
+// decoding both run on every core.
+//
+// load_linear_dng_rgb16 reads all three (Compression = 1, 7 and 8).
 
 // Serialize a standalone IFD (count + 12-byte entries + next-pointer=0 + heap
 // for out-of-line payloads) as it will sit at `base_offset` in the final file.
@@ -273,7 +281,11 @@ static void push_rational_from_float(std::vector<uint32_t>& nd, float v) {
     nd.push_back(den);
 }
 
-// Builds DNG header. StripByteCounts left as 0 — patched once the strip is done.
+// Builds DNG header. StripOffsets and StripByteCounts are reserved as
+// `nstrips`-long LONG arrays of zeros and patched once each strip is on disk;
+// the two *_pos_out values are the file offsets of those arrays (for nstrips==1
+// the single LONG lives inline in the IFD entry, which is exactly where the
+// patch has always gone).
 // Private tag 65000: 12×f32 LE = wb[3] + cam_to_srgb[9] for JPEG export.
 static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              const std::string& camera_make,
@@ -284,9 +296,12 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              bool baked_srgb,
                                              const float* cam_to_srgb,
                                              bool pixels_prewhitened,
-                                             bool compress,
+                                             int codec,
+                                             int nstrips,
+                                             int rows_per_strip,
                                              uint32_t& strip_offset_out,
-                                             uint32_t& strip_byte_counts_offset_out,
+                                             uint32_t& strip_offsets_pos_out,
+                                             uint32_t& strip_byte_counts_pos_out,
                                              const CaptureExif* exif = nullptr) {
     float derived_cam_to_srgb[9];
     const float* jpeg_cam_to_srgb = cam_to_srgb;
@@ -307,13 +322,15 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(256, (uint32_t)W);
     ifd.longv(257, (uint32_t)H);
     ifd.shorts(258, {16, 16, 16});
-    // 8 = Adobe Deflate (lossless ZIP), 1 = uncompressed. Same decoded pixels.
-    ifd.shortv(259, compress ? 8 : 1);
+    // 7 = lossless JPEG (SOF3), 8 = Adobe Deflate (ZIP), 1 = uncompressed.
+    // All three decode to the same uint16 samples.
+    ifd.shortv(259, codec == Config::DNG_CODEC_LJPEG    ? 7 :
+                    codec == Config::DNG_CODEC_DEFLATE  ? 8 : 1);
     if (baked_srgb)
         ifd.shortv(262, 2);            // RGB
     else
         ifd.shortv(262, 34892);        // LinearRaw
-    ifd.longv(273, 0);                 // StripOffsets (patched)
+    ifd.longs(273, std::vector<uint32_t>((size_t)nstrips, 0));  // StripOffsets (patched)
     // SubIFDs, reserved empty. Adding this tag later would grow IFD0 by 12
     // bytes and push the image strip along with it, which is why embedding a
     // preview used to rebuild the entire file -- a 292MB read plus a 292MB
@@ -323,8 +340,8 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     if (orientation >= 1 && orientation <= 8)
         ifd.shortv(274, (uint16_t)orientation);
     ifd.shortv(277, 3);                // SamplesPerPixel
-    ifd.longv(278, (uint32_t)H);       // RowsPerStrip
-    ifd.longv(279, 0);                 // StripByteCounts (patched after compress)
+    ifd.longv(278, (uint32_t)rows_per_strip);
+    ifd.longs(279, std::vector<uint32_t>((size_t)nstrips, 0));  // StripByteCounts (patched)
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
     ifd.ascii(306, now_tiff_datetime()); // DateTime (file write time)
@@ -335,7 +352,11 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                    exif->f_number > 0.f || exif->focal_length_mm > 0.f ||
                                    !exif->lens_model.empty() || !exif->datetime.empty());
     if (has_exif) ifd.longv(34665, 0);  // ExifIFD (patched below)
-    ifd.shortv(317, 1);                // Predictor = none (faster write; same pixels)
+    // Predictor is defined for LZW/Deflate only; lossless JPEG carries its own
+    // prediction inside the scan, so the tag is omitted rather than written as
+    // a meaningless 1.
+    if (codec != Config::DNG_CODEC_LJPEG)
+        ifd.shortv(317, 1);            // Predictor = none (faster write; same pixels)
     ifd.shorts(339, {1, 1, 1});        // SampleFormat = unsigned
 
     ifd.longs(50719, {0, 0});
@@ -409,12 +430,18 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     std::vector<uint8_t> heap;
     int strip_off_entry = -1;
+    strip_offsets_pos_out = 0;
+    strip_byte_counts_pos_out = 0;
     for (int i = 0; i < (int)ifd.e.size(); ++i) {
         auto& e = ifd.e[(size_t)i];
         if (e.tag == 273) strip_off_entry = i;
         if (!e.payload.empty()) {
             if (heap.size() & 1) heap.push_back(0);
             e.inlineval = heap_base + (uint32_t)heap.size();
+            // Multi-strip: the two LONG arrays live out of line, and their heap
+            // address is where close() writes the real offsets and sizes.
+            if (e.tag == 273) strip_offsets_pos_out = e.inlineval;
+            if (e.tag == 279) strip_byte_counts_pos_out = e.inlineval;
             heap.insert(heap.end(), e.payload.begin(), e.payload.end());
         }
     }
@@ -446,7 +473,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     }
     uint32_t strip_offset = heap_base + (uint32_t)heap.size();
     if (strip_offset & 1) strip_offset += 1;
-    if (strip_off_entry >= 0) ifd.e[(size_t)strip_off_entry].inlineval = strip_offset;
+    // Single strip: the offset is the entry's own inline value, as before.
+    if (nstrips == 1 && strip_off_entry >= 0)
+        ifd.e[(size_t)strip_off_entry].inlineval = strip_offset;
 
     std::vector<uint8_t> out;
     out.push_back('I'); out.push_back('I');
@@ -455,9 +484,10 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     w16(out, (uint16_t)n);
     for (int i = 0; i < (int)ifd.e.size(); ++i) {
         const auto& e = ifd.e[(size_t)i];
-        if (e.tag == 279) {
-            strip_byte_counts_offset_out = (uint32_t)out.size() + 8;
-        }
+        // Single strip: both values sit inline in the IFD entry, so that is
+        // where the patch goes.
+        if (nstrips == 1 && e.tag == 273) strip_offsets_pos_out = (uint32_t)out.size() + 8;
+        if (nstrips == 1 && e.tag == 279) strip_byte_counts_pos_out = (uint32_t)out.size() + 8;
         w16(out, e.tag);
         w16(out, e.type);
         w32(out, e.count);
@@ -492,22 +522,45 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
                            int orientation, const float* colorMatrixXYZtoCam,
                            const float* wbGainsGreenNorm, bool bakedSrgb,
                            const std::string& camera_make, const float* camToSrgb,
-                           bool pixelsPrewhitened, bool lossless,
-                           const CaptureExif* exif) {
+                           bool pixelsPrewhitened, int codec,
+                           const CaptureExif* exif, int numThreads) {
     if (W <= 0 || H <= 0) return false;
+    join_async();   // a reused writer must not leave a worker behind
     W_ = W; H_ = H; rows_written_ = 0;
     compressed_bytes_ = 0;
-    compress_ = lossless;
-    strip_byte_counts_offset_ = 0;
+    codec_ = (codec == Config::DNG_CODEC_LJPEG || codec == Config::DNG_CODEC_DEFLATE)
+                 ? codec : Config::DNG_CODEC_NONE;
+    num_threads_ = numThreads;
+    strip_byte_counts_pos_ = 0;
+    strip_offsets_pos_ = 0;
     deflate_ok_ = false;
+    strip_offsets_.clear();
+    strip_sizes_.clear();
+    pending_.clear();
+    enc_scratch_.clear();
+    pending_rows_ = 0;
+    encoded_rows_ = 0;
+    async_rows_ = 0;
+    async_ok_ = true;
+
+    const bool ljpeg = codec_ == Config::DNG_CODEC_LJPEG;
+    const int rows_per_strip = ljpeg ? std::min(kLjpegStripRows, H) : H;
+    const int nstrips = ljpeg ? ((H + rows_per_strip - 1) / rows_per_strip) : 1;
 
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
                                                    bakedSrgb, camToSrgb, pixelsPrewhitened,
-                                                   compress_,
-                                                   strip_offset, strip_byte_counts_offset_,
+                                                   codec_, nstrips, rows_per_strip,
+                                                   strip_offset, strip_offsets_pos_,
+                                                   strip_byte_counts_pos_,
                                                    exif);
+    if (ljpeg) {
+        strip_offsets_.reserve((size_t)nstrips);
+        strip_sizes_.reserve((size_t)nstrips);
+        pending_.resize((size_t)rows_per_strip * (size_t)W * 3u);
+    }
+    next_strip_offset_ = strip_offset;
     f_ = fopen(path.c_str(), "wb+");
     if (!f_) return false;
     // Large stdio buffer — fewer syscalls during streaming writes.
@@ -524,16 +577,21 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
         return false;
     }
 
-    if (!compress_) {
-        // Uncompressed: rows go straight to disk, no zlib state at all.
+    if (codec_ != Config::DNG_CODEC_DEFLATE) {
+        // Uncompressed and lossless JPEG both write strips straight out; no
+        // zlib state to carry at all.
         deflate_ok_ = true;
         return true;
     }
 
     auto* zs = new z_stream();
     std::memset(zs, 0, sizeof(z_stream));
-    // Fastest lossless zlib level — same decoded RGB16, much less CPU than Z_BEST/default.
-    if (deflateInit(zs, Z_BEST_SPEED) != Z_OK) {
+    // Level 6, not Z_BEST_SPEED. Measured on a 48MP merge, level 1 emits
+    // 294.6MB against 292.6MB uncompressed -- it cannot model 16-bit sensor
+    // noise, so it spends ~8.6s of unparallelizable CPU to make the file
+    // *larger*. Level 6 reaches 256.8MB. Lossless JPEG beats both at 172.6MB
+    // and is the default; this path is kept for comparison.
+    if (deflateInit(zs, 6) != Z_OK) {
         delete zs;
         fclose(f_); f_ = nullptr;
         return false;
@@ -544,12 +602,124 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     return true;
 }
 
+// Encode one complete strip and append it. Callers hand over whole strips only
+// (the last one may be short); the offset/size pair is recorded for close().
+bool DngStreamWriter::flush_ljpeg_strip(const uint16_t* rows16, int nrows) {
+    std::vector<uint8_t> enc;
+    if (!ljpeg_encode(rows16, W_, nrows, 3, enc)) return false;
+    if (fwrite(enc.data(), 1, enc.size(), f_) != enc.size()) return false;
+    strip_offsets_.push_back(next_strip_offset_);
+    strip_sizes_.push_back((uint32_t)enc.size());
+    next_strip_offset_ += (uint32_t)enc.size();
+    compressed_bytes_ += (uint32_t)enc.size();
+    return true;
+}
+
+// Wait for the worker started by the previous write_rows, if any, and take its
+// result. Returns false once anything in the encode has failed.
+bool DngStreamWriter::join_async() {
+    if (async_thread_) {
+        auto* t = static_cast<std::thread*>(async_thread_);
+        if (t->joinable()) t->join();
+        delete t;
+        async_thread_ = nullptr;
+    }
+    return async_ok_;
+}
+
+// Runs on the worker thread. Carries any part-strip from the previous band,
+// encodes every whole strip in parallel, then appends them in row order.
+bool DngStreamWriter::encode_band_ljpeg(const uint16_t* rgb16, int nrows) {
+    {
+        const size_t row_samples = (size_t)W_ * 3u;
+        const int strip_rows = std::min(kLjpegStripRows, H_);
+        int consumed = 0;
+
+        // Top up a strip a previous band ended part-way through. Merge bands
+        // are not multiples of the strip height, so this carry is the only copy
+        // on the path -- at most 63 rows per band.
+        if (pending_rows_ > 0) {
+            const int need = std::min(strip_rows - pending_rows_, nrows);
+            std::memcpy(pending_.data() + (size_t)pending_rows_ * row_samples,
+                        rgb16, (size_t)need * row_samples * sizeof(uint16_t));
+            pending_rows_ += need;
+            consumed = need;
+            // A short final strip is left to the end-of-image flush below.
+            if (pending_rows_ == strip_rows) {
+                if (!flush_ljpeg_strip(pending_.data(), pending_rows_)) return false;
+                pending_rows_ = 0;
+            }
+        }
+
+        // Whole strips encode straight out of the band buffer, in parallel:
+        // each is a self-contained bitstream, so there is no cross-strip state
+        // the way a single Deflate stream would have.
+        const int rest = nrows - consumed;
+        const int nfull = rest / strip_rows;
+        if (nfull > 0) {
+            // One scratch buffer per strip slot, kept across bands: after the
+            // first band these are already the right size, so the encode does
+            // no allocation at all.
+            if (enc_scratch_.size() < (size_t)nfull) enc_scratch_.resize((size_t)nfull);
+            std::vector<size_t> len((size_t)nfull, 0);
+            std::vector<char> ok((size_t)nfull, 0);
+            const uint16_t* base = rgb16 + (size_t)consumed * row_samples;
+            parallel_rows(nfull, num_threads_, [&](int k) {
+                ok[(size_t)k] = ljpeg_encode(base + (size_t)k * (size_t)strip_rows * row_samples,
+                                             W_, strip_rows, 3,
+                                             enc_scratch_[(size_t)k], len[(size_t)k]) ? 1 : 0;
+            });
+            for (int k = 0; k < nfull; ++k) {
+                if (!ok[(size_t)k]) return false;
+                const size_t n = len[(size_t)k];
+                if (fwrite(enc_scratch_[(size_t)k].data(), 1, n, f_) != n) return false;
+                strip_offsets_.push_back(next_strip_offset_);
+                strip_sizes_.push_back((uint32_t)n);
+                next_strip_offset_ += (uint32_t)n;
+                compressed_bytes_ += (uint32_t)n;
+            }
+            consumed += nfull * strip_rows;
+        }
+
+        // Carry the tail. When it is the tail of the image it becomes the short
+        // final strip.
+        const int tail = nrows - consumed;
+        if (tail > 0) {
+            std::memcpy(pending_.data() + (size_t)pending_rows_ * row_samples,
+                        rgb16 + (size_t)consumed * row_samples,
+                        (size_t)tail * row_samples * sizeof(uint16_t));
+            pending_rows_ += tail;
+        }
+        encoded_rows_ += nrows;
+        if (pending_rows_ > 0 && encoded_rows_ == H_) {
+            if (!flush_ljpeg_strip(pending_.data(), pending_rows_)) return false;
+            pending_rows_ = 0;
+        }
+        return true;
+    }
+}
+
 bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
     if (!f_ || !deflate_ok_ || !rgb16 || nrows <= 0) return false;
     if (rows_written_ + nrows > H_) nrows = H_ - (int)rows_written_;
     if (nrows <= 0) return true;
 
-    if (!compress_) {
+    if (codec_ == Config::DNG_CODEC_LJPEG) {
+        // Hand the band to the worker and return: the caller gets on with
+        // producing the next one while this encodes.
+        if (!join_async()) return false;
+        const size_t n = (size_t)nrows * (size_t)W_ * 3u;
+        if (async_buf_.size() < n) async_buf_.resize(n);
+        std::memcpy(async_buf_.data(), rgb16, n * sizeof(uint16_t));
+        async_rows_ = nrows;
+        rows_written_ += nrows;
+        async_thread_ = new std::thread([this]() {
+            if (!encode_band_ljpeg(async_buf_.data(), async_rows_)) async_ok_ = false;
+        });
+        return true;
+    }
+
+    if (codec_ != Config::DNG_CODEC_DEFLATE) {
         const size_t nbytes = (size_t)nrows * (size_t)W_ * 3u * sizeof(uint16_t);
         if (fwrite(rgb16, 1, nbytes, f_) != nbytes) return false;
         compressed_bytes_ += (uint32_t)nbytes;
@@ -589,9 +759,50 @@ bool DngStreamWriter::write_rows(const uint16_t* rgb16, int nrows) {
 
 bool DngStreamWriter::close() {
     if (!f_) return false;
-    bool ok = rows_written_ == H_ && deflate_ok_ && (!compress_ || z_stream_);
+    const bool use_ljpeg = codec_ == Config::DNG_CODEC_LJPEG;
+    const bool use_deflate = codec_ == Config::DNG_CODEC_DEFLATE;
+    // The last band may still be encoding; everything below needs it finished.
+    const bool async_ok = join_async();
+    bool ok = rows_written_ == H_ && deflate_ok_ && async_ok &&
+              (!use_deflate || z_stream_);
 
-    if (ok && compress_) {
+    if (ok && use_ljpeg) {
+        // Any rows still carried (a merge band that ended mid-strip, with the
+        // image ending there too) go out as the short final strip.
+        if (pending_rows_ > 0) {
+            ok = flush_ljpeg_strip(pending_.data(), pending_rows_);
+            pending_rows_ = 0;
+        }
+        const int strip_rows = std::min(kLjpegStripRows, H_);
+        const size_t want = (size_t)((H_ + strip_rows - 1) / strip_rows);
+        if (ok && strip_offsets_.size() != want) ok = false;   // strip count must match RowsPerStrip
+
+        // Patch both LONG arrays now that every strip's place is known.
+        if (ok && strip_offsets_pos_ > 0 && strip_byte_counts_pos_ > 0) {
+            std::vector<uint8_t> buf;
+            buf.reserve(strip_offsets_.size() * 4u);
+            for (uint32_t v : strip_offsets_) w32(buf, v);
+            if (fseek(f_, (long)strip_offsets_pos_, SEEK_SET) != 0 ||
+                fwrite(buf.data(), 1, buf.size(), f_) != buf.size()) ok = false;
+            buf.clear();
+            for (uint32_t v : strip_sizes_) w32(buf, v);
+            if (ok && (fseek(f_, (long)strip_byte_counts_pos_, SEEK_SET) != 0 ||
+                       fwrite(buf.data(), 1, buf.size(), f_) != buf.size())) ok = false;
+        } else if (ok) {
+            ok = false;
+        }
+        if (z_stream_) {
+            deflateEnd(static_cast<z_stream*>(z_stream_));
+            delete static_cast<z_stream*>(z_stream_);
+            z_stream_ = nullptr;
+        }
+        fclose(f_);
+        f_ = nullptr;
+        deflate_ok_ = false;
+        return ok;
+    }
+
+    if (ok && use_deflate) {
         auto* zs = static_cast<z_stream*>(z_stream_);
         int ret;
         do {
@@ -607,10 +818,12 @@ bool DngStreamWriter::close() {
         } while (ret != Z_STREAM_END);
     }
 
-    // Patch StripByteCounts for both paths: Deflate accumulates the compressed
-    // size above, uncompressed accumulates the raw size in write_rows.
-    if (ok && strip_byte_counts_offset_ > 0) {
-        if (fseek(f_, (long)strip_byte_counts_offset_, SEEK_SET) == 0) {
+    // Patch StripByteCounts for the two single-strip paths: Deflate accumulates
+    // the compressed size above, uncompressed accumulates the raw size in
+    // write_rows. StripOffsets is already correct inline, so only the one LONG
+    // needs writing here.
+    if (ok && strip_byte_counts_pos_ > 0) {
+        if (fseek(f_, (long)strip_byte_counts_pos_, SEEK_SET) == 0) {
             uint8_t le[4] = {
                 (uint8_t)(compressed_bytes_ & 0xFF),
                 (uint8_t)((compressed_bytes_ >> 8) & 0xFF),
@@ -635,6 +848,7 @@ bool DngStreamWriter::close() {
 }
 
 DngStreamWriter::~DngStreamWriter() {
+    join_async();   // never outlive a worker still reading async_buf_ / f_
     if (z_stream_) {
         deflateEnd(static_cast<z_stream*>(z_stream_));
         delete static_cast<z_stream*>(z_stream_);
@@ -643,9 +857,16 @@ DngStreamWriter::~DngStreamWriter() {
     if (f_) fclose(f_);
 }
 
-// Build the preview SubIFD. Every value fits inline, so it needs no heap.
-static std::vector<uint8_t> build_preview_ifd(uint32_t jpeg_off, size_t jpeg_len,
-                                              int jpeg_w, int jpeg_h) {
+// Build the preview SubIFD, laid out for the file offset it will occupy.
+//
+// BitsPerSample {8,8,8} is three SHORTs = 6 bytes, so it does NOT fit in an
+// entry's 4-byte value field and needs a heap slot. Serializing the entries
+// alone left its offset at 0, and readers dutifully fetched BitsPerSample from
+// the start of the file -- decoding the TIFF header as {18761, 42, 8}, i.e.
+// 'II' and the magic 42. serialize_ifd_at places out-of-line payloads properly,
+// which is why this goes through it rather than emitting the entries by hand.
+static std::vector<uint8_t> build_preview_ifd(uint32_t ifd_off, uint32_t jpeg_off,
+                                              size_t jpeg_len, int jpeg_w, int jpeg_h) {
     IFD prev;
     prev.longv(254, 1);               // NewSubfileType = reduced resolution
     prev.longv(256, (uint32_t)jpeg_w);
@@ -658,20 +879,9 @@ static std::vector<uint8_t> build_preview_ifd(uint32_t jpeg_off, size_t jpeg_len
     prev.longv(278, (uint32_t)jpeg_h);
     prev.longv(279, (uint32_t)jpeg_len);
     prev.shortv(284, 1);
-    prev.shorts(530, {2, 2});
-    prev.shortv(531, 1);
-    std::sort(prev.e.begin(), prev.e.end(),
-              [](const Entry& a, const Entry& b) { return a.tag < b.tag; });
-    std::vector<uint8_t> out;
-    w16(out, (uint16_t)prev.e.size());
-    for (const auto& e : prev.e) {
-        w16(out, e.tag);
-        w16(out, e.type);
-        w32(out, e.count);
-        w32(out, e.inlineval);
-    }
-    w32(out, 0);                      // next IFD
-    return out;
+    prev.shorts(530, {2, 2});         // YCbCrSubSampling (two SHORTs: fits inline)
+    prev.shortv(531, 1);              // YCbCrPositioning = centered
+    return serialize_ifd_at(prev, ifd_off);
 }
 
 // Append the preview and point the reserved SubIFDs tag at it. Returns false if
@@ -722,7 +932,7 @@ static bool embed_preview_append(const std::string& path,
     if (after & 1) { const uint8_t pad = 0; fwrite(&pad, 1, 1, f); ++after; }
     const uint32_t ifd1_off = (uint32_t)after;
     const std::vector<uint8_t> ifd1 =
-        build_preview_ifd(jpeg_off, jpeg_len, jpeg_w, jpeg_h);
+        build_preview_ifd(ifd1_off, jpeg_off, jpeg_len, jpeg_w, jpeg_h);
     if (fwrite(ifd1.data(), 1, ifd1.size(), f) != ifd1.size()) { fclose(f); return false; }
 
     // Patch last: until this lands the appended bytes are unreferenced, so a
@@ -833,27 +1043,12 @@ bool embed_dng_jpeg_preview(const std::string& path,
     uint32_t jpeg_off = new_strip + strip_bc;
     if (jpeg_off & 1) jpeg_off += 1;
 
-    // IFD1 (JPEG preview) after JPEG payload
-    IFD prev;
-    prev.longv(254, 1); // NewSubfileType = Reduced resolution
-    prev.longv(256, (uint32_t)jpeg_w);
-    prev.longv(257, (uint32_t)jpeg_h);
-    prev.shorts(258, {8, 8, 8});
-    prev.shortv(259, 7);              // JPEG
-    prev.shortv(262, 6);              // YCbCr
-    prev.longv(273, jpeg_off);        // StripOffsets
-    prev.shortv(277, 3);
-    prev.longv(278, (uint32_t)jpeg_h);
-    prev.longv(279, (uint32_t)jpeg_len);
-    prev.shortv(284, 1);
-    prev.shorts(530, {2, 2});         // YCbCrSubSampling 4:2:0-ish (common)
-    prev.shortv(531, 1);              // YCbCrPositioning = centered
-    std::sort(prev.e.begin(), prev.e.end(), [](const Entry& a, const Entry& b) {
-        return a.tag < b.tag;
-    });
-
     const uint32_t ifd1_offset = jpeg_off + (uint32_t)jpeg_len;
     const uint32_t ifd1_aligned = (ifd1_offset + 1u) & ~1u;
+    // IFD1 (JPEG preview) after the JPEG payload, built the same way as the
+    // append path so BitsPerSample gets a real heap slot rather than offset 0.
+    const std::vector<uint8_t> prev_bytes =
+        build_preview_ifd(ifd1_aligned, jpeg_off, jpeg_len, jpeg_w, jpeg_h);
     if (subifd_entry >= 0) ifd.e[(size_t)subifd_entry].inlineval = ifd1_aligned;
 
     std::vector<uint8_t> out;
@@ -875,16 +1070,7 @@ bool embed_dng_jpeg_preview(const std::string& path,
     while (out.size() < jpeg_off) out.push_back(0);
     out.insert(out.end(), jpeg, jpeg + jpeg_len);
     while (out.size() < ifd1_aligned) out.push_back(0);
-
-    // Write IFD1 (all values inline — no heap for this small IFD)
-    w16(out, (uint16_t)prev.e.size());
-    for (const auto& e : prev.e) {
-        w16(out, e.tag);
-        w16(out, e.type);
-        w32(out, e.count);
-        w32(out, e.inlineval);
-    }
-    w32(out, 0);
+    out.insert(out.end(), prev_bytes.begin(), prev_bytes.end());
 
     std::string tmp = path + ".preview.tmp";
     FILE* fo = fopen(tmp.c_str(), "wb");
@@ -934,6 +1120,25 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
 
     uint32_t width = 0, height = 0, strip_off = 0, strip_bc = 0, rows_per_strip = 0;
     uint16_t compression = 1, predictor = 1, spp = 0;
+    std::vector<uint32_t> strip_offs, strip_bcs;
+    // Pull a LONG/SHORT array out of an entry, inline or from the heap. A
+    // lossless-JPEG DNG carries one entry per strip, so StripOffsets and
+    // StripByteCounts are no longer single values.
+    auto read_array = [&](uint16_t type, uint32_t count, uint32_t val,
+                          std::vector<uint32_t>& dst) {
+        dst.clear();
+        const uint32_t esz = (type == T_LONG) ? 4u : (type == T_SHORT) ? 2u : 0u;
+        if (esz == 0 || count == 0) return;
+        if (esz * count <= 4u) {
+            for (uint32_t k = 0; k < count; ++k)
+                dst.push_back(esz == 4 ? val : ((val >> (16 * k)) & 0xFFFFu));
+            return;
+        }
+        if ((size_t)val + (size_t)esz * count > file.size()) return;
+        const uint8_t* p = file.data() + val;
+        for (uint32_t k = 0; k < count; ++k)
+            dst.push_back(esz == 4 ? r32(p + 4 * k) : (uint32_t)r16(p + 2 * k));
+    };
     for (uint16_t i = 0; i < nent; ++i) {
         const uint8_t* e = file.data() + ifd + 2 + i * 12;
         uint16_t tag = r16(e), type = r16(e + 2);
@@ -947,23 +1152,43 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
             case 256: width = as_long(width); break;
             case 257: height = as_long(height); break;
             case 259: compression = (uint16_t)as_long(compression); break;
-            case 273: strip_off = as_long(strip_off); break;
+            case 273: read_array(type, count, val, strip_offs); break;
             case 277: spp = (uint16_t)as_long(spp); break;
             case 278: rows_per_strip = as_long(rows_per_strip); break;
-            case 279: strip_bc = as_long(strip_bc); break;
+            case 279: read_array(type, count, val, strip_bcs); break;
             case 317: predictor = (uint16_t)as_long(predictor); break;
             default: break;
         }
     }
-    if (width == 0 || height == 0 || spp != 3 || strip_off == 0) return false;
+    if (width == 0 || height == 0 || spp != 3) return false;
+    if (strip_offs.empty()) return false;
     if (rows_per_strip == 0) rows_per_strip = height;
-    if (compression != 8 && compression != 1) return false;
+    if (compression != 8 && compression != 1 && compression != 7) return false;
+    strip_off = strip_offs[0];
+    strip_bc = strip_bcs.empty() ? 0 : strip_bcs[0];
     if (strip_off >= file.size()) return false;
 
     const size_t raw_bytes = (size_t)width * height * 3 * sizeof(uint16_t);
     rgb.resize((size_t)width * height * 3);
 
-    if (compression == 1) {
+    if (compression == 7) {
+        // Lossless JPEG: every strip is an independent stream, so they decode
+        // on all cores the same way they were written.
+        const uint32_t nstrips = (height + rows_per_strip - 1) / rows_per_strip;
+        if (strip_offs.size() != nstrips || strip_bcs.size() != nstrips) { rgb.clear(); return false; }
+        std::vector<char> ok(nstrips, 0);
+        parallel_rows((int)nstrips, 0, [&](int k) {
+            const uint32_t y0 = (uint32_t)k * rows_per_strip;
+            const uint32_t rows = std::min(rows_per_strip, height - y0);
+            const size_t off = strip_offs[(size_t)k], bc = strip_bcs[(size_t)k];
+            if (off + bc > file.size() || bc == 0) return;
+            ok[(size_t)k] = ljpeg_decode(file.data() + off, bc,
+                                         rgb.data() + (size_t)y0 * width * 3,
+                                         (int)width, (int)rows, 3) ? 1 : 0;
+        });
+        for (uint32_t k = 0; k < nstrips; ++k)
+            if (!ok[k]) { rgb.clear(); return false; }
+    } else if (compression == 1) {
         if (strip_off + raw_bytes > file.size()) { rgb.clear(); return false; }
         std::memcpy(rgb.data(), file.data() + strip_off, raw_bytes);
     } else {
@@ -989,12 +1214,9 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
     return true;
 }
 
-bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
-                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
-                                 bool& has_color) {
-    has_color = false;
-    wb[0] = wb[1] = wb[2] = 1.f;
-    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
+bool load_linear_dng_rgb16_info(const std::string& path, std::vector<uint16_t>& rgb,
+                                int& W, int& H, LinearDngColorInfo& info) {
+    info = LinearDngColorInfo{};
 
     if (!load_linear_dng_rgb16(path, rgb, W, H)) return false;
 
@@ -1012,15 +1234,15 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
     uint32_t ifd = r32(file.data() + 4);
     if (ifd + 2 > file.size()) return true;
     uint16_t nent = r16(file.data() + ifd);
-    bool private_color = false;
-    bool has_color_matrix = false;
-    float color_matrix[9] = {0};
-    bool has_analog_balance = false;
-    float analog_balance[3] = {1.f, 1.f, 1.f};
     for (uint16_t i = 0; i < nent; ++i) {
         const uint8_t* e = file.data() + ifd + 2 + i * 12;
         uint16_t tag = r16(e), type = r16(e + 2);
         uint32_t count = r32(e + 4), val = r32(e + 8);
+        if (tag == 274 && type == T_SHORT && count >= 1) {
+            const uint16_t o = r16(e + 8);
+            if (o >= 1 && o <= 8) info.orientation = (int)o;
+            continue;
+        }
         if (tag == 65000 && type == T_BYTE && count >= 48) {
             uint32_t off = (count <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
             if (off + 48 <= file.size()) {
@@ -1030,10 +1252,15 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                     std::memcpy(&v, &u, sizeof(v));
                     return v;
                 };
-                for (int k = 0; k < 3; ++k) wb[k] = read_f(off + (uint32_t)k * 4);
-                for (int k = 0; k < 9; ++k) cam_to_srgb[k] = read_f(off + 12 + (uint32_t)k * 4);
-                private_color = true;
-                has_color = true;
+                for (int k = 0; k < 3; ++k) info.wb[k] = read_f(off + (uint32_t)k * 4);
+                for (int k = 0; k < 9; ++k)
+                    info.cam_to_srgb[k] = read_f(off + 12 + (uint32_t)k * 4);
+                bool wb_ok = true;
+                for (int k = 0; k < 3; ++k)
+                    wb_ok = wb_ok && std::isfinite(info.wb[k]) && info.wb[k] > 1e-6f;
+                if (!wb_ok) { info.wb[0] = info.wb[1] = info.wb[2] = 1.f; }
+                info.has_wb = wb_ok;
+                info.has_cam_to_srgb = true;
             }
             continue;
         }
@@ -1048,11 +1275,30 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                         ? (int32_t)r32(p) : (int32_t)(uint32_t)r32(p);
                     const int32_t den = (int32_t)r32(p + 4);
                     if (den == 0) { ok = false; break; }
-                    color_matrix[k] = (float)num / (float)den;
-                    ok = ok && std::isfinite(color_matrix[k]);
+                    info.color_matrix[k] = (float)num / (float)den;
+                    ok = ok && std::isfinite(info.color_matrix[k]);
                 }
-                has_color_matrix = ok;
+                info.has_color_matrix = ok;
             }
+        }
+        if (tag == 50728 && (type == T_RATIONAL || type == T_SRATIONAL) && count >= 3) {
+            const uint32_t bytes = count * type_size(type);
+            uint32_t off = (bytes <= 4) ? (uint32_t)(e + 8 - file.data()) : val;
+            if (off + 3u * 8u <= file.size()) {
+                bool ok = true;
+                for (int k = 0; k < 3; ++k) {
+                    const uint8_t* p = file.data() + off + (uint32_t)k * 8u;
+                    const int32_t num = (type == T_SRATIONAL)
+                        ? (int32_t)r32(p) : (int32_t)(uint32_t)r32(p);
+                    const int32_t den = (int32_t)r32(p + 4);
+                    if (den == 0) { ok = false; break; }
+                    info.as_shot_neutral[k] = (float)num / (float)den;
+                    ok = ok && std::isfinite(info.as_shot_neutral[k]) &&
+                         info.as_shot_neutral[k] > 1e-6f;
+                }
+                info.has_as_shot_neutral = ok;
+            }
+            continue;
         }
         if (tag == 50727 && (type == T_RATIONAL || type == T_SRATIONAL) && count >= 3) {
             const uint32_t bytes = count * type_size(type);
@@ -1065,18 +1311,37 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                         ? (int32_t)r32(p) : (int32_t)(uint32_t)r32(p);
                     const int32_t den = (int32_t)r32(p + 4);
                     if (den == 0) { ok = false; break; }
-                    analog_balance[k] = (float)num / (float)den;
-                    ok = ok && std::isfinite(analog_balance[k]) &&
-                         std::fabs(analog_balance[k]) > 1e-6f;
+                    info.analog_balance[k] = (float)num / (float)den;
+                    ok = ok && std::isfinite(info.analog_balance[k]) &&
+                         std::fabs(info.analog_balance[k]) > 1e-6f;
                 }
-                has_analog_balance = ok;
+                info.has_analog_balance = ok;
             }
         }
     }
-    if ((!private_color || is_identity_3x3(cam_to_srgb)) && has_color_matrix) {
+    return true;
+}
+
+bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>& rgb,
+                                 int& W, int& H, float wb[3], float cam_to_srgb[9],
+                                 bool& has_color) {
+    has_color = false;
+    wb[0] = wb[1] = wb[2] = 1.f;
+    for (int i = 0; i < 9; ++i) cam_to_srgb[i] = (i % 4 == 0) ? 1.f : 0.f;
+
+    LinearDngColorInfo info;
+    if (!load_linear_dng_rgb16_info(path, rgb, W, H, info)) return false;
+
+    if (info.has_cam_to_srgb) {
+        for (int k = 0; k < 3; ++k) wb[k] = info.wb[k];
+        for (int k = 0; k < 9; ++k) cam_to_srgb[k] = info.cam_to_srgb[k];
+        has_color = true;
+    }
+    if ((!info.has_cam_to_srgb || is_identity_3x3(cam_to_srgb)) && info.has_color_matrix) {
         float derived[9];
         if (derive_cam_to_srgb_from_color_matrix(
-                color_matrix, has_analog_balance ? analog_balance : nullptr, derived)) {
+                info.color_matrix,
+                info.has_analog_balance ? info.analog_balance : nullptr, derived)) {
             for (int k = 0; k < 9; ++k) cam_to_srgb[k] = derived[k];
             has_color = true;
         }

@@ -989,12 +989,30 @@ struct Config {
     bool  has_cam_to_srgb = false;
     float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
     bool  bake_srgb = false;
-    // Lossless-compress the output DNG (Adobe Deflate / ZIP, Compression=8).
-    // Byte-for-byte identical decoded pixels to the uncompressed DNG, ~1.2-1.5x
-    // smaller on 16-bit linear photographic data (roughly -90MB at 48MP). Costs
-    // ~8.6s of single-threaded zlib per 48MP frame (a serial deflate stream), so
-    // it trades write latency for file size. Off by default = uncompressed/fast.
-    bool  dng_lossless_compress = false;
+    // Codec for the output DNG image strip. All three are lossless -- the
+    // decoded uint16 samples are identical to the bit -- so this trades only
+    // file size against write cost, never quality.
+    //
+    // Measured on a 48MP merge (8064x6048x3, 292.6MB of samples), encode cost
+    // on a 12-core desktop:
+    //   NONE     292.6MB   no CPU at all, but every byte hits the filesystem
+    //   LJPEG    172.6MB   -41%. 2.94s single-threaded, 0.50s across 12 cores
+    //                      (strips are independent streams, so it scales);
+    //                      decode 0.75s. Costs some CPU against NONE and saves
+    //                      120MB of writes -- and of dirty pages, which is what
+    //                      jetsam actually counts on iOS.
+    //   DEFLATE  256.8MB   only at zlib level 6; at the Z_BEST_SPEED this used
+    //                      to run it produced 294.6MB -- LARGER than
+    //                      uncompressed -- for ~8.6s of unparallelizable CPU,
+    //                      because level 1 cannot model 16-bit sensor noise.
+    //                      Strictly worse than LJPEG on both axes; kept only
+    //                      for reading old files and for comparison.
+    enum DngCodec : int {
+        DNG_CODEC_NONE    = 0,   // Compression = 1
+        DNG_CODEC_LJPEG   = 1,   // Compression = 7  (lossless JPEG, SOF3)
+        DNG_CODEC_DEFLATE = 2,   // Compression = 8  (Adobe Deflate / ZIP)
+    };
+    int   dng_codec = DNG_CODEC_LJPEG;
     // Store the output DNG UN-white-balanced (real AsShotNeutral) instead of
     // baking the WB gains into the pixels. The pipeline merges in
     // pre-white-balanced space (Python utils_dng order), so gains of R~2.06 /

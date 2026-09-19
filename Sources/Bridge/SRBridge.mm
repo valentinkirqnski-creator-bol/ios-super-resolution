@@ -484,8 +484,15 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_enabled = tuning[@"robustness_enabled"].boolValue;
     if (tuning[@"robustness_save_mask"])
         cfg.robustness_save_mask = tuning[@"robustness_save_mask"].boolValue;
+    // dng_codec is the current knob (0 = none, 1 = lossless JPEG, 2 = Deflate).
+    // dng_lossless_compress is the older boolean and still honoured for saved
+    // tuning presets; "lossless" now means the codec that actually earns it.
     if (tuning[@"dng_lossless_compress"])
-        cfg.dng_lossless_compress = tuning[@"dng_lossless_compress"].boolValue;
+        cfg.dng_codec = tuning[@"dng_lossless_compress"].boolValue
+                            ? hhsr::Config::DNG_CODEC_LJPEG
+                            : hhsr::Config::DNG_CODEC_NONE;
+    if (tuning[@"dng_codec"])
+        cfg.dng_codec = std::max(0, std::min(2, tuning[@"dng_codec"].intValue));
     if (tuning[@"dng_store_unwhitened"])
         cfg.dng_store_unwhitened = tuning[@"dng_store_unwhitened"].boolValue;
     if (tuning[@"merge_arch"]) cfg.merge_arch = tuning[@"merge_arch"].intValue;
