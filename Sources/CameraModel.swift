@@ -97,14 +97,7 @@ struct TuningParams: Equatable, Codable {
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
     var snr_auto_tune: Bool = false
-    /// Block-matching tile size in RAW pixels, forced rather than SNR-derived.
-    /// 8 expands through bm_tile_size_factors {1,1,1,0.5} to 8,8,8,8 -- the
-    /// coarsest level's 4 is floored back to 8 because the Metal block-matching
-    /// kernels are specialised for 8/16/32/64. Level 0's tile grid becomes
-    /// 378x504 instead of 189x252: the same pixel count matched, in four times
-    /// as many tiles, so the flow field follows smaller local motion at the cost
-    /// of fewer pixels per match to decide it from.
-    var alignment_tile_size: Int = 8
+    var alignment_tile_size: Int = 16
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -396,7 +389,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 13
+        let defaultsVersion = 12
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
