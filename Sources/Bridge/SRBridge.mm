@@ -15,6 +15,7 @@
 #include "core/mps_fft.h"
 #include "core/preset_lut.h"
 #include "core/render_isp.h"
+#include "core/finish_hdr.h"
 #include "core/dng_writer.h"
 #include "core/parallel.h"
 
@@ -261,6 +262,9 @@ static hhsr::IspParams g_isp;
 // Lightroom-fitted path. Parked here like g_isp (the export entry points take
 // only a path).
 static bool g_jpeg_match_14 = false;
+// Parameters for the HDR JPG export (core/finish_hdr). Parked here for the same
+// reason as g_isp: the export entry points are handed a path and nothing else.
+static hhsr::FinishHdrParams g_hdr;
 
 // Capture EXIF for the exported JPEG. The DNG already carries these in its Exif
 // sub-IFD (dng_writer), but exportJPEGFromLinearDNG / embedJPEGPreviewInDNG only
@@ -501,6 +505,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"isp_enabled"])        cfg.isp.enabled = tuning[@"isp_enabled"].boolValue;
     if (tuning[@"isp_exposure_ev"])    cfg.isp.exposure_ev = tuning[@"isp_exposure_ev"].floatValue;
     if (tuning[@"isp_highlight_knee"]) cfg.isp.highlight_knee = tuning[@"isp_highlight_knee"].floatValue;
+    if (tuning[@"hdr_shadow_lift"])       g_hdr.shadow_lift       = tuning[@"hdr_shadow_lift"].floatValue;
+    if (tuning[@"hdr_highlight_rolloff"]) g_hdr.highlight_rolloff = tuning[@"hdr_highlight_rolloff"].floatValue;
+    if (tuning[@"hdr_local_strength"])    g_hdr.local_strength    = tuning[@"hdr_local_strength"].floatValue;
+    if (tuning[@"hdr_contrast"])          g_hdr.contrast          = tuning[@"hdr_contrast"].floatValue;
+    if (tuning[@"hdr_vibrance"])          g_hdr.vibrance          = tuning[@"hdr_vibrance"].floatValue;
+    if (tuning[@"hdr_exposure_ev"])       g_hdr.exposure_ev       = tuning[@"hdr_exposure_ev"].floatValue;
+    if (tuning[@"hdr_chroma_denoise"])    g_hdr.chroma_denoise    = tuning[@"hdr_chroma_denoise"].floatValue;
     if (tuning[@"isp_local_strength"]) cfg.isp.local_strength = tuning[@"isp_local_strength"].floatValue;
     if (tuning[@"isp_highlight"])      cfg.isp.highlight_rolloff = tuning[@"isp_highlight"].floatValue;
     if (tuning[@"isp_shadow"])         cfg.isp.shadow_lift = tuning[@"isp_shadow"].floatValue;
@@ -1189,6 +1200,77 @@ static NSDictionary* BuildJpegExportOpts(NSString* dngPath, float quality) {
     // 4:2:0 below ~0.90, which is where most of the saving comes from, and
     // chroma subsampling is not visible on a photograph at this resolution.
     NSDictionary* opts = BuildJpegExportOpts(dngPath, 0.82f);
+    CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CGImageRelease(cgOut);
+    return ok;
+}
+
+// Frees the vector a data provider was given ownership of, below.
+static void ReleaseRGB8Backing(void* info, const void* /*data*/, size_t /*size*/) {
+    delete static_cast<std::vector<uint8_t>*>(info);
+}
+
+// Wrap interleaved 8-bit sRGB in a CGImage. The caller owns the returned ref.
+//
+// The pixels are MOVED in, not copied: at 48MP this buffer is 145MB, and handing
+// CoreGraphics a copy would hold 290MB for as long as both were alive, on a
+// pipeline whose whole margin to jetsam is about 300MB. The vector goes onto the
+// heap and the data provider owns it from there -- CGImageCreate retains the
+// provider, and the callback above frees the vector when the image is released.
+static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
+    if (W <= 0 || H <= 0 || rgb.size() < (size_t)W * (size_t)H * 3u) return NULL;
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) return NULL;
+    auto* owned = new std::vector<uint8_t>(std::move(rgb));
+    CGDataProviderRef provider = CGDataProviderCreateWithData(
+        owned, owned->data(), owned->size(), ReleaseRGB8Backing);
+    if (!provider) {
+        delete owned;
+        CGColorSpaceRelease(cs);
+        return NULL;
+    }
+    CGImageRef cg = CGImageCreate(W, H, 8, 24, (size_t)W * 3u, cs,
+                                  kCGBitmapByteOrderDefault | kCGImageAlphaNone,
+                                  provider, NULL, false, kCGRenderingIntentDefault);
+    CGDataProviderRelease(provider);
+    CGColorSpaceRelease(cs);
+    return cg;
+}
+
++ (BOOL)exportHDRJPEGFromLinearDNG:(NSString *)dngPath toPath:(NSString *)jpgPath {
+    if (dngPath.length == 0 || jpgPath.length == 0) return NO;
+
+    std::vector<uint8_t> srgb;
+    int W = 0, H = 0, orientation = 1;
+    if (!hhsr::finish_hdr_from_dng(std::string(dngPath.UTF8String), g_hdr,
+                                   srgb, W, H, orientation))
+        return NO;
+
+    CGImageRef cgOut = CGImageFromRGB8(std::move(srgb), W, H);
+    if (!cgOut) return NO;
+
+    NSURL* url = [NSURL fileURLWithPath:jpgPath];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)url, CFSTR("public.jpeg"), 1, NULL);
+    if (!dest) {
+        CGImageRelease(cgOut);
+        return NO;
+    }
+    NSMutableDictionary* opts =
+        [BuildJpegExportOpts(dngPath, 0.92f) mutableCopy];
+    // Carry the DNG's orientation. Without it a portrait capture (tag 6 on this
+    // sensor) exports as a landscape JPEG lying on its side -- the pixels are
+    // right and only the tag is missing.
+    if (orientation >= 1 && orientation <= 8) {
+        opts[(__bridge NSString*)kCGImagePropertyOrientation] = @(orientation);
+        NSMutableDictionary* tiff =
+            [(opts[(__bridge NSString*)kCGImagePropertyTIFFDictionary] ?: @{}) mutableCopy];
+        tiff[(__bridge NSString*)kCGImagePropertyTIFFOrientation] = @(orientation);
+        opts[(__bridge NSString*)kCGImagePropertyTIFFDictionary] = tiff;
+    }
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);

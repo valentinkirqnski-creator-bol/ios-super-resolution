@@ -334,6 +334,7 @@ struct CameraView: View {
             HStack(spacing: 14) {
                 frameCountControl
                 resolutionControl
+                formatControl
                 Spacer()
                 // ISO/shutter now live in the exposure bar below the top strip,
                 // so they are not duplicated here.
@@ -380,6 +381,29 @@ struct CameraView: View {
         .background(Capsule().fill(Color.white.opacity(0.12)))
         .clipShape(Capsule())
         .opacity(cam.isBusy ? 0.5 : 1)
+    }
+
+    /// What lands in Photos: the linear DNG, or the HDR-finished JPG rendered
+    /// from it. The label is the format that will be saved and a tap switches to
+    /// the other -- one button rather than a segmented pair, because with only
+    /// two states the second chip would never be the answer to anything. The
+    /// merge writes the DNG either way; JPG adds the finish pass on top of it.
+    private var formatControl: some View {
+        Button(action: {
+            guard !cam.isBusy else { return }
+            cam.exportFormat = (cam.exportFormat == .dng) ? .jpg : .dng
+        }) {
+            Text(cam.exportFormat.label)   // "DNG" / "JPG"
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(.black)
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                .background(Capsule().fill(Color.white.opacity(0.92)))
+        }
+        .disabled(cam.isBusy)
+        .opacity(cam.isBusy ? 0.5 : 1)
+        .accessibilityLabel("Save format")
+        .accessibilityValue(cam.exportFormat.label)
     }
 
     private func miniStepper(_ symbol: String, enabled: Bool, action: @escaping () -> Void) -> some View {
