@@ -258,7 +258,7 @@ struct TuningParams: Equatable, Codable {
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
         case robustness_enabled, robustness_save_mask
-        case dng_codec, dng_lossless_compress, dng_store_unwhitened
+        case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
@@ -277,6 +277,14 @@ struct TuningParams: Equatable, Codable {
     }
 
     init() {}
+
+    /// Keys that saved presets may still carry but that are no longer stored
+    /// properties. They cannot live in CodingKeys: the synthesized
+    /// `encode(to:)` requires every case there to name a stored property, and a
+    /// leftover case fails the Encodable conformance outright.
+    private enum LegacyKeys: String, CodingKey {
+        case dng_lossless_compress
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -302,9 +310,11 @@ struct TuningParams: Equatable, Codable {
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         // Older presets carry the boolean; map it onto the codec so a saved
-        // "lossless" preset gets the codec that actually earns the name.
-        if let legacy = try c.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress) {
-            dng_codec = legacy ? 1 : 0
+        // "lossless" preset gets the codec that actually earns the name. An
+        // explicit dng_codec, read after, still wins.
+        if let legacy = try? decoder.container(keyedBy: LegacyKeys.self),
+           let wasLossless = try legacy.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress) {
+            dng_codec = wasLossless ? 1 : 0
         }
         dng_codec = try c.decodeIfPresent(Int.self, forKey: .dng_codec) ?? dng_codec
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
