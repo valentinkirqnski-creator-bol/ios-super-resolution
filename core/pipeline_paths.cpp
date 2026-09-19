@@ -1824,7 +1824,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                      // then emits AsShotNeutral=1/gain and stores the real gains in
                      // the private tag for the app render.
                      work.raw_prewhitened && !dng_unwhiten_active(work, nch),
-                     work.dng_lossless_compress, &dng_exif)) {
+                     work.dng_codec, &dng_exif, work.num_threads)) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
         report("Error: cannot open output DNG", 1.f);
 #if defined(__APPLE__)

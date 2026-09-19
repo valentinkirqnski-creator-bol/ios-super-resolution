@@ -22,7 +22,9 @@ struct CaptureExif {
 bool write_linear_dng(const std::string& path, const Image& rgb,
                       const std::string& camera_model = "HandheldSR-x2");
 
-// Decode a HandheldSR LinearRaw Deflate DNG (Compression=8, Predictor=1 or 2) to planar RGB16.
+// Decode a HandheldSR LinearRaw DNG to interleaved RGB16. Handles every codec
+// the writer emits: uncompressed (1), lossless JPEG (7), Deflate (8, Predictor
+// 1 or 2), single- or multi-strip.
 bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb,
                            int& W, int& H);
 
@@ -39,8 +41,39 @@ bool load_linear_dng_rgb16_color(const std::string& path, std::vector<uint16_t>&
                                  int& W, int& H, float wb[3], float cam_to_srgb[9],
                                  bool& has_color);
 
-// Streaming LinearRaw RGB DNG with fast lossless Deflate (ZIP), no predictor.
-// Same decoded pixels as before; write path optimized for merge latency.
+// Everything a renderer needs to get colour right, read back verbatim rather
+// than pre-combined. load_linear_dng_rgb16_color hands out one already-derived
+// camera→sRGB matrix, and which space that matrix expects depends on how the
+// file was written -- LibRaw's rgb_cam wants white-balanced input, the
+// ColorMatrix-derived fallback does not. A renderer that white-balances itself
+// cannot tell the two apart from the matrix alone, and picking wrong is a
+// systematic cast. This hands back the ingredients instead, so the caller can
+// build the matrix for the space it actually renders in.
+struct LinearDngColorInfo {
+    float wb[3] = {1.f, 1.f, 1.f};      // gains the renderer still has to apply
+    bool  has_wb = false;
+    float cam_to_srgb[9] = {1,0,0, 0,1,0, 0,0,1};
+    bool  has_cam_to_srgb = false;
+    float color_matrix[9] = {0};        // ColorMatrix1: XYZ(D65) -> camera
+    bool  has_color_matrix = false;
+    float analog_balance[3] = {1.f, 1.f, 1.f};  // gains ALREADY baked into pixels
+    bool  has_analog_balance = false;
+    // AsShotNeutral: the camera neutral expressed in the STORED pixels' space.
+    // The authoritative white balance -- it is the one a reader can check the
+    // pixels against, and it is what every other DNG reader uses. The private
+    // tag's gains agree with it when both are present, and it is present in
+    // files written before that tag existed.
+    float as_shot_neutral[3] = {1.f, 1.f, 1.f};
+    bool  has_as_shot_neutral = false;
+    int   orientation = 1;              // TIFF tag 274
+};
+
+bool load_linear_dng_rgb16_info(const std::string& path, std::vector<uint16_t>& rgb,
+                                int& W, int& H, LinearDngColorInfo& info);
+
+// Streaming LinearRaw RGB DNG. The image strip is written with one of the
+// lossless codecs in Config::DngCodec; all of them decode to the same uint16
+// samples, so the choice is size/latency only.
 //
 // Highlight headroom (Config::dng_store_unwhitened): whether the encoder should
 // divide the stored rows by the WB gains, and those gains. One definition so
@@ -82,8 +115,9 @@ public:
               const std::string& camera_make = "HandheldSR",
               const float* camToSrgb = nullptr,
               bool pixelsPrewhitened = false,
-              bool lossless = false,
-              const CaptureExif* exif = nullptr);
+              int codec = Config::DNG_CODEC_LJPEG,
+              const CaptureExif* exif = nullptr,
+              int numThreads = 0);
 
     // Build a CaptureExif from a Config's capture_* fields.
     static CaptureExif exif_from_config(const Config& cfg) {
@@ -101,16 +135,55 @@ public:
     bool close();
     ~DngStreamWriter();
 
+    // Rows per strip in the lossless-JPEG path. Every strip is an independent
+    // SOI..EOI stream, so this is the parallel encode granularity as well as
+    // the TIFF one. 64 keeps the per-thread scratch at ~2.9MB on a 48MP frame
+    // while still giving a 480-row merge band 7-8 strips to spread over cores;
+    // measured size is flat to within 0.06% anywhere from 30 to 252 rows, and
+    // every multi-strip layout beats a single strip (per-strip Huffman tables
+    // adapt to local statistics).
+    static constexpr int kLjpegStripRows = 64;
+
 private:
+    bool flush_ljpeg_strip(const uint16_t* rows16, int nrows);
+    bool encode_band_ljpeg(const uint16_t* rgb16, int nrows);
+    bool join_async();
+
     FILE* f_ = nullptr;
     int W_ = 0, H_ = 0;
     long rows_written_ = 0;
-    uint32_t strip_byte_counts_offset_ = 0; // file offset of StripByteCounts LONG
+    uint32_t strip_byte_counts_pos_ = 0;   // file offset of the StripByteCounts array
+    uint32_t strip_offsets_pos_ = 0;       // file offset of the StripOffsets array
     uint32_t compressed_bytes_ = 0;
-    bool compress_ = false;                // Deflate (Compression=8) vs uncompressed
+    int codec_ = Config::DNG_CODEC_NONE;
+    int num_threads_ = 0;
     void* z_stream_ = nullptr;             // z_stream*
     std::vector<uint8_t> z_out_;
     bool deflate_ok_ = false;
+
+    // Lossless-JPEG state: one entry per strip, patched into the two LONG
+    // arrays at close(), plus the carry buffer holding the rows of a strip that
+    // a merge band ended part-way through.
+    std::vector<uint32_t> strip_offsets_;
+    std::vector<uint32_t> strip_sizes_;
+    std::vector<uint16_t> pending_;
+    int pending_rows_ = 0;
+    int encoded_rows_ = 0;                 // rows actually through the encoder
+    uint32_t next_strip_offset_ = 0;
+
+    // The encode runs on a worker so it overlaps whatever produces the next
+    // band -- the merge, on the paths that still have GPU work in flight.
+    // write_rows takes a COPY of the caller's rows rather than borrowing them:
+    // the online path hands back a single pooled GPU buffer that the next band
+    // overwrites, and the banded/fused paths each have their own double-
+    // buffering scheme. Copying (~2ms for a 480-row band, against tens of ms of
+    // encode) keeps write_rows' contract exactly as synchronous as it was, so
+    // no call site has to reason about the worker's lifetime.
+    std::vector<uint16_t> async_buf_;
+    std::vector<std::vector<uint8_t>> enc_scratch_;   // one per strip slot, reused
+    int async_rows_ = 0;
+    bool async_ok_ = true;
+    void* async_thread_ = nullptr;         // std::thread*, kept out of the header
 };
 
 } // namespace hhsr
