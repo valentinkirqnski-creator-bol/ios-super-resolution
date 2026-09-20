@@ -45,6 +45,14 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
                         const Config& cfg);
 void metal_frames_end();
 
+// True when the last metal_frames_begin refused because a buffer would not
+// allocate, as opposed to refusing on policy (the raw-resolution robustness
+// mask, whose slice size is not knowable up front). The distinction matters to
+// the caller: a policy refusal says nothing about how much memory is free,
+// whereas a failed allocation is direct evidence that the device is tight --
+// and the path the caller would otherwise escalate to wants far more.
+bool metal_frames_alloc_refused();
+
 // Which slot the stage calls below read from and write into. -1 disables
 // residency for the next call (the host path runs unchanged).
 void metal_set_active_frame(int slot);

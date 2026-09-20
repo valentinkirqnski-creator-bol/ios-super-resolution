@@ -986,8 +986,15 @@ static void bf_release() {
 bool metal_gpu_init() { return ctx().ok; }
 
 
+// Set only by the allocation check in metal_frames_begin, cleared on entry, so
+// it answers "did the last attempt run out of room" and not "did it decline".
+static bool g_bf_alloc_refused = false;
+
+bool metal_frames_alloc_refused() { return g_bf_alloc_refused; }
+
 bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
                         const Config& cfg) {
+    g_bf_alloc_refused = false;
     bf_release();
     if (!metal_gpu_init()) return false;
     if (n_frames <= 0 || raw_h <= 0 || raw_w <= 0 || tile_size <= 0) return false;
@@ -1047,6 +1054,7 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
         // just refused -- so this line is where a burst that later dies in the
         // merge actually went wrong.
         prof_add_cpu("frames#alloc-refused", 1.0);
+        g_bf_alloc_refused = true;
         bf_release();
         return false;
     }

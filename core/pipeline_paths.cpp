@@ -1379,6 +1379,28 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // instead of pushing them through DRAM once per frame. Only an explicit
     // merge_arch == 2 still asks for online.
     if (frames_resident) use_online = false;   // never both (see metal_frames_begin)
+    // Residency could not get its slices, so do not escalate to the accumulator
+    // that wants five times as much.
+    //
+    // The choice above compares estimated PEAKS, which is the wrong comparison
+    // when the thing that fails is one huge contiguous allocation. Residency
+    // asks for a single n_frames x raw buffer -- 390MB for 8 frames at 12MP,
+    // 488MB for 10 -- and a refusal there is direct evidence that the online
+    // accumulator's 1.17GB num/den pair at 48MP will be refused too. The
+    // asymmetry is what makes this worth acting on: residency failing is
+    // recoverable, while online failing is not. metal_merge_begin_online only
+    // sets flags, so the accumulator is allocated lazily inside the first flush
+    // -- by which point frames have been merged and the only exit is
+    // "Error: GPU merge failed (memory?)". Banded keeps its accumulator
+    // band-sized and can still run. Slower, and it finishes.
+    //
+    // Gated on an ALLOCATION refusal, not any refusal: declining on policy
+    // (raw-resolution robustness) says nothing about free memory, and those
+    // bursts keep choosing online exactly as before. merge_arch == 2 is an
+    // explicit request and is still honoured.
+    if (!frames_resident && use_online && work.merge_arch != 2 &&
+        metal_frames_alloc_refused())
+        use_online = false;
 #endif
     // Every comparison frame's slice has to be complete before the fused kernel
     // can read them, which is only true on the resident path.
