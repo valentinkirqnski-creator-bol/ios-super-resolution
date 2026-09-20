@@ -1111,12 +1111,15 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     ispRow("Black level", $cam.tuningParams.hdr_black_percentile,
-                           0...0.02, "%.3f")
+                           0...0.05, "%.3f")
                     Text("""
                          Fraction of the picture taken all the way to black: \
                          0.002 by default, so about one pixel in five hundred. \
                          Measured per shot rather than a fixed offset, and still \
-                         capped, so a low-key scene keeps its shadows.
+                         capped, so a low-key scene keeps its shadows. The range \
+                         runs to 0.05, where the render itself clamps it; across \
+                         that span it stays monotone, taking mean luma from 126 \
+                         down to 106.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Text("Both apply to the JPG export and to the preview Photos "
@@ -1135,6 +1138,17 @@ struct CameraView: View {
                          well-aligned tile. The rejection threshold is unchanged, \
                          and pixels whose gradient is already strong are left \
                          exactly as they were, so bright scenes behave as before.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    ispRow("Geometry reject threshold",
+                           $cam.tuningParams.motion_geom_reject_threshold,
+                           0.0005...0.02, "%.4f")
+                    Text("""
+                         The geometric test rejects a tile where |gradient| \
+                         x |within-tile motion error| exceeds this. LOWER \
+                         rejects more, so a dim or noisy scene can lose \
+                         frames to it; higher is more permissive. 0.0045 by \
+                         default; 0.02 was the original value.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Save robustness mask",
