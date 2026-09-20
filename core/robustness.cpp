@@ -2,6 +2,7 @@
 #include "robustness_nn.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
+#include "geom_gradient.h"
 #include "prof.h"
 #include <cstdint>
 #include <cstdio>
@@ -1882,9 +1883,24 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 const f32 Emag = std::sqrt(ex * ex + ey * ey);
                 const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
                 const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
-                const f32 gix = 0.5f * (ref_stats.means.at(y, xr, 0) - ref_stats.means.at(y, xl, 0)) / sc;
-                const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
-                const f32 gmag = std::sqrt(gix * gix + giy * giy);
+                // Guide channel 0 over the same clamped neighbourhood the central
+                // difference always used, plus the four diagonals the Sobel needs.
+                const f32 nb[9] = {
+                    ref_stats.means.at(yu, xl, 0), ref_stats.means.at(yu, x, 0), ref_stats.means.at(yu, xr, 0),
+                    ref_stats.means.at(y,  xl, 0), ref_stats.means.at(y,  x, 0), ref_stats.means.at(y,  xr, 0),
+                    ref_stats.means.at(yd, xl, 0), ref_stats.means.at(yd, x, 0), ref_stats.means.at(yd, xr, 0),
+                };
+                // RefStats::means is a 3x3 local mean of the guide, so one sample's
+                // variance is the guide model divided by 9. Channel 0, so the green
+                // halving inside guide_noise_var correctly does not apply.
+                GeomGradParams ggp;
+                ggp.snr_lo = cfg.motion_geom_grad_snr_lo;
+                ggp.snr_hi = cfg.motion_geom_grad_snr_hi;
+                const f32 gsv =
+                    guide_noise_var(cfg, ref_stats.means.c, 0, nb[4]) * (1.f / 9.f);
+                const GeomGradient gg = geom_gradient(nb, sc, gsv, ggp,
+                                                      cfg.motion_geom_denoise_gradient);
+                const f32 gmag = gg.gmag;
                 // Absolute criterion (|grad I| * |E|): preserves the good-light
                 // behaviour exactly -- the bright-scene rejections you already get
                 // stay. ALWAYS applied.

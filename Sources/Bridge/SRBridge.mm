@@ -541,6 +541,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
+    if (tuning[@"motion_geom_denoise_gradient"])
+        cfg.motion_geom_denoise_gradient =
+            tuning[@"motion_geom_denoise_gradient"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])

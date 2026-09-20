@@ -1123,6 +1123,26 @@ struct CameraView: View {
                          + "shows for a DNG, from the next shot on.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("Motion Rejection")) {
+                    Toggle("Noise-aware geometry gradient",
+                           isOn: $cam.tuningParams.motion_geom_denoise_gradient)
+                    Text("""
+                         Estimates the reference gradient used by the geometric \
+                         motion-rejection test with a noise-aware 3x3 operator \
+                         instead of a bare difference, so photon noise in a dark \
+                         scene is less likely to read as an edge and reject a \
+                         well-aligned tile. The rejection threshold is unchanged, \
+                         and pixels whose gradient is already strong are left \
+                         exactly as they were, so bright scenes behave as before.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Save robustness mask",
+                           isOn: $cam.tuningParams.robustness_save_mask)
+                    Text("Writes the per-frame robustness mask alongside the shot "
+                         + "as extra images. Diagnostic; leave off for normal use.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

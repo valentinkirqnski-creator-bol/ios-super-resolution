@@ -1600,8 +1600,12 @@ struct RobMaskParamsCPU {
     uint32_t geom_relative = 1;
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
+    // Geometry-only noise-aware gradient (Config::motion_geom_denoise_gradient).
+    uint32_t geom_denoise_grad = 1;
+    float    geom_grad_snr_lo = 2.0f;
+    float    geom_grad_snr_hi = 6.0f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 116, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2422,6 +2426,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
     mp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
     mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
+    mp.geom_denoise_grad = cfg.motion_geom_denoise_gradient ? 1u : 0u;
+    mp.geom_grad_snr_lo = cfg.motion_geom_grad_snr_lo;
+    mp.geom_grad_snr_hi = cfg.motion_geom_grad_snr_hi;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;

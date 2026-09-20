@@ -174,6 +174,12 @@ struct TuningParams: Equatable, Codable {
     /// contrast (∇g/g, noise-floor-subtracted) instead of absolute gradient, so
     /// misalignments are caught equally in bright and low light. Uses the
     /// relative threshold below.
+    /// Noise-aware gradient for the geometric motion-rejection test only
+    /// (core/geom_gradient.h). Blends the existing central difference toward a
+    /// normalised 3x3 Sobel by how trustworthy it is against the guide noise
+    /// model -- same units, so motion_geom_reject_threshold is unchanged, and
+    /// inert wherever the gradient is already strong.
+    var motion_geom_denoise_gradient: Bool = true
     var motion_geom_relative: Bool = false
     var motion_geom_noise_floor_mult: Float = 1.5
     var motion_geom_reject_threshold_relative: Float = 0.04
@@ -277,6 +283,7 @@ struct TuningParams: Equatable, Codable {
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
         case motion_geom_reject_enabled, motion_geom_reject_threshold
+        case motion_geom_denoise_gradient
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
@@ -365,6 +372,7 @@ struct TuningParams: Equatable, Codable {
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
+        motion_geom_denoise_gradient = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_denoise_gradient) ?? motion_geom_denoise_gradient
         motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
         motion_geom_noise_floor_mult = try c.decodeIfPresent(Float.self, forKey: .motion_geom_noise_floor_mult) ?? motion_geom_noise_floor_mult
         motion_geom_reject_threshold_relative = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold_relative) ?? motion_geom_reject_threshold_relative
@@ -2124,6 +2132,7 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
+            "motion_geom_denoise_gradient": NSNumber(value: tuningParams.motion_geom_denoise_gradient),
             "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
             "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
             "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),

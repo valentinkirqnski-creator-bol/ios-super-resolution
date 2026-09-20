@@ -919,6 +919,16 @@ struct Config {
     // ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     // drops more burst samples.
     float motion_geom_reject_threshold = 0.02f;
+    // Noise-aware gradient for the GEOMETRY TEST ONLY (core/geom_gradient.h).
+    // Blends the existing central difference toward a normalised 3x3 Sobel --
+    // same units, same scale, so motion_geom_reject_threshold is untouched --
+    // by how trustworthy the sharp gradient is against the guide noise model.
+    // Above motion_geom_grad_snr_hi the sharp estimate is returned unchanged,
+    // which is every pixel capable of rejecting in a bright scene. Nothing else
+    // in the pipeline sees this: not the Wronski mask, not the merge.
+    bool  motion_geom_denoise_gradient = true;
+    float motion_geom_grad_snr_lo = 2.0f;
+    float motion_geom_grad_snr_hi = 6.0f;
     // Exposure-invariant geometry rejection. The absolute form above weights the
     // within-tile error |E| by the ABSOLUTE reference gradient |grad I|, which
     // shrinks in dim scenes (sqrt guide: a scene at 1/4 the light has ~half the

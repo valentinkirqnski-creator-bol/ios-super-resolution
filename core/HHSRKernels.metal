@@ -1656,7 +1656,38 @@ struct RobMaskParams {
     uint geom_relative;
     float geom_noise_floor_mult;
     float geom_reject_threshold_relative;
+    // Geometry-only noise-aware gradient. Twin of geom_gradient in
+    // core/geom_gradient.h -- keep the two in step.
+    uint geom_denoise_grad;
+    float geom_grad_snr_lo;
+    float geom_grad_snr_hi;
 };
+
+// Gradient for the GEOMETRY TEST ONLY. Twin of hhsr::geom_gradient in
+// core/geom_gradient.h; see that header for why this is a Sobel blend and not a
+// blur, and why the threshold keeps its meaning. n[] is guide channel 0 over the
+// clamped 3x3, row-major. sample_var is the variance of ONE means sample.
+inline float geom_gradient_mag(thread const float n[9], float sc, float sample_var,
+                               float snr_lo, float snr_hi, bool enabled) {
+    float inv_sc = (sc > 0.f) ? (1.f / sc) : 1.f;
+    float gx = 0.5f * (n[5] - n[3]) * inv_sc;
+    float gy = 0.5f * (n[7] - n[1]) * inv_sc;
+    float sharp = sqrt(gx * gx + gy * gy);
+    if (!enabled) return sharp;
+    float v = max(sample_var, 0.f);
+    float sigma = sqrt(v) * inv_sc;
+    if (!(sigma > 0.f)) return sharp;
+    float snr = sharp / sigma;
+    float hi = (snr_hi > snr_lo) ? snr_hi : (snr_lo + 1e-6f);
+    float t = clamp((snr - snr_lo) / (hi - snr_lo), 0.f, 1.f);
+    float wb = 1.f - t * t * (3.f - 2.f * t);
+    if (wb <= 0.f) return sharp;
+    float sob_x = ((n[2] + 2.f * n[5] + n[8]) - (n[0] + 2.f * n[3] + n[6])) * (1.f / 8.f) * inv_sc;
+    float sob_y = ((n[6] + 2.f * n[7] + n[8]) - (n[0] + 2.f * n[1] + n[2])) * (1.f / 8.f) * inv_sc;
+    gx += (sob_x - gx) * wb;
+    gy += (sob_y - gy) * wb;
+    return sqrt(gx * gx + gy * gy);
+}
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
 // tile-centred). Twin of sample_s_bilinear in robustness.cpp.
@@ -2143,9 +2174,23 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v; float Emag = sqrt(ex * ex + ey * ey);
         int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
         int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
-        float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
-        float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
-        float gmag = sqrt(gix * gix + giy * giy);
+        // Guide channel 0 over the same clamped neighbourhood, plus the diagonals.
+        float nb[9] = {
+            ref_means[(uint(yu) * p.w + uint(xl)) * p.nch],
+            ref_means[(uint(yu) * p.w + gid.x)    * p.nch],
+            ref_means[(uint(yu) * p.w + uint(xr)) * p.nch],
+            ref_means[(gid.y    * p.w + uint(xl)) * p.nch],
+            ref_means[(gid.y    * p.w + gid.x)    * p.nch],
+            ref_means[(gid.y    * p.w + uint(xr)) * p.nch],
+            ref_means[(uint(yd) * p.w + uint(xl)) * p.nch],
+            ref_means[(uint(yd) * p.w + gid.x)    * p.nch],
+            ref_means[(uint(yd) * p.w + uint(xr)) * p.nch],
+        };
+        // ref_means is a 3x3 local mean of the guide, so one sample's variance is
+        // the affine guide model divided by 9. Channel 0: no green halving.
+        float gsv = max(p.alpha * clamp(nb[4], 0.f, 1.f) + p.beta, 0.f) * (1.f / 9.f);
+        float gmag = geom_gradient_mag(nb, sc, gsv, p.geom_grad_snr_lo,
+                                       p.geom_grad_snr_hi, p.geom_denoise_grad != 0u);
         // Absolute criterion (preserves good-light behaviour), always applied.
         geom_reject = (gmag * Emag) > p.geom_reject_threshold;
         // Relative (exposure-invariant) criterion added on top for low light:
