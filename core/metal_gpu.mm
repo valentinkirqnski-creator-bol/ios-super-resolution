@@ -1024,6 +1024,15 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.flow_elems = align_slice((size_t)g_bf.flow_ny * (size_t)g_bf.flow_nx * 2u * f) / f;
 
     const size_t nn = (size_t)n_frames;
+    // What residency is about to ask for, reported so a refusal below can be read
+    // against merge#avail-mb instead of guessed at. The raws slice alone is one
+    // buffer of n_frames x raw: 390MB for 8 frames at 12MP, 488MB for 10, and it
+    // is the one most likely to be refused under fragmentation.
+    prof_add_cpu("frames#slices-mb",
+                 (double)(nn * (g_bf.raw_elems + g_bf.cov_elems + g_bf.rob_elems +
+                                g_bf.flow_elems) * f) / (1024.0 * 1024.0));
+    prof_add_cpu("frames#raws-mb",
+                 (double)(nn * g_bf.raw_elems * f) / (1024.0 * 1024.0));
     g_bf.raws  = buf(nullptr, nn * g_bf.raw_elems  * f);
     g_bf.covs  = buf(nullptr, nn * g_bf.cov_elems  * f);
     g_bf.robs  = buf(nullptr, nn * g_bf.rob_elems  * f);
@@ -1033,6 +1042,11 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
                               (size_t)g_bf.rob_h * sizeof(uint32_t));
     if (!g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows || !g_bf.fft_in ||
         !g_bf.rob_rows) {
+        // Residency refused. The caller treats this as "fall back", but the
+        // fallback is the online accumulator, which is far LARGER than what was
+        // just refused -- so this line is where a burst that later dies in the
+        // merge actually went wrong.
+        prof_add_cpu("frames#alloc-refused", 1.0);
         bf_release();
         return false;
     }

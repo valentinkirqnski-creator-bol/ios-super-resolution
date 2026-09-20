@@ -1007,6 +1007,36 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // unknown, e.g. imported files without the tag, which then keep the tuned
     // r_t). Applied here so it reaches both the CPU and Metal robustness.
     if (work.capture_iso >= 100.f) work.r_t = 0.25f;
+    // A failed burst used to produce no hhsr_profile at all: the report is
+    // written at the very end of this function and all thirteen error exits
+    // return before it. That is backwards -- the runs worth a report are exactly
+    // the ones that did not finish. This guard writes one on the way out unless
+    // the success path already has.
+    //
+    // Declared before pref_fut and friends so it is destroyed LAST: a
+    // std::future from std::async blocks in its destructor, so every worker has
+    // joined by the time this reads `work`.
+    bool prof_written = false;
+    struct ProfOnExit {
+        const bool* written;
+        const Config* work;
+        double t0;
+        int n;
+        ~ProfOnExit() {
+            if (*written || !prof_enabled()) return;
+            char hdr[224];
+            std::snprintf(hdr, sizeof(hdr),
+                          "\nburst FAILED after %.1f ms over %d frames\n",
+                          prof_now_ms() - t0, n);
+            std::string prof = prof_report() + hdr;
+            if (!work->debug_string_capture.empty())
+                prof += "\n=== Metadata ===\n" + work->debug_string_capture + "\n";
+            std::printf("%s", prof.c_str());
+            std::fflush(stdout);
+            prof_save_report(prof);
+        }
+    } prof_on_exit{&prof_written, &work, t_burst, frame_count};
+
     auto report = [&](const std::string& s, float f) { if (progress) progress(s, f); };
     const bool debug = debug_dumps_enabled();
     std::ostringstream debug_summary;
@@ -1356,6 +1386,26 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 #if defined(__APPLE__)
     use_fused = frames_resident && !use_online;
 #endif
+    // The architecture actually chosen, and the inputs to the choice.
+    //
+    // Recorded because a burst that dies in the merge is otherwise
+    // indistinguishable from one that never reached it. Residency being off
+    // sends the merge to the online accumulator, whose num/den pair is 1.17GB at
+    // 48MP and is allocated LAZILY inside the first flush -- so the failure
+    // surfaces as "GPU merge failed" on the first comparison frame, seconds in,
+    // with nothing in the report saying which path was taken or why.
+#if defined(__APPLE__)
+    prof_add_cpu("merge#frames-resident", frames_resident ? 1.0 : 0.0);
+    prof_add_cpu("merge#arch-fused", use_fused ? 1.0 : 0.0);
+    prof_add_cpu("merge#arch-online", use_online ? 1.0 : 0.0);
+    prof_add_cpu("merge#frames", (double)frame_count);
+    prof_add_cpu("merge#avail-mb",
+                 (double)prof_available_bytes() / (1024.0 * 1024.0));
+    prof_add_cpu("merge#online-acc-mb",
+                 (double)((size_t)out_h * out_w * out_nch * sizeof(f32) * 2u) /
+                     (1024.0 * 1024.0));
+#endif
+
     // No host accumulator: the GPU buffer is shared storage, so it is read in
     // place. Allocating a matching host image would double the largest
     // allocation in the pipeline to hold the same bytes twice.
@@ -2316,8 +2366,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                       "\nburst wall %.1f ms over %d frames (%.1f ms/frame)\n",
                       wall, n, wall / std::max(1, n));
         std::string prof = prof_report() + hdr;
-        if (!cfg.debug_string_capture.empty()) {
-            prof += "\n=== Metadata ===\n" + cfg.debug_string_capture + "\n";
+        // `work`, not `cfg`: the loader writes the capture metadata into the
+        // working copy, so reading cfg here printed nothing, ever.
+        if (!work.debug_string_capture.empty()) {
+            prof += "\n=== Metadata ===\n" + work.debug_string_capture + "\n";
         }
         std::printf("%s", prof.c_str());
         std::fflush(stdout);
@@ -2331,6 +2383,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                       (double)prof_min_available_bytes() / (1024.0 * 1024.0));
         report(one_line, 0.995f);
     }
+    prof_written = true;
     report("Done", 1.f);
     return preview;
 }
