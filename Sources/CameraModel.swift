@@ -309,12 +309,18 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
-        // Older presets carry the boolean; map it onto the codec so a saved
-        // "lossless" preset gets the codec that actually earns the name. An
-        // explicit dng_codec, read after, still wins.
+        // Older presets carry the boolean. Only an explicit `true` is honoured,
+        // and it maps to the codec that actually earns the name "lossless".
+        //
+        // Its `false` is NOT carried over, because false was merely the old
+        // default ("uncompressed/fast (current behaviour)") rather than anything
+        // anyone chose -- and promoting an old default into an explicit codec 0
+        // is what silently held the 48MP output at 292MB after the default here
+        // became lossless JPEG. False now falls through to the current default.
         if let legacy = try? decoder.container(keyedBy: LegacyKeys.self),
-           let wasLossless = try legacy.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress) {
-            dng_codec = wasLossless ? 1 : 0
+           let wasLossless = try legacy.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress),
+           wasLossless {
+            dng_codec = 1                      // lossless JPEG
         }
         dng_codec = try c.decodeIfPresent(Int.self, forKey: .dng_codec) ?? dng_codec
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
@@ -418,7 +424,26 @@ final class CameraModel: NSObject, ObservableObject {
             return params
         }
         if let data = UserDefaults.standard.data(forKey: "TuningParams"),
-           let params = try? JSONDecoder().decode(TuningParams.self, from: data) {
+           var params = try? JSONDecoder().decode(TuningParams.self, from: data) {
+            // Re-assert the output codec once, and ONLY the codec, so that
+            // nothing else this install has tuned is disturbed.
+            //
+            // dng_codec replaced a dng_lossless_compress boolean whose default
+            // was false, and defaultsVersion was not bumped at the time, so
+            // every existing install kept decoding its old preset and landed on
+            // codec 0 -- no compression -- while the new default said lossless
+            // JPEG. The 48MP DNG stayed at 292MB and nothing said why. A preset
+            // written by a build that already had the bug holds the 0 directly,
+            // with no legacy key left to recognise it by, so this cannot be a
+            // migration keyed off the old field; it just sets the default once.
+            let codecRepairKey = "TuningParamsCodecRepaired"
+            if !UserDefaults.standard.bool(forKey: codecRepairKey) {
+                UserDefaults.standard.set(true, forKey: codecRepairKey)
+                params.dng_codec = TuningParams.appDefaults.dng_codec
+                if let repaired = try? JSONEncoder().encode(params) {
+                    UserDefaults.standard.set(repaired, forKey: "TuningParams")
+                }
+            }
             return params
         }
         return TuningParams.appDefaults

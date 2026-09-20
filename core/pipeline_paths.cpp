@@ -1854,6 +1854,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     std::vector<uint16_t> row16;
     if (!use_fused) row16.resize((size_t)band_rows * (size_t)Ws * 3u);
     prof_add_cpu("merge:open+alloc", prof_now_ms() - t_open);
+    // Which codec the strip actually got. Recorded because the one time this was
+    // wrong -- a stale saved preset pinning it to 0 -- the only symptom was a
+    // 292MB file, and nothing in the report said so.
+    prof_add_cpu("out:dng-codec#", (double)work.dng_codec);
 
     Image comp_scratch;
 #if defined(__APPLE__)
