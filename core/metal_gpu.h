@@ -263,6 +263,11 @@ bool metal_merge_wait_inflight();
 // transform, curve and LUT it always did. prev_step 0 skips it.
 // out_slot alternates 0/1 between bands, so the DNG writer can read one band's
 // rows in place while the GPU produces the next.
+// Why the last metal_merge_band_fused returned false. Every early exit in it is
+// a different bug with the same symptom, and the caller could only report one
+// generic message -- which named memory, the one thing it is usually not.
+const char* metal_merge_fused_refusal();
+
 bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
                             int y0, int bh, int Hs, int Ws, int nch,
                             int tile_size, const Config& cfg,

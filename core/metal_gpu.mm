@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -4275,20 +4276,35 @@ bool metal_merge_fused_read_diag(AccumDiag& diag, size_t pixels) {
     return true;
 }
 
+// Why the last metal_merge_band_fused refused. Every early exit below is a
+// different bug that reaches the user as one message, and that message said
+// "memory?" -- which cost real debugging time on a burst that had 1.5GB free.
+static const char* g_fused_refusal = "";
+
+const char* metal_merge_fused_refusal() {
+    return (g_fused_refusal && *g_fused_refusal) ? g_fused_refusal : "none";
+}
+
+#define FUSED_REFUSE(why) do { g_fused_refusal = (why); return false; } while (0)
+
 bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
                             int y0, int bh, int Hs, int Ws, int nch,
                             int tile_size, const Config& cfg,
                             int prev_step, int prev_h, int prev_w, float prev_scale,
                             int out_slot, const uint16_t** out_rows) {
+    g_fused_refusal = "";
     if (out_rows) *out_rows = nullptr;
-    if (!out_rows || !metal_gpu_init()) return false;
-    if (!g_bf.open || !g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows) return false;
-    if (n_comp < 0 || y0 < 0 || bh <= 0 || Ws <= 0 || nch < 1) return false;
+    if (!out_rows) FUSED_REFUSE("out_rows null");
+    if (!metal_gpu_init()) FUSED_REFUSE("gpu init");
+    if (!g_bf.open || !g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows)
+        FUSED_REFUSE("residency closed");
+    if (n_comp < 0 || y0 < 0 || bh <= 0 || Ws <= 0 || nch < 1)
+        FUSED_REFUSE("band geometry");
     // The reference needs its plane and its covariances; it never has a mask or a
     // flow field, so metal_frame_merge_ready is the wrong test for it.
-    if (!g_bf.valid_slot(ref_slot)) return false;
-    if (!g_bf.have_raw[(size_t)ref_slot] || !g_bf.have_cov[(size_t)ref_slot])
-        return false;
+    if (!g_bf.valid_slot(ref_slot)) FUSED_REFUSE("ref slot invalid");
+    if (!g_bf.have_raw[(size_t)ref_slot]) FUSED_REFUSE("ref raw slice unset");
+    if (!g_bf.have_cov[(size_t)ref_slot]) FUSED_REFUSE("ref cov slice unset");
     // accumulate_ref's overwrite rule can only fire with the adaptive denoiser,
     // which this build never enables (robustness_denoise is always 0 below).
     // Discarding the comparison contributions would have no meaning here anyway:
@@ -4296,14 +4312,14 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
 
     auto& c = ctx();
     id<MTLComputePipelineState> pipe = c.pipe("merge_band_fused");
-    if (!pipe) return false;
+    if (!pipe) FUSED_REFUSE("no merge_band_fused pipeline");
 
     const size_t out_bytes = (size_t)bh * (size_t)Ws * 3u * sizeof(uint16_t);
     const int os = (out_slot & 1);
     id<MTLBuffer> b_out = c.scratch(c.norm_out[os], c.norm_out_b[os], out_bytes);
-    if (!b_out) return false;
+    if (!b_out) FUSED_REFUSE("out16 alloc");
     if (!g_fused_diag) g_fused_diag = buf(nullptr, kFusedDiagSlots * sizeof(uint32_t));
-    if (!g_fused_diag) return false;
+    if (!g_fused_diag) FUSED_REFUSE("diag alloc");
 
     // One params entry per comparison frame. Geometry fields are identical across
     // frames -- merge_comp_contrib reads band_h / Ws / y0 / nch from whichever
@@ -4313,7 +4329,19 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     ps.reserve((size_t)std::max(1, n_comp));
     for (int i = 0; i < n_comp; ++i) {
         const int slot = comp_slots[i];
-        if (!metal_frame_merge_ready(slot)) return false;
+        if (!metal_frame_merge_ready(slot)) {
+            // Which of the four is missing, not just that one is.
+            static char why[96];
+            const bool vs = g_bf.valid_slot(slot);
+            std::snprintf(why, sizeof(why),
+                          "comp slot %d not ready (valid %d raw %d cov %d rob %d flow %d)",
+                          slot, vs ? 1 : 0,
+                          vs ? g_bf.have_raw[(size_t)slot] : 0,
+                          vs ? g_bf.have_cov[(size_t)slot] : 0,
+                          vs ? g_bf.have_rob[(size_t)slot] : 0,
+                          vs ? g_bf.have_flow[(size_t)slot] : 0);
+            FUSED_REFUSE(why);
+        }
         MergeCompParamsCPU p{};
         p.band_h = (uint32_t)bh;
         p.Ws = (uint32_t)Ws;
@@ -4400,7 +4428,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     const size_t prev_bytes =
         (size_t)std::max(1, prev_h) * (size_t)std::max(1, prev_w) * 3u * sizeof(float);
     id<MTLBuffer> b_prev = c.scratch(c.merge_prev, c.merge_prev_b, prev_bytes);
-    if (!b_prev) return false;
+    if (!b_prev) FUSED_REFUSE("preview alloc");
     // Bands write the preview sparsely, so it has to start clean or a previous
     // burst's samples would show through wherever this one writes nothing. Safe
     // on the CPU here: each band waits for its own dispatch before returning, so
@@ -4408,9 +4436,9 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     if (y0 == 0) memset([b_prev contents], 0, prev_bytes);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
-    if (!cmd) return false;
+    if (!cmd) FUSED_REFUSE("command buffer");
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return false;
+    if (!enc) FUSED_REFUSE("encoder");
     [enc setBuffer:b_out offset:0 atIndex:0];
     [enc setBytes:ps.data() length:ps.size() * sizeof(MergeCompParamsCPU) atIndex:1];
     [enc setBytes:&nframes length:sizeof(nframes) atIndex:2];
@@ -4432,12 +4460,21 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     prof_tag_gpu(cmd, "merge:band-fused");
     [cmd commit];
     [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+        static char why[128];
+        std::snprintf(why, sizeof(why), "gpu status %ld%s%s", (long)cmd.status,
+                      cmd.error ? ": " : "",
+                      cmd.error ? cmd.error.localizedDescription.UTF8String : "");
+        FUSED_REFUSE(why);
+    }
 
     (void)Hs;
     *out_rows = (const uint16_t*)[b_out contents];
-    return *out_rows != nullptr;
+    if (!*out_rows) FUSED_REFUSE("out16 contents null");
+    return true;
 }
+
+#undef FUSED_REFUSE
 
 bool metal_merge_flush_online() {
     if (!g_merge_online) return false;

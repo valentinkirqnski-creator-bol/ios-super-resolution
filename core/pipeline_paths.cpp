@@ -2125,7 +2125,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_mark_memory("merge:band-fused");
 
         if (!fused_ok) {
-            report("Error: GPU merge failed (memory?)", 1.f);
+            // Say which guard refused. "(memory?)" was a guess, and on the burst
+            // that exposed this it was wrong by 1.5GB.
+            report(std::string("Error: fused merge refused - ") +
+                       metal_merge_fused_refusal(),
+                   1.f);
             writer.close();
             if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
             return Image();
