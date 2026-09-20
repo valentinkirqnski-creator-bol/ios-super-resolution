@@ -103,6 +103,35 @@ struct FinishHdrParams {
     // Where the pull toward neutral starts ramping in. The gap to
     // clip_threshold is the smoothstep's width, so recovery has no visible edge.
     float clip_soft = 0.90f;
+    // Second, independent clip evidence: the balanced MINIMUM channel.
+    //
+    // clip_threshold above asks whether a stored channel is still at the sensor
+    // ceiling, and that evidence is destroyed by the merge. Green has the
+    // smallest white-balance gain, so green is the channel that clips first, and
+    // the merge is a kernel-weighted average -- across the soft edge of any
+    // highlight it mixes clipped green with unclipped neighbours and green lands
+    // BELOW the ceiling. cam_max then falls under clip_soft, the pull switches
+    // off, and the pixel renders as the magenta the gains produced: measured
+    // 241/113/255 at a merged green of 0.90 where the correct answer is white.
+    //
+    // Widening clip_soft cannot fix that, because a saturated red flower stores
+    // 0.906 and a magenta neon 0.959 -- indistinguishable from the blown greens
+    // at 0.90-0.96. The quantity that DOES separate them is the dimmest balanced
+    // channel: 0.90-0.96 for those blown highlights against 0.28-0.85 for every
+    // real colour, because a pixel whose weakest channel is already at display
+    // white cannot be a saturated colour. It is white, or it is a blown
+    // highlight whose clipped channel was averaged down. Gated additionally on
+    // the pixel being over display white at all, which is what keeps a pale
+    // bright sky (dimmest channel 0.85, brightest only 1.05) out of it.
+    // Measured: the whole merged-green sweep from 1.000 down to 0.900 at scene
+    // brightness 1.6 now renders 185/185/185, spread 0, where before it ran from
+    // neutral at 0.995 to 241/113/255 at 0.900. Every colour in the guard set is
+    // untouched to the bit -- red flower, magenta neon, deep sky, foliage, warm
+    // skin, bright yellow -- and a pale bright sky loses one point of saturation,
+    // 23%% to 22%%. Widening further only costs more of that sky for no further
+    // gain, which is why the window stops here.
+    float clip_neutral_min = 0.75f;    // balanced min where this starts
+    float clip_neutral_full = 0.90f;   // ... and reaches full strength
 
     // ---- black ----------------------------------------------------------
     // Fraction of pixels that land on true black.

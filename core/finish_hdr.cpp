@@ -292,12 +292,25 @@ inline void to_linear_srgb(const State& st, f32 r, f32 g, f32 b,
 
     // What the sensor blew renders white: pull the pixel to neutral at its own
     // peak, weighted by how far into the clip it went.
-    const f32 t = smoothstepf(st.p.clip_soft, st.p.clip_threshold, cam_max);
+    //
+    // Two independent pieces of evidence, because the first one is destroyed by
+    // the merge. cam_max asks whether a stored channel is still at the sensor
+    // ceiling; the merge's kernel-weighted average mixes a clipped green with
+    // unclipped neighbours across the soft edge of any highlight and leaves it
+    // just under, at which point this test silently gives up. The second asks
+    // whether the DIMMEST balanced channel has reached display white, which no
+    // saturated colour does -- see the note in finish_hdr.h for the measured
+    // separation. Whichever says "blown" more strongly wins.
+    const f32 bal_mx = std::max(r, std::max(g, b));
+    const f32 bal_mn = std::min(r, std::min(g, b));
+    const f32 t_ceiling = smoothstepf(st.p.clip_soft, st.p.clip_threshold, cam_max);
+    const f32 t_white = smoothstepf(st.p.clip_neutral_min, st.p.clip_neutral_full, bal_mn) *
+                        smoothstepf(1.0f, 1.15f, bal_mx);
+    const f32 t = std::max(t_ceiling, t_white);
     if (t > 0.f) {
-        const f32 mx = std::max(r, std::max(g, b));
-        r += (mx - r) * t;
-        g += (mx - g) * t;
-        b += (mx - b) * t;
+        r += (bal_mx - r) * t;
+        g += (bal_mx - g) * t;
+        b += (bal_mx - b) * t;
     }
 
     lr = st.m[0] * r + st.m[1] * g + st.m[2] * b;
