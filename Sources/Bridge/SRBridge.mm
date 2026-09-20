@@ -510,6 +510,11 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"hdr_local_strength"])    g_hdr.local_strength    = tuning[@"hdr_local_strength"].floatValue;
     if (tuning[@"hdr_contrast"])          g_hdr.contrast          = tuning[@"hdr_contrast"].floatValue;
     if (tuning[@"hdr_vibrance"])          g_hdr.vibrance          = tuning[@"hdr_vibrance"].floatValue;
+    // Clamped to the range the render itself honours, so a stored preset from a
+    // future build cannot push it somewhere finish_hdr would just clamp anyway.
+    if (tuning[@"hdr_black_percentile"])
+        g_hdr.display_black_percentile =
+            std::min(0.05f, std::max(0.f, tuning[@"hdr_black_percentile"].floatValue));
     if (tuning[@"hdr_exposure_ev"])       g_hdr.exposure_ev       = tuning[@"hdr_exposure_ev"].floatValue;
     if (tuning[@"hdr_chroma_denoise"])    g_hdr.chroma_denoise    = tuning[@"hdr_chroma_denoise"].floatValue;
     if (tuning[@"isp_local_strength"]) cfg.isp.local_strength = tuning[@"isp_local_strength"].floatValue;

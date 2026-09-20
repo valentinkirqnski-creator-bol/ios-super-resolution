@@ -1101,6 +1101,28 @@ struct CameraView: View {
                     Text("One-time \(store.displayPrice) purchase. Permanently removes the \(StoreManager.freeTotalLimit)-photo free limit.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("JPG Look")) {
+                    ispRow("Vibrance", $cam.tuningParams.hdr_vibrance, 0...1)
+                    Text("""
+                         Saturation boost weighted toward muted colours and faded \
+                         out in the brightest tones, so a highlight is never \
+                         re-saturated. 0.40 by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    ispRow("Black level", $cam.tuningParams.hdr_black_percentile,
+                           0...0.02, "%.3f")
+                    Text("""
+                         Fraction of the picture taken all the way to black: \
+                         0.002 by default, so about one pixel in five hundred. \
+                         Measured per shot rather than a fixed offset, and still \
+                         capped, so a low-key scene keeps its shadows.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Text("Both apply to the JPG export and to the preview Photos "
+                         + "shows for a DNG, from the next shot on.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

@@ -217,6 +217,20 @@ struct TuningParams: Equatable, Codable {
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
     var robustness_raw_resolution_enabled: Bool = true
+    // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
+    // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
+    // step or Settings will show one value and the render use another.
+    //
+    // Fraction of sampled pixels the render puts on pure black -- the black
+    // level. A percentile rather than a fixed offset, so one setting behaves the
+    // same on a flat scene and a contrasty one; the subtraction is still capped
+    // by display_black_max so a low-key shot cannot have its shadows crushed.
+    var hdr_black_percentile: Float = 0.002
+    // Saturation boost weighted (1 - sat)^2 toward muted colours and faded out in
+    // the brightest tones, so it lifts the picture without re-saturating a
+    // highlight.
+    var hdr_vibrance: Float = 0.40
+
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
     // here without changing the other silently splits the two.
@@ -268,6 +282,7 @@ struct TuningParams: Equatable, Codable {
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case kernel_selection_linear
         case use_neural_robustness
+        case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
         case isp_shadow, isp_black_point, isp_warmth, isp_contrast
@@ -358,6 +373,8 @@ struct TuningParams: Equatable, Codable {
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
+        hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
+        hdr_vibrance = try c.decodeIfPresent(Float.self, forKey: .hdr_vibrance) ?? hdr_vibrance
     }
 }
 
@@ -2027,6 +2044,8 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
+            "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),
+            "hdr_vibrance": NSNumber(value: tuningParams.hdr_vibrance),
         ]
 
         var preview: UIImage?
