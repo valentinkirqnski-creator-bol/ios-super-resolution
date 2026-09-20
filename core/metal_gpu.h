@@ -78,6 +78,12 @@ bool metal_frame_put_raw(int slot, const Image& img);
 // True once this slot holds everything the merge needs.
 bool metal_frame_merge_ready(int slot);
 
+// Whether this slot's raw plane is already in its slice. The capture path fills
+// it during decode (metal_decode_raw16_to_float writes straight into the slot);
+// a CPU-decoded frame does not, and the caller has to seed it from the host
+// plane. Lets that seeding skip a 48.8MB memcpy it does not need.
+bool metal_frame_has_raw(int slot);
+
 // Direct RAW app path: uint16 Bayer -> normalized float Bayer with the same
 // black/WB/clamp math as DecodeRawFrameDictionary's CPU fallback.
 // src_y0/src_x0/out_h/out_w crop inside the source plane (origins must be even,

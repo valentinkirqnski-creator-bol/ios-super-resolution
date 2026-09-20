@@ -1525,7 +1525,32 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // Every stage below reads and writes this frame's slice. Set after the
         // decode, which was handed its slot explicitly -- it runs on the prefetch
         // thread for a different frame and must not consult this.
-        if (frames_resident) metal_set_active_frame(k);
+        if (frames_resident) {
+            metal_set_active_frame(k);
+            // Seed the slice from the host plane when the decode did not fill it.
+            //
+            // Only the capture path fills it during decode: DecodeRawFrameDictionary
+            // hands the uint16 sensor buffer to metal_decode_raw16_to_float, which
+            // writes normalized floats straight into the slot and sets have_raw.
+            // An imported DNG is unpacked by LibRaw on the CPU and arrives as a
+            // host Image, so nothing ever wrote its slice -- and have_raw being
+            // clear makes bf_raw_buffer() return nil, which in turn refuses
+            // COVARIANCE and ROBUSTNESS residency for the frame. Three of the four
+            // readiness flags then stay clear and the fused merge refuses the frame
+            // on its first band, which is the entire "GPU merge failed" on imports:
+            // not memory, just a plane that was never uploaded. The reference is
+            // already seeded exactly this way next to metal_frames_begin.
+            //
+            // Has to happen here, before grey/align/robustness/kernels, so that
+            // the covariance and mask kernels see a resident raw and write their
+            // results into the slices instead of returning host copies.
+            if (!metal_frame_has_raw(k) && !comp.data.empty()) {
+                const double t_seed = prof_now_ms();
+                const bool seeded = metal_frame_put_raw(k, comp);
+                prof_add_cpu("comp:seed-slice", prof_now_ms() - t_seed);
+                prof_add_cpu("comp#seed-slice-ok", seeded ? 1.0 : 0.0);
+            }
+        }
 #endif
         const double t_comp_grey = prof_now_ms();
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);

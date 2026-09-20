@@ -1137,6 +1137,10 @@ bool metal_frame_put_raw(int slot, const Image& img) {
     return true;
 }
 
+bool metal_frame_has_raw(int slot) {
+    return g_bf.valid_slot(slot) && g_bf.have_raw[(size_t)slot] != 0u;
+}
+
 bool metal_frame_merge_ready(int slot) {
     if (!g_bf.valid_slot(slot)) return false;
     return g_bf.have_raw[(size_t)slot] && g_bf.have_cov[(size_t)slot] &&
