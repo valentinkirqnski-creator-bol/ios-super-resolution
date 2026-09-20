@@ -528,6 +528,19 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var exposureMinSec: Double = 1.0 / 8000.0
     @Published var exposureMaxSec: Double = 1.0 / 15.0
 
+    /// How much faster than metering the burst is actually exposed.
+    ///
+    /// Handheld multi-frame merging is only as sharp as its sharpest frames: motion
+    /// blur inside a single exposure cannot be recovered by aligning frames to each
+    /// other, because every frame carries it. Shortening the exposure trades that
+    /// blur for read noise, which is the one thing the merge does remove.
+    ///
+    /// Gain is deliberately NOT raised to match, so this is a real exposure
+    /// reduction: at 2.0 the frames are about one stop darker. Lifting that back on
+    /// the merged result costs less noise than paying for it in per-frame sensor
+    /// gain would, and it leaves a stop of highlight headroom. 1.0 disables it.
+    static let burstShutterSpeedUp: Double = 2.0
+
     static let minFrameCount = 2
     /// Long bursts trade memory for noise reduction. The banded merge holds every
     /// analyzed frame at once -- roughly 98MB per comparison frame at 12MP once
@@ -1734,9 +1747,10 @@ final class CameraModel: NSObject, ObservableObject {
             self.captureKind = .burst
             self.zslCapturing = false
 
-            self.lockForBurst()
-            self.captureNextRaw(isZSL: false)
-            self.ensureReadyBurstDir()
+            self.lockForBurst {
+                self.captureNextRaw(isZSL: false)
+                self.ensureReadyBurstDir()
+            }
         }
     }
 
@@ -1779,11 +1793,85 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func lockForBurst() {
-        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+    /// Locks focus, white balance and exposure for the burst, then calls `start`.
+    ///
+    /// `start` is a completion rather than something the caller runs next: when the
+    /// exposure is being changed, the sensor is not at the new duration until
+    /// setExposureModeCustom's handler fires. Capturing before that would put the
+    /// first frames at the metered exposure and the rest at the shortened one, and
+    /// a photometric step partway through a burst is precisely what the robustness
+    /// mask is built to reject -- the affected frames score as motion and are
+    /// dropped, which can leave the merge with nothing.
+    private func lockForBurst(then start: @escaping () -> Void) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else {
+            // A burst that cannot lock still runs, unlocked, as it always did.
+            start()
+            return
+        }
         if d.isFocusModeSupported(.locked) { d.focusMode = .locked }
         if d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
-        if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+
+        // Only when metering chose the exposure. A manual shutter is the user's own
+        // number and applyShutterOnSessionQueue has already put the device in custom
+        // mode with it; overriding that here would fight them.
+        let speedUp = Self.burstShutterSpeedUp
+        guard shutterIsAuto, speedUp > 1.0, d.isExposureModeSupported(.custom) else {
+            if shutterIsAuto, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
+            d.unlockForConfiguration()
+            start()
+            return
+        }
+
+        let metered = d.exposureDuration
+        let meteredISO = d.iso
+        var wanted = CMTimeMultiplyByFloat64(metered, multiplier: 1.0 / speedUp)
+        let minD = d.activeFormat.minExposureDuration
+        let maxD = d.activeFormat.maxExposureDuration
+        if CMTimeCompare(wanted, minD) < 0 { wanted = minD }
+        if CMTimeCompare(wanted, maxD) > 0 { wanted = maxD }
+
+        // Gain stays exactly where metering put it. The shorter exposure is
+        // therefore a real reduction in light, not a shutter/ISO trade: the frames
+        // -- and the merged DNG -- come out about one stop darker at a 2x factor.
+        // For a raw workflow that is the better half of the trade, because the
+        // exposure is lifted later on merged data where the burst has already
+        // averaged the noise down, instead of being paid for per frame in gain.
+        let iso = min(max(d.activeFormat.minISO, meteredISO), d.activeFormat.maxISO)
+
+        // One-shot, so neither route below can start the burst twice. Both run on
+        // sessionQueue, which serialises the check.
+        var started = false
+        let begin: () -> Void = {
+            if started { return }
+            started = true
+            start()
+        }
+
+        d.setExposureModeCustom(duration: wanted, iso: iso) { [weak self] _ in
+            guard let self = self else { return }
+            self.sessionQueue.async { begin() }
+        }
+        // Fallback for a completion handler that never arrives, which would
+        // otherwise hang the shutter for good.
+        //
+        // The timeout has to sit well clear of how long the change actually takes,
+        // and an earlier version of this used 0.5s and did not. In low light the
+        // preview runs at a few frames per second, so applying a new duration can
+        // take several hundred milliseconds; the fallback then fired DURING the
+        // transition and started the burst mid-ramp, giving frame 0 one exposure
+        // and the rest another. The robustness mask read that step as motion,
+        // rejected every comparison frame, and the burst failed outright with
+        // nothing merged.
+        //
+        // Two seconds cannot land inside the transition. That matters more than the
+        // delay, because the two ways this can end are both safe: if the change
+        // never applied the device is still at the metered duration for every
+        // frame, and if it applied but the callback was lost the device is at the
+        // requested one for every frame. Either way the burst is photometrically
+        // consistent, which is the property the merge needs. Only the middle of the
+        // ramp is dangerous, and this is far past it.
+        sessionQueue.asyncAfter(deadline: .now() + 2.0) { begin() }
+
         d.unlockForConfiguration()
     }
 
