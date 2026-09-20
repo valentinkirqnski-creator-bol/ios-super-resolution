@@ -74,10 +74,15 @@ struct FinishHdrParams {
     // How much of that base compression to apply. Below 1 the render keeps some
     // of the original global contrast.
     float local_strength = 0.85f;
-    // Gentle S in display space, as a luminance ratio. Small on purpose: the
-    // point of the compression above is that the whole range is visible, and a
-    // strong contrast curve throws the ends of it away again.
-    float contrast = 0.10f;
+    // An S in display space, as a luminance ratio -- applied to luma and
+    // re-applied to RGB as one factor, so it cannot rotate hue. Still modest on
+    // purpose: the point of the base compression above is that the whole range
+    // stays visible, and a strong contrast curve throws the ends of it away
+    // again. Swept on the colour chart below, 0.10 -> 0.34 raises luma RMS
+    // 37.5 -> 40.4 and clips nothing extra at any point, so this is a look
+    // choice rather than a limit; 0.26 gives RMS 39.4 and widens the 5th/95th
+    // luma percentiles from 51/158 to 49/161.
+    float contrast = 0.26f;
     // Display black anchor, MEASURED rather than assumed. The base compression
     // above lifts the shadows on purpose, which leaves the darkest content
     // sitting at a grey the whole image then reads as haze through; a constant
@@ -108,12 +113,29 @@ struct FinishHdrParams {
     float black_max = 0.03f;
 
     // ---- colour ---------------------------------------------------------
-    float saturation = 1.0f;          // 1 = the matrix's own saturation
+    // 1 = the matrix's own saturation. Applied uniformly, so this is the part of
+    // the boost that reaches colours vibrance deliberately will not touch --
+    // kept small for exactly that reason.
+    float saturation = 1.06f;
     // Boost that falls away as a colour approaches saturation, and is faded out
     // entirely in the brightest tones -- a near-white highlight must never be
     // re-saturated, because what gets amplified there is the residual channel
     // imbalance, i.e. the pink.
-    float vibrance = 0.12f;
+    //
+    // This carries most of the vibrancy, precisely because of that falloff: the
+    // weight is (1 - sat)^2, so a muted colour gets nearly all of it and an
+    // already-vivid one almost none, which lifts the picture without driving
+    // anything further out of gamut.
+    //
+    // Measured on a chart of muted patches at three exposure levels plus a
+    // neutral wedge and a blown corner: together with saturation 1.06 and
+    // contrast 0.26 this moves mean chroma 0.185 -> 0.211 and its 90th
+    // percentile 0.367 -> 0.413, while the fraction of clipped samples stays at
+    // 0.25%, mean saturation above luma 200 stays at 0.0001, and the worst
+    // channel spread on the neutral wedge stays at 2. Those last two are the
+    // ones that matter: they are what says the highlight fade is still holding
+    // and that no tint is being invented.
+    float vibrance = 0.40f;
     // Colour-difference-only smoothing. Luminance is preserved exactly, so this
     // removes shadow blotching without touching detail. It is here because the
     // shadow lift above is strong enough to make chroma noise visible.
