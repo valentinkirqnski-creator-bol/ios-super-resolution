@@ -1169,29 +1169,50 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Motion Rejection")) {
-                    Toggle("Noise-aware geometry gradient",
-                           isOn: $cam.tuningParams.motion_geom_denoise_gradient)
+                    Toggle("Geometric motion rejection",
+                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
                     Text("""
-                         Estimates the reference gradient used by the geometric \
-                         motion-rejection test with a noise-aware 3x3 operator \
-                         instead of a bare difference, so photon noise in a dark \
-                         scene is less likely to read as an edge and reject a \
-                         well-aligned tile. The rejection threshold is unchanged, \
-                         and pixels whose gradient is already strong are left \
-                         exactly as they were, so bright scenes behave as before.
+                         Zeroes robustness where a tile's single translation is a \
+                         poor model of the motion inside it -- flow gradient times \
+                         distance from the tile centre, weighted by edge strength -- \
+                         which is what produces the tile-edge ghosts when the camera \
+                         rotates during a burst. Rejected pixels fall back to the \
+                         reference frame, so this trades burst samples for a clean \
+                         result and is inert under straight-line motion.
+
+                         Off removes the test entirely, leaving plain Wronski \
+                         robustness. That is also what Handheld-Multi-Frame-\
+                         Super-Resolution-1.4 does, which has no geometric \
+                         criterion at all -- so turn it off when comparing masks \
+                         against a 1.4 reference run, or a difference here will \
+                         look like a merge difference.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
-                    ispRow("Geometry reject threshold",
-                           $cam.tuningParams.motion_geom_reject_threshold,
-                           0.0005...0.02, "%.4f")
-                    Text("""
-                         The geometric test rejects a tile where |gradient| \
-                         x |within-tile motion error| exceeds this. LOWER \
-                         rejects more, so a dim or noisy scene can lose \
-                         frames to it; higher is more permissive. 0.0045 by \
-                         default; 0.02 was the original value.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.motion_geom_reject_enabled {
+                        Toggle("Noise-aware geometry gradient",
+                               isOn: $cam.tuningParams.motion_geom_denoise_gradient)
+                        Text("""
+                             Estimates the reference gradient used by the geometric \
+                             motion-rejection test with a noise-aware 3x3 operator \
+                             instead of a bare difference, so photon noise in a dark \
+                             scene is less likely to read as an edge and reject a \
+                             well-aligned tile. The rejection threshold is unchanged, \
+                             and pixels whose gradient is already strong are left \
+                             exactly as they were, so bright scenes behave as before.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Geometry reject threshold",
+                               $cam.tuningParams.motion_geom_reject_threshold,
+                               0.0005...0.02, "%.4f")
+                        Text("""
+                             The geometric test rejects a tile where |gradient| \
+                             x |within-tile motion error| exceeds this. LOWER \
+                             rejects more, so a dim or noisy scene can lose \
+                             frames to it; higher is more permissive. 0.0045 by \
+                             default; 0.02 was the original value.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                     Toggle("Save robustness mask",
                            isOn: $cam.tuningParams.robustness_save_mask)
                     Text("Writes the per-frame robustness mask alongside the shot "
@@ -1199,41 +1220,43 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
-                Section(header: Text("Relative Rejection Criterion")) {
-                    Toggle("Exposure-invariant criterion",
-                           isOn: $cam.tuningParams.motion_geom_relative)
-                    Text("""
-                         A second geometric criterion applied ON TOP of the \
-                         absolute one, using contrast -- gradient over \
-                         brightness, with a noise floor subtracted -- instead \
-                         of absolute gradient. It catches the low-light \
-                         misalignments the absolute form misses, whose gradient \
-                         shrinks with the light.
+                if cam.tuningParams.motion_geom_reject_enabled {
+                    Section(header: Text("Relative Rejection Criterion")) {
+                        Toggle("Exposure-invariant criterion",
+                               isOn: $cam.tuningParams.motion_geom_relative)
+                        Text("""
+                             A second geometric criterion applied ON TOP of the \
+                             absolute one, using contrast -- gradient over \
+                             brightness, with a noise floor subtracted -- instead \
+                             of absolute gradient. It catches the low-light \
+                             misalignments the absolute form misses, whose gradient \
+                             shrinks with the light.
 
-                         The two are a UNION, so this can only ADD rejections, \
-                         never restore a frame. If your problem is flat sky \
-                         going black in the mask, this will not help and may \
-                         make it worse.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    ispRow("Relative threshold",
-                           $cam.tuningParams.motion_geom_reject_threshold_relative,
-                           0.005...0.2, "%.3f")
-                    ispRow("Noise floor multiplier",
-                           $cam.tuningParams.motion_geom_noise_floor_mult,
-                           0...16, "%.1f")
-                    Text("""
-                         Threshold 0.04 by default; lower rejects more. The \
-                         noise floor multiplier is how many sigma of guide \
-                         noise are subtracted from the gradient before the \
-                         contrast ratio is formed, so higher discounts noise \
-                         harder and rejects less. 1.5 by default, up to 16; past \
-                         about 5 sigma it subtracts more than a real dark edge carries, \
-                         so the criterion goes quiet altogether. 0 disables \
-                         the subtraction. Both are inert while the toggle \
-                         above is off.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
+                             The two are a UNION, so this can only ADD rejections, \
+                             never restore a frame. If your problem is flat sky \
+                             going black in the mask, this will not help and may \
+                             make it worse.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Relative threshold",
+                               $cam.tuningParams.motion_geom_reject_threshold_relative,
+                               0.005...0.2, "%.3f")
+                        ispRow("Noise floor multiplier",
+                               $cam.tuningParams.motion_geom_noise_floor_mult,
+                               0...16, "%.1f")
+                        Text("""
+                             Threshold 0.04 by default; lower rejects more. The \
+                             noise floor multiplier is how many sigma of guide \
+                             noise are subtracted from the gradient before the \
+                             contrast ratio is formed, so higher discounts noise \
+                             harder and rejects less. 1.5 by default, up to 16; past \
+                             about 5 sigma it subtracts more than a real dark edge carries, \
+                             so the criterion goes quiet altogether. 0 disables \
+                             the subtraction. Both are inert while the toggle \
+                             above is off.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                 }
             }
             .navigationTitle("Settings")
