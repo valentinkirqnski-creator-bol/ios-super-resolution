@@ -146,6 +146,38 @@ int main() {
     // occur relative to a plane this small, so src = i - h is at its furthest.
     for (int ts : {8, 16, 32, 64}) check(ts + 1, ts + 1, ts, "max relative pad");
 
+    // ---- residency flow-slice geometry vs align's -------------------------
+    // Same family as the pad above. metal_frames_begin sizes the GPU flow slice
+    // from the RAW dimensions, while align() produces its flow field on a grey
+    // that pad_image_circular has already rounded UP to whole tiles. Sizing the
+    // slice by floor made the two disagree, metal_frame_set_flow rejected the
+    // frame on ny, and the shutter failed with "GPU frame state unavailable".
+    // Both sides must round up. 3024 = 16 x 189, and 189 being odd is why this
+    // only bit at the larger tile sizes -- exactly the divisibility that made
+    // the host pad crash above.
+    std::printf("\n-- flow slice (metal_frames_begin) vs align's flow field --\n");
+    for (int dims = 0; dims < 2; ++dims) {
+        const int h = dims ? 1512 : 3024;
+        const int w = dims ? 2016 : 4032;
+        for (int ts : {8, 16, 32, 64}) {
+            const int pad_h = h + ((ts - h % ts) % ts);
+            const int pad_w = w + ((ts - w % ts) % ts);
+            const int align_ny = (pad_h + ts - 1) / ts;   // align.cpp, on the PADDED grey
+            const int align_nx = (pad_w + ts - 1) / ts;
+            const int slice_ny = (h + ts - 1) / ts;       // metal_gpu.mm, on the raw dims
+            const int slice_nx = (w + ts - 1) / ts;
+            const int old_ny = h / ts;                    // what it used to be
+            const int old_nx = w / ts;
+            const bool ok = align_ny == slice_ny && align_nx == slice_nx;
+            if (!ok) ++g_fail;
+            std::printf("  %5dx%-5d ts %2d  align %3dx%-3d  slice %3dx%-3d  %-4s"
+                        "  (floor was %3dx%-3d %s)\n",
+                        h, w, ts, align_ny, align_nx, slice_ny, slice_nx,
+                        ok ? "OK" : "FAIL", old_ny, old_nx,
+                        (old_ny == align_ny && old_nx == align_nx) ? "ok" : "MISMATCH");
+        }
+    }
+
     std::printf("\n%d failed\n", g_fail);
     return g_fail ? 1 : 0;
 }

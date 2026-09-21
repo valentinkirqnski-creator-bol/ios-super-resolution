@@ -1022,8 +1022,19 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
     g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
-    g_bf.flow_ny = raw_h / tile_size;
-    g_bf.flow_nx = raw_w / tile_size;
+    // CEILING, not floor: align() runs on a grey that pad_image_circular has
+    // already rounded UP to a whole number of tiles, and sizes its flow field
+    // (gradx.h + ts - 1) / ts to match. Sizing the slice by floor here made the
+    // two disagree whenever the plane was not an exact multiple of the tile --
+    // 3024 rows is 16 x 189 with 189 odd, so 8 and 16 divided evenly and 32 and
+    // 64 did not (94 against align's 95, 47 against 48). metal_frame_set_flow
+    // rejects a mismatch outright, which surfaced as "GPU frame state
+    // unavailable" on the first comparison frame.
+    //
+    // Same underlying assumption the host pad crash came from: residency was
+    // written when the tile size was always 16, where nothing needs padding.
+    g_bf.flow_ny = (raw_h + tile_size - 1) / tile_size;
+    g_bf.flow_nx = (raw_w + tile_size - 1) / tile_size;
     g_bf.cov_stride = 3u;
     if (g_bf.cov_h <= 0 || g_bf.cov_w <= 0 || g_bf.rob_h <= 0 || g_bf.rob_w <= 0 ||
         g_bf.flow_ny <= 0 || g_bf.flow_nx <= 0)
