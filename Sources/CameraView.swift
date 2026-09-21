@@ -1157,6 +1157,41 @@ struct CameraView: View {
                          + "as extra images. Diagnostic; leave off for normal use.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("Relative Rejection Criterion")) {
+                    Toggle("Exposure-invariant criterion",
+                           isOn: $cam.tuningParams.motion_geom_relative)
+                    Text("""
+                         A second geometric criterion applied ON TOP of the \
+                         absolute one, using contrast -- gradient over \
+                         brightness, with a noise floor subtracted -- instead \
+                         of absolute gradient. It catches the low-light \
+                         misalignments the absolute form misses, whose gradient \
+                         shrinks with the light.
+
+                         The two are a UNION, so this can only ADD rejections, \
+                         never restore a frame. If your problem is flat sky \
+                         going black in the mask, this will not help and may \
+                         make it worse.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    ispRow("Relative threshold",
+                           $cam.tuningParams.motion_geom_reject_threshold_relative,
+                           0.005...0.2, "%.3f")
+                    ispRow("Noise floor multiplier",
+                           $cam.tuningParams.motion_geom_noise_floor_mult,
+                           0...4, "%.1f")
+                    Text("""
+                         Threshold 0.04 by default; lower rejects more. The \
+                         noise floor multiplier is how many sigma of guide \
+                         noise are subtracted from the gradient before the \
+                         contrast ratio is formed, so higher discounts noise \
+                         harder and rejects less. 1.5 by default; 0 disables \
+                         the subtraction. Both are inert while the toggle \
+                         above is off.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
