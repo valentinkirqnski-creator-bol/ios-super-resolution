@@ -1127,6 +1127,29 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("Alignment")) {
+                    Picker("Tile size", selection: $cam.tuningParams.alignment_tile_size) {
+                        Text("8").tag(8)
+                        Text("16").tag(16)
+                        Text("32").tag(32)
+                        Text("64").tag(64)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("""
+                         Block-matching tile size in raw pixels, for the finest \
+                         pyramid level; the coarsest is half that, floored at 8. \
+                         16 is the default.
+
+                         BIGGER tiles match more pixels at once, so the flow \
+                         they return is more reliable on smooth or noisy \
+                         content -- which is what makes flat sky and dim scenes \
+                         misbehave -- at the cost of resolving less of the real \
+                         local motion. Smaller tiles track fine motion better \
+                         and are noisier about it.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Motion Rejection")) {
                     Toggle("Noise-aware geometry gradient",
                            isOn: $cam.tuningParams.motion_geom_denoise_gradient)
