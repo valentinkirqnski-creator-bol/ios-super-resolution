@@ -1123,6 +1123,42 @@ struct CameraView: View {
                          + "shows for a DNG, from the next shot on.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("Motion Rejection")) {
+                    Toggle("Geometric motion rejection",
+                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
+                    Text("""
+                         Zeroes robustness where one translation per tile is a poor \
+                         model of the motion inside it -- the flow gradient times \
+                         the distance from the tile centre, weighted by edge \
+                         strength. That is what leaves tile-edge ghosts when the \
+                         camera rotates during a burst. Rejected pixels fall back \
+                         to the reference frame, so it trades burst samples for a \
+                         clean result, and it is inert under straight-line motion.
+
+                         Off removes the test entirely and leaves plain Wronski \
+                         robustness, which is also what Handheld-Multi-Frame-\
+                         Super-Resolution-1.4 does -- it has no geometric \
+                         criterion. Turn it off when comparing a mask against a \
+                         1.4 reference run, or the difference will read as a merge \
+                         difference.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.motion_geom_reject_enabled {
+                        ispRow("Reject threshold",
+                               $cam.tuningParams.motion_geom_reject_threshold,
+                               0.0005...0.06, "%.4f")
+                        Text("""
+                             A tile is rejected where |gradient| x |within-tile \
+                             motion error| exceeds this. LOWER rejects more, so a \
+                             dim or noisy scene can lose most of its burst to it; \
+                             higher is more permissive. Roughly: 0.02 rejects about \
+                             15% of the frame, 0.03 about 10%, 0.06 about 3% and is \
+                             close to inert.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
