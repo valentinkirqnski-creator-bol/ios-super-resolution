@@ -118,6 +118,11 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
+    // Circularly padded copy of the above, for a tile size the plane is not a
+    // multiple of. Grow-only scratch: 49MB at 12MP, and only ever allocated when
+    // a tile size actually needs padding (8 and 16 divide 3024x4032 exactly).
+    id<MTLBuffer> pad_grey = nil;
+    size_t pad_grey_b = 0;
     // Reference Sobel gradients and ICA Hessian, cached per pyramid level.
     // One slot was enough while ICA ran only on the finest level; per-level ICA
     // asks for a different level on every call, so a single slot would miss
@@ -213,7 +218,7 @@ static MetalCtx& ctx() {
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
             "rob_row_activity",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
-            "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
+            "pyr_conv_y", "pyr_conv_x", "pyr_subsample", "pad_circular_f32",
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460",
             "align_upscale_flow_bilinear",
@@ -2515,6 +2520,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
 namespace {
 
+struct PadCircularParamsCPU {
+    uint32_t in_h, in_w, out_h, out_w;
+};
+static_assert(sizeof(PadCircularParamsCPU) == 16, "PadCircularParamsCPU");
+
 struct PyrDownParamsCPU {
     uint32_t in_h, in_w, out_h, out_w, klen, factor;
     uint32_t _pad0 = 0, _pad1 = 0;
@@ -3296,14 +3306,54 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     // again until the next frame's grey, and align_drain() below completes all
     // of this call's work before returning.
     const int grey_ts = cfg.grey_tile_size(tile_size);
-    Image moving_padded_grey;   // stays empty on the resident path
+    Image moving_padded_grey;   // stays empty on both GPU paths
     int mov0_h = moving_grey.h, mov0_w = moving_grey.w;
     id<MTLBuffer> mov0 = nil;
-    if (pad_image_circular_amount(moving_grey, grey_ts) == 0 &&
-        c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
-        c.sticky_grey_w == moving_grey.w) {
+    const bool sticky_ok = c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+                           c.sticky_grey_w == moving_grey.w;
+    const int pad_amt = pad_image_circular_amount(moving_grey, grey_ts);
+    if (pad_amt == 0 && sticky_ok) {
         mov0 = c.sticky_grey;
+    } else if (sticky_ok && moving_grey.c == 1) {
+        // Pad on the GPU, because the host plane is not there to pad.
+        //
+        // compute_grey_fft_metal returns a DIMENSIONS-ONLY Image on the resident
+        // path (want_host = !resident_raw || debug_dumps_enabled) -- the pixels
+        // exist only in sticky_grey. Calling pad_image_circular on it read from
+        // an empty vector and took a SIGSEGV at address 0, which is what a tile
+        // size of 32 or 64 did: 3024 is 16 x 189 and 189 is odd, so the grey is
+        // a multiple of 8 and 16 but never of 32 or 64, and only those two ever
+        // reached this branch.
+        const int ph = moving_grey.h + ((grey_ts - moving_grey.h % grey_ts) % grey_ts);
+        const int pw = moving_grey.w + ((grey_ts - moving_grey.w % grey_ts) % grey_ts);
+        const size_t need = (size_t)ph * (size_t)pw * sizeof(float);
+        id<MTLBuffer> dst = c.scratch(c.pad_grey, c.pad_grey_b, need);
+        if (!dst) return false;
+        PadCircularParamsCPU pp{};
+        pp.in_h = (uint32_t)moving_grey.h;
+        pp.in_w = (uint32_t)moving_grey.w;
+        pp.out_h = (uint32_t)ph;
+        pp.out_w = (uint32_t)pw;
+        id<MTLCommandBuffer> pcmd = [c.queue commandBuffer];
+        if (!pcmd) return false;
+        id<MTLComputeCommandEncoder> penc = [pcmd computeCommandEncoder];
+        if (!penc) return false;
+        [penc setBuffer:c.sticky_grey offset:0 atIndex:0];
+        [penc setBuffer:dst offset:0 atIndex:1];
+        [penc setBytes:&pp length:sizeof(pp) atIndex:2];
+        dispatch2(penc, c.pipe("pad_circular_f32"), (NSUInteger)pw, (NSUInteger)ph);
+        [penc endEncoding];
+        prof_tag_gpu(pcmd, "align:pad-circular");
+        [pcmd commit];
+        [pcmd waitUntilCompleted];
+        if (pcmd.status != MTLCommandBufferStatusCompleted) return false;
+        mov0 = dst;
+        mov0_h = ph;
+        mov0_w = pw;
     } else {
+        // No sticky grey: the non-resident path, where the host plane IS filled.
+        // Guarded anyway -- padding an empty plane is the crash above.
+        if (moving_grey.data.empty()) return false;
         moving_padded_grey = pad_image_circular(moving_grey, grey_ts);
         mov0_h = moving_padded_grey.h;
         mov0_w = moving_padded_grey.w;

@@ -90,6 +90,11 @@ Image pad_image_circular(const Image& img, int tile_size) {
     // that care use pad_image_circular_amount and skip the call; this stays
     // correct for the ones that do not.
     if (pad_h == 0 && pad_w == 0) return img;
+    // A dimensions-only Image -- h/w/c set, pixels left on the GPU -- is a real
+    // thing in this pipeline (see want_host in compute_grey_fft_metal, and
+    // metal_release_host_ref_stats). Padding one used to read an empty vector
+    // and crash; return it untouched instead so the caller's own check fires.
+    if (img.data.empty()) return img;
     Image padded(img.h + pad_h, img.w + pad_w, img.c);
     for (int y = 0; y < padded.h; ++y) {
         int src_y = y < img.h ? y : (y - img.h);

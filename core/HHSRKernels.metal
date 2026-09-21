@@ -2870,6 +2870,34 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 // Pyramid downsample — exact match of grey_pyramid.cpp downsample_by /
 // Python cuda_downsample: scipy gaussian_kernel1d, valid separable conv, stride.
 // ---------------------------------------------------------------------------
+// Circular pad of a single-channel float plane, on the GPU.
+//
+// Twin of pad_image_circular in pipeline.cpp. That one writes the wrap as
+// (i - extent), which lands inside the plane only while pad < extent -- true for
+// every geometry this pipeline produces (pad < tile_size <= 64, extent >= 1512)
+// but not in general. A modulo is identical wherever pad < extent and stays in
+// range everywhere else, so it is used here: same values on every reachable
+// input, no out-of-range read on an unreachable one.
+//
+// This exists because the moving grey lives ONLY on the GPU on the resident
+// path -- compute_grey_fft_metal returns a dimensions-only Image whose host
+// data is empty -- so padding it on the CPU read from nothing and crashed. See
+// align_metal.
+struct PadCircularParams {
+    uint in_h, in_w;
+    uint out_h, out_w;
+};
+
+kernel void pad_circular_f32(device const float* in [[buffer(0)]],
+                             device float* out [[buffer(1)]],
+                             constant PadCircularParams& p [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
+    uint sy = (gid.y < p.in_h) ? gid.y : (gid.y % p.in_h);
+    uint sx = (gid.x < p.in_w) ? gid.x : (gid.x % p.in_w);
+    out[gid.y * p.out_w + gid.x] = in[sy * p.in_w + sx];
+}
+
 struct PyrDownParams {
     uint in_h, in_w;
     uint out_h, out_w;
