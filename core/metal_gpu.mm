@@ -1101,6 +1101,15 @@ bool metal_frame_set_flow(int slot, const FlowField& flow) {
     return true;
 }
 
+void metal_frames_state_str(char* out, size_t n) {
+    if (!out || n == 0) return;
+    std::snprintf(out, n,
+                  "open=%d n=%d ts=%d flow=%dx%d elems=%zu buf=%d raw=%dx%d",
+                  g_bf.open ? 1 : 0, g_bf.n, g_bf.tile_size,
+                  g_bf.flow_ny, g_bf.flow_nx, g_bf.flow_elems,
+                  g_bf.flows ? 1 : 0, g_bf.raw_h, g_bf.raw_w);
+}
+
 bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
     rows.clear();
     any = false;

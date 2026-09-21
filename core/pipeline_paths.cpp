@@ -1625,7 +1625,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // CPU genuinely reads it (compute_motion_irregular, rob_compute_s) and it
         // is ~0.4MB. Copy it into the slice so the merge can reach it by offset.
         if (frames_resident && !metal_frame_set_flow(k, flow)) {
-            report("Error: GPU frame state unavailable", 1.f);
+            // Which of the four refusals fired, with both sides of every
+            // comparison. open=0 or buf=0 means residency was released under this
+            // burst rather than anything being mis-sized; n <= slot means the
+            // slice count disagrees with the frame indices; a flow mismatch
+            // prints as the two grids side by side.
+            char st[192] = {0};
+            metal_frames_state_str(st, sizeof(st));
+            char msg[320];
+            std::snprintf(msg, sizeof(msg),
+                          "Error: GPU frame state unavailable "
+                          "[slot=%d flow=%dx%d len=%zu ts=%d | %s]",
+                          k, flow.ny, flow.nx, flow.flow.size(), cons_ts, st);
+            report(msg, 1.f);
             return Image();
         }
 #endif
