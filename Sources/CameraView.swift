@@ -1180,13 +1180,15 @@ struct CameraView: View {
                            0.005...0.2, "%.3f")
                     ispRow("Noise floor multiplier",
                            $cam.tuningParams.motion_geom_noise_floor_mult,
-                           0...4, "%.1f")
+                           0...16, "%.1f")
                     Text("""
                          Threshold 0.04 by default; lower rejects more. The \
                          noise floor multiplier is how many sigma of guide \
                          noise are subtracted from the gradient before the \
                          contrast ratio is formed, so higher discounts noise \
-                         harder and rejects less. 1.5 by default; 0 disables \
+                         harder and rejects less. 1.5 by default, up to 16; past \
+                         about 5 sigma it subtracts more than a real dark edge carries, \
+                         so the criterion goes quiet altogether. 0 disables \
                          the subtraction. Both are inert while the toggle \
                          above is off.
                          """)
