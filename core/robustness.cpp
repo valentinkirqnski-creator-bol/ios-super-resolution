@@ -2,7 +2,6 @@
 #include "robustness_nn.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
-#include "geom_gradient.h"
 #include "prof.h"
 #include <cstdint>
 #include <cstdio>
@@ -863,18 +862,10 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
 static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     if (!std::isfinite(brightness)) brightness = 0.f;
     brightness = clampf(brightness, 0.f, 1.f);
-    // That channel's OWN alpha and beta, as 1.4 does (alpha[c]*x + beta[c]), not a
-    // mean over all three. noise_alpha()/noise_beta() average the channels for the
-    // places that genuinely want one representative number -- the SNR estimate and
-    // the Monte Carlo curves -- but here the caller has named a channel.
-    //
-    // noise_channel_alpha/beta carry the same transformation the averaged pair
-    // does: x gain for the signal term and gain squared for the read term, which
-    // is 1.4's model rewritten for a raw this pipeline has already white-balanced,
-    // plus the 1/nsites weight for a guide channel built by averaging.
-    f32 v = std::max(cfg.noise_channel_alpha(ch) * brightness +
-                     cfg.noise_channel_beta(ch), 0.f);
-    (void)nch;
+    f32 v = std::max(cfg.noise_alpha_robustness() * brightness +
+                     cfg.noise_beta_robustness(), 0.f);
+    if (nch == 3 && ch == 1)
+        v *= 0.5f; // green guide channel is the average of two Bayer greens.
     return v;
 }
 
@@ -1069,18 +1060,8 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 d_md_sq += d_t * d_t;
             }
             f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            // 1.4 guards the shrink with `if d_sq_ > 0:` (robustness.py). Without
-            // it, d_ms_sq == 0 and d_md_sq == 0 gives 0/0 = NaN -- which is what
-            // happens with the noise model off on a blown highlight or a crushed
-            // black, where both frames are bit-equal. That pixel matched, so 0 is
-            // the answer and R lands at its maximum. Guarding here and not on
-            // r_val keeps the +inf route (OOB Dodgson sample) still resolving to
-            // R = 0 through the !isfinite check downstream.
-            f32 d_sq_ = 0.f;
-            if (d_ms_sq > 0.f) {
-                const f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-                d_sq_ = d_ms_sq * shrink * shrink;
-            }
+            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+            f32 d_sq_ = d_ms_sq * shrink * shrink;
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }
@@ -1118,11 +1099,8 @@ static void apply_noise_model_1p4(const Image& d_p, const Image& ref_means,
             sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
             // dq stays +inf for an out-of-bounds sample -> exp(-inf)=0 -> R=0.
             if (std::isfinite(dq) && dq > 0.f) {
-                // 1.4's `if d_sq_ > 0` guard; 0/0 otherwise. See compute_robustness.
-                if (dq > 0.f) {
-                    const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
-                    dq *= shrink * shrink;
-                }
+                const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                dq *= shrink * shrink;
             }
             d_sq.at(y, x) = dq;
             sigma_sq.at(y, x) = sq;
@@ -1176,13 +1154,8 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                 d_md_sq += d_t * d_t;
             }
             f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            // Same 1.4 guard as above.
-            if (d_ms_sq > 0.f) {
-                const f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-                d_sq.at(y, x) = d_ms_sq * shrink * shrink;
-            } else {
-                d_sq.at(y, x) = 0.f;
-            }
+            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+            d_sq.at(y, x) = d_ms_sq * shrink * shrink;
             sigma_sq.at(y, x) = sigma_sq_;
         }
     });
@@ -1216,11 +1189,8 @@ static void apply_noise_model_fused_1p4(const Image& ref_means, const Image& com
             if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
             sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
             if (std::isfinite(dq) && dq > 0.f) {
-                // 1.4's `if d_sq_ > 0` guard; 0/0 otherwise. See compute_robustness.
-                if (dq > 0.f) {
-                    const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
-                    dq *= shrink * shrink;
-                }
+                const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                dq *= shrink * shrink;
             }
             d_sq.at(y, x) = dq;
             sigma_sq.at(y, x) = sq;
@@ -1912,24 +1882,9 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 const f32 Emag = std::sqrt(ex * ex + ey * ey);
                 const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
                 const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
-                // Guide channel 0 over the same clamped neighbourhood the central
-                // difference always used, plus the four diagonals the Sobel needs.
-                const f32 nb[9] = {
-                    ref_stats.means.at(yu, xl, 0), ref_stats.means.at(yu, x, 0), ref_stats.means.at(yu, xr, 0),
-                    ref_stats.means.at(y,  xl, 0), ref_stats.means.at(y,  x, 0), ref_stats.means.at(y,  xr, 0),
-                    ref_stats.means.at(yd, xl, 0), ref_stats.means.at(yd, x, 0), ref_stats.means.at(yd, xr, 0),
-                };
-                // RefStats::means is a 3x3 local mean of the guide, so one sample's
-                // variance is the guide model divided by 9. Channel 0, so the green
-                // halving inside guide_noise_var correctly does not apply.
-                GeomGradParams ggp;
-                ggp.snr_lo = cfg.motion_geom_grad_snr_lo;
-                ggp.snr_hi = cfg.motion_geom_grad_snr_hi;
-                const f32 gsv =
-                    guide_noise_var(cfg, ref_stats.means.c, 0, nb[4]) * (1.f / 9.f);
-                const GeomGradient gg = geom_gradient(nb, sc, gsv, ggp,
-                                                      cfg.motion_geom_denoise_gradient);
-                const f32 gmag = gg.gmag;
+                const f32 gix = 0.5f * (ref_stats.means.at(y, xr, 0) - ref_stats.means.at(y, xl, 0)) / sc;
+                const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
+                const f32 gmag = std::sqrt(gix * gix + giy * giy);
                 // Absolute criterion (|grad I| * |E|): preserves the good-light
                 // behaviour exactly -- the bright-scene rejections you already get
                 // stay. ALWAYS applied.

@@ -1656,38 +1656,7 @@ struct RobMaskParams {
     uint geom_relative;
     float geom_noise_floor_mult;
     float geom_reject_threshold_relative;
-    // Geometry-only noise-aware gradient. Twin of geom_gradient in
-    // core/geom_gradient.h -- keep the two in step.
-    uint geom_denoise_grad;
-    float geom_grad_snr_lo;
-    float geom_grad_snr_hi;
 };
-
-// Gradient for the GEOMETRY TEST ONLY. Twin of hhsr::geom_gradient in
-// core/geom_gradient.h; see that header for why this is a Sobel blend and not a
-// blur, and why the threshold keeps its meaning. n[] is guide channel 0 over the
-// clamped 3x3, row-major. sample_var is the variance of ONE means sample.
-inline float geom_gradient_mag(thread const float n[9], float sc, float sample_var,
-                               float snr_lo, float snr_hi, bool enabled) {
-    float inv_sc = (sc > 0.f) ? (1.f / sc) : 1.f;
-    float gx = 0.5f * (n[5] - n[3]) * inv_sc;
-    float gy = 0.5f * (n[7] - n[1]) * inv_sc;
-    float sharp = sqrt(gx * gx + gy * gy);
-    if (!enabled) return sharp;
-    float v = max(sample_var, 0.f);
-    float sigma = sqrt(v) * inv_sc;
-    if (!(sigma > 0.f)) return sharp;
-    float snr = sharp / sigma;
-    float hi = (snr_hi > snr_lo) ? snr_hi : (snr_lo + 1e-6f);
-    float t = clamp((snr - snr_lo) / (hi - snr_lo), 0.f, 1.f);
-    float wb = 1.f - t * t * (3.f - 2.f * t);
-    if (wb <= 0.f) return sharp;
-    float sob_x = ((n[2] + 2.f * n[5] + n[8]) - (n[0] + 2.f * n[3] + n[6])) * (1.f / 8.f) * inv_sc;
-    float sob_y = ((n[6] + 2.f * n[7] + n[8]) - (n[0] + 2.f * n[1] + n[2])) * (1.f / 8.f) * inv_sc;
-    gx += (sob_x - gx) * wb;
-    gy += (sob_y - gy) * wb;
-    return sqrt(gx * gx + gy * gy);
-}
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
 // tile-centred). Twin of sample_s_bilinear in robustness.cpp.
@@ -1793,10 +1762,7 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
 struct RobHfLossParams {
     uint h, w, nch;
     uint _pad0;
-    // Per guide channel. Twin of RobHfLossParamsCPU, which static_asserts the
-    // size -- keep the field order identical.
-    float alpha[3];
-    float beta[3];
+    float alpha, beta;
     float min_texture_snr;
     float _pad1;
 };
@@ -1842,11 +1808,8 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
         var_sum += max(vars[o], 0.f);
         lp_var_sum += max(lp_vars[o], 0.f);
         float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
-        // That channel's own alpha and beta. They already include the 1/nsites
-        // guide weight, so the green halving that used to sit here would now be
-        // applied twice.
-        uint ci = min(ch, 2u);
-        float nv = max(p.alpha[ci] * brightness + p.beta[ci], 0.f);
+        float nv = max(p.alpha * brightness + p.beta, 0.f);
+        if (p.nch == 3u && ch == 1u) nv *= 0.5f;
         noise_var += kLocalVarianceNoiseScale * nv;
         lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
     }
@@ -1996,11 +1959,8 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
                                                         sample_y, sample_x, ch);
                 float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
                 float d_p_sq = d_p_ * d_p_;
-                // 1.4's `if d_sq_ > 0` guard; see rob_make_mask.
-                if (d_p_sq > 0.f) {
-                    float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                    d_sq_ += d_p_sq * shrink * shrink;
-                }
+                float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                d_sq_ += d_p_sq * shrink * shrink;
             }
             float ratio = (sigma_sq_ > 0.f && isfinite(sigma_sq_))
                 ? d_sq_ / sigma_sq_
@@ -2109,26 +2069,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         d_md_sq += d_t * d_t;
     }
     sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    // 1.4 guards this: `if d_sq_ > 0:` around the whole shrink (robustness.py).
-    // Without it, d_ms_sq == 0 AND d_md_sq == 0 gives 0/0 = NaN. Both are zero
-    // exactly when the noise model is off (d_md_sq collapses to 0) and the
-    // reference and comparison means are bit-equal -- a fully blown highlight
-    // where both frames sit at 1.0, or a crushed black where both sit at 0. That
-    // pixel matched perfectly, so d_sq_ = 0 is the answer, and R comes out at its
-    // maximum; NaN instead poisons every merge accumulator that touches it.
-    //
-    // Guarding HERE rather than clamping r_val afterwards is what keeps the two
-    // NaN routes apart. The other one is an out-of-bounds Dodgson sample, which
-    // arrives as +inf by design so that R = 0: there d_ms_sq is +inf, this guard
-    // passes, shrink is inf/inf = NaN as before, and the downstream
-    // !isfinite(r_val) -> 0 still yields the intended rejection. A blanket clamp
-    // would force this case to 0 as well, which is the opposite of correct.
-    if (d_ms_sq > 0.f) {
-        float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-        d_sq_ = d_ms_sq * shrink * shrink;
-    } else {
-        d_sq_ = 0.f;
-    }
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    d_sq_ = d_ms_sq * shrink * shrink;
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // pixel's tile coordinate, matching the flow sampling above. Else nearest.
     float s;
@@ -2201,23 +2143,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v; float Emag = sqrt(ex * ex + ey * ey);
         int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
         int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
-        // Guide channel 0 over the same clamped neighbourhood, plus the diagonals.
-        float nb[9] = {
-            ref_means[(uint(yu) * p.w + uint(xl)) * p.nch],
-            ref_means[(uint(yu) * p.w + gid.x)    * p.nch],
-            ref_means[(uint(yu) * p.w + uint(xr)) * p.nch],
-            ref_means[(gid.y    * p.w + uint(xl)) * p.nch],
-            ref_means[(gid.y    * p.w + gid.x)    * p.nch],
-            ref_means[(gid.y    * p.w + uint(xr)) * p.nch],
-            ref_means[(uint(yd) * p.w + uint(xl)) * p.nch],
-            ref_means[(uint(yd) * p.w + gid.x)    * p.nch],
-            ref_means[(uint(yd) * p.w + uint(xr)) * p.nch],
-        };
-        // ref_means is a 3x3 local mean of the guide, so one sample's variance is
-        // the affine guide model divided by 9. Channel 0: no green halving.
-        float gsv = max(p.alpha * clamp(nb[4], 0.f, 1.f) + p.beta, 0.f) * (1.f / 9.f);
-        float gmag = geom_gradient_mag(nb, sc, gsv, p.geom_grad_snr_lo,
-                                       p.geom_grad_snr_hi, p.geom_denoise_grad != 0u);
+        float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
+        float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
+        float gmag = sqrt(gix * gix + giy * giy);
         // Absolute criterion (preserves good-light behaviour), always applied.
         geom_reject = (gmag * Emag) > p.geom_reject_threshold;
         // Relative (exposure-invariant) criterion added on top for low light:
@@ -2331,12 +2259,8 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         d_md_sq += d_t * d_t;
     }
     float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    // Same 1.4 guard as rob_make_mask; see the note there.
-    float d_sq_ = 0.f;
-    if (d_ms_sq > 0.f) {
-        float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-        d_sq_ = d_ms_sq * shrink * shrink;
-    }
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    float d_sq_ = d_ms_sq * shrink * shrink;
 
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // raw pixel's tile coordinate. Else nearest. Raw res -> tc = gid/ts - 0.5.
@@ -2901,34 +2825,6 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 // Pyramid downsample — exact match of grey_pyramid.cpp downsample_by /
 // Python cuda_downsample: scipy gaussian_kernel1d, valid separable conv, stride.
 // ---------------------------------------------------------------------------
-// Circular pad of a single-channel float plane, on the GPU.
-//
-// Twin of pad_image_circular in pipeline.cpp. That one writes the wrap as
-// (i - extent), which lands inside the plane only while pad < extent -- true for
-// every geometry this pipeline produces (pad < tile_size <= 64, extent >= 1512)
-// but not in general. A modulo is identical wherever pad < extent and stays in
-// range everywhere else, so it is used here: same values on every reachable
-// input, no out-of-range read on an unreachable one.
-//
-// This exists because the moving grey lives ONLY on the GPU on the resident
-// path -- compute_grey_fft_metal returns a dimensions-only Image whose host
-// data is empty -- so padding it on the CPU read from nothing and crashed. See
-// align_metal.
-struct PadCircularParams {
-    uint in_h, in_w;
-    uint out_h, out_w;
-};
-
-kernel void pad_circular_f32(device const float* in [[buffer(0)]],
-                             device float* out [[buffer(1)]],
-                             constant PadCircularParams& p [[buffer(2)]],
-                             uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.out_w || gid.y >= p.out_h) return;
-    uint sy = (gid.y < p.in_h) ? gid.y : (gid.y % p.in_h);
-    uint sx = (gid.x < p.in_w) ? gid.x : (gid.x % p.in_w);
-    out[gid.y * p.out_w + gid.x] = in[sy * p.in_w + sx];
-}
-
 struct PyrDownParams {
     uint in_h, in_w;
     uint out_h, out_w;

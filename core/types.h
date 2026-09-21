@@ -337,20 +337,6 @@ struct Config {
         const int n = cfa.count((uint8_t)c);
         return (n > 0) ? 1.f / (float)n : 1.f;
     }
-    // One channel's alpha/beta, carrying the white-balance and guide-averaging
-    // transformations but WITHOUT the cross-channel mean. This is the form 1.4
-    // uses (alpha[c]*x + beta[c] per Bayer plane); the averaged pair below exists
-    // only for the consumers that want a single representative number.
-    float noise_channel_alpha(int c) const {
-        if (c < 0 || c > 2) c = 1;
-        return alpha_dng[c] * noise_wb_gain(c) * noise_guide_weight(c);
-    }
-    float noise_channel_beta(int c) const {
-        if (c < 0 || c > 2) c = 1;
-        const float g = noise_wb_gain(c);
-        return beta_dng[c] * g * g * noise_guide_weight(c);
-    }
-
     float noise_alpha() const {
         float s = 0.f;
         for (int c = 0; c < 3; ++c)
@@ -413,13 +399,6 @@ struct Config {
     // at the wrong brightness for those channels. The sensor-space
     // alternative was measured on the ok/ burst and reverted by explicit
     // choice.
-    float noise_channel_alpha_robustness(int c) const {
-        return debug_noise_model_disabled ? 0.f : noise_channel_alpha(c);
-    }
-    float noise_channel_beta_robustness(int c) const {
-        return debug_noise_model_disabled ? 0.f : noise_channel_beta(c);
-    }
-
     float noise_alpha_robustness() const {
         return debug_noise_model_disabled ? 0.f : noise_alpha();
     }
@@ -940,16 +919,6 @@ struct Config {
     // ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     // drops more burst samples.
     float motion_geom_reject_threshold = 0.02f;
-    // Noise-aware gradient for the GEOMETRY TEST ONLY (core/geom_gradient.h).
-    // Blends the existing central difference toward a normalised 3x3 Sobel --
-    // same units, same scale, so motion_geom_reject_threshold is untouched --
-    // by how trustworthy the sharp gradient is against the guide noise model.
-    // Above motion_geom_grad_snr_hi the sharp estimate is returned unchanged,
-    // which is every pixel capable of rejecting in a bright scene. Nothing else
-    // in the pipeline sees this: not the Wronski mask, not the merge.
-    bool  motion_geom_denoise_gradient = true;
-    float motion_geom_grad_snr_lo = 2.0f;
-    float motion_geom_grad_snr_hi = 6.0f;
     // Exposure-invariant geometry rejection. The absolute form above weights the
     // within-tile error |E| by the ABSOLUTE reference gradient |grad I|, which
     // shrinks in dim scenes (sqrt guide: a scene at 1/4 the light has ~half the

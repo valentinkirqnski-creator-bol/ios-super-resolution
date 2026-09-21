@@ -118,11 +118,6 @@ struct MetalCtx {
     // Last grey-FFT output (Shared) — align_metal can reuse without re-upload.
     id<MTLBuffer> sticky_grey = nil;
     int sticky_grey_h = 0, sticky_grey_w = 0;
-    // Circularly padded copy of the above, for a tile size the plane is not a
-    // multiple of. Grow-only scratch: 49MB at 12MP, and only ever allocated when
-    // a tile size actually needs padding (8 and 16 divide 3024x4032 exactly).
-    id<MTLBuffer> pad_grey = nil;
-    size_t pad_grey_b = 0;
     // Reference Sobel gradients and ICA Hessian, cached per pyramid level.
     // One slot was enough while ICA ran only on the finest level; per-level ICA
     // asks for a different level on every call, so a single slot would miss
@@ -218,7 +213,7 @@ static MetalCtx& ctx() {
             "rob_tile_residual_high", "rob_make_mask", "rob_make_mask_raw", "rob_local_min_5x5",
             "rob_row_activity",
             "l1_bm_ts16", "l1_bm_ts32", "l1_bm_ts64", "ica_refine_tile",
-            "pyr_conv_y", "pyr_conv_x", "pyr_subsample", "pad_circular_f32",
+            "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460",
             "align_upscale_flow_bilinear",
@@ -1022,19 +1017,8 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
     g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
-    // CEILING, not floor: align() runs on a grey that pad_image_circular has
-    // already rounded UP to a whole number of tiles, and sizes its flow field
-    // (gradx.h + ts - 1) / ts to match. Sizing the slice by floor here made the
-    // two disagree whenever the plane was not an exact multiple of the tile --
-    // 3024 rows is 16 x 189 with 189 odd, so 8 and 16 divided evenly and 32 and
-    // 64 did not (94 against align's 95, 47 against 48). metal_frame_set_flow
-    // rejects a mismatch outright, which surfaced as "GPU frame state
-    // unavailable" on the first comparison frame.
-    //
-    // Same underlying assumption the host pad crash came from: residency was
-    // written when the tile size was always 16, where nothing needs padding.
-    g_bf.flow_ny = (raw_h + tile_size - 1) / tile_size;
-    g_bf.flow_nx = (raw_w + tile_size - 1) / tile_size;
+    g_bf.flow_ny = raw_h / tile_size;
+    g_bf.flow_nx = raw_w / tile_size;
     g_bf.cov_stride = 3u;
     if (g_bf.cov_h <= 0 || g_bf.cov_w <= 0 || g_bf.rob_h <= 0 || g_bf.rob_w <= 0 ||
         g_bf.flow_ny <= 0 || g_bf.flow_nx <= 0)
@@ -1099,15 +1083,6 @@ bool metal_frame_set_flow(int slot, const FlowField& flow) {
            flow.flow.data(), bytes);
     g_bf.have_flow[(size_t)slot] = 1u;
     return true;
-}
-
-void metal_frames_state_str(char* out, size_t n) {
-    if (!out || n == 0) return;
-    std::snprintf(out, n,
-                  "open=%d n=%d ts=%d flow=%dx%d elems=%zu buf=%d raw=%dx%d",
-                  g_bf.open ? 1 : 0, g_bf.n, g_bf.tile_size,
-                  g_bf.flow_ny, g_bf.flow_nx, g_bf.flow_elems,
-                  g_bf.flows ? 1 : 0, g_bf.raw_h, g_bf.raw_w);
 }
 
 bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
@@ -1625,12 +1600,8 @@ struct RobMaskParamsCPU {
     uint32_t geom_relative = 1;
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
-    // Geometry-only noise-aware gradient (Config::motion_geom_denoise_gradient).
-    uint32_t geom_denoise_grad = 1;
-    float    geom_grad_snr_lo = 2.0f;
-    float    geom_grad_snr_hi = 6.0f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 116, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1655,15 +1626,11 @@ static_assert(sizeof(RobMaskRawParamsCPU) == 88, "RobMaskRawParamsCPU");
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
     uint32_t _pad0 = 0;
-    // Per guide channel, as 1.4 evaluates alpha[c]*x + beta[c] per Bayer plane.
-    // These already carry the white-balance and guide-averaging factors, so the
-    // kernel must NOT re-apply the green halving it used to.
-    float alpha[3] = {0.f, 0.f, 0.f};
-    float beta[3] = {0.f, 0.f, 0.f};
+    float alpha = 0.f, beta = 0.f;
     float min_texture_snr = 0.f;
     float _pad1 = 0.f;
 };
-static_assert(sizeof(RobHfLossParamsCPU) == 48, "RobHfLossParamsCPU");
+static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
 
 static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
                             id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
@@ -1705,11 +1672,9 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     hp.h = (uint32_t)guide_h;
     hp.w = (uint32_t)guide_w;
     hp.nch = (uint32_t)nch;
-    for (int c = 0; c < 3; ++c) {
-        hp.alpha[c] = cfg.noise_channel_alpha_robustness(c);
-        hp.beta[c] = cfg.noise_channel_beta_robustness(c);
-    }
+    hp.alpha = cfg.noise_alpha_robustness();
     hp.min_texture_snr = cfg.hf_min_texture_snr;
+    hp.beta = cfg.noise_beta_robustness();
     enc = [cmd computeCommandEncoder];
     if (!enc) return false;
     [enc setBuffer:b_loss offset:0 atIndex:0];
@@ -2236,11 +2201,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.hf_h = (uint32_t)gh;
     mp.hf_w = (uint32_t)gw;
     // alpha/beta stay for the noise model (debug-gated accessors).
-    // Channel 0's own values, not the cross-channel mean: both consumers in
-    // rob_make_mask -- the geometry gradient's sample variance and the relative
-    // criterion's nsig -- read guide CHANNEL 0 (ref_means[... * p.nch]).
-    mp.alpha = cfg.noise_channel_alpha_robustness(0);
-    mp.beta = cfg.noise_channel_beta_robustness(0);
+    mp.alpha = cfg.noise_alpha_robustness();
+    mp.beta = cfg.noise_beta_robustness();
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
 
@@ -2460,9 +2422,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
     mp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
     mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
-    mp.geom_denoise_grad = cfg.motion_geom_denoise_gradient ? 1u : 0u;
-    mp.geom_grad_snr_lo = cfg.motion_geom_grad_snr_lo;
-    mp.geom_grad_snr_hi = cfg.motion_geom_grad_snr_hi;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;
@@ -2548,11 +2507,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 }
 
 namespace {
-
-struct PadCircularParamsCPU {
-    uint32_t in_h, in_w, out_h, out_w;
-};
-static_assert(sizeof(PadCircularParamsCPU) == 16, "PadCircularParamsCPU");
 
 struct PyrDownParamsCPU {
     uint32_t in_h, in_w, out_h, out_w, klen, factor;
@@ -3335,54 +3289,14 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
     // again until the next frame's grey, and align_drain() below completes all
     // of this call's work before returning.
     const int grey_ts = cfg.grey_tile_size(tile_size);
-    Image moving_padded_grey;   // stays empty on both GPU paths
+    Image moving_padded_grey;   // stays empty on the resident path
     int mov0_h = moving_grey.h, mov0_w = moving_grey.w;
     id<MTLBuffer> mov0 = nil;
-    const bool sticky_ok = c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
-                           c.sticky_grey_w == moving_grey.w;
-    const int pad_amt = pad_image_circular_amount(moving_grey, grey_ts);
-    if (pad_amt == 0 && sticky_ok) {
+    if (pad_image_circular_amount(moving_grey, grey_ts) == 0 &&
+        c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+        c.sticky_grey_w == moving_grey.w) {
         mov0 = c.sticky_grey;
-    } else if (sticky_ok && moving_grey.c == 1) {
-        // Pad on the GPU, because the host plane is not there to pad.
-        //
-        // compute_grey_fft_metal returns a DIMENSIONS-ONLY Image on the resident
-        // path (want_host = !resident_raw || debug_dumps_enabled) -- the pixels
-        // exist only in sticky_grey. Calling pad_image_circular on it read from
-        // an empty vector and took a SIGSEGV at address 0, which is what a tile
-        // size of 32 or 64 did: 3024 is 16 x 189 and 189 is odd, so the grey is
-        // a multiple of 8 and 16 but never of 32 or 64, and only those two ever
-        // reached this branch.
-        const int ph = moving_grey.h + ((grey_ts - moving_grey.h % grey_ts) % grey_ts);
-        const int pw = moving_grey.w + ((grey_ts - moving_grey.w % grey_ts) % grey_ts);
-        const size_t need = (size_t)ph * (size_t)pw * sizeof(float);
-        id<MTLBuffer> dst = c.scratch(c.pad_grey, c.pad_grey_b, need);
-        if (!dst) return false;
-        PadCircularParamsCPU pp{};
-        pp.in_h = (uint32_t)moving_grey.h;
-        pp.in_w = (uint32_t)moving_grey.w;
-        pp.out_h = (uint32_t)ph;
-        pp.out_w = (uint32_t)pw;
-        id<MTLCommandBuffer> pcmd = [c.queue commandBuffer];
-        if (!pcmd) return false;
-        id<MTLComputeCommandEncoder> penc = [pcmd computeCommandEncoder];
-        if (!penc) return false;
-        [penc setBuffer:c.sticky_grey offset:0 atIndex:0];
-        [penc setBuffer:dst offset:0 atIndex:1];
-        [penc setBytes:&pp length:sizeof(pp) atIndex:2];
-        dispatch2(penc, c.pipe("pad_circular_f32"), (NSUInteger)pw, (NSUInteger)ph);
-        [penc endEncoding];
-        prof_tag_gpu(pcmd, "align:pad-circular");
-        [pcmd commit];
-        [pcmd waitUntilCompleted];
-        if (pcmd.status != MTLCommandBufferStatusCompleted) return false;
-        mov0 = dst;
-        mov0_h = ph;
-        mov0_w = pw;
     } else {
-        // No sticky grey: the non-resident path, where the host plane IS filled.
-        // Guarded anyway -- padding an empty plane is the crash above.
-        if (moving_grey.data.empty()) return false;
         moving_padded_grey = pad_image_circular(moving_grey, grey_ts);
         mov0_h = moving_padded_grey.h;
         mov0_w = moving_padded_grey.w;

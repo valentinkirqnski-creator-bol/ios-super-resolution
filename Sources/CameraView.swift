@@ -1111,152 +1111,17 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     ispRow("Black level", $cam.tuningParams.hdr_black_percentile,
-                           0...0.05, "%.3f")
+                           0...0.02, "%.3f")
                     Text("""
                          Fraction of the picture taken all the way to black: \
                          0.002 by default, so about one pixel in five hundred. \
                          Measured per shot rather than a fixed offset, and still \
-                         capped, so a low-key scene keeps its shadows. The range \
-                         runs to 0.05, where the render itself clamps it; across \
-                         that span it stays monotone, taking mean luma from 126 \
-                         down to 106.
+                         capped, so a low-key scene keeps its shadows.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Text("Both apply to the JPG export and to the preview Photos "
                          + "shows for a DNG, from the next shot on.")
                         .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Alignment")) {
-                    Picker("Tile size", selection: $cam.tuningParams.alignment_tile_size) {
-                        Text("Auto").tag(0)
-                        Text("8").tag(8)
-                        Text("16").tag(16)
-                        Text("32").tag(32)
-                        Text("64").tag(64)
-                    }
-                    .pickerStyle(.segmented)
-                    Text("""
-                         Block-matching tile size in raw pixels, for the finest \
-                         pyramid level; the coarsest is half that. Auto is the \
-                         default and is what Python 1.4 does: it picks from the \
-                         reference frame's SNR -- 64 at or below 14, 32 at or \
-                         below 22, otherwise 16 -- so a dim scene gets bigger \
-                         tiles on its own. A fixed value overrides that.
-
-                         BIGGER tiles match more pixels at once, so the flow \
-                         they return is more reliable on smooth or noisy \
-                         content -- which is what makes flat sky and dim scenes \
-                         misbehave -- at the cost of resolving less of the real \
-                         local motion. Smaller tiles track fine motion better \
-                         and are noisier about it.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    Toggle("Match Python 1.4 alignment",
-                           isOn: $cam.tuningParams.align_match_14)
-                    Text("""
-                         On by default. Closes the three places this port (a \
-                         460-main derivative) diverged from 1.4: the finest \
-                         search radius becomes 1 rather than 3, flow is carried \
-                         between pyramid levels by a plain bilinear resize \
-                         rather than 460's three-candidate re-match, and ICA \
-                         runs at every level rather than only the finest. It \
-                         also lets Auto choose a 64px tile, which 460 capped at \
-                         32. Off restores the 460 behaviour, so a regression is \
-                         one tap from being ruled out.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Motion Rejection")) {
-                    Toggle("Geometric motion rejection",
-                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
-                    Text("""
-                         Zeroes robustness where a tile's single translation is a \
-                         poor model of the motion inside it -- flow gradient times \
-                         distance from the tile centre, weighted by edge strength -- \
-                         which is what produces the tile-edge ghosts when the camera \
-                         rotates during a burst. Rejected pixels fall back to the \
-                         reference frame, so this trades burst samples for a clean \
-                         result and is inert under straight-line motion.
-
-                         Off removes the test entirely, leaving plain Wronski \
-                         robustness. That is also what Handheld-Multi-Frame-\
-                         Super-Resolution-1.4 does, which has no geometric \
-                         criterion at all -- so turn it off when comparing masks \
-                         against a 1.4 reference run, or a difference here will \
-                         look like a merge difference.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.motion_geom_reject_enabled {
-                        Toggle("Noise-aware geometry gradient",
-                               isOn: $cam.tuningParams.motion_geom_denoise_gradient)
-                        Text("""
-                             Estimates the reference gradient used by the geometric \
-                             motion-rejection test with a noise-aware 3x3 operator \
-                             instead of a bare difference, so photon noise in a dark \
-                             scene is less likely to read as an edge and reject a \
-                             well-aligned tile. The rejection threshold is unchanged, \
-                             and pixels whose gradient is already strong are left \
-                             exactly as they were, so bright scenes behave as before.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                        ispRow("Geometry reject threshold",
-                               $cam.tuningParams.motion_geom_reject_threshold,
-                               0.0005...0.02, "%.4f")
-                        Text("""
-                             The geometric test rejects a tile where |gradient| \
-                             x |within-tile motion error| exceeds this. LOWER \
-                             rejects more, so a dim or noisy scene can lose \
-                             frames to it; higher is more permissive. 0.0045 by \
-                             default; 0.02 was the original value.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                    }
-                    Toggle("Save robustness mask",
-                           isOn: $cam.tuningParams.robustness_save_mask)
-                    Text("Writes the per-frame robustness mask alongside the shot "
-                         + "as extra images. Diagnostic; leave off for normal use.")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                if cam.tuningParams.motion_geom_reject_enabled {
-                    Section(header: Text("Relative Rejection Criterion")) {
-                        Toggle("Exposure-invariant criterion",
-                               isOn: $cam.tuningParams.motion_geom_relative)
-                        Text("""
-                             A second geometric criterion applied ON TOP of the \
-                             absolute one, using contrast -- gradient over \
-                             brightness, with a noise floor subtracted -- instead \
-                             of absolute gradient. It catches the low-light \
-                             misalignments the absolute form misses, whose gradient \
-                             shrinks with the light.
-
-                             The two are a UNION, so this can only ADD rejections, \
-                             never restore a frame. If your problem is flat sky \
-                             going black in the mask, this will not help and may \
-                             make it worse.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                        ispRow("Relative threshold",
-                               $cam.tuningParams.motion_geom_reject_threshold_relative,
-                               0.005...0.2, "%.3f")
-                        ispRow("Noise floor multiplier",
-                               $cam.tuningParams.motion_geom_noise_floor_mult,
-                               0...16, "%.1f")
-                        Text("""
-                             Threshold 0.04 by default; lower rejects more. The \
-                             noise floor multiplier is how many sigma of guide \
-                             noise are subtracted from the gradient before the \
-                             contrast ratio is formed, so higher discounts noise \
-                             harder and rejects less. 1.5 by default, up to 16; past \
-                             about 5 sigma it subtracts more than a real dark edge carries, \
-                             so the criterion goes quiet altogether. 0 disables \
-                             the subtraction. Both are inert while the toggle \
-                             above is off.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                    }
                 }
             }
             .navigationTitle("Settings")

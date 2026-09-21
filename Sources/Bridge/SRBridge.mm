@@ -541,9 +541,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
-    if (tuning[@"motion_geom_denoise_gradient"])
-        cfg.motion_geom_denoise_gradient =
-            tuning[@"motion_geom_denoise_gradient"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])
@@ -753,23 +750,13 @@ static void FillReferenceMetadataFromRawFrame(NSDictionary *frame, Config& cfg) 
     std::string noise_log;
     if (noise.size() >= 2) {
         const size_t nplanes = noise.size() / 2u;
-        // Per-channel [R, G, B], no cross-channel averaging. Fewer than 3 planes
-        // replicates the last, which for a 1-plane profile is 1.4's alpha * 4.
-        //
-        // A 4-plane profile is R G1 B G2 (1.4's expand_noise_profile_to_rgbg keeps
-        // all four, because it works on four Bayer planes). This guide has three
-        // channels and its green is the average of BOTH green sites, so the value
-        // green needs is the mean of G1 and G2 -- reading plane 1 alone dropped
-        // plane 3 on the floor.
+        // Read per-channel [R, G, B] noise without averaging, preserving differences.
+        // If fewer than 3 planes, replicate the last one.
         bool ok = true;
         for (int c = 0; c < 3; ++c) {
             size_t src_plane = (c < (int)nplanes) ? c : (nplanes - 1);
             cfg.alpha_dng[c] = (float)noise[src_plane * 2u + 0u];
             cfg.beta_dng[c] = (float)noise[src_plane * 2u + 1u];
-            if (c == 1 && nplanes >= 4u) {
-                cfg.alpha_dng[1] = 0.5f * (cfg.alpha_dng[1] + (float)noise[3u * 2u + 0u]);
-                cfg.beta_dng[1] = 0.5f * (cfg.beta_dng[1] + (float)noise[3u * 2u + 1u]);
-            }
             if (!(cfg.alpha_dng[c] > 0.f && std::isfinite(cfg.alpha_dng[c]) &&
                   std::isfinite(cfg.beta_dng[c])))
                 ok = false;

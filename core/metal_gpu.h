@@ -65,13 +65,6 @@ bool metal_frames_active();
 // analysis result the host still owns -- it is ~0.4 MB and the CPU genuinely
 // reads it (compute_motion_irregular, rob_compute_s).
 bool metal_frame_set_flow(int slot, const FlowField& flow);
-// Why a metal_frame_set_flow refusal happened. Its four conditions -- closed or
-// released residency, a slot past n_frames, a flow grid that disagrees with the
-// slice, and a flow larger than the slice -- are indistinguishable from the bool,
-// and the failure reproduces only on device. Fills `out` with the resident
-// geometry so the error message carries the numbers instead of a guess. Safe to
-// call when residency is closed.
-void metal_frames_state_str(char* out, size_t n);
 
 // Per-row non-zero flags of a resident robustness mask, so the band-skip test
 // does not need the 12 MB mask on the host. Twin of robustness_row_activity.

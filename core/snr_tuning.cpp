@@ -64,12 +64,9 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
 
     int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;
-    // 460-main falls back to 32 because ITS block matching kernels do not support
-    // tiles larger than that. This port's do -- l1_bm_ts64 is written and
-    // registered in metal_gpu_init -- and 1.4 keeps 64 below snr 14, which is the
-    // last place the tile-size selection diverged from it. So the cap only applies
-    // when 1.4 matching is off, leaving the 460-derived behaviour one flag away.
-    if (!cfg.align_match_14 && Ts > 32) Ts = 32;
+    // 460-main falls back to 32 because its block matching kernels do not
+    // support tiles larger than that.
+    if (Ts > 32) Ts = 32;
     set_alignment_tile_sizes(cfg, manual_tile_size > 0 ? manual_tile_size : Ts);
 }
 

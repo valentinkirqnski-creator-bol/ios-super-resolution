@@ -104,9 +104,6 @@ static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[
         // replicate the available value to all three channels.
         // The DNG NoiseProfile describes the sensor BEFORE white balance multiplication.
         // White balance scaling will be applied in noise_wb_gain(); store the raw values.
-        // A 4-plane profile is R G1 B G2. The guide's green averages both green
-        // sites, so green takes the MEAN of G1 and G2; see the twin of this in
-        // SRBridge.mm. Handled after the loop, once both are decoded.
         for (int c = 0; c < 3; ++c) {
             uint32_t src_plane = (c < (int)nplanes) ? c : (nplanes - 1);
             for (int k = 0; k < 2; ++k) {
@@ -121,22 +118,6 @@ static bool try_read_dng_noise_profile(const std::string& path, float alpha_rgb[
                 std::memcpy(&d, raw8, 8);
                 if (k == 0) a_out[c] = (float)d; else b_out[c] = (float)d;
             }
-        }
-        if (nplanes >= 4u) {
-            // Fold G2 into green. Without this, plane 3 was read from the file and
-            // then thrown away, and green carried G1 alone.
-            double g2a = 0.0, g2b = 0.0;
-            for (int k = 0; k < 2; ++k) {
-                uint8_t raw8[8];
-                const uint8_t* src = bytes.data() + (size_t)(2u * 3u + (uint32_t)k) * 8u;
-                if (le) std::memcpy(raw8, src, 8);
-                else for (int i = 0; i < 8; ++i) raw8[i] = src[7 - i];
-                double d;
-                std::memcpy(&d, raw8, 8);
-                if (k == 0) g2a = d; else g2b = d;
-            }
-            a_out[1] = 0.5f * (a_out[1] + (float)g2a);
-            b_out[1] = 0.5f * (b_out[1] + (float)g2b);
         }
         bool ok = true;
         for (int c = 0; c < 3; ++c) {
