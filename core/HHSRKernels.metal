@@ -1996,8 +1996,11 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
                                                         sample_y, sample_x, ch);
                 float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
                 float d_p_sq = d_p_ * d_p_;
-                float shrink = d_p_sq / (d_p_sq + d_t * d_t);
-                d_sq_ += d_p_sq * shrink * shrink;
+                // 1.4's `if d_sq_ > 0` guard; see rob_make_mask.
+                if (d_p_sq > 0.f) {
+                    float shrink = d_p_sq / (d_p_sq + d_t * d_t);
+                    d_sq_ += d_p_sq * shrink * shrink;
+                }
             }
             float ratio = (sigma_sq_ > 0.f && isfinite(sigma_sq_))
                 ? d_sq_ / sigma_sq_
@@ -2106,8 +2109,26 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         d_md_sq += d_t * d_t;
     }
     sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    d_sq_ = d_ms_sq * shrink * shrink;
+    // 1.4 guards this: `if d_sq_ > 0:` around the whole shrink (robustness.py).
+    // Without it, d_ms_sq == 0 AND d_md_sq == 0 gives 0/0 = NaN. Both are zero
+    // exactly when the noise model is off (d_md_sq collapses to 0) and the
+    // reference and comparison means are bit-equal -- a fully blown highlight
+    // where both frames sit at 1.0, or a crushed black where both sit at 0. That
+    // pixel matched perfectly, so d_sq_ = 0 is the answer, and R comes out at its
+    // maximum; NaN instead poisons every merge accumulator that touches it.
+    //
+    // Guarding HERE rather than clamping r_val afterwards is what keeps the two
+    // NaN routes apart. The other one is an out-of-bounds Dodgson sample, which
+    // arrives as +inf by design so that R = 0: there d_ms_sq is +inf, this guard
+    // passes, shrink is inf/inf = NaN as before, and the downstream
+    // !isfinite(r_val) -> 0 still yields the intended rejection. A blanket clamp
+    // would force this case to 0 as well, which is the opposite of correct.
+    if (d_ms_sq > 0.f) {
+        float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+        d_sq_ = d_ms_sq * shrink * shrink;
+    } else {
+        d_sq_ = 0.f;
+    }
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // pixel's tile coordinate, matching the flow sampling above. Else nearest.
     float s;
@@ -2310,8 +2331,12 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         d_md_sq += d_t * d_t;
     }
     float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    float d_sq_ = d_ms_sq * shrink * shrink;
+    // Same 1.4 guard as rob_make_mask; see the note there.
+    float d_sq_ = 0.f;
+    if (d_ms_sq > 0.f) {
+        float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+        d_sq_ = d_ms_sq * shrink * shrink;
+    }
 
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // raw pixel's tile coordinate. Else nearest. Raw res -> tc = gid/ts - 0.5.

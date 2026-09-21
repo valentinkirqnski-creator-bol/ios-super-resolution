@@ -1069,8 +1069,18 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 d_md_sq += d_t * d_t;
             }
             f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-            f32 d_sq_ = d_ms_sq * shrink * shrink;
+            // 1.4 guards the shrink with `if d_sq_ > 0:` (robustness.py). Without
+            // it, d_ms_sq == 0 and d_md_sq == 0 gives 0/0 = NaN -- which is what
+            // happens with the noise model off on a blown highlight or a crushed
+            // black, where both frames are bit-equal. That pixel matched, so 0 is
+            // the answer and R lands at its maximum. Guarding here and not on
+            // r_val keeps the +inf route (OOB Dodgson sample) still resolving to
+            // R = 0 through the !isfinite check downstream.
+            f32 d_sq_ = 0.f;
+            if (d_ms_sq > 0.f) {
+                const f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+                d_sq_ = d_ms_sq * shrink * shrink;
+            }
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }
@@ -1108,8 +1118,11 @@ static void apply_noise_model_1p4(const Image& d_p, const Image& ref_means,
             sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
             // dq stays +inf for an out-of-bounds sample -> exp(-inf)=0 -> R=0.
             if (std::isfinite(dq) && dq > 0.f) {
-                const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
-                dq *= shrink * shrink;
+                // 1.4's `if d_sq_ > 0` guard; 0/0 otherwise. See compute_robustness.
+                if (dq > 0.f) {
+                    const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                    dq *= shrink * shrink;
+                }
             }
             d_sq.at(y, x) = dq;
             sigma_sq.at(y, x) = sq;
@@ -1163,8 +1176,13 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                 d_md_sq += d_t * d_t;
             }
             f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
-            f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-            d_sq.at(y, x) = d_ms_sq * shrink * shrink;
+            // Same 1.4 guard as above.
+            if (d_ms_sq > 0.f) {
+                const f32 shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+                d_sq.at(y, x) = d_ms_sq * shrink * shrink;
+            } else {
+                d_sq.at(y, x) = 0.f;
+            }
             sigma_sq.at(y, x) = sigma_sq_;
         }
     });
@@ -1198,8 +1216,11 @@ static void apply_noise_model_fused_1p4(const Image& ref_means, const Image& com
             if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
             sq = std::max(sq, lut.sigma_sq[(size_t)idx]);
             if (std::isfinite(dq) && dq > 0.f) {
-                const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
-                dq *= shrink * shrink;
+                // 1.4's `if d_sq_ > 0` guard; 0/0 otherwise. See compute_robustness.
+                if (dq > 0.f) {
+                    const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                    dq *= shrink * shrink;
+                }
             }
             d_sq.at(y, x) = dq;
             sigma_sq.at(y, x) = sq;
