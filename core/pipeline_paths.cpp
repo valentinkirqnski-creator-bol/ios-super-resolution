@@ -987,6 +987,37 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     return true;
 }
 
+// Mean of a strided sample of a plane. Exists to answer one question no other
+// number in the profile can: is the burst photometrically CONSISTENT?
+//
+// Block matching assumes brightness constancy. A burst captured while auto
+// exposure is still converging -- or under mains flicker at a short shutter --
+// carries a brightness step or drift between frames, which makes each per-tile
+// match arbitrary. Neighbouring tiles then disagree, the 3x3 flow span M
+// explodes, every tile trips r_Mt, the motion prior collapses to s1 everywhere
+// and the robustness mask comes out near-black.
+//
+// From every other statistic in the profile that is indistinguishable from a
+// flow bug: motionM#pct-irregular reads 100% either way. These per-frame values
+// separate the two. A step or drift across frames means the CAPTURE is at
+// fault; flat brightness with M still high means the FLOW is.
+//
+// Strided deliberately. The full serial sum in tune_config_snr costs ~325ms and
+// its summation order is load-bearing; this is a diagnostic and must not show
+// up in the timings. Every 8th row and column is 1/64 of the plane -- ~190k
+// samples at 12MP -- which resolves a brightness step far below the level that
+// would disturb matching.
+static double strided_mean(const Image& img) {
+    if (img.h <= 0 || img.w <= 0 || img.data.empty()) return 0.0;
+    double sum = 0.0;
+    size_t cnt = 0;
+    for (int y = 0; y < img.h; y += 8) {
+        const f32* row = &img.data[(size_t)y * (size_t)img.w];
+        for (int x = 0; x < img.w; x += 8) { sum += (double)row[x]; ++cnt; }
+    }
+    return cnt ? sum / (double)cnt : 0.0;
+}
+
 } // namespace
 
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
@@ -1199,6 +1230,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             metal_frames_end();
             frames_resident = false;
         }
+    }
+    if (prof_enabled()) {
+        // Same estimator as the comparison frames below -- ref_brightness comes
+        // from tune_config_snr's full sum and is not comparable to a strided one.
+        char bkey[48];
+        std::snprintf(bkey, sizeof(bkey), "burst#brightness-f%d", ref_index);
+        prof_add_cpu(bkey, strided_mean(ref));
     }
     prof_mark_memory(frames_resident ? "frames:resident-open" : "frames:host");
     // The slices are the largest allocation in the burst, and this function has a
@@ -1491,6 +1529,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             prof_add_cpu("comp:decode(sync)", prof_now_ms() - t_decode);
         }
         if (comp.h <= 0) continue;
+        // One entry per frame rather than an aggregate: a STEP is the signal,
+        // and a mean over the burst would hide exactly that.
+        if (prof_enabled()) {
+            char bkey[48];
+            std::snprintf(bkey, sizeof(bkey), "burst#brightness-f%d", k);
+            prof_add_cpu(bkey, strided_mean(comp));
+        }
         debug_dump_bin("cpp_raw_comp_" + std::to_string(pos),
                        comp.data.data(), comp.data.size());
         if (debug) {
