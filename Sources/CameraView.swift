@@ -1157,6 +1157,27 @@ struct CameraView: View {
                              close to inert.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Don't reject flat regions",
+                               isOn: $cam.tuningParams.motion_geom_flat_guard)
+                        Text("""
+                             Stops sky and other textureless areas going black in \
+                             the mask. Their gradient is photon noise rather than \
+                             an edge, but a flat tile also gives block matching \
+                             nothing to lock onto, so its flow is arbitrary and \
+                             the within-tile error is large -- noise times a \
+                             meaningless flow clears a low threshold. This \
+                             subtracts the noise floor from the gradient first, \
+                             which is negligible at a real edge. It can only \
+                             remove rejections, never add one.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Noise floor x sigma",
+                               $cam.tuningParams.motion_geom_noise_floor_mult,
+                               0...8, "%.1f")
+                        Text("How many sigma of guide noise are subtracted. 0 "
+                             + "disables the subtraction; higher discounts noise "
+                             + "harder and rejects less. 1.5 by default.")
+                            .font(.footnote).foregroundColor(.secondary)
                     }
                 }
             }

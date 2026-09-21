@@ -547,6 +547,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_geom_relative = tuning[@"motion_geom_relative"].boolValue;
     if (tuning[@"motion_geom_noise_floor_mult"])
         cfg.motion_geom_noise_floor_mult = tuning[@"motion_geom_noise_floor_mult"].floatValue;
+    if (tuning[@"motion_geom_flat_guard"])
+        cfg.motion_geom_flat_guard = tuning[@"motion_geom_flat_guard"].boolValue;
     if (tuning[@"motion_geom_reject_threshold_relative"])
         cfg.motion_geom_reject_threshold_relative = tuning[@"motion_geom_reject_threshold_relative"].floatValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
