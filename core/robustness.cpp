@@ -863,10 +863,18 @@ static void local_stats_3x3(const Image& guide, Image& means, Image& vars) {
 static f32 guide_noise_var(const Config& cfg, int nch, int ch, f32 brightness) {
     if (!std::isfinite(brightness)) brightness = 0.f;
     brightness = clampf(brightness, 0.f, 1.f);
-    f32 v = std::max(cfg.noise_alpha_robustness() * brightness +
-                     cfg.noise_beta_robustness(), 0.f);
-    if (nch == 3 && ch == 1)
-        v *= 0.5f; // green guide channel is the average of two Bayer greens.
+    // That channel's OWN alpha and beta, as 1.4 does (alpha[c]*x + beta[c]), not a
+    // mean over all three. noise_alpha()/noise_beta() average the channels for the
+    // places that genuinely want one representative number -- the SNR estimate and
+    // the Monte Carlo curves -- but here the caller has named a channel.
+    //
+    // noise_channel_alpha/beta carry the same transformation the averaged pair
+    // does: x gain for the signal term and gain squared for the read term, which
+    // is 1.4's model rewritten for a raw this pipeline has already white-balanced,
+    // plus the 1/nsites weight for a guide channel built by averaging.
+    f32 v = std::max(cfg.noise_channel_alpha(ch) * brightness +
+                     cfg.noise_channel_beta(ch), 0.f);
+    (void)nch;
     return v;
 }
 

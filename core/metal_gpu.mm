@@ -1635,11 +1635,15 @@ static_assert(sizeof(RobMaskRawParamsCPU) == 88, "RobMaskRawParamsCPU");
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
     uint32_t _pad0 = 0;
-    float alpha = 0.f, beta = 0.f;
+    // Per guide channel, as 1.4 evaluates alpha[c]*x + beta[c] per Bayer plane.
+    // These already carry the white-balance and guide-averaging factors, so the
+    // kernel must NOT re-apply the green halving it used to.
+    float alpha[3] = {0.f, 0.f, 0.f};
+    float beta[3] = {0.f, 0.f, 0.f};
     float min_texture_snr = 0.f;
     float _pad1 = 0.f;
 };
-static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
+static_assert(sizeof(RobHfLossParamsCPU) == 48, "RobHfLossParamsCPU");
 
 static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
                             id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
@@ -1681,9 +1685,11 @@ static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
     hp.h = (uint32_t)guide_h;
     hp.w = (uint32_t)guide_w;
     hp.nch = (uint32_t)nch;
-    hp.alpha = cfg.noise_alpha_robustness();
+    for (int c = 0; c < 3; ++c) {
+        hp.alpha[c] = cfg.noise_channel_alpha_robustness(c);
+        hp.beta[c] = cfg.noise_channel_beta_robustness(c);
+    }
     hp.min_texture_snr = cfg.hf_min_texture_snr;
-    hp.beta = cfg.noise_beta_robustness();
     enc = [cmd computeCommandEncoder];
     if (!enc) return false;
     [enc setBuffer:b_loss offset:0 atIndex:0];
@@ -2210,8 +2216,11 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.hf_h = (uint32_t)gh;
     mp.hf_w = (uint32_t)gw;
     // alpha/beta stay for the noise model (debug-gated accessors).
-    mp.alpha = cfg.noise_alpha_robustness();
-    mp.beta = cfg.noise_beta_robustness();
+    // Channel 0's own values, not the cross-channel mean: both consumers in
+    // rob_make_mask -- the geometry gradient's sample variance and the relative
+    // criterion's nsig -- read guide CHANNEL 0 (ref_means[... * p.nch]).
+    mp.alpha = cfg.noise_channel_alpha_robustness(0);
+    mp.beta = cfg.noise_channel_beta_robustness(0);
     mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
 

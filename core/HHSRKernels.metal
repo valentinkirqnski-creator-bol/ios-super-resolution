@@ -1793,7 +1793,10 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
 struct RobHfLossParams {
     uint h, w, nch;
     uint _pad0;
-    float alpha, beta;
+    // Per guide channel. Twin of RobHfLossParamsCPU, which static_asserts the
+    // size -- keep the field order identical.
+    float alpha[3];
+    float beta[3];
     float min_texture_snr;
     float _pad1;
 };
@@ -1839,8 +1842,11 @@ kernel void rob_hf_loss_adaptive(device float* loss [[buffer(0)]],
         var_sum += max(vars[o], 0.f);
         lp_var_sum += max(lp_vars[o], 0.f);
         float brightness = clamp(isfinite(means[o]) ? means[o] : 0.f, 0.f, 1.f);
-        float nv = max(p.alpha * brightness + p.beta, 0.f);
-        if (p.nch == 3u && ch == 1u) nv *= 0.5f;
+        // That channel's own alpha and beta. They already include the 1/nsites
+        // guide weight, so the green halving that used to sit here would now be
+        // applied twice.
+        uint ci = min(ch, 2u);
+        float nv = max(p.alpha[ci] * brightness + p.beta[ci], 0.f);
         noise_var += kLocalVarianceNoiseScale * nv;
         lp_noise_var += kLocalVarianceNoiseScale * kGaussian5x5NoiseEnergy * nv;
     }
