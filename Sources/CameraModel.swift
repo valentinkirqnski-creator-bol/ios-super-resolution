@@ -96,8 +96,16 @@ struct TuningParams: Equatable, Codable {
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
-    var snr_auto_tune: Bool = false
-    var alignment_tile_size: Int = 16
+    /// 1.4 derives the alignment tile size, k_detail, k_denoise, D_th and D_tr
+    /// from the reference frame's SNR (update_snr_config in params.py), and the
+    /// lerps here already match its endpoints exactly. Left off, none of that ran
+    /// and the tile size was whatever alignment_tile_size forced.
+    var snr_auto_tune: Bool = true
+    /// 0 = let the SNR selection choose, as 1.4's SNR_BASED does: 64 at or below
+    /// snr 14, 32 at or below 22, else 16. A non-zero value overrides it outright
+    /// (tune_config_snr: manual_tile_size > 0 ? manual : Ts), which is what forcing
+    /// 16 here did.
+    var alignment_tile_size: Int = 0
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.

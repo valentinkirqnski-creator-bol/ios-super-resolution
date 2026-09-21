@@ -1129,6 +1129,7 @@ struct CameraView: View {
 
                 Section(header: Text("Alignment")) {
                     Picker("Tile size", selection: $cam.tuningParams.alignment_tile_size) {
+                        Text("Auto").tag(0)
                         Text("8").tag(8)
                         Text("16").tag(16)
                         Text("32").tag(32)
@@ -1137,8 +1138,11 @@ struct CameraView: View {
                     .pickerStyle(.segmented)
                     Text("""
                          Block-matching tile size in raw pixels, for the finest \
-                         pyramid level; the coarsest is half that, floored at 8. \
-                         16 is the default.
+                         pyramid level; the coarsest is half that. Auto is the \
+                         default and is what Python 1.4 does: it picks from the \
+                         reference frame's SNR -- 64 at or below 14, 32 at or \
+                         below 22, otherwise 16 -- so a dim scene gets bigger \
+                         tiles on its own. A fixed value overrides that.
 
                          BIGGER tiles match more pixels at once, so the flow \
                          they return is more reliable on smooth or noisy \
@@ -1146,6 +1150,20 @@ struct CameraView: View {
                          misbehave -- at the cost of resolving less of the real \
                          local motion. Smaller tiles track fine motion better \
                          and are noisier about it.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Match Python 1.4 alignment",
+                           isOn: $cam.tuningParams.align_match_14)
+                    Text("""
+                         On by default. Closes the three places this port (a \
+                         460-main derivative) diverged from 1.4: the finest \
+                         search radius becomes 1 rather than 3, flow is carried \
+                         between pyramid levels by a plain bilinear resize \
+                         rather than 460's three-candidate re-match, and ICA \
+                         runs at every level rather than only the finest. It \
+                         also lets Auto choose a 64px tile, which 460 capped at \
+                         32. Off restores the 460 behaviour, so a regression is \
+                         one tap from being ruled out.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }
