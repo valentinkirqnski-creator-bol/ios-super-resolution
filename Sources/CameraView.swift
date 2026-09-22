@@ -1021,6 +1021,37 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("Noise Model")) {
+                    // The stored flag is debug_noise_model_disabled, so the
+                    // binding is inverted: the switch reads as the feature, ON by
+                    // default, rather than as a double negative.
+                    Toggle("Noise model", isOn: Binding(
+                        get: { !cam.tuningParams.debug_noise_model_disabled },
+                        set: { cam.tuningParams.debug_noise_model_disabled = !$0 }
+                    ))
+                    Text("""
+                         Uses the sensor's own noise profile from the DNG -- the \
+                         affine model variance = alpha x brightness + beta -- to \
+                         tell how much of the difference between two frames is \
+                         just noise rather than motion. That is the sigma in the \
+                         robustness test, so with it on a grainy frame is still \
+                         recognised as well aligned and gets merged.
+
+                         Off, robustness falls back to sigma measured as local \
+                         contrast and d as measured colour distance in the same \
+                         processed space. Nothing breaks, but rejection stops \
+                         being calibrated to the sensor and starts depending on \
+                         scene content.
+
+                         Also skips the Monte Carlo noise curves the model needs, \
+                         which is worth about 1.5 to 1.8 seconds a burst and the \
+                         wait they add at setup -- so this is a fast way to tell \
+                         whether a rejection problem comes from the noise model or \
+                         from somewhere else. Leave it on for normal use.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
