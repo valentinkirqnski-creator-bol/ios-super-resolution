@@ -1139,8 +1139,10 @@ struct RobMaskParamsCPU {
     // _pad1). Must match the merge's setting: the mask has to score the
     // correspondence the merge actually fetches.
     uint32_t flow_bilinear = 0;
+    uint32_t geom_reject_enabled = 0; // 1 = geometry-aware rejection
+    float    geom_reject_threshold = 0.06f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 96, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1904,6 +1906,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = cfg.flow_bilinear_sampling ? 1u : 0u;
+    mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
+    mp.geom_reject_threshold = cfg.motion_geom_reject_threshold;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;

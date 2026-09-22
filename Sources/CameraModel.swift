@@ -140,6 +140,14 @@ struct TuningParams: Equatable, Codable {
     /// correction budget is already spent when level 0 starts. Costs roughly
     /// +120MB at 12MP, because the reference gradient cache goes resident.
     var align_ica_per_level_fft: Bool = false
+    /// Geometry-aware rejection: drop pixels where the per-tile translation is a
+    /// poor model of local motion (flow-gradient x offset, weighted by |grad I|).
+    /// Cleans rotation tile-ghosts by rejecting the worst pixels (they fall back
+    /// to the reference); inert under one-direction motion. A hiding fix - it
+    /// trades some burst samples for artifact-free output. Off by default.
+    var motion_geom_reject_enabled: Bool = false
+    /// |grad I|.|E| threshold (intensity units). Lower rejects more. ~0.03-0.1.
+    var motion_geom_reject_threshold: Float = 0.06
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -227,6 +235,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case acc_rob_adaptive, acc_rob_max_frame_count, align_ica_per_level
         case align_ica_per_level_fft, use_neural_flow
+        case motion_geom_reject_enabled, motion_geom_reject_threshold
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case flow_bilinear_sampling
@@ -299,6 +308,8 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_ica_per_level = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level) ?? align_ica_per_level
         align_ica_per_level_fft = try c.decodeIfPresent(Bool.self, forKey: .align_ica_per_level_fft) ?? align_ica_per_level_fft
+        motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
+        motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
         use_neural_flow = try c.decodeIfPresent(Bool.self, forKey: .use_neural_flow) ?? use_neural_flow
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -1916,6 +1927,8 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_ica_per_level": NSNumber(value: tuningParams.align_ica_per_level),
             "align_ica_per_level_fft": NSNumber(value: tuningParams.align_ica_per_level_fft),
+            "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
+            "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
             "use_neural_flow": NSNumber(value: tuningParams.use_neural_flow),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),

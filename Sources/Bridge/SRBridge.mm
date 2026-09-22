@@ -409,6 +409,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_ica_per_level = tuning[@"align_ica_per_level"].boolValue;
     if (tuning[@"align_ica_per_level_fft"])
         cfg.align_ica_per_level_fft = tuning[@"align_ica_per_level_fft"].boolValue;
+    if (tuning[@"motion_geom_reject_enabled"])
+        cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
+    if (tuning[@"motion_geom_reject_threshold"])
+        cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"use_neural_flow"])
         cfg.use_neural_flow = tuning[@"use_neural_flow"].boolValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])

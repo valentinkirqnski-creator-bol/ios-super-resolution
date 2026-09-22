@@ -1089,6 +1089,42 @@ struct CameraView: View {
                             .font(.footnote)
                             .foregroundColor(.secondary)
                     }
+
+                    Toggle("Geometry Rejection (rotation)",
+                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
+                    Text("""
+                         Rejects pixels where one translation per tile is a poor \
+                         model of the motion inside it -- the flow gradient times \
+                         the distance from the tile centre, weighted by edge \
+                         strength. That is what leaves tile-edge ghosts when the \
+                         camera rotates during a burst; rejected pixels fall back \
+                         to the reference frame.
+
+                         Inert under straight-line motion, where the flow is \
+                         uniform and the gradient of it is zero. A hiding fix: it \
+                         trades burst samples for a clean result rather than \
+                         modelling the motion better. Nothing in the reference \
+                         implementations does this, so turn it off when comparing \
+                         a mask against a 1.4 run.
+                         """)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    if cam.tuningParams.motion_geom_reject_enabled {
+                        ispRow("Geometry Threshold",
+                               $cam.tuningParams.motion_geom_reject_threshold,
+                               0.005...0.12, "%.4f")
+                        Text("""
+                             A pixel is rejected where |gradient| x |within-tile \
+                             motion error| exceeds this, in intensity units. LOWER \
+                             rejects more, so a dim or noisy scene can lose most of \
+                             its burst to it; higher is more permissive. Roughly: \
+                             0.02 rejects about 15% of a frame, 0.03 about 10%, \
+                             0.06 about 3% and is close to inert. 0.06 by default.
+                             """)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("Fallback Denoiser")) {
