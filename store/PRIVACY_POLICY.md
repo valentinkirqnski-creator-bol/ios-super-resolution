@@ -58,9 +58,14 @@ effective date.
 
 ## Contact
 
-Questions about this policy: **apps@spacetree.ventures**
+Questions about this policy: **[your contact email]**
 
 <!--
-This file is the source of truth. The HOSTED copy is docs/index.html, served by
-GitHub Pages; edit both together or the published page will drift from this one.
+BEFORE PUBLISHING:
+1. Replace [your contact email] with a real address (e.g. apps@spacetree.ventures
+   — only if you're comfortable making it public; App Store requires a contact).
+2. Optionally replace "FuzeFrame ("the app", "we", "us")" with your legal
+   developer name if you have one.
+3. Host this page and use its public URL as the "Privacy Policy URL" in App Store
+   Connect. Easiest no-Mac option: GitHub Pages (see APP_STORE_CONNECT_CHECKLIST.md).
 -->

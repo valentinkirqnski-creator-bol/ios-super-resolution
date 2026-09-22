@@ -1287,19 +1287,24 @@ static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
     if (dngPath.length == 0) return nil;
     if (maxSide < 256) maxSide = 256;
 
-    std::vector<uint16_t> rgb;
-    int W = 0, H = 0;
-    float wb[3] = {1.f, 1.f, 1.f};
-    float m[9] = {1,0,0, 0,1,0, 0,0,1};
-    bool has_color = false;
-    if (!load_linear_dng_rgb16_color(std::string(dngPath.UTF8String), rgb, W, H, wb, m, has_color) ||
+    // The SAME render as the JPG export, downscaled.
+    //
+    // This is the preview Photos shows for a DNG-only asset (ImageIO cannot
+    // decode a LinearRaw IFD0 itself), so it is what a DNG shot looks like in the
+    // library. It used to be the older render_isp / python-1.4 path, which meant
+    // one shot previewed with one look while a JPG shot of the same scene showed
+    // another. Now the app thumbnail, the Photos preview and a JPG export of the
+    // same capture all come from finish_hdr and agree.
+    std::vector<uint8_t> full;
+    int W = 0, H = 0, orientation = 1;
+    if (!hhsr::finish_hdr_from_dng(std::string(dngPath.UTF8String), g_hdr,
+                                   full, W, H, orientation) ||
         W <= 0 || H <= 0)
         return nil;
-    // In Python-1.4 mode the render applies the stored WB gains itself (straight
-    // multiply, matching 1.4); the soft roll-off is an app-only step 1.4 lacks,
-    // so skip it here to keep the preview 1:1 with the 1.4 JPEG.
-    if (!g_jpeg_match_14)
-        ReapplyWhiteBalanceIfStored(rgb, W, H, wb);
+    // The preview carries no orientation of its own: the DNG's IFD0 Orientation
+    // governs how a reader presents it, and tagging the SubIFD as well would
+    // rotate it twice.
+    (void)orientation;
 
     const int long_side = std::max(W, H);
     const float scale = (long_side > (int)maxSide)
@@ -1307,68 +1312,49 @@ static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
     const int ow = std::max(1, (int)std::lround(W * scale));
     const int oh = std::max(1, (int)std::lround(H * scale));
 
-    // Analysed at full resolution even though the preview is downscaled, so the
-    // thumbnail and the exported JPEG get the same exposure and gain map and
-    // cannot disagree about how the shot looks.
-    // Before isp_analyse, so the automatic exposure and the local gain map are
-    // derived from the cleaned image rather than from the noise.
-    // Python-1.4 mode bypasses the ISP entirely (no analysis, no chroma
-    // denoise): 1.4 has no tone map or auto-exposure, so the preview must not
-    // run them either or it would not match the 1.4 JPEG.
-    if (g_isp.enabled && !g_jpeg_match_14)
-        hhsr::isp_denoise_chroma(rgb.data(), W, H, g_isp);
-    hhsr::IspState isp;
-    const bool use_isp = g_isp.enabled && !g_jpeg_match_14 &&
-                         hhsr::isp_analyse(rgb.data(), W, H, has_color ? m : nullptr, g_isp, isp);
+    std::vector<uint8_t> srgb;
+    if (ow == W && oh == H) {
+        srgb = std::move(full);
+    } else {
+        // Box average, not point sampling. The old code took the nearest source
+        // pixel, and at 48MP into a 4096 preview that discards three pixels in
+        // four -- which aliases fine detail into moire in exactly the small image
+        // this produces. Averaging the footprint costs one pass and no memory
+        // beyond the destination.
+        srgb.resize((size_t)ow * (size_t)oh * 3u);
+        hhsr::parallel_rows(oh, 0, [&](int y) {
+            const int y0 = (int)((double)y * H / (double)oh);
+            const int y1 = std::min(H, std::max(y0 + 1,
+                                    (int)((double)(y + 1) * H / (double)oh)));
+            for (int x = 0; x < ow; ++x) {
+                const int x0 = (int)((double)x * W / (double)ow);
+                const int x1 = std::min(W, std::max(x0 + 1,
+                                        (int)((double)(x + 1) * W / (double)ow)));
+                uint32_t acc[3] = {0u, 0u, 0u};
+                uint32_t n = 0u;
+                for (int sy = y0; sy < y1; ++sy) {
+                    const uint8_t* row = full.data() + (size_t)sy * (size_t)W * 3u;
+                    for (int sx = x0; sx < x1; ++sx) {
+                        acc[0] += row[(size_t)sx * 3u + 0];
+                        acc[1] += row[(size_t)sx * 3u + 1];
+                        acc[2] += row[(size_t)sx * 3u + 2];
+                        ++n;
+                    }
+                }
+                const size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 3u;
+                if (n) {
+                    srgb[o + 0] = (uint8_t)((acc[0] + n / 2u) / n);
+                    srgb[o + 1] = (uint8_t)((acc[1] + n / 2u) / n);
+                    srgb[o + 2] = (uint8_t)((acc[2] + n / 2u) / n);
+                }
+            }
+        });
+        // The full-resolution render is 145MB at 48MP and nothing below reads it.
+        full.clear();
+        full.shrink_to_fit();
+    }
 
-    std::vector<uint8_t> srgb((size_t)ow * (size_t)oh * 4);
-    auto sample_tonemap = [&](int sx, int sy, float& sr, float& sg, float& sb) {
-        sx = std::max(0, std::min(W - 1, sx));
-        sy = std::max(0, std::min(H - 1, sy));
-        size_t i = (size_t)sy * (size_t)W + (size_t)sx;
-        float r = rgb[i * 3 + 0] * (1.f / 65535.f);
-        float g = rgb[i * 3 + 1] * (1.f / 65535.f);
-        float b = rgb[i * 3 + 2] * (1.f / 65535.f);
-        if (g_jpeg_match_14) render_python14_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-        else if (use_isp)    hhsr::isp_render(isp, r, g, b, sx, sy, sr, sg, sb);
-        else                 render_linear_dng_pixel(r, g, b, wb, m, has_color, sr, sg, sb);
-    };
-
-    hhsr::parallel_rows(oh, 0, [&](int y) {
-        int sy = (scale < 1.f) ? (int)((y + 0.5f) / scale) : y;
-        for (int x = 0; x < ow; ++x) {
-            int sx = (scale < 1.f) ? (int)((x + 0.5f) / scale) : x;
-            float sr, sg, sb;
-            sample_tonemap(sx, sy, sr, sg, sb);
-            // See the 48MP path: gamut-map toward white + clamp before the cast.
-            // In 1.4 mode the pixel is already 1.4-clipped/gamma'd -- skip the
-            // gamut desaturation (1.4 has none) and just clamp.
-            if (g_jpeg_match_14) { sr = clampf(sr, 0.f, 1.f); sg = clampf(sg, 0.f, 1.f); sb = clampf(sb, 0.f, 1.f); }
-            else finalize_display_rgb(sr, sg, sb);
-            size_t o = ((size_t)y * (size_t)ow + (size_t)x) * 4;
-            srgb[o + 0] = (uint8_t)std::lround(sr * 255.f);
-            srgb[o + 1] = (uint8_t)std::lround(sg * 255.f);
-            srgb[o + 2] = (uint8_t)std::lround(sb * 255.f);
-            srgb[o + 3] = 255;
-        }
-    });
-    rgb.clear();
-    rgb.shrink_to_fit();
-
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    if (!cs) cs = CGColorSpaceCreateDeviceRGB();
-    if (!cs) return nil;
-    NSData* data = [NSData dataWithBytes:srgb.data() length:srgb.size()];
-    srgb.clear();
-    srgb.shrink_to_fit();
-
-    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-    CGImageRef cgOut = CGImageCreate(
-        ow, oh, 8, 32, ow * 4, cs,
-        kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast,
-        provider, NULL, false, kCGRenderingIntentDefault);
-    CGDataProviderRelease(provider);
-    CGColorSpaceRelease(cs);
+    CGImageRef cgOut = CGImageFromRGB8(std::move(srgb), ow, oh);
     if (!cgOut) return nil;
 
     NSMutableData* jpegData = [NSMutableData data];
@@ -1383,8 +1369,7 @@ static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
     CGImageDestinationAddImage(dest, cgOut, (__bridge CFDictionaryRef)opts);
     BOOL enc_ok = CGImageDestinationFinalize(dest);
     CFRelease(dest);
-    // The tone-mapped image the app shows in-app: identical render to the
-    // embedded Photos preview and the exported JPEG, so all three match.
+    // What the app shows in-app, and the same bytes Photos will show.
     UIImage* img = [UIImage imageWithCGImage:cgOut];
     CGImageRelease(cgOut);
     if (!enc_ok || jpegData.length < 4) return nil;

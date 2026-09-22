@@ -115,17 +115,7 @@ struct TuningParams: Equatable, Codable {
     ///   0 = none (Compression 1), 292.6MB on a 48MP merge
     ///   1 = lossless JPEG (Compression 7), 172.6MB, encodes on all cores
     ///   2 = Deflate (Compression 8), 256.8MB, single-threaded
-    /// 0 = uncompressed, 1 = lossless JPEG (Compression=7), 2 = Deflate.
-    ///
-    /// Defaults to 0, not 1, because Photos will not render our Compression=7
-    /// output: it shows the embedded JPEG preview, then replaces it with its own
-    /// render of the main image and caches the failure, so the asset goes black
-    /// and stays black. The file is not at fault — the stream is conformant to
-    /// T.81 Annex H (verified with an independent decoder), the multi-strip TIFF
-    /// layout is correct, and every strip decodes pixel-exact. Compression=1 and
-    /// Compression=8 both render, so the size win is available through Deflate if
-    /// it matters more than the ~8.6s that costs.
-    var dng_codec: Int = 0
+    var dng_codec: Int = 1
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
@@ -235,16 +225,11 @@ struct TuningParams: Equatable, Codable {
     // level. A percentile rather than a fixed offset, so one setting behaves the
     // same on a flat scene and a contrasty one; the subtraction is still capped
     // by display_black_max so a low-key shot cannot have its shadows crushed.
-    // 0.05 is the ceiling: finish_hdr.cpp clamps this to [0, 0.05] before use,
-    // and SRBridge clamps it again on the way in, so a larger number cannot do
-    // anything. The subtraction it produces is still capped by display_black_max
-    // (0.16), so even at the ceiling a low-key shot cannot have its shadows
-    // crushed past that.
-    var hdr_black_percentile: Float = 0.05
+    var hdr_black_percentile: Float = 0.002
     // Saturation boost weighted (1 - sat)^2 toward muted colours and faded out in
     // the brightest tones, so it lifts the picture without re-saturating a
     // highlight.
-    var hdr_vibrance: Float = 0.50
+    var hdr_vibrance: Float = 0.40
 
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -445,14 +430,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        // 13: JPG Look defaults -- vibrance 0.40 -> 0.50, black level
-        // 0.002 -> 0.05. Without the bump a stored preset keeps decoding the old
-        // values and the new defaults never appear on a device that has shot
-        // before, which is how the 48MP DNG stayed at 292MB (see the codec
-        // repair below). Bumping REPLACES the whole stored preset with
-        // appDefaults, so anything else tuned on this install goes back to
-        // default too -- that is what this mechanism does.
-        let defaultsVersion = 14
+        let defaultsVersion = 12
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -558,16 +536,10 @@ final class CameraModel: NSObject, ObservableObject {
     /// blur for read noise, which is the one thing the merge does remove.
     ///
     /// Gain is deliberately NOT raised to match, so this is a real exposure
-    /// reduction: at 1.5 the frames are about 0.6 of a stop darker (log2 1.5 =
-    /// 0.585). Lifting that back on the merged result costs less noise than paying
-    /// for it in per-frame sensor gain would, and it leaves that much highlight
-    /// headroom. 1.0 disables it.
-    ///
-    /// Was 2.0, a full stop. 1.5 keeps most of the motion-blur reduction -- blur
-    /// length scales with exposure, so it is still a third shorter -- while giving
-    /// back about half the light the 2x factor cost, which matters most in the dim
-    /// scenes where the shortened exposure hurt the per-frame SNR the hardest.
-    static let burstShutterSpeedUp: Double = 1.5
+    /// reduction: at 2.0 the frames are about one stop darker. Lifting that back on
+    /// the merged result costs less noise than paying for it in per-frame sensor
+    /// gain would, and it leaves a stop of highlight headroom. 1.0 disables it.
+    static let burstShutterSpeedUp: Double = 2.0
 
     static let minFrameCount = 2
     /// Long bursts trade memory for noise reduction. The banded merge holds every
@@ -1860,8 +1832,7 @@ final class CameraModel: NSObject, ObservableObject {
 
         // Gain stays exactly where metering put it. The shorter exposure is
         // therefore a real reduction in light, not a shutter/ISO trade: the frames
-        // -- and the merged DNG -- come out about 0.6 of a stop darker at a 1.5x
-        // factor (a full stop at 2.0).
+        // -- and the merged DNG -- come out about one stop darker at a 2x factor.
         // For a raw workflow that is the better half of the trade, because the
         // exposure is lifted later on merged data where the burst has already
         // averaged the noise down, instead of being paid for per frame in gain.

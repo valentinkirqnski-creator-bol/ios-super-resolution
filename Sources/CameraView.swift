@@ -8,6 +8,7 @@ struct CameraView: View {
     @State private var showViewer = false
     @State private var showPaywall = false
     @State private var showSettings = false
+    @State private var pinchBaseZoom: CGFloat?
     @State private var focusPoint: CGPoint?
     @State private var focusVisible = false
     /// True only while the user is actively dragging the shutter slider.
@@ -145,21 +146,39 @@ struct CameraView: View {
             VStack {
                 Spacer()
                 if cam.cameraSelection != .front {
-                    // The lens picker is now the only magnification control, so it
-                    // always shows. It used to be swapped out for a continuous zoom
-                    // slider whenever zoomUIVisible was set.
-                    backLensPicker
-                        .padding(.bottom, 14)
-                        .transition(.opacity)
+                    // One or the other, never both: the slider is the zoomed-in
+                    // form of the same control, as on the reference UI.
+                    if cam.zoomUIVisible {
+                        zoomSlider(width: width)
+                            .padding(.bottom, 14)
+                            .transition(.opacity)
+                    } else {
+                        backLensPicker
+                            .padding(.bottom, 14)
+                            .transition(.opacity)
+                    }
                 }
             }
             .frame(width: width, height: height)
         }
         .frame(width: width, height: height)
-        // Pinch to zoom removed along with the slider. Nothing is attached here
-        // now, so the preview's own UIKit tap recogniser for focus -- which the
-        // MagnificationGesture had to be a simultaneousGesture to avoid stealing
-        // from -- keeps receiving taps.
+        // simultaneousGesture, not gesture: the preview carries its own UIKit
+        // tap recogniser for focus, and claiming the gesture outright here
+        // would stop taps reaching it.
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { v in
+                    guard !cam.isBusy else { return }
+                    let base = pinchBaseZoom ?? cam.zoomFactor
+                    if pinchBaseZoom == nil { pinchBaseZoom = base }
+                    cam.setZoom(base * v)
+                    cam.showZoomUI()
+                }
+                .onEnded { _ in
+                    pinchBaseZoom = nil
+                    cam.showZoomUI()
+                }
+        )
         .background(Color.black)
     }
 
@@ -397,6 +416,121 @@ struct CameraView: View {
         .disabled(!enabled)
     }
 
+    // MARK: - Zoom slider (over viewfinder)
+
+    /// Magnifications that get a labelled, emphasised tick: each physical lens,
+    /// plus 2x, plus whatever the crop limit works out to.
+    private var zoomStops: [CGFloat] {
+        var out: [CGFloat] = []
+        if cam.availableCameras.contains(.ultraWide) { out.append(cam.ultraWideNativeZoom) }
+        out.append(1)
+        out.append(2)
+        if cam.availableCameras.contains(.telephoto) { out.append(cam.telephotoNativeZoom) }
+        out.append(cam.maxZoom)
+        var uniq: [CGFloat] = []
+        for z in out.sorted() where z >= cam.minZoom - 1e-4 && z <= cam.maxZoom + 1e-4 {
+            if uniq.last.map({ abs($0 - z) > 0.05 }) ?? true { uniq.append(z) }
+        }
+        return uniq
+    }
+
+    private static func zoomLabel(_ z: CGFloat) -> String {
+        z < 1 ? String(format: "%.1f×", Double(z))
+              : (abs(z - z.rounded()) < 0.05 ? "\(Int(z.rounded()))×"
+                                             : String(format: "%.1f×", Double(z)))
+    }
+
+    /// Log scale, so each doubling takes the same distance along the track.
+    /// A linear one would bunch every useful magnification into the first
+    /// tenth of the bar.
+    private func zoomPosition(_ z: CGFloat) -> CGFloat {
+        let lo = log(max(0.01, cam.minZoom))
+        let hi = log(max(cam.minZoom * 1.01, cam.maxZoom))
+        return min(1, max(0, (log(max(0.01, z)) - lo) / (hi - lo)))
+    }
+
+    private func zoomAt(_ t: CGFloat) -> CGFloat {
+        let lo = log(max(0.01, cam.minZoom))
+        let hi = log(max(cam.minZoom * 1.01, cam.maxZoom))
+        return exp(lo + min(1, max(0, t)) * (hi - lo))
+    }
+
+    private func zoomSlider(width: CGFloat) -> some View {
+        let trackW = max(120, width - 96)
+        let ticks = 29
+        let accent = Color(red: 0.62, green: 0.85, blue: 0.88)
+        let pos = zoomPosition(cam.zoomFactor)
+        return VStack(spacing: 8) {
+            // Live magnification in a small tab that rides above the thumb.
+            Text(Self.zoomLabel(cam.zoomFactor))
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundColor(.black)
+                .padding(.horizontal, 9).padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous).fill(accent)
+                )
+                .offset(x: (pos - 0.5) * trackW)
+
+            // Tapered "spectrum" ruler: vertical bars that ramp taller toward the
+            // long end (a widening wedge that reads as increasing magnification),
+            // with a lozenge fader cap riding the track. Deliberately unlike the
+            // round-bubble-over-dots pattern.
+            ZStack {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(Color.white.opacity(0.16))
+                    .frame(height: 3)
+                HStack(spacing: 0) {
+                    ForEach(0..<ticks, id: \.self) { i in
+                        let t = CGFloat(i) / CGFloat(ticks - 1)
+                        let onStop = zoomStops.contains {
+                            abs(zoomPosition($0) - t) < 0.5 / CGFloat(ticks - 1)
+                        }
+                        let ramp = 5 + 9 * t            // taller toward telephoto
+                        Rectangle()
+                            .fill(onStop ? accent.opacity(0.9) : Color.white.opacity(0.35))
+                            .frame(width: onStop ? 2.5 : 1.5,
+                                   height: onStop ? ramp + 5 : ramp)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(.horizontal, 8)
+
+                // Fader cap.
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(accent)
+                    .frame(width: 12, height: 28)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .stroke(Color.black.opacity(0.25), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                    .offset(x: (pos - 0.5) * trackW)
+            }
+            .frame(width: trackW, height: 34)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        guard !cam.isBusy else { return }
+                        cam.setZoom(zoomAt(v.location.x / trackW))
+                        cam.showZoomUI()
+                    }
+                    .onEnded { _ in cam.showZoomUI() }
+            )
+
+            ZStack(alignment: .topLeading) {
+                ForEach(zoomStops, id: \.self) { z in
+                    Text(Self.zoomLabel(z))
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundColor(.white.opacity(0.7))
+                        .position(x: zoomPosition(z) * trackW, y: 6)
+                }
+            }
+            .frame(width: trackW, height: 12)
+        }
+        .frame(width: width)
+    }
+
     // MARK: - Lens picker (over viewfinder)
 
     private var backLensPicker: some View {
@@ -415,8 +549,7 @@ struct CameraView: View {
                     // physical lenses this device actually has (ultra-wide 0.5×,
                     // wide 1×, and the telephoto's native factor), so a base
                     // iPhone shows 0.5/1 and a Pro shows 0.5/1/<tele>. The 2×
-                    // sensor-crop is no longer reachable at all: it only ever had
-                    // the zoom slider as an entry point, and that is gone.
+                    // sensor-crop remains reachable via the zoom slider.
                 }
                 if cam.availableCameras.contains(.telephoto) {
                     lensChip(title: cam.telephotoLensLabel,
@@ -974,82 +1107,20 @@ struct CameraView: View {
                     Text("""
                          Saturation boost weighted toward muted colours and faded \
                          out in the brightest tones, so a highlight is never \
-                         re-saturated. 0.50 by default.
+                         re-saturated. 0.40 by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     ispRow("Black level", $cam.tuningParams.hdr_black_percentile,
-                           0...0.05, "%.3f")
+                           0...0.02, "%.3f")
                     Text("""
                          Fraction of the picture taken all the way to black: \
-                         0.05 by default, so about one pixel in twenty. The scale \
-                         stops at 0.05 because the render clamps there, so a \
-                         larger number would do nothing. Measured per shot rather \
-                         than a fixed offset, and the subtraction is still capped, \
-                         so a low-key scene keeps its shadows.
+                         0.002 by default, so about one pixel in five hundred. \
+                         Measured per shot rather than a fixed offset, and still \
+                         capped, so a low-key scene keeps its shadows.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Text("Both apply to the JPG export and to the preview Photos "
                          + "shows for a DNG, from the next shot on.")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("DNG Output")) {
-                    Picker("Compression", selection: $cam.tuningParams.dng_codec) {
-                        Text("None").tag(0)
-                        Text("Lossless JPEG").tag(1)
-                        Text("Deflate").tag(2)
-                    }
-                    .pickerStyle(.segmented)
-                    Text("""
-                         How the DNG's full-resolution image is stored. All three \
-                         hold exactly the same pixels -- this is lossless either \
-                         way, so it changes file size and write speed, never image \
-                         quality.
-
-                         Lossless JPEG (Compression=7) is the smallest, about \
-                         173MB against 293MB at 48MP, written by this app's own \
-                         encoder. None (Compression=1) is the largest and the \
-                         fastest to write. Deflate (Compression=8) lands in \
-                         between but is markedly slower.
-
-                         Try None if Photos shows the DNG correctly at first and \
-                         then turns it black. That symptom is Photos replacing its \
-                         quick look at the embedded preview with its own render of \
-                         the full image, and caching the result -- so if None \
-                         renders and Lossless JPEG does not, the fault is in how \
-                         this app writes the compressed stream, not in the photo.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Noise Model")) {
-                    // The stored flag is debug_noise_model_disabled, so the
-                    // binding is inverted: the switch reads as the feature, ON by
-                    // default, rather than as a double negative.
-                    Toggle("Noise model", isOn: Binding(
-                        get: { !cam.tuningParams.debug_noise_model_disabled },
-                        set: { cam.tuningParams.debug_noise_model_disabled = !$0 }
-                    ))
-                    Text("""
-                         Uses the sensor's own noise profile from the DNG -- the \
-                         affine model variance = alpha x brightness + beta -- to \
-                         tell how much of the difference between two frames is \
-                         just noise rather than motion. That is the sigma in the \
-                         robustness test, so with it on a grainy frame is still \
-                         recognised as well aligned and gets merged.
-
-                         Off, robustness falls back to sigma measured as local \
-                         contrast and d as measured colour distance in the same \
-                         processed space. Nothing breaks, but rejection stops \
-                         being calibrated to the sensor and starts depending on \
-                         scene content.
-
-                         Also skips the Monte Carlo noise curves the model needs, \
-                         which is worth about 1.5 to 1.8 seconds a burst and the \
-                         wait they add at setup -- so this is a fast way to tell \
-                         whether a rejection problem comes from the noise model or \
-                         from somewhere else. Leave it on for normal use.
-                         """)
                         .font(.footnote).foregroundColor(.secondary)
                 }
             }

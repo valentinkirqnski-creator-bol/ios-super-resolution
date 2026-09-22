@@ -330,30 +330,9 @@ bool ljpeg_encode(const uint16_t* src, int W, int rows, int ncomp,
         }
     }
 
-    // ONE Huffman table, shared by every component.
-    //
-    // Three per-component tables compress marginally better -- R, G and B do
-    // have different difference statistics -- but they are the configuration no
-    // other DNG writer produces. Adobe's own encoder emits a single table, so
-    // that is the only arrangement every DNG decoder in the world is actually
-    // exercised against, and a decoder that simply uses table 0 for all
-    // components decodes components 2 and 3 as noise. That is what Photos did:
-    // it showed the embedded JPEG preview, then replaced it with its own render
-    // of the main image and cached the result, so the asset went black and
-    // stayed black. Compression=1 and Compression=8 were unaffected, which is
-    // what narrowed it to this stream.
-    //
-    // Our own stream was conformant -- an independent decoder written from T.81
-    // Annex H reconstructs it exactly, and LibRaw's ljpeg_start would accept it
-    // too -- so this is about what decoders tolerate, not about correctness.
-    uint64_t freq_all[kNSym];
-    for (int sy = 0; sy < kNSym; ++sy) {
-        uint64_t t = 0;
-        for (int c = 0; c < ncomp; ++c) t += freq[c][sy];
-        freq_all[sy] = t;
-    }
-    HuffEnc h0;
-    if (!build_huff_enc(freq_all, h0)) return false;
+    HuffEnc h[4];
+    for (int c = 0; c < ncomp; ++c)
+        if (!build_huff_enc(freq[c], h[c])) return false;
 
     // Size once for header + worst realistic scan, then write through a raw
     // cursor. Never shrunk: the caller reuses this buffer for the next strip,
@@ -378,16 +357,15 @@ bool ljpeg_encode(const uint16_t* src, int W, int rows, int ncomp,
         hw.put8(0);                                      // Tq unused when lossless
     }
 
-    // A single DHT with Th = 0. dcraw-derived decoders fill missing tables by
-    // copying the previous one (ljpeg_start: huff[c+1] = huff[c] when unset), so
-    // one table at index 0 is what they expect every component to use, and a
-    // decoder that reads Td gets 0 for every component from the SOS below.
-    {
+    // One table per component: R, G and B have visibly different difference
+    // statistics, and dcraw-derived decoders index tables by component number,
+    // so component c must use table c.
+    for (int c = 0; c < ncomp; ++c) {
         hw.put8(0xFF); hw.put8(0xC4);                    // DHT
-        hw.put16((uint32_t)(2 + 1 + 16 + h0.nvals));
-        hw.put8(0);                                      // Tc = 0 (lossless), Th = 0
-        for (int i = 1; i <= 16; ++i) hw.put8(h0.bits[i]);
-        for (int i = 0; i < h0.nvals; ++i) hw.put8(h0.vals[i]);
+        hw.put16((uint32_t)(2 + 1 + 16 + h[c].nvals));
+        hw.put8((uint8_t)c);                             // Tc = 0 (lossless), Th = c
+        for (int i = 1; i <= 16; ++i) hw.put8(h[c].bits[i]);
+        for (int i = 0; i < h[c].nvals; ++i) hw.put8(h[c].vals[i]);
     }
 
     hw.put8(0xFF); hw.put8(0xDA);                        // SOS
@@ -395,7 +373,7 @@ bool ljpeg_encode(const uint16_t* src, int W, int rows, int ncomp,
     hw.put8((uint8_t)ncomp);                             // Ns
     for (int c = 0; c < ncomp; ++c) {
         hw.put8((uint8_t)(c + 1));                       // Cs
-        hw.put8(0);                                      // Td = 0, Ta = 0
+        hw.put8((uint8_t)(c << 4));                      // Td = c, Ta = 0
     }
     hw.put8(1);                                          // Ss = predictor 1 (Ra)
     hw.put8(0);                                          // Se, unused
@@ -409,7 +387,7 @@ bool ljpeg_encode(const uint16_t* src, int W, int rows, int ncomp,
         bw.ensure();
         for (int c = 0; c < ncomp; ++c) {
             const int s = qp[i + c];
-            const HuffEnc& hc = h0;
+            const HuffEnc& hc = h[c];
             bw.put(hc.code[s], hc.size[s]);
             if (s > 0 && s < 16) {
                 // Positive values code as themselves; negative ones as
