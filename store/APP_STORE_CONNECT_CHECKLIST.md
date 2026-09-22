@@ -14,15 +14,32 @@ Bundle id: `com.handheldsr.camera` · App name: FuzeFrame.
 
 ## 1. Host the Privacy Policy (required)
 
-Easiest no-Mac option — GitHub Pages:
-1. [ ] In your GitHub repo: **Settings → Pages →** set Source to your default
-       branch, folder `/ (root)` or `/docs`.
-2. [ ] Put the privacy policy where Pages serves it. Two options:
-       - Rename `store/PRIVACY_POLICY.md` content into a `docs/privacy.md`, or
-       - Ask me to output it as `docs/index.html`.
-3. [ ] Fill in the contact email and remove the HTML comment block first.
-4. [ ] Note the public URL (e.g. `https://<user>.github.io/<repo>/privacy`).
-       You'll paste it into App Store Connect below.
+Hosted with GitHub Pages. The page itself is DONE:
+
+- [x] `docs/index.html` — the policy as a standalone page, no dependencies, no
+      external fonts or scripts, works in light and dark, readable on a phone.
+- [x] `docs/.nojekyll` — serve the HTML as-is, no Jekyll build.
+- [x] Contact address filled in (`apps@spacetree.ventures`) and the
+      pre-publication comment block removed from `store/PRIVACY_POLICY.md`.
+
+Remaining, in the browser:
+
+1. [ ] Get `docs/` onto the branch Pages will serve. **Use `main`**, not a
+       feature branch: App Store Connect keeps this URL indefinitely and a
+       feature branch may be deleted after merging, which would silently 404 the
+       policy and can block a future app update.
+2. [ ] **Settings → Pages →** Source: *Deploy from a branch*, Branch: `main`,
+       Folder: `/docs`. Save, then wait ~1 minute for the first build.
+3. [ ] The URL will be:
+       `https://valentinkirqnski-creator-bol.github.io/ios-super-resolution/`
+       Open it and confirm it renders before pasting it anywhere.
+4. [ ] Paste that URL into App Store Connect in BOTH places:
+       - **App Privacy → Privacy Policy URL**
+       - the version page's **Privacy Policy URL** field, if shown separately
+
+> If the repo is **private**, Pages requires a paid GitHub plan. On the free
+> plan either make the repo public or host the page elsewhere — any static host
+> works, since the page is a single self-contained file.
 
 ---
 
@@ -50,7 +67,11 @@ Then add GitHub repo secrets (**Settings → Secrets and variables → Actions**
 App Store Connect → **Apps → +  → New App**:
 - [ ] Platform: **iOS**
 - [ ] Name: **FuzeFrame** (must be unique across the store; have a backup name ready)
-- [ ] Primary language, Bundle ID: **com.handheldsr.camera**, SKU: any string (e.g. `fuzeframe01`)
+- [ ] Primary language, SKU: any string (e.g. `fuzeframe01`)
+- [ ] Bundle ID: **com.handheldsr.camera.39A6M852T7** — this is what the build
+      actually uses (`project.yml`, PRODUCT_BUNDLE_IDENTIFIER, reconciled in
+      2483da7). It must match the app record EXACTLY or altool fails with
+      "Cannot determine the Apple ID from Bundle ID".
 - [ ] User access: Full
 
 ---
@@ -77,7 +98,8 @@ App Store Connect → your app → **Monetization → In-App Purchases → +**:
 
 App Store Connect → your app → **App Privacy**:
 - [ ] Data collection: **"Data Not Collected"** (the app collects/sends nothing).
-- [ ] Privacy Policy URL: paste the URL from step 1.
+- [ ] Privacy Policy URL: the GitHub Pages URL from step 1
+      (`https://valentinkirqnski-creator-bol.github.io/ios-super-resolution/`).
 
 ---
 
