@@ -1885,23 +1885,10 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 const f32 gix = 0.5f * (ref_stats.means.at(y, xr, 0) - ref_stats.means.at(y, xl, 0)) / sc;
                 const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
                 const f32 gmag = std::sqrt(gix * gix + giy * giy);
-                // Guide brightness and per-raw-pixel noise sigma at this pixel,
-                // in the same 1/sc units as gmag. Hoisted out of the relative
-                // branch below, which used to compute them for itself, because the
-                // flat/textured split needs them too.
-                const f32 bri = guide_brightness(ref_stats.means, y, x);
-                const f32 nsig =
-                    std::sqrt(guide_noise_var(cfg, ref_stats.means.c, 0, bri)) / sc;
-                // Absolute criterion (|grad I| * |E|), ALWAYS applied -- but with
-                // the threshold chosen per pixel by regime. A pixel whose gradient
-                // does not clear the noise floor is flat: there |grad I| is photon
-                // noise and |E| is inflated by a textureless tile's arbitrary flow,
-                // so the product is not measuring visible misalignment and wants
-                // its own fixed threshold. See Config.
-                const bool flat = gmag <= cfg.motion_geom_noise_floor_mult * nsig;
-                const f32 geom_thr = flat ? cfg.motion_geom_reject_threshold_flat
-                                          : cfg.motion_geom_reject_threshold;
-                geom_reject = (gmag * Emag) > geom_thr;
+                // Absolute criterion (|grad I| * |E|): preserves the good-light
+                // behaviour exactly -- the bright-scene rejections you already get
+                // stay. ALWAYS applied.
+                geom_reject = (gmag * Emag) > cfg.motion_geom_reject_threshold;
                 // Relative (exposure-invariant) criterion ADDED on top: contrast
                 // (|grad g|/g, noise-floor-subtracted) * |E|. This is what catches
                 // the low-light misalignments the absolute form misses (its
@@ -1909,8 +1896,8 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                 // lost. bri = local guide mean; nsig = per-raw-pixel guide noise
                 // sigma (same 1/sc units as gmag). See types.h.
                 if (!geom_reject && cfg.motion_geom_relative) {
-                    // bri and nsig are the ones hoisted above; this branch's
-                    // arithmetic is otherwise unchanged.
+                    const f32 bri = guide_brightness(ref_stats.means, y, x);
+                    const f32 nsig = std::sqrt(guide_noise_var(cfg, ref_stats.means.c, 0, bri)) / sc;
                     const f32 gmag_dn = std::max(0.f, gmag - cfg.motion_geom_noise_floor_mult * nsig);
                     geom_reject = (gmag_dn / (bri + 1e-4f)) * Emag >
                                   cfg.motion_geom_reject_threshold_relative;

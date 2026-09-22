@@ -1656,9 +1656,6 @@ struct RobMaskParams {
     uint geom_relative;
     float geom_noise_floor_mult;
     float geom_reject_threshold_relative;
-    // Threshold for FLAT pixels; geom_reject_threshold is the textured one.
-    // Config::motion_geom_reject_threshold_flat.
-    float geom_reject_threshold_flat;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2149,18 +2146,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
         float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
         float gmag = sqrt(gix * gix + giy * giy);
-        // Hoisted out of the relative branch: the flat/textured split needs both.
-        float bri = rob_brightness(ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x));
-        float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f)) / sc;
-        // Absolute criterion, always applied, with the threshold chosen per pixel
-        // by regime -- flat means the gradient does not clear the noise floor.
-        // See compute_robustness.
-        bool flat = gmag <= p.geom_noise_floor_mult * nsig;
-        float geom_thr = flat ? p.geom_reject_threshold_flat : p.geom_reject_threshold;
-        geom_reject = (gmag * Emag) > geom_thr;
+        // Absolute criterion (preserves good-light behaviour), always applied.
+        geom_reject = (gmag * Emag) > p.geom_reject_threshold;
         // Relative (exposure-invariant) criterion added on top for low light:
         // contrast |grad g|/g, noise-floor-subtracted. Union. See compute_robustness.
         if (!geom_reject && p.geom_relative != 0u) {
+            float bri = rob_brightness(ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x));
+            float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f)) / sc;
             float gmag_dn = max(0.f, gmag - p.geom_noise_floor_mult * nsig);
             geom_reject = (gmag_dn / (bri + 1e-4f)) * Emag > p.geom_reject_threshold_relative;
         }

@@ -1123,49 +1123,6 @@ struct CameraView: View {
                          + "shows for a DNG, from the next shot on.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
-
-                Section(header: Text("Motion Rejection")) {
-                    Toggle("Geometric motion rejection",
-                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
-                    Text("""
-                         Zeroes robustness where one translation per tile is a poor \
-                         model of the motion inside it -- the flow gradient times \
-                         the distance from the tile centre, weighted by edge \
-                         strength. That is what leaves tile-edge ghosts when the \
-                         camera rotates during a burst. Rejected pixels fall back \
-                         to the reference frame, so it trades burst samples for a \
-                         clean result, and it is inert under straight-line motion.
-
-                         Off removes the test entirely and leaves plain Wronski \
-                         robustness, which is also what Handheld-Multi-Frame-\
-                         Super-Resolution-1.4 does -- it has no geometric \
-                         criterion.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.motion_geom_reject_enabled {
-                        ispRow("Reject threshold (textured)",
-                               $cam.tuningParams.motion_geom_reject_threshold,
-                               0.0005...0.06, "%.4f")
-                        Text("""
-                             Applies to TEXTURED pixels only -- those whose \
-                             gradient clears the noise floor. A pixel is rejected \
-                             where |gradient| x |within-tile motion error| exceeds \
-                             this. LOWER rejects more; higher is more permissive. \
-                             Roughly: 0.0045 is where the test shipped, 0.02 \
-                             rejects about 15% of a frame, 0.03 about 10%, 0.06 \
-                             about 3% and is close to inert.
-
-                             Flat pixels -- sky and other areas whose gradient is \
-                             photon noise rather than an edge -- are held at a \
-                             fixed 0.0045 and are NOT affected by this slider, so \
-                             moving it cannot change how sky is treated. Their \
-                             |gradient| is noise and their |motion error| is \
-                             inflated by a textureless tile's arbitrary flow, so \
-                             the same number would not mean the same thing there.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                    }
-                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
