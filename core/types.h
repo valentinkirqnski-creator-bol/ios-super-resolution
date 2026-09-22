@@ -672,11 +672,34 @@ struct Config {
     // in. The statistics stay guide-resolution either way; only where the
     // ratio is EVALUATED and where the local-min RUNS changes.
     //
-    // Restricted to grey_method == Decimate: that path's flow field is
-    // already the coarser of the two, so the guide-resolution mask on top
-    // compounds two sources of lost precision; FFT's flow already carries
-    // native raw-tile-grid granularity, so the case for this is weaker
-    // there.
+    // NO LONGER restricted to grey_method == Decimate. The old reasoning was
+    // that Decimate's flow is already the coarser of the two, so a
+    // guide-resolution mask on top compounds two losses of precision, while
+    // FFT's flow already carries native raw-tile-grid granularity -- so the
+    // case was judged weaker on FFT. That argument is about how much this
+    // BUYS, and it stands; it is not an argument that the FFT path is wrong
+    // without it. Since grey_method is not in TuningParams, the Decimate
+    // condition also made the flag unreachable from the app, which is a poor
+    // way to express "probably not worth it".
+    //
+    // What the IPOL companion paper actually prescribes (Implementing Handheld
+    // Burst Super-resolution, "Upscaling and warping the local statistics"):
+    // sigma_p and mu_p are computed on the guide, which is twice smaller, and
+    // must be upscaled AND warped into the reference's resolution and pose --
+    // the pose part so that d is a difference between mu's that correspond.
+    // It names Dodgson's 3x3 quadratic specifically, because nearest neighbour
+    // "may be prone to aliasing on detailed areas, thus ultimately resulting
+    // in more rejection than wanted", and it states the stage "yields
+    // robustness maps rn of size H x W, like the LR frames". So the reference
+    // output is FULL LR resolution, which is what this path produces.
+    //
+    // Note the references disagree here, so "the paper" and "1.4" are
+    // different targets: 1.4's warp_stats allocates at guide_imshape and its
+    // local_min is guide-in/guide-out, so 1.4 keeps the Dodgson WARP but drops
+    // the upscale (its docstring still claims raw_imshape, with a
+    // raw_imshape_y/raw_imshape_y typo betraying stale text). 460-main has no
+    // Dodgson at all and rounds the offset. The default Metal path here does
+    // neither: bilinear at guide resolution.
     //
     // Off by default: ~4x the pixel count for R and the new upscale
     // buffers, and merge.cpp's R-sampling coordinate math has to know
@@ -753,7 +776,7 @@ struct Config {
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
     // which one gates it.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
+        return robustness_raw_resolution_enabled;
     }
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
