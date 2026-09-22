@@ -1124,15 +1124,66 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
-                Section(header: Text("Robustness Resolution")) {
+                Section(header: Text("Robustness")) {
                     Toggle("Full-resolution robustness mask",
                            isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
                     Text("""
-                         The local statistics behind the mask are measured on the                          guide image, which is half size -- one RGB sample per 2x2                          Bayer quad -- so by default one robustness value covers a                          whole quad. On, they are upscaled and warped into the                          reference frame's resolution and pose with Dodgson's 3x3                          quadratic filter, and the mask is evaluated per raw pixel.
+                         The statistics behind the mask are measured on the guide \
+                         image, which is half size -- one RGB sample per 2x2 Bayer \
+                         quad -- so by default one robustness value covers a whole \
+                         quad. On, they are upscaled and warped into the reference \
+                         frame's resolution and pose with Dodgson's 3x3 quadratic \
+                         filter, and the mask is evaluated per raw pixel.
 
-                         This is what the IPOL paper describes: the statistics have                          to be interpolated anyway to put them in the same pose                          before differencing, nearest-neighbour resampling aliases                          on detailed areas and "ultimately result[s] in more                          rejection than wanted", and the stage should yield maps the                          size of the LR frames.
+                         This is what the IPOL paper prescribes: the statistics have \
+                         to be interpolated anyway to bring them into the same pose \
+                         before differencing, and nearest-neighbour resampling \
+                         aliases on detailed areas, ultimately causing more \
+                         rejection than wanted.
 
-                         Costs: four times the pixels for the mask plus the upscale                          buffers, and the GPU cannot keep the burst's frames                          resident while this runs, so the merge takes the slower                          path. Try it if the mask looks blocky or over-rejects on                          fine detail; it will not fix a mask that is dark                          everywhere, which is a threshold or motion-prior problem                          instead.
+                         Costs four times the pixels for the mask plus the upscale \
+                         buffers, and the GPU cannot keep the burst's frames \
+                         resident while it runs, so the merge takes the slower path. \
+                         Try it if the mask looks blocky or over-rejects on fine \
+                         detail. It will not fix a mask that is dark everywhere -- \
+                         that is a threshold or motion-prior problem.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    // Stored flag is debug_noise_model_disabled, so the binding is
+                    // inverted: the switch reads as the feature and is on by
+                    // default, instead of asking for a double negative.
+                    Toggle("Noise model", isOn: Binding(
+                        get: { !cam.tuningParams.debug_noise_model_disabled },
+                        set: { cam.tuningParams.debug_noise_model_disabled = !$0 }
+                    ))
+                    Text("""
+                         Uses the sensor's noise profile from the DNG -- variance = \
+                         alpha x brightness + beta -- to judge how much of the \
+                         difference between two frames is only noise. That is the \
+                         sigma in the robustness test, so with it on a grainy frame \
+                         is still recognised as well aligned and gets merged.
+
+                         Off, robustness falls back to sigma measured as local \
+                         contrast and d as measured colour distance in the same \
+                         processed space. Nothing breaks, but rejection stops being \
+                         calibrated to the sensor. It also skips the Monte Carlo \
+                         noise curves, worth about 1.5 to 1.8 seconds a burst plus \
+                         the wait they add at setup, so this is a quick way to tell \
+                         whether a rejection problem comes from the noise model. \
+                         Leave it on for normal use.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    Toggle("Save robustness mask",
+                           isOn: $cam.tuningParams.robustness_save_mask)
+                    Text("""
+                         Writes the mask beside the shot as a greyscale PGM: white \
+                         where a pixel was trusted by every comparison frame, black \
+                         where it was rejected. Averaged over the frames and \
+                         nearest-upsampled to the raw size, the same way the \
+                         reference implementation saves it, so the two can be \
+                         compared directly. Diagnostic; leave off for normal use.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }
