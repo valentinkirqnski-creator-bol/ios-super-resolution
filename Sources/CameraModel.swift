@@ -225,11 +225,16 @@ struct TuningParams: Equatable, Codable {
     // level. A percentile rather than a fixed offset, so one setting behaves the
     // same on a flat scene and a contrasty one; the subtraction is still capped
     // by display_black_max so a low-key shot cannot have its shadows crushed.
-    var hdr_black_percentile: Float = 0.002
+    // 0.05 is the ceiling: finish_hdr.cpp clamps this to [0, 0.05] before use,
+    // and SRBridge clamps it again on the way in, so a larger number cannot do
+    // anything. The subtraction it produces is still capped by display_black_max
+    // (0.16), so even at the ceiling a low-key shot cannot have its shadows
+    // crushed past that.
+    var hdr_black_percentile: Float = 0.05
     // Saturation boost weighted (1 - sat)^2 toward muted colours and faded out in
     // the brightest tones, so it lifts the picture without re-saturating a
     // highlight.
-    var hdr_vibrance: Float = 0.40
+    var hdr_vibrance: Float = 0.50
 
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -430,7 +435,14 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 12
+        // 13: JPG Look defaults -- vibrance 0.40 -> 0.50, black level
+        // 0.002 -> 0.05. Without the bump a stored preset keeps decoding the old
+        // values and the new defaults never appear on a device that has shot
+        // before, which is how the 48MP DNG stayed at 292MB (see the codec
+        // repair below). Bumping REPLACES the whole stored preset with
+        // appDefaults, so anything else tuned on this install goes back to
+        // default too -- that is what this mechanism does.
+        let defaultsVersion = 13
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

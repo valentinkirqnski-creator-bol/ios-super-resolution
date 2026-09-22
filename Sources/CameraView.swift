@@ -1107,16 +1107,18 @@ struct CameraView: View {
                     Text("""
                          Saturation boost weighted toward muted colours and faded \
                          out in the brightest tones, so a highlight is never \
-                         re-saturated. 0.40 by default.
+                         re-saturated. 0.50 by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     ispRow("Black level", $cam.tuningParams.hdr_black_percentile,
-                           0...0.02, "%.3f")
+                           0...0.05, "%.3f")
                     Text("""
                          Fraction of the picture taken all the way to black: \
-                         0.002 by default, so about one pixel in five hundred. \
-                         Measured per shot rather than a fixed offset, and still \
-                         capped, so a low-key scene keeps its shadows.
+                         0.05 by default, so about one pixel in twenty. The scale \
+                         stops at 0.05 because the render clamps there, so a \
+                         larger number would do nothing. Measured per shot rather \
+                         than a fixed offset, and the subtraction is still capped, \
+                         so a low-key scene keeps its shadows.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Text("Both apply to the JPG export and to the preview Photos "
