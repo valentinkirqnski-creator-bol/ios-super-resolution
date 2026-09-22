@@ -1600,10 +1600,8 @@ struct RobMaskParamsCPU {
     uint32_t geom_relative = 1;
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
-    // 1 = noise-floor-subtract |grad I| before the absolute geometry test.
-    uint32_t geom_flat_guard = 1;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 108, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2424,7 +2422,6 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
     mp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
     mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
-    mp.geom_flat_guard = cfg.motion_geom_flat_guard ? 1u : 0u;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;

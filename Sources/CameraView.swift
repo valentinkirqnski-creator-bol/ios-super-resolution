@@ -1123,63 +1123,6 @@ struct CameraView: View {
                          + "shows for a DNG, from the next shot on.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
-
-                Section(header: Text("Motion Rejection")) {
-                    Toggle("Geometric motion rejection",
-                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
-                    Text("""
-                         Zeroes robustness where one translation per tile is a poor \
-                         model of the motion inside it -- the flow gradient times \
-                         the distance from the tile centre, weighted by edge \
-                         strength. That is what leaves tile-edge ghosts when the \
-                         camera rotates during a burst. Rejected pixels fall back \
-                         to the reference frame, so it trades burst samples for a \
-                         clean result, and it is inert under straight-line motion.
-
-                         Off removes the test entirely and leaves plain Wronski \
-                         robustness, which is also what Handheld-Multi-Frame-\
-                         Super-Resolution-1.4 does -- it has no geometric \
-                         criterion. Turn it off when comparing a mask against a \
-                         1.4 reference run, or the difference will read as a merge \
-                         difference.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.motion_geom_reject_enabled {
-                        ispRow("Reject threshold",
-                               $cam.tuningParams.motion_geom_reject_threshold,
-                               0.0005...0.06, "%.4f")
-                        Text("""
-                             A tile is rejected where |gradient| x |within-tile \
-                             motion error| exceeds this. LOWER rejects more, so a \
-                             dim or noisy scene can lose most of its burst to it; \
-                             higher is more permissive. Roughly: 0.02 rejects about \
-                             15% of the frame, 0.03 about 10%, 0.06 about 3% and is \
-                             close to inert.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                        Toggle("Don't reject flat regions",
-                               isOn: $cam.tuningParams.motion_geom_flat_guard)
-                        Text("""
-                             Stops sky and other textureless areas going black in \
-                             the mask. Their gradient is photon noise rather than \
-                             an edge, but a flat tile also gives block matching \
-                             nothing to lock onto, so its flow is arbitrary and \
-                             the within-tile error is large -- noise times a \
-                             meaningless flow clears a low threshold. This \
-                             subtracts the noise floor from the gradient first, \
-                             which is negligible at a real edge. It can only \
-                             remove rejections, never add one.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                        ispRow("Noise floor x sigma",
-                               $cam.tuningParams.motion_geom_noise_floor_mult,
-                               0...8, "%.1f")
-                        Text("How many sigma of guide noise are subtracted. 0 "
-                             + "disables the subtraction; higher discounts noise "
-                             + "harder and rejects less. 1.5 by default.")
-                            .font(.footnote).foregroundColor(.secondary)
-                    }
-                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

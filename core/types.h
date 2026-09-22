@@ -931,24 +931,6 @@ struct Config {
     // brightness in a dark, noisy flat region does not amplify noise into false
     // rejections. motion_geom_reject_threshold_relative is unitless*px and needs
     // its own value (the absolute threshold's units no longer apply).
-    // Flat-region guard for the ABSOLUTE criterion. Without it, a textureless
-    // region rejects for a reason that has nothing to do with motion: |grad I|
-    // there is photon noise rather than an edge, but it is not zero, and |E| is
-    // LARGE precisely because a tile with no texture gives block matching
-    // nothing to lock onto, so its flow vector is arbitrary and disagrees with
-    // its neighbours. Noise times a meaningless flow gradient clears a low
-    // threshold and the sky goes black in the mask.
-    //
-    // The relative criterion below already subtracts k*sigma before forming its
-    // contrast ratio, for the same reason. This applies the same subtraction to
-    // the absolute one, reusing motion_geom_noise_floor_mult so k means one
-    // thing in both. At a real edge |grad I| >> sigma and the subtraction is a
-    // rounding error, so good-light rejections are preserved; in a flat region
-    // |grad I| ~ sigma and the term collapses to zero, so nothing rejects.
-    //
-    // This does NOT change motion_geom_reject_threshold, and cannot cause a
-    // rejection that would not have happened without it -- it only removes.
-    bool  motion_geom_flat_guard = true;
     bool  motion_geom_relative = true;
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;

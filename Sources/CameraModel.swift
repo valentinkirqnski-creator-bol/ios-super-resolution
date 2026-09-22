@@ -174,13 +174,6 @@ struct TuningParams: Equatable, Codable {
     /// contrast (∇g/g, noise-floor-subtracted) instead of absolute gradient, so
     /// misalignments are caught equally in bright and low light. Uses the
     /// relative threshold below.
-    /// Stop the geometric test rejecting flat regions (sky). |∇I| there is
-    /// photon noise, not an edge, while |E| is large because a textureless tile
-    /// gives block matching nothing to lock onto — so noise × arbitrary flow
-    /// clears a low threshold. Subtracts the same k·σ the relative criterion
-    /// already uses, which is negligible at a real edge. Can only remove
-    /// rejections, never add one.
-    var motion_geom_flat_guard: Bool = true
     var motion_geom_relative: Bool = false
     var motion_geom_noise_floor_mult: Float = 1.5
     var motion_geom_reject_threshold_relative: Float = 0.04
@@ -284,7 +277,6 @@ struct TuningParams: Equatable, Codable {
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
         case motion_geom_reject_enabled, motion_geom_reject_threshold
-        case motion_geom_flat_guard
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
@@ -375,7 +367,6 @@ struct TuningParams: Equatable, Codable {
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
         motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
         motion_geom_noise_floor_mult = try c.decodeIfPresent(Float.self, forKey: .motion_geom_noise_floor_mult) ?? motion_geom_noise_floor_mult
-        motion_geom_flat_guard = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_flat_guard) ?? motion_geom_flat_guard
         motion_geom_reject_threshold_relative = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold_relative) ?? motion_geom_reject_threshold_relative
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
@@ -2135,7 +2126,6 @@ final class CameraModel: NSObject, ObservableObject {
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
             "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
             "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
-            "motion_geom_flat_guard": NSNumber(value: tuningParams.motion_geom_flat_guard),
             "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
