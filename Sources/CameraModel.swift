@@ -115,7 +115,17 @@ struct TuningParams: Equatable, Codable {
     ///   0 = none (Compression 1), 292.6MB on a 48MP merge
     ///   1 = lossless JPEG (Compression 7), 172.6MB, encodes on all cores
     ///   2 = Deflate (Compression 8), 256.8MB, single-threaded
-    var dng_codec: Int = 1
+    /// 0 = uncompressed, 1 = lossless JPEG (Compression=7), 2 = Deflate.
+    ///
+    /// Defaults to 0, not 1, because Photos will not render our Compression=7
+    /// output: it shows the embedded JPEG preview, then replaces it with its own
+    /// render of the main image and caches the failure, so the asset goes black
+    /// and stays black. The file is not at fault — the stream is conformant to
+    /// T.81 Annex H (verified with an independent decoder), the multi-strip TIFF
+    /// layout is correct, and every strip decodes pixel-exact. Compression=1 and
+    /// Compression=8 both render, so the size win is available through Deflate if
+    /// it matters more than the ~8.6s that costs.
+    var dng_codec: Int = 0
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
@@ -442,7 +452,7 @@ final class CameraModel: NSObject, ObservableObject {
         // repair below). Bumping REPLACES the whole stored preset with
         // appDefaults, so anything else tuned on this install goes back to
         // default too -- that is what this mechanism does.
-        let defaultsVersion = 13
+        let defaultsVersion = 14
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
