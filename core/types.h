@@ -918,7 +918,27 @@ struct Config {
     // only ~0.02-0.03 on the sqrt guide, so this must be LOW to reject anything:
     // ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     // drops more burst samples.
+    // This is now the threshold for TEXTURED pixels only. Flat pixels get
+    // motion_geom_reject_threshold_flat below, so the two can be tuned apart.
     float motion_geom_reject_threshold = 0.02f;
+    // Threshold for FLAT pixels -- those whose reference gradient is not
+    // significantly above the noise floor (|grad I| <= k*sigma, k =
+    // motion_geom_noise_floor_mult). Split from the textured threshold because
+    // the same number does not mean the same thing in the two regimes:
+    //
+    //   - textured: |grad I| is a real edge, so |grad I|*|E| measures a visible
+    //     misalignment and the threshold is a statement about how much visible
+    //     ghosting to tolerate.
+    //   - flat: |grad I| is photon noise, and |E| is large because a tile with
+    //     no texture gives block matching nothing to lock onto, so its flow is
+    //     arbitrary and disagrees with its neighbours. The product measures
+    //     almost nothing about real motion.
+    //
+    // Held at 0.0045 -- the value the whole test shipped with -- so flat regions
+    // keep their existing behaviour no matter where the textured threshold is
+    // moved. Not exposed in Settings for that reason; the slider there moves the
+    // textured one.
+    float motion_geom_reject_threshold_flat = 0.0045f;
     // Exposure-invariant geometry rejection. The absolute form above weights the
     // within-tile error |E| by the ABSOLUTE reference gradient |grad I|, which
     // shrinks in dim scenes (sqrt guide: a scene at 1/4 the light has ~half the
