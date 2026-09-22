@@ -536,10 +536,16 @@ final class CameraModel: NSObject, ObservableObject {
     /// blur for read noise, which is the one thing the merge does remove.
     ///
     /// Gain is deliberately NOT raised to match, so this is a real exposure
-    /// reduction: at 2.0 the frames are about one stop darker. Lifting that back on
-    /// the merged result costs less noise than paying for it in per-frame sensor
-    /// gain would, and it leaves a stop of highlight headroom. 1.0 disables it.
-    static let burstShutterSpeedUp: Double = 2.0
+    /// reduction: at 1.5 the frames are about 0.6 of a stop darker (log2 1.5 =
+    /// 0.585). Lifting that back on the merged result costs less noise than paying
+    /// for it in per-frame sensor gain would, and it leaves that much highlight
+    /// headroom. 1.0 disables it.
+    ///
+    /// Was 2.0, a full stop. 1.5 keeps most of the motion-blur reduction -- blur
+    /// length scales with exposure, so it is still a third shorter -- while giving
+    /// back about half the light the 2x factor cost, which matters most in the dim
+    /// scenes where the shortened exposure hurt the per-frame SNR the hardest.
+    static let burstShutterSpeedUp: Double = 1.5
 
     static let minFrameCount = 2
     /// Long bursts trade memory for noise reduction. The banded merge holds every
@@ -1832,7 +1838,8 @@ final class CameraModel: NSObject, ObservableObject {
 
         // Gain stays exactly where metering put it. The shorter exposure is
         // therefore a real reduction in light, not a shutter/ISO trade: the frames
-        // -- and the merged DNG -- come out about one stop darker at a 2x factor.
+        // -- and the merged DNG -- come out about 0.6 of a stop darker at a 1.5x
+        // factor (a full stop at 2.0).
         // For a raw workflow that is the better half of the trade, because the
         // exposure is lifted later on merged data where the burst has already
         // averaged the noise down, instead of being paid for per frame in gain.
