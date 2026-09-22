@@ -317,8 +317,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     IFD ifd;
     ifd.longv(254, 0);                 // NewSubfileType
-    ifd.ascii(271, camera_make.empty() ? "HandheldSR" : camera_make);
-    ifd.ascii(272, camera_model.empty() ? "HandheldSR-x2" : camera_model);
+    // OUR identity, never the source camera's -- see UniqueCameraModel below.
+    ifd.ascii(271, "HandheldSR");
+    ifd.ascii(272, "HandheldSR-x2");
     ifd.longv(256, (uint32_t)W);
     ifd.longv(257, (uint32_t)H);
     ifd.shorts(258, {16, 16, 16});
@@ -343,7 +344,12 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     ifd.longv(278, (uint32_t)rows_per_strip);
     ifd.longs(279, std::vector<uint32_t>((size_t)nstrips, 0));  // StripByteCounts (patched)
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
-    ifd.ascii(305, "HandheldSR");      // Software
+    // Provenance lives here now. Software is descriptive and is never used to
+    // match a camera profile, so naming the source camera in it is safe.
+    ifd.ascii(305, camera_model.empty()
+                       ? std::string("HandheldSR")
+                       : ("HandheldSR (from " + camera_make +
+                          (camera_make.empty() ? "" : " ") + camera_model + ")"));
     ifd.ascii(306, now_tiff_datetime()); // DateTime (file write time)
     // ExifIFD reserved here so it grows IFD0 by exactly one entry regardless of
     // which fields exif carries; the offset is patched once the Exif sub-IFD's
@@ -365,7 +371,27 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
 
     ifd.bytes4(50706, 1, 4, 0, 0);     // DNGVersion 1.4.0.0
     ifd.bytes4(50707, 1, 3, 0, 0);     // DNGBackwardVersion 1.3.0.0
-    ifd.ascii(50708, camera_model.empty() ? "HandheldSR-x2" : camera_model);
+    // UniqueCameraModel is the tag a RAW pipeline keys its BUILT-IN camera
+    // profile on, with Make/Model matched alongside it. This used to copy the
+    // source camera's string, so the file announced itself as an iPhone raw
+    // while actually being 3-channel LinearRaw -- at up to twice the sensor's
+    // resolution, with BlackLevel 0 / WhiteLevel 65535 and none of the lens
+    // opcodes an iPhone raw carries.
+    //
+    // Apple's RawCamera then matched its internal profile for that iPhone and
+    // rendered through assumptions the data does not satisfy. Photos shows the
+    // embedded JPEG SubIFD first, because that is cheap and needs no profile,
+    // then replaces it with the full RAW render -- which failed, and Photos
+    // caches the result, so the asset stayed black on every later view and
+    // through app relaunches. Size was not the cause: it reproduced at 12MP,
+    // where the raw plane is smaller than an ordinary 48MP CFA frame.
+    //
+    // Announcing an identity we do not have also makes a reader PREFER its own
+    // profile over the ColorMatrix1 and AsShotNeutral in the file, which is
+    // backwards for a synthetic DNG: those tags are the only correct
+    // description of this data. A name no vendor profile matches forces the
+    // reader to use them.
+    ifd.ascii(50708, "HandheldSR-x2");
     ifd.shorts(50714, {0, 0, 0});
     ifd.longs(50717, {65535, 65535, 65535});
 
