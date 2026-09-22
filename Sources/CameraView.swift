@@ -992,6 +992,35 @@ struct CameraView: View {
                          + "shows for a DNG, from the next shot on.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("DNG Output")) {
+                    Picker("Compression", selection: $cam.tuningParams.dng_codec) {
+                        Text("None").tag(0)
+                        Text("Lossless JPEG").tag(1)
+                        Text("Deflate").tag(2)
+                    }
+                    .pickerStyle(.segmented)
+                    Text("""
+                         How the DNG's full-resolution image is stored. All three \
+                         hold exactly the same pixels -- this is lossless either \
+                         way, so it changes file size and write speed, never image \
+                         quality.
+
+                         Lossless JPEG (Compression=7) is the smallest, about \
+                         173MB against 293MB at 48MP, written by this app's own \
+                         encoder. None (Compression=1) is the largest and the \
+                         fastest to write. Deflate (Compression=8) lands in \
+                         between but is markedly slower.
+
+                         Try None if Photos shows the DNG correctly at first and \
+                         then turns it black. That symptom is Photos replacing its \
+                         quick look at the embedded preview with its own render of \
+                         the full image, and caching the result -- so if None \
+                         renders and Lossless JPEG does not, the fault is in how \
+                         this app writes the compressed stream, not in the photo.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
