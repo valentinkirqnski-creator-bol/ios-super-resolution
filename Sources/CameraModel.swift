@@ -511,6 +511,22 @@ final class CameraModel: NSObject, ObservableObject {
                     UserDefaults.standard.set(repaired, forKey: "TuningParams")
                 }
             }
+            // Same shape again, for the noise model. 6268eb5 put the switch in
+            // Settings, so an install can be holding debug_noise_model_disabled
+            // = true from a debugging session; the app default has always been
+            // false (model ON) but a stored preset beats a default, and with the
+            // model off noise_alpha/noise_beta return 0 and R is measured
+            // against nothing. The flag stays available in Settings -- this only
+            // re-asserts the default once.
+            let noiseModelRepairKey = "TuningParamsNoiseModelRepaired"
+            if !UserDefaults.standard.bool(forKey: noiseModelRepairKey) {
+                UserDefaults.standard.set(true, forKey: noiseModelRepairKey)
+                params.debug_noise_model_disabled =
+                    TuningParams.appDefaults.debug_noise_model_disabled
+                if let repaired = try? JSONEncoder().encode(params) {
+                    UserDefaults.standard.set(repaired, forKey: "TuningParams")
+                }
+            }
             return params
         }
         return TuningParams.appDefaults
