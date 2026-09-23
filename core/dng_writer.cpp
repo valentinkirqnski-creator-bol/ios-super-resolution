@@ -401,7 +401,23 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                 ifd.rational(50728, {r.first, r.second, g.first, g.second, b.first, b.second});
             }
         }
-        ifd.shortv(50831, 1);          // ColorimetricReference = scene referred
+        // No tag here. 50831 is AsShotICCProfile, not ColorimetricReference
+        // (that is 50879) -- this wrote ColorimetricReference's value into
+        // AsShotICCProfile's number, so every DNG we have written announced an
+        // embedded ICC profile that was one SHORT long.
+        //
+        // AsShotICCProfile, where a reader honours it, REPLACES ColorMatrix1
+        // and AsShotNeutral as the camera-space-to-PCS transform. Adobe-derived
+        // readers ignore the tag, which is why Lightroom and LibRaw render
+        // these files; a ColorSync-based pipeline does not, and two bytes
+        // cannot build a transform. That is exactly the split in the symptom:
+        // Photos shows the JPEG SubIFD first, because a preview needs no camera
+        // profile, then the RAW render lands and is black -- at any resolution
+        // and under any of the three codecs, which is what ruled out size,
+        // compression and UniqueCameraModel in turn.
+        //
+        // Nothing replaces it: ColorimetricReference defaults to 0 = scene
+        // referred, which is what this data is and what the line meant to say.
     }
 
     if (wb || jpeg_cam_to_srgb) {
