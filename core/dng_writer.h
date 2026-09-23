@@ -144,38 +144,16 @@ public:
     // adapt to local statistics).
     static constexpr int kLjpegStripRows = 64;
 
-    // Apple's DNG reader accepts Compression=7 only in TILES, never in strips.
-    // Measured, not inferred: two files whose compressed bytes are identical and
-    // differ only in whether the layout is described by StripOffsets/RowsPerStrip
-    // /StripByteCounts or by TileWidth/TileLength/TileOffsets/TileByteCounts --
-    // the tiled one renders in Photos, the striped one goes black. Every
-    // Compression=7 DNG in the wild that Apple reads (ProRAW, Adobe DNG
-    // Converter) is tiled; ours was the only striped one.
-    //
-    // A strip of full width IS a tile of full width, so this costs nothing in
-    // size or encode time. TIFF requires both tile dimensions to be multiples of
-    // 16 and every tile to be FULL -- padded, not short -- which is the only real
-    // difference: the bottom tile row carries padding rows, and a width that is
-    // not a multiple of 16 carries padding columns.
-    static int tile_width_for(int W) { return (W + 15) & ~15; }
-
 private:
     bool flush_ljpeg_strip(const uint16_t* rows16, int nrows);
-    // Encode one tile, padding to tile_w_ x kLjpegStripRows when the source
-    // block is short. Returns false on encode failure.
-    bool encode_tile(const uint16_t* rows16, int nrows,
-                     std::vector<uint8_t>& scratch, size_t& out_len,
-                     std::vector<uint16_t>& pad);
     bool encode_band_ljpeg(const uint16_t* rgb16, int nrows);
     bool join_async();
 
     FILE* f_ = nullptr;
     int W_ = 0, H_ = 0;
     long rows_written_ = 0;
-    uint32_t strip_byte_counts_pos_ = 0;   // file offset of the StripByteCounts/TileByteCounts array
-    uint32_t strip_offsets_pos_ = 0;       // file offset of the StripOffsets/TileOffsets array
-    int tile_w_ = 0;                       // padded tile width; 0 = strip layout
-    int tile_h_ = 0;                       // TileLength / rows per strip
+    uint32_t strip_byte_counts_pos_ = 0;   // file offset of the StripByteCounts array
+    uint32_t strip_offsets_pos_ = 0;       // file offset of the StripOffsets array
     uint32_t compressed_bytes_ = 0;
     int codec_ = Config::DNG_CODEC_NONE;
     int num_threads_ = 0;
@@ -189,7 +167,6 @@ private:
     std::vector<uint32_t> strip_offsets_;
     std::vector<uint32_t> strip_sizes_;
     std::vector<uint16_t> pending_;
-    std::vector<uint16_t> tile_pad_;       // scratch for a tile needing padding
     int pending_rows_ = 0;
     int encoded_rows_ = 0;                 // rows actually through the encoder
     uint32_t next_strip_offset_ = 0;

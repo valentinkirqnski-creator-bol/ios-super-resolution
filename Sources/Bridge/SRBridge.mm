@@ -1264,24 +1264,8 @@ static CGImageRef CGImageFromRGB8(std::vector<uint8_t>&& rgb, int W, int H) {
         CGImageRelease(cgOut);
         return NO;
     }
-    // 0.97, not 0.92. Both keep 4:4:4 -- ImageIO only drops to 4:2:0 below
-    // ~0.90 -- so the difference is purely the quantization tables, and on a
-    // super-resolution merge that is exactly where it shows: ringing around the
-    // high-contrast edges the merge exists to recover. Measured on three real
-    // 1024x1024 crops of a 48MP render, against the project's own q98
-    // reference, re-encoding each at 4:4:4:
-    //
-    //   0.92  220 KB/Mpx  10.5MB  43.6 dB   <- was here
-    //   0.95  309 KB/Mpx  14.7MB  45.0 dB
-    //   0.96  361 KB/Mpx  17.2MB  45.8 dB
-    //   0.97  441 KB/Mpx  21.0MB  46.8 dB   <- now here
-    //
-    // 0.97 costs about twice the bytes of 0.92 for +3.2 dB and lands next to
-    // the reference render's own size (26.9MB), which is the quality bar this
-    // export is supposed to meet. Above it the curve goes near-lossless and the
-    // file grows faster than the picture improves.
     NSMutableDictionary* opts =
-        [BuildJpegExportOpts(dngPath, 0.97f) mutableCopy];
+        [BuildJpegExportOpts(dngPath, 0.92f) mutableCopy];
     // Carry the DNG's orientation. Without it a portrait capture (tag 6 on this
     // sensor) exports as a landscape JPEG lying on its side -- the pixels are
     // right and only the tag is missing.

@@ -114,11 +114,7 @@ struct TuningParams: Equatable, Codable {
     /// size against write cost, never quality.
     ///   0 = none (Compression 1), 292.6MB on a 48MP merge
     ///   1 = lossless JPEG (Compression 7), 172.6MB, encodes on all cores
-    ///   2 = Deflate (Compression 8), 206.7MB with Predictor=2, single-threaded
-    /// 1 again. Compression=7 went black in Photos for as long as it was written
-    /// in STRIPS; it renders as TILES, which is what the writer emits now. Two
-    /// files with byte-identical compressed data and only the layout tags
-    /// differing settled it on device.
+    ///   2 = Deflate (Compression 8), 256.8MB, single-threaded
     var dng_codec: Int = 1
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
@@ -220,19 +216,7 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
-    /// Upscale and warp the local statistics to the reference's resolution and
-    /// pose with Dodgson's 3x3 quadratic, so R is evaluated at full raw
-    /// resolution (H x W) instead of the half-resolution guide grid -- what the
-    /// IPOL paper prescribes, and what rob_upscale_dogson / rob_make_mask_raw
-    /// implement.
-    ///
-    /// Default FALSE. It used to be true but was inert, because the gate also
-    /// required grey_method == Decimate and that is not reachable from here. Now
-    /// the gate is just this flag, so leaving it true would have silently turned
-    /// the path on -- 4x the pixels for R plus the upscale buffers, and
-    /// metal_frames_begin refuses residency while it is active, which drops the
-    /// burst to the slower non-resident path. Opt in from Settings.
-    var robustness_raw_resolution_enabled: Bool = false
+    var robustness_raw_resolution_enabled: Bool = true
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
@@ -473,56 +457,6 @@ final class CameraModel: NSObject, ObservableObject {
             if !UserDefaults.standard.bool(forKey: codecRepairKey) {
                 UserDefaults.standard.set(true, forKey: codecRepairKey)
                 params.dng_codec = TuningParams.appDefaults.dng_codec
-                if let repaired = try? JSONEncoder().encode(params) {
-                    UserDefaults.standard.set(repaired, forKey: "TuningParams")
-                }
-            }
-            // Same one-shot shape as the codec repair above, for the same
-            // reason. robustness_raw_resolution_enabled shipped as TRUE while
-            // it was inert -- the gate also demanded grey_method == Decimate,
-            // which nothing could set. Now the gate is the flag alone, so an
-            // existing preset holding that stale true would silently switch the
-            // path on: 4x the mask pixels, the upscale buffers, and no GPU
-            // frame residency for the whole burst. Force it to the app default
-            // once, rather than bumping defaultsVersion, which would throw away
-            // everything else this install has tuned.
-            // Second one-shot for the same field, under its own key: the first
-            // repair above has already run on every install that has shot since
-            // the codec picker shipped, so it can no longer carry a change.
-            // This one re-asserts the default across the codec's round trip --
-            // 1, then 0 while Compression=7 was believed unrenderable, then 1
-            // again once tiles fixed it -- so an install that stored either
-            // value ends up on the current default rather than keeping whichever
-            // one it happened to save.
-            let codecTiledRepairKey = "TuningParamsCodecTiledLjpegRepaired"
-            if !UserDefaults.standard.bool(forKey: codecTiledRepairKey) {
-                UserDefaults.standard.set(true, forKey: codecTiledRepairKey)
-                params.dng_codec = TuningParams.appDefaults.dng_codec
-                if let repaired = try? JSONEncoder().encode(params) {
-                    UserDefaults.standard.set(repaired, forKey: "TuningParams")
-                }
-            }
-            let rawResRepairKey = "TuningParamsRawResRepaired"
-            if !UserDefaults.standard.bool(forKey: rawResRepairKey) {
-                UserDefaults.standard.set(true, forKey: rawResRepairKey)
-                params.robustness_raw_resolution_enabled =
-                    TuningParams.appDefaults.robustness_raw_resolution_enabled
-                if let repaired = try? JSONEncoder().encode(params) {
-                    UserDefaults.standard.set(repaired, forKey: "TuningParams")
-                }
-            }
-            // Same shape again, for the noise model. 6268eb5 put the switch in
-            // Settings, so an install can be holding debug_noise_model_disabled
-            // = true from a debugging session; the app default has always been
-            // false (model ON) but a stored preset beats a default, and with the
-            // model off noise_alpha/noise_beta return 0 and R is measured
-            // against nothing. The flag stays available in Settings -- this only
-            // re-asserts the default once.
-            let noiseModelRepairKey = "TuningParamsNoiseModelRepaired"
-            if !UserDefaults.standard.bool(forKey: noiseModelRepairKey) {
-                UserDefaults.standard.set(true, forKey: noiseModelRepairKey)
-                params.debug_noise_model_disabled =
-                    TuningParams.appDefaults.debug_noise_model_disabled
                 if let repaired = try? JSONEncoder().encode(params) {
                     UserDefaults.standard.set(repaired, forKey: "TuningParams")
                 }

@@ -4605,11 +4605,10 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     p.cfa01 = cfg.cfa.p[0][1];
     p.cfa10 = cfg.cfa.p[1][0];
     p.cfa11 = cfg.cfa.p[1][1];
-    // Derived from R's ACTUAL dimensions once BOTH branches below have filled
-    // lr_* and rob_*, never from the config flag: the raw-res path silently
-    // falls back to guide resolution when the reference's Dodgson-upscaled
-    // stats are missing, so the flag can say "raw" while the mask is guide.
-    // See accumulate_comp in merge.cpp.
+    // Decided from R's ACTUAL dimensions below (after lr/rob dims are known),
+    // not from the config flag -- the raw-res path can silently fall back to
+    // guide resolution. See accumulate_comp in merge.cpp.
+    p.raw_res_robustness = 0u;
     p.flow_bilinear = false ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
@@ -4617,6 +4616,8 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)comp_raw.w;
         p.rob_h = (uint32_t)robustness.h;
         p.rob_w = (uint32_t)robustness.w;
+        p.raw_res_robustness =
+            (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_ny = (uint32_t)flow.ny;
         p.flow_nx = (uint32_t)flow.nx;
         p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
@@ -4636,20 +4637,6 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
         p.cov_w = hit->cov_w > 0 ? (uint32_t)hit->cov_w : 1u;
     }
-    // AFTER the branch, so the cached-frame case gets it too. It used to sit
-    // inside the host-supplied branch only, leaving the flag at its initial 0
-    // whenever the frame was already resident -- which is the common path, not
-    // the rare one: pipeline_paths.cpp calls merge_comp_band with an empty
-    // comp_raw for every frame metal_merge_has_frame already holds. The kernel
-    // then applied the guide-lattice conversion (lr - 0.5)/2 to a
-    // raw-resolution mask, so every pixel was graded by R at HALF its own
-    // coordinates -- the mask's top-left quadrant stretched over the whole
-    // frame. rob_h is the full raw height there, so nothing clamped and nothing
-    // looked wrong; misaligned frames merged unchecked wherever the donor pixel
-    // happened to be bright, including in completely static areas. Invisible
-    // with a guide mask, where 0 is the correct value anyway.
-    p.raw_res_robustness =
-        (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
