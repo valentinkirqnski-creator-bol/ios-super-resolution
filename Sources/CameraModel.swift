@@ -115,7 +115,10 @@ struct TuningParams: Equatable, Codable {
     ///   0 = none (Compression 1), 292.6MB on a 48MP merge
     ///   1 = lossless JPEG (Compression 7), 172.6MB, encodes on all cores
     ///   2 = Deflate (Compression 8), 256.8MB, single-threaded
-    var dng_codec: Int = 1
+    /// 0, not 1: Compression=7 output goes black in Photos. Measured, and
+    /// the file is not malformed -- see 10fae28. Restored here because
+    /// 52f3822 reverted that commit along with the rest of the tree.
+    var dng_codec: Int = 0
     /// Store the output DNG un-white-balanced (real AsShotNeutral) so editors
     /// keep the sensor's full highlight headroom (~1 stop of R/B).
     var dng_store_unwhitened: Bool = true
@@ -347,7 +350,11 @@ struct TuningParams: Equatable, Codable {
         if let legacy = try? decoder.container(keyedBy: LegacyKeys.self),
            let wasLossless = try legacy.decodeIfPresent(Bool.self, forKey: .dng_lossless_compress),
            wasLossless {
-            dng_codec = 1                      // lossless JPEG
+            // Deliberately NOT 1. The old boolean only ever meant "compress";
+            // honouring it onto Compression=7 would hand a legacy install the
+            // codec Photos will not render. Deflate is the compressed option
+            // that does render.
+            dng_codec = 2                      // Deflate
         }
         dng_codec = try c.decodeIfPresent(Int.self, forKey: .dng_codec) ?? dng_codec
         dng_store_unwhitened = try c.decodeIfPresent(Bool.self, forKey: .dng_store_unwhitened) ?? dng_store_unwhitened
@@ -482,6 +489,22 @@ final class CameraModel: NSObject, ObservableObject {
             // frame residency for the whole burst. Force it to the app default
             // once, rather than bumping defaultsVersion, which would throw away
             // everything else this install has tuned.
+            // Second one-shot for the same field, with its own key: the first
+            // repair above has already run on every install that has shot since
+            // the codec picker shipped, so it can no longer carry a change. This
+            // one exists because the default moved 1 -> 0 after Compression=7 was
+            // found to render black in Photos, and a stored preset holding 1
+            // would otherwise keep producing black DNGs forever.
+            let codecBlackRepairKey = "TuningParamsCodecPhotosBlackRepaired"
+            if !UserDefaults.standard.bool(forKey: codecBlackRepairKey) {
+                UserDefaults.standard.set(true, forKey: codecBlackRepairKey)
+                if params.dng_codec == 1 {
+                    params.dng_codec = TuningParams.appDefaults.dng_codec
+                    if let repaired = try? JSONEncoder().encode(params) {
+                        UserDefaults.standard.set(repaired, forKey: "TuningParams")
+                    }
+                }
+            }
             let rawResRepairKey = "TuningParamsRawResRepaired"
             if !UserDefaults.standard.bool(forKey: rawResRepairKey) {
                 UserDefaults.standard.set(true, forKey: rawResRepairKey)
