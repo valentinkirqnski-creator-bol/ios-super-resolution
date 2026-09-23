@@ -299,6 +299,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
                                              int codec,
                                              int nstrips,
                                              int rows_per_strip,
+                                             int tile_width,          // 0 = strip layout
                                              uint32_t& strip_offset_out,
                                              uint32_t& strip_offsets_pos_out,
                                              uint32_t& strip_byte_counts_pos_out,
@@ -330,7 +331,16 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
         ifd.shortv(262, 2);            // RGB
     else
         ifd.shortv(262, 34892);        // LinearRaw
-    ifd.longs(273, std::vector<uint32_t>((size_t)nstrips, 0));  // StripOffsets (patched)
+    // Compression=7 goes out as TILES: Apple's reader will not render a striped
+    // lossless-JPEG DNG (see DngStreamWriter::tile_width_for). The bytes are the
+    // same either way -- only the tags that describe the layout differ.
+    const uint16_t tag_offsets = tile_width > 0 ? 324 : 273;
+    const uint16_t tag_counts  = tile_width > 0 ? 325 : 279;
+    if (tile_width > 0) {
+        ifd.longv(322, (uint32_t)tile_width);        // TileWidth
+        ifd.longv(323, (uint32_t)rows_per_strip);    // TileLength
+    }
+    ifd.longs(tag_offsets, std::vector<uint32_t>((size_t)nstrips, 0));  // patched
     // SubIFDs, reserved empty. Adding this tag later would grow IFD0 by 12
     // bytes and push the image strip along with it, which is why embedding a
     // preview used to rebuild the entire file -- a 292MB read plus a 292MB
@@ -340,8 +350,9 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     if (orientation >= 1 && orientation <= 8)
         ifd.shortv(274, (uint16_t)orientation);
     ifd.shortv(277, 3);                // SamplesPerPixel
-    ifd.longv(278, (uint32_t)rows_per_strip);
-    ifd.longs(279, std::vector<uint32_t>((size_t)nstrips, 0));  // StripByteCounts (patched)
+    // RowsPerStrip is a strip-only tag and must not appear beside tile tags.
+    if (tile_width == 0) ifd.longv(278, (uint32_t)rows_per_strip);
+    ifd.longs(tag_counts, std::vector<uint32_t>((size_t)nstrips, 0));   // patched
     ifd.shortv(284, 1);                // PlanarConfiguration = chunky
     ifd.ascii(305, "HandheldSR");      // Software
     ifd.ascii(306, now_tiff_datetime()); // DateTime (file write time)
@@ -434,14 +445,14 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     strip_byte_counts_pos_out = 0;
     for (int i = 0; i < (int)ifd.e.size(); ++i) {
         auto& e = ifd.e[(size_t)i];
-        if (e.tag == 273) strip_off_entry = i;
+        if (e.tag == tag_offsets) strip_off_entry = i;
         if (!e.payload.empty()) {
             if (heap.size() & 1) heap.push_back(0);
             e.inlineval = heap_base + (uint32_t)heap.size();
-            // Multi-strip: the two LONG arrays live out of line, and their heap
-            // address is where close() writes the real offsets and sizes.
-            if (e.tag == 273) strip_offsets_pos_out = e.inlineval;
-            if (e.tag == 279) strip_byte_counts_pos_out = e.inlineval;
+            // Multi-strip/tile: the two LONG arrays live out of line, and their
+            // heap address is where close() writes the real offsets and sizes.
+            if (e.tag == tag_offsets) strip_offsets_pos_out = e.inlineval;
+            if (e.tag == tag_counts) strip_byte_counts_pos_out = e.inlineval;
             heap.insert(heap.end(), e.payload.begin(), e.payload.end());
         }
     }
@@ -473,7 +484,7 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
     }
     uint32_t strip_offset = heap_base + (uint32_t)heap.size();
     if (strip_offset & 1) strip_offset += 1;
-    // Single strip: the offset is the entry's own inline value, as before.
+    // Single strip/tile: the offset is the entry's own inline value, as before.
     if (nstrips == 1 && strip_off_entry >= 0)
         ifd.e[(size_t)strip_off_entry].inlineval = strip_offset;
 
@@ -486,8 +497,8 @@ static std::vector<uint8_t> build_dng_prefix(int W, int H,
         const auto& e = ifd.e[(size_t)i];
         // Single strip: both values sit inline in the IFD entry, so that is
         // where the patch goes.
-        if (nstrips == 1 && e.tag == 273) strip_offsets_pos_out = (uint32_t)out.size() + 8;
-        if (nstrips == 1 && e.tag == 279) strip_byte_counts_pos_out = (uint32_t)out.size() + 8;
+        if (nstrips == 1 && e.tag == tag_offsets) strip_offsets_pos_out = (uint32_t)out.size() + 8;
+        if (nstrips == 1 && e.tag == tag_counts) strip_byte_counts_pos_out = (uint32_t)out.size() + 8;
         w16(out, e.tag);
         w16(out, e.type);
         w32(out, e.count);
@@ -533,6 +544,8 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     num_threads_ = numThreads;
     strip_byte_counts_pos_ = 0;
     strip_offsets_pos_ = 0;
+    tile_w_ = 0;
+    tile_h_ = 0;
     deflate_ok_ = false;
     strip_offsets_.clear();
     strip_sizes_.clear();
@@ -544,14 +557,21 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     async_ok_ = true;
 
     const bool ljpeg = codec_ == Config::DNG_CODEC_LJPEG;
-    const int rows_per_strip = ljpeg ? std::min(kLjpegStripRows, H) : H;
+    // TileLength must be a multiple of 16 and kLjpegStripRows is 64, so a short
+    // image keeps a single tile rather than an illegal one: round the clamp UP.
+    const int rows_per_strip = ljpeg ? (H >= kLjpegStripRows ? kLjpegStripRows
+                                                             : ((H + 15) & ~15))
+                                     : H;
     const int nstrips = ljpeg ? ((H + rows_per_strip - 1) / rows_per_strip) : 1;
+    tile_w_ = ljpeg ? tile_width_for(W) : 0;
+    tile_h_ = rows_per_strip;
 
     uint32_t strip_offset = 0;
     std::vector<uint8_t> prefix = build_dng_prefix(W, H, camera_make, camera_model, orientation,
                                                    colorMatrixXYZtoCam, wbGainsGreenNorm,
                                                    bakedSrgb, camToSrgb, pixelsPrewhitened,
                                                    codec_, nstrips, rows_per_strip,
+                                                   tile_w_,
                                                    strip_offset, strip_offsets_pos_,
                                                    strip_byte_counts_pos_,
                                                    exif);
@@ -559,6 +579,7 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
         strip_offsets_.reserve((size_t)nstrips);
         strip_sizes_.reserve((size_t)nstrips);
         pending_.resize((size_t)rows_per_strip * (size_t)W * 3u);
+        tile_pad_.clear();
     }
     next_strip_offset_ = strip_offset;
     f_ = fopen(path.c_str(), "wb+");
@@ -602,11 +623,39 @@ bool DngStreamWriter::open(const std::string& path, int W, int H, const std::str
     return true;
 }
 
-// Encode one complete strip and append it. Callers hand over whole strips only
-// (the last one may be short); the offset/size pair is recorded for close().
+// Encode one tile. TIFF requires every tile to be FULL, so a block that is
+// short (the bottom tile row) or narrow (W not a multiple of 16) is copied into
+// a padded buffer first; the padding replicates the edge sample, which costs
+// almost nothing to encode because the predictor then sees a run of zero
+// differences. A block that is already exactly tile-sized encodes in place, so
+// the common case keeps the zero-copy path it had as a strip.
+bool DngStreamWriter::encode_tile(const uint16_t* rows16, int nrows,
+                                  std::vector<uint8_t>& scratch, size_t& out_len,
+                                  std::vector<uint16_t>& pad) {
+    const int TL = tile_h_, TW = tile_w_;
+    if (TW == W_ && nrows == TL)
+        return ljpeg_encode(rows16, TW, TL, 3, scratch, out_len);
+
+    const size_t trow = (size_t)TW * 3u;
+    pad.assign((size_t)TL * trow, 0);
+    for (int y = 0; y < TL; ++y) {
+        const uint16_t* src = rows16 + (size_t)std::min(y, nrows - 1) * (size_t)W_ * 3u;
+        uint16_t* dst = pad.data() + (size_t)y * trow;
+        std::memcpy(dst, src, (size_t)W_ * 3u * sizeof(uint16_t));
+        for (int x = W_; x < TW; ++x)
+            std::memcpy(dst + (size_t)x * 3u, dst + (size_t)(W_ - 1) * 3u,
+                        3 * sizeof(uint16_t));
+    }
+    return ljpeg_encode(pad.data(), TW, TL, 3, scratch, out_len);
+}
+
+// Encode one tile and append it. Callers hand over whole tiles only (the last
+// may be short); the offset/size pair is recorded for close().
 bool DngStreamWriter::flush_ljpeg_strip(const uint16_t* rows16, int nrows) {
     std::vector<uint8_t> enc;
-    if (!ljpeg_encode(rows16, W_, nrows, 3, enc)) return false;
+    size_t n = 0;
+    if (!encode_tile(rows16, nrows, enc, n, tile_pad_)) return false;
+    enc.resize(n);
     if (fwrite(enc.data(), 1, enc.size(), f_) != enc.size()) return false;
     strip_offsets_.push_back(next_strip_offset_);
     strip_sizes_.push_back((uint32_t)enc.size());
@@ -632,7 +681,7 @@ bool DngStreamWriter::join_async() {
 bool DngStreamWriter::encode_band_ljpeg(const uint16_t* rgb16, int nrows) {
     {
         const size_t row_samples = (size_t)W_ * 3u;
-        const int strip_rows = std::min(kLjpegStripRows, H_);
+        const int strip_rows = tile_h_;
         int consumed = 0;
 
         // Top up a strip a previous band ended part-way through. Merge bands
@@ -663,11 +712,15 @@ bool DngStreamWriter::encode_band_ljpeg(const uint16_t* rgb16, int nrows) {
             if (enc_scratch_.size() < (size_t)nfull) enc_scratch_.resize((size_t)nfull);
             std::vector<size_t> len((size_t)nfull, 0);
             std::vector<char> ok((size_t)nfull, 0);
+            // One pad buffer per slot as well: encode_tile only touches it when
+            // W is not a multiple of 16, but it must not be shared across
+            // threads when it is.
+            std::vector<std::vector<uint16_t>> pads((size_t)nfull);
             const uint16_t* base = rgb16 + (size_t)consumed * row_samples;
             parallel_rows(nfull, num_threads_, [&](int k) {
-                ok[(size_t)k] = ljpeg_encode(base + (size_t)k * (size_t)strip_rows * row_samples,
-                                             W_, strip_rows, 3,
-                                             enc_scratch_[(size_t)k], len[(size_t)k]) ? 1 : 0;
+                ok[(size_t)k] = encode_tile(base + (size_t)k * (size_t)strip_rows * row_samples,
+                                            strip_rows, enc_scratch_[(size_t)k],
+                                            len[(size_t)k], pads[(size_t)k]) ? 1 : 0;
             });
             for (int k = 0; k < nfull; ++k) {
                 if (!ok[(size_t)k]) return false;
@@ -773,9 +826,9 @@ bool DngStreamWriter::close() {
             ok = flush_ljpeg_strip(pending_.data(), pending_rows_);
             pending_rows_ = 0;
         }
-        const int strip_rows = std::min(kLjpegStripRows, H_);
+        const int strip_rows = tile_h_;
         const size_t want = (size_t)((H_ + strip_rows - 1) / strip_rows);
-        if (ok && strip_offsets_.size() != want) ok = false;   // strip count must match RowsPerStrip
+        if (ok && strip_offsets_.size() != want) ok = false;   // tile count must match TileLength
 
         // Patch both LONG arrays now that every strip's place is known.
         if (ok && strip_offsets_pos_ > 0 && strip_byte_counts_pos_ > 0) {
@@ -1120,6 +1173,7 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
 
     uint32_t width = 0, height = 0, strip_off = 0, strip_bc = 0, rows_per_strip = 0;
     uint16_t compression = 1, predictor = 1, spp = 0;
+    uint32_t tile_w = 0, tile_h = 0;
     std::vector<uint32_t> strip_offs, strip_bcs;
     // Pull a LONG/SHORT array out of an entry, inline or from the heap. A
     // lossless-JPEG DNG carries one entry per strip, so StripOffsets and
@@ -1156,13 +1210,26 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
             case 277: spp = (uint16_t)as_long(spp); break;
             case 278: rows_per_strip = as_long(rows_per_strip); break;
             case 279: read_array(type, count, val, strip_bcs); break;
+            // Tiled Compression=7 -- what the writer now emits, because Apple
+            // will not render a striped lossless-JPEG DNG. Tile tags simply
+            // replace the strip ones; with TileWidth >= width there is one tile
+            // across, so the layout is otherwise identical.
+            case 322: tile_w = as_long(tile_w); break;
+            case 323: tile_h = as_long(tile_h); break;
+            case 324: read_array(type, count, val, strip_offs); break;
+            case 325: read_array(type, count, val, strip_bcs); break;
             case 317: predictor = (uint16_t)as_long(predictor); break;
             default: break;
         }
     }
     if (width == 0 || height == 0 || spp != 3) return false;
     if (strip_offs.empty()) return false;
+    // Tiles win when present: TileLength is the band height and TileWidth the
+    // padded width each stream actually carries.
+    if (tile_h > 0) rows_per_strip = tile_h;
     if (rows_per_strip == 0) rows_per_strip = height;
+    const uint32_t coded_w = (tile_w > 0) ? tile_w : width;
+    if (coded_w < width) return false;
     if (compression != 8 && compression != 1 && compression != 7) return false;
     strip_off = strip_offs[0];
     strip_bc = strip_bcs.empty() ? 0 : strip_bcs[0];
@@ -1172,19 +1239,40 @@ bool load_linear_dng_rgb16(const std::string& path, std::vector<uint16_t>& rgb, 
     rgb.resize((size_t)width * height * 3);
 
     if (compression == 7) {
-        // Lossless JPEG: every strip is an independent stream, so they decode
-        // on all cores the same way they were written.
+        // Lossless JPEG: every strip/tile is an independent stream, so they
+        // decode on all cores the same way they were written.
         const uint32_t nstrips = (height + rows_per_strip - 1) / rows_per_strip;
         if (strip_offs.size() != nstrips || strip_bcs.size() != nstrips) { rgb.clear(); return false; }
+        // A tile is always full, so the last band and any width padding decode
+        // into scratch and only the live part is kept. Strips are short instead,
+        // and land straight in the output.
+        const bool padded = (tile_h > 0);
         std::vector<char> ok(nstrips, 0);
         parallel_rows((int)nstrips, 0, [&](int k) {
             const uint32_t y0 = (uint32_t)k * rows_per_strip;
             const uint32_t rows = std::min(rows_per_strip, height - y0);
             const size_t off = strip_offs[(size_t)k], bc = strip_bcs[(size_t)k];
             if (off + bc > file.size() || bc == 0) return;
-            ok[(size_t)k] = ljpeg_decode(file.data() + off, bc,
-                                         rgb.data() + (size_t)y0 * width * 3,
-                                         (int)width, (int)rows, 3) ? 1 : 0;
+            if (!padded) {
+                ok[(size_t)k] = ljpeg_decode(file.data() + off, bc,
+                                             rgb.data() + (size_t)y0 * width * 3,
+                                             (int)width, (int)rows, 3) ? 1 : 0;
+                return;
+            }
+            if (coded_w == width && rows == rows_per_strip) {
+                ok[(size_t)k] = ljpeg_decode(file.data() + off, bc,
+                                             rgb.data() + (size_t)y0 * width * 3,
+                                             (int)width, (int)rows, 3) ? 1 : 0;
+                return;
+            }
+            std::vector<uint16_t> tmp((size_t)coded_w * rows_per_strip * 3u);
+            if (!ljpeg_decode(file.data() + off, bc, tmp.data(),
+                              (int)coded_w, (int)rows_per_strip, 3)) return;
+            for (uint32_t y = 0; y < rows; ++y)
+                std::memcpy(rgb.data() + (size_t)(y0 + y) * width * 3,
+                            tmp.data() + (size_t)y * coded_w * 3,
+                            (size_t)width * 3u * sizeof(uint16_t));
+            ok[(size_t)k] = 1;
         });
         for (uint32_t k = 0; k < nstrips; ++k)
             if (!ok[k]) { rgb.clear(); return false; }
