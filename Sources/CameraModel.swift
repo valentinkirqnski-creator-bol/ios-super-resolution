@@ -535,11 +535,19 @@ final class CameraModel: NSObject, ObservableObject {
     /// other, because every frame carries it. Shortening the exposure trades that
     /// blur for read noise, which is the one thing the merge does remove.
     ///
-    /// Gain is deliberately NOT raised to match, so this is a real exposure
-    /// reduction: at 2.0 the frames are about one stop darker. Lifting that back on
-    /// the merged result costs less noise than paying for it in per-frame sensor
-    /// gain would, and it leaves a stop of highlight headroom. 1.0 disables it.
-    static let burstShutterSpeedUp: Double = 2.0
+    /// Gain is deliberately NOT raised to match, so any value above 1.0 is a real
+    /// exposure reduction: at 2.0 the frames came out about one stop darker, to be
+    /// lifted later on merged data where the burst has already averaged the noise
+    /// down. That is a real trade, not a free win -- it also means every frame, the
+    /// merged DNG and everything derived from it sits a stop lower against the
+    /// black level and the noise floor.
+    ///
+    /// 1.0 = shoot exactly what metering chose, which is what this is set to now.
+    /// The guard below is `speedUp > 1.0`, so at 1.0 the custom-exposure branch is
+    /// skipped entirely and the device simply locks the metered duration and ISO --
+    /// no clamping against minExposureDuration, no divergence between what the
+    /// meter reported and what was shot.
+    static let burstShutterSpeedUp: Double = 1.0
 
     static let minFrameCount = 2
     /// Long bursts trade memory for noise reduction. The banded merge holds every
