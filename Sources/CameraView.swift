@@ -1102,6 +1102,37 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("Robustness (Motion Rejection)")) {
+                    ispRow("Threshold (r_t)", $cam.tuningParams.r_t, 0...1)
+                    Text("""
+                         Subtracted from every robustness score, so it is the \r
+                         floor a pixel has to clear to contribute at all. Higher \r
+                         rejects more of the burst and leans on the reference \r
+                         frame; lower merges more frames and more of their \r
+                         misalignments. 0.20 by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    ispRow("Penalty (r_s1)", $cam.tuningParams.r_s1, 0...8)
+                    Text("""
+                         The prior a tile gets once its motion looks unreliable: \r
+                         the smaller of the two scale factors the score is \r
+                         multiplied by. Lower is stricter on moving tiles. 2.0 by \r
+                         default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
+                    Text("""
+                         Saves the mask beside the photo as its own image in \r
+                         Photos: white is a pixel the merge trusted, black is one \r
+                         it rejected. Diagnostic -- it is what the merge actually \r
+                         used, so a shot that looks smeared can be read directly \r
+                         off it.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("JPG Look")) {
                     ispRow("Vibrance", $cam.tuningParams.hdr_vibrance, 0...1)
                     Text("""
