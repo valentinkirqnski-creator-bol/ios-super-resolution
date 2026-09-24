@@ -1211,6 +1211,21 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("Alignment")) {
+                    Toggle("Content-Aware Flow Upsampling",
+                           isOn: $cam.tuningParams.flow_upsample_candidates)
+                    Text("""
+                         How a coarse pyramid level seeds the next finer one. On,                          each fine tile tries three coarse candidates -- the                          nearest tile plus the next-nearest in each dimension --                          and keeps whichever gives the smallest L1 residual                          against the moving frame. No vector is invented: every                          candidate was measured at the coarse level and is                          re-checked against the image.
+
+                         Off falls back to a plain bilinear resize of the flow                          field, which consults no image content.
+
+                         The difference is at motion boundaries. Bilinear                          averages across them and returns a vector wrong for both                          sides -- the classic smear. Candidates keep the boundary,                          because the answer is always a vector one side really                          measured. This is only the seed: block matching then                          searches a few pixels around it, so a seed wrong by more                          than that radius is never recovered.
+
+                         Match 1.4 Alignment forces this off.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("JPG Look")) {
                     ispRow("Vibrance", $cam.tuningParams.hdr_vibrance, 0...1)
                     Text("""

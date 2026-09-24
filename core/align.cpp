@@ -1256,7 +1256,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             int prev_ts = ((lvl + 1) < (int)cfg.bm_tile_sizes.size())
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1])
                           : ts;
-            if (cfg.align_match_14)
+            if (!cfg.use_candidate_flow_upsample())
                 flow = upscale_flow_bilinear_14(flow, ny, nx, upsample_factor,
                                                 ts, prev_ts);
             else

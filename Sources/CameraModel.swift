@@ -163,6 +163,14 @@ struct TuningParams: Equatable, Codable {
     /// noise. The cost is that the noise curves are calibrated in the sqrt-raw
     /// guide domain and no longer describe this guide, so r_t wants its own
     /// tuning here (or run with the noise model off).
+    /// How a coarse pyramid level seeds the next finer one.
+    ///
+    /// ON: the paper's content-aware upsample -- three coarse candidates (the
+    /// nearest tile plus the next-nearest in each dimension), each re-checked
+    /// against the image, lowest L1 residual wins. OFF: plain bilinear resize.
+    ///
+    /// Forced OFF by align_match_14, which is what 1.4 does.
+    var flow_upsample_candidates: Bool = true
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -290,7 +298,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
-        case real_rgb_guide
+        case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
@@ -375,6 +383,7 @@ struct TuningParams: Equatable, Codable {
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
+        flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2143,6 +2152,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
+            "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

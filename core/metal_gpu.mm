@@ -3397,8 +3397,9 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                           ? cfg.grey_tile_size(cfg.bm_tile_sizes[lvl + 1]) : ts;
             id<MTLBuffer> b_up = nil;
             id<MTLBuffer> b_amb_up = nil;
-            if (cfg.align_match_14) {
-                // 1.4: bilinear flow resize, no ambiguity carry. The stale
+            if (!cfg.use_candidate_flow_upsample()) {
+                // Bilinear flow resize, no ambiguity carry -- 1.4's form, and
+                // what flow_upsample_candidates = false selects. The stale
                 // b_ambiguity (coarse-grid sized) is left to the realloc-on-
                 // mismatch guard just below, which hands the next level fresh
                 // zeros -- matching 1.4's flow-only upscale.

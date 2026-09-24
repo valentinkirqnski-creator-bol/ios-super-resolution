@@ -522,6 +522,31 @@ struct Config {
     // this makes the ALGORITHM identical, which is what the flow diff was.
     bool align_match_14 = false;
 
+    // How a coarse level's flow seeds the next finer one.
+    //
+    // TRUE (default): the paper's content-aware upsample. For each fine tile,
+    // take the three coarse candidates -- the nearest coarse tile plus the
+    // next-nearest in each dimension -- warp the reference patch by each, and
+    // keep whichever gives the smallest L1 residual against the moving frame.
+    // No vector is invented; every candidate was measured at the coarse level
+    // and is then re-verified against the actual image content.
+    //
+    // FALSE: bilinear resize of the flow field, no image content consulted.
+    //
+    // The difference is entirely at motion discontinuities. Bilinear averages
+    // across them and produces a vector wrong for BOTH sides -- the classic
+    // smear. The candidate form keeps the discontinuity, because it can only
+    // return a vector one side actually measured. Bilinear is smoother where
+    // the motion genuinely is smooth, but this is a SEED: block matching then
+    // searches +-3..4 px around it, so a seed that is wrong by more than the
+    // radius can never be recovered, and correctness beats smoothness.
+    //
+    // align_match_14 forces bilinear regardless, since that is what 1.4 does.
+    bool flow_upsample_candidates = true;
+    bool use_candidate_flow_upsample() const {
+        return flow_upsample_candidates && !align_match_14;
+    }
+
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
     // finest-radius override lands on the CPU and the device identically.
