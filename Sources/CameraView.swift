@@ -1122,6 +1122,37 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
 
+                    Toggle("Geometry Rejection (rotation)",
+                           isOn: $cam.tuningParams.motion_geom_reject_enabled)
+                    Text("""
+                         Rejects pixels where one translation per tile is a poor \r
+                         model of the local motion -- the flow's gradient times \r
+                         the distance from the tile centre, weighted by edge \r
+                         strength. That is the rotation tile-ghost. Rejected \r
+                         pixels fall back to the reference. Inert under \r
+                         one-direction motion.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    if cam.tuningParams.motion_geom_reject_enabled {
+                        ispRow("Geom Threshold",
+                               $cam.tuningParams.motion_geom_reject_threshold,
+                               0...0.01, "%.4f")
+                        Text("""
+                             Intensity units of |grad I| * |E|. LOWER rejects \r
+                             more. The range is 0...0.01 rather than the 0...0.06 \r
+                             the old screen used, because everything useful lives \r
+                             at the bottom of it: 0.02 rejects ~15%, 0.03 ~10%, \r
+                             0.06 ~3% (near-inert), and the default is 0.0045 -- \r
+                             which on a 0...0.06 slider sat at 7% of the travel \r
+                             and could not be set by hand. Going below the default \r
+                             rejects more of the burst: cleaner rotation, fewer \r
+                             frames merged, so more noise. 0 rejects every pixel \r
+                             carrying any edge and any flow-gradient error at all.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                     Text("""
                          Saves the mask beside the photo as its own image in \r
