@@ -1153,6 +1153,34 @@ struct CameraView: View {
                             .font(.footnote).foregroundColor(.secondary)
                     }
 
+                    Toggle("Robustness at Raw Resolution",
+                           isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
+                    Text("""
+                         Algorithm 6 as the paper writes it: Dodgson-upscale the \r
+                         local statistics x2, warp them by the flow, and score R \r
+                         at full raw resolution instead of on the half-size guide \r
+                         grid. Off is what both reference implementations \r
+                         actually ship.
+
+                         Needs Alignment Grey: FFT OFF as well -- the path is \r
+                         gated on the decimate grey, so with FFT on this switch \r
+                         does nothing.
+
+                         Known limits while on: geometry rejection is not \r
+                         implemented on this path, and Eq. 9 still min-reduces \r
+                         back to the guide lattice, so the mask ends up blocky \r
+                         per 2x2 quad anyway and rejects more than the half-res \r
+                         one. Costs 4x the pixels for R and disables GPU frame \r
+                         residency.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    Toggle("Alignment Grey: FFT", isOn: $cam.tuningParams.alignment_grey_fft)
+                    Text(cam.tuningParams.alignment_grey_fft
+                         ? "Full-res FFT low-pass of the raw. Slower, and it keeps Robustness at Raw Resolution gated off."
+                         : "2x2 Bayer quad average at half res (Wronski et al.). Faster, and the decimate grey Robustness at Raw Resolution requires.")
+                        .font(.footnote).foregroundColor(.secondary)
+
                     Toggle("Real-RGB Guide", isOn: $cam.tuningParams.real_rgb_guide)
                     Text("""
                          Measures the colour distance on a real picture instead \r

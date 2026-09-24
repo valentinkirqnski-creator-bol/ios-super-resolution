@@ -227,7 +227,10 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
-    var robustness_raw_resolution_enabled: Bool = true
+    /// FALSE. It is now a Settings toggle, so its stored value is what the user
+    /// sees; defaulting it to true while the gate also demands the decimate grey
+    /// made it read "on" while being inert, which is worse than off.
+    var robustness_raw_resolution_enabled: Bool = false
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
