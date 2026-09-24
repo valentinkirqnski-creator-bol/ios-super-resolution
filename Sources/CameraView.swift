@@ -1221,7 +1221,15 @@ struct CameraView: View {
 
                          The difference is at motion boundaries. Bilinear                          averages across them and returns a vector wrong for both                          sides -- the classic smear. Candidates keep the boundary,                          because the answer is always a vector one side really                          measured. This is only the seed: block matching then                          searches a few pixels around it, so a seed wrong by more                          than that radius is never recovered.
 
-                         Match 1.4 Alignment forces this off.
+                         Independent of Match 1.4 Alignment below.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    Toggle("Match 1.4 Alignment", isOn: $cam.tuningParams.align_match_14)
+                    Text("""
+                         Reproduces 1.4's alignment where it differs from                          460-main: the level-0 block-match search radius drops                          from 3 to 1, and the per-level ICA policy changes. It no                          longer picks the upsampler -- that is the toggle above.
+
+                         On by default, and it was choosing bilinear upsampling                          as a side effect until now.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }

@@ -541,11 +541,15 @@ struct Config {
     // searches +-3..4 px around it, so a seed that is wrong by more than the
     // radius can never be recovered, and correctness beats smoothness.
     //
-    // align_match_14 forces bilinear regardless, since that is what 1.4 does.
+    // This flag alone decides the upsampler. It used to be ANDed with
+    // !align_match_14, which made it dead on the device: align_match_14 is false
+    // here but TRUE in Sources/CameraModel.swift, and the Swift value is what
+    // SRBridge pushes into Config, so the toggle read "on" and bilinear kept
+    // running. align_match_14 keeps its other two effects -- the level-0 search
+    // radius and the per-level ICA policy below -- and no longer silently owns a
+    // third.
     bool flow_upsample_candidates = true;
-    bool use_candidate_flow_upsample() const {
-        return flow_upsample_candidates && !align_match_14;
-    }
+    bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
 
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
