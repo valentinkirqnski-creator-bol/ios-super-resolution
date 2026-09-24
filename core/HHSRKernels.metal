@@ -1602,6 +1602,11 @@ struct RobGuideParams {
     uint guide_ccm;
     int  guide_curve;
     float ccm[9];
+    // Config::real_rgb_guide. Its own branch below, not a combination of the
+    // three fields above: wb0..2 then carry the WB GAINS to apply rather than
+    // the un-prewhiten factors, and the curve is always IEC sRGB.
+    uint real_rgb;
+    uint _pad_rrg[3];
 };
 
 // Guide transfer curve -- twin of apply_guide_curve in robustness.cpp.
@@ -1745,6 +1750,21 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     float rgb[3];
     for (uint c = 0u; c < 3u; ++c)
         rgb[c] = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
+    // Real-RGB guide: white balance (already folded into wb0..2 by the host),
+    // camera->sRGB, IEC sRGB curve. Returns before the guide_ccm / guide_curve
+    // block so the two schemes cannot interleave. Twin of the real_rgb_guide
+    // branch in compute_guide (robustness.cpp).
+    if (p.real_rgb != 0u) {
+        if (p.guide_ccm != 0u) {
+            float r = rgb[0], g = rgb[1], b = rgb[2];
+            rgb[0] = p.ccm[0] * r + p.ccm[1] * g + p.ccm[2] * b;
+            rgb[1] = p.ccm[3] * r + p.ccm[4] * g + p.ccm[5] * b;
+            rgb[2] = p.ccm[6] * r + p.ccm[7] * g + p.ccm[8] * b;
+        }
+        for (uint c = 0u; c < 3u; ++c)
+            guide[o + c] = rob_guide_curve(rgb[c], 3);
+        return;
+    }
     // Optional camera->sRGB colour matrix, then the transfer curve. Mirrors
     // compute_guide in robustness.cpp. Default (guide_ccm 0, curve resolved to
     // sqrt) is byte-identical to the old sqrt-VST path.

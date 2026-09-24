@@ -153,6 +153,17 @@ struct TuningParams: Equatable, Codable {
     /// white balance, apply the camera->sRGB matrix, and a transfer curve. Makes
     /// the colour distance separate true mismatches from noise. Run with the
     /// noise model off (the LUT is calibrated in the sqrt-raw guide domain).
+    /// Build the robustness guide as display RGB instead of sensor space:
+    /// white balance kept, camera->sRGB matrix, IEC sRGB curve. One switch and
+    /// one code path, separate from the three guide_* flags below, which it
+    /// overrides while on.
+    ///
+    /// The colour distance is then measured between two pictures rather than
+    /// two sets of sensor readings, so a genuine colour mismatch separates from
+    /// noise. The cost is that the noise curves are calibrated in the sqrt-raw
+    /// guide domain and no longer describe this guide, so r_t wants its own
+    /// tuning here (or run with the noise model off).
+    var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
     /// -1 auto (follow sqrt guide), 0 none, 1 sqrt, 2 gamma, 3 srgb.
@@ -276,6 +287,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
+        case real_rgb_guide
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
@@ -360,6 +372,7 @@ struct TuningParams: Equatable, Codable {
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
+        real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
@@ -2127,6 +2140,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
+            "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),

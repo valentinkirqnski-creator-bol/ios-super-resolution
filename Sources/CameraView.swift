@@ -1153,6 +1153,25 @@ struct CameraView: View {
                             .font(.footnote).foregroundColor(.secondary)
                     }
 
+                    Toggle("Real-RGB Guide", isOn: $cam.tuningParams.real_rgb_guide)
+                    Text("""
+                         Measures the colour distance on a real picture instead \r
+                         of raw sensor readings: white balance kept, the \r
+                         camera->sRGB matrix applied, sRGB curve. Off, the guide \r
+                         is sensor-space sqrt, which is what the paper and both \r
+                         reference implementations use.
+
+                         Alignment is unaffected -- it already works on \r
+                         white-balanced raw, because the loader white-balances \r
+                         before anything else runs.
+
+                         Turn the noise model off with this, or retune r_t: the \r
+                         noise curves were measured in the sqrt-raw domain, and \r
+                         white balance scales red and blue noise about 2x while \r
+                         the matrix mixes the channels together.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                     Text("""
                          Saves the mask beside the photo as its own image in \r

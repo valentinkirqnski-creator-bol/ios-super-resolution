@@ -740,6 +740,54 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     // Un-prewhiten to camera-native (1.4 parity) UNLESS the guide is asked to
     // keep white balance (guide_white_balance) -- a real-RGB guide wants WB, and
     // the port's raw is already white-balanced by the loader's prewhitening.
+    // Real-RGB guide (Config::real_rgb_guide). Self-contained: it does not read
+    // guide_white_balance / guide_color_matrix / guide_curve at all, and returns
+    // before them, so the two schemes cannot interleave.
+    //
+    // white balance kept -> camera->sRGB -> IEC sRGB curve. The loader
+    // prewhitens (raw_io.cpp: site *= wb[c]/wb[1]), so on that path WB is
+    // already in the samples and "keep" means doing nothing; a raw that arrived
+    // un-prewhitened gets the gains applied here instead, so the guide is the
+    // same picture either way.
+    if (cfg.real_rgb_guide) {
+        f32 wb[3] = {1.f, 1.f, 1.f};
+        if (!cfg.raw_prewhitened) {
+            const f32 g = cfg.white_balance[1];
+            for (int c = 0; c < 3; ++c) {
+                const f32 wc = cfg.white_balance[c];
+                wb[c] = (std::isfinite(g) && std::isfinite(wc) && g > 0.f) ? (wc / g) : 1.f;
+            }
+        }
+        // No matrix available means no real RGB to speak of; WB plus the curve
+        // is still a better-conditioned guide than sensor space, so carry on
+        // rather than silently reverting to the 1.4 guide the caller did not ask
+        // for.
+        const bool ccm = cfg.has_cam_to_srgb;
+        const float* M = cfg.cam_to_srgb;
+        for (int y = 0; y < gh; ++y) {
+            for (int x = 0; x < gw; ++x) {
+                f32 sum[3] = {0.f, 0.f, 0.f};
+                for (int i = 0; i < 2; ++i)
+                    for (int j = 0; j < 2; ++j) {
+                        const uint8_t c = cfg.cfa.p[i][j];
+                        if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
+                    }
+                f32 rgb[3] = {sum[0] * inv[0] * wb[0],
+                              sum[1] * inv[1] * wb[1],
+                              sum[2] * inv[2] * wb[2]};
+                if (ccm) {
+                    const f32 r = rgb[0], gr = rgb[1], b = rgb[2];
+                    rgb[0] = M[0] * r + M[1] * gr + M[2] * b;
+                    rgb[1] = M[3] * r + M[4] * gr + M[5] * b;
+                    rgb[2] = M[6] * r + M[7] * gr + M[8] * b;
+                }
+                for (int c = 0; c < 3; ++c)
+                    guide.at(y, x, c) = apply_guide_curve(rgb[c], 3);  // IEC sRGB
+            }
+        }
+        return guide;
+    }
+
     f32 wbu[3] = {1.f, 1.f, 1.f};
     if (cfg.raw_prewhitened && !cfg.guide_white_balance) {
         const f32 g = cfg.white_balance[1];

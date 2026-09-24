@@ -743,6 +743,26 @@ struct Config {
     // consumption becomes per-pixel. Off by default. Does not by itself reject
     // a smooth aperture slide (M stays low there) -- pair with a lower r_s2.
 
+    // Real-RGB guide. Its own switch and its own code path -- NOT the
+    // guide_white_balance / guide_color_matrix / guide_curve combination below,
+    // which are independent 1.4-parity escape hatches that each toggle one
+    // stage. This asks a single question instead: build the robustness guide in
+    // display RGB rather than sensor space, so the colour distance is measured
+    // between two pictures rather than between two sets of sensor readings.
+    //
+    //   white balance kept (applied if the raw did not arrive prewhitened)
+    //   camera -> linear sRGB via cam_to_srgb
+    //   IEC sRGB transfer curve
+    //
+    // When on it OVERRIDES all three flags below, so the two schemes can never
+    // half-apply each other.
+    //
+    // Cost, stated plainly: the noise curves are calibrated in the sqrt-raw
+    // guide domain, so sigma_sq no longer describes this guide's noise. WB gains
+    // scale R and B noise by ~2x and the matrix mixes channels, which correlates
+    // the per-channel noise the sigma_ms_sq sum assumes is independent. Run this
+    // with the noise model off, or treat r_t as needing its own tuning.
+    bool real_rgb_guide = false;
     bool guide_white_balance = false;  // keep WB in the guide (skip un-prewhiten)
     bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB
     int  guide_curve = -1;             // -1 auto, 0 none, 1 sqrt, 2 gamma, 3 srgb
