@@ -1181,6 +1181,18 @@ struct CameraView: View {
                          : "2x2 Bayer quad average at half res (Wronski et al.). Faster, and the decimate grey Robustness at Raw Resolution requires.")
                         .font(.footnote).foregroundColor(.secondary)
 
+                    Toggle("Full-Resolution Guide", isOn: $cam.tuningParams.robustness_fullres_grey)
+                    Text("""
+                         Computes the guide, the local statistics and R at full                          raw resolution on the FFT low-pass, instead of the                          half-size Bayer guide. Nothing is upscaled, so Eq. 9's                          5x5 minimum lands on raw pixels and the merge reads R at                          its own coordinates.
+
+                         Finer, but only in support: the low-pass is band-limited                          either way, so ~2 raw pixels is still the smallest                          feature. What changes is that a 3x3 statistics window                          covers 3x3 raw instead of 6x6.
+
+                         The statistics become luma, so a mismatch that changes                          colour but not brightness stops being visible. Retune                          r_t, or run with the noise model off: the noise curves                          assume the sqrt-raw guide domain.
+
+                         Needs Alignment Grey: FFT on, which is where the                          low-pass comes from.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
                     Toggle("Real-RGB Guide", isOn: $cam.tuningParams.real_rgb_guide)
                     Text("""
                          Measures the colour distance on a real picture instead \r

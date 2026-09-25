@@ -1745,9 +1745,13 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     const bool bayer = cfg.bayer_mode;
     const int raw_h = (raw.h > 0) ? raw.h : 0;
     const int raw_w = (raw.w > 0) ? raw.w : 0;
-    guide_h = bayer ? raw_h / 2 : raw_h;
-    guide_w = bayer ? raw_w / 2 : raw_w;
-    nch = bayer ? 3 : 1;
+    // Full-resolution single-channel guide: same shape a monochrome capture
+    // produces, so every nch == 1 branch downstream takes over unchanged and no
+    // Dodgson upscale is needed. See Config::robustness_fullres_grey.
+    const bool fullres = bayer && cfg.robustness_fullres_grey;
+    guide_h = (bayer && !fullres) ? raw_h / 2 : raw_h;
+    guide_w = (bayer && !fullres) ? raw_w / 2 : raw_w;
+    nch = (bayer && !fullres) ? 3 : 1;
     if (guide_h < 1 || guide_w < 1) return false;
 
     const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
@@ -1768,7 +1772,18 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     }
     if (!b_raw || !b_guide || !b_means || !b_vars) return false;
 
-    if (bayer) {
+    if (fullres) {
+        // The guide IS the full-resolution FFT low-pass. compute_grey_fft_metal
+        // runs its own command buffer, so this has to land before `cmd` is
+        // encoded; it reuses the sticky grey when the dimensions match, which
+        // they do for every frame of a burst, so the alignment pass has usually
+        // paid for it already.
+        Image grey = compute_grey_fft_metal(raw);
+        if (grey.h != raw_h || grey.w != raw_w || grey.c != 1 ||
+            grey.data.size() != (size_t)raw_h * (size_t)raw_w)
+            return false;
+        std::memcpy([b_guide contents], grey.data.data(), guide_b);
+    } else if (bayer) {
         RobGuideParamsCPU gp{};
         gp.raw_h = (uint32_t)raw_h;
         gp.raw_w = (uint32_t)raw_w;
