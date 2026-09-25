@@ -1434,6 +1434,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     Image num_sink, den_sink;
     std::vector<int> online_pending;   // frames queued but not yet committed
     int online_skip_rejected = 0, online_skip_nodata = 0, online_skip_gpu = 0;
+    // Why a comparison frame contributed nothing, counted on EVERY merge
+    // architecture. The three online_skip_* counters above only increment on the
+    // online path, so a fused or banded burst used to fail reporting 0/0/0 --
+    // true, and useless. These separate the two cases that look identical from
+    // the outside and have completely different causes:
+    //   rob_empty  : compute_robustness returned a 0x0 image, i.e. it bailed
+    //                before producing a mask at all (a guard, a shape mismatch
+    //                against the reference stats, or a GPU refusal).
+    //   rob_zero   : a real mask was computed and every pixel in it is <= 0,
+    //                i.e. the algorithm rejected the whole frame.
+    int skip_rob_empty = 0, skip_rob_zero = 0, comp_seen = 0;
     const int online_fuse = kOnlineFuse;
 
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
@@ -1683,6 +1694,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // otherwise be missing from the split entirely. Frame order matches, and
         // rob*sel + rob*(1-sel) == rob exactly for sel in {0,1}, so the two
         // accumulators still partition acc_rob.
+        ++comp_seen;
+        if (!rob_has_nonzero) {
+            if (rob.h <= 0 || rob.w <= 0) ++skip_rob_empty;
+            else                          ++skip_rob_zero;
+        }
         if (want_s_masks)
             absorb_robustness_split(acc_rob_s1, acc_rob_s2, rob, rob_s_select,
                                     have_acc_rob_split);
@@ -1843,9 +1859,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 
     if (n_comp_ok < 1) {
         if (cache_streamed_comp_raw) fs::remove_all(cache, ec);
-        char why[160];
+        char why[256];
         std::snprintf(why, sizeof(why),
-                      "Error: no comparison frame merged (rejected %d, no data %d, gpu %d)",
+                      "Error: no comparison frame merged (%d seen; mask empty %d, "
+                      "mask all-zero %d; online: rejected %d, no data %d, gpu %d)",
+                      comp_seen, skip_rob_empty, skip_rob_zero,
                       online_skip_rejected, online_skip_nodata, online_skip_gpu);
         report(why, 1.f);
 #if defined(__APPLE__)
