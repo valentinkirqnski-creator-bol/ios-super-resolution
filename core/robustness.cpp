@@ -713,17 +713,6 @@ static inline f32 apply_guide_curve(f32 v, int curve) {
 }
 
 Image compute_guide(const Image& raw, const Config& cfg) {
-    // Full-resolution single-channel guide (Config::robustness_fullres_grey).
-    // compute_grey_fft band-limits the raw mosaic to half Nyquist, which also
-    // strips the CFA modulation, leaving luminance at H x W. Returning one
-    // channel at raw size puts the whole robustness stage on the nch == 1 path
-    // that monochrome captures already use, so no upscale is ever needed.
-    if (cfg.bayer_mode && cfg.robustness_fullres_grey) {
-        Image g = compute_grey_fft(raw);
-        if (g.h == raw.h && g.w == raw.w && g.c == 1) return g;
-        // FFT unavailable (no Metal, no CPU fallback on Apple): fall through to
-        // the half-res guide rather than returning an empty image.
-    }
     if (!cfg.bayer_mode) {
         // Python: guide_img = raw.reshape((1, H, W))
         Image g(raw.h, raw.w, 1);

@@ -791,32 +791,6 @@ struct Config {
     // scale R and B noise by ~2x and the matrix mixes channels, which correlates
     // the per-channel noise the sigma_ms_sq sum assumes is independent. Run this
     // with the noise model off, or treat r_t as needing its own tuning.
-    // Compute the guide, the local statistics and R at FULL raw resolution on a
-    // single-channel low-pass image, instead of on the half-size 3-channel Bayer
-    // guide followed by a Dodgson upscale.
-    //
-    // The image is compute_grey_fft: FFT the raw mosaic, zero the outer half of
-    // the spectrum in each dimension, inverse FFT. Band-limiting that way also
-    // removes the CFA, because the Bayer chroma modulation sits at the spectrum
-    // edges -- so the result is luminance at H x W, and no upscale is needed to
-    // reach the frame's own lattice.
-    //
-    // Everything downstream already handles this shape: it is exactly what a
-    // monochrome capture produces, so the nch == 1 branches in rob_make_mask,
-    // compute_robustness and the merge take over unchanged, Eq. 9's 5x5 min
-    // lands on raw pixels (Algorithm 6 line 34 as written), and the merge reads
-    // R at raw coordinates because both paths key on the mask's real dimensions.
-    //
-    // Two honest costs. The statistics become LUMA, so a mismatch that changes
-    // colour without changing brightness is invisible -- Wronski's 3-channel
-    // guide exists for the saturated-colour case. And the noise curves are
-    // calibrated in the sqrt-raw guide domain, so r_t wants retuning.
-    //
-    // What it does buy is SUPPORT, not information: the low-pass is band-limited
-    // to half Nyquist, so the finest resolvable feature is still ~2 raw pixels,
-    // but a 3x3 window is now 3x3 RAW rather than the 6x6 raw that a 3x3 window
-    // over 2x2-averaged quads covers.
-    bool robustness_fullres_grey = false;
     bool real_rgb_guide = false;
     bool guide_white_balance = false;  // keep WB in the guide (skip un-prewhiten)
     bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB

@@ -1745,37 +1745,9 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     const bool bayer = cfg.bayer_mode;
     const int raw_h = (raw.h > 0) ? raw.h : 0;
     const int raw_w = (raw.w > 0) ? raw.w : 0;
-    // Full-resolution single-channel guide: same shape a monochrome capture
-    // produces, so every nch == 1 branch downstream takes over unchanged and no
-    // Dodgson upscale is needed. See Config::robustness_fullres_grey.
-    //
-    // The grey is fetched HERE, before anything is sized, because it can fail
-    // and the failure must not take the burst with it. compute_grey_fft_metal
-    // reads HOST pixels, and on the resident path the comparison frame's host
-    // plane has already been freed -- only the GPU slice survives. That made
-    // every comparison frame return an empty mask in ~0.06ms while the
-    // reference, which still had its pixels, succeeded: n_comp_ok == 0 and the
-    // burst failed with "no comparison frame merged". Falling back to the
-    // half-res guide costs the feature for that frame; failing costs the shot.
-    // NOT conditioned on raw.data: compute_grey_fft_metal_impl finds the
-    // resident plane itself through bf_active(), and only needs h/w from the
-    // Image. Gating on host pixels would give the REFERENCE a full-res guide
-    // (it always has them) and the comparison frames a half-res one, and
-    // rob_run_guide_stats is shared by both -- the caller then rejects the
-    // mismatch at `gh != ref_stats.means.h` and every comparison mask comes back
-    // empty. The decision has to depend on cfg alone so the whole burst agrees.
-    Image fullres_grey;
-    const bool fullres = bayer && cfg.robustness_fullres_grey;
-    if (fullres) {
-        fullres_grey = compute_grey_fft_metal(raw);
-        if (fullres_grey.h != raw_h || fullres_grey.w != raw_w ||
-            fullres_grey.c != 1 ||
-            fullres_grey.data.size() != (size_t)raw_h * (size_t)raw_w)
-            return false;   // consistent failure, not a silent shape change
-    }
-    guide_h = (bayer && !fullres) ? raw_h / 2 : raw_h;
-    guide_w = (bayer && !fullres) ? raw_w / 2 : raw_w;
-    nch = (bayer && !fullres) ? 3 : 1;
+    guide_h = bayer ? raw_h / 2 : raw_h;
+    guide_w = bayer ? raw_w / 2 : raw_w;
+    nch = bayer ? 3 : 1;
     if (guide_h < 1 || guide_w < 1) return false;
 
     const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
@@ -1796,10 +1768,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     }
     if (!b_raw || !b_guide || !b_means || !b_vars) return false;
 
-    if (fullres) {
-        // Already fetched and validated above; this is only the upload.
-        std::memcpy([b_guide contents], fullres_grey.data.data(), guide_b);
-    } else if (bayer) {
+    if (bayer) {
         RobGuideParamsCPU gp{};
         gp.raw_h = (uint32_t)raw_h;
         gp.raw_w = (uint32_t)raw_w;

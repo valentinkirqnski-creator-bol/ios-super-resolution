@@ -171,16 +171,6 @@ struct TuningParams: Equatable, Codable {
     ///
     /// Forced OFF by align_match_14, which is what 1.4 does.
     var flow_upsample_candidates: Bool = true
-    /// Guide, local statistics and R all at FULL raw resolution, on the
-    /// single-channel FFT low-pass instead of the half-size Bayer guide. No
-    /// Dodgson upscale anywhere.
-    ///
-    /// Buys support, not information: the low-pass is band-limited to half
-    /// Nyquist either way, but a 3x3 window becomes 3x3 RAW instead of the 6x6
-    /// raw a 3x3 window over 2x2-averaged quads covers. Costs colour -- the
-    /// statistics are luma, so a colour-only mismatch is invisible -- and r_t
-    /// wants retuning, since the noise curves assume the sqrt-raw guide domain.
-    var robustness_fullres_grey: Bool = false
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -308,7 +298,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case align_match_14
         case guide_white_balance, guide_color_matrix, guide_curve
-        case real_rgb_guide, flow_upsample_candidates, robustness_fullres_grey
+        case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
@@ -394,7 +384,6 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
-        robustness_fullres_grey = try c.decodeIfPresent(Bool.self, forKey: .robustness_fullres_grey) ?? robustness_fullres_grey
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2164,7 +2153,6 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
-            "robustness_fullres_grey": NSNumber(value: tuningParams.robustness_fullres_grey),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

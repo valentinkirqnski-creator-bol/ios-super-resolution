@@ -535,8 +535,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_match_14 = tuning[@"align_match_14"].boolValue;
     if (tuning[@"flow_upsample_candidates"])
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
-    if (tuning[@"robustness_fullres_grey"])
-        cfg.robustness_fullres_grey = tuning[@"robustness_fullres_grey"].boolValue;
     if (tuning[@"real_rgb_guide"])
         cfg.real_rgb_guide = tuning[@"real_rgb_guide"].boolValue;
     if (tuning[@"guide_white_balance"])
