@@ -1042,7 +1042,7 @@ struct Config {
     // pixel silently dropped from the burst) is a permanent loss of the
     // detail super-resolution exists to recover, while the cost of a missed
     // artifact is one subtly doubled edge.
-    float robustness_refine_max_reduction = 0.75f;
+    float robustness_refine_max_reduction = 1.0f;
     // Dead zone on 1 - q_keep. Below this the pixel is left EXACTLY as the
     // analytic mask produced it, bit for bit.
     //

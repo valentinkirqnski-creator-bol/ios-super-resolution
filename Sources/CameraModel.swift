@@ -246,7 +246,7 @@ struct TuningParams: Equatable, Codable {
     /// the model is missing. See tools/rob_refine.
     var robustness_refine_nn_enabled: Bool = false
     /// kappa: the most weight the network may take from any one pixel.
-    var robustness_refine_max_reduction: Float = 0.75
+    var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
     /// as the analytic mask produced it, so the stage stays a sparse
     /// correction. 0.2 is measured: it moves 3% of the frame and captures 77%

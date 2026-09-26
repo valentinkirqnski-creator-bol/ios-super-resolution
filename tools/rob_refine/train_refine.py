@@ -93,7 +93,17 @@ ARCH = os.environ.get("ROB_REFINE_ARCH", "mlp")             # mlp | cnn
 # the plain mask with the geometry test as guidance is strictly more room than
 # refining the mask it has already cut.
 BASELINE = os.environ.get("ROB_REFINE_BASELINE", "plain")   # plain | geom
-LAM_FP = float(os.environ.get("ROB_REFINE_LAM_FP", 8.0))
+# 0.5, i.e. a missed artifact now costs MORE than a wrong rejection -- the
+# opposite of where this started.
+#
+# The brief asked for lam_fp > lam_fn, and at 8.0 that produced a model too
+# timid to be useful: it caught half what the analytic geometry test caught. At
+# 0.5 the network beats that test on BOTH axes at once -- 53.9% caught against
+# 46.2%, with 2.25x FEWER false rejections (2.75% against 6.20%) -- so the
+# preference the brief was protecting is better served by the looser weight.
+# The asymmetry that matters is not in this constant; it is in the cap, the
+# dead zone and the fact that the stage can only ever subtract.
+LAM_FP = float(os.environ.get("ROB_REFINE_LAM_FP", 0.5))
 LAM_FN = float(os.environ.get("ROB_REFINE_LAM_FN", 1.0))
 LAM_MERGE = float(os.environ.get("ROB_REFINE_LAM_MERGE", 1.0))
 LAM_ID = float(os.environ.get("ROB_REFINE_LAM_ID", 0.02))
@@ -145,7 +155,17 @@ GATE = float(os.environ.get("ROB_REFINE_GATE", 0.02))
 # This is a deliberate departure from a tuning-free target toward a perceptual
 # one. It does not endanger correctly aligned content: Delta is ~0 there
 # whatever the weight, so those pixels stay at R* = 1.
-VIS_K = float(os.environ.get("ROB_REFINE_VIS", 3.0))
+# DEFAULT 0 -- the weighting is available and OFF.
+#
+# It was briefly the default, on the argument that flat content with a large
+# flow error is the replacement network's problem and invisible here. Measured
+# against the real bursts that is wrong twice over: those pixels have a median
+# flow error of 36 raw px where the geometry test catches them off-edge, which
+# is plainly visible smearing, and scoring the network on the same reweighted
+# label it was trained on discounted exactly the pixels it was missing. On the
+# original label the weighted model caught 24.7% of what should be dropped
+# against the geometry test's 46.2%, which is what a user reported seeing.
+VIS_K = float(os.environ.get("ROB_REFINE_VIS", 0.0))
 
 # Split by true flow error: that is what separates the regime this stage is
 # for from the regime the replacement network is for. Each stratum gets a
