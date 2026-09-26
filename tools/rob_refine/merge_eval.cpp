@@ -345,6 +345,10 @@ int main(int argc, char** argv) {
     // -1 leaves the Config default; 0 or 1 forces nearest or bilinear R
     // sampling, so the two can be A/B'd against the same ground truth.
     const int rob_bilinear_override = envi("MERGE_EVAL_ROB_BILINEAR", -1);
+    // Full-resolution single-channel guide out of the FFT low pass, so R is
+    // raw-resolution with nothing upscaled. See Config::robustness_fft_guide.
+    const int fft_guide_override = envi("MERGE_EVAL_FFT_GUIDE", -1);
+    const float fft_noise_override = envf("MERGE_EVAL_FFT_NOISE", -1.f);
 
     std::vector<float> angles;
     for (int i = 2; i < argc; ++i) angles.push_back((float)std::atof(argv[i]));
@@ -371,9 +375,20 @@ int main(int argc, char** argv) {
         work.robustness_refine_regional_gate_px = reg_gate_override;
     if (rob_bilinear_override >= 0)
         work.merge_robustness_bilinear = (rob_bilinear_override != 0);
+    if (fft_guide_override >= 0) {
+        work.robustness_fft_guide = (fft_guide_override != 0);
+        // The FFT grey is the guide now, so alignment must produce it too --
+        // otherwise the burst aligns on the decimated grey and the guide is
+        // built by a second, unrelated transform.
+        if (work.robustness_fft_guide) work.grey_method = GreyMethod::FFT;
+    }
+    if (fft_noise_override >= 0.f)
+        work.robustness_fft_guide_noise_energy = fft_noise_override;
     const int ts = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
-    std::printf("R sampling: %s\n",
-                work.merge_robustness_bilinear ? "BILINEAR" : "nearest");
+    std::printf("R sampling: %s | guide: %s\n",
+                work.merge_robustness_bilinear ? "BILINEAR" : "nearest",
+                work.robustness_fft_guide ? "FFT full-res 1ch"
+                                          : "decimated half-res 3ch");
     std::printf("gates: per-pixel %.2f px, regional %.2f px\n",
                 (double)work.robustness_refine_gate_px,
                 (double)work.robustness_refine_regional_gate_px);

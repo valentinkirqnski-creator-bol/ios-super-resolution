@@ -567,14 +567,14 @@ static const NoiseCurves& make_noise_curves_channel_sqrt(f32 alpha, f32 beta, in
 // tile 16 -> 32), which is exactly what a diagnostic probe must not do.
 // robustness_guide_sqrt routes to the sqrt-domain caches (1.4 parity).
 static const NoiseCurves& mask_noise_curves(const Config& cfg) {
-    const bool sq = cfg.robustness_guide_sqrt;
+    const bool sq = cfg.robustness_guide_sqrt_active();
     if (cfg.debug_noise_model_disabled)
         return sq ? make_noise_curves_sqrt(0.f, 0.f) : make_noise_curves(0.f, 0.f);
     const f32 a = cfg.noise_alpha_robustness(), b = cfg.noise_beta_robustness();
     return sq ? make_noise_curves_sqrt(a, b) : make_noise_curves(a, b);
 }
 static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
-    const bool sq = cfg.robustness_guide_sqrt;
+    const bool sq = cfg.robustness_guide_sqrt_active();
     if (cfg.debug_noise_model_disabled)
         return sq ? make_noise_curves_channel_sqrt(0.f, 0.f, ch)
                   : make_noise_curves_channel(0.f, 0.f, ch);
@@ -676,7 +676,7 @@ void prewarm_noise_curves(const Config& cfg) {
     f32 a[4], b[4];
     bool sq[4];
     int n = 0;
-    const bool msq = cfg.robustness_guide_sqrt;
+    const bool msq = cfg.robustness_guide_sqrt_active();
     if (cfg.debug_noise_model_disabled) {
         a[n] = 0.f; b[n] = 0.f; sq[n] = msq; ++n;
     } else if (cfg.bayer_mode) {
@@ -714,6 +714,22 @@ static inline f32 apply_guide_curve(f32 v, int curve) {
 }
 
 Image compute_guide(const Image& raw, const Config& cfg) {
+    // Full-resolution single-channel guide, straight out of the FFT low pass.
+    // The CFA checkerboard sits at the corners of the spectrum, so zeroing the
+    // outer half on both axes removes it without demosaicing and without
+    // decimating: one guide sample per RAW pixel, phase-correct, so R lands on
+    // the raw lattice with nothing upscaled anywhere. Config::
+    // robustness_fft_guide documents what that costs.
+    if (cfg.bayer_mode && cfg.robustness_fft_guide) {
+        Image g = compute_grey_fft(raw);
+        // compute_grey_fft returns an empty image when its Metal path is
+        // present but fails. Falling through to the decimated guide would
+        // silently change R's resolution mid-burst, which the merge detects by
+        // DIMENSION and would then sample at half the correct position, so this
+        // has to be a hard failure rather than a fallback.
+        if (g.h == raw.h && g.w == raw.w && g.c == 1) return g;
+        return Image();
+    }
     if (!cfg.bayer_mode) {
         // Python: guide_img = raw.reshape((1, H, W))
         Image g(raw.h, raw.w, 1);
@@ -800,7 +816,7 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     // Effective transfer curve: -1 auto follows robustness_guide_sqrt so the
     // default (no colour flags) stays byte-identical.
     int curve = cfg.guide_curve;
-    if (curve < 0) curve = cfg.robustness_guide_sqrt ? 1 : 0;
+    if (curve < 0) curve = cfg.robustness_guide_sqrt_active() ? 1 : 0;
     const bool apply_ccm = cfg.guide_color_matrix && cfg.has_cam_to_srgb;
     const float* M = cfg.cam_to_srgb; // camera -> linear sRGB (same as the ISP)
     for (int y = 0; y < gh; ++y) {
@@ -1398,7 +1414,13 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 #else
     RefStats st;
     Image guide = compute_guide(ref_raw, cfg);
+    if (guide.h <= 0 || guide.w <= 0) return RefStats();
     Image means, vars;
+    // Unchanged: the 3x3 window is the same, it is simply being run on a
+    // full-resolution one-channel plane instead of a half-resolution
+    // three-channel one. The support therefore stays ~5x5 raw pixels; what
+    // changes is that every raw pixel gets its own centred estimate instead of
+    // sharing one with the other three in its quad.
     local_stats_3x3(guide, means, vars);
     // 460-main keeps robustness local statistics on the guide grid
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
@@ -1493,7 +1515,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                                     d_sq, sigma_sq, cfg.num_threads);
     else
         apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
-                                cfg.num_threads, cfg.robustness_guide_sqrt);
+                                cfg.num_threads, cfg.robustness_guide_sqrt_active());
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
@@ -1886,7 +1908,7 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         apply_noise_model_1p4(d_p, ref_stats.means, ref_stats.stds, lut14, d_sq, sigma_sq);
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
-                          cfg.robustness_guide_sqrt);
+                          cfg.robustness_guide_sqrt_active());
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);
@@ -2032,7 +2054,7 @@ void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
         else
             nc_ch[0] = &mask_noise_curves(cfg);
         apply_noise_model(d_p, ref_means, ref_vars, nc_ch, d_sq, sigma_sq,
-                          cfg.robustness_guide_sqrt);
+                          cfg.robustness_guide_sqrt_active());
     }
 }
 
@@ -2071,7 +2093,11 @@ Image build_robustness_refine_features(const RefStats& ref_stats,
     // Raw pixels per feature pixel. Every length reaching rr_features is
     // converted with it, so |E| here and motion_geom_reject_threshold there
     // are the same quantity.
-    const f32 sc = raw_res ? 1.f : 2.f;
+    // Raw pixels per guide pixel. The FFT guide is already the raw lattice, so
+    // it is 1 there for the same reason the upscaled path is 1: the feature
+    // builder's lengths and gradients are in RAW pixels either way, which is
+    // what makes them comparable with motion_geom_reject_threshold.
+    const f32 sc = (raw_res || cfg.robustness_fft_guide) ? 1.f : 2.f;
     const f32 inv2ts = 1.f / (2.f * (f32)tile_size);
 
     const std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);

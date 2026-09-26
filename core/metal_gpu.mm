@@ -1826,7 +1826,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
             gp.wb1 = 1.f;
             gp.wb2 = 1.f;
         }
-        gp.sqrt_guide = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity (unused when curve set)
+        gp.sqrt_guide = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity (unused when curve set)
         // Guide colour processing: camera->sRGB matrix + transfer curve. Curve
         // -1 auto follows robustness_guide_sqrt so the default is unchanged.
         int gcurve = cfg.guide_curve;
@@ -2255,7 +2255,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // alpha/beta stay for the noise model (debug-gated accessors).
     mp.alpha = cfg.noise_alpha_robustness();
     mp.beta = cfg.noise_beta_robustness();
-    mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
+    mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -2471,7 +2471,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = false ? 1u : 0u;
-    mp.sqrt_index = cfg.robustness_guide_sqrt ? 1u : 0u; // 1.4 parity
+    mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
     mp.geom_reject_threshold = cfg.motion_geom_reject_threshold;

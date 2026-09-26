@@ -433,11 +433,23 @@ struct Config {
     // at the wrong brightness for those channels. The sensor-space
     // alternative was measured on the ok/ burst and reverted by explicit
     // choice.
+    // Every consumer of the mask's noise model reads these -- the Monte Carlo
+    // curves, the mask kernels, the high-frequency loss map, CPU and Metal
+    // alike -- so the FFT guide's filtered-noise correction is applied here
+    // once instead of at each site.
+    float fft_guide_noise_energy() const {
+        return robustness_fft_guide
+            ? ((robustness_fft_guide_noise_energy > 0.f)
+                   ? robustness_fft_guide_noise_energy : 1.f)
+            : 1.f;
+    }
     float noise_alpha_robustness() const {
-        return debug_noise_model_disabled ? 0.f : noise_alpha();
+        return debug_noise_model_disabled ? 0.f
+                                          : noise_alpha() * fft_guide_noise_energy();
     }
     float noise_beta_robustness() const {
-        return debug_noise_model_disabled ? 0.f : noise_beta();
+        return debug_noise_model_disabled ? 0.f
+                                         : noise_beta() * fft_guide_noise_energy();
     }
     float noise_alpha_ch_robustness(int c) const {
         return debug_noise_model_disabled ? 0.f : noise_alpha_ch(c);
@@ -861,13 +873,68 @@ struct Config {
     // still reachable.
     bool merge_robustness_bilinear = true;
 
+    // Build the robustness guide from compute_grey_fft instead of the
+    // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
+    // anywhere in the chain.
+    //
+    // The decimated guide is 3 channels at half resolution -- one R, the mean of
+    // two G, one B per 2x2 quad -- because that is all a CFA quad holds. R
+    // therefore lives on a 2016x1512 lattice for a 4032x3024 raw while the merge
+    // writes 8064x6048, so one R value governs a 4x4 block of output pixels and
+    // the mask cannot express a correction at the scale a doubled edge occupies.
+    // robustness_raw_resolution_enabled does not fix that: it Dodgson-upscales
+    // the same half-resolution statistics (upscale_warp_stats), buying positions
+    // rather than information.
+    //
+    // compute_grey_fft already produces what is wanted, and the pipeline already
+    // computes it when grey_method == FFT -- for alignment only, then discards
+    // it. It zeroes the outer half of the spectrum on both axes, which is where
+    // the CFA checkerboard lives, and inverse-transforms: a full-resolution,
+    // single-channel, phase-correct image with no demosaic and no resampling.
+    //
+    // What this costs, none of it hidden:
+    //
+    //   - BANDWIDTH, not sampling. The low pass is a brick wall at half Nyquist,
+    //     so the guide carries a half-resolution image's bandwidth sampled at
+    //     full resolution. It improves where the weight can be PLACED, not how
+    //     fine a structure the statistics can resolve.
+    //   - ONE channel instead of three, so Eq. 6's d^2 is a single measurement
+    //     rather than a sum over R, G and B: roughly sqrt(3) less SNR in the
+    //     decision.
+    //   - The guide is LINEAR, not sqrt(raw), so the noise curve must be indexed
+    //     by brightness directly. See robustness_guide_sqrt_active().
+    //   - The noise is FILTERED and therefore correlated, with its variance
+    //     scaled by the fraction of spectrum kept. See
+    //     robustness_fft_guide_noise_energy.
+    bool robustness_fft_guide = false;
+
+    // Fraction of white-noise variance surviving compute_grey_fft's low pass.
+    // Zeroing the outer half of the spectrum on each axis keeps the central
+    // quarter, and for white input the variance scales by the kept fraction, so
+    // 0.25 is the analytic value -- the same role kGaussian5x5NoiseEnergy plays
+    // for the 5x5 blur in robustness.cpp. Exposed rather than hardcoded because
+    // the brick wall is ideal only in theory: the transform is on a finite,
+    // non-periodic image, so the realised factor should be CALIBRATED against
+    // the measured local variance of a flat patch rather than trusted.
+    float robustness_fft_guide_noise_energy = 0.25f;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
     // which one gates it.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled && grey_method == GreyMethod::Decimate;
+        // The FFT guide is already at raw resolution, so there is nothing to
+        // upscale and asking for it would resample a full-res plane to itself.
+        return robustness_raw_resolution_enabled && !robustness_fft_guide &&
+               grey_method == GreyMethod::Decimate;
+    }
+    // Whether the guide is sqrt(raw), which decides both its transfer curve and
+    // whether the noise curve is indexed by mean^2. The FFT guide is a linear
+    // low pass of the raw, so it is indexed by brightness directly; applying
+    // sqrt to it would not even be the same thing as low-passing sqrt(raw).
+    bool robustness_guide_sqrt_active() const {
+        return robustness_guide_sqrt && !robustness_fft_guide;
     }
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
