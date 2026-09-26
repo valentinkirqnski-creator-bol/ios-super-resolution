@@ -917,72 +917,11 @@ struct CameraView: View {
                 + "neighbourhood. Measured against ground truth on synthetic bursts built "
                 + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
-        robustnessRefineControls
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
              """)
             .font(.caption2).foregroundColor(.secondary)
-    }
-
-    // Out of fineAlignmentSection deliberately. That section was already a
-    // ~100-line ViewBuilder expression and this file has previously been
-    // pushed past the Swift type checker's limit ("unable to type-check this
-    // expression in reasonable time") by adding less than this to one; the
-    // chooseReferenceHelp comment below records the same lesson. The help
-    // strings are plain String properties for the same reason.
-    @ViewBuilder
-    private var robustnessRefineControls: some View {
-        Toggle("Learned Geometry Refinement",
-               isOn: $cam.tuningParams.robustness_refine_nn_enabled)
-        Text(refineHelp).font(.caption2).foregroundColor(.secondary)
-        HStack {
-            Text("Refinement Cap")
-            Spacer()
-            Text(String(format: "%.2f", cam.tuningParams.robustness_refine_max_reduction))
-        }
-        Slider(value: $cam.tuningParams.robustness_refine_max_reduction, in: 0.0...1.0)
-        Text(refineCapHelp).font(.caption2).foregroundColor(.secondary)
-        HStack {
-            Text("Refinement Dead Zone")
-            Spacer()
-            Text(String(format: "%.2f", cam.tuningParams.robustness_refine_deadzone))
-        }
-        Slider(value: $cam.tuningParams.robustness_refine_deadzone, in: 0.0...0.5)
-        Text(refineDeadZoneHelp).font(.caption2).foregroundColor(.secondary)
-    }
-
-    private var refineHelp: String {
-        "A different network from the one above, with the opposite relationship "
-        + "to the analytic mask: that one REPLACES Wronski Eq. 5-9, this one "
-        + "keeps it in charge and may only multiply its output down. It targets "
-        + "the one failure the analytic mask cannot see \u{2014} with one flow "
-        + "vector per tile, rotation and parallax leave the fetch a fraction of "
-        + "a pixel out toward the tile edges, doubling thin edges, and "
-        + "d\u{b2}/\u{3c3}\u{b2} reads that as MORE trustworthy because "
-        + "\u{3c3} rises with the edge's own texture faster than d rises with "
-        + "the shift. Runs on top of Geometry Rejection above, not instead of "
-        + "it. R = 0 stays 0, no pixel loses more than the cap below, and a "
-        + "missing model is a no-op."
-    }
-
-    private var refineCapHelp: String {
-        "The most weight the network may take from any one pixel. 1.0 lets it "
-        + "veto a pixel outright; the 0.75 default keeps a quarter of the "
-        + "weight even where it is most certain, because a wrongly rejected "
-        + "pixel is detail that cannot be recovered while a missed artifact is "
-        + "one subtly doubled edge. 0 makes the stage inert."
-    }
-
-    private var refineDeadZoneHelp: String {
-        "Below this much predicted reduction the pixel is passed through "
-        + "exactly as the analytic mask produced it. This is the sparsity "
-        + "control. Measured on held-out frames: 0.20 moves 3% of the frame "
-        + "and captures 77% of the available improvement, 0.10 moves 16% for "
-        + "89%, and 0 moves the whole frame for 100% \u{2014} but a reduction "
-        + "applied everywhere is nearly inert anyway, since the merge "
-        + "normalises and only the differences between frames survive. Raise "
-        + "it to act only on the strongest cases."
     }
 
     // Two of the eight Sections live here rather than inline. The Form body
@@ -1210,6 +1149,66 @@ struct CameraView: View {
                              rejects more of the burst: cleaner rotation, fewer \r
                              frames merged, so more noise. 0 rejects every pixel \r
                              carrying any edge and any flow-gradient error at all.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+
+                    Toggle("Learned Geometry Refinement",
+                           isOn: $cam.tuningParams.robustness_refine_nn_enabled)
+                    Text("""
+                         The learned version of the test above, running on top of \r
+                         it rather than instead of it. Same target -- the \r
+                         fraction-of-a-pixel misalignment one flow vector per \r
+                         tile leaves under rotation or parallax, which thickens \r
+                         edges and repeats on the tile grid -- but graded instead \r
+                         of a hard threshold, and it can tell an edge from text \r
+                         or foliage, so it does not reject fine detail for being \r
+                         high-contrast.
+
+                         Why it is needed at all: d^2/sigma^2 measures the shift \r
+                         in pixels, but sigma is measured on the same edge, so \r
+                         the gradient cancels and the score never learns how \r
+                         VISIBLE the error is. Measured, R stays at 0.999 from \r
+                         perfect alignment all the way out to a 2-pixel error, \r
+                         while the ideal weight falls to 0.44.
+
+                         It can only take weight away. R = 0 stays 0, no pixel \r
+                         loses more than the cap, and if the model is missing \r
+                         nothing changes at all.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    if cam.tuningParams.robustness_refine_nn_enabled {
+                        ispRow("Refinement Cap",
+                               $cam.tuningParams.robustness_refine_max_reduction,
+                               0...1, "%.2f")
+                        Text("""
+                             The most weight the network may take from any one \r
+                             pixel. 1.0 lets it veto a pixel outright; the 0.75 \r
+                             default keeps a quarter even where it is most \r
+                             certain, because a wrongly rejected pixel is detail \r
+                             that cannot come back while a missed artifact is one \r
+                             subtly doubled edge. 0 makes the stage inert.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+
+                        ispRow("Refinement Dead Zone",
+                               $cam.tuningParams.robustness_refine_deadzone,
+                               0...0.35, "%.2f")
+                        Text("""
+                             Below this much predicted reduction the pixel is \r
+                             passed through untouched, which is what keeps the \r
+                             stage a sparse correction rather than a new mask.
+
+                             It trades directly against the sub-pixel case. \r
+                             Measured on held-out frames, in the 0.1-0.5 px band \r
+                             this is aimed at: 0.05 recovers 17% of the excess \r
+                             merge error and moves 71% of the frame, 0.10 \r
+                             recovers 6%, and 0.20 recovers under 2% while moving \r
+                             only 3%. False rejection stayed at 0.10% at every \r
+                             setting, so low costs nothing measurable. Use 0.05 \r
+                             for thickened edges and tile-grid ghosting; raise it \r
+                             only to act on the strongest cases.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
