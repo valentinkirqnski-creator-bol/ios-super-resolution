@@ -2211,6 +2211,12 @@ Image build_robustness_refine_features(const RefStats& ref_stats,
             in.s_prior = s_prior;
             in.sc = sc;
             in.nch = nch;
+            in.alpha = cfg.noise_alpha_robustness();
+            in.beta = cfg.noise_beta_robustness();
+            in.geom_relative = cfg.motion_geom_relative ? 1 : 0;
+            in.geom_threshold = cfg.motion_geom_reject_threshold;
+            in.geom_threshold_rel = cfg.motion_geom_reject_threshold_relative;
+            in.geom_noise_mult = cfg.motion_geom_noise_floor_mult;
 
             rr_features(&in, &feat.at(sy, x, 0));
         }

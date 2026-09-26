@@ -43,7 +43,7 @@
 
 // Must match kRobustnessRefineChannels and the trained width. robustness.cpp
 // static_asserts the first against types.h so the two cannot drift.
-#define RR_CHANNELS 33
+#define RR_CHANNELS 39
 #define RR_WIDTH 16
 
 // Flat weight-buffer layout, shared by tools/rob_refine/export_metal_weights.py
@@ -89,6 +89,12 @@ struct RefineInputs {
     float s_prior;         // the motion prior actually applied
     float sc;              // raw pixels per feature pixel: 2 guide, 1 raw-res
     int   nch;             // guide channels the luma was averaged over
+    // motion_geom_reject's settings, copied in by the gather so that
+    // rr_features can reproduce its metric and its verdict (channels 33-35)
+    // without taking a second parameter block.
+    float alpha, beta;
+    int   geom_relative;
+    float geom_threshold, geom_threshold_rel, geom_noise_mult;
 };
 
 // log(1+x) rather than log1p, deliberately.
@@ -130,6 +136,11 @@ inline void rr_features(const RR_THREAD RefineInputs* in, RR_THREAD float* f) {
     const float sc = in->sc;
     const float inv_sc = 1.f / sc;
     const int nch = in->nch;
+    const float p_alpha = in->alpha, p_beta = in->beta;
+    const int p_geom_relative = in->geom_relative;
+    const float p_geom_thresh = in->geom_threshold;
+    const float p_geom_thresh_rel = in->geom_threshold_rel;
+    const float p_geom_noise_mult = in->geom_noise_mult;
 
     // ---- 0-3: what the analytic mask saw.
     const float sig = rr_max(in->sigma_sq, 1e-12f);
@@ -325,6 +336,70 @@ inline void rr_features(const RR_THREAD RefineInputs* in, RR_THREAD float* f) {
     const float E_perp_n = Ex * nx + Ey * ny;
     f[32] = (sd_lk > 1e-12f) ? (E_perp_n * delta_lk / (sd_lk * sd_lk)) : 0.f;
 
+    // ---- 33-35: what motion_geom_reject thinks, as guidance.
+    //
+    // The hand-designed test is good at this artifact and bad at sparing fine
+    // detail: measured, it falsely rejects 4.6% of thin lines and 5.6% of the
+    // strongest gradients, and it doubles the excess merge error on pixels the
+    // flow got RIGHT. Both failures come from the same place -- it thresholds
+    // a product, |grad I| * |E|, so a strong edge with a modest E trips it
+    // whether or not the misalignment is real, and once it fires it sets R to
+    // zero with no way back.
+    //
+    // So it is given to the network as evidence instead of as a fait accompli:
+    // the continuous metric it thresholds, the exposure-invariant variant, and
+    // its actual verdict at the configured thresholds. Paired with the pooled
+    // measurement in channels 27-29 -- which DOES know whether the predicted
+    // shift is there -- the network can follow it where it is right and
+    // decline where it is not.
+    //
+    // This only works when the refinement is trained on the mask with geometry
+    // rejection OFF. Trained on the mask with it on, the zeros are already in
+    // channel 0 and the stage cannot undo them: it multiplies.
+    const float Emag = f[6];
+    f[33] = gmag * Emag;
+    // Its own noise term, which is channel 0's variance at the MEAN
+    // brightness, not the per-channel sum used elsewhere here. Matched
+    // deliberately so the guidance is the same number the analytic test uses.
+    const float geom_nsig =
+        sqrt(rr_max(p_alpha * f[20] + p_beta, 0.f)) * inv_sc;
+    const float gmag_dn = rr_max(0.f, gmag - p_geom_noise_mult * geom_nsig);
+    f[34] = (gmag_dn / (f[20] + 1e-4f)) * Emag;
+    const int fired_abs = (f[33] > p_geom_thresh) ? 1 : 0;
+    const int fired_rel = (p_geom_relative != 0 && f[34] > p_geom_thresh_rel) ? 1 : 0;
+    f[35] = (fired_abs != 0 || fired_rel != 0) ? 1.f : 0.f;
+
+    // ---- 36-38: a second, coarser scale, so "is there an edge" is answered
+    // for fine structure and for soft structure separately.
+    //
+    // Central differences at +-2 instead of +-1, which is a scale-space step
+    // and needs no wider window -- the 5x5 luma is already gathered. A thin
+    // line carries its energy at the fine scale and almost none at the coarse
+    // one; a soft or already-thickened edge is the other way round. That ratio
+    // is channel 38, and it is the closest thing here to reading edge
+    // thickness directly.
+    float Kxx = 0.f, Kyy = 0.f, Kxy = 0.f;
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            const int yy = 2 + i, xx = 2 + j;
+            // +-2 taps, clamped inside the 5x5 window.
+            const int xl = (xx - 2 < 0) ? 0 : xx - 2, xr = (xx + 2 > 4) ? 4 : xx + 2;
+            const int yu = (yy - 2 < 0) ? 0 : yy - 2, yd = (yy + 2 > 4) ? 4 : yy + 2;
+            const float a = (in->refl[yy][xr] - in->refl[yy][xl]) /
+                            rr_max((float)(xr - xl), 1.f) * inv_sc;
+            const float b = (in->refl[yd][xx] - in->refl[yu][xx]) /
+                            rr_max((float)(yd - yu), 1.f) * inv_sc;
+            Kxx += a * a; Kyy += b * b; Kxy += a * b;
+        }
+    const float ctr = Kxx + Kyy;
+    const float cdisc = sqrt(rr_max((Kxx - Kyy) * (Kxx - Kyy) + 4.f * Kxy * Kxy, 0.f));
+    const float c1 = 0.5f * (ctr + cdisc), c2 = 0.5f * (ctr - cdisc);
+    f[36] = rr_log1p(c1 / rr_max(9.f * sig_res * sig_res, 1e-20f));
+    f[37] = (c1 > 1e-20f) ? rr_clamp(c2 / c1, 0.f, 1.f) : 0.f;
+    // Positive = energy concentrated at the fine scale, i.e. a thin/sharp
+    // edge. Negative = soft or spread out.
+    f[38] = rr_log1p(l1 / rr_max(c1, 1e-20f)) - rr_log1p(c1 / rr_max(l1, 1e-20f));
+
     // Where the estimated flow points outside the comparison frame, Eq. 6
     // gives d = inf, and apply_noise_model's Wiener shrink then evaluates
     // inf/inf -- so d_sq, and R with it, are NaN on those border pixels. That
@@ -416,7 +491,14 @@ struct RefineParams {
     float alpha, beta;      // noise model, as the mask's gated accessors give it
     float kappa;            // Config::robustness_refine_max_reduction
     float deadzone;         // Config::robustness_refine_deadzone
-    int _pad0, _pad1;       // 64 bytes
+    // motion_geom_reject's own settings, so its metric and its verdict can be
+    // handed to the network as guidance rather than only reaching it as the
+    // zeros it already stamped into R. See channels 33-35.
+    int geom_relative;      // Config::motion_geom_relative
+    float geom_threshold;            // absolute, |grad I| * |E|
+    float geom_threshold_rel;        // exposure-invariant
+    float geom_noise_floor_mult;
+    int _pad0, _pad1;       // 80 bytes
 };
 
 inline int rr_clampi(int v, int lo, int hi) {
@@ -593,6 +675,12 @@ inline void rr_gather(const RR_DEVICE float* ref_means,
     in->s_prior = s_prior;
     in->sc = sc;
     in->nch = p->nch;
+    in->alpha = p->alpha;
+    in->beta = p->beta;
+    in->geom_relative = p->geom_relative;
+    in->geom_threshold = p->geom_threshold;
+    in->geom_threshold_rel = p->geom_threshold_rel;
+    in->geom_noise_mult = p->geom_noise_floor_mult;
 
     for (int i = 0; i < 5; ++i)
         for (int j = 0; j < 5; ++j)

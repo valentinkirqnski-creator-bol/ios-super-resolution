@@ -62,7 +62,11 @@ NAMES = ["R", "z_d", "tex", "s", "Ex", "Ey", "Emag", "div", "curl", "Mspan",
          "edge_snr", "aniso", "delta_lk", "sd_lk", "t_lk",
          # where in the tile, and whether the geometry agrees with the
          # measurement once both are in units of its uncertainty
-         "u_n", "v_n", "agree_lk"]
+         "u_n", "v_n", "agree_lk",
+         # motion_geom_reject's own metric and verdict, as guidance
+         "gm_abs", "gm_rel", "gm_fire",
+         # a second, coarser scale, so small and large edges are separable
+         "edge_snr_c", "coh_c", "thick"]
 IN_CH = len(NAMES)                 # 36
 # Derived, not hardcoded: they moved when the feature count changed, and a
 # stale literal here reads the target out of a feature column.
@@ -79,11 +83,16 @@ CH_SIGMA = IN_CH + 4
 # scale and crush everything real into a rounding error. Folded into the
 # exported graph, so nothing outside these weights has to know about it.
 LOG_CH = [1, 4, 5, 6, 7, 8, 9, 13, 14, 16, 17, 18, 19, 22, 23,
-          27, 28, 29, 32]
+          27, 28, 29, 32, 33, 34]
 
 KAPPA = float(os.environ.get("ROB_REFINE_KAPPA", 0.75))
 ARCH = os.environ.get("ROB_REFINE_ARCH", "mlp")             # mlp | cnn
-BASELINE = os.environ.get("ROB_REFINE_BASELINE", "geom")    # plain | geom
+# plain by default now. Geometry rejection reaches the network as channels
+# 33-35 -- its metric and its verdict -- rather than as the zeros it already
+# wrote into R, because the stage MULTIPLIES and cannot undo a zero. Refining
+# the plain mask with the geometry test as guidance is strictly more room than
+# refining the mask it has already cut.
+BASELINE = os.environ.get("ROB_REFINE_BASELINE", "plain")   # plain | geom
 LAM_FP = float(os.environ.get("ROB_REFINE_LAM_FP", 8.0))
 LAM_FN = float(os.environ.get("ROB_REFINE_LAM_FN", 1.0))
 LAM_MERGE = float(os.environ.get("ROB_REFINE_LAM_MERGE", 1.0))
@@ -109,6 +118,34 @@ POOL_PER_FRAME = int(os.environ.get("ROB_REFINE_POOL", 40000))
 # that the network is trained to say "change nothing" on the vast majority of
 # pixels and its output means something where it does not.
 GATE = float(os.environ.get("ROB_REFINE_GATE", 0.02))
+
+# Visibility weighting on the label, in units of the gradient's own noise.
+#
+# The stored R* is the inverse-MSE optimal weight, 1/(1 + Delta^2/sigma^2), and
+# measured on real bursts HALF of what it marks for rejection is flat content
+# with a median flow error of 7.7 raw px -- 44% of it above 10 px. That is gross
+# search failure over featureless regions, which is the REPLACEMENT network's
+# problem (tools/rob_nn: "flat shadow onto flat shadow"), not this stage's. A
+# sub-pixel shift on flat content produces no visible error at all; it gets
+# flagged only because sigma is small there too, so a tiny Delta still clears
+# Delta/sigma > 1.
+#
+# So Delta^2 is weighted by whether there is structure present to show the
+# error:
+#
+#     vis = gmag^2 / (gmag^2 + (k sigma_grad)^2)
+#
+# noise-aware, dimensionless, and with no free scale beyond k. At k = 3 an edge
+# at three sigma of gradient noise counts half. Measured effect on the label:
+# rejection mass falls from 7.61% of pixels to 2.78%, the flat share of it from
+# 49% to 5%, and 81% of the rejections on real edges survive.
+#
+# Set 0 to disable, which reproduces the stored label exactly.
+#
+# This is a deliberate departure from a tuning-free target toward a perceptual
+# one. It does not endanger correctly aligned content: Delta is ~0 there
+# whatever the weight, so those pixels stay at R* = 1.
+VIS_K = float(os.environ.get("ROB_REFINE_VIS", 3.0))
 
 # Split by true flow error: that is what separates the regime this stage is
 # for from the regime the replacement network is for. Each stratum gets a
@@ -154,9 +191,29 @@ def merge_excess_np(w, rstar):
     return ((1.0 + w * w / rs) / (1.0 + w) ** 2) * (1.0 + rs) - 1.0
 
 
+def visible_rstar(px):
+    """R* with Delta^2 weighted by whether the error is visible. See VIS_K.
+
+    Recomputed from the stored Delta, sigma, gradient and noise rather than
+    regenerating the dataset -- the generator writes all four, so the weighting
+    is a training-time decision and can be swept without a two-hour rebuild.
+    """
+    D, S = px[..., CH_DELTA], px[..., CH_SIGMA]
+    if VIS_K <= 0.0:
+        return px[..., CH_RSTAR]
+    gmag, nsig = px[..., 12], px[..., 21]
+    # The gradient's own noise, with the same attenuation rr_features assumes:
+    # a central difference of 3x3 means of a 3-channel luma.
+    sig_g = nsig * 0.70710678 / (3.0 * np.sqrt(3.0))
+    ref = VIS_K * sig_g
+    vis = (gmag * gmag) / (gmag * gmag + ref * ref + 1e-20)
+    s2 = np.maximum(S, 1e-9) ** 2
+    return (s2 / (s2 + vis * D * D)).astype(np.float32)
+
+
 def target_q(px, baseline=BASELINE):
     R = baseline_R(px, baseline)
-    rstar = px[..., CH_RSTAR]
+    rstar = visible_rstar(px)
     q = np.clip(rstar / np.maximum(R, 1e-6), 0.0, 1.0)
     # The significance gate: where leaving R alone costs less than GATE of
     # excess merged MSE, the right answer is exactly "change nothing".
@@ -186,6 +243,7 @@ def usable(px, baseline=BASELINE, require_live=True):
     configurations 1 and 2 differ -- with it on, the two scored identically
     and the geometry test looked inert when it was not."""
     ok = finite(px)
+    ok &= np.isfinite(visible_rstar(px))
     if require_live:
         ok &= baseline_R(px, baseline) > 0.02
     return ok
@@ -329,8 +387,8 @@ def main():
     print(f"dataset {PREFIX}: {NF} frames {H}x{W}x{C}  "
           f"({n_train} train, {NF - n_train} held out)")
     print(f"baseline={BASELINE} arch={ARCH} kappa={KAPPA} gate={GATE} "
-          f"lam_fp={LAM_FP} lam_fn={LAM_FN} lam_merge={LAM_MERGE} "
-          f"lam_id={LAM_ID} steps={STEPS}")
+          f"vis_k={VIS_K} lam_fp={LAM_FP} lam_fn={LAM_FN} "
+          f"lam_merge={LAM_MERGE} lam_id={LAM_ID} steps={STEPS}")
 
     pools = build_pools(data, n_train, rng)
     live_strata = []

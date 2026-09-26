@@ -83,11 +83,19 @@ for line in fields.splitlines():
         continue
     if line.split()[0] in ("int", "float", "unsigned"):
         n_scalars += len([p for p in line.split(None, 1)[1].split(",") if p.strip()])
-if n_scalars * 4 != 64:
-    fail.append(f"RefineParams has {n_scalars} 4-byte fields = {n_scalars*4} bytes, "
-                "but both sides assert 64")
-if 'static_assert(sizeof(RefineParams) == 64' not in host:
-    fail.append("metal_gpu.mm no longer asserts sizeof(RefineParams) == 64")
+# Read the asserted size out of the host rather than hardcoding it here --
+# the struct grows when the kernel needs more, and a lint that has to be edited
+# in lockstep is a lint that gets edited wrong.
+m = re.search(r"static_assert\(sizeof\(RefineParams\) == (\d+)", host)
+if not m:
+    fail.append("metal_gpu.mm no longer asserts a size for RefineParams")
+else:
+    want = int(m.group(1))
+    if n_scalars * 4 != want:
+        fail.append(f"RefineParams has {n_scalars} 4-byte fields = {n_scalars*4} "
+                    f"bytes, but metal_gpu.mm asserts {want}")
+    if want % 16 != 0:
+        fail.append(f"RefineParams is {want} bytes, not a multiple of 16")
 
 # Forbidden in the shared header's CODE, per its own portability rules. Its
 # comments discuss these deliberately, so strip them first.

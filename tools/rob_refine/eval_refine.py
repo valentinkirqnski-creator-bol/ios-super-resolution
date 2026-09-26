@@ -42,7 +42,7 @@ SC = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SC)
 from train_refine import (NAMES, IN_CH, CH_RGEOM, CH_RSTAR, CH_FLOWERR,
                           CH_DELTA, CH_SIGMA, LOG_CH, RefineMLP, RefineCNN,
-                          load, features, signed_log_np, finite)
+                          load, features, signed_log_np, finite, visible_rstar)
 
 PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "refineset")
 CKPT = sys.argv[2] if len(sys.argv) > 2 else None
@@ -141,7 +141,7 @@ def main():
     for fi in held:
         px = np.asarray(data[fi], dtype=np.float32)
         ok = finite(px)
-        rstar = np.nan_to_num(px[..., CH_RSTAR])
+        rstar = np.nan_to_num(visible_rstar(px))
         R_plain = np.nan_to_num(px[..., 0])
         R_geom = np.nan_to_num(px[..., CH_RGEOM])
         full = np.ones_like(R_plain)
@@ -187,7 +187,7 @@ def main():
     print("=" * 78)
     px = np.asarray(data[held[0]], dtype=np.float32)
     ok = finite(px)
-    rstar = np.nan_to_num(px[..., CH_RSTAR])
+    rstar = np.nan_to_num(visible_rstar(px))
     R_plain, R_geom = np.nan_to_num(px[..., 0]), np.nan_to_num(px[..., CH_RGEOM])
     gmag, coh, lap = px[..., 12], px[..., 15], px[..., 16]
     nsig, bright = px[..., 21], px[..., 20]

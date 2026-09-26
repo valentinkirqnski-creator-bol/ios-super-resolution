@@ -1645,7 +1645,7 @@ static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
 // failure mode for a Metal argument struct -- the two copies drifting a field
 // apart and every value after it being garbage -- cannot happen here. The size
 // is asserted anyway, because setBytes takes a length.
-static_assert(sizeof(RefineParams) == 64, "RefineParams");
+static_assert(sizeof(RefineParams) == 80, "RefineParams");
 
 // The 761 compiled-in floats, uploaded once and kept. Tiny, but re-uploading
 // per comparison frame would be a pointless copy on the very path this stage
@@ -2564,6 +2564,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             rp.beta = cfg.noise_beta_robustness();
             rp.kappa = std::min(std::max(cfg.robustness_refine_max_reduction, 0.f), 1.f);
             rp.deadzone = std::min(std::max(cfg.robustness_refine_deadzone, 0.f), 1.f);
+            // Handed over whether or not the geometry test is enabled: the
+            // network is trained with its metric as guidance, so the channels
+            // must carry the same numbers either way.
+            rp.geom_relative = cfg.motion_geom_relative ? 1 : 0;
+            rp.geom_threshold = cfg.motion_geom_reject_threshold;
+            rp.geom_threshold_rel = cfg.motion_geom_reject_threshold_relative;
+            rp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
             enc = [cmd computeCommandEncoder];
             if (enc) {
                 [enc setBuffer:b_out offset:out_off_bytes atIndex:0];

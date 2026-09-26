@@ -57,7 +57,7 @@ inline constexpr int kRobustnessNnStripRows = 192;
 //
 // The refinement runs AFTER Eq. 9's 5x5 minimum, on the mask the merge would
 // otherwise consume, and is deliberately not dilated again.
-inline constexpr int kRobustnessRefineChannels = 33;
+inline constexpr int kRobustnessRefineChannels = 39;
 
 // Receptive-field radius in guide pixels. Zero for the pointwise (1x1-only)
 // network, which is what tools/rob_refine/train_refine.py produces by
@@ -1001,7 +1001,12 @@ struct Config {
     // only ~0.02-0.03 on the sqrt guide, so this must be LOW to reject anything:
     // ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     // drops more burst samples.
-    float motion_geom_reject_threshold = 0.02f;
+    // 0.0045, matching the value the Settings screen ships and the one the
+    // refinement's guidance channels are evaluated at. It was 0.02 here while
+    // Sources/CameraModel.swift defaulted to 0.0045, so every off-device
+    // harness measured a nearly inert geometry test while the app ran a far
+    // stricter one.
+    float motion_geom_reject_threshold = 0.0045f;
     // Exposure-invariant geometry rejection. The absolute form above weights the
     // within-tile error |E| by the ABSOLUTE reference gradient |grad I|, which
     // shrinks in dim scenes (sqrt guide: a scene at 1/4 the light has ~half the
@@ -1061,7 +1066,7 @@ struct Config {
     // 0.2 buys three quarters of the benefit by touching three percent of the
     // frame, which is the trade this stage was asked for. Lower it to act more
     // broadly, raise it to act only on the strongest cases.
-    float robustness_refine_deadzone = 0.20f;
+    float robustness_refine_deadzone = 0.05f;
 
     // The accumulated-robustness adaptive denoiser was removed; the reference
     // merge no longer enlarges its kernel from the accumulated robustness.

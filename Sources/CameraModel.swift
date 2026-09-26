@@ -251,7 +251,7 @@ struct TuningParams: Equatable, Codable {
     /// as the analytic mask produced it, so the stage stays a sparse
     /// correction. 0.2 is measured: it moves 3% of the frame and captures 77%
     /// of the available merge-error improvement (see types.h for the sweep).
-    var robustness_refine_deadzone: Float = 0.20
+    var robustness_refine_deadzone: Float = 0.05
     /// FALSE. It is now a Settings toggle, so its stored value is what the user
     /// sees; defaulting it to true while the gate also demands the decimate grey
     /// made it read "on" while being inert, which is worse than off.

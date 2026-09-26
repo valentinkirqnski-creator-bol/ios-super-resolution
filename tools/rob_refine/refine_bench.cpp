@@ -400,6 +400,15 @@ int main(int argc, char** argv) {
         rp.beta = work.noise_beta_robustness();
         rp.kappa = on.robustness_refine_max_reduction;
         rp.deadzone = on.robustness_refine_deadzone;
+        // The geometry-rejection guidance channels (33-35). Easy to forget,
+        // and forgetting is not benign: left zero, every pixel's |grad I|*|E|
+        // clears a zero threshold and gm_fire reads as 1 everywhere, which
+        // showed up here as 90,741 pixels of GPU-against-CPU disagreement that
+        // were entirely an artefact of this test block.
+        rp.geom_relative = work.motion_geom_relative ? 1 : 0;
+        rp.geom_threshold = work.motion_geom_reject_threshold;
+        rp.geom_threshold_rel = work.motion_geom_reject_threshold_relative;
+        rp.geom_noise_floor_mult = work.motion_geom_noise_floor_mult;
 
         if (curve_n <= 0) {
             std::printf("\nGPU parity: no noise curves (1.4 LUT mode?) -- skipped\n");
