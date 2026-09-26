@@ -2147,6 +2147,10 @@ Image build_robustness_refine_features(const RefStats& ref_stats,
     Image feat(strip_h, w, kRobustnessRefineChannels);
     parallel_rows(strip_h, cfg.num_threads, [&](int sy) {
         const int y = std::min(std::max(y0 + sy, 0), h - 1);
+        // The affine fit is per TILE and identical for every pixel in it, and
+        // x advances along a row, so it changes only every tile_size/sc pixels.
+        int aff_ty = -1, aff_tx = -1;
+        RefineAffine aff{};
         for (int x = 0; x < w; ++x) {
             RefineInputs in;
             for (int i = 0; i < 5; ++i)
@@ -2189,6 +2193,20 @@ Image build_robustness_refine_features(const RefStats& ref_stats,
             in.u = rawx - ((f32)ptx + 0.5f) * (f32)tile_size;
             in.v = rawy - ((f32)pty + 0.5f) * (f32)tile_size;
             in.tile_size = (f32)tile_size;
+
+            // Twin of the block in rr_gather; FlowField::flow is already the
+            // (ty*nx+tx)*2 layout rr_fit_affine expects, so the two read the
+            // same numbers and the GPU parity check covers this too.
+            if (pty != aff_ty || ptx != aff_tx) {
+                rr_fit_affine(flow.flow.data(), flow.ny, flow.nx, pty, ptx,
+                              (f32)tile_size, &aff);
+                aff_ty = pty; aff_tx = ptx;
+            }
+            in.aEx = flow.dx(pty, ptx) - (aff.a11 * in.u + aff.a12 * in.v + aff.t1);
+            in.aEy = flow.dy(pty, ptx) - (aff.a21 * in.u + aff.a22 * in.v + aff.t2);
+            in.a_res = aff.res;
+            in.a_rot = (aff.a21 - aff.a12) * (f32)tile_size;
+            in.a_div = (aff.a11 + aff.a22) * (f32)tile_size;
 
             f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
             f32 mxx = -mnx, mxy = -mnx;

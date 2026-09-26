@@ -43,7 +43,7 @@
 
 // Must match kRobustnessRefineChannels and the trained width. robustness.cpp
 // static_asserts the first against types.h so the two cannot drift.
-#define RR_CHANNELS 39
+#define RR_CHANNELS 47
 #define RR_WIDTH 16
 
 // Flat weight-buffer layout, shared by tools/rob_refine/export_metal_weights.py
@@ -59,7 +59,10 @@
 #define RR_OFF_B2      (RR_OFF_W2 + RR_WIDTH * RR_WIDTH)
 #define RR_OFF_W3      (RR_OFF_B2 + RR_WIDTH)             // [16]
 #define RR_OFF_B3      (RR_OFF_W3 + RR_WIDTH)             // [1]
-#define RR_WEIGHTS_N   (RR_OFF_B3 + 1)                    // 761
+// Derived, never a literal: metal_gpu.mm static_asserts the generated table
+// against it, so a channel count changed here without regenerating the weights
+// is a compile error rather than a silent misread of the wrong offsets.
+#define RR_WEIGHTS_N   (RR_OFF_B3 + 1)
 
 // Everything one pixel's decision depends on, gathered by the caller.
 //
@@ -83,6 +86,13 @@ struct RefineInputs {
     float noise_var_sum;   // summed per-channel modelled noise variance
     float gdxdx, gdydx;    // flow-field gradient, per raw pixel
     float gdxdy, gdydy;
+    // The local affine motion model, fitted by least squares over a window of
+    // tile vectors. See rr_fit_affine. aEx/aEy is the displacement error the
+    // model attributes to this pixel; a_res is how badly the model fits, which
+    // is the non-affine (parallax) part of the motion.
+    float aEx, aEy;
+    float a_res;
+    float a_rot, a_div;    // px across one tile
     float u, v;            // offset from the tile centre, raw pixels
     float tile_size;
     float Mspan;           // Eq. 7 local flow span
@@ -129,6 +139,106 @@ inline void rr_canonical_dir(float gx, float gy, float gmag,
     *ux = sx; *uy = sy;
 }
 
+
+// ---- the local affine motion model ---------------------------------------
+//
+// The refinement's strongest feature has always been E = -G.(u,v), the flow
+// field's gradient times the pixel's offset from its tile centre. G was a
+// CENTRAL DIFFERENCE of the immediately neighbouring tile vectors: a two-tap
+// estimate of a field whose every sample is a noisy block-match result, divided
+// by 2*tile_size, which amplifies that noise while the true gradient is small.
+//
+// Under rotation the true flow is exactly affine, so fitting
+//
+//     flow(p) = A (p - c) + t
+//
+// by least squares over a WINDOW of tile vectors uses 25 samples instead of 4.
+// Measured against the true per-pixel displacement error on a real burst, rank
+// correlation 0.76-0.77 against the central difference's 0.36-0.46, stable
+// across rotation magnitude where the central difference gets WORSE. It also
+// recovers the magnitude: at 0.1 degrees the true mean error is 0.92 raw px,
+// this predicts 0.96, the central difference 0.28.
+//
+// The quantity that matters is not the fitted flow but the DISAGREEMENT between
+// what the merge will use (this tile's own constant vector) and what the locally
+// consistent motion model says should be used at this pixel. That catches two
+// failures at once: the within-tile variation a single vector cannot represent,
+// and a tile whose vector is simply mis-estimated relative to its neighbours.
+//
+// The fit residual is a second, independent signal: rotation is affine and
+// parallax is not, so how badly the affine model fits the local tile vectors
+// measures the non-affine part of the motion directly. Nothing else here does.
+//
+// Refitted per pixel rather than prepassed per tile. It is redundant -- every
+// pixel in a tile gets the same fit -- but the flow field is a few hundred
+// kilobytes and stays in cache, and the alternative is another resident buffer
+// and another kernel on a path whose whole point is that it needs neither.
+#define RR_AFF_R 2          /* tile-window radius: 5x5 tiles */
+
+struct RefineAffine {
+    float a11, a12, a21, a22;   /* d(flow)/d(offset), raw px per raw px */
+    float t1, t2;               /* fitted flow at this tile's centre */
+    float res;                  /* RMS fit residual, raw px */
+    int   ok;                   /* 0 when the window was degenerate */
+};
+
+inline void rr_fit_affine(const RR_DEVICE float* flow, int ny, int nx,
+                          int ty, int tx, float tile_size,
+                          RR_THREAD RefineAffine* out) {
+    float Sw = 0.f, Suu = 0.f, Svv = 0.f, Suv = 0.f, Su = 0.f, Sv = 0.f;
+    float Sx = 0.f, Sxu = 0.f, Sxv = 0.f, Sy = 0.f, Syu = 0.f, Syv = 0.f;
+    for (int i = -RR_AFF_R; i <= RR_AFF_R; ++i)
+        for (int j = -RR_AFF_R; j <= RR_AFF_R; ++j) {
+            const int yy = ty + i, xx = tx + j;
+            if (yy < 0 || yy >= ny || xx < 0 || xx >= nx) continue;
+            const float u = (float)j * tile_size, v = (float)i * tile_size;
+            const int fi = (yy * nx + xx) * 2;
+            const float fx = flow[fi + 0], fy = flow[fi + 1];
+            Sw += 1.f; Suu += u * u; Svv += v * v; Suv += u * v;
+            Su += u; Sv += v;
+            Sx += fx; Sxu += fx * u; Sxv += fx * v;
+            Sy += fy; Syu += fy * u; Syv += fy * v;
+        }
+    // Normal equations against [u, v, 1]. Symmetric 3x3, solved by cofactors;
+    // the same matrix serves both components.
+    const float m00 = Suu, m01 = Suv, m02 = Su;
+    const float m11 = Svv, m12 = Sv, m22 = Sw;
+    const float c00 = m11 * m22 - m12 * m12;
+    const float c01 = m02 * m12 - m01 * m22;
+    const float c02 = m01 * m12 - m02 * m11;
+    const float det = m00 * c00 + m01 * c01 + m02 * c02;
+    const int fi0 = (ty * nx + tx) * 2;
+    if (!(det > 1e-12f || det < -1e-12f)) {
+        out->a11 = 0.f; out->a12 = 0.f; out->a21 = 0.f; out->a22 = 0.f;
+        out->t1 = flow[fi0 + 0]; out->t2 = flow[fi0 + 1];
+        out->res = 0.f; out->ok = 0;
+        return;
+    }
+    const float inv = 1.f / det;
+    const float c11 = m00 * m22 - m02 * m02;
+    const float c12 = m02 * m01 - m00 * m12;
+    const float c22 = m00 * m11 - m01 * m01;
+    out->a11 = (c00 * Sxu + c01 * Sxv + c02 * Sx) * inv;
+    out->a12 = (c01 * Sxu + c11 * Sxv + c12 * Sx) * inv;
+    out->t1  = (c02 * Sxu + c12 * Sxv + c22 * Sx) * inv;
+    out->a21 = (c00 * Syu + c01 * Syv + c02 * Sy) * inv;
+    out->a22 = (c01 * Syu + c11 * Syv + c12 * Sy) * inv;
+    out->t2  = (c02 * Syu + c12 * Syv + c22 * Sy) * inv;
+    out->ok = 1;
+    float ss = 0.f, n = 0.f;
+    for (int i = -RR_AFF_R; i <= RR_AFF_R; ++i)
+        for (int j = -RR_AFF_R; j <= RR_AFF_R; ++j) {
+            const int yy = ty + i, xx = tx + j;
+            if (yy < 0 || yy >= ny || xx < 0 || xx >= nx) continue;
+            const float u = (float)j * tile_size, v = (float)i * tile_size;
+            const int fi = (yy * nx + xx) * 2;
+            const float ex = out->a11 * u + out->a12 * v + out->t1 - flow[fi + 0];
+            const float ey = out->a21 * u + out->a22 * v + out->t2 - flow[fi + 1];
+            ss += ex * ex + ey * ey; n += 1.f;
+        }
+    out->res = sqrt(ss / rr_max(n, 1.f));
+}
+
 // The 24 feature channels. Documented once, in stages.h on
 // build_robustness_refine_features -- that comment is the contract with the
 // dataset generator and the trainer, and this is its implementation.
@@ -171,6 +281,16 @@ inline void rr_features(const RR_THREAD RefineInputs* in, RR_THREAD float* f) {
     f[7] = (in->gdxdx + in->gdydy) * in->tile_size;
     f[8] = (in->gdydx - in->gdxdy) * in->tile_size;
     f[9] = in->Mspan;
+
+    // ---- 39-45: the same geometry read off the least-squares affine model
+    // instead of a two-tap central difference. Same sign convention as E: the
+    // displacement the content lands at, relative to where it was wanted.
+    f[39] = in->aEx;
+    f[40] = in->aEy;
+    f[41] = sqrt(in->aEx * in->aEx + in->aEy * in->aEy);
+    f[43] = rr_log1p(in->a_res);
+    f[44] = in->a_rot;
+    f[45] = in->a_div;
 
     // ---- 10-16: image structure. Central differences on the luma window,
     // divided by sc so the gradient is per RAW pixel and |grad I| * |E| here
@@ -240,6 +360,17 @@ inline void rr_features(const RR_THREAD RefineInputs* in, RR_THREAD float* f) {
             res_abs += fabs(in->refl[i + 1][j + 1] - in->cmpl[i][j]);
     res_abs *= (1.f / 9.f);
     f[19] = rr_clamp(res_abs / rr_max(nsig_px, 1e-6f), 0.f, 64.f);
+
+    // Across the edge -- the component of the affine model's error that
+    // actually doubles an edge, as f[13] is for the central-difference E.
+    f[42] = in->aEx * ux + in->aEy * uy;
+    // The damage this predicts, in noise units: a displacement d across a
+    // gradient g shifts the fetched value by about d*g, and what decides
+    // whether that is visible is its size against the pixel's own noise. The
+    // network is a two-layer MLP over normalised inputs -- it can neither
+    // multiply nor divide -- so having the three factors as separate channels
+    // is not the same as having their product.
+    f[46] = rr_clamp(fabs(f[42]) * gmag / rr_max(nsig_px, 1e-6f), 0.f, 64.f);
 
     f[20] = rr_clamp(in->refl[2][2], 0.f, 1.f);
     f[21] = nsig_px * inv_sc;
@@ -653,6 +784,23 @@ inline void rr_gather(const RR_DEVICE float* ref_means,
     in->u = rawx - ((float)ptx + 0.5f) * (float)p->tile_size;
     in->v = rawy - ((float)pty + 0.5f) * (float)p->tile_size;
     in->tile_size = (float)p->tile_size;
+
+    // The same question asked of 25 tile vectors instead of 4, through a motion
+    // model that rotation satisfies exactly. The disagreement measured is
+    // between the vector the merge will actually fetch with -- this tile's own,
+    // constant across the tile -- and what the locally consistent motion says
+    // belongs at this pixel, so it carries both the within-tile variation a
+    // single vector cannot represent and a tile vector that is simply wrong.
+    RefineAffine aff;
+    rr_fit_affine(flow, p->flow_ny, p->flow_nx, pty, ptx,
+                  (float)p->tile_size, &aff);
+    in->aEx = flow[pidx * 2 + 0]
+            - (aff.a11 * in->u + aff.a12 * in->v + aff.t1);
+    in->aEy = flow[pidx * 2 + 1]
+            - (aff.a21 * in->u + aff.a22 * in->v + aff.t2);
+    in->a_res = aff.res;
+    in->a_rot = (aff.a21 - aff.a12) * (float)p->tile_size;
+    in->a_div = (aff.a11 + aff.a22) * (float)p->tile_size;
 
     // Eq. 7's local flow span over the 3x3 tile neighbourhood.
     float mnx = INFINITY, mny = INFINITY, mxx = -INFINITY, mxy = -INFINITY;

@@ -66,8 +66,21 @@ NAMES = ["R", "z_d", "tex", "s", "Ex", "Ey", "Emag", "div", "curl", "Mspan",
          # motion_geom_reject's own metric and verdict, as guidance
          "gm_abs", "gm_rel", "gm_fire",
          # a second, coarser scale, so small and large edges are separable
-         "edge_snr_c", "coh_c", "thick"]
-IN_CH = len(NAMES)                 # 36
+         "edge_snr_c", "coh_c", "thick",
+         # the local affine motion model: the same within-tile question asked
+         # of 25 tile vectors through a model rotation satisfies exactly,
+         # rather than of 4 through a central difference. Measured against the
+         # true per-pixel displacement error on the real bursts, rank
+         # correlation 0.76 where "Emag" gets 0.36-0.46 -- and flat in
+         # rotation magnitude, where the central difference degrades.
+         # "aE_res" is the part of the local motion the affine model canNOT
+         # explain, which is parallax; nothing else here measures that.
+         "aEx", "aEy", "aEmag", "aE_perp", "aE_res", "aE_rot", "aE_div",
+         # |aE_perp| * gmag / nsig: the predicted damage in noise units. A
+         # two-layer MLP over normalised inputs can neither multiply nor
+         # divide, so the three factors separately are not this.
+         "aE_z"]
+IN_CH = len(NAMES)
 # Derived, not hardcoded: they moved when the feature count changed, and a
 # stale literal here reads the target out of a feature column.
 CH_RGEOM = IN_CH
@@ -83,7 +96,8 @@ CH_SIGMA = IN_CH + 4
 # scale and crush everything real into a rounding error. Folded into the
 # exported graph, so nothing outside these weights has to know about it.
 LOG_CH = [1, 4, 5, 6, 7, 8, 9, 13, 14, 16, 17, 18, 19, 22, 23,
-          27, 28, 29, 32, 33, 34]
+          27, 28, 29, 32, 33, 34,
+          39, 40, 41, 42, 44, 45]
 
 KAPPA = float(os.environ.get("ROB_REFINE_KAPPA", 0.75))
 ARCH = os.environ.get("ROB_REFINE_ARCH", "mlp")             # mlp | cnn

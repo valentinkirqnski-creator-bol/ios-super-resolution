@@ -13,3 +13,11 @@ DerivedData/
 # macOS / Xcode noise
 .DS_Store
 xcuserdata/
+
+# Offline training harness: object files, linked binaries, Python caches
+*.o
+*.exe
+__pycache__/
+tools/rob_refine/refine_dataset
+tools/rob_refine/refine_bench
+tools/rob_nn/rob_dataset

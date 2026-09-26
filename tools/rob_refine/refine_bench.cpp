@@ -34,6 +34,13 @@
 #include "robustness_refine_shared.h"
 #include "robustness_refine_weights.h"
 #include <chrono>
+// Same guard metal_gpu.mm carries. The bench exists to prove the host and the
+// kernel agree, so a compiled-in table left over from a different channel count
+// must stop the build here too -- otherwise it silently reads the wrong offsets
+// and reports a parity failure that is really a stale file.
+static_assert(hhsr::kRobustnessRefineWeightCount == RR_WEIGHTS_N,
+              "regenerate robustness_refine_weights.h: "
+              "python tools/rob_refine/export_metal_weights.py <ckpt>");
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

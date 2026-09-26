@@ -31,7 +31,7 @@ CORE = os.path.normpath(os.path.join(SC, "..", "..", "core"))
 # Mirrors core/robustness_refine_shared.h. Asserted against the header below so
 # a change on either side is a build-time or run-time failure rather than a
 # silently wrong mask.
-RR_CHANNELS = 39
+RR_CHANNELS = 47
 RR_WIDTH = 16
 OFF_MU = 0
 OFF_SD = OFF_MU + RR_CHANNELS

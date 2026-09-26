@@ -57,7 +57,7 @@ inline constexpr int kRobustnessNnStripRows = 192;
 //
 // The refinement runs AFTER Eq. 9's 5x5 minimum, on the mask the merge would
 // otherwise consume, and is deliberately not dilated again.
-inline constexpr int kRobustnessRefineChannels = 39;
+inline constexpr int kRobustnessRefineChannels = 47;
 
 // Receptive-field radius in guide pixels. Zero for the pointwise (1x1-only)
 // network, which is what tools/rob_refine/train_refine.py produces by
