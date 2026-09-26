@@ -280,6 +280,60 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 //                   |agree_lk| reaches +0.352, and |t_lk| * |E_perp| +0.356 --
 //                   both above |E| alone, which is the best of the old features
 //
+//  ---- motion_geom_reject's own test, handed over as guidance rather than
+//  applied. It is a good detector and a blunt one; the network gets its metric
+//  and its verdict and is free to disagree, which it cannot do with the zeros
+//  the test would otherwise already have written into R.
+//
+//  33   gm_abs      |grad I| * |E|, the absolute criterion, in R's own units
+//  34   gm_rel      the exposure-invariant form: (|grad I| noise-subtracted,
+//                   divided by local brightness) * |E|
+//  35   gm_fire     1 when either criterion clears its threshold
+//
+//  ---- a second, coarser scale, so a small edge and a large one are separable
+//  rather than both just "an edge". Smooth THEN differentiate; pooling g^2 over
+//  a wider window does not do this and was measured not to (detection ratio
+//  1.00 between drop and keep pixels).
+//
+//  36   edge_snr_c  channel 25 on the 5x5 window's smoothed derivatives
+//  37   coh_c       coherence at that coarser scale
+//  38   thick       log ratio of the two scales' lambda1 -- positive when the
+//                   structure is fine, negative when it is broad
+//
+//  ---- the local affine motion model. Channels 4-9 read the flow field with a
+//  CENTRAL DIFFERENCE: a two-tap estimate, divided by 2*tile_size, of a field
+//  whose every sample is a noisy block-match result. Under rotation the true
+//  flow is exactly affine, so it is fitted by least squares over a 5x5 window
+//  of tile vectors -- 25 samples instead of 4 -- and the same questions asked
+//  again of the fit. See rr_fit_affine.
+//
+//  Measured on the two real bursts, rank correlation against the generator's
+//  recorded per-pixel flow error: 0.782 for channel 41 where channel 6 gets
+//  0.429, and 0.683 against 0.302 in the sub-pixel band below one pixel. Flat
+//  in rotation magnitude, where the central difference degrades. It also beats
+//  Mspan (0.591), which the trained model leaned on hardest -- and Mspan is per
+//  TILE, constant across the very tile whose interior this is resolving.
+//
+//  39   aEx         the flow this tile will be fetched with, minus what the
+//  40   aEy         affine model says belongs at this pixel. Same sign
+//                   convention as E. Catches two failures at once: the
+//                   within-tile variation one vector cannot represent, and a
+//                   tile vector that is simply wrong relative to its
+//                   neighbours -- the central difference sees neither cleanly
+//  41   aEmag       its length
+//  42   aE_perp     its component across the edge, as 13 is for E
+//  43   aE_res      log1p of the RMS fit residual. Rotation is affine and
+//                   parallax is not, so this is the non-affine part of the
+//                   local motion. Nothing else here measures it (0.562)
+//  44   aE_rot      the fit's antisymmetric part, px across one tile: channel
+//  45   aE_div      8 and 7 again, from 25 samples instead of 4
+//  46   aE_z        |aE_perp| * |grad I| / sigma, clamped. The predicted damage
+//                   in noise units -- a displacement across a gradient shifts
+//                   the fetched value by their product, and what decides
+//                   visibility is its size against the pixel's own noise. A
+//                   two-layer MLP over normalised inputs can neither multiply
+//                   nor divide, so the three factors separately are not this
+//
 // Emits exactly `strip_h` rows starting at source row y0, clamped to the
 // image. With kRobustnessRefineHalo == 0 (the pointwise net) any row range
 // is exact; a convolutional variant needs the same fully-inside-the-image

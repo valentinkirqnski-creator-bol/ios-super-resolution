@@ -205,7 +205,8 @@ weights.
 ## Pipeline
 
 ```bash
-# 1. training set from your own raws (29 float32 channels, guide resolution)
+# 1. training set from your own raws (52 float32 channels, guide resolution:
+#    47 features, then R_geom, R*, flow error, Delta, sigma)
 ./refine_dataset refineset 8 ref0.dng ref1.dng ...
 #    ROB_REFINE_STRIDE (3)     spatial decimation
 #    ROB_REFINE_WTV_MAX (0.8)  max within-tile variation, px/tile
