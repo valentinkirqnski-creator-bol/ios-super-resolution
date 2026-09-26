@@ -126,6 +126,18 @@ HOLDOUT = int(os.environ.get("ROB_REFINE_HOLDOUT", 8))
 WIDTH = int(os.environ.get("ROB_REFINE_WIDTH", 16))
 SEED = int(os.environ.get("ROB_REFINE_SEED", 0))
 POOL_PER_FRAME = int(os.environ.get("ROB_REFINE_POOL", 40000))
+# Ceiling on the pools' total size, in pixels, because POOL_PER_FRAME alone does
+# not bound them: the cost is per-frame times frames times strata, so it grows
+# with the dataset. Measured the hard way -- 240 frames at 40000 committed
+# 9.95 GB on a 13.8 GB machine, and the run spent 1.6 hours paging at 0.7 cores
+# with a 225 MB working set before it was killed. Nothing in the output said so;
+# it simply looked slow.
+#
+# 12M pixels is ~2.4 GB at 52 channels and ~10,000 pixels per parameter for the
+# model this trains, which is far past where more data changes the answer. The
+# per-frame count is reduced to fit, so every frame still contributes and the
+# stratification is untouched.
+POOL_TOTAL_MAX = int(os.environ.get("ROB_REFINE_POOL_TOTAL", 12_000_000))
 # Significance gate on the TARGET, in units of excess merged-pixel MSE.
 #
 # The inverse-MSE optimal weight R* is slightly below 1 almost everywhere,
@@ -370,6 +382,13 @@ def build_pools(data, n_train, rng, baseline=BASELINE):
     million random reads per run and dominates everything else; the pools are
     a couple of hundred MB and make a batch a fancy-index."""
     pools = {name: [] for name, _, _, _ in STRATA}
+    per_frame = min(POOL_PER_FRAME,
+                    max(1, POOL_TOTAL_MAX // max(1, n_train * len(STRATA))))
+    if per_frame < POOL_PER_FRAME:
+        print(f"pool: {POOL_PER_FRAME} -> {per_frame} px per frame per stratum "
+              f"({n_train} frames x {len(STRATA)} strata would be "
+              f"{n_train * len(STRATA) * POOL_PER_FRAME / 1e6:.0f}M px, "
+              f"capped at {POOL_TOTAL_MAX / 1e6:.0f}M)")
     for f in range(n_train):
         px = np.asarray(data[f], dtype=np.float32)
         ok = usable(px, baseline)
@@ -379,7 +398,7 @@ def build_pools(data, n_train, rng, baseline=BASELINE):
             ys, xs = np.nonzero(sel)
             if ys.size == 0:
                 continue
-            take = min(ys.size, POOL_PER_FRAME)
+            take = min(ys.size, per_frame)
             pick = rng.choice(ys.size, take, replace=False)
             pools[name].append(px[ys[pick], xs[pick], :])
     for k in list(pools):
