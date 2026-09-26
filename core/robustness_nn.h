@@ -59,4 +59,35 @@ bool robustness_nn_infer(const Image& feat, Image& out);
 // over can return the memory without waiting for the next failure.
 void robustness_nn_release_buffers();
 
+// ---- refinement network (RobustnessRefineNet, tools/rob_refine) ----------
+//
+// A SECOND, independent model with the opposite relationship to the analytic
+// mask. robustness_nn_infer above produces a mask that REPLACES Wronski
+// Eq. 5-9. These produce a keep-confidence q that MULTIPLIES it:
+//
+//     R_final = R * (1 - kappa * (1 - q))
+//
+// so the analytic mask stays authoritative and the network can only take
+// weight away, never add it. The two are independently toggled and can run
+// together, in which case the refinement refines whichever mask the
+// replacement stage left behind.
+//
+// The target is the failure Eq. 5-9 is structurally unable to see: with one
+// flow vector per tile, rotation and parallax leave a fraction-of-a-pixel
+// misalignment that grows toward the tile edges, doubling or thickening thin
+// edges while d^2/sigma^2 reads as MORE confident rather than less. See
+// types.h (kRobustnessRefineChannels) and tools/rob_refine/README.md.
+bool robustness_refine_available();
+
+// feat: kRobustnessRefineChannels interleaved planes in the order
+//       build_robustness_refine_features documents (stages.h).
+// out:  resized to feat.h x feat.w x 1, q in [0,1] -- 1 keep, 0 reject.
+//
+// Returns false on any failure, leaving `out` untouched; the caller then
+// leaves R exactly as the analytic mask produced it, which is the reason
+// enabling this can never make the pipeline worse than not enabling it.
+bool robustness_refine_infer(const Image& feat, Image& out);
+
+void robustness_refine_release_buffers();
+
 } // namespace hhsr

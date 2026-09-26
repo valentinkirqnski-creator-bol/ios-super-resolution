@@ -8,6 +8,10 @@
 #include "debug_utils.h"
 #include "prof.h"
 #include "mps_fft.h"
+// RR_WEIGHTS_N, for the static_assert that the generated table below matches
+// the layout the kernel reads, and the compiled-in weights themselves.
+#include "robustness_refine_shared.h"
+#include "robustness_refine_weights.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -1634,6 +1638,31 @@ struct RobHfLossParamsCPU {
 };
 static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
 
+// Learned refinement of the analytic mask (Config::robustness_refine_nn_enabled).
+//
+// No host mirror of the parameter block: RefineParams comes out of
+// robustness_refine_shared.h, which the kernel includes too, so the usual
+// failure mode for a Metal argument struct -- the two copies drifting a field
+// apart and every value after it being garbage -- cannot happen here. The size
+// is asserted anyway, because setBytes takes a length.
+static_assert(sizeof(RefineParams) == 64, "RefineParams");
+
+// The 761 compiled-in floats, uploaded once and kept. Tiny, but re-uploading
+// per comparison frame would be a pointless copy on the very path this stage
+// exists to keep cheap.
+static id<MTLBuffer> g_rob_refine_w = nil;
+
+static id<MTLBuffer> rob_refine_weights() {
+    if (g_rob_refine_w) return g_rob_refine_w;
+    static_assert(kRobustnessRefineWeightCount == RR_WEIGHTS_N,
+                  "generated weight table does not match the layout in "
+                  "robustness_refine_shared.h -- re-run "
+                  "tools/rob_refine/export_metal_weights.py");
+    g_rob_refine_w = buf(kRobustnessRefineWeights,
+                         sizeof(float) * (size_t)kRobustnessRefineWeightCount);
+    return g_rob_refine_w;
+}
+
 static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
                             id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
                             int guide_h, int guide_w, int nch,
@@ -2271,7 +2300,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
 static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,
                                            const FlowField& flow, int tile_size, const Config& cfg,
-                                           Image* s_select_out) {
+                                           Image* s_select_out, bool* refined_out) {
     if (!metal_gpu_init() || comp_raw.h <= 0 || comp_raw.w <= 0) return Image();
     if (ref_stats.means.h <= 0 || ref_stats.means.w <= 0) return Image();
     auto& c = ctx();
@@ -2283,6 +2312,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // falls back to the guide-resolution path below.
     if (cfg.robustness_raw_resolution_active() &&
         !false) {
+        // No refine kernel for this path: rob_refine_mask is guide-resolution
+        // only, so refined_out stays false and compute_robustness falls back to
+        // refining on the CPU (which needs means_hires, and declines if the
+        // hires statistics were never built).
         Image raw_res = compute_robustness_metal_raw_res_impl(comp_raw, flow, tile_size,
                                                                cfg, s_select_out);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
@@ -2496,6 +2529,60 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBytes:&sp length:sizeof(sp) atIndex:2];
     dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
     [enc endEncoding];
+
+    // ---- learned refinement (Config::robustness_refine_nn_enabled) --------
+    //
+    // One extra kernel over the finished mask. No feature planes, no readback,
+    // no Core ML: the network is pointwise, so its 24 features and both hidden
+    // layers live in each thread's registers. The CPU twin
+    // (apply_robustness_refinement) has to rebuild the guide, the local
+    // statistics and Eq. 6 on the host because RefStats comes back from this
+    // path with empty pixel vectors by design -- here all of that is already
+    // in the buffers bound below.
+    //
+    // In place on the mask: each thread reads R only at its own pixel.
+    //
+    // Deliberately NOT in the pipeline list metal_gpu_init() requires, so a
+    // missing rob_refine_mask leaves the whole Metal backend working and this
+    // one stage off, rather than falling the entire pipeline back to the CPU.
+    if (cfg.robustness_refine_nn_enabled) {
+        id<MTLComputePipelineState> refine = c.pipe("rob_refine_mask");
+        id<MTLBuffer> b_w = refine ? rob_refine_weights() : nil;
+        if (refine && b_w) {
+            RefineParams rp{};
+            rp.h = gh;
+            rp.w = gw;
+            rp.nch = nch;
+            rp.tile_size = tile_size;
+            rp.flow_ny = flow.ny;
+            rp.flow_nx = flow.nx;
+            rp.curve_n = (int)g_rob_curve_n;
+            rp.sqrt_index = cfg.robustness_guide_sqrt ? 1 : 0;
+            rp.ambiguous_enabled = amb_on ? 1 : 0;
+            rp.r_s1 = cfg.r_s1;
+            rp.alpha = cfg.noise_alpha_robustness();
+            rp.beta = cfg.noise_beta_robustness();
+            rp.kappa = std::min(std::max(cfg.robustness_refine_max_reduction, 0.f), 1.f);
+            rp.deadzone = std::min(std::max(cfg.robustness_refine_deadzone, 0.f), 1.f);
+            enc = [cmd computeCommandEncoder];
+            if (enc) {
+                [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
+                [enc setBuffer:b_gmeans offset:0 atIndex:1];
+                [enc setBuffer:b_ref_m offset:0 atIndex:2];
+                [enc setBuffer:b_ref_v offset:0 atIndex:3];
+                [enc setBuffer:b_std offset:0 atIndex:4];
+                [enc setBuffer:b_diff offset:0 atIndex:5];
+                [enc setBuffer:b_S offset:0 atIndex:6];
+                [enc setBuffer:b_flow offset:0 atIndex:7];
+                [enc setBuffer:b_match_amb offset:0 atIndex:8];
+                [enc setBuffer:b_w offset:0 atIndex:9];
+                [enc setBytes:&rp length:sizeof(rp) atIndex:10];
+                dispatch2(enc, refine, (NSUInteger)rp.w, (NSUInteger)rp.h);
+                [enc endEncoding];
+                if (refined_out) *refined_out = true;
+            }
+        }
+    }
 
     prof_tag_gpu(cmd, "robustness:all");
     [cmd commit];
@@ -4812,10 +4899,10 @@ RefStats init_robustness_metal(const Image& ref_raw, const Config& cfg) {
 
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
                                const FlowField& flow, int tile_size, const Config& cfg,
-                               Image* s_select_out) {
+                               Image* s_select_out, bool* refined_out) {
     @autoreleasepool {
         return compute_robustness_metal_impl(comp_raw, ref_stats, flow, tile_size, cfg,
-                                             s_select_out);
+                                             s_select_out, refined_out);
     }
 }
 

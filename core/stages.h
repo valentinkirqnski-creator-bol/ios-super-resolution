@@ -179,6 +179,120 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
                          Image* s_select_out = nullptr);
 
+// ---- learned refinement of the analytic mask (Config::
+// robustness_refine_nn_enabled) -------------------------------------------
+//
+// Feature planes for the refinement network, at the resolution `R` already
+// is, interleaved, kRobustnessRefineChannels of them. This layout is a
+// contract with tools/rob_refine/refine_dataset.cpp (writes the training
+// set) and tools/rob_refine/train_refine.py (consumes it); all three must be
+// changed together or the weights are being fed something they never saw.
+//
+//  idx  name        meaning (guide-resolution pixels; flow in RAW pixels)
+//   0   R           the analytic mask at this pixel, post Eq. 9 minimum --
+//                   the quantity being refined, so the net can learn "leave
+//                   an already-doubtful pixel alone"
+//   1   z_d         d^2 / sigma^2, Eq. 5's exponent argument
+//   2   tex         log1p(sigma^2 / channel-summed noise variance): how much
+//                   of sigma is the scene's own texture rather than noise.
+//                   This is the leniency that lets a doubled edge through
+//   3   s           the motion prior actually applied (s1 or s2)
+//   4   Ex          within-tile flow error, x. The flow field's gradient G
+//   5   Ey          (central difference of neighbouring tile vectors) times
+//                   the pixel's offset from its tile centre, NEGATED so it
+//                   reads as "the fetched content is displaced by E relative
+//                   to what we wanted" -- directly comparable with 18 below
+//   6   Emag        |E|
+//   7   div         divergence of the flow field, px across one tile
+//   8   curl        curl of the flow field, px across one tile
+//   9   Mspan       Eq. 7's local flow span over the 3x3 tile neighbourhood
+//  10   gx          reference gradient, x (guide units)
+//  11   gy          reference gradient, y
+//  12   gmag        |grad I|
+//  13   E_perp      E . g_hat -- the component of the within-tile error
+//                   ACROSS the edge. This is the one that doubles an edge;
+//                   an equal displacement along the edge is invisible
+//  14   E_par       |E x g_hat| -- the harmless component, given so the net
+//                   can tell the two apart rather than seeing only |E|
+//  15   coh         structure-tensor coherence (l1-l2)/(l1+l2). ~1 on a
+//                   clean edge, ~0 on text, foliage, repetitive texture and
+//                   noise -- the protection for the content that must NOT be
+//                   rejected for being high-frequency
+//  16   lap         Laplacian of the reference luma (thin lines, ringing)
+//  17   res         signed residual, reference luma - comparison luma fetched
+//                   at the estimated flow
+//  18   res_disp    -res / max(gmag, floor): the displacement the RESIDUAL
+//                   implies, in guide pixels. A real geometric misalignment
+//                   makes this agree with E_perp; a content change, a
+//                   specular flicker or an exposure difference does not
+//  19   res_z       3x3 mean |res| / noise sigma -- is the residual even
+//                   above the noise floor
+//  20   bright      local reference brightness
+//  21   nsig        modelled noise sigma at that brightness
+//  22   agree       E_perp * res_disp. Positive and large is the signature
+//                   the whole stage is built to find: the flow field predicts
+//                   a cross-edge error here AND the photometry shows one
+//  23   mismatch    |res_disp| - |E_perp|: residual the geometry does not
+//                   explain (content change, occlusion, a different failure)
+//
+// Emits exactly `strip_h` rows starting at source row y0, clamped to the
+// image. With kRobustnessRefineHalo == 0 (the pointwise net) any row range
+// is exact; a convolutional variant needs the same fully-inside-the-image
+// windowing build_robustness_nn_features documents.
+//
+// Lengths and directions are in RAW pixels throughout, the same units
+// Config::motion_geom_reject_threshold is expressed in, so the two tests are
+// directly comparable. Channels 13 and 18 are signed along a canonicalised
+// gradient direction (flipped so gy > 0), which makes their signs comparable
+// between pixels and makes 22 the sign-agreement it is meant to be.
+//
+// `R` selects the resolution: ref_stats.means/.stds when R is guide-sized,
+// .means_hires/.stds_hires when it is raw-sized, with comp_means matching.
+// d_sq/sigma_sq are Eq. 6's outputs for the same plane, passed in rather than
+// recomputed so this cannot drift from the mask it is refining -- the Metal
+// path does not return them, so its caller runs apply_noise_model itself.
+Image build_robustness_refine_features(const RefStats& ref_stats,
+                                       const Image& comp_means, const Image& R,
+                                       const Image& d_sq, const Image& sigma_sq,
+                                       const FlowField& flow, int tile_size,
+                                       const Config& cfg, int y0, int strip_h);
+
+// Eq. 6 on its own: the correspondence the mask scores (reference statistics
+// against comparison statistics fetched at the estimated flow) reduced to
+// d^2 and sigma^2. Exposed because two callers outside compute_robustness
+// need exactly these numbers -- apply_robustness_refinement, which must feed
+// the network the mask's own values rather than a lookalike, and
+// tools/rob_refine/refine_dataset.cpp, which must write the training set with
+// the same numbers inference will see. raw_res tells it whether comp_means
+// has already been warped into the reference frame (the raw-resolution path
+// warps during upscaling, so applying the flow again would double it).
+void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
+                               const Image& comp_means, const FlowField& flow,
+                               int tile_size, bool raw_res, const Config& cfg,
+                               Image& d_sq, Image& sigma_sq);
+
+// Eq. 7/8's per-tile motion prior s (r_s1 where the flow field is irregular,
+// r_s2 where it is not), one entry per tile. Exposed for the same reason as
+// robustness_correspondence: the refinement's feature builder and its GPU
+// parity harness both need the mask's own values rather than a lookalike.
+std::vector<f32> robustness_motion_prior(const FlowField& flow, const Config& cfg);
+
+// Applies the refinement network to `R` in place. comp_raw is needed only to
+// build the comparison guide statistics. A no-op (returning false, R
+// untouched) when the toggle is off, the model is unavailable, the feature
+// planes cannot be built, or inference fails -- so every failure mode is
+// "current behaviour", never "no mask".
+//
+// changed_frac, when non-null, receives the fraction of pixels the refinement
+// actually moved (outside Config::robustness_refine_deadzone). That number is
+// the headline the stage is judged on: this is supposed to be a sparse
+// correction, and a run that rewrites half the frame is broken however good
+// its loss looked.
+bool apply_robustness_refinement(Image& R, const Image& comp_raw,
+                                 const RefStats& ref_stats, const FlowField& flow,
+                                 int tile_size, const Config& cfg,
+                                 float* changed_frac = nullptr);
+
 // ---- kernels.cpp --------------------------------------------------------
 CovField estimate_kernels(const Image& raw, const Config& cfg);
 

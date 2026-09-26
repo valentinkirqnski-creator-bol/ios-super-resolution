@@ -564,6 +564,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
+    if (tuning[@"robustness_refine_nn_enabled"])
+        cfg.robustness_refine_nn_enabled = tuning[@"robustness_refine_nn_enabled"].boolValue;
+    if (tuning[@"robustness_refine_max_reduction"])
+        cfg.robustness_refine_max_reduction = tuning[@"robustness_refine_max_reduction"].floatValue;
+    if (tuning[@"robustness_refine_deadzone"])
+        cfg.robustness_refine_deadzone = tuning[@"robustness_refine_deadzone"].floatValue;
 }
 
 static std::string NSStringToStd(id value) {

@@ -235,6 +235,23 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
+    /// Learned REFINEMENT of the analytic mask -- a different network with the
+    /// opposite relationship to it from use_neural_robustness above. That one
+    /// replaces Wronski Eq. 5-9; this one keeps it authoritative and may only
+    /// multiply its output down, by at most refine_max_reduction, and leaves
+    /// anything inside refine_deadzone bit-identical. Targets the residual
+    /// sub-pixel misalignment that one flow vector per tile leaves under
+    /// rotation and parallax, which d^2/sigma^2 scores as MORE trustworthy
+    /// rather than less. Off by default; falls back to leaving R untouched if
+    /// the model is missing. See tools/rob_refine.
+    var robustness_refine_nn_enabled: Bool = false
+    /// kappa: the most weight the network may take from any one pixel.
+    var robustness_refine_max_reduction: Float = 0.75
+    /// Below this much predicted reduction the pixel is passed through exactly
+    /// as the analytic mask produced it, so the stage stays a sparse
+    /// correction. 0.2 is measured: it moves 3% of the frame and captures 77%
+    /// of the available merge-error improvement (see types.h for the sweep).
+    var robustness_refine_deadzone: Float = 0.20
     /// FALSE. It is now a Settings toggle, so its stored value is what the user
     /// sees; defaulting it to true while the gate also demands the decimate grey
     /// made it read "on" while being inert, which is worse than off.
@@ -305,6 +322,8 @@ struct TuningParams: Equatable, Codable {
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case kernel_selection_linear
         case use_neural_robustness
+        case robustness_refine_nn_enabled, robustness_refine_max_reduction
+        case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -398,6 +417,9 @@ struct TuningParams: Equatable, Codable {
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
+        robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
+        robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
+        robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
         hdr_vibrance = try c.decodeIfPresent(Float.self, forKey: .hdr_vibrance) ?? hdr_vibrance
     }
@@ -2167,6 +2189,9 @@ final class CameraModel: NSObject, ObservableObject {
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
+            "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
+            "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
+            "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),
             "hdr_vibrance": NSNumber(value: tuningParams.hdr_vibrance),
         ]

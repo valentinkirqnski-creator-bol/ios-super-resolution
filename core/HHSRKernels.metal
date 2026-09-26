@@ -6,6 +6,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// The refinement network's arithmetic, shared verbatim with robustness.cpp so
+// the CPU mask and the GPU mask cannot drift. See rob_refine_mask below.
+#include "robustness_refine_shared.h"
+
 constant float PI = 3.14159265358979323846f;
 
 struct RawDecodeParams {
@@ -2354,6 +2358,51 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
         }
     }
     out[gid.y * p.w + gid.x] = mn;
+}
+
+// ---- learned refinement of the analytic mask (Config::
+// robustness_refine_nn_enabled) ------------------------------------------
+//
+// One kernel, no intermediate buffers, nothing read back to the host.
+//
+// That is only possible because the network is POINTWISE: the 24 features and
+// both 16-wide hidden layers live in this thread's registers and never reach
+// memory, so the whole stage costs one pass over the mask. The CPU twin has to
+// materialise a 24-channel feature plane, hand it to Core ML in strips and read
+// the result back, which is what puts that path at ~400 ms plus a 49 MB strip.
+// Here there is no feature plane at all, and Core ML is not involved: the 761
+// weights are compiled in (robustness_refine_weights.h).
+//
+// Runs AFTER rob_local_min_5x5, on the mask the merge would otherwise consume,
+// and is deliberately not dilated again. In place: every thread reads R only at
+// its own pixel, so there is no ordering hazard.
+//
+// The body is one call. Everything it does -- the gather, Eq. 6, the 24
+// features, the network, the bounded multiply -- is in
+// robustness_refine_shared.h, compiled identically into robustness.cpp. That is
+// what makes it testable off-device: tools/rob_refine/refine_bench.cpp runs the
+// same functions against the CPU implementation on real frames.
+kernel void rob_refine_mask(device float* R [[buffer(0)]],
+                            device const float* comp_means [[buffer(1)]],
+                            device const float* ref_means [[buffer(2)]],
+                            device const float* ref_vars [[buffer(3)]],
+                            device const float* std_curve [[buffer(4)]],
+                            device const float* diff_curve [[buffer(5)]],
+                            device const float* S [[buffer(6)]],
+                            device const float* flow [[buffer(7)]],
+                            device const uint* match_ambiguous [[buffer(8)]],
+                            device const float* weights [[buffer(9)]],
+                            constant RefineParams& p [[buffer(10)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(p.w) || gid.y >= uint(p.h)) return;
+    // Copied out of the constant address space so the shared helpers can take a
+    // plain thread pointer and stay free of Metal address-space qualifiers.
+    // 64 bytes per thread, which the compiler keeps in registers.
+    RefineParams pp = p;
+    const uint ri = gid.y * uint(p.w) + gid.x;
+    R[ri] = rr_refine_pixel(ref_means, ref_vars, comp_means, std_curve, diff_curve,
+                            S, flow, match_ambiguous, weights, &pp,
+                            int(gid.y), int(gid.x), R[ri]);
 }
 
 // L1 BM for ts==16: one thread per tile. Per-shift costs use the same

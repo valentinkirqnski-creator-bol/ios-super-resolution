@@ -36,6 +36,40 @@ inline constexpr int kRobustnessNnChannels = 13;
 inline constexpr int kRobustnessNnHalo = 8;
 inline constexpr int kRobustnessNnStripRows = 192;
 
+// ---- Learned robustness REFINEMENT (robustness_nn.h, the *_refine_* entry
+// points; tools/rob_refine) -----------------------------------------------
+//
+// A different network with a different job from the one above. That one
+// REPLACES Wronski Eq. 5-9. This one keeps Eq. 5-9 as the authority and only
+// multiplies its output down:
+//
+//     R_final = R_wronski * (1 - kappa * (1 - q_keep))
+//
+// so it can never trust a pixel Eq. 5-9 rejected, and kappa bounds how much
+// of any one pixel it is allowed to take away. It exists for one failure the
+// analytic mask is structurally unable to see: the flow field carries ONE
+// VECTOR PER TILE, so under rotation or parallax the true displacement varies
+// across the tile and the fetched content is off by a fraction of a pixel
+// toward the tile edges. That leaves thin doubled or thickened edges which
+// d^2/sigma^2 scores as MORE trustworthy rather than less -- sigma rises with
+// the edge's own texture faster than d does (rotation-tile-artifact; and see
+// Config::motion_geom_reject_enabled, the hand-designed version of this test).
+//
+// The refinement runs AFTER Eq. 9's 5x5 minimum, on the mask the merge would
+// otherwise consume, and is deliberately not dilated again.
+inline constexpr int kRobustnessRefineChannels = 24;
+
+// Receptive-field radius in guide pixels. Zero for the pointwise (1x1-only)
+// network, which is what tools/rob_refine/train_refine.py produces by
+// default: every feature needing a neighbourhood -- the structure tensor, the
+// flow gradient, the residual's local mean -- is computed in
+// build_robustness_refine_features, so the network itself is per-pixel and a
+// strip's output is trivially identical to whole-plane inference. The 5x5
+// convolutional variant (ROB_REFINE_ARCH=cnn) has radius 2; shipping that
+// model means raising this to match or the strips seam.
+inline constexpr int kRobustnessRefineHalo = 0;
+inline constexpr int kRobustnessRefineStripRows = 256;
+
 struct Image {
     int h = 0;
     int w = 0;
@@ -983,6 +1017,51 @@ struct Config {
     bool  motion_geom_relative = true;
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
+
+    // Learned refinement of the analytic mask (kRobustnessRefineChannels
+    // above; robustness_nn.h's *_refine_* entry points; tools/rob_refine).
+    // Runs on top of everything else -- Eq. 5-9, the s1/s2 prior, the
+    // ambiguous-match demotion, motion_geom_reject above and Eq. 9's minimum
+    // -- and can only take mask away:
+    //
+    //     R_final = R * (1 - refine_max_reduction * (1 - q_keep))
+    //
+    // R == 0 therefore stays 0 whatever the network says, and no pixel loses
+    // more than refine_max_reduction of its weight. Off by default, and
+    // falls back to leaving R untouched whenever the model is missing or
+    // fails to load, so enabling it can never leave the pipeline maskless.
+    bool  robustness_refine_nn_enabled = false;
+    // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
+    // quarter of the weight even where it is most certain, because the cost
+    // of a wrong rejection (a correctly aligned, aliased, high-frequency
+    // pixel silently dropped from the burst) is a permanent loss of the
+    // detail super-resolution exists to recover, while the cost of a missed
+    // artifact is one subtly doubled edge.
+    float robustness_refine_max_reduction = 0.75f;
+    // Dead zone on 1 - q_keep. Below this the pixel is left EXACTLY as the
+    // analytic mask produced it, bit for bit.
+    //
+    // This is the sparsity control, and 0.2 is measured rather than guessed.
+    // The network's target is the inverse-MSE optimal merge weight, which is
+    // a little below 1 almost everywhere, so without a dead zone the stage
+    // touches the whole frame for almost no benefit -- and a reduction applied
+    // uniformly to every comparison frame is close to inert anyway, since the
+    // merge normalises num/den and only the differences between frames
+    // survive. Swept on eight held-out frames (tools/rob_refine/eval_refine.py),
+    // at kappa 0.75, against the excess merged-pixel MSE the analytic mask
+    // alone incurs:
+    //
+    //   dead   pixels moved   false rejection   share of the available gain
+    //   0.00        100 %          0.01 %                100 %
+    //   0.05         71 %          0.01 %                 98 %
+    //   0.10         16 %          0.01 %                 89 %
+    //   0.20        3.1 %          0.01 %                 77 %
+    //   0.35        1.2 %          0.01 %                 63 %
+    //
+    // 0.2 buys three quarters of the benefit by touching three percent of the
+    // frame, which is the trade this stage was asked for. Lower it to act more
+    // broadly, raise it to act only on the strongest cases.
+    float robustness_refine_deadzone = 0.20f;
 
     // The accumulated-robustness adaptive denoiser was removed; the reference
     // merge no longer enlarges its kernel from the accumulated robustness.

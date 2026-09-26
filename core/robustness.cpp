@@ -1,5 +1,6 @@
 #include "stages.h"
 #include "robustness_nn.h"
+#include "robustness_refine_shared.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
 #include "prof.h"
@@ -1688,9 +1689,18 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
     return feat;
 }
 
-Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
-                         const FlowField& flow, int tile_size, const Config& cfg,
-                         Image* s_select_out) {
+// The analytic mask exactly as it has always been. compute_robustness below
+// is a thin wrapper that runs the learned refinement on top of whatever this
+// returns, so every path through here -- Metal, raw-resolution, the learned
+// replacement, the two degenerate early returns -- gets the same treatment
+// without each having to remember to ask for it.
+// refined_on_gpu is set when the Metal path's rob_refine_mask kernel has
+// already applied the learned refinement, so the wrapper below does not apply
+// it a second time.
+static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_stats,
+                                     const FlowField& flow, int tile_size,
+                                     const Config& cfg, Image* s_select_out,
+                                     bool* refined_on_gpu) {
     if (!cfg.robustness_enabled) {
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
@@ -1802,7 +1812,7 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     // LUT replaces it), so it is not necessarily slower overall.
     if (!active_noise_lut14().valid) {
         Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
-                                             s_select_out);
+                                             s_select_out, refined_on_gpu);
         if (gpu.h > 0 && gpu.w > 0) return gpu;
         return Image();
     }
@@ -1960,6 +1970,367 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
         }
     }
     return local_min_5x5(R);
+}
+
+// ======================= learned refinement (Config::
+// robustness_refine_nn_enabled) ===========================================
+//
+// See stages.h for the channel contract and types.h for why this stage
+// exists at all. The short version: Eq. 5-9 decides from a photometric
+// statistic, and the residual misalignment left by ONE FLOW VECTOR PER TILE
+// under rotation or parallax makes that statistic more confident, not less
+// -- sigma picks up the edge's own texture faster than d picks up a
+// fraction-of-a-pixel shift. Everything below is in service of handing a
+// network the geometric evidence instead, and of making sure it can only
+// ever subtract.
+
+std::vector<f32> robustness_motion_prior(const FlowField& flow, const Config& cfg) {
+    return compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+}
+
+void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
+                               const Image& comp_means, const FlowField& flow,
+                               int tile_size, bool raw_res, const Config& cfg,
+                               Image& d_sq, Image& sigma_sq) {
+    d_sq = Image(); sigma_sq = Image();
+    if (ref_means.h <= 0 || ref_means.w <= 0 || ref_means.c <= 0) return;
+    if (comp_means.c != ref_means.c) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return;
+
+    Image d_p(ref_means.h, ref_means.w, ref_means.c);
+    parallel_rows(ref_means.h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 fx = 0.f, fy = 0.f;
+            if (!raw_res) {
+                // Nearest tile, and the displacement halved into guide units:
+                // the same sampling compute_robustness_core uses, because the
+                // mask has to score the correspondence the MERGE will fetch.
+                const int pty = std::min(flow.ny - 1,
+                    std::max(0, (int)((2.f * (f32)y + 0.5f) / (f32)tile_size)));
+                const int ptx = std::min(flow.nx - 1,
+                    std::max(0, (int)((2.f * (f32)x + 0.5f) / (f32)tile_size)));
+                fx = 0.5f * flow.dx(pty, ptx);
+                fy = 0.5f * flow.dy(pty, ptx);
+            }
+            for (int ch = 0; ch < ref_means.c; ++ch) {
+                const f32 cv = raw_res
+                    ? comp_means.at(y, x, ch)
+                    : sample_bilinear_or_inf(comp_means, (f32)y + fy, (f32)x + fx, ch);
+                d_p.at(y, x, ch) = std::isfinite(cv)
+                    ? std::fabs(ref_means.at(y, x, ch) - cv)
+                    : std::numeric_limits<f32>::infinity();
+            }
+        }
+    });
+    const NoiseLut14& lut14 = active_noise_lut14();
+    if (lut14.valid && !cfg.debug_noise_model_disabled) {
+        apply_noise_model_1p4(d_p, ref_means, ref_vars, lut14, d_sq, sigma_sq);
+    } else {
+        const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
+        if (ref_means.c == 3)
+            for (int ch = 0; ch < 3; ++ch) nc_ch[ch] = &mask_noise_curves_channel(cfg, ch);
+        else
+            nc_ch[0] = &mask_noise_curves(cfg);
+        apply_noise_model(d_p, ref_means, ref_vars, nc_ch, d_sq, sigma_sq,
+                          cfg.robustness_guide_sqrt);
+    }
+}
+
+static_assert(RR_CHANNELS == kRobustnessRefineChannels,
+              "robustness_refine_shared.h and types.h disagree on the channel "
+              "count; the trained weights match one of them");
+
+Image build_robustness_refine_features(const RefStats& ref_stats,
+                                       const Image& comp_means, const Image& R,
+                                       const Image& d_sq, const Image& sigma_sq,
+                                       const FlowField& flow, int tile_size,
+                                       const Config& cfg, int y0, int strip_h) {
+    if (R.h <= 0 || R.w <= 0 || strip_h <= 0) return Image();
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return Image();
+
+    // Which set of reference statistics this mask was made from. Decided by
+    // matching R's own dimensions rather than by reading the toggle, for the
+    // same reason merge.cpp does: the raw-resolution path silently falls back
+    // to guide resolution when the hires stats are missing, so the flag is not
+    // the authority on what actually ran.
+    const bool raw_res = (R.h != ref_stats.means.h || R.w != ref_stats.means.w);
+    const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
+    const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
+    if (rm.h != R.h || rm.w != R.w || rm.c < 1) return Image();
+    // Dimensions are not enough: on the Metal path RefStats can carry shape
+    // with the pixel vectors empty (the statistics stay GPU-resident), and
+    // indexing that reads off the end of an empty vector on every pixel.
+    if (rm.data.size() < (size_t)rm.h * rm.w * rm.c ||
+        rv.data.size() < (size_t)rv.h * rv.w * rv.c)
+        return Image();
+    if (comp_means.c != rm.c || comp_means.h <= 0 || comp_means.w <= 0) return Image();
+    if (d_sq.h != R.h || d_sq.w != R.w || sigma_sq.h != R.h || sigma_sq.w != R.w)
+        return Image();
+
+    const int h = R.h, w = R.w, nch = rm.c;
+    // Raw pixels per feature pixel. Every length reaching rr_features is
+    // converted with it, so |E| here and motion_geom_reject_threshold there
+    // are the same quantity.
+    const f32 sc = raw_res ? 1.f : 2.f;
+    const f32 inv2ts = 1.f / (2.f * (f32)tile_size);
+
+    const std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+
+    // ---- two scalar luma planes for the strip, built once -----------------
+    // Everything spatial in rr_features -- the gradient, the 3x3 structure
+    // tensor, the Laplacian, the local mean residual -- would otherwise
+    // re-read nch interleaved channels for every tap, which is ~200 scattered
+    // loads per output pixel and, measured, 1.8 s per 3 MP frame against
+    // 0.27 s this way. The Metal kernel does gather per thread instead: on a
+    // GPU the scattered reads are cheap and a prepass would cost a buffer.
+    //
+    // The comparison plane is sampled WHERE THE FLOW POINTS, which is also a
+    // correctness fix: the local mean residual previously differenced the
+    // reference against the comparison frame at the same coordinate, with no
+    // flow applied at all, so channel 19 was measuring the scene's global
+    // motion rather than the residual after alignment.
+    //
+    // Two rows of margin: the structure tensor evaluates a gradient at y+-1,
+    // and that gradient reaches y+-2.
+    const int MARGIN = 2;
+    const int lum_h = strip_h + 2 * MARGIN;
+    std::vector<f32> refl((size_t)lum_h * w), cmpl((size_t)lum_h * w);
+    // Divide rather than multiply by a reciprocal: rr_luma in the shared header
+    // divides, and the two differ by up to one ULP. Measured, that alone was
+    // the entire disagreement between this path and the GPU one on 28 of 3.28
+    // million pixels, so matching it is free and makes the parity check exact
+    // enough to be worth trusting.
+    const f32 fnch = (f32)nch;
+    parallel_rows(lum_h, cfg.num_threads, [&](int ly) {
+        const int y = std::min(std::max(y0 - MARGIN + ly, 0), h - 1);
+        f32* rrow = &refl[(size_t)ly * w];
+        f32* crow = &cmpl[(size_t)ly * w];
+        for (int x = 0; x < w; ++x) {
+            f32 s = 0.f;
+            for (int c = 0; c < nch; ++c) s += rm.at(y, x, c);
+            rrow[x] = s / fnch;
+
+            f32 cs = 0.f;
+            bool ok = true;
+            if (raw_res) {
+                // upscale_warp_stats already applied the flow when building
+                // the hires comparison statistics, so the correct sample sits
+                // at (y,x) and shifting again would double-apply it.
+                for (int c = 0; c < nch; ++c) cs += comp_means.at(y, x, c);
+            } else {
+                const f32 rawy = sc * (f32)y + 0.5f * (sc - 1.f);
+                const f32 rawx = sc * (f32)x + 0.5f * (sc - 1.f);
+                auto cl0 = [](int a, int hi) { return a < 0 ? 0 : (a >= hi ? hi - 1 : a); };
+                const int pty = cl0((int)((rawy + 0.5f) / (f32)tile_size), flow.ny);
+                const int ptx = cl0((int)((rawx + 0.5f) / (f32)tile_size), flow.nx);
+                const f32 fyg = 0.5f * flow.dy(pty, ptx);
+                const f32 fxg = 0.5f * flow.dx(pty, ptx);
+                for (int c = 0; c < nch; ++c) {
+                    const f32 v = sample_bilinear_or_inf(comp_means, (f32)y + fyg,
+                                                         (f32)x + fxg, c);
+                    if (!std::isfinite(v)) { ok = false; break; }
+                    cs += v;
+                }
+            }
+            // The flow points outside the comparison frame. Eq. 6 gives that
+            // pixel d = inf and R = 0, so the refinement has nothing left to
+            // take; matching the reference makes the residual zero rather than
+            // infinite, which keeps the features finite.
+            crow[x] = ok ? cs / fnch : rrow[x];
+        }
+    });
+    auto plane_at = [&](const std::vector<f32>& p, int sy, int x) -> f32 {
+        const int ly = std::min(std::max(sy + MARGIN, 0), lum_h - 1);
+        return p[(size_t)ly * w + (size_t)std::min(std::max(x, 0), w - 1)];
+    };
+
+    Image feat(strip_h, w, kRobustnessRefineChannels);
+    parallel_rows(strip_h, cfg.num_threads, [&](int sy) {
+        const int y = std::min(std::max(y0 + sy, 0), h - 1);
+        for (int x = 0; x < w; ++x) {
+            RefineInputs in;
+            for (int i = 0; i < 5; ++i)
+                for (int j = 0; j < 5; ++j)
+                    in.refl[i][j] = plane_at(refl, sy + i - 2, x + j - 2);
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    in.cmpl[i][j] = plane_at(cmpl, sy + i - 1, x + j - 1);
+
+            // ---- tile addressing. Nearest tile, deliberately: this is the
+            // vector the merge will actually fetch with, and the quantity
+            // being judged is how badly THAT vector misrepresents the motion
+            // inside its own tile. Smoothing it between tile centres would
+            // describe a flow field the merge does not use.
+            const f32 rawy = sc * (f32)y + 0.5f * (sc - 1.f);
+            const f32 rawx = sc * (f32)x + 0.5f * (sc - 1.f);
+            auto clt = [](int a, int hi) { return a < 0 ? 0 : (a >= hi ? hi - 1 : a); };
+            const int pty = clt((int)((rawy + 0.5f) / (f32)tile_size), flow.ny);
+            const int ptx = clt((int)((rawx + 0.5f) / (f32)tile_size), flow.nx);
+            const size_t pidx = (size_t)pty * flow.nx + ptx;
+            const int ptu = clt(pty - 1, flow.ny), ptd = clt(pty + 1, flow.ny);
+            const int pxl = clt(ptx - 1, flow.nx), pxr = clt(ptx + 1, flow.nx);
+
+            in.R = R.at(y, x);
+            in.d_sq = d_sq.at(y, x);
+            in.sigma_sq = sigma_sq.at(y, x);
+            f32 noise_var_sum = 0.f;
+            for (int c = 0; c < nch; ++c)
+                noise_var_sum += guide_noise_var(cfg, nch, c, rm.at(y, x, c));
+            in.noise_var_sum = noise_var_sum;
+            in.gdxdx = (flow.dx(pty, pxr) - flow.dx(pty, pxl)) * inv2ts;
+            in.gdydx = (flow.dy(pty, pxr) - flow.dy(pty, pxl)) * inv2ts;
+            in.gdxdy = (flow.dx(ptd, ptx) - flow.dx(ptu, ptx)) * inv2ts;
+            in.gdydy = (flow.dy(ptd, ptx) - flow.dy(ptu, ptx)) * inv2ts;
+            in.u = rawx - ((f32)ptx + 0.5f) * (f32)tile_size;
+            in.v = rawy - ((f32)pty + 0.5f) * (f32)tile_size;
+            in.tile_size = (f32)tile_size;
+
+            f32 mnx = std::numeric_limits<f32>::infinity(), mny = mnx;
+            f32 mxx = -mnx, mxy = -mnx;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const int yy = pty + i, xx = ptx + j;
+                    if (yy < 0 || yy >= flow.ny || xx < 0 || xx >= flow.nx) continue;
+                    const f32 vx = flow.dx(yy, xx), vy = flow.dy(yy, xx);
+                    mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
+                    mny = std::min(mny, vy); mxy = std::max(mxy, vy);
+                }
+            const f32 spx = (mxx > mnx) ? (mxx - mnx) : 0.f;
+            const f32 spy = (mxy > mny) ? (mxy - mny) : 0.f;
+            in.Mspan = std::sqrt(spx * spx + spy * spy);
+
+            f32 s_prior = S[pidx];
+            if (cfg.flow_reject_ambiguous_enabled &&
+                pidx < flow.match_ambiguous.size() && flow.match_ambiguous[pidx] != 0u)
+                s_prior = std::min(s_prior, cfg.r_s1);
+            in.s_prior = s_prior;
+            in.sc = sc;
+            in.nch = nch;
+
+            rr_features(&in, &feat.at(sy, x, 0));
+        }
+    });
+    return feat;
+}
+
+bool apply_robustness_refinement(Image& R, const Image& comp_raw,
+                                 const RefStats& ref_stats, const FlowField& flow,
+                                 int tile_size, const Config& cfg,
+                                 float* changed_frac) {
+    if (changed_frac) *changed_frac = 0.f;
+    if (!cfg.robustness_refine_nn_enabled) return false;
+    if (R.h <= 0 || R.w <= 0 || R.c != 1) return false;
+    // compute_robustness_metal returns dimensions with no pixels when the mask
+    // stays GPU-resident for the merge. Nothing on the host can refine that --
+    // and nothing needs to, because the GPU path refines in its own kernel; the
+    // only way to arrive here with an empty mask is that kernel being absent,
+    // in which case leaving R alone is the correct fail-closed behaviour.
+    if (R.data.size() < (size_t)R.h * (size_t)R.w) return false;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return false;
+    if (!robustness_refine_available()) return false;
+
+#ifdef __APPLE__
+    // The Metal path keeps the reference statistics on the GPU; bring them
+    // across once per burst, exactly as the replacement network's caller does.
+    if (ref_stats.means.data.empty()) {
+        RefStats* mutable_stats = const_cast<RefStats*>(&ref_stats);
+        if (!metal_fetch_host_ref_stats(*mutable_stats)) return false;
+    }
+#endif
+    const bool raw_res = (R.h != ref_stats.means.h || R.w != ref_stats.means.w);
+    const Image& rm = raw_res ? ref_stats.means_hires : ref_stats.means;
+    const Image& rv = raw_res ? ref_stats.stds_hires : ref_stats.stds;
+    if (rm.h != R.h || rm.w != R.w) return false;
+    if (rm.data.size() < (size_t)rm.h * rm.w * rm.c ||
+        rv.data.size() < (size_t)rv.h * rv.w * rv.c)
+        return false;
+
+    // Comparison statistics on the same lattice as R, by the same route the
+    // mask took to get there.
+    Image comp_means;
+    {
+        Image guide = compute_guide(comp_raw, cfg);
+        Image comp_vars;
+        local_stats_3x3(guide, comp_means, comp_vars);
+        if (raw_res)
+            comp_means = upscale_warp_stats(comp_means, /*is_ref=*/false, &flow,
+                                            tile_size, cfg.num_threads, false);
+    }
+    if (comp_means.h <= 0 || comp_means.w <= 0) return false;
+
+    // Eq. 6 again, for the two channels that have to be the mask's own
+    // numbers rather than a reimplementation of them.
+    Image d_sq, sigma_sq;
+    robustness_correspondence(rm, rv, comp_means, flow, tile_size, raw_res, cfg,
+                              d_sq, sigma_sq);
+    if (d_sq.h != rm.h || sigma_sq.h != rm.h) return false;
+
+    // Strips, for the same reason the replacement network uses them: the
+    // weights are negligible but the activations are not, and this pipeline
+    // is already close enough to the footprint limit that a gigabyte of
+    // intermediates is a jetsam kill rather than a slowdown.
+    const int strip_rows = kRobustnessRefineStripRows;
+    const int halo = kRobustnessRefineHalo;
+    const int strip_h = strip_rows + 2 * halo;
+    if (R.h < strip_h) return false;
+
+    Image refined(R.h, R.w, 1);
+    const f32 kappa = clampf(cfg.robustness_refine_max_reduction, 0.f, 1.f);
+    const f32 dead = clampf(cfg.robustness_refine_deadzone, 0.f, 1.f);
+    size_t changed = 0;
+
+    for (int y0 = 0; y0 < R.h; y0 += strip_rows) {
+        const int top = std::min(std::max(y0 - halo, 0), R.h - strip_h);
+        Image feat = build_robustness_refine_features(ref_stats, comp_means, R, d_sq,
+                                                      sigma_sq, flow, tile_size, cfg,
+                                                      top, strip_h);
+        Image q;
+        if (feat.h != strip_h || !robustness_refine_infer(feat, q) ||
+            q.h != strip_h || q.w != R.w) {
+            // Any failure leaves R exactly as the analytic mask produced it.
+            return false;
+        }
+        const int rows = std::min(strip_rows, R.h - y0);
+        for (int r = 0; r < rows; ++r) {
+            const f32* qp = &q.at(y0 - top + r, 0);
+            const f32* rp = &R.at(y0 + r, 0);
+            f32* op = &refined.at(y0 + r, 0);
+            for (int x = 0; x < R.w; ++x) {
+                // q is confidence that the pixel should be KEPT. Every part of
+                // this is deliberate: the reduction is bounded by kappa, it
+                // MULTIPLIES R rather than replacing it (so R == 0 stays 0 and
+                // the network can never resurrect a pixel Eq. 5-9 rejected),
+                // and anything inside the dead zone passes through bit for bit
+                // so the stage stays a sparse correction rather than a new
+                // mask wearing the old one as a hat.
+                const f32 drop = 1.f - clampf(qp[x], 0.f, 1.f);
+                if (drop <= dead) { op[x] = rp[x]; continue; }
+                op[x] = rp[x] * (1.f - kappa * drop);
+                if (rp[x] > 0.f && op[x] != rp[x]) ++changed;
+            }
+        }
+    }
+    R = std::move(refined);
+    if (changed_frac)
+        *changed_frac = (f32)((double)changed / ((double)R.h * (double)R.w));
+    return true;
+}
+
+Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
+                         const FlowField& flow, int tile_size, const Config& cfg,
+                         Image* s_select_out) {
+    bool refined_on_gpu = false;
+    Image R = compute_robustness_core(comp_raw, ref_stats, flow, tile_size, cfg,
+                                      s_select_out, &refined_on_gpu);
+    // The Metal path refines inside its own command buffer -- one kernel over
+    // the finished mask, with the guide, the statistics and the flow already in
+    // GPU buffers and nothing read back. Doing it again here would apply the
+    // reduction twice, and would also be the expensive way round: this CPU
+    // implementation has to rebuild on the host everything that path already
+    // holds.
+    if (!refined_on_gpu && R.h > 0 && R.w > 0)
+        apply_robustness_refinement(R, comp_raw, ref_stats, flow, tile_size, cfg);
+    return R;
 }
 
 } // namespace hhsr

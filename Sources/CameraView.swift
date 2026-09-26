@@ -917,11 +917,72 @@ struct CameraView: View {
                 + "neighbourhood. Measured against ground truth on synthetic bursts built "
                 + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
                 + "analytic mask automatically if the model is missing.")
+        robustnessRefineControls
         Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
         Text("""
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
              """)
             .font(.caption2).foregroundColor(.secondary)
+    }
+
+    // Out of fineAlignmentSection deliberately. That section was already a
+    // ~100-line ViewBuilder expression and this file has previously been
+    // pushed past the Swift type checker's limit ("unable to type-check this
+    // expression in reasonable time") by adding less than this to one; the
+    // chooseReferenceHelp comment below records the same lesson. The help
+    // strings are plain String properties for the same reason.
+    @ViewBuilder
+    private var robustnessRefineControls: some View {
+        Toggle("Learned Geometry Refinement",
+               isOn: $cam.tuningParams.robustness_refine_nn_enabled)
+        Text(refineHelp).font(.caption2).foregroundColor(.secondary)
+        HStack {
+            Text("Refinement Cap")
+            Spacer()
+            Text(String(format: "%.2f", cam.tuningParams.robustness_refine_max_reduction))
+        }
+        Slider(value: $cam.tuningParams.robustness_refine_max_reduction, in: 0.0...1.0)
+        Text(refineCapHelp).font(.caption2).foregroundColor(.secondary)
+        HStack {
+            Text("Refinement Dead Zone")
+            Spacer()
+            Text(String(format: "%.2f", cam.tuningParams.robustness_refine_deadzone))
+        }
+        Slider(value: $cam.tuningParams.robustness_refine_deadzone, in: 0.0...0.5)
+        Text(refineDeadZoneHelp).font(.caption2).foregroundColor(.secondary)
+    }
+
+    private var refineHelp: String {
+        "A different network from the one above, with the opposite relationship "
+        + "to the analytic mask: that one REPLACES Wronski Eq. 5-9, this one "
+        + "keeps it in charge and may only multiply its output down. It targets "
+        + "the one failure the analytic mask cannot see \u{2014} with one flow "
+        + "vector per tile, rotation and parallax leave the fetch a fraction of "
+        + "a pixel out toward the tile edges, doubling thin edges, and "
+        + "d\u{b2}/\u{3c3}\u{b2} reads that as MORE trustworthy because "
+        + "\u{3c3} rises with the edge's own texture faster than d rises with "
+        + "the shift. Runs on top of Geometry Rejection above, not instead of "
+        + "it. R = 0 stays 0, no pixel loses more than the cap below, and a "
+        + "missing model is a no-op."
+    }
+
+    private var refineCapHelp: String {
+        "The most weight the network may take from any one pixel. 1.0 lets it "
+        + "veto a pixel outright; the 0.75 default keeps a quarter of the "
+        + "weight even where it is most certain, because a wrongly rejected "
+        + "pixel is detail that cannot be recovered while a missed artifact is "
+        + "one subtly doubled edge. 0 makes the stage inert."
+    }
+
+    private var refineDeadZoneHelp: String {
+        "Below this much predicted reduction the pixel is passed through "
+        + "exactly as the analytic mask produced it. This is the sparsity "
+        + "control. Measured on held-out frames: 0.20 moves 3% of the frame "
+        + "and captures 77% of the available improvement, 0.10 moves 16% for "
+        + "89%, and 0 moves the whole frame for 100% \u{2014} but a reduction "
+        + "applied everywhere is nearly inert anyway, since the merge "
+        + "normalises and only the differences between frames survive. Raise "
+        + "it to act only on the strongest cases."
     }
 
     // Two of the eight Sections live here rather than inline. The Form body

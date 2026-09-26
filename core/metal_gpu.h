@@ -195,9 +195,15 @@ void metal_release_host_ref_stats(RefStats& ref_stats); // free host pixels; kee
 bool metal_fetch_host_ref_stats(RefStats& ref_stats);
 // s_select_out, when non-null, also receives a per-pixel record of which motion
 // prior was applied: 1 where the strict s1 was used, 0 where s2 was.
+//
+// refined_out, when non-null, reports whether the rob_refine_mask kernel ran
+// (Config::robustness_refine_nn_enabled). compute_robustness must know: it
+// applies the refinement itself for the CPU paths, and running it again on a
+// mask the GPU has already refined would apply the reduction twice.
 Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
                                const FlowField& flow, int tile_size, const Config& cfg,
-                               Image* s_select_out = nullptr);
+                               Image* s_select_out = nullptr,
+                               bool* refined_out = nullptr);
 
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
