@@ -44,7 +44,7 @@ computed through the cap and the multiply the pipeline will actually apply,
 not on q directly -- train on q alone and the network optimises a mask nothing
 downstream ever uses.
 """
-import json, os, sys
+import json, math, os, sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -154,6 +154,35 @@ POOL_TOTAL_MAX = int(os.environ.get("ROB_REFINE_POOL_TOTAL", 12_000_000))
 # that the network is trained to say "change nothing" on the vast majority of
 # pixels and its output means something where it does not.
 GATE = float(os.environ.get("ROB_REFINE_GATE", 0.02))
+
+# ---- the runtime gate ----------------------------------------------------
+#
+# Below this much local flow disagreement (channel 41, the affine model's
+# disagreement with the vector the tile will be fetched with, raw px) the stage
+# returns R untouched, and the network is not consulted at all.
+#
+# Measured on the MERGED image against a known ground truth, sweeping injected
+# per-tile flow error as its own axis: attenuating costs -2.16 dB at 0.70 px,
+# breaks even at 1.01 px, and pays +3.12 dB at 3.09 px. The reason is that the
+# Wronski merge is a SUPER-RESOLUTION merge, so a sub-pixel offset between
+# frames is the signal it feeds on rather than damage to be suppressed. The R*
+# target cannot express that -- it is derived per-pixel from what was fetched
+# against what should have been -- so it asks for attenuation in exactly the
+# band where the merge wanted the sample. The gate is what keeps a faithfully
+# trained network out of that band.
+#
+# 0.80 px because channel 41 tracks true flow error almost 1:1 in the median
+# (0.861 at 0.75-1 px, 1.201 at 1-1.5 px), and at 0.80 the gate spares 84.1% of
+# the pixels below 1 px while withholding only 4.1% of those above it. Median
+# true error among the pixels it still lets through: 1.046 px.
+#
+# Must match Config::robustness_refine_gate_px and RefineParams::gate_px. It is
+# applied to the PREDICTION during training, not to the sampling, so the loss
+# sees exactly what inference will produce and no gradient is spent on pixels
+# the runtime will never let the network touch.
+GATE_PX = float(os.environ.get("ROB_REFINE_GATE_PX", 0.80))
+CH_AEMAG = 41                      # RR_CH_AEMAG in robustness_refine_shared.h
+
 
 # Visibility weighting on the label, in units of the gradient's own noise.
 #
@@ -523,9 +552,23 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=2e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, STEPS)
 
+    # The threshold in normalised space. Channel 41 is in LOG_CH, and aEmag is
+    # non-negative, so the transform the network sees is log1p then standardise.
+    gate_n = ((math.log1p(GATE_PX) - mu[CH_AEMAG]) / max(float(sd[CH_AEMAG]), 1e-9)
+              if GATE_PX > 0 else float("-inf"))
+    if GATE_PX > 0:
+        print(f"gate: channel {CH_AEMAG} ({NAMES[CH_AEMAG]}) < {GATE_PX} raw px "
+              f"-> R unchanged  (normalised threshold {gate_n:+.4f})")
+
     for it in range(STEPS):
         x, t, r, rstar = draw() if ARCH == "mlp" else draw_patches()
         p = model(x)
+        if GATE_PX > 0:
+            # Forced to "keep" exactly where the runtime will force it, so the
+            # loss is computed on the decisions that actually ship and the
+            # gradient is not spent defending pixels the gate already protects.
+            p = torch.where(x[:, CH_AEMAG:CH_AEMAG + 1] < gate_n,
+                            torch.ones_like(p), p)
         live = (r > 0.02).float()
         n = live.sum().clamp(min=1.0)
 
@@ -550,7 +593,8 @@ def main():
     out = os.path.join(SC, f"refinenet_{ARCH}_{BASELINE}.pt")
     torch.save({"state": model.state_dict(), "mu": mu, "sd": sd,
                 "arch": ARCH, "baseline": BASELINE, "in_ch": IN_CH,
-                "log_ch": LOG_CH, "width": WIDTH, "kappa": KAPPA}, out)
+                "log_ch": LOG_CH, "width": WIDTH, "kappa": KAPPA,
+                "gate_px": GATE_PX, "gate_ch": CH_AEMAG}, out)
     save_host_bin(model, mu, sd, os.path.splitext(out)[0] + ".bin")
     with open(os.path.join(SC, "refinenet_norm.json"), "w") as f:
         json.dump({"mu": mu.tolist(), "sd": sd.tolist(), "in_ch": IN_CH,

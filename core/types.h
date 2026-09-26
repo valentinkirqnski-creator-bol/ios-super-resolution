@@ -830,6 +830,37 @@ struct Config {
     bool guide_color_matrix = false;   // apply cfg.cam_to_srgb to the guide RGB
     int  guide_curve = -1;             // -1 auto, 0 none, 1 sqrt, 2 gamma, 3 srgb
 
+    // Sample the robustness mask bilinearly instead of nearest.
+    //
+    // R lives on the guide lattice -- 2016x1512 for a 4032x3024 raw, one value
+    // per 2x2 Bayer quad -- while the merge writes at Config::scale, 8064x6048.
+    // Sampled nearest, one R value therefore governs a 4x4 block of output
+    // pixels as a hard step, and the weight field is piecewise constant on that
+    // grid. A doubled edge is a few output pixels across, so a nearest-sampled
+    // mask cannot express the correction at the scale the artifact occurs, and
+    // its own 4x4 steps are a candidate for the blocky look this whole effort
+    // started from.
+    //
+    // Bilinear sampling adds no information -- it cannot make R resolve an edge
+    // it never saw -- but it removes the quantisation, and it is the bilinear
+    // interpolation of R to full resolution, evaluated where it is used rather
+    // than materialised into a 4x-larger buffer that would say the same thing.
+    //
+    // It cannot resurrect a rejection. Eq. 9's 5x5 local minimum has already
+    // dilated every zero by two guide pixels in each direction, which is 8
+    // output pixels, so the four taps around any originally-rejected pixel are
+    // all zero and a one-guide-pixel ramp only ever appears outside the region
+    // Eq. 5-8 actually rejected.
+    //
+    // What it does change: the comment it replaces defended the invariant that
+    // "R grades the same tile the merge fetches", since the flow is per-tile and
+    // nearest. That is true, and it is the blockiness of the FLOW that is the
+    // defect -- this stage exists because one vector per tile cannot represent
+    // the motion -- not the smoothness of the mask. Kept as a flag so the two
+    // can be compared rather than assumed, and so 1.4's blocky-R behaviour is
+    // still reachable.
+    bool merge_robustness_bilinear = true;
+
     bool robustness_raw_resolution_enabled = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
@@ -1067,6 +1098,22 @@ struct Config {
     // frame, which is the trade this stage was asked for. Lower it to act more
     // broadly, raise it to act only on the strongest cases.
     float robustness_refine_deadzone = 0.05f;
+    // Local flow disagreement, raw px, below which the learned refinement is
+    // skipped and R is returned unchanged. 0 disables the gate.
+    //
+    // Measured on the merged image against a known ground truth: attenuating is
+    // net harmful below ~1 px of per-tile flow error (-2.16 dB at 0.70 px) and
+    // helpful above it (+3.12 dB at 3.09 px). See RefineParams::gate_px for why
+    // -- briefly, this is a super-resolution merge and a sub-pixel offset is
+    // information, which the R* target cannot represent.
+    float robustness_refine_gate_px = 0.80f;
+    // The same test asked of the NEIGHBOURHOOD rather than the pixel, which is
+    // the form that actually removes the low-error regression: the per-pixel
+    // gate alone recovered +0.94 dB of it and left -1.22 dB, because a frame at
+    // 0.8 px mean error still has ~23% of its pixels above the per-pixel
+    // threshold and those are the costly ones. See RefineParams::reg_gate_px.
+    // 0 disables. One-sided: it can only leave R alone.
+    float robustness_refine_regional_gate_px = 1.00f;
 
     // The accumulated-robustness adaptive denoiser was removed; the reference
     // merge no longer enlarges its kernel from the accumulated robustness.

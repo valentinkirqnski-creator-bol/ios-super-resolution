@@ -2571,6 +2571,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             rp.geom_threshold = cfg.motion_geom_reject_threshold;
             rp.geom_threshold_rel = cfg.motion_geom_reject_threshold_relative;
             rp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
+            rp.gate_px = cfg.robustness_refine_gate_px;
+            rp.reg_gate_px = cfg.robustness_refine_regional_gate_px;
             enc = [cmd computeCommandEncoder];
             if (enc) {
                 [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
@@ -3741,7 +3743,9 @@ struct MergeCompParamsCPU {
     // 4 = legacy xx,xy,yx,yy covariance entries, 3 = xx,xy,yy. 0 reads as 4 in
     // the kernel, so a zero-initialised params block behaves as before.
     uint32_t cov_stride = 4;
-    uint32_t _pad3 = 0;
+    // 1 = sample R bilinearly rather than nearest (was _pad3). See
+    // Config::merge_robustness_bilinear.
+    uint32_t rob_bilinear = 0;
     // Element offsets into the burst-wide buffers, for the fused band kernel.
     // Zero for the single-frame kernels, which bind each frame's slice directly.
     uint32_t img_off = 0, flow_off = 0, cov_off = 0, rob_off = 0;
@@ -4491,6 +4495,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_bilinear = 0u;
+        p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
         p.cov_stride = g_bf.cov_stride;
         p.img_off  = (uint32_t)bf_raw_off(slot);
         p.flow_off = (uint32_t)bf_flow_off(slot);
@@ -4729,6 +4734,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // stats are missing, so the flag can say "raw" while the mask is guide.
     // See accumulate_comp in merge.cpp.
     p.flow_bilinear = false ? 1u : 0u;
+    p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

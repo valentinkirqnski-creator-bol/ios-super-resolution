@@ -48,6 +48,10 @@ PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "refineset")
 CKPT = sys.argv[2] if len(sys.argv) > 2 else None
 KAPPA = float(os.environ.get("ROB_REFINE_KAPPA", 0.75))
 DEAD = float(os.environ.get("ROB_REFINE_DEADZONE", 0.05))
+# Must match Config::robustness_refine_gate_px; see train_refine.GATE_PX for why
+# it exists and why 0.80.
+GATE_PX = float(os.environ.get("ROB_REFINE_GATE_PX", 0.80))
+CH_AEMAG = 41
 HOLDOUT = int(os.environ.get("ROB_REFINE_HOLDOUT", 8))
 
 # Ground-truth classes.
@@ -68,10 +72,12 @@ def predict(model, mu, sd, px, baseline):
     return q.numpy().reshape(px.shape[:-1]) if px.ndim > 1 else q.numpy().ravel()
 
 
-def apply_refine(R, q):
-    """Exactly what apply_robustness_refinement does, dead zone included."""
+def apply_refine(R, q, aemag=None):
+    """Exactly what apply_robustness_refinement does: gate, then dead zone."""
     drop = np.clip(1.0 - q, 0.0, 1.0)
     out = np.where(drop <= DEAD, R, R * (1.0 - KAPPA * drop))
+    if GATE_PX > 0 and aemag is not None:
+        out = np.where(np.abs(aemag) < GATE_PX, R, out)
     return out.astype(np.float32)
 
 
@@ -152,7 +158,7 @@ def main():
             q = predict(m, mu, sd, px, base)
             src = R_geom if base == "geom" else R_plain
             lab = ("4" if base == "geom" else "3") + f"  + NN ({arch}, on {base})"
-            rows.append((lab, apply_refine(src, q), src))
+            rows.append((lab, apply_refine(src, q, px[..., CH_AEMAG]), src))
 
         for name, R, base in rows:
             s = stats(R, base, rstar, ok)
@@ -207,7 +213,7 @@ def main():
         q = predict(m, mu, sd, px, base)
         src = R_geom if base == "geom" else R_plain
         rows.append((("4" if base == "geom" else "3") + f"  + NN ({arch})",
-                     apply_refine(src, q), src))
+                     apply_refine(src, q, px[..., CH_AEMAG]), src))
     for nm, _, _ in rows:
         hdr += f" {nm[:14]:>15}"
     print(hdr)

@@ -247,6 +247,15 @@ g++ -O2 -std=gnu++17 -static -pthread *.o ../../vendor/LibRaw/lib/libraw.a \
     -lws2_32 -o refine_dataset      # -lws2_32 is Windows only
 ```
 
+After touching `core/types.h`, **delete every `.o` and rebuild all of them.**
+`Config` is a by-value member of half these signatures, so a stale object file
+compiled against the previous layout gives one binary two different `Config`
+sizes. That is an ODR violation, and it does not fail at link time -- it
+corrupts the heap and crashes somewhere unrelated, usually in the first large
+allocation after startup (`load_raw_frame`, with exit code 127 and no message).
+Measured the hard way, twice: see also the `-std` trap below, which looks
+identical from the outside.
+
 Build every translation unit with the **same** `-std`. Mixing `-std=c++17`
 and `-std=gnu++17` flips `__USE_MINGW_ANSI_STDIO` on MinGW, which changes
 inline definitions between objects and corrupts the heap inside LibRaw's

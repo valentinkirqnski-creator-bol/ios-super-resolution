@@ -2306,6 +2306,26 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
     Image refined(R.h, R.w, 1);
     const f32 kappa = clampf(cfg.robustness_refine_max_reduction, 0.f, 1.f);
     const f32 dead = clampf(cfg.robustness_refine_deadzone, 0.f, 1.f);
+    const f32 gate = std::max(0.f, cfg.robustness_refine_gate_px);
+    const f32 reg_gate = std::max(0.f, cfg.robustness_refine_regional_gate_px);
+
+    // Regional misalignment, one value per tile, from the same rr_fit_affine the
+    // kernel runs. Per tile rather than per pixel is not an approximation here:
+    // the quantity is a property of the tile neighbourhood, so every pixel in a
+    // tile shares it by construction, and the kernel computing it inline gets
+    // bit-identical numbers from the same function.
+    std::vector<f32> tile_reg;
+    if (reg_gate > 0.f && flow.ny > 0 && flow.nx > 0) {
+        tile_reg.resize((size_t)flow.ny * flow.nx);
+        parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+            for (int tx = 0; tx < flow.nx; ++tx) {
+                RefineAffine aff{};
+                rr_fit_affine(flow.flow.data(), flow.ny, flow.nx, ty, tx,
+                              (f32)tile_size, &aff);
+                tile_reg[(size_t)ty * flow.nx + tx] = aff.reg;
+            }
+        });
+    }
     size_t changed = 0;
 
     for (int y0 = 0; y0 < R.h; y0 += strip_rows) {
@@ -2324,7 +2344,31 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
             const f32* qp = &q.at(y0 - top + r, 0);
             const f32* rp = &R.at(y0 + r, 0);
             f32* op = &refined.at(y0 + r, 0);
+            // The gate reads the same feature channel the kernel reads, out of
+            // the plane already built above, so the two paths cannot disagree
+            // about which pixels the stage is allowed to touch.
+            const f32* gp = &feat.at(y0 - top + r, 0, RR_CH_AEMAG);
+            // Same tile addressing rr_gather uses, so the two paths gate the
+            // same pixels.
+            const f32 sc_g = (ref_stats.means.c == 3) ? 2.f : 1.f;
+            const f32 rawy_g = sc_g * (f32)(y0 + r) + 0.5f * (sc_g - 1.f);
+            const int pty_g = std::min(std::max((int)((rawy_g + 0.5f) / (f32)tile_size), 0),
+                                       flow.ny - 1);
             for (int x = 0; x < R.w; ++x) {
+                if (!tile_reg.empty()) {
+                    const f32 rawx_g = sc_g * (f32)x + 0.5f * (sc_g - 1.f);
+                    const int ptx_g = std::min(
+                        std::max((int)((rawx_g + 0.5f) / (f32)tile_size), 0),
+                        flow.nx - 1);
+                    if (tile_reg[(size_t)pty_g * flow.nx + ptx_g] < reg_gate) {
+                        op[x] = rp[x];
+                        continue;
+                    }
+                }
+                if (gate > 0.f && gp[(size_t)x * feat.c] < gate) {
+                    op[x] = rp[x];
+                    continue;
+                }
                 // q is confidence that the pixel should be KEPT. Every part of
                 // this is deliberate: the reduction is bounded by kappa, it
                 // MULTIPLIES R rather than replacing it (so R == 0 stays 0 and

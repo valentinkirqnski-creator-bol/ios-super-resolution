@@ -323,6 +323,8 @@ int main(int argc, char** argv) {
         std::printf(
             "usage: merge_eval ref.dng [rot_deg ...]\n"
             "  With no angles, sweeps 0.05 0.2 0.5 1.0 2.0 4.0 degrees.\n"
+            "  MERGE_EVAL_ERR_SWEEP=1 reads the arguments as INJECTED per-tile\n"
+            "  flow error in raw px instead; rotation is held at MERGE_EVAL_ROT.\n"
             "env: MERGE_EVAL_FRAMES (5)   comparison frames per burst\n"
             "     MERGE_EVAL_SHIFT (6)    translation added to every frame, raw px\n"
             "     MERGE_EVAL_GEOM (0.0045) geometry rejection threshold\n");
@@ -331,6 +333,18 @@ int main(int argc, char** argv) {
     const int n_frames = std::max(1, envi("MERGE_EVAL_FRAMES", 5));
     const float shift = envf("MERGE_EVAL_SHIFT", 6.f);
     const float geom_thr = envf("MERGE_EVAL_GEOM", 0.0045f);
+    // With MERGE_EVAL_ERR_SWEEP set, the positional arguments are per-tile error
+    // magnitudes in raw px rather than rotation angles, and the rotation is held
+    // at MERGE_EVAL_ROT so the error axis is the only thing moving.
+    const bool err_mode = std::getenv("MERGE_EVAL_ERR_SWEEP") != nullptr;
+    const float fixed_rot = envf("MERGE_EVAL_ROT", 0.f);
+    // -1 means "leave the Config default alone", so an unset variable cannot
+    // silently disable a gate the shipped defaults enable.
+    const float gate_px_override = envf("MERGE_EVAL_GATE_PX", -1.f);
+    const float reg_gate_override = envf("MERGE_EVAL_REG_GATE_PX", -1.f);
+    // -1 leaves the Config default; 0 or 1 forces nearest or bilinear R
+    // sampling, so the two can be A/B'd against the same ground truth.
+    const int rob_bilinear_override = envi("MERGE_EVAL_ROB_BILINEAR", -1);
 
     std::vector<float> angles;
     for (int i = 2; i < argc; ++i) angles.push_back((float)std::atof(argv[i]));
@@ -352,7 +366,17 @@ int main(int argc, char** argv) {
     work.burst_frame_count = n_frames + 1;
     tune_config_snr(ref, work);
     work.r_t = cfg.r_t; work.r_s1 = cfg.r_s1; work.r_s2 = cfg.r_s2;
+    if (gate_px_override >= 0.f) work.robustness_refine_gate_px = gate_px_override;
+    if (reg_gate_override >= 0.f)
+        work.robustness_refine_regional_gate_px = reg_gate_override;
+    if (rob_bilinear_override >= 0)
+        work.merge_robustness_bilinear = (rob_bilinear_override != 0);
     const int ts = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+    std::printf("R sampling: %s\n",
+                work.merge_robustness_bilinear ? "BILINEAR" : "nearest");
+    std::printf("gates: per-pixel %.2f px, regional %.2f px\n",
+                (double)work.robustness_refine_gate_px,
+                (double)work.robustness_refine_regional_gate_px);
     std::printf("%dx%d raw, ts=%d, %d comparison frames, scale %.0f\n",
                 ref.w, ref.h, ts, n_frames, (double)work.scale);
 
@@ -370,7 +394,9 @@ int main(int argc, char** argv) {
         {"+ geom reject + NN",  true,  true },
     };
 
-    for (float deg : angles) {
+    for (float sweep : angles) {
+        const float deg = err_mode ? fixed_rot : sweep;
+        const float tile_err = err_mode ? sweep : 0.f;
         MotionField X;
         X.cy = 0.5f * (float)ref.h; X.cx = 0.5f * (float)ref.w;
         X.set_rotation(deg);
@@ -394,6 +420,33 @@ int main(int argc, char** argv) {
             Image cg = compute_grey(comps[k], work.bayer_mode, work.grey_method);
             flows[k] = align(ref_pyr, ref_grey, cg, work, ts);
             covs[k] = estimate_kernels(comps[k], work);
+
+            // Controlled per-tile flow error, swept as its OWN axis.
+            //
+            // Sweeping the rotation angle and letting the flow error fall out of
+            // it was the wrong variable. The same nominal angle produced 3.62 px
+            // of error in one sweep and 3.98 px in another, depending only on how
+            // much translation was mixed in, and those two gave +3.15 dB and
+            // +1.66 dB. What decides whether attenuating is worth it is the error
+            // itself, so the error is what to control.
+            //
+            // Every tile vector is displaced by exactly tile_err in a random
+            // direction, on top of whatever the aligner already got wrong. The
+            // true motion is untouched, so the ground truth is untouched: this
+            // makes the mask's input wrong by a known amount and changes nothing
+            // else. The direction is random rather than fixed so the error cannot
+            // look like a global translation the aligner might have absorbed.
+            if (tile_err > 0.f) {
+                std::mt19937 jr((uint32_t)(k * 7919 + 13));
+                std::uniform_real_distribution<float> ja(0.f, 6.2831853f);
+                for (int ty = 0; ty < flows[k].ny; ++ty)
+                    for (int tx = 0; tx < flows[k].nx; ++tx) {
+                        const float a = ja(jr);
+                        const size_t i = ((size_t)ty * flows[k].nx + tx) * 2;
+                        flows[k].flow[i + 0] += tile_err * std::cos(a);
+                        flows[k].flow[i + 1] += tile_err * std::sin(a);
+                    }
+            }
 
             zero_flows[k] = flows[k];
             std::fill(zero_flows[k].flow.begin(), zero_flows[k].flow.end(), 0.f);
@@ -443,9 +496,16 @@ int main(int argc, char** argv) {
 
         std::printf("\n================================================================"
                     "================================\n");
-        std::printf("  rotation %.2f deg | mean true displacement %.2f px | "
-                    "mean per-tile flow error %.3f px\n",
-                    (double)deg, mean_true_disp, mean_flow_err);
+        if (err_mode)
+            std::printf("  INJECTED per-tile error %.3f px | rotation %.2f deg"
+                        " | mean true displacement %.2f px"
+                        " | MEASURED mean flow error %.3f px\n",
+                        (double)tile_err, (double)deg, mean_true_disp,
+                        mean_flow_err);
+        else
+            std::printf("  rotation %.2f deg | mean true displacement %.2f px"
+                        " | mean per-tile flow error %.3f px\n",
+                        (double)deg, mean_true_disp, mean_flow_err);
         std::printf("  edge threshold %.5f (top 10%%), thin %.5f (top 5%% |lap|), "
                     "peak %.4f\n", (double)edge_thr, (double)thin_thr, (double)peak);
         std::printf("================================================================"

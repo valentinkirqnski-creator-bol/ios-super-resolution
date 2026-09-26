@@ -46,6 +46,11 @@
 #define RR_CHANNELS 47
 #define RR_WIDTH 16
 
+// The channel the runtime gate reads: the local affine model's disagreement
+// with the vector this tile will be fetched with, in raw pixels. Named because
+// the gate, the host and the trainer must agree on it.
+#define RR_CH_AEMAG 41
+
 // Flat weight-buffer layout, shared by tools/rob_refine/export_metal_weights.py
 // (writes it), core/robustness_refine_weights.h (holds it) and rr_eval below
 // (reads it). One buffer rather than nine, so the GPU binds one argument and
@@ -92,6 +97,7 @@ struct RefineInputs {
     // is the non-affine (parallax) part of the motion.
     float aEx, aEy;
     float a_res;
+    float a_reg;           // regional misalignment, raw px; see rr_fit_affine
     float a_rot, a_div;    // px across one tile
     float u, v;            // offset from the tile centre, raw pixels
     float tile_size;
@@ -179,6 +185,10 @@ struct RefineAffine {
     float a11, a12, a21, a22;   /* d(flow)/d(offset), raw px per raw px */
     float t1, t2;               /* fitted flow at this tile's centre */
     float res;                  /* RMS fit residual, raw px */
+    /* Regional misalignment over the same window, raw px: how wrong the
+       per-tile translation model is AROUND here, as opposed to at this pixel.
+       See the accumulation in rr_fit_affine for why it takes two terms. */
+    float reg;
     int   ok;                   /* 0 when the window was degenerate */
 };
 
@@ -211,7 +221,7 @@ inline void rr_fit_affine(const RR_DEVICE float* flow, int ny, int nx,
     if (!(det > 1e-12f || det < -1e-12f)) {
         out->a11 = 0.f; out->a12 = 0.f; out->a21 = 0.f; out->a22 = 0.f;
         out->t1 = flow[fi0 + 0]; out->t2 = flow[fi0 + 1];
-        out->res = 0.f; out->ok = 0;
+        out->res = 0.f; out->reg = 0.f; out->ok = 0;
         return;
     }
     const float inv = 1.f / det;
@@ -225,7 +235,7 @@ inline void rr_fit_affine(const RR_DEVICE float* flow, int ny, int nx,
     out->a22 = (c01 * Syu + c11 * Syv + c12 * Sy) * inv;
     out->t2  = (c02 * Syu + c12 * Syv + c22 * Sy) * inv;
     out->ok = 1;
-    float ss = 0.f, n = 0.f;
+    float ss = 0.f, n = 0.f, sa = 0.f;
     for (int i = -RR_AFF_R; i <= RR_AFF_R; ++i)
         for (int j = -RR_AFF_R; j <= RR_AFF_R; ++j) {
             const int yy = ty + i, xx = tx + j;
@@ -234,9 +244,49 @@ inline void rr_fit_affine(const RR_DEVICE float* flow, int ny, int nx,
             const int fi = (yy * nx + xx) * 2;
             const float ex = out->a11 * u + out->a12 * v + out->t1 - flow[fi + 0];
             const float ey = out->a21 * u + out->a22 * v + out->t2 - flow[fi + 1];
-            ss += ex * ex + ey * ey; n += 1.f;
+            ss += ex * ex + ey * ey;
+            sa += sqrt(ex * ex + ey * ey);
+            n += 1.f;
         }
-    out->res = sqrt(ss / rr_max(n, 1.f));
+    const float inv_n = 1.f / rr_max(n, 1.f);
+    out->res = sqrt(ss * inv_n);
+
+    // ---- regional misalignment, in raw px ---------------------------------
+    //
+    // Asking "is THIS pixel's error small" turned out to be the wrong question.
+    // A per-pixel gate on the same quantity recovered +0.94 dB of the low-error
+    // damage and left -1.22 dB, because in a frame whose mean error is 0.8 px
+    // only ~77% of pixels fall under the threshold and the ~23% that survive are
+    // the high-gradient ones, where attenuating costs the most. The question
+    // that matters is whether the neighbourhood is misaligned enough for
+    // attenuating to be worth its cost in lost sub-pixel samples.
+    //
+    // Two terms, and both are needed:
+    //
+    //   sa * inv_n  how far each tile's own vector sits from the local affine
+    //               model, averaged (not RMS -- the mean tracked the true error
+    //               regime at 0.998 rank correlation across frames where the
+    //               median managed only 0.742, because the mean is carried by
+    //               the tail that actually does the damage);
+    //
+    //   sweep       the displacement the fitted model itself sweeps across one
+    //               tile, sampled at its four corners. Without this the
+    //               statistic is blind to exactly the case this stage exists
+    //               for: a pure rotation IS affine, so the residual term is
+    //               near zero precisely when within-tile error is largest.
+    //               Measured on the real bursts, the residual alone saturates --
+    //               median 0.956 at 0.75-1 px of true error against 0.973 at
+    //               1.5-3 px -- and cannot separate the regimes at all.
+    float sweep = 0.f;
+    const float hs = 0.5f * tile_size;
+    for (int sy = -1; sy <= 1; sy += 2)
+        for (int sx = -1; sx <= 1; sx += 2) {
+            const float u = (float)sx * hs, v = (float)sy * hs;
+            const float ex = out->a11 * u + out->a12 * v;
+            const float ey = out->a21 * u + out->a22 * v;
+            sweep += sqrt(ex * ex + ey * ey);
+        }
+    out->reg = sa * inv_n + 0.25f * sweep;
 }
 
 // The 24 feature channels. Documented once, in stages.h on
@@ -629,7 +679,29 @@ struct RefineParams {
     float geom_threshold;            // absolute, |grad I| * |E|
     float geom_threshold_rel;        // exposure-invariant
     float geom_noise_floor_mult;
-    int _pad0, _pad1;       // 80 bytes
+    // Below this much local flow disagreement, in raw pixels, the stage returns
+    // R untouched. Config::robustness_refine_gate_px; 0 disables the gate.
+    //
+    // Measured, not chosen: on the merged image against a known ground truth,
+    // attenuating is NET HARMFUL below about 1 px of per-tile flow error and
+    // helpful above it -- because the Wronski merge is a SUPER-RESOLUTION merge,
+    // so a sub-pixel offset is the signal it feeds on, not damage. R* cannot
+    // represent that: it is derived per-pixel from what was fetched against what
+    // should have been, so it counts every displacement as loss and asks for
+    // attenuation exactly where the merge wanted the sample.
+    //
+    // Channel 41 is the runtime stand-in for that error -- nothing on device
+    // knows the true displacement -- and it tracks it almost 1:1 in the median
+    // (0.861 at 0.75-1 px, 1.201 at 1-1.5 px). At 0.80 the gate leaves alone
+    // 84.1% of the pixels below 1 px, where attenuating costs quality, and only
+    // 4.1% of those above it. Median true error among the pixels it still lets
+    // through: 1.046 px, which is the crossover itself.
+    float gate_px;
+    // Regional form of the same idea, and the one that does the work:
+    // Config::robustness_refine_regional_gate_px. 0 disables it. Strictly
+    // one-sided -- it can only force q = 1, never strengthen a reduction, so
+    // R_final <= R survives it untouched.
+    float reg_gate_px;      // 80 bytes
 };
 
 inline int rr_clampi(int v, int lo, int hi) {
@@ -799,6 +871,7 @@ inline void rr_gather(const RR_DEVICE float* ref_means,
     in->aEy = flow[pidx * 2 + 1]
             - (aff.a21 * in->u + aff.a22 * in->v + aff.t2);
     in->a_res = aff.res;
+    in->a_reg = aff.reg;
     in->a_rot = (aff.a21 - aff.a12) * (float)p->tile_size;
     in->a_div = (aff.a11 + aff.a22) * (float)p->tile_size;
 
@@ -859,8 +932,15 @@ inline float rr_refine_pixel(const RR_DEVICE float* ref_means,
     RefineInputs in;
     rr_gather(ref_means, ref_vars, comp_means, std_curve, diff_curve, S, flow,
               match_ambiguous, p, y, x, R, &in);
+    // The regional gate first, because rr_gather has already produced it and it
+    // decides whether this neighbourhood is worth refining at all.
+    if (p->reg_gate_px > 0.f && in.a_reg < p->reg_gate_px) return R;
     float f[RR_CHANNELS];
     rr_features(&in, f);
+    // Then the per-pixel gate, before the network is consulted rather than
+    // after: below the threshold there is no decision to make, so the weights
+    // are not read and R is returned bit-for-bit.
+    if (p->gate_px > 0.f && f[RR_CH_AEMAG] < p->gate_px) return R;
     return rr_apply(R, rr_eval(f, weights), p->kappa, p->deadzone);
 }
 

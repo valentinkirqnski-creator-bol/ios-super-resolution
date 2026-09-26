@@ -416,6 +416,8 @@ int main(int argc, char** argv) {
         rp.geom_threshold = work.motion_geom_reject_threshold;
         rp.geom_threshold_rel = work.motion_geom_reject_threshold_relative;
         rp.geom_noise_floor_mult = work.motion_geom_noise_floor_mult;
+        rp.gate_px = work.robustness_refine_gate_px;
+        rp.reg_gate_px = work.robustness_refine_regional_gate_px;
 
         if (curve_n <= 0) {
             std::printf("\nGPU parity: no noise curves (1.4 LUT mode?) -- skipped\n");

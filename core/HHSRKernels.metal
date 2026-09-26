@@ -871,7 +871,9 @@ struct MergeCompParams {
     // layout, 3 for xx,xy,yy. yx was written as a duplicate of xy and never
     // read, so dropping it is a stride change with identical values.
     uint cov_stride;
-    uint _pad3;
+    // 1 = sample R bilinearly rather than nearest (was _pad3). See
+    // Config::merge_robustness_bilinear.
+    uint rob_bilinear;
     // Element (not byte) offsets into the burst-wide image / flow / covariance /
     // robustness buffers. Every comparison frame writes its analysis output into
     // a slice of one allocation, so the merge binds four buffers however long the
@@ -1115,10 +1117,12 @@ static inline void merge_comp_contrib(device const float* img,
         rob_y = (lr_y - 0.5f) / 2.f;
         rob_x = (lr_x - 0.5f) / 2.f;
     }
-    // 1.4 parity: nearest R when the flow is nearest (p.flow_bilinear == 0), so
-    // R grades the same tile the merge fetches. Bilinear otherwise.
+    // Driven by its OWN bit, not p.flow_bilinear: interpolating the mask and
+    // interpolating the tile flow are different decisions, and sharing a flag
+    // would have made turning one on silently change the alignment the merge
+    // fetches with. See Config::merge_robustness_bilinear.
     float local_r;
-    if (p.flow_bilinear != 0u) {
+    if (p.rob_bilinear != 0u) {
         local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
     } else {
         int iy = clamp(int(floor(rob_y + 0.5f)), 0, int(p.rob_h) - 1);
