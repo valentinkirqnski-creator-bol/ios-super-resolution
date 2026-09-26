@@ -208,6 +208,14 @@ int main(int argc, char** argv) {
         work.r_t = cfg.r_t; work.r_s1 = cfg.r_s1; work.r_s2 = cfg.r_s2;
         const int ts = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
 
+        // align() caches the reference's Sobel gradients and ICA Hessian,
+        // keyed on the ADDRESS of the Pyramid it was given. ref_pyr below is a
+        // loop local, so the second and every later reference is handed back
+        // the FIRST reference's derivatives and aligns against them. Measured
+        // before this call existed: a static camera on reference 0 gave a mean
+        // flow error of 0.207 px, and references 1..N all converged to
+        // 0.589 px with 42% of the frame labelled unmergeable instead of 6%.
+        clear_align_ref_ica_cache();
         Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
         Pyramid ref_pyr = build_pyramid(ref_grey, work.bm_factors);
         Image ref_guide = compute_guide(ref, work);
