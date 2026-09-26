@@ -151,19 +151,6 @@ def main():
     print(f"wrote {out} ({WEIGHTS_N} floats, "
           f"{os.path.getsize(out) / 1024:.0f} KB of source)")
 
-    # The same weights in refine_bench's plain format, written here rather than
-    # only by the trainer. They were separate, and copying a checkpoint over the
-    # .pt without re-running training left the .bin one run behind: the bench
-    # then loaded one model as the host evaluator while the compiled header held
-    # another, and reported 2.6 million pixels of GPU-against-CPU disagreement
-    # that was entirely a stale file. One command, three artefacts, no drift.
-    import struct
-    from train_refine import save_host_bin, RefineMLP
-    m = RefineMLP(cin=RR_CHANNELS, w=RR_WIDTH)
-    m.load_state_dict(st)
-    save_host_bin(m, ck["mu"], ck["sd"],
-                  os.path.splitext(ckpt)[0] + ".bin")
-
 
 if __name__ == "__main__":
     main()

@@ -167,31 +167,6 @@ GATE = float(os.environ.get("ROB_REFINE_GATE", 0.02))
 # against the geometry test's 46.2%, which is what a user reported seeing.
 VIS_K = float(os.environ.get("ROB_REFINE_VIS", 0.0))
 
-# How much harder to penalise misalignment than the single-frame inverse-MSE
-# weight does, because it does not average out the way noise does.
-#
-# R* = sigma^2/(sigma^2 + Delta^2) is the optimal weight for ONE comparison
-# frame carrying an independent error. Neither half holds for this artifact.
-# The merge averages N frames, so the noise shrinks by sqrt(N) while a
-# misalignment does not shrink at all -- and under rotation it is worse than
-# merely persistent: every frame puts the SAME tile-shaped error in the SAME
-# place, growing with distance from each tile centre, so the errors reinforce
-# rather than cancel.
-#
-# The consequence was visible in the band breakdown: at 0.1-0.5 px of flow
-# error the label asked for R* = 0.90-0.95, a five to ten percent trim, so no
-# amount of training or recall balancing could produce a rejection there -- and
-# that is exactly the band a user reported still seeing under rotation.
-#
-# Delta^2 is therefore multiplied by this before the weight is formed. It is
-# the burst length in the limit of perfectly correlated error and 1 in the
-# limit of independent error; 4 sits between, for a burst of 8 whose per-frame
-# rotations differ in size but share their spatial pattern.
-#
-# It barely touches correctly aligned content -- at Delta/sigma = 0.06 the
-# weight goes from 0.997 to 0.987, which the dead zone absorbs entirely.
-SYS_N = float(os.environ.get("ROB_REFINE_SYS", 4.0))
-
 # Split by true flow error: that is what separates the regime this stage is
 # for from the regime the replacement network is for. Each stratum gets a
 # fixed share of every batch regardless of how rare it is in the data.
@@ -237,25 +212,23 @@ def merge_excess_np(w, rstar):
 
 
 def visible_rstar(px):
-    """The merge weight to aim for: SYS_N and VIS_K applied to the stored R*.
+    """R* with Delta^2 weighted by whether the error is visible. See VIS_K.
 
     Recomputed from the stored Delta, sigma, gradient and noise rather than
-    regenerating the dataset -- the generator writes all four, so both are
-    training-time decisions and can be swept without a two-hour rebuild.
+    regenerating the dataset -- the generator writes all four, so the weighting
+    is a training-time decision and can be swept without a two-hour rebuild.
     """
     D, S = px[..., CH_DELTA], px[..., CH_SIGMA]
-    if VIS_K <= 0.0 and SYS_N == 1.0:
+    if VIS_K <= 0.0:
         return px[..., CH_RSTAR]
-    d2 = (D * D) * SYS_N
-    if VIS_K > 0.0:
-        gmag, nsig = px[..., 12], px[..., 21]
-        # The gradient's own noise, with the same attenuation rr_features
-        # assumes: a central difference of 3x3 means of a 3-channel luma.
-        sig_g = nsig * 0.70710678 / (3.0 * np.sqrt(3.0))
-        ref = VIS_K * sig_g
-        d2 = d2 * ((gmag * gmag) / (gmag * gmag + ref * ref + 1e-20))
+    gmag, nsig = px[..., 12], px[..., 21]
+    # The gradient's own noise, with the same attenuation rr_features assumes:
+    # a central difference of 3x3 means of a 3-channel luma.
+    sig_g = nsig * 0.70710678 / (3.0 * np.sqrt(3.0))
+    ref = VIS_K * sig_g
+    vis = (gmag * gmag) / (gmag * gmag + ref * ref + 1e-20)
     s2 = np.maximum(S, 1e-9) ** 2
-    return (s2 / (s2 + d2)).astype(np.float32)
+    return (s2 / (s2 + vis * D * D)).astype(np.float32)
 
 
 def target_q(px, baseline=BASELINE):
@@ -434,7 +407,7 @@ def main():
     print(f"dataset {PREFIX}: {NF} frames {H}x{W}x{C}  "
           f"({n_train} train, {NF - n_train} held out)")
     print(f"baseline={BASELINE} arch={ARCH} kappa={KAPPA} gate={GATE} "
-          f"vis_k={VIS_K} sys_n={SYS_N} lam_fp={LAM_FP} lam_fn={LAM_FN} "
+          f"vis_k={VIS_K} lam_fp={LAM_FP} lam_fn={LAM_FN} "
           f"lam_merge={LAM_MERGE} lam_id={LAM_ID} steps={STEPS}")
 
     pools = build_pools(data, n_train, rng)
