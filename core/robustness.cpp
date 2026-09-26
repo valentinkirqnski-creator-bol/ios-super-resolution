@@ -720,7 +720,7 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     // decimating: one guide sample per RAW pixel, phase-correct, so R lands on
     // the raw lattice with nothing upscaled anywhere. Config::
     // robustness_fft_guide documents what that costs.
-    if (cfg.bayer_mode && cfg.robustness_fft_guide) {
+    if (cfg.robustness_fft_guide_active()) {
         Image g = compute_grey_fft(raw);
         // compute_grey_fft returns an empty image when its Metal path is
         // present but fails. Falling through to the decimated guide would
@@ -2097,7 +2097,7 @@ Image build_robustness_refine_features(const RefStats& ref_stats,
     // it is 1 there for the same reason the upscaled path is 1: the feature
     // builder's lengths and gradients are in RAW pixels either way, which is
     // what makes them comparable with motion_geom_reject_threshold.
-    const f32 sc = (raw_res || cfg.robustness_fft_guide) ? 1.f : 2.f;
+    const f32 sc = (raw_res || cfg.robustness_fft_guide_active()) ? 1.f : 2.f;
     const f32 inv2ts = 1.f / (2.f * (f32)tile_size);
 
     const std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
@@ -2274,6 +2274,16 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
                                  float* changed_frac) {
     if (changed_frac) *changed_frac = 0.f;
     if (!cfg.robustness_refine_nn_enabled) return false;
+    // The network's input normalisation was fitted on the DECIMATED guide: three
+    // channels, sqrt domain, sc = 2. The FFT guide is one channel, linear, sc = 1,
+    // so the same features arrive on a different scale and the network is being
+    // asked about inputs it has never seen. Measured on the merged image, that
+    // configuration is slightly WORSE than not refining at all (-0.12 dB at
+    // 2.1 px of flow error, against +2.9 dB on the guide it was trained for), so
+    // declining is the honest behaviour until it is retrained against this guide.
+    // Not silent: this is the one combination where the toggle cannot be obeyed,
+    // and it says so here rather than quietly producing a meaningless mask.
+    if (cfg.robustness_fft_guide_active()) return false;
     if (R.h <= 0 || R.w <= 0 || R.c != 1) return false;
     // compute_robustness_metal returns dimensions with no pixels when the mask
     // stays GPU-resident for the merge. Nothing on the host can refine that --

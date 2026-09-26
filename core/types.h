@@ -438,7 +438,7 @@ struct Config {
     // alike -- so the FFT guide's filtered-noise correction is applied here
     // once instead of at each site.
     float fft_guide_noise_energy() const {
-        return robustness_fft_guide
+        return robustness_fft_guide_active()
             ? ((robustness_fft_guide_noise_energy > 0.f)
                    ? robustness_fft_guide_noise_energy : 1.f)
             : 1.f;
@@ -923,10 +923,32 @@ struct Config {
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
     // which one gates it.
+    // Whether the guide is built from the full-resolution FFT grey.
+    //
+    // robustness_raw_resolution_enabled reaches this too, and that is the point:
+    // it used to be silently discarded. The old predicate required the Decimate
+    // grey, because the only raw-resolution route it knew was the Dodgson
+    // upscale of the half-res statistics, and that upscale assumes the guide is
+    // half res. grey_method defaults to FFT, so the toggle flipped a bool that
+    // the predicate then threw away and the setting did nothing at all in the
+    // shipping configuration -- a dead switch rather than a reported conflict.
+    //
+    // With the FFT grey there is no conflict to report: the guide is ALREADY at
+    // raw resolution, so asking for raw-resolution R means using it directly,
+    // with no upscale anywhere. That is strictly more information than the
+    // Dodgson route, which only ever bought positions.
+    bool robustness_fft_guide_active() const {
+        return bayer_mode && grey_method == GreyMethod::FFT &&
+               (robustness_fft_guide || robustness_raw_resolution_enabled);
+    }
+    // The Dodgson-upscale route specifically. Every consumer of this means "the
+    // reference statistics were upscaled and live in means_hires/stds_hires",
+    // which is true of that route and only that route -- the FFT guide needs no
+    // hires buffers because its own statistics are already full resolution, and
+    // the ordinary guide-resolution code path produces raw-resolution R from
+    // them without knowing anything has changed.
     bool robustness_raw_resolution_active() const {
-        // The FFT guide is already at raw resolution, so there is nothing to
-        // upscale and asking for it would resample a full-res plane to itself.
-        return robustness_raw_resolution_enabled && !robustness_fft_guide &&
+        return robustness_raw_resolution_enabled && !robustness_fft_guide_active() &&
                grey_method == GreyMethod::Decimate;
     }
     // Whether the guide is sqrt(raw), which decides both its transfer curve and
@@ -934,7 +956,7 @@ struct Config {
     // low pass of the raw, so it is indexed by brightness directly; applying
     // sqrt to it would not even be the same thing as low-passing sqrt(raw).
     bool robustness_guide_sqrt_active() const {
-        return robustness_guide_sqrt && !robustness_fft_guide;
+        return robustness_guide_sqrt && !robustness_fft_guide_active();
     }
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
