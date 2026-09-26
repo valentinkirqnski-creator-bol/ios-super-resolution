@@ -64,12 +64,12 @@
 // UP. Where the analytic mask is already at or below R* the target is exactly
 // 1 and the correct answer is to do nothing.
 //
-// Output: 29 float32 channels per sampled pixel at guide resolution. See
-// LAYOUT below. Channel 0 is R with motion_geom_reject OFF and channel 24 is
-// the same mask with it ON; the other 23 feature channels do not depend on
-// that toggle, so swapping channel 0 for channel 24 at training time gives
-// the exact feature tensor for either baseline and both can be evaluated
-// from one dataset.
+// Output: kRobustnessRefineChannels + 5 float32 channels per sampled pixel at
+// guide resolution. See LAYOUT below. Channel 0 is R with motion_geom_reject
+// OFF and the first channel after the features is the same mask with it ON;
+// no other feature channel depends on that toggle, so swapping channel 0 for
+// that one at training time gives the exact feature tensor for either
+// baseline and both can be evaluated from one dataset.
 #include "stages.h"
 #include "parallel.h"
 #include "raw_io.h"
@@ -86,12 +86,13 @@ using namespace hhsr;
 namespace {
 
 // ---------------------------------------------------------------- LAYOUT
-// 0..23  build_robustness_refine_features, channel 0 = R (geom reject OFF)
-// 24     R with motion_geom_reject ON
-// 25     R*, the ideal merge weight from ground truth
-// 26     |flow_est - flow_true| at this pixel, raw px   (analysis only)
-// 27     Delta, the mis-fetch magnitude, intensity units (analysis only)
-// 28     sigma used to normalise it                     (analysis only)
+// 0..N-1 build_robustness_refine_features, channel 0 = R (geom reject OFF),
+//        where N = kRobustnessRefineChannels
+// N      R with motion_geom_reject ON
+// N+1    R*, the ideal merge weight from ground truth
+// N+2    |flow_est - flow_true| at this pixel, raw px   (analysis only)
+// N+3    Delta, the mis-fetch magnitude, intensity units (analysis only)
+// N+4    sigma used to normalise it                     (analysis only)
 constexpr int kOutChannels = kRobustnessRefineChannels + 5;
 constexpr int kChRGeom = kRobustnessRefineChannels;
 constexpr int kChRStar = kRobustnessRefineChannels + 1;

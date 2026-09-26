@@ -2177,6 +2177,11 @@ Image build_robustness_refine_features(const RefStats& ref_stats,
             for (int c = 0; c < nch; ++c)
                 noise_var_sum += guide_noise_var(cfg, nch, c, rm.at(y, x, c));
             in.noise_var_sum = noise_var_sum;
+            // Free here: the reference variances are already to hand. See
+            // RefineInputs::sigma_ms_sq for why it is worth a channel.
+            f32 sigma_ms_sq = 0.f;
+            for (int c = 0; c < nch; ++c) sigma_ms_sq += rv.at(y, x, c);
+            in.sigma_ms_sq = sigma_ms_sq;
             in.gdxdx = (flow.dx(pty, pxr) - flow.dx(pty, pxl)) * inv2ts;
             in.gdydx = (flow.dy(pty, pxr) - flow.dy(pty, pxl)) * inv2ts;
             in.gdxdy = (flow.dx(ptd, ptx) - flow.dx(ptu, ptx)) * inv2ts;

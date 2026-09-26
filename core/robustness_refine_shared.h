@@ -43,7 +43,7 @@
 
 // Must match kRobustnessRefineChannels and the trained width. robustness.cpp
 // static_asserts the first against types.h so the two cannot drift.
-#define RR_CHANNELS 24
+#define RR_CHANNELS 33
 #define RR_WIDTH 16
 
 // Flat weight-buffer layout, shared by tools/rob_refine/export_metal_weights.py
@@ -72,8 +72,14 @@ struct RefineInputs {
     float refl[5][5];      // [y+2][x+2], reference luma
     float cmpl[3][3];      // [y+1][x+1], comparison luma at the estimated flow
     float R;               // the analytic mask being refined, post Eq. 9
-    float d_sq;            // Eq. 6
-    float sigma_sq;        // Eq. 6
+    float d_sq;            // Eq. 6, after the Wiener shrink
+    float sigma_sq;        // Eq. 6, max(measured, noise floor)
+    // The MEASURED half of Eq. 6's sigma, before it is maxed against the
+    // modelled noise floor. Against sigma_sq it says which of the two won:
+    // equal means the scene's own texture set sigma, smaller means the noise
+    // floor did. R is exactly as high in both cases and the right answer is
+    // not, which is the sigma-leniency this whole stage exists for.
+    float sigma_ms_sq;
     float noise_var_sum;   // summed per-channel modelled noise variance
     float gdxdx, gdydx;    // flow-field gradient, per raw pixel
     float gdxdy, gdydy;
@@ -184,6 +190,7 @@ inline void rr_features(const RR_THREAD RefineInputs* in, RR_THREAD float* f) {
             const float b = 0.5f * (in->refl[yy + 1][xx] - in->refl[yy - 1][xx]) * inv_sc;
             Jxx += a * a; Jyy += b * b; Jxy += a * b;
         }
+    // tr, disc and Jxy are reused by the Lucas-Kanade block below.
     const float tr = Jxx + Jyy;
     const float disc = sqrt(rr_max((Jxx - Jyy) * (Jxx - Jyy) + 4.f * Jxy * Jxy, 0.f));
     f[15] = (tr > 1e-12f) ? rr_clamp(disc / tr, 0.f, 1.f) : 0.f;
@@ -227,6 +234,96 @@ inline void rr_features(const RR_THREAD RefineInputs* in, RR_THREAD float* f) {
     f[21] = nsig_px * inv_sc;
     f[22] = E_perp * res_disp;
     f[23] = fabs(res_disp) - fabs(E_perp);
+
+    // ---- 24: how much of sigma^2 the scene's own texture accounts for.
+    // 1 means texture set it, below 1 means the modelled noise floor did.
+    f[24] = rr_clamp(in->sigma_ms_sq / sig, 0.f, 1.f);
+
+    // ---- 28-32: find the edge against the noise, then measure its shift.
+    //
+    // Two separate questions, answered with the same matrix.
+    //
+    // IS THERE AN EDGE. The structure tensor's dominant eigenvalue l1 is the
+    // squared gradient energy along the edge normal. Divided by the noise
+    // energy the sensor would have produced over the same window it becomes a
+    // signal-to-noise ratio, so "is there a real edge here" is answered the
+    // same way in bright light and at ISO 6400 -- which is what an absolute
+    // gradient threshold cannot do, and why one tuned in daylight rejects
+    // nothing in a dim scene.
+    //
+    // HOW FAR IS IT OUT. res ~ delta * grad I, so a single pixel estimates
+    // delta with an uncertainty of sigma_res/|grad I| -- measured, 0.25 to 0.8
+    // raw px, which is larger than the 0.1-0.5 px error being hunted. But
+    // delta is a geometric field, smooth over a few pixels, while the residual
+    // noise is independent per pixel: pool it. Weighting each tap by its own
+    // precision (g^2) is exactly the Lucas-Kanade normal equation
+    //
+    //     J delta = b,   J = structure tensor,   b = sum -res * grad I
+    //
+    // and J is already computed above for the coherence. On an edge J is
+    // rank-1, so the only observable component is along the normal -- which is
+    // also the only direction a shift is visible in. Its uncertainty is
+    // sigma_res/sqrt(l1), so t_LK below is a calibrated "how many sigmas of
+    // displacement is actually there".
+    //
+    // The window is 3x3 and stays 3x3. Measured against ground truth, the rank
+    // correlation of |t_LK| with the damage is +0.301 at 3x3, +0.222 at 5x5
+    // and +0.174 at 7x7: a wider pool averages away the within-tile variation
+    // that IS the artifact. It also costs nothing, because 3x3 taps of a
+    // central difference need exactly the 5x5 luma window already gathered.
+    const float sig_res = nsig_px * 1.41421356f / (3.f * sqrt((float)nch));
+    const float l1 = 0.5f * (tr + disc);
+    const float l2 = 0.5f * (tr - disc);
+    float bx = 0.f, by = 0.f;
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            const int yy = 2 + i, xx = 2 + j;
+            const float a = 0.5f * (in->refl[yy][xx + 1] - in->refl[yy][xx - 1]) * inv_sc;
+            const float b = 0.5f * (in->refl[yy + 1][xx] - in->refl[yy - 1][xx]) * inv_sc;
+            const float r = in->refl[yy][xx] - in->cmpl[i + 1][j + 1];
+            bx += -r * a;
+            by += -r * b;
+        }
+    // Dominant eigenvector of J, i.e. the edge normal, sign-canonicalised the
+    // same way as the per-pixel gradient so the two are comparable.
+    float nx = Jxy, ny = l1 - Jxx;
+    const float nn = sqrt(nx * nx + ny * ny);
+    if (nn > 1e-20f) { nx /= nn; ny /= nn; } else { nx = 1.f; ny = 0.f; }
+    if (ny < 0.f || (ny == 0.f && nx < 0.f)) { nx = -nx; ny = -ny; }
+    const float delta_lk = (l1 > 1e-20f) ? ((bx * nx + by * ny) / l1) : 0.f;
+    const float sd_lk = (l1 > 1e-20f) ? (sig_res / sqrt(l1)) : 0.f;
+    // Noise energy over the 3x3 window, so this is an SNR and not a gradient.
+    f[25] = rr_log1p(l1 / rr_max(9.f * sig_res * sig_res, 1e-20f));
+    f[26] = (l1 > 1e-20f) ? rr_clamp(l2 / l1, 0.f, 1.f) : 0.f;
+    f[27] = delta_lk;
+    f[28] = sd_lk;
+    f[29] = (sd_lk > 1e-12f) ? rr_clamp(delta_lk / sd_lk, -64.f, 64.f) : 0.f;
+
+    // ---- 33-35: where in the tile, and does the geometry agree.
+    //
+    // Under rotation the within-tile error grows with distance from the tile
+    // centre and resets at every boundary, so the offset is not a detail of
+    // the parameterisation -- it is the shape of the artifact. Given
+    // explicitly, normalised by the tile, rather than left for the network to
+    // infer from E.
+    f[30] = in->u / in->tile_size;
+    f[31] = in->v / in->tile_size;
+    // The agreement the brief asks for, in units of the measurement's own
+    // uncertainty rather than raw. Raw it does not separate at all (measured:
+    // no monotone trend against ground truth); on the pooled estimate and
+    // divided by the uncertainty, |t_LK| * |E_perp| reaches +0.356 -- better
+    // than either term alone, and better than |E|, the strongest single
+    // feature at +0.339.
+    //
+    // E is projected onto the STRUCTURE TENSOR's normal here, not onto the
+    // pointwise gradient that channel 13 uses. The two directions are
+    // canonicalised independently and can come out opposed, which makes the
+    // product's sign meaningless -- measured, the first version of this
+    // channel was non-monotone against ground truth for exactly that reason.
+    // Same direction as delta_lk, so a positive value means the flow geometry
+    // and the photometry point the same way.
+    const float E_perp_n = Ex * nx + Ey * ny;
+    f[32] = (sd_lk > 1e-12f) ? (E_perp_n * delta_lk / (sd_lk * sd_lk)) : 0.f;
 
     // Where the estimated flow points outside the comparison frame, Eq. 6
     // gives d = inf, and apply_noise_model's Wiener shrink then evaluates
@@ -457,6 +554,7 @@ inline void rr_gather(const RR_DEVICE float* ref_means,
     in->R = R;
     in->d_sq = d_ms_sq * shrink * shrink;
     in->sigma_sq = rr_max(sigma_ms_sq, sigma_md_sq);
+    in->sigma_ms_sq = sigma_ms_sq;
     in->noise_var_sum = noise_var_sum;
 
     const int ptu = rr_clampi(pty - 1, 0, p->flow_ny - 1);

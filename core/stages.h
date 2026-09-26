@@ -229,11 +229,56 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
 //                   above the noise floor
 //  20   bright      local reference brightness
 //  21   nsig        modelled noise sigma at that brightness
-//  22   agree       E_perp * res_disp. Positive and large is the signature
-//                   the whole stage is built to find: the flow field predicts
-//                   a cross-edge error here AND the photometry shows one
+//  22   agree       E_perp * res_disp, pointwise. Kept, but measured to be
+//                   nearly uninformative: the pointwise displacement estimate
+//                   has an uncertainty of 0.25-0.8 raw px, larger than the
+//                   error being hunted, so per-pixel agreement is buried in
+//                   noise (rank correlation with the damage +0.04). Channel
+//                   32 is the version that works
 //  23   mismatch    |res_disp| - |E_perp|: residual the geometry does not
 //                   explain (content change, occlusion, a different failure)
+//  24   sig_ms_frac sigma_ms^2 / sigma^2: how much of Eq. 6's sigma the
+//                   scene's own texture accounts for, rather than the modelled
+//                   noise floor. 1 means texture won. Inert in bright scenes
+//                   (measured ~1 everywhere); it is there for low light, where
+//                   the floor wins and a high R means something different
+//
+//  ---- noise-aware edge detection, then a pooled measurement of its shift.
+//  Both come out of the same 3x3 structure tensor already built for channel 15,
+//  which is why they cost no extra gathering: a 3x3 Lucas-Kanade window needs
+//  exactly the 5x5 luma the builder already holds.
+//
+//  25   edge_snr    log1p(lambda1 / noise energy over the window). "Is there a
+//                   real edge here", answered against the noise model instead
+//                   of an absolute gradient, so one threshold works in daylight
+//                   and at ISO 6400. Only ~4% of pixels carry a real edge
+//  26   aniso       lambda2/lambda1: edge against corner or isotropic texture
+//  27   delta_lk    the displacement along the edge normal, from
+//                   J delta = b (J the structure tensor, b = sum -res grad I).
+//                   Inverse-variance pooling of the per-pixel estimate, which
+//                   is what buys the precision: measured uncertainty 0.097 raw
+//                   px against 0.25-0.8 px pointwise
+//  28   sd_lk       that uncertainty, sigma_res / sqrt(lambda1), so the network
+//                   knows how far to trust channel 27
+//  29   t_lk        delta_lk / sd_lk -- displacement in units of its own noise.
+//                   The strongest single feature measured (+0.358 against the
+//                   damage, where the pointwise residual reaches +0.150). It
+//                   sits at ~1.65 on correctly aligned content, not 0: that is
+//                   the aliasing and resampling floor, and it is the baseline
+//                   "no evidence" level the network learns to ignore
+//  30   u_n         offset from the tile centre, x, in tile widths
+//  31   v_n         offset from the tile centre, y. Under rotation the error
+//                   grows with this and resets at each tile boundary, so the
+//                   offset is the shape of the artifact, not a detail of the
+//                   parameterisation
+//  32   agree_lk    E.n * delta_lk / sd_lk^2 -- the flow geometry confirmed by
+//                   the pooled measurement, in units of its uncertainty. E is
+//                   projected onto the STRUCTURE TENSOR's normal, the same
+//                   direction delta_lk uses; projecting onto the pointwise
+//                   gradient instead (as channel 13 does) canonicalises the
+//                   sign independently and the product loses its meaning.
+//                   |agree_lk| reaches +0.352, and |t_lk| * |E_perp| +0.356 --
+//                   both above |E| alone, which is the best of the old features
 //
 // Emits exactly `strip_h` rows starting at source row y0, clamped to the
 // image. With kRobustnessRefineHalo == 0 (the pointwise net) any row range

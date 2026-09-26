@@ -55,9 +55,22 @@ PREFIX = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "refineset")
 # ---- layout, mirroring refine_dataset.cpp -------------------------------
 NAMES = ["R", "z_d", "tex", "s", "Ex", "Ey", "Emag", "div", "curl", "Mspan",
          "gx", "gy", "gmag", "E_perp", "E_par", "coh", "lap", "res", "res_disp",
-         "res_z", "bright", "nsig", "agree", "mismatch"]
-IN_CH = len(NAMES)                 # 24
-CH_RGEOM, CH_RSTAR, CH_FLOWERR, CH_DELTA, CH_SIGMA = 24, 25, 26, 27, 28
+         "res_z", "bright", "nsig", "agree", "mismatch",
+         # how much of sigma^2 is the scene's own texture
+         "sig_ms_frac",
+         # noise-aware edge detection, then the pooled displacement
+         "edge_snr", "aniso", "delta_lk", "sd_lk", "t_lk",
+         # where in the tile, and whether the geometry agrees with the
+         # measurement once both are in units of its uncertainty
+         "u_n", "v_n", "agree_lk"]
+IN_CH = len(NAMES)                 # 36
+# Derived, not hardcoded: they moved when the feature count changed, and a
+# stale literal here reads the target out of a feature column.
+CH_RGEOM = IN_CH
+CH_RSTAR = IN_CH + 1
+CH_FLOWERR = IN_CH + 2
+CH_DELTA = IN_CH + 3
+CH_SIGMA = IN_CH + 4
 
 # Channels with a heavy tail: the flow-derived lengths reach hundreds of
 # pixels over flat content where the block search wandered, while the regime
@@ -65,7 +78,8 @@ CH_RGEOM, CH_RSTAR, CH_FLOWERR, CH_DELTA, CH_SIGMA = 24, 25, 26, 27, 28
 # representable in one normalised input instead of letting the tail set the
 # scale and crush everything real into a rounding error. Folded into the
 # exported graph, so nothing outside these weights has to know about it.
-LOG_CH = [1, 4, 5, 6, 7, 8, 9, 13, 14, 16, 17, 18, 19, 22, 23]
+LOG_CH = [1, 4, 5, 6, 7, 8, 9, 13, 14, 16, 17, 18, 19, 22, 23,
+          27, 28, 29, 32]
 
 KAPPA = float(os.environ.get("ROB_REFINE_KAPPA", 0.75))
 ARCH = os.environ.get("ROB_REFINE_ARCH", "mlp")             # mlp | cnn

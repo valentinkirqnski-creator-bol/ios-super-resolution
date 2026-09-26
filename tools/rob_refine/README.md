@@ -160,7 +160,7 @@ flow field alone. Parallax makes it depend on the scene.
 **Pointwise by default.** Every feature needing a neighbourhood — the
 structure tensor, the flow-field gradient, the residual's local mean — is
 computed in `build_robustness_refine_features`, so the network itself sees
-one pixel at a time: `24 → 16 → 16 → 1`, ReLU, sigmoid, **689 parameters**.
+one pixel at a time: `24 → 16 → 16 → 1`, ReLU, sigmoid, **833 parameters**.
 
 That is a design choice, not a compromise. A receptive field of one pixel
 means the on-device strip decomposition is *exactly* equivalent to whole-plane
@@ -259,7 +259,7 @@ from `pipeline.cpp`. It also provides the `refine_host.h` hook that lets
 
 ## Feature layout
 
-24 planes, interleaved, at the resolution `R` already is. This ordering is a
+33 planes, interleaved, at the resolution `R` already is. This ordering is a
 contract between `build_robustness_refine_features` (`core/robustness.cpp`),
 `refine_dataset.cpp` and `train_refine.py`; changing it means retraining.
 Lengths are in **raw pixels** throughout, the same units
@@ -283,8 +283,64 @@ Lengths are in **raw pixels** throughout, the same units
 | 18 | `res_disp` | `-res/|∇I|` — the displacement the **residual** implies |
 | 19 | `res_z` | 3×3 mean `|res|` over noise σ |
 | 20–21 | `bright`, `nsig` | local brightness and modelled noise σ |
-| 22 | `agree` | `E_perp * res_disp` — positive and large is the signature this stage exists to find |
+| 22 | `agree` | `E_perp * res_disp`, pointwise. Kept, but measured to be nearly uninformative (+0.04) — see below. Channel 32 is the version that works |
 | 23 | `mismatch` | residual the geometry does not explain |
+| 24 | `sig_ms_frac` | `σ_ms²/σ²` — how much of Eq. 6's σ the scene's own texture accounts for rather than the modelled noise floor. Inert in bright scenes (~1 everywhere); it is there for low light, where the floor wins and a high R means something different |
+| 25 | `edge_snr` | `log1p(λ₁ / noise energy)` — **is there a real edge**, against the noise model instead of an absolute gradient, so one answer works in daylight and at ISO 6400. Only ~4% of pixels carry one |
+| 26 | `aniso` | `λ₂/λ₁` — edge against corner or isotropic texture |
+| 27 | `delta_lk` | displacement along the edge normal from `J·δ = b` — inverse-variance pooling of the per-pixel estimate. Uncertainty **0.097 raw px** against 0.25–0.8 px pointwise |
+| 28 | `sd_lk` | that uncertainty, `σ_res/√λ₁`, so the network knows how far to trust 27 |
+| 29 | `t_lk` | `delta_lk / sd_lk` — the displacement in units of its own noise. **The strongest single feature measured, +0.358.** Sits at ~1.65 on correctly aligned content, not 0: that is the aliasing floor, and it is the "no evidence" baseline the network learns to ignore |
+| 30–31 | `u_n`, `v_n` | offset from the tile centre in tile widths. Under rotation the error grows with this and resets at each boundary, so the offset is the shape of the artifact, not a detail of the parameterisation |
+| 32 | `agree_lk` | `E·n * delta_lk / sd_lk²` — the flow geometry confirmed by the pooled measurement, in units of its uncertainty. `\|agree_lk\|` reaches +0.352 |
+
+### Finding the edge against the noise, then measuring its shift
+
+Channels 25–29 and 32 all come out of the **same 3×3 structure tensor** already
+built for the coherence in channel 15, which is why they cost no extra
+gathering: a 3×3 Lucas-Kanade window needs exactly the 5×5 luma window the
+builder already holds.
+
+The first version of this stage had only the pointwise estimate `res_disp`, and
+measurement showed why it underperformed: `−res/|∇I|` estimates the
+displacement with an uncertainty of `σ_res/|∇I|`, which is **0.25–0.8 raw px** —
+larger than the 0.1–0.5 px error being hunted. So per-pixel it is noise, and the
+agreement channel built on it reaches only +0.04 against the damage. The model
+was effectively running on `|E|` alone.
+
+But δ is a *geometric* field, smooth over a few pixels, while the residual noise
+is independent per pixel. Pool it, weighting each tap by its own precision
+(`g²`), and that is exactly the Lucas-Kanade normal equation
+
+```
+J·δ = b     J = structure tensor,   b = Σ −res·∇I
+```
+
+On an edge `J` is rank-1, so the only observable component is along the normal —
+which is also the only direction a shift is visible in.
+
+**The pool stays 3×3.** Measured rank correlation of `|t_lk|` with the damage:
++0.301 at 3×3, +0.222 at 5×5, +0.174 at 7×7. A wider pool averages away the
+within-tile variation that *is* the artifact.
+
+| on real edges | `\|t_lk\|` | `\|δ_lk\|` px | `sd_lk` px | R* |
+|---|---|---|---|---|
+| flow error <0.1 px | 1.65 | 0.137 | 0.097 | 0.975 |
+| 0.1–0.3 px | 1.82 | 0.155 | 0.101 | 0.894 |
+| 0.3–0.5 px | 2.81 | 0.210 | 0.094 | 0.730 |
+| 0.5–1 px | 3.56 | 0.279 | 0.097 | 0.577 |
+| 1–3 px | 6.54 | 0.469 | 0.089 | 0.350 |
+
+Two traps worth recording. `agree_lk` must project `E` onto the **structure
+tensor's** normal, not onto the pointwise gradient channel 13 uses: the two are
+canonicalised independently and can come out opposed, which makes the product's
+sign meaningless — the first version was non-monotone against ground truth for
+exactly that reason. And `d_ms`/`d_md`/`sigma_md` were tried and dropped: the
+CPU builder fills `RefineInputs` from precomputed planes and never had them
+(they live inside `apply_noise_model`, which returns only `d²` and `σ²`), so
+getting them there costs four more full-resolution planes — 50 MB on a path
+already at 124 MB — or a duplicated noise-model loop. `sig_ms_frac` is the one
+that was free.
 
 Channels 13 and 18 are signed along a canonicalised gradient direction
 (flipped so `gy > 0`), which is what makes channel 22 a sign agreement rather
@@ -405,6 +461,106 @@ Both models are trained and checked in (`refinenet_mlp_geom.pt`,
 `refinenet_mlp_plain.pt`); which one ships is a matter of which baseline the
 toggle is left in.
 
+### What the Lucas-Kanade channels actually bought
+
+Almost nothing end to end, and the reason is worth more than the channels are.
+
+`|t_lk|` is a far stronger signal than the pointwise estimate it joins (+0.358
+against +0.150 univariately). Scored on the same held-out frames with the same
+labels — channels 0–23 are unchanged, so the previous model can be run on the
+new dataset by slicing its first 24 columns — it moves the overall merge error
+by **1%**, and the sub-pixel band not at all:
+
+| | falseR% | chg% | mergeMSE | sub-pixel band | 0.5–3 px |
+|---|---|---|---|---|---|
+| Wronski + geometry rejection | 2.225 | — | 0.10128 | 0.03443 | 0.51270 |
+| + NN, 24 channels | 2.323 | 48.4 | 0.07386 | 0.03226 | 0.37348 |
+| + NN, 33 channels | 2.312 | **43.8** | 0.07368 | 0.03235 | **0.36678** |
+
+It reaches the same place touching 10% fewer pixels, and is ~2% better in the
+0.5–3 px band. That is the whole gain.
+
+The natural next guess is that a 833-parameter network cannot exploit the new
+signal. It is wrong — fitting the *same* features with far more capacity barely
+moves anything:
+
+| model | parameters | merge error vs geometry rejection |
+|---|---|---|
+| shipped | 833 | −23.3% |
+| wider | 4,033 | −25.3% |
+| wider and deeper | 21,985 | −25.7% |
+
+A 26× network buys 2.4 points. So the features and the label have been squeezed
+nearly dry by the tiny model, and the univariate strength of `t_lk` was largely
+**redundant** given `res`, `gmag` and the coherence the network already had.
+
+The channels stay: they are better motivated, strictly cheaper per unit of
+result, and `edge_snr`/`sig_ms_frac` address low light, which this single bright
+burst cannot exercise. But adding more features of this kind is not where the
+next improvement is.
+
+### Per motion regime
+
+The held-out frames are exactly one cycle of the eight regimes, so this is a
+clean read on the cases the stage was built for. Excess merged-pixel MSE, dead
+zone 0.05:
+
+| regime | Wronski + geom | + NN | |
+|---|---|---|---|
+| static camera | 0.13559 | 0.10841 | −20.0% |
+| sub-pixel shift | 0.06276 | 0.05507 | −12.3% |
+| large shift | 0.11157 | 0.08913 | −20.1% |
+| **small rotation** | 0.12802 | 0.10785 | **−15.8%** |
+| **rotation + shift** | 0.08516 | 0.06820 | **−19.9%** |
+| **parallax** | 0.06407 | 0.04818 | **−24.8%** |
+| **parallax + depth step** | 0.08803 | 0.06930 | **−21.3%** |
+| everything + occlusion | 0.13504 | 0.07557 | −44.0% |
+
+### Picking kappa and the dead zone
+
+`wBad` is the mean weight left on pixels ground truth says to drop — the
+quantity a surviving ghost is proportional to.
+
+| kappa | dead | chg% | falseR% | wBad | mergeMSE | rotation regimes only |
+|---|---|---|---|---|---|---|
+| — | — | 0.00 | 0.000 | 0.7825 | 0.10128 | 0.09132 |
+| 0.75 | **0.05** | 43.8 | 2.312 | 0.6820 | 0.07368 (−27.3%) | 0.07061 (**−22.7%**) |
+| 0.75 | 0.10 | 12.7 | 2.312 | 0.6923 | 0.07531 (−25.6%) | 0.07207 (−21.1%) |
+| 0.75 | 0.20 | 4.3 | 2.312 | 0.7049 | 0.07720 (−23.8%) | 0.07368 (−19.3%) |
+| 1.00 | **0.05** | 43.8 | 2.458 | **0.6485** | **0.06839 (−32.5%)** | **0.06730 (−26.3%)** |
+| 1.00 | 0.20 | 4.3 | 2.458 | 0.6791 | 0.07291 (−28.0%) | 0.07122 (−22.0%) |
+
+Lifting `kappa` to 1.0 costs 0.15 percentage points of false rejection and buys
+5 points of merge error. Note what it does *not* do: `wBad` only falls from 0.68
+to 0.65, so a misaligned pixel still keeps about two thirds of its weight.
+
+### Why the ghost is reduced and not removed
+
+That `wBad` number is the answer, and it is a property of the **label**, not of
+the features, the capacity or the cap.
+
+The target is the inverse-MSE optimal merge weight, `R* = 1/(1 + Delta²/sigma²)`.
+On a rotation-misaligned strong edge that evaluates to 0.73–0.89 — so the
+correct answer, by the objective being optimised, is *keep three quarters of the
+weight*. The network is doing what it was asked to do.
+
+But minimising mean squared error is not the same as removing a visible
+artifact. A doubled edge is a **structured** error, spatially coherent along the
+edge and repeating on the tile grid, and the eye finds that far more objectionable
+than its MSE contribution suggests. MSE-optimal weighting therefore
+systematically under-rejects for this particular artifact, while being exactly
+right for noise.
+
+Closing that gap means changing the target, not the model: weighting `Delta²` by
+the structure-tensor coherence, say, so that a coherent doubled edge is charged
+more than the same energy scattered as texture. That is a deliberate departure
+from a principled, tuning-free label toward a perceptual one, and it raises the
+false-rejection risk it was chosen to avoid — which is why it is written down
+here rather than done.
+
+The other honest limit: this is one bright daylight burst of synthetic motion.
+`edge_snr` and `sig_ms_frac` exist for low light and are inert on it.
+
 ### Sparsity
 
 The dead zone is the control, swept at `kappa = 0.75` on a held-out frame:
@@ -486,7 +642,7 @@ which reaches the same answer by a different route — planes instead of gathers
 `apply_noise_model` instead of the transcribed noise block:
 
 ```
-max |R_gpu - R_cpu|                      7.87e-06
+max |R_gpu - R_cpu|                      8.82e-06
 pixels differing by more than 1e-5       0 of 3,282,240
 dead-zone boundary flips                 1
 ```
@@ -533,7 +689,7 @@ against a synthetic 1° rotation, at the shipped Config defaults:
 | `R == 0` became positive | **0 pixels** |
 | largest single reduction | 0.7499, i.e. the `kappa` cap is binding |
 | strip vs whole-plane features | **max abs difference exactly 0** |
-| pixels moved | **2.00%** |
+| pixels moved | **2.09%** |
 | mean R | 0.9577 → 0.9501 |
 
 Cost per comparison frame, 7 strips of 256 rows, desktop CPU:
@@ -545,7 +701,7 @@ Cost per comparison frame, 7 strips of 256 rows, desktop CPU:
 | feature builder, all strips | 272 |
 | whole stage including a scalar-C++ stand-in for the network | 1098 |
 
-Peak extra allocation **124 MB**: one 24-channel feature strip 49 MB, `d_sq`
+Peak extra allocation **143 MB**: one 33-channel feature strip 68 MB, `d_sq`
 plus `sigma_sq` 25 MB, comparison means 38 MB, refined mask 12 MB.
 
 The feature builder was 1801 ms before the luma planes were precomputed; every
@@ -555,7 +711,7 @@ loads per output pixel.
 ### On the 200 ms budget
 
 These are the CPU fallback's numbers. Memory is comfortably inside the budget;
-time is not, and the reason is not the network — 689 parameters evaluated
+time is not, and the reason is not the network — 833 parameters evaluated
 pointwise is ~2.3 GMAC over a 3 MP plane, which the ANE does in single-digit
 milliseconds. The ~1 s above is scalar C++ standing in for Core ML.
 
