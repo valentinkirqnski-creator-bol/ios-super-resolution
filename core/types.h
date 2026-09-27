@@ -594,7 +594,7 @@ struct Config {
     // running. align_match_14 keeps its other two effects -- the level-0 search
     // radius and the per-level ICA policy below -- and no longer silently owns a
     // third.
-    bool flow_upsample_candidates = true;
+    bool flow_upsample_candidates = false;  // app default; see TuningParams
     bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
 
     // Block-match search radius for a pyramid level, fine (0) to coarse.
@@ -720,7 +720,7 @@ struct Config {
     // comparison frame while the mask is being built.
 
     float r_t  = 0.12f;
-    float r_s1 = 2.0f;
+    float r_s1 = 1.99f;   // app default; see TuningParams
     float r_s2 = 12.0f;
     // M (Wronski et al. Eq. 7): max-minus-min flow displacement over a 3x3
     // tile neighbourhood, literal raw span -- no detrending. A rigid rotation

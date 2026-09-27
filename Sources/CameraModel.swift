@@ -83,8 +83,15 @@ enum OutputResolutionMode: String, CaseIterable, Identifiable {
 /// Holds the C++ algorithm tuning parameters for live adjustments.
 struct TuningParams: Equatable, Codable {
     // Match 460-main params.py
-    var r_t: Float = 0.20
-    var r_s1: Float = 2.0
+    // ---- fixed app configuration ---------------------------------------
+    //
+    // The values below are pinned rather than exposed. Their controls were
+    // removed from the settings Form, so appDefaults IS the configuration and
+    // the only way to change one is here. Each is annotated with what it was,
+    // because a pinned value with no record of the previous one cannot be
+    // reasoned about later.
+    var r_t: Float = 0.12          // was 0.20
+    var r_s1: Float = 1.99         // was 2.0
     var r_s2: Float = 12.0
     var r_Mt: Float = 0.8
     // true = full-res FFT low-pass, false = 2x2 Bayer quad average at half res
@@ -170,7 +177,7 @@ struct TuningParams: Equatable, Codable {
     /// against the image, lowest L1 residual wins. OFF: plain bilinear resize.
     ///
     /// Forced OFF by align_match_14, which is what 1.4 does.
-    var flow_upsample_candidates: Bool = true
+    var flow_upsample_candidates: Bool = false     // was true
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -255,7 +262,17 @@ struct TuningParams: Equatable, Codable {
     /// FALSE. It is now a Settings toggle, so its stored value is what the user
     /// sees; defaulting it to true while the gate also demands the decimate grey
     /// made it read "on" while being inert, which is worse than off.
-    var robustness_raw_resolution_enabled: Bool = false
+    // ON, together with alignment_grey_fft, selects the FULL-RES FFT guide:
+    // R on the raw lattice with nothing upscaled. Measured Wronski-only against
+    // the decimated guide, +2.49 dB at 2.1 px of per-tile flow error and
+    // -0.59 dB at 0.27 px. Chosen deliberately with that trade known.
+    //
+    // It also puts motion_geom_reject's threshold in a domain it was not
+    // calibrated for -- that threshold is in the decimated guide's gradient
+    // units -- which measured as mildly counterproductive (+3.6% thicken).
+    // Kept on at 0.0045 by explicit instruction; noted here so the interaction
+    // is not rediscovered as a mystery.
+    var robustness_raw_resolution_enabled: Bool = true   // was false
     // Analytic edge-misalignment detector; defaults mirror core/types.h.
     // These are new keys, so an existing saved preset -- which only
     // overrides what it actually contains -- leaves them here.
@@ -271,11 +288,14 @@ struct TuningParams: Equatable, Codable {
     // level. A percentile rather than a fixed offset, so one setting behaves the
     // same on a flat scene and a contrasty one; the subtraction is still capped
     // by display_black_max so a low-key shot cannot have its shadows crushed.
-    var hdr_black_percentile: Float = 0.002
+    // 0.050 sets the black point at the 5th percentile. 25x the previous
+    // value, and above the 0.02 maximum the slider used to allow -- which no
+    // longer constrains it, since the control is gone.
+    var hdr_black_percentile: Float = 0.050        // was 0.002
     // Saturation boost weighted (1 - sat)^2 toward muted colours and faded out in
     // the brightest tones, so it lifts the picture without re-saturating a
     // highlight.
-    var hdr_vibrance: Float = 0.40
+    var hdr_vibrance: Float = 0.50                 // was 0.40
 
     // JPEG/preview rendering (core/render_isp.cpp). Defaults mirror the C++
     // exactly; they were tuned against real DNG/reference pairs, so changing one
@@ -490,7 +510,14 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 12
+        // 13: the fixed configuration above. A saved preset silently beats a
+        // new appDefaults -- that is what this counter exists for, and skipping
+        // the bump is why a previous default change (dng_codec) never reached
+        // any existing install and needed the one-off repair below. Bumping
+        // REPLACES the whole saved preset, so anything else an install had
+        // tuned returns to appDefaults too; that is the intent here, because
+        // the controls for these are no longer reachable to re-tune.
+        let defaultsVersion = 13
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
