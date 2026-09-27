@@ -1063,6 +1063,41 @@ struct CameraView: View {
                 }
     }
 
+    // Extracted rather than inline for the same reason kernelsSection is: the Form
+    // body was once a single 343-line expression and the Swift type checker gave
+    // up on it. These are the only tuning controls still reachable after cef567b
+    // pinned the rest, and they sit together because the second needs the first.
+    private var motionRejectionSection: some View {
+        Section(header: Text("Motion Rejection")) {
+            Toggle("Robustness at Raw Resolution",
+                   isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
+            Text("""
+                 Grades every raw pixel separately instead of using one value per 2x2 sensor block, so the boundary between kept and rejected detail lands four times more precisely. Measured +2.5 dB at moderate hand shake. The neural mask below also needs this.
+
+                 Turn it OFF if a shot fails for memory: it raises what the merge holds by roughly 300 MB on a 12 MP eight-frame burst, and with it off the pipeline returns exactly to the older half-resolution behaviour.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+            Toggle("Neural Robustness Mask", isOn: $cam.tuningParams.sr_gate_enabled)
+                .disabled(!cam.tuningParams.robustness_raw_resolution_enabled)
+            // A plain if rather than a ternary inside the Text: an inline ternary
+            // in a Text is the shape that has pushed this file past the type
+            // checker before.
+            if !cam.tuningParams.robustness_raw_resolution_enabled {
+                Text("Unavailable while Robustness at Raw Resolution is off. The network was trained on that setting's full-resolution inputs and declines on anything else, which leaves the fixed formula running.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+            Text("""
+                 Decides per pixel how much of each frame to merge, using a small trained network instead of the fixed formula. It was trained on the merged result, so it keeps the sub-pixel offsets that super-resolution needs while still rejecting real misalignment: ghosting and doubled edges from moving subjects or hand shake.
+
+                 Measured +5.2 dB against the fixed formula on held-out test bursts, and better in every case tested. Slightly slower per shot. Turn it off to get the previous behaviour exactly.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+        }
+    }
+
     private var tuningSettingsView: some View {
         NavigationView {
             Form {
@@ -1102,21 +1137,7 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
-                // The one tuning control that is back in the Form. Everything
-                // else pinned by cef567b stays pinned; this is exposed because
-                // it is a genuine quality/behaviour choice rather than a
-                // calibration constant, and because it can be measured against
-                // the analytic mask on the same shot.
-                Section(header: Text("Motion Rejection")) {
-                    Toggle("Neural Robustness Mask", isOn: $cam.tuningParams.sr_gate_enabled)
-                    Text("""
-                        Decides per pixel how much of each frame to merge, using a small trained network instead of the fixed formula. It was trained on the merged result, so it keeps the sub-pixel offsets that super-resolution needs while still rejecting real misalignment: ghosting and doubled edges from moving subjects or hand shake.
-
-                        Measured +5.2 dB against the fixed formula on held-out test bursts, and better in every case tested. Slightly slower per shot. Turn it off to get the previous behaviour exactly.
-                        """)
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
+                motionRejectionSection
 
             }
             .navigationTitle("Settings")
