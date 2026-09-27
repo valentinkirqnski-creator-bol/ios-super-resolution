@@ -11,3 +11,9 @@ sr_gate_random.pt
 integ_in.bin
 integ_mask.bin
 __pycache__/
+mk*_log.txt
+t_*.txt
+sr_gate12.pt
+sr_gate_d3_*.pt
+sr_gate_final.pt
+train12_log.txt

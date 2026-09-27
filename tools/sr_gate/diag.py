@@ -20,7 +20,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def main():
-    dngs = srburst.find_dngs(ROOT)
+    dngs, _ = srburst.find_dngs(ROOT)
     scene_full = srburst.load_scene(dngs[0])
     Hs = Ws = 384
     y0 = (scene_full.shape[0] - Hs) // 2
@@ -46,8 +46,9 @@ def main():
         rs, rs_ng, rs_ng_nomin, amed, ap90, grej = [], [], [], [], [], []
         for n in range(1, len(b['raws'])):
             gm, _ = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][n]))
-            d_sq, sig_sq = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n],
-                                                 cfg, std_c, diff_c)
+            d_sq, sig_sq, _ = srsim.compute_d_sigma(ref_m, ref_v, gm,
+                                                    b['flows'][n], cfg,
+                                                    std_c, diff_c)
             a = d_sq / np.maximum(sig_sq, 1e-20)
             amed.append(np.median(a))
             ap90.append(np.percentile(a, 90))

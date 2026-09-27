@@ -35,7 +35,7 @@ def main():
     a = ap.parse_args()
     here = os.path.dirname(os.path.abspath(__file__))
 
-    dngs = srburst.find_dngs(bld.ROOT)
+    dngs, _ = srburst.find_dngs(bld.ROOT)
     scene_full = srburst.load_scene(dngs[0])
     y0 = (scene_full.shape[0] - a.hr) // 2
     x0 = (scene_full.shape[1] - a.hr) // 2
@@ -79,17 +79,22 @@ def main():
     # difference between the pipeline's own guide/Eq.6 and the port's.
     std_c, diff_c = srsim.noise_curves_closed_form(cfg.alpha_rob, cfg.beta_rob)
     ref_m, ref_v = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][0]))
-    gm, _ = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][1]))
-    d_sq, sig_sq = srsim.compute_d_sigma(ref_m, ref_v, gm, flow, cfg, std_c, diff_c)
-    feat = srsim.build_features(d_sq, sig_sq, ref_m, ref_v, flow, cfg)
+    gm, gv = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][1]))
+    d_sq, sig_sq, comps = srsim.compute_d_sigma(ref_m, ref_v, gm, flow, cfg,
+                                                std_c, diff_c)
+    cvw = srsim.warp_sample_comp(gv, flow, cfg)
+    feat = srsim.build_features(d_sq, sig_sq, ref_m, ref_v, flow, cfg, comps, cvw)
     ck = torch.load(os.path.join(here, a.ckpt), map_location='cpu',
                     weights_only=True)
     net = gate.SRGate(in_ch=ck['in_ch'], width=ck['width'],
                       dilations=ck['dilations'])
     net.load_state_dict(ck['state_dict'])
     net.eval()
+    # Sliced to the net's own width: srsim builds 12 channels, the shipped net
+    # consumes the first 8 (channels 8-11 measured neutral, see srsim).
+    n_in = net.convs[0].weight.shape[1]
     with torch.no_grad():
-        m_torch = net(torch.from_numpy(feat[None]))[0, 0].numpy()
+        m_torch = net(torch.from_numpy(feat[:n_in][None]))[0, 0].numpy()
 
     d = np.abs(m_torch - m_gate)
     print()

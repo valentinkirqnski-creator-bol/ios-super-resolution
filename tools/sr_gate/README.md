@@ -96,7 +96,7 @@ scale 2, steerable kernel, `ts = 16`. PSNR against the oracle-merge ground truth
 | Eq. 6–9, geometry rejection off | 40.97 dB | +3.15 dB | +1.88 | 20/20 |
 | Eq. 6–8, no 5x5 minimum either | 42.97 dB | +1.16 dB | −0.04 | 19/20 |
 | `R = 1` (merge everything) | 41.65 dB | +2.47 dB | −0.27 | 18/20 |
-| **sr_gate** | **44.13 dB** | — | | |
+| **sr_gate** | **44.08 dB** | — | | |
 
 Edge MSE −61%, flat MSE −80%, both against the shipping mask.
 
@@ -122,6 +122,53 @@ analytic variant. Both parts are real and they are separate findings:
 An oracle `R` — optimised per burst directly against the ground truth, so it has
 seen the answer — reaches 4–8 dB above `R = 1`, which bounds what any mask of
 this shape could do. The gate captures roughly a third of that.
+
+## Two things that were tried and did NOT work
+
+Recorded because both are reasonable things to expect, and because the cost of
+re-trying them is another hour.
+
+**The statistics behind the ratio (channels 8-11).** `d^2/sigma^2` is one number
+built from four, and Eq. 6 reduces them with a `max()` and a shrinkage that throw
+away which term won. Adding those back -- `shrink`, `sigdom`, a contrast-relative
+`d_rel`, and `varmatch` from the comparison frame's local variance that both
+backends compute and discard -- changes nothing:
+
+| in_ch | scenes | steps | test PSNR |
+|-------|--------|-------|-----------|
+| 8     | 6      | 4200  | 44.07 dB  |
+| 12    | 6      | 4200  | 44.07 dB  |
+
+A ridge probe against the oracle mask agrees from a different direction: the
+incremental R^2 of 8-11 over 0-7 is **-0.0027**, i.e. no linear information the
+first eight do not already span (`probe_features.py`). Most likely because
+`sigma_ms^2` is `ref_vars`, which channel 2 carries; `shrink` moves with
+`d^2/sigma^2`; and `d_rel` is a rescaling of the same residual. The channels are
+kept in `srsim.py` behind a default-off argument so the ablation can be re-run,
+but the shipped net is 8-channel and `core/` is unchanged.
+
+A trap worth naming: the first attempt at this comparison used a WALL-CLOCK budget
+and looked like a 0.07 dB loss. A wider input is slower per step, so the
+12-channel net had silently had 1900 fewer steps. `train.py --steps` exists to
+match step counts; do not compare feature sets by minutes.
+
+**Three more capture sessions.** `Downloads/ours`, `ours2`, `ours3` -- 8-frame
+handheld bursts, one scene each, same sensor -- take the training material from 3
+capture sessions to 6. At matched steps that is also neutral: 44.08 dB against
+44.13. And on those very scenes, the model that never saw them scores 42.61
+against the one trained on them at 42.58, winning 15 of 20 cells.
+
+That is a better result than it looks. It says the eight features are
+scene-agnostic enough that the mapping from them to a merge weight does not need
+to be learned per scene -- the 3-session model already reached +5.0 dB over
+Wronski on three sessions it had never seen. The extra captures therefore
+CONFIRM the generalisation that the original dataset's narrowness left open,
+rather than improving on it. The shipped model is trained on all six anyway,
+since nothing argues against the broader data and it is the more defensible
+default for content none of this has seen.
+
+Run-to-run spread across five 8-channel runs at different data and step counts is
+about 0.07 dB, so treat every difference in this section as noise.
 
 ## Parity
 

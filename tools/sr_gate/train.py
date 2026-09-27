@@ -91,7 +91,17 @@ def psnr_t(out, gt):
 
 
 def run_gate(net, feat):
-    """feat (batch, N, C, h, w) -> R (batch, N, h, w)."""
+    """feat (batch, N, C, h, w) -> R (batch, N, h, w).
+
+    Sliced to the channel count the NETWORK declares, not the dataset's. The
+    feature set only ever grows by appending, so an 8-channel checkpoint scores
+    correctly on a 12-channel dataset -- which is what makes an added-features
+    A/B exact: both models see the same bursts and the same noise draws, rather
+    than two datasets built from separate random seeds.
+    """
+    want = net.convs[0].weight.shape[1]
+    if feat.shape[2] > want:
+        feat = feat[:, :, :want]
     b, n = feat.shape[0], feat.shape[1]
     r = net(feat.flatten(0, 1))[:, 0]
     return r.view(b, n, feat.shape[-2], feat.shape[-1])
@@ -135,10 +145,19 @@ def main():
     ap.add_argument('--data', default='data')
     ap.add_argument('--out', default='sr_gate.pt')
     ap.add_argument('--minutes', type=float, default=28.0)
+    ap.add_argument('--steps', type=int, default=0,
+                    help='fixed step count instead of a time budget. Comparing two '
+                         'feature sets under the same WALL CLOCK is not a fair '
+                         'test: a wider input is slower per step, so it silently '
+                         'gets fewer of them. Match steps when comparing.')
     ap.add_argument('--batch', type=int, default=2)
     ap.add_argument('--lr', type=float, default=4e-3)
     ap.add_argument('--threads', type=int, default=0)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--in-ch', type=int, default=0,
+                    help='train on only the first N feature channels. The set only '
+                         'ever grows by appending, so this ablates the additions '
+                         'against the SAME bursts rather than a rebuilt dataset.')
     ap.add_argument('--eval-every', type=float, default=300.0,
                     help='seconds between validation passes')
     a = ap.parse_args()
@@ -153,8 +172,9 @@ def main():
     val = Split(root, 'val')
     print('bursts: %d train, %d val  (memory mapped)' % (train.n, val.n))
 
-    net = gate.SRGate()
-    print('sr_gate: %d parameters' % net.n_params())
+    net = gate.SRGate(in_ch=a.in_ch) if a.in_ch > 0 else gate.SRGate()
+    print('sr_gate: %d parameters, %d input channels'
+          % (net.n_params(), net.convs[0].weight.shape[1]))
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     budget = a.minutes * 60.0
     t0 = time.time()
@@ -174,8 +194,14 @@ def main():
         loss.backward()
         opt.step()
     per_step = (time.time() - t0) / warm
-    total_steps = max(200, int((budget - (time.time() - t0)) / per_step))
-    print('%.3f s/step -> planning %d steps' % (per_step, total_steps))
+    if a.steps > 0:
+        total_steps = a.steps
+        budget = 1e9        # the step count is the budget now
+        print('%.3f s/step -> %d steps requested (~%.0f min)'
+              % (per_step, total_steps, per_step * total_steps / 60.0))
+    else:
+        total_steps = max(200, int((budget - (time.time() - t0)) / per_step))
+        print('%.3f s/step -> planning %d steps' % (per_step, total_steps))
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=a.lr, total_steps=total_steps, pct_start=0.15)
 
@@ -213,7 +239,7 @@ def main():
                 best = g
                 torch.save({'state_dict': net.state_dict(),
                             'dilations': net.dilations, 'width': gate.WIDTH,
-                            'in_ch': gate.NUM_FEATURES, 'steps': step,
+                            'in_ch': net.convs[0].weight.shape[1], 'steps': step,
                             'val_gain': g}, outp)
                 print('  saved (best so far)', flush=True)
 
@@ -223,7 +249,7 @@ def main():
           % (g, best))
     if g >= best:
         torch.save({'state_dict': net.state_dict(), 'dilations': net.dilations,
-                    'width': gate.WIDTH, 'in_ch': gate.NUM_FEATURES,
+                    'width': gate.WIDTH, 'in_ch': net.convs[0].weight.shape[1],
                     'steps': step, 'val_gain': g}, outp)
         print('saved final to', outp)
     else:

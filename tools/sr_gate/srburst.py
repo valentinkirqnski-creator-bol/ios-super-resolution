@@ -47,9 +47,25 @@ from srsim import CFA, SCALE, Cfg
 # scene loading
 # --------------------------------------------------------------------------
 
-def find_dngs(root):
+# Scene sources that are NOT under `root`. bursts/ and the hdrplus payloads sit
+# one directory above the repo; `ours` is one above that again, so no single
+# relative pattern reaches both. Override or extend with SR_GATE_SCENES, an
+# os.pathsep separated list of directories to glob for *.dng.
+# ours, ours2, ours3, ... -- one 8-frame handheld burst of one scene each. Globbed
+# rather than listed so another capture is picked up by dropping the folder in.
+# sorted() inside find_dngs keeps the order stable, which the holdout depends on.
+EXTRA_SCENE_GLOBS = ['../ours*/*.dng']
+
+
+def find_dngs(root, extra=True):
     """Real Bayer DNGs only. photos-dng-test/ and ok/ hold linear demosaiced
-    outputs, which are not sensor data and are excluded."""
+    outputs, which are not sensor data and are excluded.
+
+    Order is stable -- sorted within each pattern, patterns in a fixed order, and
+    the out-of-tree sources LAST. make_data.py draws its holdout from a
+    permutation of this list, so anything that reorders it silently changes which
+    scenes are held out and makes new numbers incomparable with old ones.
+    """
     pats = [
         'bursts/**/*.dng',
         'hdrplus-python-main/test_data/**/*.dng',
@@ -57,7 +73,23 @@ def find_dngs(root):
     out = []
     for p in pats:
         out += sorted(glob.glob(os.path.join(root, p), recursive=True))
-    return [p for p in out if 'photos-dng-test' not in p.replace('\\', '/')]
+    n_in_tree = len(out)
+    if extra:
+        for p in EXTRA_SCENE_GLOBS:
+            out += sorted(glob.glob(os.path.join(root, p), recursive=True))
+        for d in os.environ.get('SR_GATE_SCENES', '').split(os.pathsep):
+            if d.strip():
+                out += sorted(glob.glob(os.path.join(d.strip(), '*.dng')))
+    out = [p for p in out if 'photos-dng-test' not in p.replace(chr(92), '/')]
+    # Deduplicate while keeping order, in case a glob and SR_GATE_SCENES overlap.
+    seen = set()
+    uniq = []
+    for p in out:
+        k = os.path.normcase(os.path.abspath(p))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq, n_in_tree
 
 
 def load_scene(path):

@@ -20,7 +20,7 @@ def psnr(a, b):
 
 
 def main():
-    dngs = srburst.find_dngs(ROOT)
+    dngs, _ = srburst.find_dngs(ROOT)
     print('DNGs found:', len(dngs))
     for d in dngs[:3]:
         print('  ', os.path.relpath(d, ROOT))
@@ -87,8 +87,8 @@ def main():
         Ag[n - 1], Bg[n - 1] = srmerge.accumulate_comp_ab(b['raws_clean'][n],
                                                           tfx, tfy, covs_c, cfg)
         gm, _ = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][n]))
-        d_sq, sig_sq = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n],
-                                             cfg, std_c, diff_c)
+        d_sq, sig_sq, _ = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n],
+                                                cfg, std_c, diff_c)
         feats[n - 1] = srsim.build_features(d_sq, sig_sq, ref_m, ref_v,
                                             b['flows'][n], cfg)
         Rw[n - 1] = srsim.wronski_robustness(d_sq, sig_sq, b['flows'][n], ref_m, cfg)

@@ -31,7 +31,7 @@ def to_t(x):
 
 
 def main():
-    dngs = srburst.find_dngs(build.ROOT)
+    dngs, _ = srburst.find_dngs(build.ROOT)
     scene_full = srburst.load_scene(dngs[0])
     Hs = Ws = 384
     y0 = (scene_full.shape[0] - Hs) // 2

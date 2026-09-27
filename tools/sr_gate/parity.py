@@ -58,7 +58,7 @@ def main():
     a = ap.parse_args()
     here = os.path.dirname(os.path.abspath(__file__))
 
-    dngs = srburst.find_dngs(bld.ROOT)
+    dngs, _ = srburst.find_dngs(bld.ROOT)
     scene_full = srburst.load_scene(dngs[0])
     y0 = (scene_full.shape[0] - a.hr) // 2
     x0 = (scene_full.shape[1] - a.hr) // 2
@@ -75,9 +75,10 @@ def main():
     cfg.tune_snr(b['raws'][0], std_c)
     cfg.tile_size = 16
     ref_m, ref_v = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][0]))
-    gm, _ = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][1]))
-    d_sq, sig_sq = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][1], cfg,
-                                         std_c, diff_c)
+    gm, gv = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][1]))
+    d_sq, sig_sq, comps = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][1],
+                                                cfg, std_c, diff_c)
+    cvw = srsim.warp_sample_comp(gv, b['flows'][1], cfg)
 
     inp = os.path.join(here, 'parity_in.bin')
     outp = os.path.join(here, 'parity_out.bin')
@@ -97,12 +98,20 @@ def main():
     print('beta_rob   python %.9g  c++ %.9g  rel %.2e'
           % (cfg.beta_rob, beta_rob, abs(beta_rob / cfg.beta_rob - 1)))
 
-    p_feat = srsim.build_features(d_sq, sig_sq, ref_m, ref_v, b['flows'][1], cfg)
+    p_feat = srsim.build_features(d_sq, sig_sq, ref_m, ref_v, b['flows'][1], cfg,
+                                  comps, cvw)
     print()
     print('%-8s %-12s %-12s %-10s' % ('feature', 'max abs err', 'mean abs err',
                                       'range'))
     worst = 0.0
-    for i, nm in enumerate(srsim.FEATURE_NAMES):
+    # Only the channels the C++ actually emits. srsim can build more than the
+    # shipped net consumes (8-11 measured neutral, not shipped), and the C++ plane
+    # is sized by SRG_FEATURES, so the comparison is over that many.
+    n_cmp = c_feat.shape[0]
+    assert p_feat.shape[0] >= n_cmp, (p_feat.shape, c_feat.shape)
+    print('comparing %d channels (C++ SRG_FEATURES); srsim builds %d'
+          % (n_cmp, p_feat.shape[0]))
+    for i, nm in enumerate(srsim.FEATURE_NAMES[:n_cmp]):
         e = np.abs(p_feat[i] - c_feat[i])
         worst = max(worst, float(e.max()))
         print('%-8s %-12.3e %-12.3e [%.3f, %.3f]'
@@ -118,7 +127,7 @@ def main():
     with torch.no_grad():
         # torch on the C++ features isolates the inference from the features
         t_on_c = net(torch.from_numpy(c_feat[None]))[0, 0].numpy()
-        t_on_p = net(torch.from_numpy(p_feat[None]))[0, 0].numpy()
+        t_on_p = net(torch.from_numpy(p_feat[:n_cmp][None]))[0, 0].numpy()
     print()
     print('mask: torch(py feats) vs c++            max %.3e  mean %.3e'
           % (np.abs(t_on_p - c_mask).max(), np.abs(t_on_p - c_mask).mean()))

@@ -117,15 +117,26 @@ def main():
     for k in ('train', 'val', 'test'):
         os.makedirs(os.path.join(out, k), exist_ok=True)
 
-    dngs = srburst.find_dngs(build.ROOT)
-    # Split by source photo. The two bursts/ captures and the hdrplus payload
-    # are different scenes AND different sensors, so put some of each on both
-    # sides rather than validating on a sensor never trained on.
+    dngs, n_in_tree = srburst.find_dngs(build.ROOT)
+    # Split by source photo. The bursts/ captures and the hdrplus payload are
+    # different scenes AND different sensors, so put some of each on both sides
+    # rather than validating on a sensor never trained on.
+    #
+    # The holdout is drawn from the IN-TREE pool only, and the permutation is
+    # over exactly that many files, so adding a source does NOT reshuffle it: the
+    # six val/test scenes stay the six they have always been, and a number
+    # measured before a source was added stays comparable with one measured
+    # after. Out-of-tree sources are train-only, which does mean nothing here
+    # measures generalisation TO them -- say so rather than implying otherwise.
     rng = np.random.default_rng(12345)
-    order = list(rng.permutation(len(dngs)))
+    order = list(rng.permutation(n_in_tree))
     val_files = [dngs[i] for i in order[:6]]
-    train_files = [dngs[i] for i in order[6:]]
-    print('train scenes %d, val scenes %d' % (len(train_files), len(val_files)))
+    train_files = [dngs[i] for i in order[6:]] + dngs[n_in_tree:]
+    print('train scenes %d (%d in tree + %d train-only), val scenes %d'
+          % (len(train_files), n_in_tree - 6, len(dngs) - n_in_tree,
+             len(val_files)))
+    for q in dngs[n_in_tree:]:
+        print('   train-only source:', os.path.basename(q))
 
     jobs = []
     # training: regimes sampled with the moving-object case over-weighted,

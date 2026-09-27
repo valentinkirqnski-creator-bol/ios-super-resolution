@@ -29,7 +29,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NUM_FEATURES = 8
+import srsim
+
+# Imported rather than restated: srsim.build_features defines what the channels
+# ARE, and a second hardcoded count here is how the two silently disagree.
+NUM_FEATURES = srsim.NUM_FEATURES
 WIDTH = 8
 DILATIONS = (1, 2, 3)
 

@@ -226,6 +226,18 @@ def sample_bilinear_or_inf(img, y, x):
     return np.where(ok, out, np.inf)
 
 
+def warp_sample_comp(plane, flow, cfg):
+    """Sample a COMPARISON-frame plane where Eq. 6 fetches it: that pixel's tile
+    flow taken nearest, then bilinear in space, +inf outside the frame. Used for
+    the comparison frame's local variance, which Eq. 6 computes and discards."""
+    h, w = plane.shape
+    ty, tx = tile_index_grids(h, w, cfg.tile_size)
+    fx = flow[..., 0][ty, tx]
+    fy = flow[..., 1][ty, tx]
+    yy, xx = np.mgrid[0:h, 0:w]
+    return sample_bilinear_or_inf(plane, yy + fy, xx + fx)
+
+
 def tile_index_grids(h, w, ts):
     """patch_idy/patch_idx for a 1-channel (raw-resolution) guide: y // ts."""
     yy, xx = np.mgrid[0:h, 0:w]
@@ -257,7 +269,14 @@ def compute_d_sigma(ref_means, ref_vars, comp_means, flow, cfg, std_curve, diff_
         shrink = d_ms_sq / (d_ms_sq + d_md_sq)
     shrink = np.where(np.isfinite(shrink), shrink, 1.0)
     d_sq = d_ms_sq * shrink * shrink
-    return d_sq.astype(np.float32), sigma_sq.astype(np.float32)
+    # The four terms, returned as well as their combination. Eq. 6 reduces them
+    # with a max() and a shrinkage, and both of those are lossy: the ratio
+    # d^2/sigma^2 cannot say WHICH term won the max, nor how much of the raw
+    # residual the noise correction removed. build_features turns them into
+    # channels 8-11.
+    comps = dict(sigma_ms_sq=sigma_ms_sq, sigma_md_sq=sigma_md_sq,
+                 d_ms_sq=d_ms_sq, d_md_sq=d_md_sq, shrink=shrink)
+    return d_sq.astype(np.float32), sigma_sq.astype(np.float32), comps
 
 
 # --------------------------------------------------------------------------
@@ -376,8 +395,9 @@ def wronski_robustness(d_sq, sigma_sq, flow, ref_means, cfg, geom_reject=True):
 # features for the gate
 # --------------------------------------------------------------------------
 
-NUM_FEATURES = 8
-FEATURE_NAMES = ('exp_a', 'log_a', 'snr', 'subpix', 'span', 'emag', 'grad', 'dir_e')
+NUM_FEATURES = 12
+FEATURE_NAMES = ('exp_a', 'log_a', 'snr', 'subpix', 'span', 'emag', 'grad', 'dir_e',
+                 'shrink', 'sigdom', 'd_rel', 'varmatch')
 
 # Feature compressions. Every one lands in [0, 1] so the network sees a fixed
 # scale independent of exposure, ISO and sensor. Kept as module constants
@@ -389,9 +409,13 @@ F_EMAG_SCALE = 0.5
 F_GRAD_SCALE = 1.0 / 6.0
 F_DIRE_SCALE = 1.0 / 6.0
 F_SUBPIX_SCALE = 1.0 / 0.70710678
+F_DREL_SCALE = 0.5
+F_DREL_FLOOR = 0.01
+F_VARMATCH_SCALE = 1.0 / 3.0
 
 
-def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg):
+def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
+                   comps=None, comp_vars_warped=None):
     """The gate input. Eight per-pixel channels on the raw-resolution guide
     lattice, all in [0, 1].
 
@@ -403,6 +427,70 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg):
       5 emag   |E| / 2                           within-tile translation error
       6 grad   log1p(|grad g| / sigma_n)/6       is there an edge to smear
       7 dir_e  log1p(|grad g . E| / sigma_n)/6   predicted error ACROSS the edge
+
+    Channels 8-11 are the statistics Eq. 6 COLLAPSES -- and they are MEASURED
+    NEUTRAL, so the shipped model does not use them. They are kept because the
+    negative result is worth more than the code costs: it is the answer to "the
+    mask only sees the ratio, surely the terms behind it carry more", which is a
+    reasonable thing to expect and turns out to be false here.
+
+    Two independent measurements, both on the same 40 held-out bursts:
+
+      * matched training -- same data, same 4200 steps, same seed, 8 channels
+        against 12 -- gives 44.07 dB either way. The first attempt looked like a
+        0.07 dB LOSS, but that comparison was run to a wall-clock budget, and the
+        wider input is slower per step, so the 12-channel net had silently had
+        1900 fewer steps. Match steps, not minutes, when comparing feature sets.
+      * a ridge probe against the ORACLE mask (probe_features.py) puts the
+        incremental R^2 of channels 8-11 over 0-7 at -0.0027: no linear
+        information beyond what the first eight already span. Per channel,
+        shrink +0.0032, sigdom +0.0009, varmatch -0.0004, d_rel -0.0076.
+
+    Why, most likely: sigma_ms^2 is ref_vars, which channel 2 already carries;
+    shrink is a monotone function of d_ms^2/d_md^2, which moves with d^2/sigma^2;
+    and d_rel is a rescaling of the same residual. The one genuinely new
+    measurement was varmatch, the comparison frame's texture, and it adds nothing
+    either. The reduction Eq. 6 performs turns out not to lose much.
+
+    Costs avoided by not shipping them: 2049 parameters instead of 1761, a 50%
+    wider feature plane on both backends, and four more compressions that
+    core/sr_gate_shared.h and the Metal kernel would have to keep in lockstep.
+
+    The description of each, for anyone re-testing them:
+
+      8 shrink   d_ms^2/(d_ms^2 + d_md^2)      how much of the raw residual
+                                               survived the noise correction. 0
+                                               means the difference is entirely
+                                               explainable as noise, 1 means it is
+                                               far above the noise's own |mean
+                                               difference| scale. The ratio
+                                               conflates this with magnitude.
+      9 sigdom   sigma_ms^2/(sigma_ms^2 + sigma_md^2)   WHICH term won the max()
+                                               in Eq. 6: above 0.5 real local
+                                               structure dominates, below it the
+                                               noise floor does, i.e. a flat area
+                                               where sigma^2 is a floor rather
+                                               than a measurement.
+     10 d_rel    log1p(d_ms/brightness)/2      the residual relative to CONTRAST
+                                               rather than to noise. Exposure
+                                               invariant, and it separates a big
+                                               difference on a bright edge from
+                                               the same difference in shadow,
+                                               which the noise-relative ratio
+                                               does not.
+     11 varmatch |log((var_ref + n)/(var_comp + n))|/3   does the warped
+                                               comparison frame have the same
+                                               amount of texture here at all.
+                                               Both backends already compute the
+                                               comparison frame's local variance
+                                               and throw it away
+                                               ("byproduct, never read", Eq. 6
+                                               only wants the means), so this
+                                               channel is free. It sees occlusion
+                                               and gross mismatch, which a
+                                               difference of MEANS can miss when
+                                               two different textures happen to
+                                               average alike.
 
     3 is the channel that makes this different from a residual-only mask: a
     half-pixel offset produces a large d^2 and is exactly the sample placement
@@ -445,4 +533,35 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg):
     f[6] = np.clip(np.log1p(gmag / nsig) * F_GRAD_SCALE, 0.0, 1.0)
     f[7] = np.clip(np.log1p(np.abs(gx * ex + gy * ey) / nsig) * F_DIRE_SCALE,
                    0.0, 1.0)
+
+    if comps is None:
+        return f
+    # ---- 8-11: the terms Eq. 6 reduced away -----------------------------
+    f[8] = np.clip(comps['shrink'], 0.0, 1.0)
+    sms = comps['sigma_ms_sq']
+    smd = comps['sigma_md_sq']
+    f[9] = np.clip(sms / np.maximum(sms + smd, 1e-30), 0.0, 1.0)
+    d_ms = np.sqrt(np.maximum(comps['d_ms_sq'], 0.0))
+    bri = np.clip(np.nan_to_num(ref_means, nan=0.0), 0.0, 1.0)
+    # Denominator floored at 1% of full scale, not at an epsilon: with an
+    # epsilon this channel correlates +0.34 with darkness alone, because any
+    # residual is large next to a near-zero brightness, and it would be partly a
+    # "this pixel is dark" detector. At 0.01 that drops to +0.27 with no change
+    # in how much of the top end clips (1.5% either way, and those are genuine
+    # large residuals rather than the dark-pixel artifact).
+    f[10] = np.clip(np.log1p(np.minimum(d_ms / (bri + F_DREL_FLOOR), 1e12)) *
+                    F_DREL_SCALE, 0.0, 1.0)
+    if comp_vars_warped is None:
+        f[11] = 0.0
+    else:
+        n = np.maximum(nvar, 1e-20)
+        cv = comp_vars_warped.astype(np.float64)
+        ok = np.isfinite(cv)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            ratio = (sms + n) / (np.where(ok, np.maximum(cv, 0.0), 0.0) + n)
+            lr = np.abs(np.log(np.maximum(ratio, 1e-30)))
+        # A fetch outside the comparison frame has no texture to compare with, so
+        # it reads as maximal mismatch -- the same direction Eq. 6 takes it with
+        # its +inf residual.
+        f[11] = np.where(ok, np.clip(lr * F_VARMATCH_SCALE, 0.0, 1.0), 1.0)
     return f

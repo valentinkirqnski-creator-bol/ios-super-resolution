@@ -64,11 +64,14 @@ def build_burst(scene, spec, rng, tile_size=16):
         Ag[n - 1], Bg[n - 1] = srmerge.accumulate_comp_ab(b['raws_clean'][n], tfx,
                                                           tfy, covs_c, cfg)
 
-        gm, _ = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][n]))
-        d_sq, sig_sq = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n], cfg,
-                                             std_c, diff_c)
+        # gv, the comparison frame's local variance, is what Eq. 6 computes and
+        # throws away. Channel 11 uses it, so it costs nothing extra here either.
+        gm, gv = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][n]))
+        d_sq, sig_sq, comps = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n],
+                                                    cfg, std_c, diff_c)
+        cvw = srsim.warp_sample_comp(gv, b['flows'][n], cfg)
         feat[n - 1] = srsim.build_features(d_sq, sig_sq, ref_m, ref_v,
-                                           b['flows'][n], cfg)
+                                           b['flows'][n], cfg, comps, cvw)
         Rw[n - 1] = srsim.wronski_robustness(d_sq, sig_sq, b['flows'][n], ref_m, cfg)
 
     covs_rc = srmerge.estimate_kernels(b['raws_clean'][0], cfg)
@@ -101,7 +104,7 @@ def merged(d, R):
 
 
 def main():
-    dngs = srburst.find_dngs(ROOT)
+    dngs, _ = srburst.find_dngs(ROOT)
     scene_full = srburst.load_scene(dngs[0])
     Hs = Ws = 384
     y0 = (scene_full.shape[0] - Hs) // 2

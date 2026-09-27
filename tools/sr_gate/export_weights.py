@@ -19,6 +19,8 @@ import argparse
 import os
 import sys
 
+import io
+
 import numpy as np
 import torch
 
@@ -77,7 +79,20 @@ def main():
     assert w.size == net.n_params(), (w.size, net.n_params())
     assert tuple(ck['dilations']) == gate.DILATIONS, \
         'core/sr_gate.h hardcodes the dilations; regenerate it too'
-    assert ck['in_ch'] == srsim.NUM_FEATURES
+    # Checked against what the C++ will actually run -- core/sr_gate_shared.h --
+    # and NOT against srsim.NUM_FEATURES. The simulator can build more channels
+    # than the shipped net consumes (8-11 were measured neutral and are not
+    # shipped), so comparing with it would refuse a perfectly good export.
+    hdr = os.path.join(here, '..', '..', 'core', 'sr_gate_shared.h')
+    want = None
+    for line in io.open(hdr, encoding='utf-8'):
+        if line.startswith('#define SRG_FEATURES'):
+            want = int(line.split()[2])
+    assert want is not None, 'SRG_FEATURES not found in ' + hdr
+    assert ck['in_ch'] == want, (
+        'checkpoint has %d input channels but core/sr_gate_shared.h declares '
+        'SRG_FEATURES %d -- the app would feed the net the wrong feature plane'
+        % (ck['in_ch'], want))
 
     lines = []
     for i in range(0, w.size, 6):
