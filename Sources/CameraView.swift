@@ -1174,7 +1174,7 @@ struct CameraView: View {
                          scores 1 however strong it is. Contrast only scales a \r
                          disagreement already measured; it cannot invent one. The \r
                          weighting is soft throughout, so no thin line is cut outright. \r
-                         """
+                         """)
                         .font(.footnote).foregroundColor(.secondary)
 
                     if cam.tuningParams.edge_misalign_enabled {
@@ -1186,7 +1186,7 @@ struct CameraView: View {
                          an edge, in sigma. The confidence ramps in from here to twice \r
                          here, so nothing steps. Lower grades fainter edges and risks \r
                          grading noise; higher restricts it to obvious structure. \r
-                         """
+                         """)
                             .font(.footnote).foregroundColor(.secondary)
                         ispRow("Displacement Scale",
                                $cam.tuningParams.edge_misalign_shift_z,
@@ -1195,7 +1195,7 @@ struct CameraView: View {
                          The displacement damage, in noise units, at which a frame \r
                          keeps half its weight. A scale, not a threshold: smaller is \r
                          more aggressive everywhere rather than switching on somewhere. \r
-                         """
+                         """)
                             .font(.footnote).foregroundColor(.secondary)
                         ispRow("Confidence Floor",
                                $cam.tuningParams.edge_misalign_min_conf,
@@ -1204,7 +1204,7 @@ struct CameraView: View {
                          The least weight a detection may leave. 0 lets a badly \r
                          displaced edge be dropped entirely; raise it to bound the \r
                          worst case and keep some of every frame. \r
-                         """
+                         """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
 
