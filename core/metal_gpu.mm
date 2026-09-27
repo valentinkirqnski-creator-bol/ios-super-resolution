@@ -1728,12 +1728,15 @@ static id<MTLBuffer> srg_grow(__strong id<MTLBuffer>& slot, size_t& slot_bytes,
 
 static id<MTLBuffer> srg_weights() {
     if (g_srg_w) return g_srg_w;
-    static_assert(SRG_WEIGHTS_N == kSrGateWeightCount,
-                  "generated weight table does not match the layout in "
-                  "sr_gate_shared.h -- re-run tools/sr_gate/export_weights.py");
     int n = 0;
     const f32* w = sr_gate_weights(&n);
-    if (!w || n <= 0) return nil;
+    // Checked here rather than with a static_assert because the generated table
+    // (core/sr_gate_weights.h) is deliberately not included by this translation
+    // unit -- it is static const, so including it would put a second copy of
+    // 1761 floats in this object file. sr_gate.cpp, which does include it,
+    // carries the compile-time assert; this catches the same mismatch at load
+    // time and declines rather than reading past the end of the blob.
+    if (!w || n != SRG_WEIGHTS_N) return nil;
     g_srg_w = buf(w, sizeof(float) * (size_t)n);
     return g_srg_w;
 }
@@ -1746,11 +1749,15 @@ static id<MTLBuffer> srg_weights() {
 // [y0, y1) the layers need a1 [y0-3, y1+3), a0 [y0-5, y1+5) and features
 // [y0-6, y1+6), each clipped to [0, h). Every tap is clamped into [0, h-1], so
 // a clamped tap always lands inside the band that was computed.
+// curve_n is passed in rather than read from g_rob_curve_n: that global is
+// declared several hundred lines below this helper, and depending on where the
+// helper happens to sit in the file is how this failed to compile the first time.
 static bool rob_run_sr_gate(id<MTLBuffer> b_out, size_t out_off_bytes,
                             id<MTLBuffer> b_gmeans, id<MTLBuffer> b_ref_m,
                             id<MTLBuffer> b_ref_v, id<MTLBuffer> b_std,
                             id<MTLBuffer> b_diff, id<MTLBuffer> b_flow,
                             int gh, int gw, int nch, int tile_size,
+                            size_t curve_n,
                             const FlowField& flow, const Config& cfg,
                             id<MTLCommandBuffer> cmd) {
     auto& c = ctx();
@@ -1759,7 +1766,8 @@ static bool rob_run_sr_gate(id<MTLBuffer> b_out, size_t out_off_bytes,
     id<MTLComputePipelineState> p_head = c.pipe("sr_gate_head");
     id<MTLBuffer> b_w = srg_weights();
     if (!p_feat || !p_conv || !p_head || !b_w) return false;
-    if (gh <= 0 || gw <= 0 || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0)
+    if (gh <= 0 || gw <= 0 || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0 ||
+        curve_n == 0)
         return false;
 
     // 192 output rows per band. At 4032 wide and 8 channels the activation
@@ -1785,7 +1793,7 @@ static bool rob_run_sr_gate(id<MTLBuffer> b_out, size_t out_off_bytes,
     fp.tile_size = (uint32_t)tile_size;
     fp.flow_ny = (uint32_t)flow.ny;
     fp.flow_nx = (uint32_t)flow.nx;
-    fp.curve_n = (uint32_t)g_rob_curve_n;
+    fp.curve_n = (uint32_t)curve_n;
     fp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u;
     // The ROBUSTNESS pair, not noise_alpha()/noise_beta(): on the FFT guide
     // those differ by the 0.25 filtered-noise factor and the gate was trained
@@ -2809,7 +2817,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     if (cfg.sr_gate_enabled && nch == 1 && sr_gate_available()) {
         sr_gate_done = rob_run_sr_gate(b_out, out_off_bytes, b_gmeans, b_ref_m,
                                        b_ref_v, b_std, b_diff, b_flow, gh, gw,
-                                       nch, tile_size, flow, cfg, cmd);
+                                       nch, tile_size, g_rob_curve_n, flow, cfg,
+                                       cmd);
         if (sr_gate_done && want_s_select) {
             // The gate makes no s1/s2 choice, and no kernel writes the selector
             // on this path. Report the strict prior uniformly so the split
