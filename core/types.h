@@ -773,6 +773,31 @@ struct Config {
     // reaches AUC 0.926 and 73% detection at a 10% false-reject budget.
     bool use_neural_robustness = false;
 
+    // sr_gate (core/sr_gate.h): a 1761-parameter network that emits the final
+    // per-pixel mask in place of Eq. 5-9 -- the exponential, the s1/s2 prior,
+    // the r_t offset, the geometry rejection AND the 5x5 minimum. Off by
+    // default; declines and falls back to the analytic mask whenever the guide
+    // is not the one-channel raw-resolution guide it was trained on.
+    //
+    // It differs from use_neural_robustness in what it was trained AGAINST, and
+    // that is the whole point. That network learns a better R*; this one is
+    // trained on the MERGED IMAGE, against what the merge would have produced
+    // with perfect alignment and nothing rejected. The distinction matters
+    // because R* cannot be the right target: a sub-pixel offset between frames
+    // is the signal an SR merge feeds on, and any label of the form
+    // 1/(1 + delta^2/sigma^2) scores it as damage. Measured on this project's
+    // own bursts, rejection is NET HARMFUL below ~1.6 px of per-tile flow error
+    // for exactly that reason, so a mask trained faithfully to R* inherits the
+    // error rather than fixing it.
+    //
+    // Second motivation, specific to the shipping configuration: with the
+    // full-resolution FFT guide, Eq. 9's 5x5 minimum takes the worst of 25
+    // per-pixel tests on a lattice four times denser than the one it was
+    // designed for. Measured, at ZERO flow error, it drops mean R from 0.95 to
+    // 0.61 -- most of the burst is discarded before there is anything to
+    // reject. See tools/sr_gate/ for the measurements and the training.
+    bool sr_gate_enabled = false;
+
     // Handheld-Multi-Frame-Super-Resolution-1.4 parity: build the robustness
     // GUIDE as sqrt(raw) (a variance-stabilizing transform) instead of the
     // linear channel average, exactly as 1.4's cuda_compute_guide_image does.

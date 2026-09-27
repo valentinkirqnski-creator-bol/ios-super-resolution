@@ -242,6 +242,27 @@ struct TuningParams: Equatable, Codable {
     /// than FFT's, so the guide-resolution mask on top compounds two sources
     /// of lost precision. ~4x the pixel count for the mask.
     var use_neural_robustness: Bool = false
+    /// sr_gate: a 1761-parameter network that emits the FINAL mask in place of
+    /// Wronski Eq. 5-9 -- the exponential, the s1/s2 prior, the r_t offset, the
+    /// geometry rejection and the 5x5 minimum all stop running.
+    ///
+    /// Different from use_neural_robustness above in what it was trained
+    /// AGAINST, which is the whole point. That one learns a better R*; this one
+    /// is trained on the MERGED IMAGE, against what the merge would produce with
+    /// perfect alignment and nothing rejected. R* cannot be the right target
+    /// because a sub-pixel offset between frames is the signal a
+    /// super-resolution merge feeds on, and 1/(1 + delta^2/sigma^2) scores it as
+    /// damage -- measured on this project's own bursts, rejection is net harmful
+    /// below ~1.6 px of per-tile flow error for exactly that reason.
+    ///
+    /// Measured on 40 held-out synthesised bursts (tools/sr_gate): +5.2 dB
+    /// against the shipping mask and +1.2 dB against the best analytic variant,
+    /// winning in 20/20 regime-by-flow-error cells. It needs the
+    /// full-resolution FFT guide, which is what "Robustness at Raw Resolution"
+    /// plus "Alignment Grey: FFT" select; on any other guide it declines and the
+    /// analytic mask runs unchanged, so this can never leave the pipeline
+    /// without a mask.
+    var sr_gate_enabled: Bool = false
     /// Learned REFINEMENT of the analytic mask -- a different network with the
     /// opposite relationship to it from use_neural_robustness above. That one
     /// replaces Wronski Eq. 5-9; this one keeps it authoritative and may only
@@ -350,7 +371,7 @@ struct TuningParams: Equatable, Codable {
         case edge_misalign_enabled, edge_misalign_edge_snr
         case edge_misalign_shift_z, edge_misalign_min_conf
         case kernel_selection_linear
-        case use_neural_robustness
+        case use_neural_robustness, sr_gate_enabled
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
@@ -450,6 +471,7 @@ struct TuningParams: Equatable, Codable {
         edge_misalign_shift_z = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_shift_z) ?? edge_misalign_shift_z
         edge_misalign_min_conf = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_min_conf) ?? edge_misalign_min_conf
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
+        sr_gate_enabled = try c.decodeIfPresent(Bool.self, forKey: .sr_gate_enabled) ?? sr_gate_enabled
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
@@ -2233,6 +2255,7 @@ final class CameraModel: NSObject, ObservableObject {
             "edge_misalign_shift_z": NSNumber(value: tuningParams.edge_misalign_shift_z),
             "edge_misalign_min_conf": NSNumber(value: tuningParams.edge_misalign_min_conf),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
+            "sr_gate_enabled": NSNumber(value: tuningParams.sr_gate_enabled),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),

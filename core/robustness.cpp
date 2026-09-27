@@ -1,6 +1,7 @@
 #include "stages.h"
 #include "robustness_nn.h"
 #include "robustness_refine_shared.h"
+#include "sr_gate.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
 #include "prof.h"
@@ -2095,6 +2096,31 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
                           cfg.robustness_guide_sqrt_active());
+
+    // sr_gate (Config::sr_gate_enabled): the learned mask takes over from here.
+    // Deliberately placed AFTER Eq. 6 and before Eq. 7-9, because d^2 and
+    // sigma^2 are two of its eight features -- it scores the same
+    // correspondence through the same noise model the analytic mask does, and
+    // differs only in what it does with the result. Everything below (the
+    // s1/s2 prior, the r_t offset, the geometry rejection, the edge confidence,
+    // the 5x5 minimum) is what it REPLACES, so none of it runs.
+    if (cfg.sr_gate_enabled) {
+        Image gated = sr_gate_mask(ref_stats.means, ref_stats.stds, d_sq,
+                                   sigma_sq, flow, tile_size, cfg);
+        if (gated.h == h && gated.w == w) {
+            // The gate makes no s1/s2 choice. Report the strict prior uniformly
+            // so the split masks stay well-formed and still sum to this one.
+            if (s_select_out) {
+                *s_select_out = Image(h, w, 1);
+                std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
+            }
+            return gated;
+        }
+        // Empty means out of domain (a guide the gate was not trained on) or
+        // weights missing. Fall through to the analytic mask rather than leave
+        // the pipeline without one.
+    }
+
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
     Image R(h, w, 1);

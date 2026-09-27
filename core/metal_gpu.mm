@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include "metal_gpu.h"
+#include "sr_gate.h"
 #include "dng_writer.h"
 #include "debug_utils.h"
 #include "prof.h"
@@ -1019,6 +1020,20 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.tile_size = tile_size;
     g_bf.cov_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
+    // Deliberately the DECIMATED lattice even when robustness_fft_guide_active()
+    // makes the mask raw resolution. This store holds one mask per frame,
+    // simultaneously, because the band-pipelined merge walks every frame inside
+    // each band -- so raw-resolution slices would be 48 MB x 8 = 390 MB instead
+    // of 97 MB, which is not available next to the resident raws.
+    //
+    // Nothing needs to change for that to be CORRECT: the dimensions then do not
+    // match gh/gw in compute_robustness_metal, so rob_resident goes false, the
+    // mask comes back to the host, and merge_comp_band_metal takes rob_h/rob_w
+    // and raw_res_robustness from the Image it is handed. The cost is one
+    // full-frame readback and upload per comparison frame, which is the price of
+    // the FFT guide on this path until masks are stored at raw resolution or in
+    // half precision. Sizing these to gh/gw without solving that is how you get
+    // a residency refusal for the raws as well.
     g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
     g_bf.flow_ny = raw_h / tile_size;
@@ -1663,6 +1678,199 @@ static id<MTLBuffer> rob_refine_weights() {
     return g_rob_refine_w;
 }
 
+// ---- sr_gate (Config::sr_gate_enabled) ----------------------------------
+//
+// Replaces rob_make_mask AND rob_local_min_5x5. The network emits the final
+// per-pixel decision, so Eq. 7-9 -- the s1/s2 prior, the r_t offset, the
+// geometry rejection, the 5x5 minimum -- do not run at all; see core/sr_gate.h
+// for why the minimum in particular is not wanted on top of it.
+//
+// Like rob_refine_mask, these three kernels are deliberately NOT in the
+// pipeline list metal_gpu_init() requires: a build whose Metal library predates
+// them keeps working with the analytic mask instead of falling the entire
+// backend back to the CPU.
+
+struct SrGateFeatParamsCPU {
+    uint32_t h, w, nch, tile_size;
+    uint32_t flow_ny, flow_nx, curve_n, sqrt_index;
+    float alpha_rob, beta_rob;
+    int32_t dst_y0;
+    uint32_t dst_rows;
+};
+static_assert(sizeof(SrGateFeatParamsCPU) == 48, "SrGateFeatParamsCPU");
+
+struct SrGateConvParamsCPU {
+    uint32_t h, w;
+    int32_t src_y0, dst_y0;
+    uint32_t dst_rows, in_ch, out_ch, dil, w_off, b_off;
+};
+static_assert(sizeof(SrGateConvParamsCPU) == 40, "SrGateConvParamsCPU");
+
+static __strong id<MTLBuffer> g_srg_w = nil;
+static __strong id<MTLBuffer> g_srg_feat = nil;
+static size_t g_srg_feat_b = 0;
+static __strong id<MTLBuffer> g_srg_a0 = nil;
+static size_t g_srg_a0_b = 0;
+static __strong id<MTLBuffer> g_srg_a1 = nil;
+static size_t g_srg_a1_b = 0;
+static __strong id<MTLBuffer> g_srg_a2 = nil;
+static size_t g_srg_a2_b = 0;
+
+static id<MTLBuffer> srg_grow(__strong id<MTLBuffer>& slot, size_t& slot_bytes,
+                              size_t need) {
+    if (need == 0) return nil;
+    if (slot && slot_bytes >= need) return slot;
+    slot = [ctx().device newBufferWithLength:need
+                                    options:MTLResourceStorageModeShared];
+    slot_bytes = slot ? need : 0;
+    return slot;
+}
+
+static id<MTLBuffer> srg_weights() {
+    if (g_srg_w) return g_srg_w;
+    static_assert(SRG_WEIGHTS_N == kSrGateWeightCount,
+                  "generated weight table does not match the layout in "
+                  "sr_gate_shared.h -- re-run tools/sr_gate/export_weights.py");
+    int n = 0;
+    const f32* w = sr_gate_weights(&n);
+    if (!w || n <= 0) return nil;
+    g_srg_w = buf(w, sizeof(float) * (size_t)n);
+    return g_srg_w;
+}
+
+// Encode the whole network over row bands into b_out. Returns false WITHOUT
+// encoding anything if a pipeline or a buffer is missing, in which case the
+// caller runs the analytic mask exactly as before.
+//
+// Band arithmetic, the same as sr_gate_infer_cpu: to produce output rows
+// [y0, y1) the layers need a1 [y0-3, y1+3), a0 [y0-5, y1+5) and features
+// [y0-6, y1+6), each clipped to [0, h). Every tap is clamped into [0, h-1], so
+// a clamped tap always lands inside the band that was computed.
+static bool rob_run_sr_gate(id<MTLBuffer> b_out, size_t out_off_bytes,
+                            id<MTLBuffer> b_gmeans, id<MTLBuffer> b_ref_m,
+                            id<MTLBuffer> b_ref_v, id<MTLBuffer> b_std,
+                            id<MTLBuffer> b_diff, id<MTLBuffer> b_flow,
+                            int gh, int gw, int nch, int tile_size,
+                            const FlowField& flow, const Config& cfg,
+                            id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> p_feat = c.pipe("sr_gate_features");
+    id<MTLComputePipelineState> p_conv = c.pipe("sr_gate_conv");
+    id<MTLComputePipelineState> p_head = c.pipe("sr_gate_head");
+    id<MTLBuffer> b_w = srg_weights();
+    if (!p_feat || !p_conv || !p_head || !b_w) return false;
+    if (gh <= 0 || gw <= 0 || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0)
+        return false;
+
+    // 192 output rows per band. At 4032 wide and 8 channels the activation
+    // buffers are ~26 MB each; a whole-plane layout would be 390 MB each and
+    // the network needs two of them live at once.
+    const int band = 192;
+    const int pad0 = SRG_DIL2 + SRG_DIL1;   // 5
+    const int pad1 = SRG_DIL2;              // 3
+    const size_t row_act = (size_t)gw * SRG_WIDTH * sizeof(float);
+    const size_t feat_b = (size_t)(band + 2 * SRG_HALO) * (size_t)gw *
+                          SRG_FEATURES * sizeof(float);
+    const size_t act_b = (size_t)(band + 2 * pad0) * row_act;
+    id<MTLBuffer> b_feat = srg_grow(g_srg_feat, g_srg_feat_b, feat_b);
+    id<MTLBuffer> b_a0 = srg_grow(g_srg_a0, g_srg_a0_b, act_b);
+    id<MTLBuffer> b_a1 = srg_grow(g_srg_a1, g_srg_a1_b, act_b);
+    id<MTLBuffer> b_a2 = srg_grow(g_srg_a2, g_srg_a2_b, (size_t)band * row_act);
+    if (!b_feat || !b_a0 || !b_a1 || !b_a2) return false;
+
+    SrGateFeatParamsCPU fp{};
+    fp.h = (uint32_t)gh;
+    fp.w = (uint32_t)gw;
+    fp.nch = (uint32_t)nch;
+    fp.tile_size = (uint32_t)tile_size;
+    fp.flow_ny = (uint32_t)flow.ny;
+    fp.flow_nx = (uint32_t)flow.nx;
+    fp.curve_n = (uint32_t)g_rob_curve_n;
+    fp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u;
+    // The ROBUSTNESS pair, not noise_alpha()/noise_beta(): on the FFT guide
+    // those differ by the 0.25 filtered-noise factor and the gate was trained
+    // against the former.
+    fp.alpha_rob = cfg.noise_alpha_robustness();
+    fp.beta_rob = cfg.noise_beta_robustness();
+
+    const int w_off[SRG_LAYERS] = {SRG_OFF_W0, SRG_OFF_W1, SRG_OFF_W2};
+    const int b_off[SRG_LAYERS] = {SRG_OFF_B0, SRG_OFF_B1, SRG_OFF_B2};
+    const int dil[SRG_LAYERS] = {SRG_DIL0, SRG_DIL1, SRG_DIL2};
+
+    for (int y0 = 0; y0 < gh; y0 += band) {
+        const int y1 = std::min(y0 + band, gh);
+        const int fy0 = std::max(0, y0 - SRG_HALO);
+        const int fy1 = std::min(gh, y1 + SRG_HALO);
+        const int a0y0 = std::max(0, y0 - pad0), a0y1 = std::min(gh, y1 + pad0);
+        const int a1y0 = std::max(0, y0 - pad1), a1y1 = std::min(gh, y1 + pad1);
+
+        fp.dst_y0 = fy0;
+        fp.dst_rows = (uint32_t)(fy1 - fy0);
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_feat offset:0 atIndex:0];
+        [e setBuffer:b_gmeans offset:0 atIndex:1];
+        [e setBuffer:b_ref_m offset:0 atIndex:2];
+        [e setBuffer:b_ref_v offset:0 atIndex:3];
+        [e setBuffer:b_std offset:0 atIndex:4];
+        [e setBuffer:b_diff offset:0 atIndex:5];
+        [e setBuffer:b_flow offset:0 atIndex:6];
+        [e setBytes:&fp length:sizeof(fp) atIndex:7];
+        dispatch2(e, p_feat, (NSUInteger)gw, (NSUInteger)fp.dst_rows);
+        [e endEncoding];
+
+        // Each layer reads what the previous one wrote, and Metal only tracks
+        // that hazard ACROSS encoders, so every layer gets its own.
+        const int src_y0[SRG_LAYERS] = {fy0, a0y0, a1y0};
+        const int dst_y0[SRG_LAYERS] = {a0y0, a1y0, y0};
+        const int dst_rows[SRG_LAYERS] = {a0y1 - a0y0, a1y1 - a1y0, y1 - y0};
+        id<MTLBuffer> src[SRG_LAYERS] = {b_feat, b_a0, b_a1};
+        id<MTLBuffer> dst[SRG_LAYERS] = {b_a0, b_a1, b_a2};
+        for (int l = 0; l < SRG_LAYERS; ++l) {
+            SrGateConvParamsCPU cp{};
+            cp.h = (uint32_t)gh;
+            cp.w = (uint32_t)gw;
+            cp.src_y0 = src_y0[l];
+            cp.dst_y0 = dst_y0[l];
+            cp.dst_rows = (uint32_t)dst_rows[l];
+            cp.in_ch = (uint32_t)(l == 0 ? SRG_FEATURES : SRG_WIDTH);
+            cp.out_ch = (uint32_t)SRG_WIDTH;
+            cp.dil = (uint32_t)dil[l];
+            cp.w_off = (uint32_t)w_off[l];
+            cp.b_off = (uint32_t)b_off[l];
+            e = [cmd computeCommandEncoder];
+            if (!e) return false;
+            [e setBuffer:dst[l] offset:0 atIndex:0];
+            [e setBuffer:src[l] offset:0 atIndex:1];
+            [e setBuffer:b_w offset:0 atIndex:2];
+            [e setBytes:&cp length:sizeof(cp) atIndex:3];
+            dispatch2(e, p_conv, (NSUInteger)gw, (NSUInteger)cp.dst_rows);
+            [e endEncoding];
+        }
+
+        SrGateConvParamsCPU hp{};
+        hp.h = (uint32_t)gh;
+        hp.w = (uint32_t)gw;
+        hp.src_y0 = y0;
+        hp.dst_y0 = y0;
+        hp.dst_rows = (uint32_t)(y1 - y0);
+        hp.in_ch = (uint32_t)SRG_WIDTH;
+        hp.out_ch = 1u;
+        hp.dil = 1u;
+        hp.w_off = (uint32_t)SRG_OFF_HW;
+        hp.b_off = (uint32_t)SRG_OFF_HB;
+        e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_out offset:out_off_bytes atIndex:0];
+        [e setBuffer:b_a2 offset:0 atIndex:1];
+        [e setBuffer:b_w offset:0 atIndex:2];
+        [e setBytes:&hp length:sizeof(hp) atIndex:3];
+        dispatch2(e, p_head, (NSUInteger)gw, (NSUInteger)hp.dst_rows);
+        [e endEncoding];
+    }
+    return true;
+}
+
 static bool rob_run_hf_loss(id<MTLBuffer> b_guide, id<MTLBuffer> b_means,
                             id<MTLBuffer> b_vars, __strong id<MTLBuffer>& b_loss,
                             int guide_h, int guide_w, int nch,
@@ -1757,6 +1965,140 @@ static std::vector<f32> rob_compute_s(const FlowField& flow, f32 Mt, f32 s1, f32
     return S;
 }
 
+// ---- full-resolution FFT robustness guide -------------------------------
+//
+// Config::robustness_fft_guide_active() asks for the robustness guide to be the
+// full-resolution, single-channel, LINEAR low pass of the raw -- what
+// compute_grey_fft produces -- instead of the half-resolution three-channel
+// Bayer average. core/types.h has pinned that as the shipping configuration
+// since cef567b, and until now this file ignored it: rob_run_guide_stats built
+// the decimated guide unconditionally, so the device ran a different mask from
+// the desktop and the +2.49 dB that motivated pinning it was a CPU-only result.
+//
+// It also silently mismatched the noise model. The curves below are built from
+// noise_alpha_ch_robustness(), which already carries the FFT guide's 0.25
+// filtered-noise factor because that predicate is a Config question and does not
+// know what this file built -- so the decimated guide was being scored against a
+// noise floor four times too small, which over-rejects. Building the guide the
+// Config asks for makes the two agree.
+//
+// Why this does NOT reuse c.sticky_grey, which already holds a full-resolution
+// FFT grey for the alignment: that pin is refreshed by every frame's grey, so
+// matching dimensions is not evidence that it holds the frame being scored. And
+// compute_grey_fft_metal sources its input from bf_active() whenever the Image
+// it is handed has no host pixels, so calling it for the REFERENCE while a
+// comparison frame is resident would low-pass the wrong frame. Both failures are
+// silent and would produce a mask scored against a different exposure. The
+// source is taken by argument here instead.
+//
+// Costs, stated: one extra full-frame FFT per frame (the alignment already ran
+// one on the same pixels, and reusing it is the optimisation this deliberately
+// declines), and a raw-resolution guide plus its means and variances instead of
+// quarter-resolution ones -- 3 x 48 MB rather than 3 x 36 MB at 12 MP.
+static __strong id<MTLBuffer> g_rob_fft_in = nil;
+static size_t g_rob_fft_in_b = 0;
+
+static bool rob_fft_guide(const Image& raw, id<MTLBuffer> b_raw,
+                         size_t raw_off_bytes, id<MTLBuffer> b_guide,
+                         int h, int w) {
+    auto& c = ctx();
+    // In-place fftshift requires even dimensions, as in compute_grey_fft_metal.
+    if (h <= 0 || w <= 0 || (h & 1) || (w & 1) || !b_guide) return false;
+    const size_t n = (size_t)h * (size_t)w;
+    const size_t nb = n * sizeof(float);
+    if ([b_guide length] < nb) return false;
+
+    const float* host_in = raw.data.empty() ? nullptr : raw.data.data();
+    id<MTLBuffer> in_buf = nil;
+    if (b_raw) {
+        if (raw_off_bytes == 0) {
+            in_buf = b_raw;
+        } else {
+            // MPSGraph tensor data cannot carry a buffer offset, so a resident
+            // frame's slice is blitted to offset 0 -- the same trade the
+            // alignment grey makes, one GPU-side copy against a host round trip.
+            in_buf = c.scratch(g_rob_fft_in, g_rob_fft_in_b, nb);
+            if (!in_buf) return false;
+            id<MTLCommandBuffer> bcmd = [c.queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = bcmd ? [bcmd blitCommandEncoder] : nil;
+            if (!blit) return false;
+            [blit copyFromBuffer:b_raw sourceOffset:raw_off_bytes
+                        toBuffer:in_buf destinationOffset:0 size:nb];
+            [blit endEncoding];
+            prof_tag_gpu(bcmd, "rob:guide-slice-blit");
+            [bcmd commit];
+            [bcmd waitUntilCompleted];
+            if (bcmd.status != MTLCommandBufferStatusCompleted) return false;
+        }
+    }
+    if (!in_buf && !host_in) return false;
+
+    if (mps_fft_enabled() &&
+        mps_grey_lowpass(in_buf ? nullptr : host_in, nullptr, h, w,
+                         (__bridge void*)b_guide, (__bridge void*)in_buf))
+        return true;
+
+    // Stockham fallback: the same five stages compute_grey_fft_metal_impl runs.
+    // Its scratch pools are shared, which is safe because the alignment grey and
+    // the robustness guide never overlap in time -- but c.fft_out deliberately
+    // is NOT, because that is the buffer pinned as sticky_grey and clobbering it
+    // would align the next frame against this guide.
+    const size_t cbytes = n * sizeof(float) * 2;
+    const size_t col_bytes = (size_t)kFftBatchChunk * (size_t)h * sizeof(float) * 2;
+    id<MTLBuffer> c0 = c.scratch(c.fft_c0, c.fft_c0_b, cbytes);
+    id<MTLBuffer> col_scratch = c.scratch(c.scratch_cols, c.scratch_cols_bytes,
+                                          col_bytes);
+    id<MTLBuffer> pp = c.scratch(c.fft_pp, c.fft_pp_b, cbytes);
+    if (!c0 || !col_scratch) return false;
+    // pack_rows_real is an ordinary kernel, so unlike MPSGraph it can read the
+    // slice where it lies; only the host case needs staging.
+    id<MTLBuffer> src = in_buf;
+    size_t src_off = 0;
+    if (!src) {
+        src = c.scratch(g_rob_fft_in, g_rob_fft_in_b, nb);
+        if (!src) return false;
+        memcpy([src contents], host_in, nb);
+    } else if (src == b_raw) {
+        src_off = raw_off_bytes;
+    }
+
+    __strong id<MTLCommandBuffer> fcmd = [c.queue commandBuffer];
+    if (!fcmd) return false;
+    const uint32_t hu = (uint32_t)h, wu = (uint32_t)w;
+    id<MTLComputeCommandEncoder> e = [fcmd computeCommandEncoder];
+    if (!e) return false;
+    [e setBuffer:c0 offset:0 atIndex:0];
+    [e setBuffer:src offset:src_off atIndex:1];
+    [e setBytes:&hu length:sizeof(hu) atIndex:2];
+    [e setBytes:&wu length:sizeof(wu) atIndex:3];
+    dispatch2(e, c.pipe("pack_rows_real"), wu, hu);
+    [e endEncoding];
+    // prune_lowpass: zero_fft_borders_natural below discards those columns
+    // unconditionally, so the forward pass need not compute them.
+    if (!fft2d_gpu(c0, col_scratch, pp, hu, wu, false, fcmd, /*prune_lowpass*/true))
+        return false;
+    e = [fcmd computeCommandEncoder];
+    if (!e) return false;
+    [e setBuffer:c0 offset:0 atIndex:0];
+    [e setBytes:&hu length:sizeof(hu) atIndex:1];
+    [e setBytes:&wu length:sizeof(wu) atIndex:2];
+    dispatch2(e, c.pipe("zero_fft_borders_natural"), wu, hu);
+    [e endEncoding];
+    if (!fft2d_gpu(c0, col_scratch, pp, hu, wu, true, fcmd)) return false;
+    e = [fcmd computeCommandEncoder];
+    if (!e) return false;
+    const uint32_t count = (uint32_t)n;
+    [e setBuffer:b_guide offset:0 atIndex:0];
+    [e setBuffer:c0 offset:0 atIndex:1];
+    [e setBytes:&count length:sizeof(count) atIndex:2];
+    dispatch1(e, c.pipe("extract_real"), n);
+    [e endEncoding];
+    prof_tag_gpu(fcmd, "rob:fft-guide");
+    [fcmd commit];
+    [fcmd waitUntilCompleted];
+    return fcmd.status == MTLCommandBufferStatusCompleted;
+}
+
 // b_raw_in / raw_off_elems: when non-nil, the frame's plane is already resident
 // and is bound at that element offset instead of being uploaded from `raw`.
 // pooled: reuse the context's per-frame temps (comparison frames). The reference
@@ -1772,11 +2114,17 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
                                 bool pooled = false) {
     auto& c = ctx();
     const bool bayer = cfg.bayer_mode;
+    // Config::robustness_fft_guide_active(): a full-resolution, single-channel,
+    // LINEAR guide instead of the half-resolution three-channel Bayer average.
+    // See rob_fft_guide above for why this file used to ignore that and what it
+    // cost.
+    const bool fft_guide = cfg.robustness_fft_guide_active();
+    const bool decimated = bayer && !fft_guide;
     const int raw_h = (raw.h > 0) ? raw.h : 0;
     const int raw_w = (raw.w > 0) ? raw.w : 0;
-    guide_h = bayer ? raw_h / 2 : raw_h;
-    guide_w = bayer ? raw_w / 2 : raw_w;
-    nch = bayer ? 3 : 1;
+    guide_h = decimated ? raw_h / 2 : raw_h;
+    guide_w = decimated ? raw_w / 2 : raw_w;
+    nch = decimated ? 3 : 1;
     if (guide_h < 1 || guide_w < 1) return false;
 
     const size_t guide_b = (size_t)guide_h * (size_t)guide_w * (size_t)nch * sizeof(float);
@@ -1797,7 +2145,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
     }
     if (!b_raw || !b_guide || !b_means || !b_vars) return false;
 
-    if (bayer) {
+    if (decimated) {
         RobGuideParamsCPU gp{};
         gp.raw_h = (uint32_t)raw_h;
         gp.raw_w = (uint32_t)raw_w;
@@ -1862,6 +2210,11 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         [enc setBytes:&gp length:sizeof(gp) atIndex:2];
         dispatch2(enc, c.pipe("rob_guide_bayer"), gp.guide_w, gp.guide_h);
         [enc endEncoding];
+    } else if (fft_guide) {
+        // The low pass runs on its own command buffer and waits, so the stats
+        // encoded on `cmd` below observe a finished guide.
+        if (!rob_fft_guide(raw, b_raw, raw_off_bytes, b_guide, guide_h, guide_w))
+            return false;
     } else {
         // Grey mode: the guide IS the plane. A blit keeps a resident frame on the
         // GPU; the host copy is only for the non-resident path.
@@ -2449,6 +2802,23 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         !b_R || !b_out || !b_s_select)
         return Image();
 
+    // The learned mask, if it is on and in the domain its weights were fitted
+    // in. Encoded into b_out directly -- where the merge reads the mask from --
+    // so nothing below runs when it succeeds.
+    bool sr_gate_done = false;
+    if (cfg.sr_gate_enabled && nch == 1 && sr_gate_available()) {
+        sr_gate_done = rob_run_sr_gate(b_out, out_off_bytes, b_gmeans, b_ref_m,
+                                       b_ref_v, b_std, b_diff, b_flow, gh, gw,
+                                       nch, tile_size, flow, cfg, cmd);
+        if (sr_gate_done && want_s_select) {
+            // The gate makes no s1/s2 choice, and no kernel writes the selector
+            // on this path. Report the strict prior uniformly so the split
+            // masks stay well-formed and still sum to the combined one.
+            float* sp = (float*)[b_s_select contents];
+            if (sp) std::fill(sp, sp + (size_t)gh * (size_t)gw, 1.f);
+        }
+    }
+
     RobMaskParamsCPU mp{};
     mp.h = (uint32_t)gh;
     mp.w = (uint32_t)gw;
@@ -2461,8 +2831,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.r_t = cfg.r_t;
     mp.hf_enabled = false ? 1u : 0u;
     mp.hf_variance_loss_threshold = 0.f;
-    mp.alpha = cfg.noise_alpha();
-    mp.beta = cfg.noise_beta();
+    // The ROBUSTNESS variants, matching guide_noise_var in robustness.cpp. These
+    // feed the geometry test's noise floor, and noise_alpha() omits the FFT
+    // guide's 0.25 filtered-noise factor -- so on that guide the GPU was using a
+    // floor four times the CPU's and rejecting less.
+    mp.alpha = cfg.noise_alpha_robustness();
+    mp.beta = cfg.noise_beta_robustness();
     mp.flow_reject_1d_residual_threshold = 0.f;
     mp.aperture_reject_enabled = aperture_reject_on ? 1u : 0u;
     mp.r_s1 = cfg.r_s1;
@@ -2483,52 +2857,55 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         : b_motion;
     if (!b_match_amb) return Image();
 
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    if (!enc) return Image();
-    if (aperture_reject_on) {
-        [enc setBuffer:b_tile_residual_high offset:0 atIndex:0];
-        [enc setBuffer:b_gmeans offset:0 atIndex:1];
-        [enc setBuffer:b_ref_m offset:0 atIndex:2];
-        [enc setBuffer:b_ref_v offset:0 atIndex:3];
-        [enc setBuffer:b_std offset:0 atIndex:4];
-        [enc setBuffer:b_diff offset:0 atIndex:5];
-        [enc setBuffer:b_flow offset:0 atIndex:6];
-        [enc setBytes:&mp length:sizeof(mp) atIndex:7];
-        dispatch2(enc, c.pipe("rob_tile_residual_high"), mp.flow_nx, mp.flow_ny);
-        [enc endEncoding];
-
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (!sr_gate_done) {
         enc = [cmd computeCommandEncoder];
         if (!enc) return Image();
-    }
-    [enc setBuffer:b_R offset:0 atIndex:0];
-    [enc setBuffer:b_gmeans offset:0 atIndex:1];
-    [enc setBuffer:b_ref_m offset:0 atIndex:3];
-    [enc setBuffer:b_ref_v offset:0 atIndex:4];
-    [enc setBuffer:b_std offset:0 atIndex:6];
-    [enc setBuffer:b_diff offset:0 atIndex:7];
-    [enc setBuffer:b_S offset:0 atIndex:8];
-    [enc setBuffer:b_motion offset:0 atIndex:9];
-    [enc setBuffer:b_ref_hf offset:0 atIndex:5];
-    [enc setBuffer:b_flow offset:0 atIndex:10];
-    [enc setBytes:&mp length:sizeof(mp) atIndex:11];
-    [enc setBuffer:b_aperture offset:0 atIndex:12];
-    [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
-    [enc setBuffer:b_s_select offset:0 atIndex:14];
-    [enc setBuffer:b_match_amb offset:0 atIndex:15];
-    dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
-    [enc endEncoding];
+        if (aperture_reject_on) {
+            [enc setBuffer:b_tile_residual_high offset:0 atIndex:0];
+            [enc setBuffer:b_gmeans offset:0 atIndex:1];
+            [enc setBuffer:b_ref_m offset:0 atIndex:2];
+            [enc setBuffer:b_ref_v offset:0 atIndex:3];
+            [enc setBuffer:b_std offset:0 atIndex:4];
+            [enc setBuffer:b_diff offset:0 atIndex:5];
+            [enc setBuffer:b_flow offset:0 atIndex:6];
+            [enc setBytes:&mp length:sizeof(mp) atIndex:7];
+            dispatch2(enc, c.pipe("rob_tile_residual_high"), mp.flow_nx, mp.flow_ny);
+            [enc endEncoding];
 
-    RobStatsParamsCPU sp{};
-    sp.h = (uint32_t)gh;
-    sp.w = (uint32_t)gw;
-    sp.nch = 1u;
-    enc = [cmd computeCommandEncoder];
-    if (!enc) return Image();
-    [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
-    [enc setBuffer:b_R offset:0 atIndex:1];
-    [enc setBytes:&sp length:sizeof(sp) atIndex:2];
-    dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
-    [enc endEncoding];
+            enc = [cmd computeCommandEncoder];
+            if (!enc) return Image();
+        }
+        [enc setBuffer:b_R offset:0 atIndex:0];
+        [enc setBuffer:b_gmeans offset:0 atIndex:1];
+        [enc setBuffer:b_ref_m offset:0 atIndex:3];
+        [enc setBuffer:b_ref_v offset:0 atIndex:4];
+        [enc setBuffer:b_std offset:0 atIndex:6];
+        [enc setBuffer:b_diff offset:0 atIndex:7];
+        [enc setBuffer:b_S offset:0 atIndex:8];
+        [enc setBuffer:b_motion offset:0 atIndex:9];
+        [enc setBuffer:b_ref_hf offset:0 atIndex:5];
+        [enc setBuffer:b_flow offset:0 atIndex:10];
+        [enc setBytes:&mp length:sizeof(mp) atIndex:11];
+        [enc setBuffer:b_aperture offset:0 atIndex:12];
+        [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
+        [enc setBuffer:b_s_select offset:0 atIndex:14];
+        [enc setBuffer:b_match_amb offset:0 atIndex:15];
+        dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
+        [enc endEncoding];
+
+        RobStatsParamsCPU sp{};
+        sp.h = (uint32_t)gh;
+        sp.w = (uint32_t)gw;
+        sp.nch = 1u;
+        enc = [cmd computeCommandEncoder];
+        if (!enc) return Image();
+        [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
+        [enc setBuffer:b_R offset:0 atIndex:1];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+        dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
+        [enc endEncoding];
+    }  // !sr_gate_done
 
     // ---- learned refinement (Config::robustness_refine_nn_enabled) --------
     //
@@ -2545,7 +2922,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // Deliberately NOT in the pipeline list metal_gpu_init() requires, so a
     // missing rob_refine_mask leaves the whole Metal backend working and this
     // one stage off, rather than falling the entire pipeline back to the CPU.
-    if (cfg.robustness_refine_nn_enabled) {
+    if (!sr_gate_done && cfg.robustness_refine_nn_enabled) {
         id<MTLComputePipelineState> refine = c.pipe("rob_refine_mask");
         id<MTLBuffer> b_w = refine ? rob_refine_weights() : nil;
         if (refine && b_w) {

@@ -572,6 +572,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.edge_misalign_min_conf = tuning[@"edge_misalign_min_conf"].floatValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
+    if (tuning[@"sr_gate_enabled"])
+        cfg.sr_gate_enabled = tuning[@"sr_gate_enabled"].boolValue;
     if (tuning[@"robustness_refine_nn_enabled"])
         cfg.robustness_refine_nn_enabled = tuning[@"robustness_refine_nn_enabled"].boolValue;
     if (tuning[@"robustness_refine_max_reduction"])

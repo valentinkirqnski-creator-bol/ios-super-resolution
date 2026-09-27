@@ -10,6 +10,10 @@ using namespace metal;
 // the CPU mask and the GPU mask cannot drift. See rob_refine_mask below.
 #include "robustness_refine_shared.h"
 
+// sr_gate's feature definitions, shared verbatim with core/sr_gate.cpp for the
+// same reason. See sr_gate_features below.
+#include "sr_gate_shared.h"
+
 constant float PI = 3.14159265358979323846f;
 
 struct RawDecodeParams {
@@ -2362,6 +2366,243 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
         }
     }
     out[gid.y * p.w + gid.x] = mn;
+}
+
+// ==== sr_gate: the learned robustness mask (Config::sr_gate_enabled) ======
+//
+// Three kernels, dispatched per ROW BAND. Banding is not an optimisation here,
+// it is the only way this fits: a 4032x3024 guide with 8 channels is 390 MB per
+// activation plane and the network needs two of them live at once. A band of
+// 192 output rows needs three buffers of ~26 MB instead.
+//
+// The band arithmetic, working backwards through the dilations. To produce
+// output rows [y0, y1) the layers need
+//     a2 [y0, y1)   a1 [y0-3, y1+3)   a0 [y0-5, y1+5)   feat [y0-6, y1+6)
+// each clipped to [0, h). Every tap is clamped into [0, h-1] -- which is what
+// the replicate padding the network was trained with does -- so a clamped tap
+// always lands inside the source band and no extra guard is needed.
+//
+// The features themselves are NOT written here: sr_gate_shared.h holds them and
+// core/sr_gate.cpp includes the same text, so the CPU mask and the GPU mask
+// cannot drift on a log divisor or a saturation point. What this kernel does is
+// the gathering -- Eq. 6 and the flow neighbourhood -- which each backend does
+// its own way. sr_gate_infer_cpu is the golden reference for the rest.
+
+struct SrGateFeatParams {
+    uint h, w, nch;
+    uint tile_size;
+    uint flow_ny, flow_nx;
+    uint curve_n;
+    uint sqrt_index;     // 1 = index the noise curve by mean^2 (sqrt guide)
+    // noise_alpha_robustness() / noise_beta_robustness(), NOT noise_alpha().
+    // On the FFT guide those differ by the 0.25 filtered-noise factor, and the
+    // gate was trained against the robustness pair.
+    float alpha_rob, beta_rob;
+    int  dst_y0;         // image row of this band's first output row
+    uint dst_rows;
+};
+
+struct SrGateConvParams {
+    uint h, w;
+    int  src_y0;         // image row held at source buffer row 0
+    int  dst_y0;
+    uint dst_rows;
+    uint in_ch, out_ch;
+    uint dil;
+    uint w_off;          // float offset of this layer's weights in the blob
+    uint b_off;
+};
+
+// Generalised over nch so one kernel serves the one-channel raw-resolution FFT
+// guide and the three-channel decimated guide: Eq. 6 already reduces to two
+// scalars, so only the summation, the tile indexing and the guide-to-raw scale
+// differ. Twin of build_sr_gate_features in core/sr_gate.cpp.
+kernel void sr_gate_features(device float* feat [[buffer(0)]],
+                             device const float* comp_means [[buffer(1)]],
+                             device const float* ref_means [[buffer(2)]],
+                             device const float* ref_vars [[buffer(3)]],
+                             device const float* std_curve [[buffer(4)]],
+                             device const float* diff_curve [[buffer(5)]],
+                             device const float* flow [[buffer(6)]],
+                             constant SrGateFeatParams& p [[buffer(7)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.dst_rows) return;
+    const int y = p.dst_y0 + int(gid.y);
+    const int x = int(gid.x);
+    const uint w = p.w;
+    const uint nch = p.nch;
+    const float sc = (nch == 3u) ? 2.f : 1.f;
+
+    // Tile index, sampled exactly as rob_make_mask and the merge sample it.
+    int ty, tx;
+    if (nch == 1u) {
+        ty = y / int(p.tile_size);
+        tx = x / int(p.tile_size);
+    } else {
+        ty = int((2.f * float(y) + 0.5f) / float(p.tile_size));
+        tx = int((2.f * float(x) + 0.5f) / float(p.tile_size));
+    }
+    ty = clamp(ty, 0, int(p.flow_ny) - 1);
+    tx = clamp(tx, 0, int(p.flow_nx) - 1);
+    const uint fi = (uint(ty) * p.flow_nx + uint(tx)) * 2u;
+    const float raw_fx = flow[fi + 0u];
+    const float raw_fy = flow[fi + 1u];
+    // What the merge actually fetches with: halved on the half-resolution guide.
+    const float flow_x = (nch == 1u) ? raw_fx : 0.5f * raw_fx;
+    const float flow_y = (nch == 1u) ? raw_fy : 0.5f * raw_fy;
+
+    // ---- Eq. 6, the same aggregation rob_make_mask performs ---------------
+    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    float var_sum = 0.f, nvar_sum = 0.f, bri_sum = 0.f;
+    const float sample_x = float(x) + flow_x;
+    const float sample_y = float(y) + flow_y;
+    for (uint ch = 0u; ch < nch; ++ch) {
+        const uint o = (uint(y) * w + uint(x)) * nch + ch;
+        const float brightness = ref_means[o];
+        float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+        int id_noise = lround_away(1000.f * bidx);
+        if (!isfinite(brightness)) id_noise = 0;
+        else if (id_noise < 0) id_noise = 0;
+        else if (id_noise >= int(p.curve_n)) id_noise = int(p.curve_n) - 1;
+        const uint curve_id = ch * p.curve_n + uint(id_noise);
+        const float sigma_t = std_curve[curve_id];
+        const float d_t = diff_curve[curve_id];
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
+        const float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, nch,
+                                                      sample_y, sample_x, ch);
+        const float d_p_ = isfinite(comp) ? fabs(brightness - comp) : INFINITY;
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
+        // guide_noise_var: the green guide channel averages two Bayer greens,
+        // so half the variance.
+        const float b_cl = clamp(isfinite(brightness) ? brightness : 0.f, 0.f, 1.f);
+        float nv = max(p.alpha_rob * b_cl + p.beta_rob, 0.f);
+        if (nch == 3u && ch == 1u) nv *= 0.5f;
+        nvar_sum += nv;
+        var_sum += max(ref_vars[o], 0.f);
+        bri_sum += b_cl;
+    }
+
+    SrGateInputs in;
+    in.sigma_sq = max(sigma_ms_sq, sigma_md_sq);
+    const float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    in.d_sq = d_ms_sq * shrink * shrink;
+    in.var_sum = var_sum;
+    in.nvar_sum = nvar_sum;
+    in.raw_fx = raw_fx;
+    in.raw_fy = raw_fy;
+    in.tile_size = float(p.tile_size);
+
+    // ---- the 3x3 tile flow span (Eq. 7's motion prior quantity) -----------
+    float mnx = INFINITY, mxx = -INFINITY, mny = INFINITY, mxy = -INFINITY;
+    for (int i = -1; i <= 1; ++i) {
+        const int yy = ty + i;
+        if (yy < 0 || yy >= int(p.flow_ny)) continue;
+        for (int j = -1; j <= 1; ++j) {
+            const int xx = tx + j;
+            if (xx < 0 || xx >= int(p.flow_nx)) continue;
+            const uint k = (uint(yy) * p.flow_nx + uint(xx)) * 2u;
+            mnx = min(mnx, flow[k + 0u]); mxx = max(mxx, flow[k + 0u]);
+            mny = min(mny, flow[k + 1u]); mxy = max(mxy, flow[k + 1u]);
+        }
+    }
+    const float sp0 = mxx - mnx, sp1 = mxy - mny;
+    in.span = sqrt(sp0 * sp0 + sp1 * sp1);
+
+    // ---- the within-tile motion a per-tile translation cannot carry -------
+    in.ex = 0.f;
+    in.ey = 0.f;
+    if (p.flow_ny >= 3u && p.flow_nx >= 3u) {
+        const int ptu = clamp(ty - 1, 0, int(p.flow_ny) - 1);
+        const int ptd = clamp(ty + 1, 0, int(p.flow_ny) - 1);
+        const int pxl = clamp(tx - 1, 0, int(p.flow_nx) - 1);
+        const int pxr = clamp(tx + 1, 0, int(p.flow_nx) - 1);
+        const float inv2ts = 1.f / (2.f * float(p.tile_size));
+        const uint c_l = (uint(ty) * p.flow_nx + uint(pxl)) * 2u;
+        const uint c_r = (uint(ty) * p.flow_nx + uint(pxr)) * 2u;
+        const uint c_u = (uint(ptu) * p.flow_nx + uint(tx)) * 2u;
+        const uint c_d = (uint(ptd) * p.flow_nx + uint(tx)) * 2u;
+        const float gdxdx = (flow[c_r + 0u] - flow[c_l + 0u]) * inv2ts;
+        const float gdydx = (flow[c_r + 1u] - flow[c_l + 1u]) * inv2ts;
+        const float gdxdy = (flow[c_d + 0u] - flow[c_u + 0u]) * inv2ts;
+        const float gdydy = (flow[c_d + 1u] - flow[c_u + 1u]) * inv2ts;
+        const float rawx = sc * float(x) + 0.5f * (sc - 1.f);
+        const float rawy = sc * float(y) + 0.5f * (sc - 1.f);
+        const float uu = rawx - (float(tx) + 0.5f) * float(p.tile_size);
+        const float vv = rawy - (float(ty) + 0.5f) * float(p.tile_size);
+        in.ex = gdxdx * uu + gdxdy * vv;
+        in.ey = gdydx * uu + gdydy * vv;
+    }
+
+    // ---- channel 0's gradient, and the noise sigma in the same units ------
+    const int xl = max(0, x - 1), xr = min(int(p.w) - 1, x + 1);
+    const int yu = max(0, y - 1), yd = min(int(p.h) - 1, y + 1);
+    in.gix = 0.5f * (ref_means[(uint(y) * w + uint(xr)) * nch] -
+                     ref_means[(uint(y) * w + uint(xl)) * nch]) / sc;
+    in.giy = 0.5f * (ref_means[(uint(yd) * w + uint(x)) * nch] -
+                     ref_means[(uint(yu) * w + uint(x)) * nch]) / sc;
+    const float bri = bri_sum / float(nch);
+    in.nsig = sqrt(max(p.alpha_rob * bri + p.beta_rob, 1.0e-20f)) / sc;
+
+    thread float out8[SRG_FEATURES];
+    sr_gate_features_from(&in, out8);
+    device float* o = feat + (uint(gid.y) * w + uint(x)) * SRG_FEATURES;
+    for (uint i = 0u; i < uint(SRG_FEATURES); ++i) o[i] = out8[i];
+}
+
+// One dilated 3x3 ReLU layer over a band. Channel interleaved throughout, the
+// same layout core/sr_gate.cpp uses, so a dump from either side is directly
+// comparable. Twin of conv_relu_band.
+kernel void sr_gate_conv(device float* dst [[buffer(0)]],
+                         device const float* src [[buffer(1)]],
+                         device const float* wgt [[buffer(2)]],
+                         constant SrGateConvParams& p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.dst_rows) return;
+    const int y = p.dst_y0 + int(gid.y);
+    const int x = int(gid.x);
+    const int H = int(p.h), W = int(p.w);
+    const int dil = int(p.dil);
+    const uint in_ch = p.in_ch, out_ch = p.out_ch;
+    device const float* W0 = wgt + p.w_off;
+    device const float* B0 = wgt + p.b_off;
+
+    float acc[SRG_WIDTH];
+    for (uint o = 0u; o < out_ch; ++o) acc[o] = B0[o];
+    for (int ky = 0; ky < 3; ++ky) {
+        const int yy = clamp(y + (ky - 1) * dil, 0, H - 1);
+        device const float* row = src + (uint(yy - p.src_y0) * p.w) * in_ch;
+        for (int kx = 0; kx < 3; ++kx) {
+            const int xx = clamp(x + (kx - 1) * dil, 0, W - 1);
+            device const float* v = row + uint(xx) * in_ch;
+            const uint kidx = uint(ky * 3 + kx);
+            for (uint o = 0u; o < out_ch; ++o) {
+                device const float* wo = W0 + (o * in_ch) * 9u;
+                float s = 0.f;
+                for (uint i = 0u; i < in_ch; ++i) s += wo[i * 9u + kidx] * v[i];
+                acc[o] += s;
+            }
+        }
+    }
+    device float* out = dst + (uint(gid.y) * p.w + uint(x)) * out_ch;
+    for (uint o = 0u; o < out_ch; ++o) out[o] = max(acc[o], 0.f);
+}
+
+// 1x1 head + sigmoid, straight into the mask plane at its image row.
+kernel void sr_gate_head(device float* R [[buffer(0)]],
+                         device const float* src [[buffer(1)]],
+                         device const float* wgt [[buffer(2)]],
+                         constant SrGateConvParams& p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.dst_rows) return;
+    const int y = p.dst_y0 + int(gid.y);
+    device const float* v = src + (uint(gid.y) * p.w + gid.x) * p.in_ch;
+    device const float* W0 = wgt + p.w_off;
+    float s = wgt[p.b_off];
+    for (uint i = 0u; i < p.in_ch; ++i) s += W0[i] * v[i];
+    R[uint(y) * p.w + gid.x] = 1.f / (1.f + exp(-s));
 }
 
 // ---- learned refinement of the analytic mask (Config::

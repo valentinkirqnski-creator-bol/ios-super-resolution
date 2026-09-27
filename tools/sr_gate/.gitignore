@@ -1,0 +1,13 @@
+data/
+.scene_cache/
+*.npz
+*.npy
+*.exe
+*.o
+parity_in.bin
+parity_out.bin
+train_log.txt
+sr_gate_random.pt
+integ_in.bin
+integ_mask.bin
+__pycache__/
