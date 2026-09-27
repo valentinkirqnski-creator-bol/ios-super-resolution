@@ -562,6 +562,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
             ? hhsr::SelectionLaw::Linear : hhsr::SelectionLaw::HardThreshold;
     if (tuning[@"robustness_raw_resolution_enabled"])
         cfg.robustness_raw_resolution_enabled = tuning[@"robustness_raw_resolution_enabled"].boolValue;
+    if (tuning[@"edge_misalign_enabled"])
+        cfg.edge_misalign_enabled = tuning[@"edge_misalign_enabled"].boolValue;
+    if (tuning[@"edge_misalign_edge_snr"])
+        cfg.edge_misalign_edge_snr = tuning[@"edge_misalign_edge_snr"].floatValue;
+    if (tuning[@"edge_misalign_shift_z"])
+        cfg.edge_misalign_shift_z = tuning[@"edge_misalign_shift_z"].floatValue;
+    if (tuning[@"edge_misalign_min_conf"])
+        cfg.edge_misalign_min_conf = tuning[@"edge_misalign_min_conf"].floatValue;
     if (tuning[@"use_neural_robustness"])
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"robustness_refine_nn_enabled"])

@@ -1153,6 +1153,61 @@ struct CameraView: View {
                             .font(.footnote).foregroundColor(.secondary)
                     }
 
+                    Toggle("Edge Misalignment Detector",
+                           isOn: $cam.tuningParams.edge_misalign_enabled)
+                    Text("""
+                         Analytic, not learned. For each strong edge it takes a short \r
+                         profile across the edge NORMAL in the reference and in the \r
+                         aligned frame, locates each edge to sub-pixel precision, and \r
+                         weighs the frame down in proportion to how far the two \r
+                         disagree. \r
+
+                         What it is for: the thin ghost beside a concrete post or a \r
+                         roof-tile boundary. A single frame never contains that double \r
+                         -- its edge is a single edge, just slightly misplaced. The \r
+                         double is what the merge makes of several frames whose edges \r
+                         sit in slightly different places, so suppressing the displaced \r
+                         ones is what stops the sum from doubling. \r
+
+                         Unlike the threshold test above, every term is a DIFFERENCE \r
+                         between the two frames, so a strong but correctly aligned edge \r
+                         scores 1 however strong it is. Contrast only scales a \r
+                         disagreement already measured; it cannot invent one. The \r
+                         weighting is soft throughout, so no thin line is cut outright. \r
+                         """
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    if cam.tuningParams.edge_misalign_enabled {
+                        ispRow("Edge Sensitivity (sigma)",
+                               $cam.tuningParams.edge_misalign_edge_snr,
+                               1...12, "%.1f")
+                        Text("""
+                         How far above its own noise a gradient must rise to count as \r
+                         an edge, in sigma. The confidence ramps in from here to twice \r
+                         here, so nothing steps. Lower grades fainter edges and risks \r
+                         grading noise; higher restricts it to obvious structure. \r
+                         """
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Displacement Scale",
+                               $cam.tuningParams.edge_misalign_shift_z,
+                               0.5...8, "%.2f")
+                        Text("""
+                         The displacement damage, in noise units, at which a frame \r
+                         keeps half its weight. A scale, not a threshold: smaller is \r
+                         more aggressive everywhere rather than switching on somewhere. \r
+                         """
+                            .font(.footnote).foregroundColor(.secondary)
+                        ispRow("Confidence Floor",
+                               $cam.tuningParams.edge_misalign_min_conf,
+                               0...1, "%.2f")
+                        Text("""
+                         The least weight a detection may leave. 0 lets a badly \r
+                         displaced edge be dropped entirely; raise it to bound the \r
+                         worst case and keep some of every frame. \r
+                         """
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+
                     Toggle("Learned Geometry Refinement",
                            isOn: $cam.tuningParams.robustness_refine_nn_enabled)
                     Text("""

@@ -256,6 +256,13 @@ struct TuningParams: Equatable, Codable {
     /// sees; defaulting it to true while the gate also demands the decimate grey
     /// made it read "on" while being inert, which is worse than off.
     var robustness_raw_resolution_enabled: Bool = false
+    // Analytic edge-misalignment detector; defaults mirror core/types.h.
+    // These are new keys, so an existing saved preset -- which only
+    // overrides what it actually contains -- leaves them here.
+    var edge_misalign_enabled: Bool = false
+    var edge_misalign_edge_snr: Float = 4.0
+    var edge_misalign_shift_z: Float = 2.0
+    var edge_misalign_min_conf: Float = 0.0
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
@@ -320,6 +327,8 @@ struct TuningParams: Equatable, Codable {
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
+        case edge_misalign_enabled, edge_misalign_edge_snr
+        case edge_misalign_shift_z, edge_misalign_min_conf
         case kernel_selection_linear
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
@@ -416,6 +425,10 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
+        edge_misalign_enabled = try c.decodeIfPresent(Bool.self, forKey: .edge_misalign_enabled) ?? edge_misalign_enabled
+        edge_misalign_edge_snr = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_edge_snr) ?? edge_misalign_edge_snr
+        edge_misalign_shift_z = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_shift_z) ?? edge_misalign_shift_z
+        edge_misalign_min_conf = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_min_conf) ?? edge_misalign_min_conf
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
@@ -2188,6 +2201,10 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
+            "edge_misalign_enabled": NSNumber(value: tuningParams.edge_misalign_enabled),
+            "edge_misalign_edge_snr": NSNumber(value: tuningParams.edge_misalign_edge_snr),
+            "edge_misalign_shift_z": NSNumber(value: tuningParams.edge_misalign_shift_z),
+            "edge_misalign_min_conf": NSNumber(value: tuningParams.edge_misalign_min_conf),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
