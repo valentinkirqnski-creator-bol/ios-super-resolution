@@ -418,6 +418,7 @@ int main(int argc, char** argv) {
         rp.geom_noise_floor_mult = work.motion_geom_noise_floor_mult;
         rp.gate_px = work.robustness_refine_gate_px;
         rp.reg_gate_px = work.robustness_refine_regional_gate_px;
+        rp.sharpen_gamma = work.robustness_refine_sharpen_gamma;
 
         if (curve_n <= 0) {
             std::printf("\nGPU parity: no noise curves (1.4 LUT mode?) -- skipped\n");

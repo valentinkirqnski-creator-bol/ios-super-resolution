@@ -1116,6 +1116,38 @@ struct Config {
     // rejecting the top ~20% by this metric leaves the rest at the noise floor.
     // A rejection ("hiding") fix -- it discards misaligned samples rather than
     // aligning them. Off by default.
+    // ---- analytic edge-misalignment detector ---------------------------
+    //
+    // Multiplies a confidence in [0,1] into the analytic mask:
+    // R_final = R_analytic * C_edge * C_nn. Off by default; when off the mask is
+    // bit-for-bit what it was. See edge_misalignment_confidence in
+    // robustness.cpp for the derivation of each term.
+    //
+    // Unlike motion_geom_reject, every term is driven by a DIFFERENCE between the
+    // reference and the comparison frame, so a strong but correctly aligned edge
+    // scores exactly 1 no matter how strong it is. Gradient magnitude only ever
+    // scales a disagreement that has already been measured; it cannot manufacture
+    // one. And the weighting is soft throughout -- there is no hard rejection to
+    // dilate away a thin line.
+    bool  edge_misalign_enabled = false;
+    // Edge test, in units of the guide's own noise sigma. The confidence ramps in
+    // from this value to twice it, so nothing steps.
+    float edge_misalign_edge_snr = 4.0f;
+    // Half-length of the 1D profile taken across the edge normal, in GUIDE
+    // pixels. 3 gives seven taps and five usable derivatives, which is the least
+    // that can carry a second peak as well as a centroid.
+    int   edge_misalign_radius = 3;
+    // Scale, not a threshold: the displacement damage |shift| * |grad| / sigma at
+    // which the confidence reaches 0.5. In noise units, so it is exposure
+    // invariant.
+    float edge_misalign_shift_z = 2.0f;
+    // The same for the secondary-peak term, which is measured as excess over the
+    // reference profile's own second peak.
+    float edge_misalign_ghost_z = 3.0f;
+    // Floor on the confidence. 0 lets a detection remove the frame's
+    // contribution entirely; raise it to bound the worst case.
+    float edge_misalign_min_conf = 0.0f;
+
     bool  motion_geom_reject_enabled = false;
     // intensity units (|grad I|*|E|). At a strong rotation edge the metric is
     // only ~0.02-0.03 on the sqrt guide, so this must be LOW to reject anything:
@@ -1203,6 +1235,17 @@ struct Config {
     // threshold and those are the costly ones. See RefineParams::reg_gate_px.
     // 0 disables. One-sided: it can only leave R alone.
     float robustness_refine_regional_gate_px = 1.00f;
+    // Sharpening exponent on the attenuation. See rr_apply for the measurement
+    // that motivates it: the network leaves ~36% of the weight on 90% of the
+    // pixels that should be dropped, where the analytic geometry test leaves
+    // zero on the 43% it catches -- lower mean squared error, visibly worse
+    // ghosting, because MSE is quadratic and ghost visibility is not.
+    //
+    // 1.0 is the identity and reproduces the previous behaviour bit for bit.
+    // Below 1 the attenuation becomes decisive; tune WITH the dead zone, which
+    // is the control for the false rejections a smaller gamma would otherwise
+    // wake up.
+    float robustness_refine_sharpen_gamma = 1.0f;
 
     // The accumulated-robustness adaptive denoiser was removed; the reference
     // merge no longer enlarges its kernel from the accumulated robustness.

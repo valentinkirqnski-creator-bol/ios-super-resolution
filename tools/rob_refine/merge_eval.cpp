@@ -242,6 +242,21 @@ struct Metrics {
     Acc all, edge, thin, flat;
     Acc zone[ZONE_N];
     double thicken = 0.0; size_t thicken_n = 0;
+    // VISIBLE error near edges: the fraction of edge-neighbourhood pixels whose
+    // error exceeds the ground truth's own noise scale by a factor of three.
+    //
+    // This exists because every other column here is an energy measure and
+    // ghosting is not an energy phenomenon. Measured on the real bursts, the
+    // analytic geometry test leaves exactly zero weight on the 43% of
+    // should-drop pixels it fires on, while the network reduces 90% of them to
+    // about 0.36 -- lower mean squared error, and a 36%-amplitude ghost nearly
+    // everywhere a ghost exists. A ghost at 36% is obvious to look at and
+    // contributes ~13% of the squared error, so MSE prefers the configuration
+    // that looks worse. A count of pixels over a visibility threshold does not.
+    size_t vis_hit = 0, vis_n = 0;
+    double vis_pct() const {
+        return vis_n ? 100.0 * (double)vis_hit / (double)vis_n : 0.0;
+    }
     double psnr(double peak) const {
         const double m = all.mean();
         return m > 0.0 ? 10.0 * std::log10(peak * peak / m) : 99.0;
@@ -256,7 +271,8 @@ struct Metrics {
 // look better for having destroyed the evidence.
 Metrics score(const Image& out_rgb, const Image& gt_rgb,
               const Image& gt_g, const Image& gt_gmag, const Image& gt_lap,
-              float edge_thr, float thin_thr, float scale, int ts) {
+              float edge_thr, float thin_thr, float scale, int ts,
+              float vis_thr) {
     Image og = luma_of(out_rgb), ogm, olap;
     grad_lap(og, ogm, olap);
     Metrics m;
@@ -289,6 +305,11 @@ Metrics score(const Image& out_rgb, const Image& gt_rgb,
                     const double ex = (double)ogm.at(y, x) - (double)gm;
                     if (ex > 0.0) m.thicken += ex;
                     ++m.thicken_n;
+                    // Same population as thicken -- beside a ground-truth edge,
+                    // which is exactly where a doubled edge shows up -- but
+                    // counted rather than squared.
+                    ++m.vis_n;
+                    if (std::fabs(e) > (double)vis_thr) ++m.vis_hit;
                 }
             }
         }
@@ -349,6 +370,11 @@ int main(int argc, char** argv) {
     // raw-resolution with nothing upscaled. See Config::robustness_fft_guide.
     const int fft_guide_override = envi("MERGE_EVAL_FFT_GUIDE", -1);
     const float fft_noise_override = envf("MERGE_EVAL_FFT_NOISE", -1.f);
+    const float sharpen_override = envf("MERGE_EVAL_SHARPEN", -1.f);
+    const float deadzone_override = envf("MERGE_EVAL_DEADZONE", -1.f);
+    const int edge_mis = envi("MERGE_EVAL_EDGE_MISALIGN", -1);
+    const float edge_shift_z = envf("MERGE_EVAL_EDGE_SHIFT_Z", -1.f);
+    const float edge_snr = envf("MERGE_EVAL_EDGE_SNR", -1.f);
 
     std::vector<float> angles;
     for (int i = 2; i < argc; ++i) angles.push_back((float)std::atof(argv[i]));
@@ -384,14 +410,28 @@ int main(int argc, char** argv) {
     }
     if (fft_noise_override >= 0.f)
         work.robustness_fft_guide_noise_energy = fft_noise_override;
+    if (sharpen_override > 0.f)
+        work.robustness_refine_sharpen_gamma = sharpen_override;
+    if (deadzone_override >= 0.f)
+        work.robustness_refine_deadzone = deadzone_override;
+    if (edge_mis >= 0) work.edge_misalign_enabled = (edge_mis != 0);
+    if (edge_shift_z > 0.f) work.edge_misalign_shift_z = edge_shift_z;
+    if (edge_snr > 0.f) work.edge_misalign_edge_snr = edge_snr;
     const int ts = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
     std::printf("R sampling: %s | guide: %s\n",
                 work.merge_robustness_bilinear ? "BILINEAR" : "nearest",
                 work.robustness_fft_guide ? "FFT full-res 1ch"
                                           : "decimated half-res 3ch");
-    std::printf("gates: per-pixel %.2f px, regional %.2f px\n",
+    std::printf("edge-misalign detector: %s (snr %.1f, shift_z %.2f, radius %d)\n",
+                work.edge_misalign_enabled ? "ON" : "off",
+                (double)work.edge_misalign_edge_snr,
+                (double)work.edge_misalign_shift_z,
+                work.edge_misalign_radius);
+    std::printf("gates: per-pixel %.2f px, regional %.2f px | sharpen gamma %.2f, dead zone %.3f\n",
                 (double)work.robustness_refine_gate_px,
-                (double)work.robustness_refine_regional_gate_px);
+                (double)work.robustness_refine_regional_gate_px,
+                (double)work.robustness_refine_sharpen_gamma,
+                (double)work.robustness_refine_deadzone);
     std::printf("%dx%d raw, ts=%d, %d comparison frames, scale %.0f\n",
                 ref.w, ref.h, ts, n_frames, (double)work.scale);
 
@@ -505,9 +545,26 @@ int main(int argc, char** argv) {
 
         Image gt_g = luma_of(gt), gt_gmag, gt_lap;
         grad_lap(gt_g, gt_gmag, gt_lap);
+        // The ground truth's own noise scale: RMS of what a 3x3 box filter
+        // removes, over FLAT ground-truth pixels only, so scene structure does
+        // not inflate it. Taken from the ground truth rather than from any
+        // configuration's output, so the threshold is the same yardstick for all
+        // four and cannot move when a configuration gets noisier.
         const float edge_thr = percentile(gt_gmag, 0.90f);
         const float thin_thr = percentile(gt_lap, 0.95f);
         const float peak = percentile(gt_g, 0.999f);
+        double nse = 0.0; size_t nsn = 0;
+        for (int y = 1; y < gt_g.h - 1; y += 3)
+            for (int x = 1; x < gt_g.w - 1; x += 3) {
+                if (gt_gmag.at(y, x) >= 0.25f * edge_thr) continue;
+                float sum = 0.f;
+                for (int i = -1; i <= 1; ++i)
+                    for (int j = -1; j <= 1; ++j) sum += gt_g.at(y + i, x + j);
+                const double d = (double)gt_g.at(y, x) - (double)(sum / 9.f);
+                nse += d * d; ++nsn;
+            }
+        const float gt_noise = (nsn > 0) ? (float)std::sqrt(nse / (double)nsn) : 0.f;
+        const float vis_thr = 3.f * gt_noise;
 
         std::printf("\n================================================================"
                     "================================\n");
@@ -523,10 +580,13 @@ int main(int argc, char** argv) {
                         (double)deg, mean_true_disp, mean_flow_err);
         std::printf("  edge threshold %.5f (top 10%%), thin %.5f (top 5%% |lap|), "
                     "peak %.4f\n", (double)edge_thr, (double)thin_thr, (double)peak);
+        std::printf("  gt noise %.6f, visible-error threshold %.6f (3x)\n",
+                    (double)gt_noise, (double)vis_thr);
         std::printf("================================================================"
                     "================================\n");
-        std::printf("  %-21s %8s %10s %10s %10s %10s\n",
-                    "configuration", "PSNR", "edge MSE", "thin MSE", "thicken", "flat MSE");
+        std::printf("  %-21s %8s %10s %10s %10s %10s %8s\n",
+                    "configuration", "PSNR", "edge MSE", "thin MSE", "thicken",
+                    "flat MSE", "VISIBLE%");
 
         Metrics base;
         for (int c = 0; c < 4; ++c) {
@@ -545,16 +605,16 @@ int main(int argc, char** argv) {
             }
             Image out = merge_burst(ref, ref_covs, comps, flows, covs, robs, ts, run);
             Metrics m = score(out, gt, gt_g, gt_gmag, gt_lap, edge_thr, thin_thr,
-                              work.scale, ts);
+                              work.scale, ts, vis_thr);
             if (c == 0) base = m;
             auto pct = [](double v, double b) {
                 return b > 0.0 ? 100.0 * (v - b) / b : 0.0;
             };
-            std::printf("  %-21s %8.3f %10.3e %10.3e %10.3e %10.3e\n",
+            std::printf("  %-21s %8.3f %10.3e %10.3e %10.3e %10.3e %7.3f%%\n",
                         CONFIGS[c].name, m.psnr((double)peak), m.edge.mean(),
                         m.thin.mean(),
                         m.thicken_n ? m.thicken / (double)m.thicken_n : 0.0,
-                        m.flat.mean());
+                        m.flat.mean(), m.vis_pct());
             if (c > 0)
                 std::printf("  %-21s %+8.2f %9.1f%% %9.1f%% %9.1f%% %9.1f%%\n", "  vs Wronski",
                             m.psnr((double)peak) - base.psnr((double)peak),

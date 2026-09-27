@@ -1645,7 +1645,7 @@ static_assert(sizeof(RobHfLossParamsCPU) == 32, "RobHfLossParamsCPU");
 // failure mode for a Metal argument struct -- the two copies drifting a field
 // apart and every value after it being garbage -- cannot happen here. The size
 // is asserted anyway, because setBytes takes a length.
-static_assert(sizeof(RefineParams) == 80, "RefineParams");
+static_assert(sizeof(RefineParams) == 96, "RefineParams");
 
 // The 761 compiled-in floats, uploaded once and kept. Tiny, but re-uploading
 // per comparison frame would be a pointless copy on the very path this stage
@@ -2573,6 +2573,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             rp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
             rp.gate_px = cfg.robustness_refine_gate_px;
             rp.reg_gate_px = cfg.robustness_refine_regional_gate_px;
+            rp.sharpen_gamma = cfg.robustness_refine_sharpen_gamma;
             enc = [cmd computeCommandEncoder];
             if (enc) {
                 [enc setBuffer:b_out offset:out_off_bytes atIndex:0];

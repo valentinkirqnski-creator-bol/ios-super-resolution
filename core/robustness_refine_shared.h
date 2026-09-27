@@ -636,10 +636,38 @@ inline float rr_eval(const RR_THREAD float* f, const RR_DEVICE float* w) {
 // enforcing different guarantees: R == 0 stays 0 because this MULTIPLIES,
 // nothing exceeds kappa because drop is clamped into [0,1], and anything
 // inside the dead zone returns R unchanged bit for bit.
-inline float rr_apply(float R, float q, float kappa, float deadzone) {
+// Bounded attenuation, with the dead zone doubling as the foot of a sharpening
+// curve.
+//
+// Why sharpening is needed at all: MSE is quadratic and ghosting is not. Measured
+// on the real bursts, the analytic geometry test leaves EXACTLY ZERO weight on
+// the 43% of should-drop pixels it fires on, while this network -- trained to the
+// inverse-MSE optimal weight under a quadratic loss -- reduces 90% of them to
+// about 0.36 and almost never reaches 0. Its mean output is 0.87. Lower mean
+// squared error, and a 36%-amplitude ghost left nearly everywhere a ghost exists,
+// which is plainly visible while contributing only ~13% of the squared error. The
+// timidity is structural: a quadratic loss toward a target that is itself rarely
+// near zero regresses to the middle.
+//
+//   d  = (drop - deadzone) / (1 - deadzone)   rescaled so the dead-zone edge is 0
+//   d' = d ^ gamma                            gamma < 1 pushes it toward 1
+//
+// gamma alone is not selective: x^gamma is concave, so it amplifies every drop,
+// and in RELATIVE terms most at the small end (at deadzone 0.05, gamma 0.5 takes
+// a drop of 0.06 to 0.102, a factor 1.7, but 0.9 only to 0.918, a factor 1.02).
+// So it must be tuned together with the dead zone: raise deadzone to silence the
+// timid detections, lower gamma to make the survivors decisive. gamma = 1 is the
+// identity and reproduces the previous behaviour exactly.
+inline float rr_apply(float R, float q, float kappa, float deadzone, float gamma) {
     const float drop = rr_clamp(1.f - q, 0.f, 1.f);
     if (drop <= deadzone) return R;
-    return R * (1.f - kappa * drop);
+    float d = (drop - deadzone) / rr_max(1.f - deadzone, 1e-6f);
+    d = rr_clamp(d, 0.f, 1.f);
+    // Guarded rather than called unconditionally: pow(x, 1) is not always exactly
+    // x, and this path must stay bit-identical to the unsharpened one at the
+    // default so the A/B measures only the curve.
+    if (gamma > 0.f && gamma != 1.f) d = pow(d, gamma);
+    return R * (1.f - kappa * d);
 }
 
 
@@ -697,11 +725,16 @@ struct RefineParams {
     // 4.1% of those above it. Median true error among the pixels it still lets
     // through: 1.046 px, which is the crossover itself.
     float gate_px;
+    // Config::robustness_refine_sharpen_gamma. 1 = identity.
+    float sharpen_gamma;
     // Regional form of the same idea, and the one that does the work:
     // Config::robustness_refine_regional_gate_px. 0 disables it. Strictly
     // one-sided -- it can only force q = 1, never strengthen a reduction, so
     // R_final <= R survives it untouched.
-    float reg_gate_px;      // 80 bytes
+    float reg_gate_px;
+    // setBytes needs a multiple of 16, which metal_lint.py checks. The three
+    // gate/sharpen floats took the struct from 80 to 84, so it pads to 96.
+    int _pad0, _pad1, _pad2;   // 96 bytes
 };
 
 inline int rr_clampi(int v, int lo, int hi) {
@@ -941,7 +974,8 @@ inline float rr_refine_pixel(const RR_DEVICE float* ref_means,
     // after: below the threshold there is no decision to make, so the weights
     // are not read and R is returned bit-for-bit.
     if (p->gate_px > 0.f && f[RR_CH_AEMAG] < p->gate_px) return R;
-    return rr_apply(R, rr_eval(f, weights), p->kappa, p->deadzone);
+    return rr_apply(R, rr_eval(f, weights), p->kappa, p->deadzone,
+                    p->sharpen_gamma);
 }
 
 #endif  // HHSR_ROBUSTNESS_REFINE_SHARED_H

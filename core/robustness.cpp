@@ -1719,6 +1719,187 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
 // refined_on_gpu is set when the Metal path's rob_refine_mask kernel has
 // already applied the learned refinement, so the wrapper below does not apply
 // it a second time.
+
+// ---- analytic edge-misalignment detector --------------------------------
+//
+// Returns a confidence in [0,1] per GUIDE pixel: 1 = the edge here sits where
+// the reference's edge sits, 0 = it is displaced enough to show. It multiplies
+// into the analytic mask, so R_final = R_analytic * C_edge * C_nn and disabling
+// it restores the previous mask bit for bit.
+//
+// The artifact being targeted is a doubled edge in the MERGED image -- a concrete
+// post or roof-tile boundary with a thin replica beside it. Worth being precise
+// about where that comes from, because it decides what can be measured per frame:
+// a single comparison frame does NOT contain a double edge. Its edge is a single
+// edge, merely in slightly the wrong place. The doubling is what the accumulator
+// makes of N frames whose edges sit at N slightly different positions. So the
+// per-frame observable is DISPLACEMENT, and suppressing displaced contributions
+// is what stops the sum from doubling.
+//
+// Five steps, all on the existing guide statistics:
+//
+//  1. Edge test on the existing 3x3 central difference, against the noise model
+//     rather than an absolute number, so it behaves the same in daylight and at
+//     ISO 6400. Ramped rather than thresholded, so there is no discontinuity
+//     where the mask starts acting.
+//  2. A 1D profile along the edge NORMAL, +-edge_misalign_radius guide pixels,
+//     sampled in the reference and in the comparison at the position the merge
+//     will actually fetch (same flow convention as d_p above, deliberately).
+//  3. Sub-pixel edge location in each profile, as the centroid of the profile's
+//     |derivative|. Their difference is the displacement along the normal, which
+//     is the only direction that can double an edge -- displacement ALONG an
+//     edge slides it into itself and is harmless, and the normal projection is
+//     what separates the two.
+//  4. Damage, not displacement: a shift matters in proportion to the gradient it
+//     crosses and only when it clears the noise, so the quantity scored is
+//     |shift| * |grad| / sigma. Half a pixel on a weak edge is invisible and is
+//     scored as such.
+//  5. Secondary gradient peak, as EXCESS over the reference's own profile. A
+//     broad or textured edge has a large second peak in both frames and must not
+//     be penalised for it; only structure the comparison has that the reference
+//     does not is evidence of a genuine double, which is the occlusion and
+//     two-structures-warped-together case.
+//
+// Both terms become soft weights through 1/(1+(z/z0)^2), which is the
+// inverse-MSE optimal weight's own shape, so the constants are scales rather
+// than thresholds and nothing is a hard cliff.
+//
+// Why it does not fire on ordinary strong edges: every term is driven by a
+// DIFFERENCE between the two frames. A perfectly aligned edge, however strong,
+// has shift ~ 0 and no excess peak, so C = 1 exactly. Gradient magnitude enters
+// only as a multiplier on an already-measured disagreement -- it can never
+// create one. That is the property motion_geom_reject lacks, and the reason it
+// rejects 25.6% of thin lines on correctly aligned content.
+//
+// Cost: one pass over the guide, 2*(2R+1) bilinear luma taps plus ~30 flops per
+// pixel. No new buffers beyond the returned plane, no extra passes over the raw.
+static Image edge_misalignment_confidence(const Image& ref_means,
+                                          const Image& comp_means,
+                                          const FlowField& flow, int tile_size,
+                                          const Config& cfg) {
+    const int h = ref_means.h, w = ref_means.w, nch = ref_means.c;
+    Image C(std::max(h, 0), std::max(w, 0), 1);
+    if (h <= 0 || w <= 0) return C;
+    std::fill(C.data.begin(), C.data.end(), 1.f);
+    if (!cfg.edge_misalign_enabled || tile_size <= 0 ||
+        flow.ny <= 0 || flow.nx <= 0 || comp_means.c != nch)
+        return C;
+
+    const int RAD = std::max(1, std::min(cfg.edge_misalign_radius, 4));
+    const int NTAP = 2 * RAD + 1;
+    const f32 inv_nch = 1.f / (f32)std::max(nch, 1);
+    const f32 z0 = std::max(cfg.edge_misalign_shift_z, 1e-3f);
+    const f32 zg0 = std::max(cfg.edge_misalign_ghost_z, 1e-3f);
+    const f32 snr_min = std::max(cfg.edge_misalign_edge_snr, 1e-3f);
+    const f32 cmin = clampf(cfg.edge_misalign_min_conf, 0.f, 1.f);
+
+    auto luma_at = [&](const Image& img, int y, int x) {
+        f32 s = 0.f;
+        for (int ch = 0; ch < img.c; ++ch) s += img.at(y, x, ch);
+        return s * inv_nch;
+    };
+    auto luma_bilin = [&](const Image& img, f32 yy, f32 xx) {
+        f32 s = 0.f;
+        for (int ch = 0; ch < img.c; ++ch) {
+            const f32 v = sample_bilinear_or_inf(img, yy, xx, ch);
+            if (!std::isfinite(v)) return std::numeric_limits<f32>::infinity();
+            s += v;
+        }
+        return s * inv_nch;
+    };
+
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        std::vector<f32> rp((size_t)NTAP), cp((size_t)NTAP);
+        for (int x = 0; x < w; ++x) {
+            // ---- 1. is there an edge, against the noise floor ------------
+            const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
+            const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
+            const f32 gx = 0.5f * (luma_at(ref_means, y, xr) - luma_at(ref_means, y, xl));
+            const f32 gy = 0.5f * (luma_at(ref_means, yd, x) - luma_at(ref_means, yu, x));
+            const f32 gmag = std::sqrt(gx * gx + gy * gy);
+            if (!(gmag > 0.f)) continue;
+            f32 nvar = 0.f;
+            for (int ch = 0; ch < nch; ++ch)
+                nvar += guide_noise_var(cfg, nch, ch, ref_means.at(y, x, ch));
+            // Luma averages nch independent channels, so its variance is the sum
+            // over nch^2 -- the same inv_nch the luma itself carries, squared.
+            const f32 nsig = std::sqrt(std::max(nvar, 0.f)) * inv_nch;
+            const f32 floor_g = snr_min * std::max(nsig, 1e-9f);
+            // Ramp, not a threshold: 0 at the floor, 1 at twice the floor.
+            const f32 edge_w = clampf(gmag / floor_g - 1.f, 0.f, 1.f);
+            if (edge_w <= 0.f) continue;
+
+            const f32 nrmx = gx / gmag, nrmy = gy / gmag;
+
+            // ---- 2. the flow the merge will fetch with, same convention --
+            f32 fx = 0.f, fy = 0.f;
+            {
+                auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+                int pty, ptx;
+                if (nch == 1) {
+                    pty = cl(y / tile_size, flow.ny);
+                    ptx = cl(x / tile_size, flow.nx);
+                    fx = flow.dx(pty, ptx); fy = flow.dy(pty, ptx);
+                } else {
+                    pty = cl((int)((2.f * (f32)y + 0.5f) / (f32)tile_size), flow.ny);
+                    ptx = cl((int)((2.f * (f32)x + 0.5f) / (f32)tile_size), flow.nx);
+                    fx = 0.5f * flow.dx(pty, ptx); fy = 0.5f * flow.dy(pty, ptx);
+                }
+            }
+
+            // ---- 2b. the two profiles across the normal -----------------
+            bool ok = true;
+            for (int i = 0; i < NTAP && ok; ++i) {
+                const f32 t = (f32)(i - RAD);
+                rp[(size_t)i] = luma_bilin(ref_means, (f32)y + t * nrmy, (f32)x + t * nrmx);
+                cp[(size_t)i] = luma_bilin(comp_means, (f32)y + fy + t * nrmy,
+                                                       (f32)x + fx + t * nrmx);
+                if (!std::isfinite(rp[(size_t)i]) || !std::isfinite(cp[(size_t)i]))
+                    ok = false;
+            }
+            // Off the edge of either frame. d_p already scores those as infinite
+            // difference, so leaving C at 1 adds nothing and removes nothing.
+            if (!ok) continue;
+
+            // ---- 3. sub-pixel edge position, and the profile's peaks -----
+            auto locate = [&](const std::vector<f32>& p, f32& peak, f32& second) {
+                f32 num = 0.f, den = 0.f;
+                peak = 0.f; second = 0.f;
+                for (int i = 1; i + 1 < NTAP; ++i) {
+                    const f32 d = std::fabs(0.5f * (p[(size_t)i + 1] - p[(size_t)i - 1]));
+                    const f32 t = (f32)(i - RAD);
+                    num += t * d; den += d;
+                    if (d > peak) { second = peak; peak = d; }
+                    else if (d > second) { second = d; }
+                }
+                return (den > 1e-12f) ? (num / den) : 0.f;
+            };
+            f32 rpeak = 0.f, rsec = 0.f, cpeak = 0.f, csec = 0.f;
+            const f32 t_ref = locate(rp, rpeak, rsec);
+            const f32 t_cmp = locate(cp, cpeak, csec);
+            const f32 shift = t_cmp - t_ref;          // guide px along the normal
+
+            // ---- 4. displacement, expressed as damage in noise units ----
+            const f32 z = std::fabs(shift) * gmag / std::max(nsig, 1e-9f);
+            const f32 zr = z / z0;
+            const f32 c_disp = 1.f / (1.f + zr * zr);
+
+            // ---- 5. secondary peak, as EXCESS over the reference --------
+            const f32 g_cmp = (cpeak > 1e-12f) ? (csec / cpeak) : 0.f;
+            const f32 g_ref = (rpeak > 1e-12f) ? (rsec / rpeak) : 0.f;
+            const f32 excess = std::max(g_cmp - g_ref, 0.f);
+            const f32 zg = excess * cpeak / std::max(nsig, 1e-9f);
+            const f32 zgr = zg / zg0;
+            const f32 c_ghost = 1.f / (1.f + zgr * zgr);
+
+            // ---- 6. combine, ramped in by edge confidence ---------------
+            const f32 c = c_disp * c_ghost;
+            C.at(y, x) = clampf(1.f - edge_w * (1.f - c), cmin, 1.f);
+        }
+    });
+    return C;
+}
+
 static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_stats,
                                      const FlowField& flow, int tile_size,
                                      const Config& cfg, Image* s_select_out,
@@ -1870,6 +2051,11 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     Image comp_means, comp_vars;
     local_stats_3x3(guide, comp_means, comp_vars);
 
+    // One pass over the guide, before the mask loop, so the per-pixel cost stays
+    // a single lookup below.
+    const Image c_edge = edge_misalignment_confidence(ref_stats.means, comp_means,
+                                                      flow, tile_size, cfg);
+
     const int h = comp_means.h, w = comp_means.w;
     Image d_p(h, w, ref_stats.means.c);
     for (int y = 0; y < h; ++y) {
@@ -1987,6 +2173,16 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            // R_final = R_analytic * C_edge, and the learned refinement
+            // multiplies its own factor on afterwards. Applied HERE, before the
+            // local_min_5x5 that closes this function, so a reduction is spread
+            // over the same 5x5 neighbourhood Eq. 9 spreads everything else
+            // over: an isolated deep attenuation reads as speckle, while a
+            // dilated one reads as a clean hole, which is most of why the
+            // analytic geometry test looks better than the network at equal
+            // mean weight.
+            if (cfg.edge_misalign_enabled && c_edge.h == h && c_edge.w == w)
+                r_val *= clampf(c_edge.at(y, x), 0.f, 1.f);
             R.at(y, x) = r_val;
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
@@ -2343,6 +2539,7 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
     const f32 kappa = clampf(cfg.robustness_refine_max_reduction, 0.f, 1.f);
     const f32 dead = clampf(cfg.robustness_refine_deadzone, 0.f, 1.f);
     const f32 gate = std::max(0.f, cfg.robustness_refine_gate_px);
+    const f32 sharpen = cfg.robustness_refine_sharpen_gamma;
     const f32 reg_gate = std::max(0.f, cfg.robustness_refine_regional_gate_px);
 
     // Regional misalignment, one value per tile, from the same rr_fit_affine the
@@ -2414,7 +2611,11 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
                 // mask wearing the old one as a hat.
                 const f32 drop = 1.f - clampf(qp[x], 0.f, 1.f);
                 if (drop <= dead) { op[x] = rp[x]; continue; }
-                op[x] = rp[x] * (1.f - kappa * drop);
+                // Twin of rr_apply; see it for why the curve exists.
+                f32 d = (drop - dead) / std::max(1.f - dead, 1e-6f);
+                d = clampf(d, 0.f, 1.f);
+                if (sharpen > 0.f && sharpen != 1.f) d = std::pow(d, sharpen);
+                op[x] = rp[x] * (1.f - kappa * d);
                 if (rp[x] > 0.f && op[x] != rp[x]) ++changed;
             }
         }
