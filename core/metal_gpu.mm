@@ -1011,6 +1011,11 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     // not ready. A slice sized for one and filled with the other would fail the
     // merge outright, so that path keeps the pre-residency behaviour -- slower,
     // but it is not the shipped configuration (it requires the Decimate grey).
+    //
+    // robustness_fft_guide_active() ALSO produces a raw-resolution mask, and is
+    // the shipped configuration, but it is not declined here: its resolution is
+    // fixed rather than decided at run time, so the slice below is simply sized
+    // for it.
     if (cfg.robustness_raw_resolution_active()) return false;
 
     auto& c = ctx();
@@ -1020,22 +1025,30 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.tile_size = tile_size;
     g_bf.cov_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
-    // Deliberately the DECIMATED lattice even when robustness_fft_guide_active()
-    // makes the mask raw resolution. This store holds one mask per frame,
-    // simultaneously, because the band-pipelined merge walks every frame inside
-    // each band -- so raw-resolution slices would be 48 MB x 8 = 390 MB instead
-    // of 97 MB, which is not available next to the resident raws.
+    // This slice MUST be sized for the lattice the mask will actually land on.
+    // metal_frame_merge_ready gates the fused merge on have_rob, and
+    // compute_robustness_metal only sets that flag when the mask's dimensions
+    // match this slice -- so getting it wrong does not degrade quietly, it
+    // refuses the merge outright and kills the capture:
+    //     "fused merge refused - comp slot 1 not ready (... rob 0 ...)"
     //
-    // Nothing needs to change for that to be CORRECT: the dimensions then do not
-    // match gh/gw in compute_robustness_metal, so rob_resident goes false, the
-    // mask comes back to the host, and merge_comp_band_metal takes rob_h/rob_w
-    // and raw_res_robustness from the Image it is handed. The cost is one
-    // full-frame readback and upload per comparison frame, which is the price of
-    // the FFT guide on this path until masks are stored at raw resolution or in
-    // half precision. Sizing these to gh/gw without solving that is how you get
-    // a residency refusal for the raws as well.
-    g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
-    g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
+    // robustness_fft_guide_active() puts the mask at RAW resolution, four times
+    // this slice: 48 MB per frame instead of 12 MB at 12 MP, so 390 MB instead of
+    // 97 MB for eight frames. That is asked for rather than declined, because
+    // unlike the Dodgson route refused above this resolution is known HERE and
+    // not decided at run time -- which was the whole reason that route could not
+    // be sized. If it does not fit, the allocation below refuses, sets
+    // g_bf_alloc_refused, and the caller falls back to the banded merge exactly
+    // as it does for any other refusal.
+    //
+    // These three lines must agree with rob_run_guide_stats' guide_h/guide_w/nch
+    // for every Config, and both now read the same predicate so they cannot
+    // disagree on the FFT guide. Anything added to either has to be added to the
+    // other; there is no runtime check, because the failure surfaces as the
+    // fused-merge refusal above rather than as a mismatch anyone can see here.
+    const bool rob_raw_res = cfg.robustness_fft_guide_active();
+    g_bf.rob_h = (cfg.bayer_mode && !rob_raw_res) ? raw_h / 2 : raw_h;
+    g_bf.rob_w = (cfg.bayer_mode && !rob_raw_res) ? raw_w / 2 : raw_w;
     g_bf.flow_ny = raw_h / tile_size;
     g_bf.flow_nx = raw_w / tile_size;
     g_bf.cov_stride = 3u;
