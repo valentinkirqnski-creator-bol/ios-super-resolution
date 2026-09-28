@@ -1173,6 +1173,14 @@ bool metal_frame_has_raw(int slot) {
     return g_bf.valid_slot(slot) && g_bf.have_raw[(size_t)slot] != 0u;
 }
 
+const float* metal_frame_rob_plane(int slot, int* h, int* w) {
+    if (!g_bf.valid_slot(slot) || !g_bf.robs) return nullptr;
+    if (g_bf.have_rob[(size_t)slot] == 0u) return nullptr;
+    if (h) *h = g_bf.rob_h;
+    if (w) *w = g_bf.rob_w;
+    return (const float*)[g_bf.robs contents] + bf_rob_off(slot);
+}
+
 bool metal_frame_merge_ready(int slot) {
     if (!g_bf.valid_slot(slot)) return false;
     return g_bf.have_raw[(size_t)slot] && g_bf.have_cov[(size_t)slot] &&
@@ -3003,10 +3011,14 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     if (rob_resident) g_bf.have_rob[(size_t)bf_slot] = 1u;
 
     // The mask only comes back to the host when something on the CPU reads it:
-    // the save-mask PGM export, the debug dumps, or the s1/s2 split. The merge
-    // reads the slice.
-    const bool want_host = !rob_resident || want_s_select ||
-                           cfg.robustness_save_mask || debug_dumps_enabled();
+    // the debug dumps or the s1/s2 split. The merge reads the slice.
+    //
+    // robustness_save_mask is deliberately NOT in this list. The slices are
+    // Shared-storage, so the PGM export can read them in place at the tail of
+    // the shot (metal_frame_rob_plane) instead of paying a full-resolution
+    // memcpy here on every comparison frame and keeping an accumulator alive
+    // across the burst. Saving the mask is now free of both.
+    const bool want_host = !rob_resident || want_s_select || debug_dumps_enabled();
     if (!want_host) {
         Image dims;
         dims.h = gh;

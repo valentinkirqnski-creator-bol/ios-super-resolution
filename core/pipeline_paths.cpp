@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <future>
 #include <mutex>
@@ -667,6 +668,11 @@ static void append_merge_summary(std::ostringstream& ss, const MergeDebugStats& 
 }
 
 static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) {
+    // A dimensions-only mask means the GPU kept it in the frame slice and never
+    // copied it back. Those frames are summed straight from the slices at the
+    // tail (rob_resident_slots), so there is nothing to absorb here -- and the
+    // assignment below would otherwise leave acc_rob sized but empty.
+    if (rob.data.empty()) return;
     if (!have) {
         acc_rob = Image(rob.h, rob.w, 1);
         acc_rob.data = rob.data;
@@ -1128,11 +1134,21 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // than every mask being held until after the loop.
     Image acc_rob;
     bool have_acc_rob = false;
+    // Comparison frames whose mask stayed on the GPU. Their slices are read in
+    // place when the PGM is written, so saving the mask costs no readback, no
+    // accumulator and no per-frame pass. The two sets partition the burst: a
+    // frame is here exactly when its mask came back dimensions-only, and in
+    // acc_rob otherwise (imports, or any frame refused residency).
+    std::vector<int> rob_resident_slots;
     // The only consumers of the accumulated mask are the save-mask PGM export
-    // and the debug summary, both off by default. Summing it regardless read and
-    // rewrote a 3MP plane for every comparison frame to produce a value nothing
-    // looked at -- and it is the one stage that still needs the mask on the
-    // host, so gating it is what lets the mask stay GPU-resident.
+    // and the debug summary. Summing it regardless read and rewrote a 3MP plane
+    // for every comparison frame to produce a value nothing looked at.
+    //
+    // On the resident path this now absorbs nothing at all: the masks come back
+    // dimensions-only and are summed once, from their slices, when the PGM is
+    // written. What is left here is the host fallback -- frames the GPU never
+    // held, and the debug dump, which wants the plane itself and forces the
+    // readback anyway.
     const bool want_acc_rob = cfg.robustness_save_mask || debug_dumps_enabled();
     // Same sum, partitioned by which motion prior scored each pixel. Debug only,
     // and only meaningful alongside the combined mask, so it follows the same
@@ -1695,6 +1711,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // rob*sel + rob*(1-sel) == rob exactly for sel in {0,1}, so the two
         // accumulators still partition acc_rob.
         ++comp_seen;
+        // Before any of the stash branches, which differ in when (and whether)
+        // they absorb the mask. Recorded here so all three agree, and so the
+        // frame order matches the host sum's.
+        if (work.robustness_save_mask && rob.data.empty() && rob.h > 0 &&
+            rob.w > 0)
+            rob_resident_slots.push_back(k);
         if (!rob_has_nonzero) {
             if (rob.h <= 0 || rob.w <= 0) ++skip_rob_empty;
             else                          ++skip_rob_zero;
@@ -2380,11 +2402,52 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     writer.close();
     prof_add_cpu("out:dng-close(flush)", prof_now_ms() - t_close);
     const double t_tail = prof_now_ms();
-    if (work.robustness_save_mask && have_acc_rob) {
+    if (work.robustness_save_mask && (have_acc_rob || !rob_resident_slots.empty())) {
         // Save at raw resolution (nearest-upsampled from the guide grid),
         // matching 1.4's full-res mask export. No-op if already raw-res.
-        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", ref.h, ref.w))
-            report("Wrote robustness mask", 0.985f);
+        //
+        // Summed a row at a time rather than plane by plane. On the resident
+        // path the per-frame masks are still in their GPU slices -- Shared
+        // storage, so reading them is a pointer dereference, not a transfer --
+        // and this is the only place the burst's sum is ever formed. That is
+        // what makes saving the mask free: no per-frame copy back to the host,
+        // and the largest buffer this holds is one row of the guide.
+        //
+        // acc_rob covers whatever did come back on the host, so a burst that
+        // mixes the two (an import alongside captured frames, or a frame the
+        // GPU refused) still sums every frame exactly once.
+        bool wrote = false;
+#if defined(__APPLE__)
+        if (!rob_resident_slots.empty()) {
+            int mh = 0, mw = 0;
+            if (const float* probe =
+                    metal_frame_rob_plane(rob_resident_slots.front(), &mh, &mw)) {
+                (void)probe;
+                std::vector<f32> row((size_t)mw);
+                wrote = write_robustness_mask_pgm_rows(
+                    mh, mw, n - 1, dng_path, "", ref.h, ref.w,
+                    [&](int sy) -> const f32* {
+                        const size_t off = (size_t)sy * (size_t)mw;
+                        if (have_acc_rob && acc_rob.h == mh && acc_rob.w == mw)
+                            std::memcpy(row.data(), &acc_rob.at(sy, 0),
+                                        (size_t)mw * sizeof(f32));
+                        else
+                            std::fill(row.begin(), row.end(), 0.f);
+                        for (int s : rob_resident_slots) {
+                            int sh = 0, sw = 0;
+                            const float* p = metal_frame_rob_plane(s, &sh, &sw);
+                            if (!p || sh != mh || sw != mw) continue;
+                            for (int x = 0; x < mw; ++x) row[(size_t)x] += p[off + x];
+                        }
+                        return row.data();
+                    });
+            }
+        }
+#endif
+        if (!wrote && have_acc_rob)
+            wrote = write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "",
+                                              ref.h, ref.w);
+        if (wrote) report("Wrote robustness mask", 0.985f);
         // Same normalisation as the combined mask, so the three are directly
         // comparable: a pixel is bright in exactly one of _s1 and _s2, at the
         // value it contributed to the combined one.

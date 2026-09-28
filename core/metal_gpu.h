@@ -84,6 +84,19 @@ bool metal_frame_merge_ready(int slot);
 // plane. Lets that seeding skip a 48.8MB memcpy it does not need.
 bool metal_frame_has_raw(int slot);
 
+// Read-only view of this slot's robustness mask, where the kernel left it.
+//
+// The frame slices are MTLResourceStorageModeShared, so this is a plain CPU
+// pointer into the pages the GPU wrote -- no copy, no transfer, nothing
+// allocated. Returns nullptr unless the slot holds a finished mask; *h and *w
+// (optional) give the guide lattice it lives on, which is half the raw size
+// unless robustness runs at raw resolution.
+//
+// Valid only until metal_frames_end(), and only for reading: the fused merge is
+// still sourcing the same bytes. Exists so the save-mask PGM export can sum the
+// burst once at the tail instead of forcing every mask back to the host.
+const float* metal_frame_rob_plane(int slot, int* h, int* w);
+
 // Direct RAW app path: uint16 Bayer -> normalized float Bayer with the same
 // black/WB/clamp math as DecodeRawFrameDictionary's CPU fallback.
 // src_y0/src_x0/out_h/out_w crop inside the source plane (origins must be even,

@@ -61,4 +61,20 @@ bool write_robustness_mask_pgm(const Image& acc_rob, int n_comp_frames,
                                const char* name_suffix = "",
                                int target_h = 0, int target_w = 0);
 
+// Same file, from a source that produces one row of the summed mask at a time
+// instead of holding the whole plane. Returning nullptr aborts the write.
+//
+// This exists so the save-mask export can read the per-frame masks where they
+// already are -- in the GPU-resident frame slices, which are Shared-storage and
+// therefore ordinary CPU-addressable memory -- rather than forcing every mask
+// back to the host and keeping a full-resolution accumulator alive across the
+// burst. write_robustness_mask_pgm is a thin wrapper over this, so both routes
+// emit a byte-identical file.
+using RobMaskRowFn = std::function<const f32*(int src_y)>;
+bool write_robustness_mask_pgm_rows(int src_h, int src_w, int n_comp_frames,
+                                    const std::string& dng_path,
+                                    const char* name_suffix,
+                                    int target_h, int target_w,
+                                    const RobMaskRowFn& src_row);
+
 } // namespace hhsr
