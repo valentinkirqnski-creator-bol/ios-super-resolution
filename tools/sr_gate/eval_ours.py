@@ -40,10 +40,7 @@ def psnr(a, b):
 
 def load(ckpt, here):
     ck = torch.load(os.path.join(here, ckpt), map_location='cpu', weights_only=True)
-    net = gate.SRGate(in_ch=ck['in_ch'], width=ck['width'],
-                      dilations=ck['dilations'])
-    net.load_state_dict(ck['state_dict'])
-    net.eval()
+    net = gate.from_checkpoint(ck)
     return net, ck['in_ch']
 
 

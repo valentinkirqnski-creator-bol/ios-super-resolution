@@ -2827,7 +2827,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // in. Encoded into b_out directly -- where the merge reads the mask from --
     // so nothing below runs when it succeeds.
     bool sr_gate_done = false;
-    if (cfg.sr_gate_enabled && nch == 1 && sr_gate_available()) {
+    // nch == 3: the weights are fitted on the three-channel half-resolution
+    // guide. sr_gate_mask in core/sr_gate.cpp says why that is the shipped one.
+    if (cfg.sr_gate_enabled && nch == 3 && sr_gate_available()) {
         sr_gate_done = rob_run_sr_gate(b_out, out_off_bytes, b_gmeans, b_ref_m,
                                        b_ref_v, b_std, b_diff, b_flow, gh, gw,
                                        nch, tile_size, g_rob_curve_n, flow, cfg,

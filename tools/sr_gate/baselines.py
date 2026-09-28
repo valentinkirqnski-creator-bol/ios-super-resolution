@@ -62,10 +62,7 @@ def main():
     sp = T.Split(root, a.split)
     ck = torch.load(os.path.join(here, a.ckpt), map_location='cpu',
                     weights_only=True)
-    net = gate.SRGate(in_ch=ck['in_ch'], width=ck['width'],
-                      dilations=ck['dilations'])
-    net.load_state_dict(ck['state_dict'])
-    net.eval()
+    net = gate.from_checkpoint(ck)
 
     rows = {}
     with torch.no_grad():

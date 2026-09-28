@@ -65,9 +65,10 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ckpt_path = a.ckpt if os.path.isabs(a.ckpt) else os.path.join(here, a.ckpt)
     ck = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-    net = gate.SRGate(in_ch=ck['in_ch'], width=ck['width'],
-                      dilations=ck['dilations'])
-    net.load_state_dict(ck['state_dict'])
+    net = gate.from_checkpoint(ck)
+    assert not net.coarse, (
+        'this exporter writes the fine-branch layout that core/sr_gate_shared.h '
+        'describes; a coarse-branch checkpoint needs the header extended first')
 
     flat = []
     for conv in net.convs:

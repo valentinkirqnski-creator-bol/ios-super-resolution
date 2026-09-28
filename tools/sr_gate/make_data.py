@@ -21,7 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build
 import srburst
 
-HR = 320            # HR crop -> 160 raw -> 320 output, 10x10 tiles at ts=16
+# HR crop -> 384 raw -> 192 guide px -> 384x384 loss grid (output stride 2),
+# 24x24 tiles at ts=16. Bigger than before because the coarse branch has a ~250
+# guide-pixel receptive field and would otherwise see mostly replicate padding.
+HR = 768
 VAL_SIGMAS = (0.12, 0.35, 0.9, 2.2, 5.0)
 
 

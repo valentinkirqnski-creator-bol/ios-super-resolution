@@ -73,12 +73,41 @@ class Cfg:
         self.alpha_rob = self.alpha * FFT_GUIDE_NOISE_ENERGY
         self.beta_rob = self.beta * FFT_GUIDE_NOISE_ENERGY
         self.tile_size = tile_size
+        # Which guide. nch == 1 is the full-resolution FFT guide (linear);
+        # nch == 3 is the half-resolution decimated Bayer guide with the 1.4
+        # sqrt transfer, which is what Metal builds and what the shipping config
+        # selects with robustness_raw_resolution OFF.
+        self.nch = 1
+        self.guide_sqrt = False
+        # Per-channel alpha/beta for the 3-channel guide: alpha_dng[c] *
+        # wb_gain(c) * guide_weight(c), NOT divided by 3 and NOT scaled by the
+        # FFT guide's 0.25. wb_gain is 1 here because the synthesiser works in a
+        # neutral-gain domain; guide_weight is 1/count(c), so green gets 1/2.
+        self.alpha_ch = [ALPHA_DNG * noise_gain * w
+                         for w in (1.0, 0.5, 1.0)]
+        self.beta_ch = [BETA_DNG * noise_gain * noise_gain * w
+                        for w in (1.0, 0.5, 1.0)]
         # snr_auto_tune (core/snr_tuning.cpp tune_config_snr); filled by
         # tune_snr() once the reference frame exists.
         self.k_detail = 0.17
         self.k_denoise = 0.0
         self.D_th = 0.76
         self.D_tr = 1.12
+
+    def use_decimated_guide(self):
+        """The 3-channel half-resolution Bayer guide with the 1.4 sqrt transfer.
+
+        Everything that depends on which guide is in use is set HERE, together,
+        because getting one of them wrong is silent: the FFT guide's 0.25
+        filtered-noise factor does not apply to this one, and the curves move to
+        the sqrt domain and become per channel.
+        """
+        self.nch = 3
+        self.guide_sqrt = True
+        # noise_alpha_robustness() == noise_alpha() when the FFT guide is off.
+        self.alpha_rob = self.alpha
+        self.beta_rob = self.beta
+        return self
 
     def tune_snr(self, ref_raw, std_curve):
         brightness = float(ref_raw.mean())
@@ -105,6 +134,52 @@ class Cfg:
 # noise curves -- fast_monte_carlo.unitary_MC, linear (non-sqrt) domain
 # --------------------------------------------------------------------------
 
+def get_non_linearity_bound(alpha, beta, tol=3.0):
+    """robustness.cpp get_non_linearity_bound: the brightness range over which
+    clipping at 0 and at 1 is more than `tol` sigma away, so the statistic is
+    linear in sigma and does not need the Monte Carlo."""
+    a, b, t = float(alpha), float(beta), float(tol)
+    tol_sq = t * t
+    xmin = tol_sq / 2.0 * (a + math.sqrt(tol_sq * a * a + 4.0 * b))
+    inner = (2.0 + tol_sq * a) ** 2 - 4.0 * (1.0 + tol_sq * b)
+    xmax = (2.0 + tol_sq * a - math.sqrt(max(0.0, inner))) / 2.0
+    return xmin, xmax
+
+
+def interp_mc_range(std_curve, diff_curve, alpha, beta, tol=3.0):
+    """robustness.cpp interp_MC_range + prepare_noise_curve_spec.
+
+    The pipeline runs the Monte Carlo ONLY at the two non-linear ends and fills
+    everything between by interpolating the SQUARES of the endpoint values, then
+    taking the root. Leaving this out was a real difference, not a rounding one:
+    with raw MC on every bin the end-to-end mask differed from the pipeline's by
+    1.9e-2 mean, and raising the patch count 10x did not move it at all, which is
+    what showed the gap was systematic.
+    """
+    n = N_BRIGHTNESS
+    xmin, xmax = get_non_linearity_bound(alpha, beta, tol)
+    imin = int(math.ceil(xmin * n)) + 1
+    imax = int(math.floor(xmax * n)) - 1
+    if imin > n or imax <= imin:          # full MC, nothing to interpolate
+        return std_curve, diff_curve
+    imin = max(imin, 0)
+    imax = min(imax, n)
+    b0 = (imin - 1) / float(n)
+    b1 = (imax + 1) / float(n)
+    denom = b1 - b0
+    if denom <= 0:
+        return std_curve, diff_curve
+    s2min, s2max = float(std_curve[imin]) ** 2, float(std_curve[imax]) ** 2
+    d2min, d2max = float(diff_curve[imin]) ** 2, float(diff_curve[imax]) ** 2
+    i = np.arange(imin, imax + 1)
+    nb = (i / float(n) - b0) / denom
+    std_curve[imin:imax + 1] = np.sqrt(np.maximum(
+        nb * (s2max - s2min) + s2min, 0.0)).astype(np.float32)
+    diff_curve[imin:imax + 1] = np.sqrt(np.maximum(
+        nb * (d2max - d2min) + d2min, 0.0)).astype(np.float32)
+    return std_curve, diff_curve
+
+
 def build_noise_curves(alpha, beta, n_patches=20000, seed=1337):
     """std_curve / diff_curve over N_BRIGHTNESS+1 bins.
 
@@ -130,7 +205,33 @@ def build_noise_curves(alpha, beta, n_patches=20000, seed=1337):
         sd = np.sqrt(((p - m[:, :, None]) ** 2).mean(axis=2))
         std_curve[i] = 0.5 * (sd[0] + sd[1]).mean()
         diff_curve[i] = np.abs(m[0] - m[1]).mean()
-    return std_curve.astype(np.float32), diff_curve.astype(np.float32)
+    return interp_mc_range(std_curve.astype(np.float32),
+                           diff_curve.astype(np.float32), alpha, beta)
+
+
+def build_noise_curves_sqrt(alpha, beta, n_patches=20000, seed=1337):
+    """unitary_MC with sqrt_domain=True: 1.4's guide applies sqrt to the CLIPPED
+    raw before the 3x3 patch statistics, so the curve has to as well. Stored at
+    the LATENT brightness bin, which is why the mask indexes it by mean^2.
+
+    No closed form for this one -- the sqrt is applied per sample, before the
+    patch mean, so the statistic is not a scaling of the linear case.
+    """
+    rng = np.random.default_rng(seed)
+    b = np.arange(N_BRIGHTNESS + 1, dtype=np.float64) / N_BRIGHTNESS
+    sd = np.sqrt(np.maximum(0.0, alpha * b + beta))
+    std_curve = np.empty_like(b)
+    diff_curve = np.empty_like(b)
+    for i in range(b.size):
+        g = rng.standard_normal((2, n_patches, 9))
+        pv = np.clip(b[i] + sd[i] * g, 0.0, 1.0)
+        pv = np.sqrt(pv)
+        m = pv.mean(axis=2)
+        st = np.sqrt(((pv - m[:, :, None]) ** 2).mean(axis=2))
+        std_curve[i] = 0.5 * (st[0] + st[1]).mean()
+        diff_curve[i] = np.abs(m[0] - m[1]).mean()
+    return interp_mc_range(std_curve.astype(np.float32),
+                           diff_curve.astype(np.float32), alpha, beta)
 
 
 def noise_curves_closed_form(alpha, beta):
@@ -181,13 +282,53 @@ def compute_grey_fft(raw):
     return np.real(np.fft.ifft2(np.fft.ifftshift(f))).astype(np.float32)
 
 
+def compute_guide_decimate3(raw, wb_undo=(1.0, 1.0, 1.0), curve=1):
+    """core/robustness.cpp compute_guide, Bayer branch.
+
+    One output pixel per 2x2 quad, per colour, divided by how many sites that
+    colour has (green has two). wb_undo is wb[1]/wb[c], which takes the loader's
+    prewhitening back out so the guide is 1.4's camera-native sqrt(raw); the
+    synthesiser works in a neutral domain so it is (1,1,1) there. curve 1 is
+    sqrt, which is what guide_curve defaults to in the app.
+    """
+    h, w = raw.shape
+    g = np.zeros((h // 2, w // 2, 3), np.float32)
+    # RGGB: (0,0)=R, (0,1)=G, (1,0)=G, (1,1)=B -- taken from CFA rather than
+    # assumed, same as the C++ reads cfg.cfa.
+    sums = np.zeros((h // 2, w // 2, 3), np.float64)
+    cnt = np.zeros(3, np.float64)
+    for i in range(2):
+        for j in range(2):
+            c = int(CFA[i, j])
+            sums[..., c] += raw[i::2, j::2]
+            cnt[c] += 1
+    for c in range(3):
+        v = sums[..., c] / max(cnt[c], 1.0) * wb_undo[c]
+        g[..., c] = apply_guide_curve(v, curve)
+    return g
+
+
+def apply_guide_curve(v, curve):
+    """Twin of apply_guide_curve in robustness.cpp. 1 = sqrt, 0 = linear."""
+    if curve == 1:
+        return np.sqrt(np.maximum(v, 0.0))
+    if curve == 2:
+        return np.clip(v, 0.0, 1.0) ** (1.0 / 2.2)
+    if curve == 3:
+        vc = np.clip(v, 0.0, 1.0)
+        return np.where(vc <= 0.0031308, 12.92 * vc,
+                        1.055 * vc ** (1.0 / 2.4) - 0.055)
+    return v
+
+
 def local_stats_3x3(g):
     """core/robustness.cpp local_stats_3x3: 3x3 box mean and population
     variance, edge-clamped."""
-    h, w = g.shape
-    p = np.pad(g.astype(np.float64), 1, mode='edge')
-    s = np.zeros((h, w), dtype=np.float64)
-    s2 = np.zeros((h, w), dtype=np.float64)
+    h, w = g.shape[:2]
+    pad = ((1, 1), (1, 1)) + ((0, 0),) * (g.ndim - 2)
+    p = np.pad(g.astype(np.float64), pad, mode='edge')
+    s = np.zeros(g.shape, dtype=np.float64)
+    s2 = np.zeros(g.shape, dtype=np.float64)
     for i in range(3):
         for j in range(3):
             v = p[i:i + h, j:j + w]
@@ -198,10 +339,16 @@ def local_stats_3x3(g):
     return m.astype(np.float32), var.astype(np.float32)
 
 
-def guide_noise_var(cfg, brightness):
-    """guide_noise_var for nch == 1: alpha_rob * b + beta_rob, b clamped."""
+def guide_noise_var(cfg, brightness, ch=0, nch=1):
+    """robustness.cpp guide_noise_var. Note it uses the AVERAGED
+    noise_alpha_robustness(), not the per-channel pair -- the per-channel values
+    are only for the Monte-Carlo curves -- and halves the green channel because
+    the guide averaged two Bayer greens into it."""
     b = np.clip(np.nan_to_num(brightness, nan=0.0), 0.0, 1.0)
-    return np.maximum(cfg.alpha_rob * b + cfg.beta_rob, 0.0)
+    v = np.maximum(cfg.alpha_rob * b + cfg.beta_rob, 0.0)
+    if nch == 3 and ch == 1:
+        v = v * 0.5
+    return v
 
 
 # --------------------------------------------------------------------------
@@ -238,31 +385,60 @@ def warp_sample_comp(plane, flow, cfg):
     return sample_bilinear_or_inf(plane, yy + fy, xx + fx)
 
 
-def tile_index_grids(h, w, ts):
-    """patch_idy/patch_idx for a 1-channel (raw-resolution) guide: y // ts."""
+def tile_index_grids(h, w, ts, nch=1):
+    """patch_idy/patch_idx, exactly as compute_robustness_core indexes them.
+
+    One channel means the guide is at RAW resolution, so the tile is y // ts.
+    Three channels means it is half resolution, so the raw coordinate is
+    2y + 0.5 and the tile is int((2y + 0.5) / ts) -- the extra half pixel is the
+    quad centre, and dropping it shifts the whole tile grid by half a tile at the
+    bottom of each tile.
+    """
     yy, xx = np.mgrid[0:h, 0:w]
+    if nch == 3:
+        return (((2.0 * yy + 0.5) / ts).astype(np.int64),
+                ((2.0 * xx + 0.5) / ts).astype(np.int64))
     return yy // ts, xx // ts
 
 
 def compute_d_sigma(ref_means, ref_vars, comp_means, flow, cfg, std_curve, diff_curve):
     """Eq. 6 for the one-channel guide: d_p is the warped difference of local
     means, then apply_noise_model's shrinkage / noise floor."""
-    h, w = ref_means.shape
+    h, w = ref_means.shape[:2]
+    nch = 1 if ref_means.ndim == 2 else ref_means.shape[2]
     ts = cfg.tile_size
-    ty, tx = tile_index_grids(h, w, ts)
-    fx = flow[..., 0][ty, tx]
-    fy = flow[..., 1][ty, tx]
+    ty, tx = tile_index_grids(h, w, ts, nch)
+    ty = np.clip(ty, 0, flow.shape[0] - 1)
+    tx = np.clip(tx, 0, flow.shape[1] - 1)
+    # The three-channel guide is half resolution, so the merge fetches at half
+    # the raw displacement.
+    fsc = 0.5 if nch == 3 else 1.0
+    fx = flow[..., 0][ty, tx] * fsc
+    fy = flow[..., 1][ty, tx] * fsc
     yy, xx = np.mgrid[0:h, 0:w]
-    comp = sample_bilinear_or_inf(comp_means, yy + fy, xx + fx)
-    d_p = np.abs(ref_means - comp)
 
-    b = ref_means
-    sigma_t = curve_lookup(std_curve, b)
-    d_t = curve_lookup(diff_curve, b)
-    sigma_ms_sq = ref_vars.astype(np.float64)
-    sigma_md_sq = sigma_t.astype(np.float64) ** 2
-    d_ms_sq = d_p.astype(np.float64) ** 2
-    d_md_sq = d_t.astype(np.float64) ** 2
+    # Eq. 6 aggregates across channels FIRST and applies max()/shrinkage once,
+    # which is not the same as summing per-channel max() -- see the comment in
+    # apply_noise_model.
+    sigma_ms_sq = np.zeros((h, w), np.float64)
+    sigma_md_sq = np.zeros((h, w), np.float64)
+    d_ms_sq = np.zeros((h, w), np.float64)
+    d_md_sq = np.zeros((h, w), np.float64)
+    for ch in range(nch):
+        rm = ref_means if nch == 1 else ref_means[..., ch]
+        rv = ref_vars if nch == 1 else ref_vars[..., ch]
+        cm = comp_means if nch == 1 else comp_means[..., ch]
+        sc_ = std_curve if nch == 1 else std_curve[ch]
+        dc_ = diff_curve if nch == 1 else diff_curve[ch]
+        comp = sample_bilinear_or_inf(cm, yy + fy, xx + fx)
+        d_p = np.abs(rm - comp)
+        # sqrt guide: the curve is keyed by LATENT brightness and the guide mean
+        # is sqrt(latent), so it is indexed by mean SQUARED.
+        bidx = rm.astype(np.float64) ** 2 if cfg.guide_sqrt else rm
+        sigma_ms_sq += rv.astype(np.float64)
+        sigma_md_sq += curve_lookup(sc_, bidx).astype(np.float64) ** 2
+        d_ms_sq += d_p.astype(np.float64) ** 2
+        d_md_sq += curve_lookup(dc_, bidx).astype(np.float64) ** 2
 
     sigma_sq = np.maximum(sigma_ms_sq, sigma_md_sq)
     with np.errstate(invalid='ignore', divide='ignore'):
@@ -307,14 +483,16 @@ def flow_span(flow):
     return np.sqrt(d[..., 0] ** 2 + d[..., 1] ** 2).astype(np.float32)
 
 
-def geom_residual(flow, ts, h, w):
+def geom_residual(flow, ts, h, w, nch=1):
     """E = (grad flow) . (offset from tile centre): the within-tile part of the
     motion a per-tile translation cannot represent (motion_geom_reject).
     Returns ex, ey at raw resolution."""
     ny, nx = flow.shape[:2]
     if ny < 3 or nx < 3:
         return np.zeros((h, w), np.float32), np.zeros((h, w), np.float32)
-    ty, tx = tile_index_grids(h, w, ts)
+    ty, tx = tile_index_grids(h, w, ts, nch)
+    ty = np.clip(ty, 0, ny - 1)
+    tx = np.clip(tx, 0, nx - 1)
 
     def cl(a, hi):
         return np.clip(a, 0, hi - 1)
@@ -328,18 +506,23 @@ def geom_residual(flow, ts, h, w):
     gdxdy = (dxf[dn, tx] - dxf[up, tx]) * inv2ts
     gdydy = (dyf[dn, tx] - dyf[up, tx]) * inv2ts
     yy, xx = np.mgrid[0:h, 0:w]
-    # sc == 1 for the one-channel raw-resolution guide.
-    u = xx - (tx + 0.5) * ts
-    v = yy - (ty + 0.5) * ts
+    # The offset from the tile centre is in RAW pixels, so a half-resolution
+    # guide pixel has to be converted: rawx = 2x + 0.5.
+    sc = 2.0 if nch == 3 else 1.0
+    rawx = sc * xx + 0.5 * (sc - 1.0)
+    rawy = sc * yy + 0.5 * (sc - 1.0)
+    u = rawx - (tx + 0.5) * ts
+    v = rawy - (ty + 0.5) * ts
     ex = gdxdx * u + gdxdy * v
     ey = gdydx * u + gdydy * v
     return ex.astype(np.float32), ey.astype(np.float32)
 
 
-def guide_gradient(ref_means):
-    """The central difference compute_robustness_core takes on ref_means
-    (sc == 1, so no /sc), with the C++ edge-index clamping."""
-    g = ref_means.astype(np.float32)
+def guide_gradient(ref_means, nch=1):
+    """The central difference compute_robustness_core takes on ref_means:
+    CHANNEL 0 only, divided by the guide-to-raw scale so it is per raw pixel."""
+    g = (ref_means if ref_means.ndim == 2 else ref_means[..., 0]).astype(np.float32)
+    sc = 2.0 if nch == 3 else 1.0
     gx = np.empty_like(g)
     gy = np.empty_like(g)
     gx[:, 1:-1] = 0.5 * (g[:, 2:] - g[:, :-2])
@@ -348,7 +531,7 @@ def guide_gradient(ref_means):
     gy[1:-1, :] = 0.5 * (g[2:, :] - g[:-2, :])
     gy[0, :] = 0.5 * (g[1, :] - g[0, :])
     gy[-1, :] = 0.5 * (g[-1, :] - g[-2, :])
-    return gx, gy
+    return gx / sc, gy / sc
 
 
 def local_min_5x5(r):
@@ -366,8 +549,11 @@ def wronski_robustness(d_sq, sigma_sq, flow, ref_means, cfg, geom_reject=True):
     """compute_robustness_core for the shipping configuration: Eq. 6-9 with
     motion_geom_reject on (both the absolute and the relative criterion)."""
     h, w = d_sq.shape
+    nch = 1 if ref_means.ndim == 2 else ref_means.shape[2]
     ts = cfg.tile_size
-    ty, tx = tile_index_grids(h, w, ts)
+    ty, tx = tile_index_grids(h, w, ts, nch)
+    ty = np.clip(ty, 0, flow.shape[0] - 1)
+    tx = np.clip(tx, 0, flow.shape[1] - 1)
     S, _ = compute_s(flow, R_MT, R_S1, R_S2)
     s = S[ty, tx]
 
@@ -377,14 +563,17 @@ def wronski_robustness(d_sq, sigma_sq, flow, ref_means, cfg, geom_reject=True):
     r = np.clip(np.nan_to_num(r, nan=0.0) - R_T, 0.0, 1.0)
 
     if geom_reject:
-        ex, ey = geom_residual(flow, ts, h, w)
+        ex, ey = geom_residual(flow, ts, h, w, nch)
         emag = np.sqrt(ex * ex + ey * ey)
-        gx, gy = guide_gradient(ref_means)
+        gx, gy = guide_gradient(ref_means, nch)
         gmag = np.sqrt(gx * gx + gy * gy)
         rej = (gmag * emag) > GEOM_REJECT_THRESHOLD
-        nsig = np.sqrt(guide_noise_var(cfg, ref_means))
+        sc = 2.0 if nch == 3 else 1.0
+        bri = (ref_means if nch == 1 else ref_means.mean(axis=2))
+        bri = np.clip(np.nan_to_num(bri, nan=0.0), 0.0, 1.0)
+        nsig = np.sqrt(guide_noise_var(cfg, bri, 0, nch)) / sc
         gmag_dn = np.maximum(0.0, gmag - GEOM_NOISE_FLOOR_MULT * nsig)
-        rej = rej | ((gmag_dn / (np.clip(ref_means, 0, 1) + 1e-4)) * emag >
+        rej = rej | ((gmag_dn / (bri + 1e-4)) * emag >
                      GEOM_REJECT_THRESHOLD_RELATIVE)
         r = np.where(rej, 0.0, r)
 
@@ -498,8 +687,11 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
     per-tile error produces a residual the noise model explains away.
     """
     h, w = d_sq.shape
+    nch = 1 if ref_means.ndim == 2 else ref_means.shape[2]
     ts = cfg.tile_size
-    ty, tx = tile_index_grids(h, w, ts)
+    ty, tx = tile_index_grids(h, w, ts, nch)
+    ty = np.clip(ty, 0, flow.shape[0] - 1)
+    tx = np.clip(tx, 0, flow.shape[1] - 1)
 
     with np.errstate(divide='ignore', invalid='ignore'):
         a = d_sq.astype(np.float64) / sigma_sq.astype(np.float64)
@@ -509,9 +701,21 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
     f[0] = np.exp(-np.minimum(a, 60.0))
     f[1] = np.clip(np.log1p(np.minimum(a, 1e12)) * F_LOG_A_SCALE, 0.0, 1.0)
 
-    nvar = guide_noise_var(cfg, ref_means)
-    sig_var = np.maximum(ref_vars.astype(np.float64) - nvar, 0.0)
-    f[2] = np.clip(np.log1p(sig_var / np.maximum(nvar, 1e-20)) * F_SNR_SCALE,
+    # Summed across channels, each against its own floor -- the green channel's
+    # is halved because the guide averaged two Bayer greens into it.
+    var_sum = np.zeros((h, w), np.float64)
+    nvar_sum = np.zeros((h, w), np.float64)
+    bri_sum = np.zeros((h, w), np.float64)
+    for ch in range(nch):
+        rm = ref_means if nch == 1 else ref_means[..., ch]
+        rv = ref_vars if nch == 1 else ref_vars[..., ch]
+        b_cl = np.clip(np.nan_to_num(rm, nan=0.0), 0.0, 1.0)
+        nvar_sum += guide_noise_var(cfg, b_cl, ch, nch)
+        var_sum += np.maximum(rv.astype(np.float64), 0.0)
+        bri_sum += b_cl
+    nvar = nvar_sum
+    sig_var = np.maximum(var_sum - nvar_sum, 0.0)
+    f[2] = np.clip(np.log1p(sig_var / np.maximum(nvar_sum, 1e-20)) * F_SNR_SCALE,
                    0.0, 1.0)
 
     fx = flow[..., 0][ty, tx]
@@ -523,13 +727,17 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
     span = flow_span(flow)[ty, tx]
     f[4] = np.clip(span / ts * F_SPAN_SCALE, 0.0, 1.0)
 
-    ex, ey = geom_residual(flow, ts, h, w)
+    ex, ey = geom_residual(flow, ts, h, w, nch)
     emag = np.sqrt(ex * ex + ey * ey)
     f[5] = np.clip(emag * F_EMAG_SCALE, 0.0, 1.0)
 
-    gx, gy = guide_gradient(ref_means)
+    gx, gy = guide_gradient(ref_means, nch)
     gmag = np.sqrt(gx * gx + gy * gy)
-    nsig = np.sqrt(np.maximum(nvar, 1e-20))
+    # Channel 0's own floor at the cross-channel mean brightness, in the same
+    # per-raw-pixel units as the gradient above.
+    sc = 2.0 if nch == 3 else 1.0
+    bri = bri_sum / float(nch)
+    nsig = np.sqrt(np.maximum(guide_noise_var(cfg, bri, 0, nch), 1e-20)) / sc
     f[6] = np.clip(np.log1p(gmag / nsig) * F_GRAD_SCALE, 0.0, 1.0)
     f[7] = np.clip(np.log1p(np.abs(gx * ex + gy * ey) / nsig) * F_DIRE_SCALE,
                    0.0, 1.0)
@@ -542,7 +750,7 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
     smd = comps['sigma_md_sq']
     f[9] = np.clip(sms / np.maximum(sms + smd, 1e-30), 0.0, 1.0)
     d_ms = np.sqrt(np.maximum(comps['d_ms_sq'], 0.0))
-    bri = np.clip(np.nan_to_num(ref_means, nan=0.0), 0.0, 1.0)
+    bri = np.clip(bri_sum / float(nch), 0.0, 1.0)
     # Denominator floored at 1% of full scale, not at an epsilon: with an
     # epsilon this channel correlates +0.34 with darkness alone, because any
     # residual is large next to a near-zero brightness, and it would be partly a

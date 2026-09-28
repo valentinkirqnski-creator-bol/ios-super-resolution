@@ -262,7 +262,16 @@ struct TuningParams: Equatable, Codable {
     /// plus "Alignment Grey: FFT" select; on any other guide it declines and the
     /// analytic mask runs unchanged, so this can never leave the pipeline
     /// without a mask.
-    var sr_gate_enabled: Bool = false
+    /// ON as of defaultsVersion 14. Measured on the held-out synthetic grid for
+    /// the shipping half-resolution guide: 40.99 dB for the fixed formula,
+    /// 43.18 dB for this, winning all 20 regime-by-flow-error cells. On the real
+    /// bursts it rejects 96% of independently-moving regions against the fixed
+    /// formula's 85%, which is the ghosting case it was built for.
+    ///
+    /// NOT verified on device: the Metal kernels have never executed. A missing
+    /// kernel degrades to the fixed formula on its own; a wrong one would not,
+    /// so this toggle is the way back.
+    var sr_gate_enabled: Bool = true
     /// Learned REFINEMENT of the analytic mask -- a different network with the
     /// opposite relationship to it from use_neural_robustness above. That one
     /// replaces Wronski Eq. 5-9; this one keeps it authoritative and may only
@@ -293,7 +302,20 @@ struct TuningParams: Equatable, Codable {
     // units -- which measured as mildly counterproductive (+3.6% thicken).
     // Kept on at 0.0045 by explicit instruction; noted here so the interaction
     // is not rediscovered as a mystery.
-    var robustness_raw_resolution_enabled: Bool = true   // was false
+    // OFF as of defaultsVersion 14, reverting the ON this was given in cef567b.
+    // Turning it on selects the full-resolution FFT guide, and on device that
+    // costs an extra full-frame FFT per frame AND takes the resident robustness
+    // slice from 97 MB to 390 MB -- which, on a device with ~100 MB of headroom
+    // to jetsam, is refused, dropping the burst off the resident path and
+    // therefore off the fused merge. Measured on device: ~400 ms -> ~3000 ms per
+    // 12 MP frame. The +2.5 dB that motivated it was a CPU-only measurement and
+    // had never actually run on device before that commit.
+    //
+    // Off, the guide is the half-resolution three-channel Bayer guide Metal has
+    // always built: a quarter of the mask pixels, no extra FFT, the slice back
+    // at 97 MB, and d^2 summed over R, G and B so the mask sees COLOUR
+    // differences a luminance guide cannot.
+    var robustness_raw_resolution_enabled: Bool = false
     // Analytic edge-misalignment detector; defaults mirror core/types.h.
     // These are new keys, so an existing saved preset -- which only
     // overrides what it actually contains -- leaves them here.
@@ -539,7 +561,7 @@ final class CameraModel: NSObject, ObservableObject {
         // REPLACES the whole saved preset, so anything else an install had
         // tuned returns to appDefaults too; that is the intent here, because
         // the controls for these are no longer reachable to re-tune.
-        let defaultsVersion = 13
+        let defaultsVersion = 14
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

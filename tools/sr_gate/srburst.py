@@ -179,24 +179,46 @@ def _box2_blur(s):
 # --------------------------------------------------------------------------
 
 class BurstSpec:
+    """Motion parameters, with the ranges taken from measure_motion.py rather
+    than guessed.
+
+    What the guessed ranges got wrong, measured on the real bursts:
+
+      * GLOBAL translation was 0.3-6 raw px. Real handheld bursts here reach
+        264 px between the reference and the last frame. span and emag are built
+        from flow magnitudes, so the whole feature distribution was off.
+      * OBJECT velocity was 1.5-10 px. The ours2 subject moves ~250 px and
+        changes pose, which is the case the mask actually failed on, and no
+        training burst was within a factor of 25 of it.
+      * objects were axis-aligned rectangles translating rigidly, which is the
+        one shape whose displaced copy still matches itself.
+    """
+
     def __init__(self, rng, regime=None):
         r = rng
         self.regime = regime if regime is not None else r.integers(0, 4)
-        # handheld shake: a few raw px of translation, up to ~0.6 degrees
-        self.trans = float(r.uniform(0.3, 6.0))
-        self.theta = float(r.uniform(0.0, 0.010)) * (1 if r.random() < 0.7 else 0)
-        # per-tile estimate jitter, log-uniform across the whole regime range
+        # Handheld camera motion. Log-uniform because the small end is where
+        # most shots live and where rejection is most harmful, while the large
+        # end has to be represented at all.
+        self.trans = float(np.exp(r.uniform(np.log(0.3), np.log(250.0))))
+        self.theta = float(r.uniform(0.0, 0.020)) * (1 if r.random() < 0.7 else 0)
         self.sigma_flow = float(np.exp(r.uniform(np.log(0.08), np.log(6.0))))
-        # a translation-only estimate of a rotating field: coherent, within-tile
+        # A translation-only estimate of a rotating field: coherent within-tile
+        # error, the mode a residual test cannot see.
         self.translation_only = bool(self.regime == 1)
         if self.translation_only:
-            self.theta = float(r.uniform(0.002, 0.012))
+            self.theta = float(r.uniform(0.002, 0.020))
             self.sigma_flow = float(np.exp(r.uniform(np.log(0.08), np.log(0.8))))
-        # independently moving object
+        # An independently moving subject. 5-400 px log-uniform: block matching
+        # follows the low end and cannot follow the high end, and the mask has to
+        # handle both.
         self.has_object = bool(self.regime == 2)
-        self.obj_vel = float(r.uniform(1.5, 10.0))
+        self.obj_vel = float(np.exp(r.uniform(np.log(5.0), np.log(400.0))))
         self.obj_lock_p = float(r.uniform(0.5, 1.0))
-        # gross outlier tiles
+        # Non-rigid: the subject also rotates and changes scale, so its displaced
+        # copy does not match itself the way a translated rectangle does.
+        self.obj_theta = float(r.uniform(-0.06, 0.06))
+        self.obj_scale = float(np.exp(r.uniform(np.log(0.94), np.log(1.06))))
         self.outlier_p = float(r.uniform(0.0, 0.06)) if self.regime == 3 else 0.0
         self.noise_gain = float(np.exp(r.uniform(np.log(1.0), np.log(24.0))))
         self.n_frames = 8
@@ -222,18 +244,35 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
         if spec.has_object:
             ox = tx + spec.obj_vel * f * rng.uniform(-1, 1)
             oy = ty + spec.obj_vel * f * rng.uniform(-1, 1)
-            obj_motions.append(Motion(th, ox, oy, cy, cx))
+            # Its own rotation on top of the camera's, so the subject deforms
+            # relative to the background rather than sliding rigidly.
+            obj_motions.append(Motion(th + spec.obj_theta * f, ox, oy, cy, cx))
         else:
             obj_motions.append(motions[-1])
 
-    # object support, in REFERENCE raw coordinates
+    # Object support in REFERENCE raw coordinates. A smoothed random field
+    # thresholded to the wanted area, not a rectangle: a rectangle's displaced
+    # copy still matches itself along its own edges, which is exactly the
+    # evidence the mask is supposed to find.
     obj_mask = np.zeros((h, w), bool)
     if spec.has_object:
-        oh = int(rng.uniform(0.25, 0.55) * h)
-        ow = int(rng.uniform(0.25, 0.55) * w)
-        oy0 = int(rng.uniform(0, h - oh))
-        ox0 = int(rng.uniform(0, w - ow))
-        obj_mask[oy0:oy0 + oh, ox0:ox0 + ow] = True
+        frac = float(rng.uniform(0.10, 0.45))
+        small = rng.standard_normal((max(2, h // 64), max(2, w // 64)))
+        # box-blur the field a couple of times, then bilinearly enlarge
+        for _ in range(2):
+            small = 0.25 * (small +
+                            np.roll(small, 1, 0) + np.roll(small, -1, 0) +
+                            np.roll(small, 1, 1))
+        yy_ = np.linspace(0, small.shape[0] - 1, h)
+        xx_ = np.linspace(0, small.shape[1] - 1, w)
+        y0i = np.clip(yy_.astype(int), 0, small.shape[0] - 2)
+        x0i = np.clip(xx_.astype(int), 0, small.shape[1] - 2)
+        fy_ = (yy_ - y0i)[:, None]
+        fx_ = (xx_ - x0i)[None, :]
+        top = small[y0i][:, x0i] * (1 - fx_) + small[y0i][:, x0i + 1] * fx_
+        bot = small[y0i + 1][:, x0i] * (1 - fx_) + small[y0i + 1][:, x0i + 1] * fx_
+        field = top * (1 - fy_) + bot * fy_
+        obj_mask = field > np.quantile(field, 1.0 - frac)
 
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     cfa_ch = CFA[np.arange(h)[:, None] & 1, np.arange(w)[None, :] & 1]

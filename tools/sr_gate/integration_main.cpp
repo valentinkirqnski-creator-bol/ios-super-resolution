@@ -91,7 +91,11 @@ int main(int argc, char** argv) {
     cfg.scale = 2.f;
     cfg.grey_method = GreyMethod::FFT;
     cfg.robustness_enabled = true;
-    cfg.robustness_raw_resolution_enabled = true;   // + FFT grey => FFT guide
+    // The shipping configuration as of defaultsVersion 14: raw-resolution OFF,
+    // so compute_guide builds the three-channel half-resolution sqrt guide.
+    cfg.robustness_raw_resolution_enabled = false;
+    cfg.robustness_guide_sqrt = true;
+    cfg.guide_curve = 1;
     cfg.raw_prewhitened = false;
     cfg.num_threads = 0;
     for (int c = 0; c < 3; ++c) {
@@ -108,10 +112,10 @@ int main(int argc, char** argv) {
     std::printf("sr_gate_available %d\n", (int)sr_gate_available());
 
     RefStats st = init_robustness(ref, cfg);
-    if (st.means.h != h || st.means.w != w || st.means.c != 1) {
-        std::fprintf(stderr, "guide is %dx%dx%d, expected %dx%dx1 -- the "
+    if (st.means.h != h / 2 || st.means.w != w / 2 || st.means.c != 3) {
+        std::fprintf(stderr, "guide is %dx%dx%d, expected %dx%dx3 -- the "
                      "shipping predicate did not select the FFT guide\n",
-                     st.means.h, st.means.w, st.means.c, h, w);
+                     st.means.h, st.means.w, st.means.c, h / 2, w / 2);
         return 1;
     }
     std::printf("guide %dx%d x%d ok\n", st.means.h, st.means.w, st.means.c);
@@ -120,8 +124,12 @@ int main(int argc, char** argv) {
     Image r_analytic = compute_robustness(comp, st, flow, ts, cfg, nullptr);
     cfg.sr_gate_enabled = true;
     Image r_gate = compute_robustness(comp, st, flow, ts, cfg, nullptr);
-    if (r_analytic.h != h || r_gate.h != h) {
-        std::fprintf(stderr, "mask shape wrong\n");
+    // The mask lives on the GUIDE lattice, which is half the raw size on the
+    // three-channel decimated guide.
+    if (r_analytic.h != st.means.h || r_gate.h != st.means.h) {
+        std::fprintf(stderr, "mask shape wrong: analytic %dx%d gate %dx%d, "
+                     "guide %dx%d\n", r_analytic.h, r_analytic.w, r_gate.h,
+                     r_gate.w, st.means.h, st.means.w);
         return 1;
     }
 
@@ -148,7 +156,7 @@ int main(int argc, char** argv) {
     FILE* o = std::fopen(argc > 2 ? argv[2] : "integ_mask.bin", "wb");
     if (o) {
         std::fwrite("SRGM", 1, 4, o);
-        int32_t oh[2] = {h, w};
+        int32_t oh[2] = {r_gate.h, r_gate.w};
         std::fwrite(oh, sizeof(oh), 1, o);
         std::fwrite(r_gate.data.data(), sizeof(float), r_gate.data.size(), o);
         std::fwrite(r_analytic.data.data(), sizeof(float), r_analytic.data.size(), o);

@@ -28,11 +28,12 @@ import build as bld
 
 
 def dump(path, ref_m, ref_v, d_sq, sig_sq, flow, ts, alpha_sensor, beta_sensor):
-    h, w = ref_m.shape
+    h, w = ref_m.shape[:2]
+    nch = 1 if ref_m.ndim == 2 else ref_m.shape[2]
     ny, nx = flow.shape[:2]
     with open(path, 'wb') as f:
         f.write(b'SRGD')
-        f.write(struct.pack('<5i', h, w, ny, nx, ts))
+        f.write(struct.pack('<6i', h, w, ny, nx, ts, nch))
         f.write(struct.pack('<2f', alpha_sensor, beta_sensor))
         for a in (ref_m, ref_v, d_sq, sig_sq):
             f.write(np.ascontiguousarray(a, np.float32).tobytes())
@@ -55,6 +56,9 @@ def main():
     ap.add_argument('--exe', default='sr_gate_parity.exe')
     ap.add_argument('--ckpt', default='sr_gate.pt')
     ap.add_argument('--hr', type=int, default=320)
+    ap.add_argument('--nch', type=int, default=1,
+                    help='1 = full-res FFT guide, 3 = decimated sqrt guide')
+    ap.add_argument('--patches', type=int, default=4000)
     a = ap.parse_args()
     here = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,14 +75,30 @@ def main():
     b = srburst.synth_burst(scene, spec, rng, tile_size=16)
 
     cfg = srsim.Cfg(noise_gain=spec.noise_gain, tile_size=16)
-    std_c, diff_c = srsim.noise_curves_closed_form(cfg.alpha_rob, cfg.beta_rob)
-    cfg.tune_snr(b['raws'][0], std_c)
+    if a.nch == 3:
+        cfg.use_decimated_guide()
+        std_c = []
+        diff_c = []
+        for c in range(3):
+            sc_, dc_ = srsim.build_noise_curves_sqrt(cfg.alpha_ch[c],
+                                                     cfg.beta_ch[c],
+                                                     n_patches=a.patches)
+            std_c.append(sc_)
+            diff_c.append(dc_)
+        guide = srsim.compute_guide_decimate3
+    else:
+        std_c, diff_c = srsim.noise_curves_closed_form(cfg.alpha_rob, cfg.beta_rob)
+        guide = srsim.compute_grey_fft
+    tune = std_c[1] if a.nch == 3 else std_c
+    cfg.tune_snr(b['raws'][0], tune)
     cfg.tile_size = 16
-    ref_m, ref_v = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][0]))
-    gm, gv = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][1]))
+    ref_m, ref_v = srsim.local_stats_3x3(guide(b['raws'][0]))
+    gm, gv = srsim.local_stats_3x3(guide(b['raws'][1]))
     d_sq, sig_sq, comps = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][1],
                                                 cfg, std_c, diff_c)
-    cvw = srsim.warp_sample_comp(gv, b['flows'][1], cfg)
+    # Channels 8-11 are not shipped (measured neutral), and the C++ emits
+    # SRG_FEATURES of them, so parity is over the 8 the app actually uses.
+    cvw = None
 
     inp = os.path.join(here, 'parity_in.bin')
     outp = os.path.join(here, 'parity_out.bin')
@@ -98,8 +118,7 @@ def main():
     print('beta_rob   python %.9g  c++ %.9g  rel %.2e'
           % (cfg.beta_rob, beta_rob, abs(beta_rob / cfg.beta_rob - 1)))
 
-    p_feat = srsim.build_features(d_sq, sig_sq, ref_m, ref_v, b['flows'][1], cfg,
-                                  comps, cvw)
+    p_feat = srsim.build_features(d_sq, sig_sq, ref_m, ref_v, b['flows'][1], cfg)
     print()
     print('%-8s %-12s %-12s %-10s' % ('feature', 'max abs err', 'mean abs err',
                                       'range'))
@@ -120,10 +139,7 @@ def main():
 
     ck = torch.load(os.path.join(here, a.ckpt), map_location='cpu',
                     weights_only=True)
-    net = gate.SRGate(in_ch=ck['in_ch'], width=ck['width'],
-                      dilations=ck['dilations'])
-    net.load_state_dict(ck['state_dict'])
-    net.eval()
+    net = gate.from_checkpoint(ck)
     with torch.no_grad():
         # torch on the C++ features isolates the inference from the features
         t_on_c = net(torch.from_numpy(c_feat[None]))[0, 0].numpy()

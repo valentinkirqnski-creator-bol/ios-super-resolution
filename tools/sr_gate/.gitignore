@@ -17,3 +17,6 @@ sr_gate12.pt
 sr_gate_d3_*.pt
 sr_gate_final.pt
 train12_log.txt
+mk4.txt
+t_h_*.txt
+sr_gate_h_*.pt

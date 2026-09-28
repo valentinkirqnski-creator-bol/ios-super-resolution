@@ -1072,19 +1072,19 @@ struct CameraView: View {
             Toggle("Robustness at Raw Resolution",
                    isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
             Text("""
-                 Grades every raw pixel separately instead of using one value per 2x2 sensor block, so the boundary between kept and rejected detail lands four times more precisely. Measured +2.5 dB at moderate hand shake. The neural mask below also needs this.
+                 Grades every raw pixel separately instead of using one value per 2x2 sensor block, so the rejection boundary lands four times more precisely. Off by default, and most people should leave it off.
 
-                 Turn it OFF if a shot fails for memory: it raises what the merge holds by roughly 300 MB on a 12 MP eight-frame burst, and with it off the pipeline returns exactly to the older half-resolution behaviour.
+                 It costs an extra full-frame transform per frame and raises what the merge holds by about 300 MB on a 12 MP eight-frame burst, which on a phone usually means the shot falls back to a slower path: measured around 400 ms per frame off, 3000 ms on. It also turns the neural mask below OFF, because that is trained on the standard half-resolution colour inputs.
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
             Toggle("Neural Robustness Mask", isOn: $cam.tuningParams.sr_gate_enabled)
-                .disabled(!cam.tuningParams.robustness_raw_resolution_enabled)
+                .disabled(cam.tuningParams.robustness_raw_resolution_enabled)
             // A plain if rather than a ternary inside the Text: an inline ternary
             // in a Text is the shape that has pushed this file past the type
             // checker before.
-            if !cam.tuningParams.robustness_raw_resolution_enabled {
-                Text("Unavailable while Robustness at Raw Resolution is off. The network was trained on that setting's full-resolution inputs and declines on anything else, which leaves the fixed formula running.")
+            if cam.tuningParams.robustness_raw_resolution_enabled {
+                Text("Unavailable while Robustness at Raw Resolution is ON. The network is trained on the standard half-resolution colour inputs and declines on anything else, which leaves the fixed formula running.")
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }

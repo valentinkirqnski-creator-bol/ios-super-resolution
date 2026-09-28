@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     char magic[4];
-    int32_t hdr[5];
+    int32_t hdr[6];
     float ab[2];
     if (!rd(f, magic, 4) || std::memcmp(magic, "SRGD", 4) != 0 ||
         !rd(f, hdr, sizeof(hdr)) || !rd(f, ab, sizeof(ab))) {
@@ -51,11 +51,17 @@ int main(int argc, char** argv) {
         return 2;
     }
     const int h = hdr[0], w = hdr[1], ny = hdr[2], nx = hdr[3], ts = hdr[4];
+    const int nch = hdr[5];
+    if (nch != 1 && nch != 3) {
+        std::fprintf(stderr, "nch must be 1 or 3\n");
+        return 2;
+    }
     const float alpha_sensor = ab[0], beta_sensor = ab[1];
 
-    Image ref_means(h, w, 1), ref_vars(h, w, 1), d_sq(h, w, 1), sigma_sq(h, w, 1);
+    Image ref_means(h, w, nch), ref_vars(h, w, nch), d_sq(h, w, 1), sigma_sq(h, w, 1);
+    const size_t nstat = (size_t)h * w * (size_t)nch * sizeof(float);
     const size_t n = (size_t)h * w * sizeof(float);
-    if (!rd(f, ref_means.data.data(), n) || !rd(f, ref_vars.data.data(), n) ||
+    if (!rd(f, ref_means.data.data(), nstat) || !rd(f, ref_vars.data.data(), nstat) ||
         !rd(f, d_sq.data.data(), n) || !rd(f, sigma_sq.data.data(), n)) {
         std::fprintf(stderr, "short read on planes\n");
         return 2;
@@ -71,7 +77,11 @@ int main(int argc, char** argv) {
     Config cfg;
     cfg.bayer_mode = true;
     cfg.grey_method = hhsr::GreyMethod::FFT;
-    cfg.robustness_fft_guide = true;          // -> robustness_fft_guide_active()
+    // nch decides the guide: 1 is the full-resolution FFT guide (linear), 3 is
+    // the half-resolution decimated Bayer guide with the 1.4 sqrt transfer.
+    cfg.robustness_fft_guide = (nch == 1);
+    cfg.robustness_guide_sqrt = true;   // inert while the FFT guide is active
+    cfg.guide_curve = 1;                // Sqrt, as the app defaults set it
     cfg.raw_prewhitened = false;             // wb gains already folded in
     cfg.debug_noise_model_disabled = false;
     cfg.num_threads = 0;

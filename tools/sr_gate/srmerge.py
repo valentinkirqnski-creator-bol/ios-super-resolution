@@ -217,13 +217,19 @@ def _round_half_away(x):
     return np.floor(np.abs(x) + 0.5).astype(np.int64) * np.where(x < 0, -1, 1)
 
 
-def accumulate_comp_ab(raw, flowx, flowy, covs, cfg: Cfg):
+def accumulate_comp_ab(raw, flowx, flowy, covs, cfg: Cfg, stride=1):
     """accumulate_comp with local_r factored out. flowx/flowy are given at
     OUTPUT resolution so that either a per-tile or a per-pixel (ground truth)
     field can be fed in. Returns A, B of shape (3, Hs, Ws)."""
     h, w = raw.shape
-    Hs, Ws = h * SCALE, w * SCALE
+    # The loss is evaluated on every `stride`-th output pixel. The merge is
+    # pointwise in output space once A and B are factored out, so a subsampled
+    # grid is the same estimator on a subset -- and it is what makes a crop big
+    # enough for the coarse branch to have real context affordable to store.
+    Hs, Ws = (h * SCALE) // stride, (w * SCALE) // stride
     hi, hj = np.mgrid[0:Hs, 0:Ws]
+    hi = hi * stride
+    hj = hj * stride
     lr_x = hj / SCALE
     lr_y = hi / SCALE
 
@@ -260,11 +266,13 @@ def accumulate_comp_ab(raw, flowx, flowy, covs, cfg: Cfg):
     return A, B
 
 
-def accumulate_ref_ab(raw, covs, cfg: Cfg):
+def accumulate_ref_ab(raw, covs, cfg: Cfg, stride=1):
     """accumulate_ref (Alg. 11): no flow, R == 1, fixed radius 1."""
     h, w = raw.shape
-    Hs, Ws = h * SCALE, w * SCALE
+    Hs, Ws = (h * SCALE) // stride, (w * SCALE) // stride
     hi, hj = np.mgrid[0:Hs, 0:Ws]
+    hi = hi * stride
+    hj = hj * stride
     coarse_x = hj / SCALE
     coarse_y = hi / SCALE
     kmap_j = (coarse_x - 0.5) / 2.0
@@ -295,11 +303,13 @@ def accumulate_ref_ab(raw, covs, cfg: Cfg):
     return A, B
 
 
-def tile_flow_at_output(flow, h, w, ts):
+def tile_flow_at_output(flow, h, w, ts, stride=1):
     """The per-tile flow the merge actually fetches: nearest tile, indexed by
     int(lr / tile_size) -- accumulate_comp does not interpolate."""
-    Hs, Ws = h * SCALE, w * SCALE
+    Hs, Ws = (h * SCALE) // stride, (w * SCALE) // stride
     hi, hj = np.mgrid[0:Hs, 0:Ws]
+    hi = hi * stride
+    hj = hj * stride
     lr_x = hj / SCALE
     lr_y = hi / SCALE
     px = (lr_x / ts).astype(np.int64)
@@ -309,18 +319,30 @@ def tile_flow_at_output(flow, h, w, ts):
     return flow[py, px, 0].astype(np.float64), flow[py, px, 1].astype(np.float64)
 
 
-def sample_r_at_output(R, h, w):
+def sample_r_at_output(R, h, w, stride=1, guide_scale=1):
     """merge_robustness_bilinear with rob_is_raw: R is sampled bilinearly at
     (lr_y, lr_x) = (hr/2, hr/2). Returns the 4 corner indices and weights so
     the same gather can be done in torch during training."""
-    Hs, Ws = h * SCALE, w * SCALE
+    Hs, Ws = (h * SCALE) // stride, (w * SCALE) // stride
     hi, hj = np.mgrid[0:Hs, 0:Ws]
-    y = np.clip(hi / SCALE, 0, h - 1)
-    x = np.clip(hj / SCALE, 0, w - 1)
+    hi = hi * stride
+    hj = hj * stride
+    # merge.cpp: rob_is_raw -> sample at lr directly; otherwise the guide is half
+    # resolution and the position is (lr - 0.5) / 2.
+    gh = h // guide_scale
+    gw = w // guide_scale
+    if guide_scale == 1:
+        y = np.clip(hi / SCALE, 0, gh - 1)
+        x = np.clip(hj / SCALE, 0, gw - 1)
+    else:
+        y = np.clip((hi / SCALE - 0.5) / 2.0, 0, gh - 1)
+        x = np.clip((hj / SCALE - 0.5) / 2.0, 0, gw - 1)
     y0 = np.floor(y).astype(np.int64)
     x0 = np.floor(x).astype(np.int64)
-    y1 = np.minimum(y0 + 1, h - 1)
-    x1 = np.minimum(x0 + 1, w - 1)
+    # Clamped to the GUIDE extent, not the raw one: R lives on the guide
+    # lattice, which is half the raw size when guide_scale is 2.
+    y1 = np.minimum(y0 + 1, gh - 1)
+    x1 = np.minimum(x0 + 1, gw - 1)
     fy = (y - y0).astype(np.float32)
     fx = (x - x0).astype(np.float32)
     if R is None:

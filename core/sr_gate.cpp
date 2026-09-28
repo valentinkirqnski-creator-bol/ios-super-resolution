@@ -263,7 +263,18 @@ Image sr_gate_mask(const Image& ref_means, const Image& ref_vars,
     // domain -- three residuals summed instead of one, a different lattice, a
     // different noise scale -- so decline rather than run a trained function
     // out of the domain it was measured in.
-    if (ref_means.c != 1) return Image();
+    // The shipped weights are fitted on the THREE-channel half-resolution guide:
+    // the 1.4 sqrt guide Metal has always built, which is what the shipping
+    // config selects with robustness_raw_resolution OFF. A quarter of the pixels
+    // of the full-resolution FFT guide, no extra FFT per frame, the resident mask
+    // slice stays at 97 MB, and d^2 sums over R, G and B so the mask sees colour
+    // differences a single-channel luminance guide cannot.
+    //
+    // build_sr_gate_features handles the one-channel FFT guide too, identically
+    // on both backends, but no weights have been fitted there since the guide
+    // changed -- so decline rather than run a trained function outside the domain
+    // it was measured in.
+    if (ref_means.c != 3) return Image();
     Image feat = build_sr_gate_features(ref_means, ref_vars, d_sq, sigma_sq,
                                        flow, tile_size, cfg);
     if (feat.h <= 0) return Image();

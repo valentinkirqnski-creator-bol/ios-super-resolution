@@ -154,6 +154,9 @@ def main():
     ap.add_argument('--lr', type=float, default=4e-3)
     ap.add_argument('--threads', type=int, default=0)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--no-coarse', action='store_true',
+                    help='fine branch only, the 13x13 receptive field that could '
+                         'not see a whole moving subject')
     ap.add_argument('--in-ch', type=int, default=0,
                     help='train on only the first N feature channels. The set only '
                          'ever grows by appending, so this ablates the additions '
@@ -172,7 +175,7 @@ def main():
     val = Split(root, 'val')
     print('bursts: %d train, %d val  (memory mapped)' % (train.n, val.n))
 
-    net = gate.SRGate(in_ch=a.in_ch) if a.in_ch > 0 else gate.SRGate()
+    net = gate.SRGate(in_ch=a.in_ch or gate.NUM_FEATURES, coarse=not a.no_coarse)
     print('sr_gate: %d parameters, %d input channels'
           % (net.n_params(), net.convs[0].weight.shape[1]))
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
@@ -239,7 +242,10 @@ def main():
                 best = g
                 torch.save({'state_dict': net.state_dict(),
                             'dilations': net.dilations, 'width': gate.WIDTH,
-                            'in_ch': net.convs[0].weight.shape[1], 'steps': step,
+                            'in_ch': (net.cconvs[0].weight.shape[1] // 2) if net.coarse
+                         else net.convs[0].weight.shape[1],
+                'coarse': net.coarse, 'pool': net.pool,
+                'coarse_dilations': net.coarse_dilations, 'steps': step,
                             'val_gain': g}, outp)
                 print('  saved (best so far)', flush=True)
 
@@ -249,7 +255,10 @@ def main():
           % (g, best))
     if g >= best:
         torch.save({'state_dict': net.state_dict(), 'dilations': net.dilations,
-                    'width': gate.WIDTH, 'in_ch': net.convs[0].weight.shape[1],
+                    'width': gate.WIDTH, 'in_ch': (net.cconvs[0].weight.shape[1] // 2) if net.coarse
+                         else net.convs[0].weight.shape[1],
+                'coarse': net.coarse, 'pool': net.pool,
+                'coarse_dilations': net.coarse_dilations,
                     'steps': step, 'val_gain': g}, outp)
         print('saved final to', outp)
     else:

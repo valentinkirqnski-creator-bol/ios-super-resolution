@@ -51,10 +51,7 @@ def main():
 
     ck = torch.load(os.path.join(here, a.ckpt), map_location='cpu',
                     weights_only=True)
-    net = gate.SRGate(in_ch=ck['in_ch'], width=ck['width'],
-                      dilations=ck['dilations'])
-    net.load_state_dict(ck['state_dict'])
-    net.eval()
+    net = gate.from_checkpoint(ck)
     print('%s split: %d bursts, %d parameters, %d training steps'
           % (a.split, sp.n, net.n_params(), ck.get('steps', -1)))
 

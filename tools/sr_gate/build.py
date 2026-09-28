@@ -18,6 +18,28 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     '..', '..', '..'))
 
 
+_CURVES = {}
+
+
+def sqrt_curves(cfg, n_patches=4000):
+    """Per-channel sqrt-domain curves, cached: they depend only on the noise
+    gain, and the Monte Carlo is 1001 bins x 4000 patches x 9 samples per
+    channel -- far too slow to repeat for every burst."""
+    key = tuple(round(v, 12) for v in cfg.alpha_ch + cfg.beta_ch)
+    hit = _CURVES.get(key)
+    if hit is None:
+        std, diff = [], []
+        for c in range(3):
+            sc_, dc_ = srsim.build_noise_curves_sqrt(cfg.alpha_ch[c],
+                                                     cfg.beta_ch[c],
+                                                     n_patches=n_patches)
+            std.append(sc_)
+            diff.append(dc_)
+        hit = (std, diff)
+        _CURVES[key] = hit
+    return hit
+
+
 def psnr(a, b):
     m = float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
     return 10.0 * np.log10(1.0 / max(m, 1e-12))
@@ -37,46 +59,55 @@ def build_burst(scene, spec, rng, tile_size=16):
     N = len(b['raws'])
 
     cfg = srsim.Cfg(noise_gain=spec.noise_gain, tile_size=tile_size)
-    std_c, diff_c = srsim.noise_curves_closed_form(cfg.alpha_rob, cfg.beta_rob)
-    cfg.tune_snr(b['raws'][0], std_c)
+    cfg.use_decimated_guide()
+    std_c, diff_c = sqrt_curves(cfg)
+    cfg.tune_snr(b['raws'][0], std_c[1])
     # The synthesiser laid the flow out on a fixed tile grid, so keep the mask
     # on that grid rather than letting the SNR tune move it underneath.
     cfg.tile_size = tile_size
 
-    ref_m, ref_v = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][0]))
+    # The guide is HALF resolution and three channels, so the mask lattice is
+    # h/2 x w/2 and the loss grid is subsampled to match what that can express.
+    ST = 2
+    gh, gw = h // 2, w // 2
+    Hs, Ws = (h * 2) // ST, (w * 2) // ST
+    ref_m, ref_v = srsim.local_stats_3x3(srsim.compute_guide_decimate3(b['raws'][0]))
     covs_ref = srmerge.estimate_kernels(b['raws'][0], cfg)
-    A_ref, B_ref = srmerge.accumulate_ref_ab(b['raws'][0], covs_ref, cfg)
+    A_ref, B_ref = srmerge.accumulate_ref_ab(b['raws'][0], covs_ref, cfg, ST)
 
-    A = np.zeros((N - 1, 3, h * 2, w * 2), np.float32)
+    A = np.zeros((N - 1, 3, Hs, Ws), np.float32)
     B = np.zeros_like(A)
     Ag = np.zeros_like(A)
     Bg = np.zeros_like(A)
-    feat = np.zeros((N - 1, srsim.NUM_FEATURES, h, w), np.float32)
-    Rw = np.zeros((N - 1, h, w), np.float32)
+    # Only the shipped channels are stored. srsim can build 12; channels 8-11
+    # measured neutral and core/sr_gate_shared.h declares 8.
+    NF = 8
+    feat = np.zeros((N - 1, NF, gh, gw), np.float32)
+    Rw = np.zeros((N - 1, gh, gw), np.float32)
 
     for n in range(1, N):
         covs = srmerge.estimate_kernels(b['raws'][n], cfg)
-        fx, fy = srmerge.tile_flow_at_output(b['flows'][n], h, w, cfg.tile_size)
-        A[n - 1], B[n - 1] = srmerge.accumulate_comp_ab(b['raws'][n], fx, fy, covs, cfg)
+        fx, fy = srmerge.tile_flow_at_output(b['flows'][n], h, w, cfg.tile_size,
+                                             ST)
+        A[n - 1], B[n - 1] = srmerge.accumulate_comp_ab(b['raws'][n], fx, fy,
+                                                        covs, cfg, ST)
 
         covs_c = srmerge.estimate_kernels(b['raws_clean'][n], cfg)
         tfx, tfy = b['true_flow'][n]
-        Ag[n - 1], Bg[n - 1] = srmerge.accumulate_comp_ab(b['raws_clean'][n], tfx,
-                                                          tfy, covs_c, cfg)
+        Ag[n - 1], Bg[n - 1] = srmerge.accumulate_comp_ab(
+            b['raws_clean'][n], tfx[::ST, ::ST], tfy[::ST, ::ST], covs_c, cfg, ST)
 
-        # gv, the comparison frame's local variance, is what Eq. 6 computes and
-        # throws away. Channel 11 uses it, so it costs nothing extra here either.
-        gm, gv = srsim.local_stats_3x3(srsim.compute_grey_fft(b['raws'][n]))
+        gm, gv = srsim.local_stats_3x3(
+            srsim.compute_guide_decimate3(b['raws'][n]))
         d_sq, sig_sq, comps = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n],
                                                     cfg, std_c, diff_c)
-        cvw = srsim.warp_sample_comp(gv, b['flows'][n], cfg)
         feat[n - 1] = srsim.build_features(d_sq, sig_sq, ref_m, ref_v,
-                                           b['flows'][n], cfg, comps, cvw)
+                                           b['flows'][n], cfg)[:NF]
         Rw[n - 1] = srsim.wronski_robustness(d_sq, sig_sq, b['flows'][n], ref_m, cfg)
 
     covs_rc = srmerge.estimate_kernels(b['raws_clean'][0], cfg)
-    A_rc, B_rc = srmerge.accumulate_ref_ab(b['raws_clean'][0], covs_rc, cfg)
-    ones_out = np.ones((N - 1, h * 2, w * 2), np.float32)
+    A_rc, B_rc = srmerge.accumulate_ref_ab(b['raws_clean'][0], covs_rc, cfg, ST)
+    ones_out = np.ones((N - 1, Hs, Ws), np.float32)
     gt = srmerge.merge_from_ab(A_rc, B_rc, Ag, Bg, ones_out)
 
     # An edge map on the ground truth, used to weight the loss and to report
@@ -91,14 +122,17 @@ def build_burst(scene, spec, rng, tile_size=16):
 
     return dict(feat=feat, Rw=Rw, A=A, B=B, A_ref=A_ref, B_ref=B_ref, gt=gt,
                 edge=edge.astype(np.float32), h=h, w=w,
+                stride=ST, guide_scale=2,
                 tile_size=tile_size, regime=b['regime'],
                 sigma_flow=b['sigma_flow'], noise_gain=b['noise_gain'])
 
 
 def merged(d, R):
-    """R at guide/raw resolution (N-1, h, w) -> merged RGB output."""
+    """R on the guide lattice (N-1, h/2, w/2) -> merged RGB output."""
     n = R.shape[0]
-    Rout = np.stack([srmerge.sample_r_at_output(R[i], d['h'], d['w'])
+    Rout = np.stack([srmerge.sample_r_at_output(R[i], d['h'], d['w'],
+                                                d.get('stride', 2),
+                                                d.get('guide_scale', 2))
                      for i in range(n)], axis=0)
     return srmerge.merge_from_ab(d['A_ref'], d['B_ref'], d['A'], d['B'], Rout)
 
