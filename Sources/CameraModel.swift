@@ -115,7 +115,22 @@ struct TuningParams: Equatable, Codable {
     /// Off merges every frame at full weight everywhere. Diagnostic: it shows
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
-    var robustness_save_mask: Bool = false
+    /// Writes <name>_robustness.pgm next to the DNG and saves it to Photos with
+    /// the shot. ON as of defaultsVersion 15, because the mask is the only
+    /// direct view of what the merge actually weighted: a frame being
+    /// under-merged reads as a dark mask, which is exactly the question open on
+    /// the neural mask right now.
+    ///
+    /// The value is the mask ACCUMULATED over the comparison frames, not one
+    /// frame's, so read it against the frame count (7 on an 8-frame burst)
+    /// rather than against 1. pipeline.cpp nearest-upsamples it from the guide
+    /// grid to raw resolution, matching 1.4's export.
+    ///
+    /// It is not free: it forces the mask back to the host every frame
+    /// (metal_gpu.mm want_host), which is the readback the resident path exists
+    /// to avoid, and it keeps an extra accumulation buffer. Diagnostic setting
+    /// -- turn it off for a build where speed matters.
+    var robustness_save_mask: Bool = true
     /// Codec for the output DNG image strip. Every option is lossless -- the
     /// decoded 16-bit samples are identical to the bit -- so this trades file
     /// size against write cost, never quality.
@@ -561,7 +576,7 @@ final class CameraModel: NSObject, ObservableObject {
         // REPLACES the whole saved preset, so anything else an install had
         // tuned returns to appDefaults too; that is the intent here, because
         // the controls for these are no longer reachable to re-tune.
-        let defaultsVersion = 14
+        let defaultsVersion = 15
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
