@@ -1101,6 +1101,16 @@ struct CameraView: View {
                     Text("One-time \(store.displayPrice) purchase. Permanently removes the \(StoreManager.freeTotalLimit)-photo free limit.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                Section(header: Text("Advanced")) {
+                    Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
+                        Text("8").tag(8)
+                        Text("16").tag(16)
+                        Text("32").tag(32)
+                        Text("64").tag(64)
+                    }
+                    Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
