@@ -54,7 +54,7 @@ from srsim import CFA, SCALE, Cfg
 # ours, ours2, ours3, ... -- one 8-frame handheld burst of one scene each. Globbed
 # rather than listed so another capture is picked up by dropping the folder in.
 # sorted() inside find_dngs keeps the order stable, which the holdout depends on.
-EXTRA_SCENE_GLOBS = ['../ours*/*.dng', '../shots/*.dng']
+EXTRA_SCENE_GLOBS = ['../ours*/*.dng', '../shots/*.dng', '../*.dng']
 
 
 def find_dngs(root, extra=True):
@@ -125,28 +125,80 @@ def load_scene(path):
 # motion
 # --------------------------------------------------------------------------
 
-class Motion:
-    """A similarity in RAW pixel coordinates mapping REFERENCE -> frame n,
-    which is the direction the merge's flow points (lr_mov = lr + flow)."""
+def _par_dir(m):
+    """Unit direction of a frame's camera translation; (0,0) when it did not
+    move, so a stationary frame gets no parallax rather than a random one."""
+    d = m.t
+    n = float(np.hypot(d[0], d[1]))
+    return (0.0, 0.0) if n < 1e-9 else (float(d[0]) / n, float(d[1]) / n)
 
-    def __init__(self, theta, tx, ty, cy, cx):
+
+class Motion:
+    """Camera motion in RAW pixel coordinates, REFERENCE -> frame n, which is
+    the direction the merge's flow points (lr_mov = lr + flow).
+
+    Roll, yaw and pitch, plus an image-plane translation.
+
+    Roll alone is a similarity, and that is all this modelled before. Yaw and
+    pitch are rotations about the camera's own vertical and horizontal axes, so
+    they are PROJECTIVE: the image transform is K R K^-1, and the displacement
+    they produce grows quadratically toward the frame edges rather than
+    linearly. That matters here for two reasons. A per-tile constant flow
+    approximates a projective field worst at the sides, which is where the
+    straight-line misalignments show up; and no amount of in-plane rotation
+    reproduces the keystone, so a mask trained only on roll has never seen the
+    shape. Handheld capture has yaw and pitch in it as a matter of course --
+    they are what pointing the phone slightly differently looks like.
+
+    Reduces EXACTLY to the old similarity when yaw = pitch = 0: K R K^-1 for a
+    pure roll is the in-plane rotation, so existing behaviour is unchanged.
+    """
+
+    def __init__(self, theta, tx, ty, cy, cx, yaw=0.0, pitch=0.0, f=None,
+                 scale=1.0):
         self.theta = float(theta)
+        # Dolly: the camera moving along its optical axis. A pure scale about the
+        # principal point, so the flow is RADIAL and grows with distance from
+        # centre -- another field a per-tile constant vector fits worst at the
+        # frame edges, which is where the reported misalignments are.
+        self.scale = float(scale)
+        self.yaw = float(yaw)
+        self.pitch = float(pitch)
         self.t = np.array([tx, ty], np.float64)
         self.c = np.array([cx, cy], np.float64)
+        # Focal length in raw pixels. 1.5x the half-diagonal is a normal phone
+        # field of view; it only sets how much keystone a given yaw produces.
+        self.f = float(f) if f else 3.0 * float(max(cx, cy))
+
+    def _R(self, inv=False):
+        cr, sr = np.cos(self.theta), np.sin(self.theta)
+        cy_, sy_ = np.cos(self.yaw), np.sin(self.yaw)
+        cp, sp = np.cos(self.pitch), np.sin(self.pitch)
+        Rz = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]])
+        Ry = np.array([[cy_, 0.0, sy_], [0.0, 1.0, 0.0], [-sy_, 0.0, cy_]])
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]])
+        R = Ry @ Rx @ Rz
+        return R.T if inv else R
+
+    def _warp(self, x, y, R, tx, ty, sc=1.0):
+        X = (x - self.c[0]) / self.f
+        Y = (y - self.c[1]) / self.f
+        Xp = R[0, 0] * X + R[0, 1] * Y + R[0, 2]
+        Yp = R[1, 0] * X + R[1, 1] * Y + R[1, 2]
+        Zp = R[2, 0] * X + R[2, 1] * Y + R[2, 2]
+        # Behind the camera cannot be imaged; clamp rather than produce a sign
+        # flip, which would fold the frame onto itself.
+        Zp = np.where(np.abs(Zp) < 1e-6, 1e-6, Zp)
+        return (self.f * Xp / Zp * sc + self.c[0] + tx,
+                self.f * Yp / Zp * sc + self.c[1] + ty)
 
     def forward(self, x, y):
-        ct, st = np.cos(self.theta), np.sin(self.theta)
-        dx = x - self.c[0]
-        dy = y - self.c[1]
-        return (ct * dx - st * dy + self.c[0] + self.t[0],
-                st * dx + ct * dy + self.c[1] + self.t[1])
+        return self._warp(x, y, self._R(False), self.t[0], self.t[1],
+                          self.scale)
 
     def inverse(self, x, y):
-        ct, st = np.cos(-self.theta), np.sin(-self.theta)
-        dx = x - self.c[0] - self.t[0]
-        dy = y - self.c[1] - self.t[1]
-        return (ct * dx - st * dy + self.c[0],
-                st * dx + ct * dy + self.c[1])
+        return self._warp(x - self.t[0], y - self.t[1], self._R(True), 0.0,
+                          0.0, 1.0 / max(self.scale, 1e-9))
 
 
 def _bilinear(img, y, x):
@@ -194,22 +246,45 @@ class BurstSpec:
         one shape whose displaced copy still matches itself.
     """
 
-    def __init__(self, rng, regime=None):
+    # Motion magnitude as a STRATIFIED LADDER rather than one wide draw.
+    #
+    # Everything used to be a single log-uniform over the full range, e.g.
+    # trans over 0.3..250 px. That leaves coverage of any particular magnitude
+    # to chance, and the bands that matter most were the thinnest: level 0 here
+    # (sub-pixel camera motion, a near-tripod shot) did not exist at all, and
+    # the object case started at 5 px so a slowly drifting subject was never
+    # shown. Drawing the LEVEL first and the value inside it guarantees every
+    # band is represented in proportion, which is what makes "progressively
+    # larger" a property of the dataset rather than of the seed.
+    #
+    #        trans px        roll rad       sigma_flow px   obj_vel px      yaw/pitch rad
+    LEVELS = (
+        ((0.05, 0.5),   (0.0000, 0.002), (0.01, 0.04), (0.2, 1.0),    (0.0000, 0.0015)),
+        ((0.5, 3.0),    (0.0000, 0.006), (0.04, 0.12), (1.0, 5.0),    (0.0000, 0.0040)),
+        ((3.0, 15.0),   (0.0005, 0.015), (0.12, 0.40), (5.0, 25.0),   (0.0010, 0.0100)),
+        ((15.0, 60.0),  (0.0010, 0.030), (0.40, 1.20), (25.0, 100.0), (0.0020, 0.0200)),
+        ((60.0, 250.0), (0.0020, 0.055), (1.20, 6.00), (100.0, 400.0),(0.0040, 0.0350)),
+    )
+
+    def __init__(self, rng, regime=None, level=None):
         r = rng
-        self.regime = regime if regime is not None else r.integers(0, 4)
-        # Handheld camera motion. Log-uniform because the small end is where
-        # most shots live and where rejection is most harmful, while the large
-        # end has to be represented at all.
-        self.trans = float(np.exp(r.uniform(np.log(0.3), np.log(250.0))))
-        # Up to 0.055 rad (3.2 deg), not 0.020 (1.1 deg). Handheld roll across
-        # an 8-frame burst reaches several degrees, and the mask was measured
+        # 5 regimes now: 4 is parallax. See synth_burst.
+        self.regime = regime if regime is not None else r.integers(0, 5)
+        self.level = int(level) if level is not None else int(r.integers(0, len(self.LEVELS)))
+        tr, th, sf, ov, yp = self.LEVELS[self.level]
+
+        def logu(lo, hi):
+            return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+        self.trans = logu(*tr)
+        # Up to 0.055 rad (3.2 deg) at the top level. Handheld roll across an
+        # 8-frame burst reaches several degrees, and the mask was measured
         # FAILING on rotation -- 1.3 dB worse than merging everything on a
-        # burst it had estimated correctly. A cap at 1.1 deg meant the regime it
-        # fails on was barely in the training set at all.
-        self.theta = float(r.uniform(0.0, 0.055)) * (1 if r.random() < 0.7 else 0)
+        # burst it had estimated correctly.
+        self.theta = float(r.uniform(*th)) * (1 if r.random() < 0.7 else 0)
         # Irregular (non-monotonic) camera motion.
         #
-        # Every trajectory here was displacement = trans * n/(N-1), a straight
+        # Every trajectory used to be displacement = trans * n/(N-1), a straight
         # ramp whose only randomness was its direction. Real handheld is a
         # random walk: the camera reverses, pauses and accelerates inside one
         # burst, so consecutive frames are not ordered by how far they have
@@ -218,18 +293,41 @@ class BurstSpec:
         # a near-perfect proxy for misalignment -- a shortcut that does not
         # exist on a real burst.
         self.irregular = bool(r.random() < 0.5)
-        self.sigma_flow = float(np.exp(r.uniform(np.log(0.08), np.log(6.0))))
+        self.sigma_flow = logu(*sf)
         # A translation-only estimate of a rotating field: coherent within-tile
         # error, the mode a residual test cannot see.
         self.translation_only = bool(self.regime == 1)
         if self.translation_only:
-            self.theta = float(r.uniform(0.002, 0.040))
-            self.sigma_flow = float(np.exp(r.uniform(np.log(0.08), np.log(0.8))))
-        # An independently moving subject. 5-400 px log-uniform: block matching
-        # follows the low end and cannot follow the high end, and the mask has to
-        # handle both.
+            self.theta = max(self.theta, float(r.uniform(0.002, max(0.003, th[1]))))
+            self.sigma_flow = min(self.sigma_flow, 0.8)
+        # An independently moving subject, now from 0.2 px (a slow drift the
+        # block match follows exactly) up to 400 px (which it cannot follow at
+        # all). The mask has to handle both ends and everything between.
         self.has_object = bool(self.regime == 2)
-        self.obj_vel = float(np.exp(r.uniform(np.log(5.0), np.log(400.0))))
+        self.obj_vel = logu(*ov)
+        # Parallax: depth-induced motion under camera TRANSLATION.
+        #
+        # Different in kind from the moving-object case, which is why it gets
+        # its own regime rather than a wider obj_vel. An object is one compact
+        # support moving against a static background; parallax is EVERYWHERE,
+        # its magnitude is tied to scene structure rather than to a mask, and
+        # at every depth discontinuity a tile straddles two disparities -- so
+        # the single per-tile motion vector lands between them and is wrong on
+        # both sides. That is the same geometry as the side-of-frame
+        # misalignment that survives rotation, and no residual test sees it,
+        # because within a tile the error is coherent.
+        #
+        # disparity = baseline / depth, so the inverse-depth map IS the flow
+        # shape and only its scale is free.
+        # Out-of-plane rotation. Drawn independently per axis and allowed to be
+        # zero, because a handheld burst is not always tilting.
+        # Dolly, log-symmetric about 1.0 so in and out are equally likely.
+        dz = (yp[1] - yp[0]) * 1.2
+        self.scale = float(np.exp(r.uniform(-dz, dz))) if r.random() < 0.5 else 1.0
+        self.yaw = float(r.uniform(*yp)) * (1 if r.random() < 0.6 else 0)
+        self.pitch = float(r.uniform(*yp)) * (1 if r.random() < 0.6 else 0)
+        self.has_parallax = bool(self.regime == 4)
+        self.par_disp = logu(max(0.3, tr[0]), max(1.0, tr[1]))
         self.obj_lock_p = float(r.uniform(0.5, 1.0))
         # Non-rigid: the subject also rotates and changes scale, so its displaced
         # copy does not match itself the way a translated rectangle does.
@@ -271,17 +369,24 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
             th = spec.theta * float(rot[n])
             tx = spec.trans * float(wlk[n, 0])
             ty = spec.trans * float(wlk[n, 1])
+            yw = spec.yaw * float(wlk[n, 0])
+            pt = spec.pitch * float(wlk[n, 1])
         else:
             th = spec.theta * f * rng.uniform(0.6, 1.4)
             tx = spec.trans * f * rng.uniform(-1, 1)
             ty = spec.trans * f * rng.uniform(-1, 1)
-        motions.append(Motion(th, tx, ty, cy, cx))
+            yw = spec.yaw * f * rng.uniform(-1, 1)
+            pt = spec.pitch * f * rng.uniform(-1, 1)
+        sc_n = spec.scale ** (float(wlk[n, 0]) if spec.irregular else f)
+        motions.append(Motion(th, tx, ty, cy, cx, yaw=yw, pitch=pt, scale=sc_n))
         if spec.has_object:
             ox = tx + spec.obj_vel * f * rng.uniform(-1, 1)
             oy = ty + spec.obj_vel * f * rng.uniform(-1, 1)
             # Its own rotation on top of the camera's, so the subject deforms
             # relative to the background rather than sliding rigidly.
-            obj_motions.append(Motion(th + spec.obj_theta * f, ox, oy, cy, cx))
+            obj_motions.append(Motion(th + spec.obj_theta * f, ox, oy,
+                                      cy, cx, yaw=yw, pitch=pt,
+                                      scale=sc_n * spec.obj_scale ** f))
         else:
             obj_motions.append(motions[-1])
 
@@ -309,6 +414,31 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
         field = top * (1 - fy_) + bot * fy_
         obj_mask = field > np.quantile(field, 1.0 - frac)
 
+    # Inverse depth, for the parallax regime. A smooth random field with a few
+    # sharp steps: the smooth part gives the gradual disparity change a per-tile
+    # flow handles fine, and the steps give the depth edges where it cannot.
+    inv_depth = None
+    if spec.has_parallax:
+        k = max(2, min(h, w) // 96)
+        f0 = rng.standard_normal((k, k))
+        for _ in range(2):
+            f0 = 0.25 * (f0 + np.roll(f0, 1, 0) + np.roll(f0, -1, 0) +
+                         np.roll(f0, 1, 1))
+        ys = np.linspace(0, k - 1, h)
+        xs = np.linspace(0, k - 1, w)
+        y0i = np.clip(ys.astype(int), 0, k - 2)
+        x0i = np.clip(xs.astype(int), 0, k - 2)
+        fy_ = (ys - y0i)[:, None]
+        fx_ = (xs - x0i)[None, :]
+        top = f0[y0i][:, x0i] * (1 - fx_) + f0[y0i][:, x0i + 1] * fx_
+        bot = f0[y0i + 1][:, x0i] * (1 - fx_) + f0[y0i + 1][:, x0i + 1] * fx_
+        fld = top * (1 - fy_) + bot * fy_
+        fld = (fld - fld.min()) / max(fld.max() - fld.min(), 1e-9)
+        # Two or three depth planes with hard edges, plus the smooth part.
+        steps = float(rng.integers(2, 4))
+        inv_depth = (np.floor(fld * steps) / steps) * 0.7 + fld * 0.3
+        inv_depth = inv_depth.astype(np.float64)
+
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     cfa_ch = CFA[np.arange(h)[:, None] & 1, np.arange(w)[None, :] & 1]
 
@@ -326,6 +456,14 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
             py = np.where(is_obj, poy, pby)
         else:
             px, py = pbx, pby
+        if inv_depth is not None:
+            # Depth-proportional shift along the camera's own displacement for
+            # this frame, so it is a true parallax field and not extra noise.
+            # Motion stores the translation as .t -- an hasattr('tx') guard here
+            # silently produced zero parallax.
+            ux, uy = _par_dir(motions[n])
+            px = px + ux * spec.par_disp * inv_depth
+            py = py + uy * spec.par_disp * inv_depth
         samp = _bilinear(blurred, py * SCALE, px * SCALE)
         clean = np.take_along_axis(samp, cfa_ch[..., None], axis=2)[..., 0]
         clean = np.clip(clean, 0.0, 1.0).astype(np.float32)
@@ -352,6 +490,14 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
             fy = np.where(obj_here, fy_o, fy_b)
         else:
             fx, fy = fx_b, fy_b
+        if inv_depth is not None:
+            # Per-PIXEL inverse depth: this is the exact field, which is what
+            # makes the ground-truth merge correct and ferr meaningful.
+            ux, uy = _par_dir(motions[n])
+            idp = inv_depth[np.clip(np.rint(lr_y).astype(np.int64), 0, h - 1),
+                            np.clip(np.rint(lr_x).astype(np.int64), 0, w - 1)]
+            fx = fx + ux * spec.par_disp * idp
+            fy = fy + uy * spec.par_disp * idp
         true_flow.append((fx - lr_x, fy - lr_y))
 
     # --- ESTIMATED per-tile flow (what block matching would hand the mask)
@@ -367,11 +513,32 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
                 blk = obj_mask[i * ts:(i + 1) * ts, j * ts:(j + 1) * ts]
                 tile_obj[i, j] = blk.mean() > 0.5
 
+    # Per-tile MEDIAN inverse depth: what a block match actually locks onto.
+    #
+    # It finds the one displacement that best explains the tile as a whole,
+    # which is the dominant depth in it. A tile wholly inside one depth plane is
+    # therefore estimated correctly; a tile straddling a depth EDGE gets a
+    # single vector that is wrong on both sides of the edge, by half the
+    # disparity step each way. That residual is coherent within the tile, so no
+    # residual-based test can see it -- the same geometry as the side-of-frame
+    # misalignment that survives rotation.
+    tile_idp = None
+    if inv_depth is not None:
+        tile_idp = np.zeros((ny, nx))
+        for i in range(ny):
+            for j in range(nx):
+                tile_idp[i, j] = np.median(
+                    inv_depth[i * ts:(i + 1) * ts, j * ts:(j + 1) * ts])
+
     flows = []
     for n in range(N):
         bx, by = motions[n].forward(TCX, TCY)
         fx = bx - TCX
         fy = by - TCY
+        if tile_idp is not None:
+            ux, uy = _par_dir(motions[n])
+            fx = fx + ux * spec.par_disp * tile_idp
+            fy = fy + uy * spec.par_disp * tile_idp
         if spec.translation_only:
             # the estimate collapses the rotating field to its mean translation
             fx = np.full_like(fx, fx.mean())
@@ -403,5 +570,7 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
                 # 1, so these are the bursts that answer "does the mask reject
                 # camera rotation it could have merged".
                 theta=spec.theta, trans=spec.trans,
-                irregular=spec.irregular,
+                yaw=spec.yaw, pitch=spec.pitch, scale=spec.scale,
+                irregular=spec.irregular, level=spec.level,
+                has_parallax=spec.has_parallax,
                 translation_only=spec.translation_only)

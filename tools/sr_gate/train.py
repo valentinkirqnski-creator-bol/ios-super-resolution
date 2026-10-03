@@ -110,8 +110,22 @@ def ghost_risk(ferr, hs, ws, thresh=1.6):
     return torch.nn.functional.interpolate(g, size=(hs, ws), mode='nearest')[:, 0]
 
 
-def losses(out, gt, edge, ghost=None, floor=None, w_edge=3.0, w_grad=1.0,
-           w_ghost=6.0):
+def keep_value(ferr, hs, ws, thresh=1.6):
+    """Where EVERY frame is well aligned, so merging is unambiguously right.
+
+    The exact complement of ghost_risk: amax <= thresh against its amax >
+    thresh. A min over frames was tried first and is wrong -- "at least one of
+    seven frames is usable" is true for 99.5% of pixels, which makes the term
+    uniform, and a uniform weight only SCALES the loss. Every intervention that
+    merely scaled this mask has measured as doing nothing to its selectivity,
+    so a weight that cannot discriminate is not worth adding.
+    """
+    k = (ferr.amax(dim=1) <= thresh).float().unsqueeze(1)
+    return torch.nn.functional.interpolate(k, size=(hs, ws), mode='nearest')[:, 0]
+
+
+def losses(out, gt, edge, ghost=None, floor=None, keep=None, w_edge=3.0,
+           w_grad=1.0, w_ghost=6.0, w_keep=4.0):
     l1 = (out - gt).abs().mean()
     norm = edge.flatten(1).mean(dim=1).clamp_min(1e-6).view(-1, 1, 1)
     en = (edge / norm).clamp(0, 8)
@@ -128,6 +142,21 @@ def losses(out, gt, edge, ghost=None, floor=None, w_edge=3.0, w_grad=1.0,
         # failure that is visible: detail from a wrongly placed frame laid over
         # an edge, which is what reads as thickening.
         ew = ew + w_ghost * en * ghost
+    if keep is not None:
+        # The complement of the ghost term, and the one that was missing.
+        #
+        # ghost pays for MERGING damage. Nothing paid for DISCARDING good
+        # signal, and that asymmetry is the over-rejection: measured on
+        # APC_1186, 100% of pixels are well aligned under realistic motion and
+        # the mask still rejected about 30% of them, where Wronski rejected 8%.
+        # The plain L1 does technically pay -- the target holds the detail a
+        # rejected aligned pixel threw away -- but a fraction of a dB on an easy
+        # burst was worth nothing beside ten on a broken one.
+        #
+        # Weighted by 1+en rather than en: a ghost is only visible on an edge,
+        # but throwing away a well-aligned FLAT region costs real noise
+        # reduction, so it must not be free away from edges.
+        ew = ew + w_keep * (1.0 + en) * keep
     per = ((out - gt).abs().mean(dim=1) * ew).flatten(1).mean(dim=1)
     if floor is not None:
         # Each burst scored against ITS OWN achievable error, not in absolute
@@ -207,7 +236,8 @@ def evaluate(net, val):
 
 
 def report(rows):
-    names = {0: 'jitter', 1: 'rot-only', 2: 'object', 3: 'outlier'}
+    names = {0: 'jitter', 1: 'rot-only', 2: 'object', 3: 'outlier',
+             4: 'parallax'}
     print('%-9s %-6s %-8s %-8s %-8s %-10s %-9s %-7s %-7s' %
           ('regime', 'sig_f', 'Wronski', 'R=1', 'gate', 'vs Wronski', 'vs R=1',
            'meanRg', 'meanRw'))
@@ -242,6 +272,15 @@ def main():
                     help='train on only the first N feature channels. The set only '
                          'ever grows by appending, so this ablates the additions '
                          'against the SAME bursts rather than a rebuilt dataset.')
+    ap.add_argument('--w-keep', type=float, default=4.0,
+                    help='weight on not discarding well-aligned signal. This '
+                         'and --w-ghost ARE the over-rejection vs edge-precision '
+                         'trade: at 4.0 the mask reaches within 0.02 dB of R=1 '
+                         'on a static burst but its edge/real rises to 0.381 '
+                         'from 0.139, i.e. it merges misaligned edges it should '
+                         'reject.')
+    ap.add_argument('--w-ghost', type=float, default=6.0,
+                    help='weight on not merging a real misalignment on an edge')
     ap.add_argument('--eval-every', type=float, default=300.0,
                     help='seconds between validation passes')
     a = ap.parse_args()
@@ -276,7 +315,10 @@ def main():
         _, _, _, loss = losses(out, d['gt'], d['edge'],
                                ghost_risk(d['ferr'], out.shape[-2],
                                           out.shape[-1]),
-                               r1_floor(d, d['edge']))
+                               r1_floor(d, d['edge']),
+                               keep_value(d['ferr'], out.shape[-2],
+                                          out.shape[-1]),
+                               w_ghost=a.w_ghost, w_keep=a.w_keep)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -306,7 +348,10 @@ def main():
         l1, l1e, lg, loss = losses(out, d['gt'], d['edge'],
                                    ghost_risk(d['ferr'], out.shape[-2],
                                               out.shape[-1]),
-                                   r1_floor(d, d['edge']))
+                                   r1_floor(d, d['edge']),
+                                   keep_value(d['ferr'], out.shape[-2],
+                                              out.shape[-1]),
+                                   w_ghost=a.w_ghost, w_keep=a.w_keep)
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
