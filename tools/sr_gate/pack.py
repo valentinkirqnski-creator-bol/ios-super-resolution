@@ -24,6 +24,10 @@ FIELDS = {
     'gt': np.float32,
     'edge': np.float16,
     'Rw': np.float16,
+    # Per-pixel error of the flow the merge used, raw px, per comparison frame.
+    # Carried for the LOSS WEIGHT only -- never as a target. fp16 is ample: the
+    # loss only asks whether it crosses a 1.6 px threshold.
+    'ferr': np.float16,
     'meta': np.float32,
 }
 

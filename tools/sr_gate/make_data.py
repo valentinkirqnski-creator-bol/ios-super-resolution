@@ -75,6 +75,7 @@ def save(d, path):
         B_ref=d['B_ref'].astype(np.float16),
         gt=d['gt'].astype(np.float32),
         edge=d['edge'].astype(np.float16),
+        ferr=d['ferr'].astype(np.float16),
         meta=np.array([d['regime'], d['sigma_flow'], d['noise_gain'],
                        d['tile_size']], np.float32),
     )
@@ -145,7 +146,14 @@ def main():
     # training: regimes sampled with the moving-object case over-weighted,
     # because that is the one where a mask has to be SELECTIVE rather than
     # uniformly permissive or uniformly strict.
-    weights = np.array([0.32, 0.20, 0.32, 0.16])
+    # Rebalanced toward the clean handheld case after eval_goals.py measured the
+    # gate sitting at mean R 0.576 on a STATIC burst, where nothing is wrong and
+    # R=1 is optimal -- 0.56 dB given away for no reason. Two thirds of the
+    # bursts here carried a deliberate corruption, so the clean case had little
+    # gradient behind it. The moving-object case stays above uniform (0.28 vs
+    # 0.25) because it is still the one where a mask has to be SELECTIVE rather
+    # than uniformly permissive or uniformly strict.
+    weights = np.array([0.44, 0.16, 0.28, 0.12])
     for i in range(a.train):
         regime = int(np.searchsorted(np.cumsum(weights), rng.random()))
         jobs.append(('train', i, train_files[i % len(train_files)],

@@ -84,6 +84,14 @@ def build_burst(scene, spec, rng, tile_size=16):
     NF = 8
     feat = np.zeros((N - 1, NF, gh, gw), np.float32)
     Rw = np.zeros((N - 1, gh, gw), np.float32)
+    # How wrong the flow the merge ACTUALLY used is, per mask pixel, in raw
+    # pixels. The synthesiser imposed the motion, so this is exact rather than
+    # estimated -- which is what makes it possible to ask whether a rejection
+    # was deserved. A large residual with a small ferr is aliasing the merge
+    # wants; the same residual with a large ferr is damage. No statistic
+    # available on a real burst can separate those two, and every question about
+    # over-rejection is really a question about this quantity.
+    ferr = np.zeros((N - 1, gh, gw), np.float32)
 
     for n in range(1, N):
         covs = srmerge.estimate_kernels(b['raws'][n], cfg)
@@ -96,6 +104,12 @@ def build_burst(scene, spec, rng, tile_size=16):
         tfx, tfy = b['true_flow'][n]
         Ag[n - 1], Bg[n - 1] = srmerge.accumulate_comp_ab(
             b['raws_clean'][n], tfx[::ST, ::ST], tfy[::ST, ::ST], covs_c, cfg, ST)
+        # Both are the per-output-pixel flow at stride ST, so they subtract
+        # directly; [::2, ::2] then drops it onto the half-resolution mask
+        # lattice the gate and Rw live on.
+        dfx = fx - tfx[::ST, ::ST]
+        dfy = fy - tfy[::ST, ::ST]
+        ferr[n - 1] = np.sqrt(dfx * dfx + dfy * dfy)[::2, ::2]
 
         gm, gv = srsim.local_stats_3x3(
             srsim.compute_guide_decimate3(b['raws'][n]))
@@ -121,10 +135,11 @@ def build_burst(scene, spec, rng, tile_size=16):
     edge = np.sqrt(gx * gx + gy * gy)
 
     return dict(feat=feat, Rw=Rw, A=A, B=B, A_ref=A_ref, B_ref=B_ref, gt=gt,
-                edge=edge.astype(np.float32), h=h, w=w,
+                edge=edge.astype(np.float32), ferr=ferr, h=h, w=w,
                 stride=ST, guide_scale=2,
                 tile_size=tile_size, regime=b['regime'],
-                sigma_flow=b['sigma_flow'], noise_gain=b['noise_gain'])
+                sigma_flow=b['sigma_flow'], noise_gain=b['noise_gain'],
+                theta=b.get('theta', 0.0))
 
 
 def merged(d, R):

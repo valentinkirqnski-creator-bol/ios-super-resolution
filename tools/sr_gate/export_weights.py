@@ -74,8 +74,14 @@ def main():
     for conv in net.convs:
         flat.append(conv.weight.detach().numpy().ravel())
         flat.append(conv.bias.detach().numpy().ravel())
-    flat.append(net.head.weight.detach().numpy().ravel())
-    flat.append(net.head.bias.detach().numpy().ravel())
+    # The output temperature is folded in HERE, so the device keeps its plain
+    # sigmoid. sigmoid(T*(w.x + b)) == sigmoid((Tw).x + Tb) exactly, so this is
+    # an identity and not an approximation: core/sr_gate.cpp and the Metal
+    # kernel need no change, the weight-blob layout is unchanged, and parity.py
+    # still compares like with like.
+    t = float(getattr(net, 'out_temp', 1.0))
+    flat.append((net.head.weight.detach().numpy() * t).ravel())
+    flat.append((net.head.bias.detach().numpy() * t).ravel())
     w = np.concatenate(flat).astype(np.float32)
     assert w.size == net.n_params(), (w.size, net.n_params())
     assert tuple(ck['dilations']) == gate.DILATIONS, \

@@ -46,6 +46,10 @@ COARSE_WIDTH = 10
 COARSE_DILATIONS = (1, 2, 4, 8)
 
 
+# Sharpness of the output sigmoid. 1.0 reproduces the original behaviour.
+OUT_TEMP = 3.0
+
+
 class SRGate(nn.Module):
     """Per-pixel mask from per-pixel features, with a coarse branch for context.
 
@@ -67,6 +71,7 @@ class SRGate(nn.Module):
     """
 
     def __init__(self, in_ch=NUM_FEATURES, width=WIDTH, dilations=DILATIONS,
+                 out_temp=OUT_TEMP,
                  coarse=True, pool=POOL, coarse_width=COARSE_WIDTH,
                  coarse_dilations=COARSE_DILATIONS):
         super().__init__()
@@ -90,11 +95,34 @@ class SRGate(nn.Module):
             for i, d in enumerate(self.dilations)
         ])
         self.head = nn.Conv2d(chans[-1], 1, 1)
-        # Start permissive. R near 1 is the do-no-harm initialisation: the mask
-        # begins as "merge everything" and training has to earn every rejection,
-        # rather than starting from a collapse it then has to climb out of.
+        # Start permissive: the mask begins as "merge everything" and training
+        # has to earn every rejection, rather than starting from a collapse it
+        # then has to climb out of.
+        #
+        # 3.5, not 2.0. The head only ever learns to SUBTRACT from this bias --
+        # rejection is what the loss rewards -- so whatever sigmoid(bias) is
+        # becomes an effective CEILING on the finished mask. At 2.0 that ceiling
+        # was sigmoid(2.0) = 0.881, and the shipped model's measured maximum was
+        # 0.853..0.861 over six bursts spanning sigma_flow 0.12 to 5.0: it could
+        # not say "fully trust this pixel" anywhere, and its median on a static
+        # burst was 0.46 where 1.0 was correct. 3.5 puts the start at 0.971.
+        #
+        # A stretched sigmoid with a clamp was tried first, to make a hard 0 and
+        # a hard 1 exactly attainable, and it FAILED: with bias 4.0 the start
+        # landed at 1.0013, inside the clamp, where the gradient is zero. The
+        # net sat at its initialisation for all 4000 steps and emitted a constant
+        # 1.0 -- identical to R=1 on every validation row, and 12.85 dB worse
+        # than Wronski at sigma_flow 5.0. Keep the activation unsaturating, and
+        # keep the init off its flat region.
+        self.out_temp = float(out_temp)
         nn.init.zeros_(self.head.weight)
-        nn.init.constant_(self.head.bias, 2.0)
+        # Divided by the temperature so the STARTING output is sigmoid(3.5) =
+        # 0.971 whatever the temperature is. Initialising past the saturation
+        # knee is how the clamp attempt died, and a temperature reaches
+        # saturation sooner, so this division is load-bearing rather than
+        # cosmetic: at T=3 a bias of 3.5 would start at sigmoid(10.5), where the
+        # gradient is ~2e-5 and the net cannot move.
+        nn.init.constant_(self.head.bias, 3.5 / self.out_temp)
 
     def _coarse(self, x):
         n, c, h, w = x.shape
@@ -119,7 +147,22 @@ class SRGate(nn.Module):
         for conv, d in zip(self.convs, self.dilations):
             x = F.pad(x, (d, d, d, d), mode='replicate')
             x = F.relu(conv(x))
-        return torch.sigmoid(self.head(x))
+        # Temperature, not a clamp.
+        #
+        # The measured defect of every model so far is that it will not COMMIT:
+        # mean R sat near 0.5 everywhere, and its edge/real vs edge/aligned gap
+        # was 0.27 against Wronski's 0.73 -- while Wronski gets that gap from a
+        # pointwise formula with no network, which proves the information is in
+        # the features and the smooth output is what discards it. Raising the
+        # init ceiling (2.0 -> 3.5) did not fix it; a stretched sigmoid with a
+        # clamp killed the gradient outright.
+        #
+        # A temperature has neither problem: it saturates without a flat region,
+        # so the gradient lives everywhere. And it costs NOTHING on the device:
+        # the head is linear, so sigmoid(T*(w.x + b)) == sigmoid((Tw).x + Tb),
+        # and export_weights.py folds T into the head weights. core/sr_gate.cpp
+        # and the Metal kernel keep their plain sigmoid and stay bit-compatible.
+        return torch.sigmoid(self.head(x) * self.out_temp)
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -134,6 +177,7 @@ def from_checkpoint(ck):
     coarse branch existed have no 'coarse' key and are fine-only."""
     net = SRGate(in_ch=ck['in_ch'], width=ck['width'],
                  dilations=ck['dilations'], coarse=ck.get('coarse', False),
+                 out_temp=ck.get('out_temp', 1.0),
                  pool=ck.get('pool', POOL),
                  coarse_dilations=tuple(ck.get('coarse_dilations',
                                                COARSE_DILATIONS)))

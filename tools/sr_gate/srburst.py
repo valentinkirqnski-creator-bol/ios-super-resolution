@@ -54,7 +54,7 @@ from srsim import CFA, SCALE, Cfg
 # ours, ours2, ours3, ... -- one 8-frame handheld burst of one scene each. Globbed
 # rather than listed so another capture is picked up by dropping the folder in.
 # sorted() inside find_dngs keeps the order stable, which the holdout depends on.
-EXTRA_SCENE_GLOBS = ['../ours*/*.dng']
+EXTRA_SCENE_GLOBS = ['../ours*/*.dng', '../shots/*.dng']
 
 
 def find_dngs(root, extra=True):
@@ -201,13 +201,29 @@ class BurstSpec:
         # most shots live and where rejection is most harmful, while the large
         # end has to be represented at all.
         self.trans = float(np.exp(r.uniform(np.log(0.3), np.log(250.0))))
-        self.theta = float(r.uniform(0.0, 0.020)) * (1 if r.random() < 0.7 else 0)
+        # Up to 0.055 rad (3.2 deg), not 0.020 (1.1 deg). Handheld roll across
+        # an 8-frame burst reaches several degrees, and the mask was measured
+        # FAILING on rotation -- 1.3 dB worse than merging everything on a
+        # burst it had estimated correctly. A cap at 1.1 deg meant the regime it
+        # fails on was barely in the training set at all.
+        self.theta = float(r.uniform(0.0, 0.055)) * (1 if r.random() < 0.7 else 0)
+        # Irregular (non-monotonic) camera motion.
+        #
+        # Every trajectory here was displacement = trans * n/(N-1), a straight
+        # ramp whose only randomness was its direction. Real handheld is a
+        # random walk: the camera reverses, pauses and accelerates inside one
+        # burst, so consecutive frames are not ordered by how far they have
+        # moved. That matters to the mask because span, |E| and the residual
+        # are all read per frame against frame 0, and a ramp makes frame index
+        # a near-perfect proxy for misalignment -- a shortcut that does not
+        # exist on a real burst.
+        self.irregular = bool(r.random() < 0.5)
         self.sigma_flow = float(np.exp(r.uniform(np.log(0.08), np.log(6.0))))
         # A translation-only estimate of a rotating field: coherent within-tile
         # error, the mode a residual test cannot see.
         self.translation_only = bool(self.regime == 1)
         if self.translation_only:
-            self.theta = float(r.uniform(0.002, 0.020))
+            self.theta = float(r.uniform(0.002, 0.040))
             self.sigma_flow = float(np.exp(r.uniform(np.log(0.08), np.log(0.8))))
         # An independently moving subject. 5-400 px log-uniform: block matching
         # follows the low end and cannot follow the high end, and the mask has to
@@ -235,11 +251,30 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
     N = spec.n_frames
     motions = [Motion(0.0, 0.0, 0.0, cy, cx)]
     obj_motions = [Motion(0.0, 0.0, 0.0, cy, cx)]
+    # A random walk when irregular, the old ramp otherwise. Normalised so the
+    # walk's LARGEST excursion is spec.trans either way, which keeps the two
+    # trajectory kinds comparable in magnitude rather than making the irregular
+    # ones systematically smaller.
+    if spec.irregular:
+        stp = rng.standard_normal((N, 2))
+        wlk = np.cumsum(stp, axis=0)
+        wlk -= wlk[0]
+        amp = np.abs(wlk).max()
+        wlk = wlk / amp if amp > 1e-9 else wlk
+        rot = np.cumsum(rng.standard_normal(N))
+        rot -= rot[0]
+        ramp = np.abs(rot).max()
+        rot = rot / ramp if ramp > 1e-9 else rot
     for n in range(1, N):
         f = n / (N - 1.0)
-        th = spec.theta * f * rng.uniform(0.6, 1.4)
-        tx = spec.trans * f * rng.uniform(-1, 1)
-        ty = spec.trans * f * rng.uniform(-1, 1)
+        if spec.irregular:
+            th = spec.theta * float(rot[n])
+            tx = spec.trans * float(wlk[n, 0])
+            ty = spec.trans * float(wlk[n, 1])
+        else:
+            th = spec.theta * f * rng.uniform(0.6, 1.4)
+            tx = spec.trans * f * rng.uniform(-1, 1)
+            ty = spec.trans * f * rng.uniform(-1, 1)
         motions.append(Motion(th, tx, ty, cy, cx))
         if spec.has_object:
             ox = tx + spec.obj_vel * f * rng.uniform(-1, 1)
@@ -361,4 +396,12 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
     return dict(raws=raws, raws_clean=raws_clean, flows=flows,
                 true_flow=true_flow, obj_mask=obj_mask, tile_size=ts,
                 noise_gain=spec.noise_gain, regime=spec.regime,
-                sigma_flow=spec.sigma_flow, h=h, w=w)
+                sigma_flow=spec.sigma_flow, h=h, w=w,
+                # Returned so an evaluation can select the rotating bursts.
+                # Rotation is estimated CORRECTLY here (the per-tile flow is
+                # read off the true motion at tile centres) in every regime but
+                # 1, so these are the bursts that answer "does the mask reject
+                # camera rotation it could have merged".
+                theta=spec.theta, trans=spec.trans,
+                irregular=spec.irregular,
+                translation_only=spec.translation_only)
