@@ -56,6 +56,9 @@ import srburst
 FERR_REAL = 1.6
 # Edge strength above this quantile of the frame counts as "near an edge".
 EDGE_Q = 0.80
+# Below this quantile of edge strength the ground truth is flat, and anything
+# the merge puts there is an artifact rather than a reconstruction error.
+SMOOTH_Q = 0.50
 
 
 def psnr(a, b):
@@ -74,16 +77,29 @@ def masks_for(d, net, n_in):
 
 
 def merged_psnr(d, mask):
-    """PSNR of the merge under this mask, overall and on the edge band."""
+    """PSNR of the merge: overall, on the edge band, and on the SMOOTH band.
+
+    The smooth band is the one that matters for ghosting and it was missing.
+    `edge` comes from the ground truth, so every edge-keyed figure asks "is the
+    structure that should be here right?" -- and a ghost is structure that
+    should NOT be here, lying in a region the GT calls flat. A wire smeared
+    across open sky is invisible to the edge band and is a tiny area fraction of
+    the whole frame, so the overall mean hides it too. That is how a model which
+    ghosts visibly scored only 0.04 worse on the edge gap.
+    """
     out = bld.srmerge.merge_from_ab(d['A_ref'], d['B_ref'], d['A'], d['B'],
                                     mask_to_output(d, mask))
     gt = d['gt']
     e = d['edge']
     band = e > np.quantile(e, EDGE_Q)
-    band3 = np.broadcast_to(band, gt.shape)
-    mse_e = float(np.mean((out[band3] - gt[band3]) ** 2))
-    return psnr(out, gt), (99.0 if mse_e <= 0 else
-                           float(10.0 * np.log10(1.0 / mse_e)))
+    smooth = e < np.quantile(e, SMOOTH_Q)
+    b3 = np.broadcast_to(band, gt.shape)
+    s3 = np.broadcast_to(smooth, gt.shape)
+    mse_e = float(np.mean((out[b3] - gt[b3]) ** 2))
+    mse_s = float(np.mean((out[s3] - gt[s3]) ** 2))
+    return (psnr(out, gt),
+            99.0 if mse_e <= 0 else float(10.0 * np.log10(1.0 / mse_e)),
+            99.0 if mse_s <= 0 else float(10.0 * np.log10(1.0 / mse_s)))
 
 
 def mask_to_output(d, mask):
@@ -184,11 +200,12 @@ def main():
                     s = acc.setdefault(key, {}).setdefault(case, np.zeros(2))
                     s[0] += float(m.sum())
                     s[1] += m.size
-                    p, pe = merged_psnr(d, m)
-                    q = acc[key].setdefault(case + ':psnr', np.zeros(3))
+                    p, pe, ps = merged_psnr(d, m)
+                    q = acc[key].setdefault(case + ':psnr', np.zeros(4))
                     q[0] += p
                     q[1] += pe
                     q[2] += 1
+                    q[3] += ps
                     nb = np.broadcast_to(near_edge, m.shape)
                     for cell, sel in (('edge/real', nb & real),
                                       ('edge/aligned', nb & ~real),
@@ -216,16 +233,17 @@ def main():
         print(row)
 
     print()
-    print('merged PSNR, dB  (overall / edge band)')
+    print('merged PSNR, dB  (overall / edge band / SMOOTH band)')
     hdr = '%-14s' % 'mask'
     for case, _ in cases:
-        hdr += '%-20s' % case
+        hdr += '%-24s' % case
     print(hdr)
     for nm in names:
         row = '%-14s' % nm[:13]
         for case, _ in cases:
             q = acc[nm].get(case + ':psnr')
-            row += '%-20s' % ('%.2f / %.2f' % (q[0] / q[2], q[1] / q[2])
+            row += '%-24s' % ('%.2f / %.2f / %.2f'
+                              % (q[0] / q[2], q[1] / q[2], q[3] / q[2])
                               if q is not None and q[2] else '-')
         print(row)
 

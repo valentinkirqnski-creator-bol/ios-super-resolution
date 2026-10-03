@@ -141,7 +141,19 @@ def losses(out, gt, edge, ghost=None, floor=None, keep=None, w_edge=3.0,
         # for flat-area ghosts nobody sees. The product pays for exactly the
         # failure that is visible: detail from a wrongly placed frame laid over
         # an edge, which is what reads as thickening.
-        ew = ew + w_ghost * en * ghost
+        # (1 + en), NOT en. This gating was the bug that made v6 ghost.
+        #
+        # `edge` comes from the GROUND TRUTH, so en marks where structure SHOULD
+        # be. A ghost is structure where it should NOT be -- a wire smeared
+        # across open sky -- and there en ~ 0, so an en-gated penalty vanishes at
+        # exactly the pixels the artifact occupies. Worse, the keep term below
+        # carries (1 + en) and so kept full strength there, which left the loss
+        # actively pushing R UP wherever a ghost would land.
+        #
+        # A ghost is in fact MOST conspicuous against a smooth background, not
+        # least. So merging damage must cost something everywhere, and more on an
+        # edge -- never nothing off one.
+        ew = ew + w_ghost * (1.0 + en) * ghost
     if keep is not None:
         # The complement of the ghost term, and the one that was missing.
         #
