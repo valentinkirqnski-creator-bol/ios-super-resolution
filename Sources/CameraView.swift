@@ -1095,6 +1095,12 @@ struct CameraView: View {
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
+            Toggle("Edge Misalignment Rejection", isOn: $cam.tuningParams.edge_misalign_enabled)
+            Text("""
+                 Attenuates only edges where the two frames actually disagree — a measured sub-pixel shift along the edge normal, or a genuine doubled edge from motion. A correctly aligned edge, however sharp, is kept at full weight, so unlike geometry rejection it never thins or drops clean detail. Targets the doubled and thickened edges from hand shake and moving subjects.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
         }
     }
 
