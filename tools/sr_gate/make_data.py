@@ -140,6 +140,13 @@ def main():
     ap.add_argument('--train', type=int, default=72)
     ap.add_argument('--val', type=int, default=24)
     ap.add_argument('--jobs', type=int, default=6)
+    ap.add_argument('--regimes', default='',
+                    help='comma list restricting which regimes are built, e.g. '
+                         '"0" for CAMERA MOTION ONLY -- translation, roll, yaw, '
+                         'pitch and dolly, with no independently moving subject, '
+                         'no parallax and no gross outliers. Levels are then '
+                         'sampled UNIFORMLY so every magnitude band from '
+                         'sub-pixel to 250 px gets equal weight.')
     ap.add_argument('--test', type=int, default=0,
                     help='also build a TEST grid, from the val scenes but with '
                          'different crops, seeds and regime draws. The '
@@ -191,6 +198,15 @@ def main():
     # scene structure, and wrong on both sides of every depth edge.
     r_w = np.array([0.34, 0.12, 0.22, 0.10, 0.22])
     l_w = np.array([0.26, 0.24, 0.20, 0.16, 0.14])
+    only = [int(v) for v in a.regimes.split(',') if v.strip() != ''] if a.regimes else None
+    if only:
+        # Restricted build: the named regimes only, and levels uniform so the
+        # magnitude ladder is swept evenly instead of being weighted small.
+        r_w = np.zeros(5)
+        for q in only:
+            r_w[q] = 1.0 / len(only)
+        l_w = np.full(5, 0.2)
+        print('regimes restricted to %s, levels uniform' % only)
     for i in range(a.train):
         regime = int(np.searchsorted(np.cumsum(r_w), rng.random()))
         level = int(np.searchsorted(np.cumsum(l_w), rng.random()))
@@ -199,14 +215,16 @@ def main():
     # Validation and test: the full 5x5 regime x level grid, so the report is a
     # sweep over both axes rather than an average that hides either.
     k = 0
-    for regime in range(5):
+    grid = only if only else list(range(5))
+    for regime in grid:
         for level in range(5):
-            jobs.append(('val', k, val_files[k % len(val_files)],
-                         500000 + k, out, cache, regime, level))
-            k += 1
+            for rep in range(1 if len(grid) > 1 else 5):
+                jobs.append(('val', k, val_files[k % len(val_files)],
+                             500000 + k, out, cache, regime, level))
+                k += 1
     n_test = 0
     if a.test:
-        for regime in range(5):
+        for regime in grid:
             for level in range(5):
                 jobs.append(('test', n_test,
                              val_files[(n_test + 3) % len(val_files)],

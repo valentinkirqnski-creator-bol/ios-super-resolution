@@ -81,7 +81,9 @@ def build_burst(scene, spec, rng, tile_size=16):
     Bg = np.zeros_like(A)
     # Only the shipped channels are stored. srsim can build 12; channels 8-11
     # measured neutral and core/sr_gate_shared.h declares 8.
-    NF = 8
+    # 9: channels 0-7 plus the per-channel max d^2/sigma^2. srsim can build 13;
+    # 9-12 measured neutral and are not stored.
+    NF = 9
     feat = np.zeros((N - 1, NF, gh, gw), np.float32)
     Rw = np.zeros((N - 1, gh, gw), np.float32)
     # How wrong the flow the merge ACTUALLY used is, per mask pixel, in raw
@@ -116,7 +118,7 @@ def build_burst(scene, spec, rng, tile_size=16):
         d_sq, sig_sq, comps = srsim.compute_d_sigma(ref_m, ref_v, gm, b['flows'][n],
                                                     cfg, std_c, diff_c)
         feat[n - 1] = srsim.build_features(d_sq, sig_sq, ref_m, ref_v,
-                                           b['flows'][n], cfg)[:NF]
+                                           b['flows'][n], cfg, comps)[:NF]
         Rw[n - 1] = srsim.wronski_robustness(d_sq, sig_sq, b['flows'][n], ref_m, cfg)
 
     covs_rc = srmerge.estimate_kernels(b['raws_clean'][0], cfg)

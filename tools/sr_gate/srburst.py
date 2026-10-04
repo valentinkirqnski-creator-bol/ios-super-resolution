@@ -338,12 +338,36 @@ class BurstSpec:
         self.n_frames = 8
 
 
+# Half-res width of a whole 12 MP frame. The displacements in LEVELS are quoted
+# for a frame this wide and are rescaled to whatever is actually synthesised.
+REF_W = 2016.0
+
+
 def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
     """Returns a dict with the raw frames, the estimated per-tile flow, the true
     per-pixel flow at output resolution, and the noise-free frames."""
     Hs, Ws = scene.shape[:2]
     h, w = Hs // SCALE, Ws // SCALE
     blurred = _box2_blur(scene)
+
+    # Displacements are FRACTIONS OF THE FRAME, not absolute pixels.
+    #
+    # Training runs on crops, and a crop is not a small photograph: a 250 px
+    # translation across a 384 px crop leaves 12.2% of the content with any
+    # correspondence at all, where the same translation across a whole 2016 px
+    # frame leaves 76.7%. Six times worse. Without this the network learns
+    # "large motion means almost everything is out of bounds, so reject", which
+    # is a property of the crop and not of the motion, and the lesson does not
+    # transfer to a real burst.
+    #
+    # sigma_flow is NOT scaled: it is per-tile jitter and a tile is 16 px
+    # whatever the frame is. Yaw and pitch need no scaling either, because the
+    # focal length in Motion is derived from the frame size, so their
+    # displacement is already frame-relative.
+    fscale = float(w) / REF_W
+    trans = spec.trans * fscale
+    obj_vel = spec.obj_vel * fscale
+    par_disp = spec.par_disp * fscale
 
     cy, cx = h / 2.0, w / 2.0
     N = spec.n_frames
@@ -367,21 +391,21 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
         f = n / (N - 1.0)
         if spec.irregular:
             th = spec.theta * float(rot[n])
-            tx = spec.trans * float(wlk[n, 0])
-            ty = spec.trans * float(wlk[n, 1])
+            tx = trans * float(wlk[n, 0])
+            ty = trans * float(wlk[n, 1])
             yw = spec.yaw * float(wlk[n, 0])
             pt = spec.pitch * float(wlk[n, 1])
         else:
             th = spec.theta * f * rng.uniform(0.6, 1.4)
-            tx = spec.trans * f * rng.uniform(-1, 1)
-            ty = spec.trans * f * rng.uniform(-1, 1)
+            tx = trans * f * rng.uniform(-1, 1)
+            ty = trans * f * rng.uniform(-1, 1)
             yw = spec.yaw * f * rng.uniform(-1, 1)
             pt = spec.pitch * f * rng.uniform(-1, 1)
         sc_n = spec.scale ** (float(wlk[n, 0]) if spec.irregular else f)
         motions.append(Motion(th, tx, ty, cy, cx, yaw=yw, pitch=pt, scale=sc_n))
         if spec.has_object:
-            ox = tx + spec.obj_vel * f * rng.uniform(-1, 1)
-            oy = ty + spec.obj_vel * f * rng.uniform(-1, 1)
+            ox = tx + obj_vel * f * rng.uniform(-1, 1)
+            oy = ty + obj_vel * f * rng.uniform(-1, 1)
             # Its own rotation on top of the camera's, so the subject deforms
             # relative to the background rather than sliding rigidly.
             obj_motions.append(Motion(th + spec.obj_theta * f, ox, oy,
@@ -462,8 +486,8 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
             # Motion stores the translation as .t -- an hasattr('tx') guard here
             # silently produced zero parallax.
             ux, uy = _par_dir(motions[n])
-            px = px + ux * spec.par_disp * inv_depth
-            py = py + uy * spec.par_disp * inv_depth
+            px = px + ux * par_disp * inv_depth
+            py = py + uy * par_disp * inv_depth
         samp = _bilinear(blurred, py * SCALE, px * SCALE)
         clean = np.take_along_axis(samp, cfa_ch[..., None], axis=2)[..., 0]
         clean = np.clip(clean, 0.0, 1.0).astype(np.float32)
@@ -496,8 +520,8 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
             ux, uy = _par_dir(motions[n])
             idp = inv_depth[np.clip(np.rint(lr_y).astype(np.int64), 0, h - 1),
                             np.clip(np.rint(lr_x).astype(np.int64), 0, w - 1)]
-            fx = fx + ux * spec.par_disp * idp
-            fy = fy + uy * spec.par_disp * idp
+            fx = fx + ux * par_disp * idp
+            fy = fy + uy * par_disp * idp
         true_flow.append((fx - lr_x, fy - lr_y))
 
     # --- ESTIMATED per-tile flow (what block matching would hand the mask)
@@ -537,8 +561,8 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
         fy = by - TCY
         if tile_idp is not None:
             ux, uy = _par_dir(motions[n])
-            fx = fx + ux * spec.par_disp * tile_idp
-            fy = fy + uy * spec.par_disp * tile_idp
+            fx = fx + ux * par_disp * tile_idp
+            fy = fy + uy * par_disp * tile_idp
         if spec.translation_only:
             # the estimate collapses the rotating field to its mean translation
             fx = np.full_like(fx, fx.mean())
