@@ -1669,11 +1669,6 @@ struct RobMaskParams {
     uint geom_relative;
     float geom_noise_floor_mult;
     float geom_reject_threshold_relative;
-    // Measured-misalignment rejection (Config::translation_reject): delta_hat =
-    // d / |grad I| in pixels; keep below px_lo, fade out by px_hi.
-    uint translation_reject_enabled;
-    float translation_reject_px_lo;
-    float translation_reject_px_hi;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2194,26 +2189,6 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
-    // Measured-misalignment rejection: delta_hat = d / |grad I| (pixels). Twin
-    // of translation_reject_keep in robustness.cpp. Catches pure translation and
-    // does not saturate at strong edges; gate on a real edge, soft-ramp.
-    if (p.translation_reject_enabled != 0u && r_val > 0.f) {
-        float sc = (p.nch == 3u) ? 2.0f : 1.0f;
-        int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
-        int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
-        float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
-        float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
-        float gmag = sqrt(gix * gix + giy * giy);
-        float bri = rob_brightness(ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x));
-        float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f)) / sc;
-        if (gmag > nsig) {
-            float delta_px = sqrt(max(0.f, d_sq_)) / (gmag + 1e-6f);
-            float lo = p.translation_reject_px_lo;
-            float hi = max(lo + 1e-3f, p.translation_reject_px_hi);
-            float t = clamp((delta_px - lo) / (hi - lo), 0.f, 1.f);
-            r_val *= 1.f - t * t * (3.f - 2.f * t);
-        }
-    }
     R[gid.y * p.w + gid.x] = r_val;
     // Which prior this pixel ended up on. Compared against r_s1 rather than
     // recomputing the conditions, so the record cannot drift from the value
@@ -2241,11 +2216,6 @@ struct RobMaskRawParams {
     float beta;
     uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide; was _pad0)
     uint per_pixel_s;  // 1 = sample s bilinearly per pixel (Wronski per-pixel M)
-    // Measured-misalignment rejection (Config::translation_reject): delta_hat =
-    // d / |grad I| in pixels; keep below px_lo, fade out by px_hi.
-    uint translation_reject_enabled;
-    float translation_reject_px_lo;
-    float translation_reject_px_hi;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2356,23 +2326,6 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     // Python reference's min/max clamp yields the intended 0. Mirror the CPU
     // guard in compute_robustness_raw_res.
     if (!isfinite(r_val)) r_val = 0.f;
-    // Measured-misalignment rejection (raw lattice: no sc, delta_hat in raw px).
-    if (p.translation_reject_enabled != 0u && r_val > 0.f) {
-        int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
-        int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
-        float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]);
-        float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]);
-        float gmag = sqrt(gix * gix + giy * giy);
-        float bri = ref_means[out_o * p.nch];
-        float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f));
-        if (gmag > nsig) {
-            float delta_px = sqrt(max(0.f, d_sq_)) / (gmag + 1e-6f);
-            float lo = p.translation_reject_px_lo;
-            float hi = max(lo + 1e-3f, p.translation_reject_px_hi);
-            float t = clamp((delta_px - lo) / (hi - lo), 0.f, 1.f);
-            r_val *= 1.f - t * t * (3.f - 2.f * t);
-        }
-    }
     R[out_o] = r_val;
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
