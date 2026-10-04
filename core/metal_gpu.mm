@@ -1632,8 +1632,14 @@ struct RobMaskRawParamsCPU {
     float beta = 0.f;
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide; was _pad0)
     uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
+    uint32_t edge_misalign_enabled = 0;
+    uint32_t edge_misalign_radius = 3;
+    float    edge_misalign_edge_snr = 4.0f;
+    float    edge_misalign_shift_z = 2.0f;
+    float    edge_misalign_ghost_z = 3.0f;
+    float    edge_misalign_min_conf = 0.0f;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 88, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 112, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2263,6 +2269,12 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.beta = cfg.noise_beta_robustness();
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
+    mp.edge_misalign_enabled = cfg.edge_misalign_enabled ? 1u : 0u;
+    mp.edge_misalign_radius = (uint32_t)std::max(1, std::min(cfg.edge_misalign_radius, 4));
+    mp.edge_misalign_edge_snr = cfg.edge_misalign_edge_snr;
+    mp.edge_misalign_shift_z = cfg.edge_misalign_shift_z;
+    mp.edge_misalign_ghost_z = cfg.edge_misalign_ghost_z;
+    mp.edge_misalign_min_conf = cfg.edge_misalign_min_conf;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();

@@ -2216,6 +2216,15 @@ struct RobMaskRawParams {
     float beta;
     uint sqrt_index;  // 1 = index the noise curve by mean^2 (sqrt guide; was _pad0)
     uint per_pixel_s;  // 1 = sample s bilinearly per pixel (Wronski per-pixel M)
+    // Edge-misalignment rejection (Config::edge_misalign_*). comp_means is
+    // already flow-warped here, so the residual shift is measured at the same
+    // normal positions in both frames (no flow offset).
+    uint edge_misalign_enabled;
+    uint edge_misalign_radius;
+    float edge_misalign_edge_snr;
+    float edge_misalign_shift_z;
+    float edge_misalign_ghost_z;
+    float edge_misalign_min_conf;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2233,6 +2242,88 @@ struct RobMaskRawParams {
 // one way: no aperture_limited/tile_residual_high support, so
 // compute_robustness_metal_impl only takes this path when
 // flow_reject_1d_enabled is off.
+// ---- edge-misalignment confidence (twin of edge_misalignment_confidence in
+// robustness.cpp), raw lattice, comp already flow-warped so no flow offset ----
+inline float rob_em_luma(device const float* buf, uint w, uint nch, int y, int x) {
+    uint o = (uint(y) * w + uint(x)) * nch;
+    float s = 0.f;
+    for (uint ch = 0u; ch < nch; ++ch) s += buf[o + ch];
+    return s / float(nch);
+}
+inline float rob_em_luma_bilin(device const float* buf, uint h, uint w, uint nch,
+                               float yy, float xx) {
+    // Off either frame -> INF, exactly as the CPU sampler and d_p treat it.
+    if (!(yy >= 0.f) || !(xx >= 0.f) || yy > float(int(h) - 1) || xx > float(int(w) - 1))
+        return INFINITY;
+    int y0 = int(floor(yy)), x0 = int(floor(xx));
+    int y1 = min(y0 + 1, int(h) - 1), x1 = min(x0 + 1, int(w) - 1);
+    float ay = yy - float(y0), ax = xx - float(x0);
+    uint o00 = (uint(y0) * w + uint(x0)) * nch, o01 = (uint(y0) * w + uint(x1)) * nch;
+    uint o10 = (uint(y1) * w + uint(x0)) * nch, o11 = (uint(y1) * w + uint(x1)) * nch;
+    float s = 0.f;
+    for (uint ch = 0u; ch < nch; ++ch) {
+        float v00 = buf[o00 + ch], v01 = buf[o01 + ch], v10 = buf[o10 + ch], v11 = buf[o11 + ch];
+        if (!isfinite(v00) || !isfinite(v01) || !isfinite(v10) || !isfinite(v11)) return INFINITY;
+        float top = v00 + (v01 - v00) * ax, bot = v10 + (v11 - v10) * ax;
+        s += top + (bot - top) * ay;
+    }
+    return s / float(nch);
+}
+inline float rob_edge_misalign_c(device const float* ref_means,
+                                 device const float* comp_means,
+                                 constant RobMaskRawParams& p, int y, int x) {
+    if (p.edge_misalign_enabled == 0u) return 1.f;
+    int RAD = clamp(int(p.edge_misalign_radius), 1, 4);
+    int NTAP = 2 * RAD + 1;
+    uint w = p.w, h = p.h, nch = p.nch;
+    int xl = max(0, x - 1), xr = min(int(w) - 1, x + 1);
+    int yu = max(0, y - 1), yd = min(int(h) - 1, y + 1);
+    float gx = 0.5f * (rob_em_luma(ref_means, w, nch, y, xr) - rob_em_luma(ref_means, w, nch, y, xl));
+    float gy = 0.5f * (rob_em_luma(ref_means, w, nch, yd, x) - rob_em_luma(ref_means, w, nch, yu, x));
+    float gmag = sqrt(gx * gx + gy * gy);
+    if (!(gmag > 0.f)) return 1.f;
+    float bri = rob_em_luma(ref_means, w, nch, y, x);
+    // Luma averages nch channels, so its noise variance is (per-channel)/nch.
+    float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f) / float(nch));
+    float floor_g = p.edge_misalign_edge_snr * max(nsig, 1e-9f);
+    float edge_w = clamp(gmag / floor_g - 1.f, 0.f, 1.f);  // ramp, not a threshold
+    if (edge_w <= 0.f) return 1.f;
+    float nrmx = gx / gmag, nrmy = gy / gmag;
+    float rp[9], cp[9];
+    for (int i = 0; i < NTAP; ++i) {
+        float t = float(i - RAD);
+        rp[i] = rob_em_luma_bilin(ref_means, h, w, nch, float(y) + t * nrmy, float(x) + t * nrmx);
+        cp[i] = rob_em_luma_bilin(comp_means, h, w, nch, float(y) + t * nrmy, float(x) + t * nrmx);
+        if (!isfinite(rp[i]) || !isfinite(cp[i])) return 1.f;
+    }
+    float rnum = 0.f, rden = 0.f, cnum = 0.f, cden = 0.f;
+    float rpeak = 0.f, rsec = 0.f, cpeak = 0.f, csec = 0.f;
+    for (int i = 1; i + 1 < NTAP; ++i) {
+        float d = fabs(0.5f * (rp[i + 1] - rp[i - 1])); float t = float(i - RAD);
+        rnum += t * d; rden += d;
+        if (d > rpeak) { rsec = rpeak; rpeak = d; } else if (d > rsec) rsec = d;
+    }
+    for (int i = 1; i + 1 < NTAP; ++i) {
+        float d = fabs(0.5f * (cp[i + 1] - cp[i - 1])); float t = float(i - RAD);
+        cnum += t * d; cden += d;
+        if (d > cpeak) { csec = cpeak; cpeak = d; } else if (d > csec) csec = d;
+    }
+    float t_ref = rden > 1e-12f ? rnum / rden : 0.f;
+    float t_cmp = cden > 1e-12f ? cnum / cden : 0.f;
+    float shift = t_cmp - t_ref;                 // residual, along the normal
+    float z = fabs(shift) * gmag / max(nsig, 1e-9f);
+    float zr = z / max(p.edge_misalign_shift_z, 1e-3f);
+    float c_disp = 1.f / (1.f + zr * zr);
+    float g_cmp = cpeak > 1e-12f ? csec / cpeak : 0.f;
+    float g_ref = rpeak > 1e-12f ? rsec / rpeak : 0.f;
+    float excess = max(g_cmp - g_ref, 0.f);      // only NEW structure counts
+    float zg = excess * cpeak / max(nsig, 1e-9f);
+    float zgr = zg / max(p.edge_misalign_ghost_z, 1e-3f);
+    float c_ghost = 1.f / (1.f + zgr * zgr);
+    float c = c_disp * c_ghost;
+    return clamp(1.f - edge_w * (1.f - c), p.edge_misalign_min_conf, 1.f);
+}
+
 kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const float* comp_means [[buffer(1)]],
                               device const float* ref_means [[buffer(2)]],
@@ -2326,6 +2417,8 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     // Python reference's min/max clamp yields the intended 0. Mirror the CPU
     // guard in compute_robustness_raw_res.
     if (!isfinite(r_val)) r_val = 0.f;
+    if (p.edge_misalign_enabled != 0u && r_val > 0.f)
+        r_val *= rob_edge_misalign_c(ref_means, comp_means, p, int(gid.y), int(gid.x));
     R[out_o] = r_val;
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;

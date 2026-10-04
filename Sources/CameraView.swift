@@ -1111,6 +1111,20 @@ struct CameraView: View {
                     }
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                 }
+
+                Section(header: Text("Edge Misalignment Rejection")) {
+                    Toggle("Reject Misaligned Edges", isOn: $cam.tuningParams.edge_misalign_enabled)
+                    Text("""
+                         Attenuates the merge weight only where the reference and the aligned comparison frame actually disagree at an edge — a measured sub-pixel shift along the edge normal, or a genuine doubled edge from motion. A correctly aligned edge, however sharp, is kept at full weight, so unlike geometry rejection it never thins or drops clean detail. Targets doubled and thickened edges from hand shake and moving subjects.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.edge_misalign_enabled {
+                        ispRow("Edge SNR", $cam.tuningParams.edge_misalign_edge_snr, 1.0...12.0, "%.1f")
+                        ispRow("Shift scale (px)", $cam.tuningParams.edge_misalign_shift_z, 0.3...5.0, "%.2f")
+                        ispRow("Ghost scale", $cam.tuningParams.edge_misalign_ghost_z, 0.5...6.0, "%.2f")
+                        ispRow("Min confidence", $cam.tuningParams.edge_misalign_min_conf, 0.0...1.0, "%.2f")
+                    }
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

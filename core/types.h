@@ -1143,6 +1143,21 @@ struct Config {
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
 
+    // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
+    // the reference and the (flow-warped) comparison actually disagree at an
+    // edge: it measures the sub-pixel shift along the edge normal and a genuine
+    // doubled edge, so a correctly aligned edge -- however sharp -- is kept at
+    // full weight (unlike motion_geom_reject, which rejects a fraction of clean
+    // thin lines). Every term is a DIFFERENCE between the two frames, with the
+    // gradient only a multiplier, so it cannot manufacture a rejection from edge
+    // strength alone. Soft weights 1/(1+(z/z0)^2). Off by default.
+    bool  edge_misalign_enabled = false;
+    float edge_misalign_edge_snr = 4.0f;   // edge must clear this * noise sigma
+    int   edge_misalign_radius = 3;        // normal-profile half-length (<=4)
+    float edge_misalign_shift_z = 2.0f;    // shift-damage scale
+    float edge_misalign_ghost_z = 3.0f;    // secondary-peak-excess scale
+    float edge_misalign_min_conf = 0.0f;   // floor on the confidence
+
     // Learned refinement of the analytic mask (kRobustnessRefineChannels
     // above; robustness_nn.h's *_refine_* entry points; tools/rob_refine).
     // Runs on top of everything else -- Eq. 5-9, the s1/s2 prior, the

@@ -553,6 +553,18 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_geom_noise_floor_mult = tuning[@"motion_geom_noise_floor_mult"].floatValue;
     if (tuning[@"motion_geom_reject_threshold_relative"])
         cfg.motion_geom_reject_threshold_relative = tuning[@"motion_geom_reject_threshold_relative"].floatValue;
+    if (tuning[@"edge_misalign_enabled"])
+        cfg.edge_misalign_enabled = tuning[@"edge_misalign_enabled"].boolValue;
+    if (tuning[@"edge_misalign_edge_snr"])
+        cfg.edge_misalign_edge_snr = tuning[@"edge_misalign_edge_snr"].floatValue;
+    if (tuning[@"edge_misalign_radius"])
+        cfg.edge_misalign_radius = tuning[@"edge_misalign_radius"].intValue;
+    if (tuning[@"edge_misalign_shift_z"])
+        cfg.edge_misalign_shift_z = tuning[@"edge_misalign_shift_z"].floatValue;
+    if (tuning[@"edge_misalign_ghost_z"])
+        cfg.edge_misalign_ghost_z = tuning[@"edge_misalign_ghost_z"].floatValue;
+    if (tuning[@"edge_misalign_min_conf"])
+        cfg.edge_misalign_min_conf = tuning[@"edge_misalign_min_conf"].floatValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])

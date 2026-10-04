@@ -196,6 +196,15 @@ struct TuningParams: Equatable, Codable {
     var motion_geom_relative: Bool = false
     var motion_geom_noise_floor_mult: Float = 1.5
     var motion_geom_reject_threshold_relative: Float = 0.04
+    // Edge-misalignment rejection: attenuates only edges where the two frames
+    // actually disagree (measured normal shift / genuine double). Aligned edges
+    // kept at full weight. See Config::edge_misalign_*.
+    var edge_misalign_enabled: Bool = false
+    var edge_misalign_edge_snr: Float = 4.0
+    var edge_misalign_radius: Int = 3
+    var edge_misalign_shift_z: Float = 2.0
+    var edge_misalign_ghost_z: Float = 3.0
+    var edge_misalign_min_conf: Float = 0.0
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -318,6 +327,8 @@ struct TuningParams: Equatable, Codable {
         case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
+        case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
+        case edge_misalign_shift_z, edge_misalign_ghost_z, edge_misalign_min_conf
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case kernel_selection_linear
@@ -412,6 +423,12 @@ struct TuningParams: Equatable, Codable {
         motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
         motion_geom_noise_floor_mult = try c.decodeIfPresent(Float.self, forKey: .motion_geom_noise_floor_mult) ?? motion_geom_noise_floor_mult
         motion_geom_reject_threshold_relative = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold_relative) ?? motion_geom_reject_threshold_relative
+        edge_misalign_enabled = try c.decodeIfPresent(Bool.self, forKey: .edge_misalign_enabled) ?? edge_misalign_enabled
+        edge_misalign_edge_snr = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_edge_snr) ?? edge_misalign_edge_snr
+        edge_misalign_radius = try c.decodeIfPresent(Int.self, forKey: .edge_misalign_radius) ?? edge_misalign_radius
+        edge_misalign_shift_z = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_shift_z) ?? edge_misalign_shift_z
+        edge_misalign_ghost_z = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_ghost_z) ?? edge_misalign_ghost_z
+        edge_misalign_min_conf = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_min_conf) ?? edge_misalign_min_conf
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
@@ -2184,6 +2201,12 @@ final class CameraModel: NSObject, ObservableObject {
             "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
             "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
             "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),
+            "edge_misalign_enabled": NSNumber(value: tuningParams.edge_misalign_enabled),
+            "edge_misalign_edge_snr": NSNumber(value: tuningParams.edge_misalign_edge_snr),
+            "edge_misalign_radius": NSNumber(value: tuningParams.edge_misalign_radius),
+            "edge_misalign_shift_z": NSNumber(value: tuningParams.edge_misalign_shift_z),
+            "edge_misalign_ghost_z": NSNumber(value: tuningParams.edge_misalign_ghost_z),
+            "edge_misalign_min_conf": NSNumber(value: tuningParams.edge_misalign_min_conf),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
