@@ -1021,8 +1021,14 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
     g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
-    g_bf.flow_ny = raw_h / tile_size;
-    g_bf.flow_nx = raw_w / tile_size;
+    // Round UP, not down: the aligner circular-pads the grey up to a multiple
+    // of the tile before building the flow grid, so its flow is ceil(dim/tile)
+    // tiles per axis. With floor, any tile size that doesn't divide the image
+    // evenly (e.g. 32/64) made this buffer one tile too small per padded axis,
+    // and metal_frame_set_flow's exact-size check rejected the flow with
+    // "GPU frame state unavailable". At 16 (divides evenly) ceil == floor.
+    g_bf.flow_ny = (raw_h + tile_size - 1) / tile_size;
+    g_bf.flow_nx = (raw_w + tile_size - 1) / tile_size;
     g_bf.cov_stride = 3u;
     if (g_bf.cov_h <= 0 || g_bf.cov_w <= 0 || g_bf.rob_h <= 0 || g_bf.rob_w <= 0 ||
         g_bf.flow_ny <= 0 || g_bf.flow_nx <= 0)
