@@ -47,13 +47,7 @@ COARSE_DILATIONS = (1, 2, 4, 8)
 
 
 # Sharpness of the output sigmoid. 1.0 reproduces the original behaviour.
-# Unused since the head became (s, t): the structural floor in
-# sr_gate_combine replaces what the temperature was trying to buy.
-OUT_TEMP = 1.0
-
-# Must equal SRG_S_MAX / SRG_T_MAX in core/sr_gate_shared.h.
-SMAX = 2.0
-TMAX = 0.5
+OUT_TEMP = 3.0
 
 
 class SRGate(nn.Module):
@@ -77,7 +71,7 @@ class SRGate(nn.Module):
     """
 
     def __init__(self, in_ch=NUM_FEATURES, width=WIDTH, dilations=DILATIONS,
-                 out_temp=OUT_TEMP, head_out=2,
+                 out_temp=OUT_TEMP,
                  coarse=True, pool=POOL, coarse_width=COARSE_WIDTH,
                  coarse_dilations=COARSE_DILATIONS):
         super().__init__()
@@ -100,14 +94,7 @@ class SRGate(nn.Module):
             nn.Conv2d(chans[i], chans[i + 1], 3, padding=0, dilation=d)
             for i, d in enumerate(self.dilations)
         ])
-        # TWO outputs: the per-pixel s and t of Wronski's own formula.
-        #
-        # head_out=1 is the retired direct-R head, kept loadable so checkpoints
-        # from before this change can still be scored side by side -- a model
-        # that cannot be compared with its predecessor cannot be shown to be an
-        # improvement on it.
-        self.head_out = int(head_out)
-        self.head = nn.Conv2d(chans[-1], self.head_out, 1)
+        self.head = nn.Conv2d(chans[-1], 1, 1)
         # Start permissive: the mask begins as "merge everything" and training
         # has to earn every rejection, rather than starting from a collapse it
         # then has to climb out of.
@@ -128,16 +115,14 @@ class SRGate(nn.Module):
         # than Wronski at sigma_flow 5.0. Keep the activation unsaturating, and
         # keep the init off its flat region.
         self.out_temp = float(out_temp)
-        # Start AT Wronski's exponential: s = 1, t ~ 0, so R = exp(-d^2/sigma^2).
-        # The net begins as the analytic mask instead of having to rediscover
-        # it, and every training step is a correction to something that works.
         nn.init.zeros_(self.head.weight)
-        with torch.no_grad():
-            if self.head_out == 2:
-                self.head.bias[0] = 0.0   # 2*sigmoid(0)   = 1.0   -> s = 1
-                self.head.bias[1] = -4.0  # 0.5*sigmoid(-4)= 0.009 -> t ~ 0
-            else:
-                self.head.bias.fill_(3.5 / self.out_temp)
+        # Divided by the temperature so the STARTING output is sigmoid(3.5) =
+        # 0.971 whatever the temperature is. Initialising past the saturation
+        # knee is how the clamp attempt died, and a temperature reaches
+        # saturation sooner, so this division is load-bearing rather than
+        # cosmetic: at T=3 a bias of 3.5 would start at sigmoid(10.5), where the
+        # gradient is ~2e-5 and the net cannot move.
+        nn.init.constant_(self.head.bias, 3.5 / self.out_temp)
 
     def _coarse(self, x):
         n, c, h, w = x.shape
@@ -157,43 +142,27 @@ class SRGate(nn.Module):
         return y[:, :, :h, :w]
 
     def forward(self, x):
-        # Feature 0 IS exp(-d^2/sigma^2) (core/sr_gate_shared.h), so the formula
-        # needs nothing the network is not already given. Kept aside because the
-        # conv stack overwrites its working tensor.
-        exp_a = x[:, 0:1]
-        y = x
         if self.coarse:
-            y = torch.cat([y, self._coarse(y)], dim=1)
+            x = torch.cat([x, self._coarse(x)], dim=1)
         for conv, d in zip(self.convs, self.dilations):
-            y = F.pad(y, (d, d, d, d), mode='replicate')
-            y = F.relu(conv(y))
-        # The network predicts s and t. The FORMULA is kept:
+            x = F.pad(x, (d, d, d, d), mode='replicate')
+            x = F.relu(conv(x))
+        # Temperature, not a clamp.
         #
-        #     R = clamp(s * exp(-d^2/sigma^2) - t, 0, 1)
+        # The measured defect of every model so far is that it will not COMMIT:
+        # mean R sat near 0.5 everywhere, and its edge/real vs edge/aligned gap
+        # was 0.27 against Wronski's 0.73 -- while Wronski gets that gap from a
+        # pointwise formula with no network, which proves the information is in
+        # the features and the smooth output is what discards it. Raising the
+        # init ceiling (2.0 -> 3.5) did not fix it; a stretched sigmoid with a
+        # clamp killed the gradient outright.
         #
-        # i.e. Wronski Eq. 5 with s and t made per-pixel, instead of s coming
-        # from the motion prior and t being a global threshold.
-        #
-        # This is a STRUCTURAL guarantee rather than a learned one, and it is
-        # what every previous version lacked. As d^2/sigma^2 grows, exp(-a) -> 0
-        # and R -> -t -> 0 no matter what the network says: a high-residual
-        # pixel cannot be merged however permissive the net would like to be.
-        #
-        # That is the property that was missing. Permissiveness is exactly what
-        # reintroduced visible misalignments, and mask mean tracked the reports
-        # one for one -- 0.128 clean, 0.255 artifacts, 0.482 worse. A free-form
-        # head has no floor under it; this has one, and the only way through it
-        # is for the residual itself to be small.
-        #
-        # The over-rejection cure is still available: where a is small the net
-        # can raise s toward 2 and drop t, taking R to a hard 1 on content the
-        # analytic mask was needlessly strict about.
-        h = self.head(y)
-        if self.head_out == 1:
-            return torch.sigmoid(h * self.out_temp)
-        s_ = SMAX * torch.sigmoid(h[:, 0:1])
-        t_ = TMAX * torch.sigmoid(h[:, 1:2])
-        return (s_ * exp_a - t_).clamp(0.0, 1.0)
+        # A temperature has neither problem: it saturates without a flat region,
+        # so the gradient lives everywhere. And it costs NOTHING on the device:
+        # the head is linear, so sigmoid(T*(w.x + b)) == sigmoid((Tw).x + Tb),
+        # and export_weights.py folds T into the head weights. core/sr_gate.cpp
+        # and the Metal kernel keep their plain sigmoid and stay bit-compatible.
+        return torch.sigmoid(self.head(x) * self.out_temp)
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -209,7 +178,6 @@ def from_checkpoint(ck):
     net = SRGate(in_ch=ck['in_ch'], width=ck['width'],
                  dilations=ck['dilations'], coarse=ck.get('coarse', False),
                  out_temp=ck.get('out_temp', 1.0),
-                 head_out=ck['state_dict']['head.weight'].shape[0],
                  pool=ck.get('pool', POOL),
                  coarse_dilations=tuple(ck.get('coarse_dilations',
                                                COARSE_DILATIONS)))

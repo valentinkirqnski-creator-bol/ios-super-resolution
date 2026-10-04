@@ -2590,33 +2590,19 @@ kernel void sr_gate_conv(device float* dst [[buffer(0)]],
     for (uint o = 0u; o < out_ch; ++o) out[o] = max(acc[o], 0.f);
 }
 
-// 1x1 head -> (s, t) -> Wronski's formula, into the mask plane at its row.
+// 1x1 head + sigmoid, straight into the mask plane at its image row.
 kernel void sr_gate_head(device float* R [[buffer(0)]],
                          device const float* src [[buffer(1)]],
                          device const float* wgt [[buffer(2)]],
                          constant SrGateConvParams& p [[buffer(3)]],
-                         device const float* feat [[buffer(4)]],
                          uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.dst_rows) return;
     const int y = p.dst_y0 + int(gid.y);
     device const float* v = src + (uint(gid.y) * p.w + gid.x) * p.in_ch;
     device const float* W0 = wgt + p.w_off;
-    device const float* W1 = W0 + p.in_ch;
-    float s0 = wgt[p.b_off];
-    float s1 = wgt[p.b_off + 1u];
-    for (uint i = 0u; i < p.in_ch; ++i) {
-        s0 += W0[i] * v[i];
-        s1 += W1[i] * v[i];
-    }
-    // exp_a is feature SRG_F_EXP_A of this pixel, read from the FEATURE band.
-    //
-    // That buffer is banded and channel-interleaved, not a plain plane: it holds
-    // (band + 2*SRG_HALO) rows of gw pixels of SRG_FEATURES floats, so output
-    // row gid.y sits at feature row gid.y + SRG_HALO. Indexing it by absolute
-    // image row would read the wrong pixel entirely.
-    const uint fr = (uint(gid.y) + uint(SRG_HALO)) * p.w + gid.x;
-    const float exp_a = feat[fr * uint(SRG_FEATURES) + uint(SRG_F_EXP_A)];
-    R[uint(y) * p.w + gid.x] = sr_gate_combine(s0, s1, exp_a);
+    float s = wgt[p.b_off];
+    for (uint i = 0u; i < p.in_ch; ++i) s += W0[i] * v[i];
+    R[uint(y) * p.w + gid.x] = 1.f / (1.f + exp(-s));
 }
 
 // ---- learned refinement of the analytic mask (Config::

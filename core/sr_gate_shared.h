@@ -55,9 +55,8 @@
 #define SRG_OFF_W2 (SRG_OFF_B1 + SRG_WIDTH)
 #define SRG_OFF_B2 (SRG_OFF_W2 + SRG_WIDTH * SRG_WIDTH * 9)
 #define SRG_OFF_HW (SRG_OFF_B2 + SRG_WIDTH)
-// Head is 2 x WIDTH: the network predicts s and t, not R directly.
-#define SRG_OFF_HB (SRG_OFF_HW + 2 * SRG_WIDTH)
-#define SRG_WEIGHTS_N (SRG_OFF_HB + 2)
+#define SRG_OFF_HB (SRG_OFF_HW + SRG_WIDTH)
+#define SRG_WEIGHTS_N (SRG_OFF_HB + 1)
 
 // ---- feature compressions ------------------------------------------------
 #define SRG_LOG_A_SCALE 0.125f          // 1/8
@@ -77,28 +76,6 @@
 #define SRG_F_EMAG 5
 #define SRG_F_GRAD 6
 #define SRG_F_DIR_E 7
-
-// Bounds on the per-pixel s and t. s up to 2 lets the network be MORE
-// permissive than the plain exponential where the residual is small, which is
-// the over-rejection cure; t up to 0.5 lets it hold a floor.
-#define SRG_S_MAX 2.0f
-#define SRG_T_MAX 0.5f
-
-// Wronski Eq. 5 with s and t per-pixel: R = clamp(s*exp(-d^2/sigma^2) - t,0,1).
-//
-// The formula is KEPT rather than replaced by the network, and that is a
-// structural guarantee instead of a learned one. As d^2/sigma^2 grows, exp(-a)
-// goes to 0 and R goes to -t and then to 0 whatever the network says, so a
-// high-residual pixel cannot be merged however permissive the net would like to
-// be. Earlier versions emitted R directly and had no such floor: mask mean
-// tracked the reported artifacts one for one (0.128 clean, 0.255 artifacts,
-// 0.482 worse), because permissiveness and visible misalignment were the same
-// axis with nothing underneath it.
-inline float sr_gate_combine(float h0, float h1, float exp_a) {
-    const float s = SRG_S_MAX / (1.0f + exp(-h0));
-    const float t = SRG_T_MAX / (1.0f + exp(-h1));
-    return SRG_CLAMP01(s * exp_a - t);
-}
 
 // Everything a pixel's features are built from. Each backend fills this its own
 // way -- a CPU thread walks rows and reads planes it already has, a GPU thread

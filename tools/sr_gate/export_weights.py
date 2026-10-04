@@ -11,7 +11,7 @@ drift.
     conv0 W  [width][in][3][3]      conv0 b [width]
     conv1 W  [width][width][3][3]   conv1 b [width]
     conv2 W  [width][width][3][3]   conv2 b [width]
-    head  W  [2][width]             head  b [2]   (row 0 = s, row 1 = t)
+    head  W  [1][width]             head  b [1]
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ namespace hhsr {
 //   conv0 W [width][in][3][3], conv0 b [width],
 //   conv1 W [width][width][3][3], conv1 b [width],
 //   conv2 W [width][width][3][3], conv2 b [width],
-//   head  W [2][width],           head  b [2]  -- s and t, not R
+//   head  W [1][width],           head  b [1]
 static const int kSrGateWeightCount = %(nparam)d;
 
 static const f32 kSrGateWeights[%(nparam)d] = {
@@ -74,13 +74,14 @@ def main():
     for conv in net.convs:
         flat.append(conv.weight.detach().numpy().ravel())
         flat.append(conv.bias.detach().numpy().ravel())
-    # Head is 2 x width: row 0 is s, row 1 is t, matching sr_gate.cpp's
-    # hw0 / hw1 = W + SRG_OFF_HW and + kW. No temperature folding any more --
-    # the sigmoids now live inside sr_gate_combine with fixed SRG_S_MAX and
-    # SRG_T_MAX scales, so scaling the head would change what s and t MEAN
-    # rather than being the identity it was for a bare sigmoid.
-    flat.append(net.head.weight.detach().numpy().ravel())
-    flat.append(net.head.bias.detach().numpy().ravel())
+    # The output temperature is folded in HERE, so the device keeps its plain
+    # sigmoid. sigmoid(T*(w.x + b)) == sigmoid((Tw).x + Tb) exactly, so this is
+    # an identity and not an approximation: core/sr_gate.cpp and the Metal
+    # kernel need no change, the weight-blob layout is unchanged, and parity.py
+    # still compares like with like.
+    t = float(getattr(net, 'out_temp', 1.0))
+    flat.append((net.head.weight.detach().numpy() * t).ravel())
+    flat.append((net.head.bias.detach().numpy() * t).ravel())
     w = np.concatenate(flat).astype(np.float32)
     assert w.size == net.n_params(), (w.size, net.n_params())
     assert tuple(ck['dilations']) == gate.DILATIONS, \
