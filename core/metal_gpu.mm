@@ -1612,8 +1612,14 @@ struct RobMaskParamsCPU {
     uint32_t geom_relative = 1;
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
+    uint32_t edge_misalign_enabled = 0;
+    uint32_t edge_misalign_radius = 3;
+    float    edge_misalign_edge_snr = 4.0f;
+    float    edge_misalign_shift_z = 2.0f;
+    float    edge_misalign_ghost_z = 3.0f;
+    float    edge_misalign_min_conf = 0.0f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 128, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2496,6 +2502,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
     mp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
     mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
+    mp.edge_misalign_enabled = cfg.edge_misalign_enabled ? 1u : 0u;
+    mp.edge_misalign_radius = (uint32_t)std::max(1, std::min(cfg.edge_misalign_radius, 4));
+    mp.edge_misalign_edge_snr = cfg.edge_misalign_edge_snr;
+    mp.edge_misalign_shift_z = cfg.edge_misalign_shift_z;
+    mp.edge_misalign_ghost_z = cfg.edge_misalign_ghost_z;
+    mp.edge_misalign_min_conf = cfg.edge_misalign_min_conf;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;

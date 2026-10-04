@@ -1669,6 +1669,14 @@ struct RobMaskParams {
     uint geom_relative;
     float geom_noise_floor_mult;
     float geom_reject_threshold_relative;
+    // Edge-misalignment rejection (Config::edge_misalign_*). comp_means is NOT
+    // warped in this path, so the kernel samples it at the per-tile flow offset.
+    uint edge_misalign_enabled;
+    uint edge_misalign_radius;
+    float edge_misalign_edge_snr;
+    float edge_misalign_shift_z;
+    float edge_misalign_ghost_z;
+    float edge_misalign_min_conf;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2004,6 +2012,15 @@ kernel void rob_tile_residual_high(device uint* tile_high [[buffer(0)]],
     tile_high[pidx] = high_count >= need ? 1u : 0u;
 }
 
+// Forward declarations; definitions are just above rob_make_mask_raw.
+inline float rob_em_luma(device const float* buf, uint w, uint nch, int y, int x);
+inline float rob_em_luma_bilin(device const float* buf, uint h, uint w, uint nch, float yy, float xx);
+inline float rob_edge_misalign_c(device const float* ref_means, device const float* comp_means,
+                                 uint h, uint w, uint nch, int y, int x, float fx, float fy,
+                                 uint em_enabled, int em_radius, float em_edge_snr,
+                                 float em_shift_z, float em_ghost_z, float em_min_conf,
+                                 float alpha, float beta);
+
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(3)]],
@@ -2189,6 +2206,29 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     float r_val = hard_reject
         ? 0.f
         : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+    if (p.edge_misalign_enabled != 0u && r_val > 0.f) {
+        // comp_means is not warped in this guide-resolution path, so sample it
+        // at the per-tile flow the merge will fetch with (same convention as
+        // edge_misalignment_confidence in robustness.cpp).
+        float fxo, fyo;
+        if (p.nch == 1u) {
+            int pty = clamp(int(gid.y) / int(p.tile_size), 0, int(p.flow_ny) - 1);
+            int ptx = clamp(int(gid.x) / int(p.tile_size), 0, int(p.flow_nx) - 1);
+            uint fo = (uint(pty) * p.flow_nx + uint(ptx)) * 2u;
+            fxo = flow[fo + 0u]; fyo = flow[fo + 1u];
+        } else {
+            int pty = clamp(int((2.f * float(gid.y) + 0.5f) / float(p.tile_size)), 0, int(p.flow_ny) - 1);
+            int ptx = clamp(int((2.f * float(gid.x) + 0.5f) / float(p.tile_size)), 0, int(p.flow_nx) - 1);
+            uint fo = (uint(pty) * p.flow_nx + uint(ptx)) * 2u;
+            fxo = 0.5f * flow[fo + 0u]; fyo = 0.5f * flow[fo + 1u];
+        }
+        r_val *= rob_edge_misalign_c(ref_means, comp_means, p.h, p.w, p.nch,
+                                     int(gid.y), int(gid.x), fxo, fyo,
+                                     p.edge_misalign_enabled, int(p.edge_misalign_radius),
+                                     p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
+                                     p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
+                                     p.alpha, p.beta);
+    }
     R[gid.y * p.w + gid.x] = r_val;
     // Which prior this pixel ended up on. Compared against r_s1 rather than
     // recomputing the conditions, so the record cannot drift from the value
@@ -2269,13 +2309,19 @@ inline float rob_em_luma_bilin(device const float* buf, uint h, uint w, uint nch
     }
     return s / float(nch);
 }
+// Shared by both mask kernels. (fx,fy) is the flow offset to sample comp with:
+// 0 in the raw path (comp already warped) and the per-tile flow in the
+// guide-resolution path (comp not warped).
 inline float rob_edge_misalign_c(device const float* ref_means,
                                  device const float* comp_means,
-                                 constant RobMaskRawParams& p, int y, int x) {
-    if (p.edge_misalign_enabled == 0u) return 1.f;
-    int RAD = clamp(int(p.edge_misalign_radius), 1, 4);
+                                 uint h, uint w, uint nch, int y, int x,
+                                 float fx, float fy,
+                                 uint em_enabled, int em_radius, float em_edge_snr,
+                                 float em_shift_z, float em_ghost_z, float em_min_conf,
+                                 float alpha, float beta) {
+    if (em_enabled == 0u) return 1.f;
+    int RAD = clamp(em_radius, 1, 4);
     int NTAP = 2 * RAD + 1;
-    uint w = p.w, h = p.h, nch = p.nch;
     int xl = max(0, x - 1), xr = min(int(w) - 1, x + 1);
     int yu = max(0, y - 1), yd = min(int(h) - 1, y + 1);
     float gx = 0.5f * (rob_em_luma(ref_means, w, nch, y, xr) - rob_em_luma(ref_means, w, nch, y, xl));
@@ -2284,8 +2330,8 @@ inline float rob_edge_misalign_c(device const float* ref_means,
     if (!(gmag > 0.f)) return 1.f;
     float bri = rob_em_luma(ref_means, w, nch, y, x);
     // Luma averages nch channels, so its noise variance is (per-channel)/nch.
-    float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f) / float(nch));
-    float floor_g = p.edge_misalign_edge_snr * max(nsig, 1e-9f);
+    float nsig = sqrt(max(alpha * bri + beta, 0.f) / float(nch));
+    float floor_g = em_edge_snr * max(nsig, 1e-9f);
     float edge_w = clamp(gmag / floor_g - 1.f, 0.f, 1.f);  // ramp, not a threshold
     if (edge_w <= 0.f) return 1.f;
     float nrmx = gx / gmag, nrmy = gy / gmag;
@@ -2293,7 +2339,7 @@ inline float rob_edge_misalign_c(device const float* ref_means,
     for (int i = 0; i < NTAP; ++i) {
         float t = float(i - RAD);
         rp[i] = rob_em_luma_bilin(ref_means, h, w, nch, float(y) + t * nrmy, float(x) + t * nrmx);
-        cp[i] = rob_em_luma_bilin(comp_means, h, w, nch, float(y) + t * nrmy, float(x) + t * nrmx);
+        cp[i] = rob_em_luma_bilin(comp_means, h, w, nch, float(y) + fy + t * nrmy, float(x) + fx + t * nrmx);
         if (!isfinite(rp[i]) || !isfinite(cp[i])) return 1.f;
     }
     float rnum = 0.f, rden = 0.f, cnum = 0.f, cden = 0.f;
@@ -2312,16 +2358,16 @@ inline float rob_edge_misalign_c(device const float* ref_means,
     float t_cmp = cden > 1e-12f ? cnum / cden : 0.f;
     float shift = t_cmp - t_ref;                 // residual, along the normal
     float z = fabs(shift) * gmag / max(nsig, 1e-9f);
-    float zr = z / max(p.edge_misalign_shift_z, 1e-3f);
+    float zr = z / max(em_shift_z, 1e-3f);
     float c_disp = 1.f / (1.f + zr * zr);
     float g_cmp = cpeak > 1e-12f ? csec / cpeak : 0.f;
     float g_ref = rpeak > 1e-12f ? rsec / rpeak : 0.f;
     float excess = max(g_cmp - g_ref, 0.f);      // only NEW structure counts
     float zg = excess * cpeak / max(nsig, 1e-9f);
-    float zgr = zg / max(p.edge_misalign_ghost_z, 1e-3f);
+    float zgr = zg / max(em_ghost_z, 1e-3f);
     float c_ghost = 1.f / (1.f + zgr * zgr);
     float c = c_disp * c_ghost;
-    return clamp(1.f - edge_w * (1.f - c), p.edge_misalign_min_conf, 1.f);
+    return clamp(1.f - edge_w * (1.f - c), em_min_conf, 1.f);
 }
 
 kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
@@ -2418,7 +2464,12 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     // guard in compute_robustness_raw_res.
     if (!isfinite(r_val)) r_val = 0.f;
     if (p.edge_misalign_enabled != 0u && r_val > 0.f)
-        r_val *= rob_edge_misalign_c(ref_means, comp_means, p, int(gid.y), int(gid.x));
+        r_val *= rob_edge_misalign_c(ref_means, comp_means, p.h, p.w, p.nch,
+                                     int(gid.y), int(gid.x), 0.f, 0.f,
+                                     p.edge_misalign_enabled, int(p.edge_misalign_radius),
+                                     p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
+                                     p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
+                                     p.alpha, p.beta);
     R[out_o] = r_val;
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
