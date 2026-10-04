@@ -1894,6 +1894,10 @@ static bool rob_run_sr_gate(id<MTLBuffer> b_out, size_t out_off_bytes,
         [e setBuffer:b_a2 offset:0 atIndex:1];
         [e setBuffer:b_w offset:0 atIndex:2];
         [e setBytes:&hp length:sizeof(hp) atIndex:3];
+        // The head needs exp(-d^2/sigma^2) itself, because the network predicts
+        // s and t and the mask is still Wronski's R = s*exp(-a) - t. It reads it
+        // from the feature band at index SRG_F_EXP_A, offset by SRG_HALO rows.
+        [e setBuffer:b_feat offset:0 atIndex:4];
         dispatch2(e, p_head, (NSUInteger)gw, (NSUInteger)hp.dst_rows);
         [e endEncoding];
     }

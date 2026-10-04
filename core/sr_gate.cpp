@@ -237,15 +237,23 @@ Image sr_gate_infer_cpu(const Image& feat) {
         conv_relu_band(buf1.data(), a1y0, buf2.data(), y0, y1 - y0,
                        w, h, kW, kW, kDil[2], W + kWOff[2], W + kBOff[2], 0);
 
-        const f32* hw = W + SRG_OFF_HW;
-        const f32 hb = W[SRG_OFF_HB];
+        const f32* hw0 = W + SRG_OFF_HW;
+        const f32* hw1 = hw0 + kW;
+        const f32 hb0 = W[SRG_OFF_HB];
+        const f32 hb1 = W[SRG_OFF_HB + 1];
         parallel_rows(y1 - y0, 0, [&](int r) {
             const f32* src = buf2.data() + (size_t)r * w * kW;
             for (int x = 0; x < w; ++x) {
                 const f32* v = src + (size_t)x * kW;
-                f32 s = hb;
-                for (int i = 0; i < kW; ++i) s += hw[i] * v[i];
-                out.at(y0 + r, x) = 1.f / (1.f + std::exp(-s));
+                f32 s0 = hb0, s1 = hb1;
+                for (int i = 0; i < kW; ++i) {
+                    s0 += hw0[i] * v[i];
+                    s1 += hw1[i] * v[i];
+                }
+                // Feature 0 is exp(-d^2/sigma^2); the formula needs nothing the
+                // feature plane does not already carry.
+                out.at(y0 + r, x) = sr_gate_combine(
+                    s0, s1, feat.at(y0 + r, x, SRG_F_EXP_A));
             }
         });
     }
