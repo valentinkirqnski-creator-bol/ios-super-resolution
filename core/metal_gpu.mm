@@ -1612,8 +1612,11 @@ struct RobMaskParamsCPU {
     uint32_t geom_relative = 1;
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
+    uint32_t translation_reject_enabled = 0;
+    float    translation_reject_px_lo = 1.0f;
+    float    translation_reject_px_hi = 1.6f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 104, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 116, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1632,8 +1635,11 @@ struct RobMaskRawParamsCPU {
     float beta = 0.f;
     uint32_t sqrt_index = 0;  // 1 = index noise curve by mean^2 (sqrt guide; was _pad0)
     uint32_t per_pixel_s = 0; // 1 = bilinear per-pixel s (Wronski per-pixel M)
+    uint32_t translation_reject_enabled = 0;
+    float    translation_reject_px_lo = 1.0f;
+    float    translation_reject_px_hi = 1.6f;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 88, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 100, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2263,6 +2269,9 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.beta = cfg.noise_beta_robustness();
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
+    mp.translation_reject_enabled = cfg.translation_reject_enabled ? 1u : 0u;
+    mp.translation_reject_px_lo = cfg.translation_reject_px_lo;
+    mp.translation_reject_px_hi = cfg.translation_reject_px_hi;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -2484,6 +2493,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
     mp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
     mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
+    mp.translation_reject_enabled = cfg.translation_reject_enabled ? 1u : 0u;
+    mp.translation_reject_px_lo = cfg.translation_reject_px_lo;
+    mp.translation_reject_px_hi = cfg.translation_reject_px_hi;
     id<MTLBuffer> b_match_amb = amb_on
         ? buf(flow.match_ambiguous.data(), flow.match_ambiguous.size() * sizeof(uint32_t))
         : b_motion;
