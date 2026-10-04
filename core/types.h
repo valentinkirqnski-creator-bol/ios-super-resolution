@@ -1143,6 +1143,22 @@ struct Config {
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
 
+    // Measured-misregistration rejection. Estimates the per-pixel shift in
+    // pixels straight from the image residual via brightness constancy
+    // (d ~= |grad I| * delta  =>  delta_hat = d / |grad I|), so unlike the
+    // flow-gradient motion_geom test it also catches PURE TRANSLATION, and
+    // unlike d^2/sigma^2 it does not saturate at high-contrast edges (the
+    // contrast cancels), which is what otherwise leaves thickened edges. The
+    // estimate is gated on a real edge (gradient above the guide noise), then
+    // the robustness weight is ramped down between px_lo and px_hi: sub-pixel
+    // offsets below px_lo (aliasing, the super-resolution signal) are kept and
+    // only larger shifts are attenuated. px thresholds are in the mask's pixel
+    // grid; ~1.0 -> 1.6 matches the measured point where rejection stops
+    // helping. Off by default; tune on the CPU harness.
+    bool  translation_reject_enabled = false;
+    float translation_reject_px_lo = 1.0f;
+    float translation_reject_px_hi = 1.6f;
+
     // Learned refinement of the analytic mask (kRobustnessRefineChannels
     // above; robustness_nn.h's *_refine_* entry points; tools/rob_refine).
     // Runs on top of everything else -- Eq. 5-9, the s1/s2 prior, the

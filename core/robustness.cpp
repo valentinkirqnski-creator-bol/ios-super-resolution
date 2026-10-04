@@ -1453,6 +1453,27 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // feature, not built here) -- mapped down from the raw pixel to its parent
 // guide pixel for that one lookup. Not the common case this toggle is meant
 // for; it stays correct, just at its existing granularity rather than the new one.
+// Measured-misregistration attenuation (Config::translation_reject_enabled).
+// delta_hat = d / |grad I| estimates the per-pixel shift in pixels from the
+// image residual (brightness constancy), so it responds to pure translation
+// and, because contrast cancels, does not saturate at strong edges the way
+// d^2/sigma^2 does. Gated on a real edge (gradient above guide noise) so flat
+// regions do not read a spurious shift; soft ramp keeps sub-pixel offsets
+// (aliasing / SR signal) below px_lo and attenuates larger shifts to px_hi.
+// grad_mag and noise_sigma must be in the same pixel/intensity units; returns
+// a multiplier in [0,1] to apply to the robustness weight.
+static inline f32 translation_reject_keep(const Config& cfg, f32 d_sq_val,
+                                          f32 grad_mag, f32 noise_sigma) {
+    if (!cfg.translation_reject_enabled) return 1.f;
+    if (!(grad_mag > noise_sigma)) return 1.f;      // no real edge here
+    const f32 d_meas = std::sqrt(std::max(0.f, d_sq_val));
+    const f32 delta_px = d_meas / (grad_mag + 1e-6f);
+    const f32 lo = cfg.translation_reject_px_lo;
+    const f32 hi = std::max(lo + 1e-3f, cfg.translation_reject_px_hi);
+    f32 t = clampf((delta_px - lo) / (hi - lo), 0.f, 1.f);
+    return 1.f - t * t * (3.f - 2.f * t);           // 1 below lo, 0 above hi
+}
+
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
                                         const FlowField& flow, int tile_size,
                                         const Config& cfg, Image* s_select_out) {
@@ -1549,6 +1570,17 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             // would return NaN, poisoning every merge accumulator that touches
             // this pixel.
             if (!std::isfinite(r_val)) r_val = 0.f;
+            if (cfg.translation_reject_enabled && r_val > 0.f) {
+                // Raw-res: ref_means/d_sq are already on the raw lattice, so the
+                // gradient is per raw pixel and delta_hat comes out in raw px.
+                const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
+                const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
+                const f32 gix = 0.5f * (ref_means.at(y, xr, 0) - ref_means.at(y, xl, 0));
+                const f32 giy = 0.5f * (ref_means.at(yd, x, 0) - ref_means.at(yu, x, 0));
+                const f32 gmag = std::sqrt(gix * gix + giy * giy);
+                const f32 nsig = std::sqrt(guide_noise_var(cfg, nch, 0, ref_means.at(y, x, 0)));
+                r_val *= translation_reject_keep(cfg, d_sq.at(y, x), gmag, nsig);
+            }
             R.at(y, x) = r_val;
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
@@ -1987,6 +2019,19 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             f32 r_val = hard_reject
                 ? 0.f
                 : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+            if (cfg.translation_reject_enabled && r_val > 0.f) {
+                // Guide-res: gradient divided by sc to raw px, matching the geom
+                // block above, so delta_hat is in raw pixels.
+                const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
+                const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
+                const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
+                const f32 gix = 0.5f * (ref_stats.means.at(y, xr, 0) - ref_stats.means.at(y, xl, 0)) / sc;
+                const f32 giy = 0.5f * (ref_stats.means.at(yd, x, 0) - ref_stats.means.at(yu, x, 0)) / sc;
+                const f32 gmag = std::sqrt(gix * gix + giy * giy);
+                const f32 bri = guide_brightness(ref_stats.means, y, x);
+                const f32 nsig = std::sqrt(guide_noise_var(cfg, ref_stats.means.c, 0, bri)) / sc;
+                r_val *= translation_reject_keep(cfg, d_sq.at(y, x), gmag, nsig);
+            }
             R.at(y, x) = r_val;
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }

@@ -553,6 +553,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_geom_noise_floor_mult = tuning[@"motion_geom_noise_floor_mult"].floatValue;
     if (tuning[@"motion_geom_reject_threshold_relative"])
         cfg.motion_geom_reject_threshold_relative = tuning[@"motion_geom_reject_threshold_relative"].floatValue;
+    if (tuning[@"translation_reject_enabled"])
+        cfg.translation_reject_enabled = tuning[@"translation_reject_enabled"].boolValue;
+    if (tuning[@"translation_reject_px_lo"])
+        cfg.translation_reject_px_lo = tuning[@"translation_reject_px_lo"].floatValue;
+    if (tuning[@"translation_reject_px_hi"])
+        cfg.translation_reject_px_hi = tuning[@"translation_reject_px_hi"].floatValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
