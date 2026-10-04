@@ -3416,7 +3416,27 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         c.sticky_grey_w == moving_grey.w) {
         mov0 = c.sticky_grey;
     } else {
-        moving_padded_grey = pad_image_circular(moving_grey, grey_ts);
+        // Padding is needed (the grey does not tile evenly at this tile size --
+        // e.g. 32/64 px tiles). pad_image_circular reads CPU pixels, but on the
+        // resident path moving_grey is header-only: its pixels live in
+        // sticky_grey on the GPU and moving_grey.data is empty, so padding it
+        // directly dereferenced a null buffer and crashed (SIGSEGV in
+        // pad_image_circular). Materialise the grey from the shared GPU buffer
+        // first. This readback only happens when padding is actually required
+        // (non-16 tiles), so the fast no-copy path for 16px tiles is unchanged.
+        Image src = moving_grey;
+        if (src.data.empty()) {
+            if (c.sticky_grey && c.sticky_grey_h == moving_grey.h &&
+                c.sticky_grey_w == moving_grey.w) {
+                src = Image(moving_grey.h, moving_grey.w, 1);
+                memcpy(src.data.data(), [c.sticky_grey contents],
+                       (size_t)moving_grey.h * (size_t)moving_grey.w * sizeof(float));
+            } else {
+                // No CPU pixels and no matching resident buffer to read back.
+                return false;
+            }
+        }
+        moving_padded_grey = pad_image_circular(src, grey_ts);
         mov0_h = moving_padded_grey.h;
         mov0_w = moving_padded_grey.w;
         mov0 = buf(moving_padded_grey.data.data(),
