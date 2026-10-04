@@ -196,12 +196,6 @@ struct TuningParams: Equatable, Codable {
     var motion_geom_relative: Bool = false
     var motion_geom_noise_floor_mult: Float = 1.5
     var motion_geom_reject_threshold_relative: Float = 0.04
-    // Measured-misregistration rejection: delta_hat = d / |grad I| (pixels),
-    // catches pure translation and doesn't saturate at strong edges. Soft ramp
-    // from px_lo (kept) to px_hi (rejected). See Config::translation_reject_*.
-    var translation_reject_enabled: Bool = false
-    var translation_reject_px_lo: Float = 1.0
-    var translation_reject_px_hi: Float = 1.6
     /// Route alignment through the bundled PWCNet Core ML model instead of
     /// the classical block-matching pyramid, feeding the result into the
     /// same robustness/merge math either way. Falls back to the classical
@@ -324,7 +318,6 @@ struct TuningParams: Equatable, Codable {
         case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
-        case translation_reject_enabled, translation_reject_px_lo, translation_reject_px_hi
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case kernel_selection_linear
@@ -419,9 +412,6 @@ struct TuningParams: Equatable, Codable {
         motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
         motion_geom_noise_floor_mult = try c.decodeIfPresent(Float.self, forKey: .motion_geom_noise_floor_mult) ?? motion_geom_noise_floor_mult
         motion_geom_reject_threshold_relative = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold_relative) ?? motion_geom_reject_threshold_relative
-        translation_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .translation_reject_enabled) ?? translation_reject_enabled
-        translation_reject_px_lo = try c.decodeIfPresent(Float.self, forKey: .translation_reject_px_lo) ?? translation_reject_px_lo
-        translation_reject_px_hi = try c.decodeIfPresent(Float.self, forKey: .translation_reject_px_hi) ?? translation_reject_px_hi
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
@@ -2194,9 +2184,6 @@ final class CameraModel: NSObject, ObservableObject {
             "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),
             "motion_geom_noise_floor_mult": NSNumber(value: tuningParams.motion_geom_noise_floor_mult),
             "motion_geom_reject_threshold_relative": NSNumber(value: tuningParams.motion_geom_reject_threshold_relative),
-            "translation_reject_enabled": NSNumber(value: tuningParams.translation_reject_enabled),
-            "translation_reject_px_lo": NSNumber(value: tuningParams.translation_reject_px_lo),
-            "translation_reject_px_hi": NSNumber(value: tuningParams.translation_reject_px_hi),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),

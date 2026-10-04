@@ -1111,22 +1111,6 @@ struct CameraView: View {
                     }
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                 }
-
-                Section(header: Text("Measured Misalignment Rejection")) {
-                    Toggle("Reject by Measured Shift", isOn: $cam.tuningParams.translation_reject_enabled)
-                    Text("""
-                         Estimates each pixel's misregistration in pixels from the \
-                         image residual (δ = d / |∇I|). Unlike the geometry test it \
-                         also catches pure translation, and it does not over-reject \
-                         sharp edges. Sub-pixel offsets below the low threshold are \
-                         kept (they feed super-resolution); larger shifts are faded out.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.translation_reject_enabled {
-                        ispRow("Keep below (px)", $cam.tuningParams.translation_reject_px_lo, 0.3...2.0, "%.2f")
-                        ispRow("Reject above (px)", $cam.tuningParams.translation_reject_px_hi, 0.5...3.0, "%.2f")
-                    }
-                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
