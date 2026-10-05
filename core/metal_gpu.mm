@@ -948,6 +948,10 @@ struct BurstFrames {
     size_t rob_rows_b = 0;
 
     std::vector<uint8_t> have_raw, have_cov, have_rob, have_flow;
+    // Per-slot global homography (Config::global_homography_enabled): 9 floats
+    // (row-major 3x3, lr coords) carried into the fused merge's MergeCompParams.
+    std::vector<f32> homography;         // n*9
+    std::vector<uint8_t> have_homography; // n
 
     bool valid_slot(int slot) const { return open && slot >= 0 && slot < n; }
 };
@@ -1085,6 +1089,8 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.have_cov.assign(nn, 0u);
     g_bf.have_rob.assign(nn, 0u);
     g_bf.have_flow.assign(nn, 0u);
+    g_bf.homography.assign(nn * 9u, 0.f);
+    g_bf.have_homography.assign(nn, 0u);
     g_bf.open = true;
     return true;
 }
@@ -1111,6 +1117,10 @@ bool metal_frame_set_flow(int slot, const FlowField& flow) {
             memcpy((uint8_t*)[g_bf.affines contents] + bf_affine_off(slot) * sizeof(float),
                    flow.affine_jac.data(), abytes);
         }
+    }
+    if (g_bf.homography.size() >= (size_t)(slot + 1) * 9u) {
+        for (int i = 0; i < 9; ++i) g_bf.homography[(size_t)slot * 9u + i] = flow.global_h[i];
+        g_bf.have_homography[(size_t)slot] = flow.has_global_h ? 1u : 0u;
     }
     g_bf.have_flow[(size_t)slot] = 1u;
     return true;
@@ -1640,8 +1650,10 @@ struct RobMaskParamsCPU {
     float    edge_misalign_ghost_z = 3.0f;
     float    edge_misalign_min_conf = 0.0f;
     uint32_t affine_flow = 0;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
+    float    h[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
+    uint32_t use_homography = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 132, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 172, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2525,6 +2537,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = false ? 1u : 0u;
     mp.affine_flow = rob_use_affine ? 1u : 0u;
+    mp.use_homography = flow.has_global_h ? 1u : 0u;
+    for (int i = 0; i < 9; ++i) mp.h[i] = flow.global_h[i];
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
@@ -3834,8 +3848,10 @@ struct MergeCompParamsCPU {
     // the element offset into the affines slice (4 floats/tile).
     uint32_t affine_flow = 0;
     uint32_t affine_off = 0;
+    float    h[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
+    uint32_t use_homography = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 120, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 160, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -4594,6 +4610,10 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.rob_off  = (uint32_t)bf_rob_off(slot);
         p.affine_flow = cfg.affine_flow_enabled ? 1u : 0u;
         p.affine_off  = (uint32_t)bf_affine_off(slot);
+        p.use_homography = (g_bf.have_homography.size() > (size_t)slot &&
+                            g_bf.have_homography[(size_t)slot]) ? 1u : 0u;
+        if (g_bf.homography.size() >= (size_t)(slot + 1) * 9u)
+            for (int i = 0; i < 9; ++i) p.h[i] = g_bf.homography[(size_t)slot * 9u + i];
         ps.push_back(p);
     }
     // Metal still requires the params binding to be non-empty.

@@ -535,6 +535,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.align_match_14 = tuning[@"align_match_14"].boolValue;
     if (tuning[@"affine_flow_enabled"])
         cfg.affine_flow_enabled = tuning[@"affine_flow_enabled"].boolValue;
+    if (tuning[@"global_homography_enabled"])
+        cfg.global_homography_enabled = tuning[@"global_homography_enabled"].boolValue;
     if (tuning[@"flow_upsample_candidates"])
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
     if (tuning[@"real_rgb_guide"])

@@ -888,6 +888,10 @@ struct MergeCompParams {
     // flow_off (2 floats/tile).
     uint affine_flow;
     uint affine_off;
+    // Global homography (Config::global_homography_enabled). Row-major 3x3 in
+    // lr/raw coords; composed onto the comp sample position when use_homography.
+    float h[9];
+    uint use_homography;
 };
 
 struct MergeRefParams {
@@ -1167,6 +1171,15 @@ static inline void merge_comp_contrib(device const float* img,
 
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
+    // Global homography warp-then-refine: compose H*(lr + residual_flow) as the
+    // comp sample position (CPU twin in merge.cpp). lr coords -> no scaling.
+    if (p.use_homography != 0u) {
+        float wq = p.h[6] * lr_mov_x + p.h[7] * lr_mov_y + p.h[8];
+        float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
+        float hx = (p.h[0] * lr_mov_x + p.h[1] * lr_mov_y + p.h[2]) * iwq;
+        float hy = (p.h[3] * lr_mov_x + p.h[4] * lr_mov_y + p.h[5]) * iwq;
+        lr_mov_x = hx; lr_mov_y = hy;
+    }
     if (!(lr_mov_x >= 0.f && lr_mov_x < float(p.lr_w) &&
           lr_mov_y >= 0.f && lr_mov_y < float(p.lr_h)))
         return;
@@ -1713,6 +1726,10 @@ struct RobMaskParams {
     float edge_misalign_ghost_z;
     float edge_misalign_min_conf;
     uint affine_flow;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
+    // Global homography (Config::global_homography_enabled). Row-major 3x3 in
+    // lr/raw coords; composed onto the comp sample position when use_homography.
+    float h[9];
+    uint use_homography;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2136,6 +2153,18 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     }
     float sample_x = float(gid.x) + flow_x;
     float sample_y = float(gid.y) + flow_y;
+    // Global homography: compose H as the merge does. Guide may be half-res
+    // (nch==3) -> x2 to raw, apply H (lr coords), /2 back; full-res 1ch is raw.
+    if (p.use_homography != 0u) {
+        float px = (p.nch == 1u) ? sample_x : 2.f * sample_x;
+        float py = (p.nch == 1u) ? sample_y : 2.f * sample_y;
+        float wq = p.h[6] * px + p.h[7] * py + p.h[8];
+        float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
+        float hx = (p.h[0] * px + p.h[1] * py + p.h[2]) * iwq;
+        float hy = (p.h[3] * px + p.h[4] * py + p.h[5]) * iwq;
+        sample_x = (p.nch == 1u) ? hx : 0.5f * hx;
+        sample_y = (p.nch == 1u) ? hy : 0.5f * hy;
+    }
     // Eq. 6 aggregates each term into ONE scalar across channels first
     // (sigma = sqrt(sum of per-channel variances); d/d_ms/d_md are bare
     // per-pixel scalars, not per-channel), and only then applies max()/

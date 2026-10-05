@@ -172,8 +172,17 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 local_r = robustness.at(iy, ix);
             }
 
-            const f32 lr_mov_x = lr_x + flowx;
-            const f32 lr_mov_y = lr_y + flowy;
+            f32 lr_mov_x = lr_x + flowx;
+            f32 lr_mov_y = lr_y + flowy;
+            // Global homography warp-then-refine: the comparison was warped into
+            // the reference frame before align(), so the actual comp position is
+            // H*(lr + residual_flow). Compose it back here (and the covariance is
+            // then fetched at the correct comp position too).
+            if (cfg.global_homography_enabled && flow.has_global_h) {
+                f32 hx, hy;
+                apply_homography(flow.global_h, lr_mov_x, lr_mov_y, hx, hy);
+                lr_mov_x = hx; lr_mov_y = hy;
+            }
             if (!(lr_mov_x >= 0.f && lr_mov_x < (f32)lr_w &&
                   lr_mov_y >= 0.f && lr_mov_y < (f32)lr_h))
                 continue;

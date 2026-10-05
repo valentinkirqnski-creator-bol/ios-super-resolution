@@ -1905,8 +1905,21 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 }
             }
 
-            const f32 sample_x = (f32)x + flow_x;
-            const f32 sample_y = (f32)y + flow_y;
+            f32 sample_x = (f32)x + flow_x;
+            f32 sample_y = (f32)y + flow_y;
+            // Global homography: compose H*(comp position) as the merge does.
+            // The guide may be half-res (3ch), so convert guide->raw (x2), apply
+            // H (raw/lr coords), convert back (/2); the full-res 1ch guide is raw.
+            if (cfg.global_homography_enabled && flow.has_global_h) {
+                f32 hx, hy;
+                if (d_p.c == 1) {
+                    apply_homography(flow.global_h, sample_x, sample_y, hx, hy);
+                    sample_x = hx; sample_y = hy;
+                } else {
+                    apply_homography(flow.global_h, 2.f * sample_x, 2.f * sample_y, hx, hy);
+                    sample_x = 0.5f * hx; sample_y = 0.5f * hy;
+                }
+            }
             for (int ch = 0; ch < d_p.c; ++ch) {
                 // 460-parity: nearest (round) comp sample, not bilinear.
                 const f32 comp = sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
@@ -2058,11 +2071,20 @@ void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
                     fy = 0.5f * flow.dy(pty, ptx);
                 }
             }
+            // Global homography: compose H into the comp sample position (guide
+            // is half-res here, so x2 to raw / apply H / /2 back), matching the
+            // merge. Only on the !raw_res (guide) branch.
+            f32 s_x = (f32)x + fx, s_y = (f32)y + fy;
+            if (!raw_res && cfg.global_homography_enabled && flow.has_global_h) {
+                f32 hx, hy;
+                apply_homography(flow.global_h, 2.f * s_x, 2.f * s_y, hx, hy);
+                s_x = 0.5f * hx; s_y = 0.5f * hy;
+            }
             for (int ch = 0; ch < ref_means.c; ++ch) {
                 const f32 cv = raw_res
                     ? comp_means.at(y, x, ch)
                     // 460-parity: nearest (round) comp sample, not bilinear.
-                    : sample_nearest_or_inf(comp_means, (f32)y + fy, (f32)x + fx, ch);
+                    : sample_nearest_or_inf(comp_means, s_y, s_x, ch);
                 d_p.at(y, x, ch) = std::isfinite(cv)
                     ? std::fabs(ref_means.at(y, x, ch) - cv)
                     : std::numeric_limits<f32>::infinity();
