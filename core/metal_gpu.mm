@@ -959,6 +959,11 @@ struct BurstFrames {
 static BurstFrames g_bf;
 static int g_active_slot = -1;
 static bool g_resident_out = false;
+// When set, compute_grey_fft_metal materializes the grey host-side even on the
+// resident path, so the CPU global-homography estimator can read its pixels
+// (Config::global_homography_enabled). Off = resident greys stay GPU-only.
+static bool g_grey_force_host = false;
+void metal_set_grey_force_host(bool v) { g_grey_force_host = v; }
 
 static inline size_t bf_raw_off(int slot)  { return (size_t)slot * g_bf.raw_elems; }
 static inline size_t bf_cov_off(int slot)  { return (size_t)slot * g_bf.cov_elems; }
@@ -1349,7 +1354,7 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
         // The host copy of the grey is only wanted when something on the CPU will
         // read it: the debug dumps, or a non-resident frame whose alignment has to
         // upload it. align_metal otherwise reads the pinned buffer below.
-        const bool want_host = !resident_raw || debug_dumps_enabled();
+        const bool want_host = !resident_raw || debug_dumps_enabled() || g_grey_force_host;
         Image grey;
         grey.h = (int)h;
         grey.w = (int)w;
