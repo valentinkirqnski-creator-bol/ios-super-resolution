@@ -1112,6 +1112,14 @@ struct CameraView: View {
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                 }
 
+                Section(header: Text("Geometry Rejection")) {
+                    Toggle("Reject Misaligned Motion", isOn: $cam.tuningParams.motion_geom_reject_enabled)
+                    Text("""
+                         Drops frames' contribution in tiles where the aligned comparison frame disagrees geometrically with the reference — occlusion, subject motion, or a large residual misalignment the block search could not resolve. On by default; turning it off makes merging follow the plain reference algorithm, which can keep more detail on perfectly still scenes but may leave ghosts where anything moved.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Edge Misalignment Rejection")) {
                     Toggle("Reject Misaligned Edges", isOn: $cam.tuningParams.edge_misalign_enabled)
                     Text("""
