@@ -890,7 +890,7 @@ struct MergeCompParams {
     uint affine_off;
     // Global homography (Config::global_homography_enabled). Row-major 3x3 in
     // lr/raw coords; composed onto the comp sample position when use_homography.
-    float h[9];
+    float hmat[9];
     uint use_homography;
 };
 
@@ -1174,10 +1174,10 @@ static inline void merge_comp_contrib(device const float* img,
     // Global homography warp-then-refine: compose H*(lr + residual_flow) as the
     // comp sample position (CPU twin in merge.cpp). lr coords -> no scaling.
     if (p.use_homography != 0u) {
-        float wq = p.h[6] * lr_mov_x + p.h[7] * lr_mov_y + p.h[8];
+        float wq = p.hmat[6] * lr_mov_x + p.hmat[7] * lr_mov_y + p.hmat[8];
         float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
-        float hx = (p.h[0] * lr_mov_x + p.h[1] * lr_mov_y + p.h[2]) * iwq;
-        float hy = (p.h[3] * lr_mov_x + p.h[4] * lr_mov_y + p.h[5]) * iwq;
+        float hx = (p.hmat[0] * lr_mov_x + p.hmat[1] * lr_mov_y + p.hmat[2]) * iwq;
+        float hy = (p.hmat[3] * lr_mov_x + p.hmat[4] * lr_mov_y + p.hmat[5]) * iwq;
         lr_mov_x = hx; lr_mov_y = hy;
     }
     if (!(lr_mov_x >= 0.f && lr_mov_x < float(p.lr_w) &&
@@ -1728,7 +1728,8 @@ struct RobMaskParams {
     uint affine_flow;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
     // Global homography (Config::global_homography_enabled). Row-major 3x3 in
     // lr/raw coords; composed onto the comp sample position when use_homography.
-    float h[9];
+    // Named hmat (not h) because RobMaskParams::h is the guide height.
+    float hmat[9];
     uint use_homography;
 };
 
@@ -2158,10 +2159,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     if (p.use_homography != 0u) {
         float px = (p.nch == 1u) ? sample_x : 2.f * sample_x;
         float py = (p.nch == 1u) ? sample_y : 2.f * sample_y;
-        float wq = p.h[6] * px + p.h[7] * py + p.h[8];
+        float wq = p.hmat[6] * px + p.hmat[7] * py + p.hmat[8];
         float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
-        float hx = (p.h[0] * px + p.h[1] * py + p.h[2]) * iwq;
-        float hy = (p.h[3] * px + p.h[4] * py + p.h[5]) * iwq;
+        float hx = (p.hmat[0] * px + p.hmat[1] * py + p.hmat[2]) * iwq;
+        float hy = (p.hmat[3] * px + p.hmat[4] * py + p.hmat[5]) * iwq;
         sample_x = (p.nch == 1u) ? hx : 0.5f * hx;
         sample_y = (p.nch == 1u) ? hy : 0.5f * hy;
     }
