@@ -1112,6 +1112,29 @@ struct CameraView: View {
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                 }
 
+                Section(header: Text("Robustness Mask")) {
+                    Toggle("Robustness", isOn: $cam.tuningParams.robustness_enabled)
+                    Text("""
+                         The per-pixel robustness mask (Eq. 5–9) that down-weights moving or misaligned frames during merge. Off merges every frame equally — sharper on perfectly still scenes, but ghosts anything that moved.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.robustness_enabled {
+                        ispRow("Threshold t", $cam.tuningParams.r_t, 0.0...0.5, "%.3f")
+                        ispRow("s1 (irregular flow)", $cam.tuningParams.r_s1, 0.0...4.0, "%.2f")
+                        ispRow("s2 (regular flow)", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")
+                        ispRow("Mt (motion threshold)", $cam.tuningParams.r_Mt, 0.0...4.0, "%.2f")
+                        Text("460-main: t 0.12, s1 2, s2 12, Mt 0.8. Higher t rejects more; higher s1/s2 trust frames more; Mt is the per-tile flow spread that switches s2→s1.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+
+                Section(header: Text("Steerable Kernels")) {
+                    ispRow("k_stretch", $cam.tuningParams.k_stretch, 1.0...8.0, "%.1f")
+                    ispRow("k_shrink", $cam.tuningParams.k_shrink, 0.25...4.0, "%.2f")
+                    Text("Shape of the merge kernels along/across edges. 460-main: k_stretch 4, k_shrink 2. Higher stretch elongates kernels along edges; higher shrink narrows them across edges (sharper, noisier).")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Geometry Rejection")) {
                     Toggle("Reject Misaligned Motion", isOn: $cam.tuningParams.motion_geom_reject_enabled)
                     Text("""
