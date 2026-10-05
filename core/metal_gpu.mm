@@ -8,6 +8,7 @@
 #include "debug_utils.h"
 #include "prof.h"
 #include "mps_fft.h"
+#include "tile_reject_weights.h"
 // RR_WEIGHTS_N, for the static_assert that the generated table below matches
 // the layout the kernel reads, and the compiled-in weights themselves.
 #include "robustness_refine_shared.h"
@@ -1657,8 +1658,9 @@ struct RobMaskParamsCPU {
     uint32_t affine_flow = 0;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
     uint32_t use_homography = 0;
+    uint32_t tile_reject = 0;  // 1 = darken-only tile-reject NN (Config::tile_reject_nn_enabled)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 172, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 176, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2544,6 +2546,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.affine_flow = rob_use_affine ? 1u : 0u;
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
+    mp.tile_reject = cfg.tile_reject_nn_enabled ? 1u : 0u;
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
@@ -2595,6 +2598,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_s_select offset:0 atIndex:14];
     [enc setBuffer:b_match_amb offset:0 atIndex:15];
     [enc setBuffer:b_affine offset:0 atIndex:16];
+    id<MTLBuffer> b_tr = buf(kTileRejectW, sizeof(kTileRejectW));
+    [enc setBuffer:b_tr offset:0 atIndex:17];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

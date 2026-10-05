@@ -1731,6 +1731,7 @@ struct RobMaskParams {
     // Named hmat (not h) because RobMaskParams::h is the guide height.
     float hmat[9];
     uint use_homography;
+    uint tile_reject;  // 1 = darken-only tile-reject NN (Config::tile_reject_nn_enabled)
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2090,6 +2091,25 @@ inline float rob_edge_misalign_c(device const float* ref_means, device const flo
                                  float em_shift_z, float em_ghost_z, float em_min_conf,
                                  float alpha, float beta);
 
+// Tiny darken-only tile-reject NN eval: 7 features -> 8 -> 1 (sigmoid).
+// Flat weights w layout matches core/tile_reject_weights.h:
+//   mu[7], sd[7], W1[8*7] (o*7+i), b1[8], W2[8], b2[1].
+inline float tr_eval(thread const float* f, device const float* w) {
+    const int F = 7, H = 8;
+    const int oMU = 0, oSD = F, oW1 = 2 * F, oB1 = 2 * F + H * F;
+    const int oW2 = 2 * F + H * F + H, oB2 = 2 * F + H * F + 2 * H;
+    float xn[7];
+    for (int i = 0; i < F; ++i) xn[i] = (f[i] - w[oMU + i]) / w[oSD + i];
+    float acc = w[oB2];
+    for (int o = 0; o < H; ++o) {
+        float h = w[oB1 + o];
+        for (int i = 0; i < F; ++i) h += w[oW1 + o * F + i] * xn[i];
+        h = max(h, 0.f);
+        acc += w[oW2 + o] * h;
+    }
+    return 1.f / (1.f + exp(-acc));
+}
+
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(3)]],
@@ -2106,6 +2126,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device float* s_select [[buffer(14)]],
                           device const uint* match_ambiguous [[buffer(15)]],
                           device const float* affine_jac [[buffer(16)]],
+                          device const float* tr_w [[buffer(17)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -2566,6 +2587,43 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                                      p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
                                      p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
                                      p.alpha, p.beta);
+    // Tiny darken-only tile-reject NN (Config::tile_reject_nn_enabled): gate R
+    // by g in (0,1) from the per-tile single-vector-error features. Multiply ->
+    // can only darken. Features mirror tools/tile_reject_nn/features.py.
+    if (p.tile_reject != 0u && r_val > 0.f) {
+        int ty = clamp(patch_idy, 0, int(p.flow_ny) - 1);
+        int tx = clamp(patch_idx, 0, int(p.flow_nx) - 1);
+        uint fnx = p.flow_nx;
+        int txm = max(tx - 1, 0), txp = min(tx + 1, int(fnx) - 1);
+        int tym = max(ty - 1, 0), typ = min(ty + 1, int(p.flow_ny) - 1);
+        float Jxx = 0.5f * (flow[(uint(ty) * fnx + uint(txp)) * 2 + 0] - flow[(uint(ty) * fnx + uint(txm)) * 2 + 0]);
+        float Jyx = 0.5f * (flow[(uint(ty) * fnx + uint(txp)) * 2 + 1] - flow[(uint(ty) * fnx + uint(txm)) * 2 + 1]);
+        float Jxy = 0.5f * (flow[(uint(typ) * fnx + uint(tx)) * 2 + 0] - flow[(uint(tym) * fnx + uint(tx)) * 2 + 0]);
+        float Jyy = 0.5f * (flow[(uint(typ) * fnx + uint(tx)) * 2 + 1] - flow[(uint(tym) * fnx + uint(tx)) * 2 + 1]);
+        float grad_mag = sqrt(Jxx * Jxx + Jxy * Jxy + Jyx * Jyx + Jyy * Jyy);
+        float rawx = (p.nch == 1u) ? float(gid.x) : 2.f * float(gid.x) + 0.5f;
+        float rawy = (p.nch == 1u) ? float(gid.y) : 2.f * float(gid.y) + 0.5f;
+        float offx = rawx / float(p.tile_size) - (float(tx) + 0.5f);
+        float offy = rawy / float(p.tile_size) - (float(ty) + 0.5f);
+        float ex = Jxx * offx + Jxy * offy, ey = Jyx * offx + Jyy * offy;
+        float pred_err = sqrt(ex * ex + ey * ey);
+        float dist = sqrt(offx * offx + offy * offy) / 0.5f;
+        uint xl = uint(max(int(gid.x) - 1, 0)), xr = uint(min(int(gid.x) + 1, int(p.w) - 1));
+        uint yu = uint(max(int(gid.y) - 1, 0)), yd = uint(min(int(gid.y) + 1, int(p.h) - 1));
+        float lr = 0.f, rr = 0.f, ur = 0.f, dr = 0.f;
+        for (uint c = 0; c < p.nch; ++c) {
+            lr += ref_means[(gid.y * p.w + xl) * p.nch + c];
+            rr += ref_means[(gid.y * p.w + xr) * p.nch + c];
+            ur += ref_means[(yu * p.w + gid.x) * p.nch + c];
+            dr += ref_means[(yd * p.w + gid.x) * p.nch + c];
+        }
+        float invn = 1.f / float(p.nch);
+        float gx = 0.5f * (rr - lr) * invn, gy = 0.5f * (dr - ur) * invn;
+        float refgrad = sqrt(gx * gx + gy * gy);
+        float dos = sqrt(d_sq_ / max(sigma_sq_, 1e-12f));
+        float fvec[7] = { dos, grad_mag, dist, pred_err, refgrad, Jxx + Jyy, Jyx - Jxy };
+        r_val *= tr_eval(fvec, tr_w);
+    }
     R[out_o] = r_val;
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;

@@ -723,6 +723,13 @@ struct Config {
     // model parallax or moving objects. See core/global_homography.h.
     bool global_homography_enabled = false;
 
+    // Tiny darken-only NN that refines the robustness mask for per-tile
+    // single-vector misalignment (rotation/parallax/irregular). Multiplies R by
+    // a gate in (0,1) -- can only darken, never brighten. Runs inline in the
+    // device robustness kernel; weights in core/tile_reject_weights.h. OFF by
+    // default; experimental. See tools/tile_reject_nn.
+    bool tile_reject_nn_enabled = false;
+
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
     // finest-radius override lands on the CPU and the device identically.

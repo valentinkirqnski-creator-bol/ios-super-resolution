@@ -1126,6 +1126,11 @@ struct CameraView: View {
                         Text("460-main: t 0.12, s1 2, s2 12, Mt 0.8. Higher t rejects more; higher s1/s2 trust frames more; Mt is the per-tile flow spread that switches s2→s1.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                    Toggle("NN Tile-Reject Refine", isOn: $cam.tuningParams.tile_reject_nn_enabled)
+                    Text("""
+                         Experimental tiny neural net that only DARKENS the mask (never brightens) where a tile's single motion vector is wrong — rotation/parallax/irregular motion. Conservative by design.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Steerable Kernels")) {
