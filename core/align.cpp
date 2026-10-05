@@ -1008,14 +1008,17 @@ static FlowField upscale_flow_460(const Image& ref, const Image& moving,
             // every level and every shipped configuration -- circular padding
             // only guarantees divisibility at level 0.
             //
-            // Those uncovered tiles form a strip along the bottom and right
-            // edges. They used to be reset to zero motion, which the finest
-            // level could not recover: its search radius is 1, so a burst with
-            // any real handheld motion left that strip unaligned. Clamping to
-            // the nearest covered coarse tile hands them the neighbouring
-            // estimate instead, and the three-candidate test below still
-            // re-verifies it against the image. upscale_flow(), the sibling
-            // above, has always clamped.
+            // 460-parity: those uncovered bottom/right-strip tiles get ZERO
+            // motion, exactly as cuda_upsample_alignments (block_matching.py:
+            // 298-302) does. (A clamp-to-nearest-covered-tile variant recovered
+            // that strip better -- the finest level's search radius is 1 and
+            // cannot fix a zeroed strip -- but 460 does not do it, so matching
+            // the reference means leaving the strip at zero.)
+            if (tx >= repeat_factor * in.nx || ty >= repeat_factor * in.ny) {
+                out.dx(ty, tx) = 0.f;
+                out.dy(ty, tx) = 0.f;
+                continue;
+            }
             const int prev_x = std::min(tx / repeat_factor, in.nx - 1);
             const int prev_y = std::min(ty / repeat_factor, in.ny - 1);
             const int ups_x = tx % repeat_factor;

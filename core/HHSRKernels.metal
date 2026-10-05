@@ -3264,9 +3264,18 @@ kernel void align_upscale_flow_460(device const float* in_flow [[buffer(0)]],
 
     // target_n* always exceeds repeat_factor * in_n* (see upscale_flow_460 in
     // align.cpp for why), leaving a strip of tiles along the bottom and right
-    // edges with no coarse tile above them. Clamp to the nearest covered tile;
-    // resetting those to zero motion left the strip unrecoverable at the finest
-    // level, whose search radius is 1.
+    // edges with no coarse tile above them. 460-parity: those tiles get ZERO
+    // motion, as cuda_upsample_alignments (block_matching.py:298-302) does.
+    // (A clamp-to-nearest-covered-tile variant recovered the strip better --
+    // the finest level's search radius is 1 and cannot fix a zeroed strip --
+    // but 460 does not do it, so the reference match leaves the strip at zero.)
+    if (gid.x >= p.repeat_factor * p.in_nx || gid.y >= p.repeat_factor * p.in_ny) {
+        out_flow[o + 0u] = 0.f;
+        out_flow[o + 1u] = 0.f;
+        if (p.carry_ambiguity != 0u)
+            out_amb[gid.y * p.target_nx + gid.x] = 0u;
+        return;
+    }
     uint prev_x = min(gid.x / p.repeat_factor, p.in_nx - 1u);
     uint prev_y = min(gid.y / p.repeat_factor, p.in_ny - 1u);
     uint ups_x = gid.x % p.repeat_factor;
