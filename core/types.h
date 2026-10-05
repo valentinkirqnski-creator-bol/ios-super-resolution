@@ -785,7 +785,14 @@ struct Config {
     // now sqrt(latent), so latent = mean^2). All of that is handled behind
     // this one flag. No visible toggle; flip via the tuning dict if it ever
     // misbehaves on device. Only the robustness path changes.
-    bool robustness_guide_sqrt = true;
+    //
+    // Set to FALSE to match 460-main exactly: the robustness guide is then the
+    // plain linear per-2x2-quad channel average (no sqrt VST), and the noise
+    // curves are the linear-domain fast-MC curves indexed by brightness
+    // directly (not mean^2). This flag gates the guide transfer curve, the
+    // noise-LUT domain, and the mean^2 index on both the CPU and the Metal
+    // paths (robustness_guide_sqrt_active()).
+    bool robustness_guide_sqrt = false;
 
     // --- Guide colour processing (IPOL-author suggestion) -------------------
     // Render the robustness GUIDE as a real display RGB before d/sigma are
