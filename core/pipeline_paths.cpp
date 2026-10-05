@@ -1618,6 +1618,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                      comp_grey.h, comp_grey.w, cons_ts,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(cons_ts));
+        // Fit the per-tile affine motion model on the finalized raw-grid flow,
+        // before it is uploaded to the GPU slice (metal_frame_set_flow) and
+        // before robustness/merge consume it. Off by default (Config::
+        // affine_flow_enabled); leaves flow.affine_jac empty otherwise so every
+        // consumer keeps the plain per-tile vector.
+        if (work.affine_flow_enabled) flow.fit_affine();
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),

@@ -1878,16 +1878,31 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             int patch_idy = 0, patch_idx = 0;
             // Same sampling as the merge, deliberately: the mask must score
             // the correspondence the merge will actually fetch.
+            const bool aff = cfg.affine_flow_enabled && flow.has_affine();
             if (d_p.c == 1) {
+                // Full-res guide: guide position IS the raw position.
                 patch_idy = y / tile_size;
                 patch_idx = x / tile_size;
-                flow_x = flow.dx(patch_idy, patch_idx);
-                flow_y = flow.dy(patch_idy, patch_idx);
+                if (aff) {
+                    flow.sample_affine((f32)y, (f32)x, tile_size, flow_x, flow_y);
+                } else {
+                    flow_x = flow.dx(patch_idy, patch_idx);
+                    flow_y = flow.dy(patch_idy, patch_idx);
+                }
             } else {
+                // Half-res 3ch guide: raw position is 2*guide+0.5, flow halved.
                 patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
                 patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
-                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                if (aff) {
+                    f32 rdx, rdy;
+                    flow.sample_affine(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
+                                       tile_size, rdx, rdy);
+                    flow_x = 0.5f * rdx;
+                    flow_y = 0.5f * rdy;
+                } else {
+                    flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                    flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                }
             }
 
             const f32 sample_x = (f32)x + flow_x;
@@ -2028,12 +2043,20 @@ void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
                 // Nearest tile, and the displacement halved into guide units:
                 // the same sampling compute_robustness_core uses, because the
                 // mask has to score the correspondence the MERGE will fetch.
-                const int pty = std::min(flow.ny - 1,
-                    std::max(0, (int)((2.f * (f32)y + 0.5f) / (f32)tile_size)));
-                const int ptx = std::min(flow.nx - 1,
-                    std::max(0, (int)((2.f * (f32)x + 0.5f) / (f32)tile_size)));
-                fx = 0.5f * flow.dx(pty, ptx);
-                fy = 0.5f * flow.dy(pty, ptx);
+                if (cfg.affine_flow_enabled && flow.has_affine()) {
+                    f32 rdx, rdy;
+                    flow.sample_affine(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f,
+                                       tile_size, rdx, rdy);
+                    fx = 0.5f * rdx;
+                    fy = 0.5f * rdy;
+                } else {
+                    const int pty = std::min(flow.ny - 1,
+                        std::max(0, (int)((2.f * (f32)y + 0.5f) / (f32)tile_size)));
+                    const int ptx = std::min(flow.nx - 1,
+                        std::max(0, (int)((2.f * (f32)x + 0.5f) / (f32)tile_size)));
+                    fx = 0.5f * flow.dx(pty, ptx);
+                    fy = 0.5f * flow.dy(pty, ptx);
+                }
             }
             for (int ch = 0; ch < ref_means.c; ++ch) {
                 const f32 cv = raw_res

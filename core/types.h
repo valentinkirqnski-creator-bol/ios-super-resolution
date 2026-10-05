@@ -112,6 +112,16 @@ struct FlowField {
     // deriving it, which is what the full-resolution FFT path relies on.
     std::vector<uint32_t> motion_irregular;
 
+    // Per-tile local affine motion model (Config::affine_flow_enabled). Four
+    // floats per tile -- the 2x2 Jacobian [Jxx, Jxy, Jyx, Jyy] of the flow field,
+    // fitted by least squares over a window of neighbour tile vectors. The tile's
+    // own vector (dx/dy above) stays the exact intercept; J adds the first-order
+    // variation across the tile, so rotation/yaw/pitch (locally affine) warp each
+    // sub-region correctly instead of by one constant vector. Empty = not fitted;
+    // every consumer then falls back to the plain per-tile vector. See fit_affine
+    // and sample_affine. Deliberately NOT allocated by the constructor.
+    std::vector<f32> affine_jac;
+
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
         flow((size_t)ny_ * nx_ * 2, 0.f),
@@ -172,6 +182,68 @@ struct FlowField {
         out_dx = tx0 + (bx0 - tx0) * ay;
         out_dy = ty0 + (by0 - ty0) * ay;
     }
+
+    inline bool has_affine() const {
+        return affine_jac.size() == (size_t)ny * (size_t)nx * 4 && ny > 0 && nx > 0;
+    }
+
+    // Per-pixel displacement from the per-tile affine model (Config::
+    // affine_flow_enabled). The owning tile is floor(raw/ts) -- the same tile
+    // index the merge/robustness nearest path uses -- and the within-tile
+    // offset is in tile units, centred (off = raw/ts - 0.5 - tile_idx), so at a
+    // tile centre this returns exactly the tile's own vector. Falls back to the
+    // plain vector if the model was not fitted. See fit_affine.
+    inline void sample_affine(f32 raw_y, f32 raw_x, int tile_size,
+                              f32& out_dx, f32& out_dy) const {
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+        const int px = cl((int)std::floor(raw_x / (f32)tile_size), nx);
+        const int py = cl((int)std::floor(raw_y / (f32)tile_size), ny);
+        const f32 d0x = dx(py, px), d0y = dy(py, px);
+        if (!has_affine() || tile_size <= 0) { out_dx = d0x; out_dy = d0y; return; }
+        const f32 offx = raw_x / (f32)tile_size - 0.5f - (f32)px;
+        const f32 offy = raw_y / (f32)tile_size - 0.5f - (f32)py;
+        const f32* J = &affine_jac[((size_t)py * nx + px) * 4];
+        out_dx = d0x + J[0] * offx + J[1] * offy;
+        out_dy = d0y + J[2] * offx + J[3] * offy;
+    }
+
+    // Least-squares fit of the per-tile flow Jacobian over a (2*radius+1)^2
+    // window of neighbour tile vectors, keeping the tile's own vector as the
+    // intercept. Rotation/yaw/pitch make the flow field locally affine, so J is
+    // their first-order signature; a singular window gives J=0 and each element
+    // is clamped to +/-jmax so noisy block matches cannot fling pixels.
+    inline void fit_affine(int radius = 2, f32 jmax = 2.f) {
+        if (ny <= 0 || nx <= 0) { affine_jac.clear(); return; }
+        affine_jac.assign((size_t)ny * (size_t)nx * 4, 0.f);
+        for (int ty = 0; ty < ny; ++ty) {
+            for (int tx = 0; tx < nx; ++tx) {
+                const f32 f0x = dx(ty, tx), f0y = dy(ty, tx);
+                f32 m00 = 0.f, m01 = 0.f, m11 = 0.f;
+                f32 bx0 = 0.f, bx1 = 0.f, by0 = 0.f, by1 = 0.f;
+                for (int i = ty - radius; i <= ty + radius; ++i) {
+                    if (i < 0 || i >= ny) continue;
+                    for (int j = tx - radius; j <= tx + radius; ++j) {
+                        if (j < 0 || j >= nx) continue;
+                        const f32  dxx = (f32)(j - tx), dyy = (f32)(i - ty);
+                        const f32 fx = dx(i, j) - f0x, fy = dy(i, j) - f0y;
+                        m00 += dxx * dxx; m01 += dxx * dyy; m11 += dyy * dyy;
+                        bx0 += dxx * fx;  bx1 += dyy * fx;
+                        by0 += dxx * fy;  by1 += dyy * fy;
+                    }
+                }
+                f32* J = &affine_jac[((size_t)ty * nx + tx) * 4];
+                const f32 det = m00 * m11 - m01 * m01;
+                if (std::fabs(det) < 1e-6f) { J[0] = J[1] = J[2] = J[3] = 0.f; continue; }
+                const f32 inv = 1.f / det;
+                auto cl = [&](f32 v) { return v < -jmax ? -jmax : (v > jmax ? jmax : v); };
+                J[0] = cl(inv * ( m11 * bx0 - m01 * bx1));
+                J[1] = cl(inv * (-m01 * bx0 + m00 * bx1));
+                J[2] = cl(inv * ( m11 * by0 - m01 * by1));
+                J[3] = cl(inv * (-m01 * by0 + m00 * by1));
+            }
+        }
+    }
+
     inline uint32_t& aperture(int ty, int tx) { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t aperture(int ty, int tx) const { return aperture_limited[(size_t)ty * nx + tx]; }
     inline uint32_t& ambiguous(int ty, int tx) { return match_ambiguous[(size_t)ty * nx + tx]; }
@@ -615,6 +687,15 @@ struct Config {
     // third.
     bool flow_upsample_candidates = true;
     bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
+
+    // Per-tile local affine motion model. When on, the finalized flow field is
+    // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
+    // robustness sample the per-pixel affine displacement (FlowField::
+    // sample_affine) instead of one constant vector per tile. Models rotation /
+    // yaw / pitch / smooth parallax within a tile; genuine motion discontinuities
+    // (occlusion, moving-object edges) still fall to the robustness mask. OFF by
+    // default: not part of the 460-main algorithm, purely additive.
+    bool affine_flow_enabled = false;
 
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
