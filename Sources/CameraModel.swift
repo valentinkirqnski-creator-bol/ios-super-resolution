@@ -264,7 +264,13 @@ struct TuningParams: Equatable, Codable {
     /// FALSE. It is now a Settings toggle, so its stored value is what the user
     /// sees; defaulting it to true while the gate also demands the decimate grey
     /// made it read "on" while being inert, which is worse than off.
-    var robustness_raw_resolution_enabled: Bool = true
+    ///
+    /// 460-parity: false also makes robustness_fft_guide_active() false, so the
+    /// robustness guide is the half-res 3-channel RGB Bayer guide 460-main uses
+    /// (compute_guide_image) on every path. The Metal robustness backend already
+    /// builds that guide unconditionally, so this does not change device output;
+    /// it aligns the CPU/reference path and the config flags with what ships.
+    var robustness_raw_resolution_enabled: Bool = false
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
