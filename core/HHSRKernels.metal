@@ -1149,8 +1149,11 @@ static inline void merge_comp_contrib(device const float* img,
     if (!p.iso) {
         float kmap_j, kmap_i;
         if (p.bayer) {
-            kmap_j = lr_mov_x / 2.f - 0.5f;
-            kmap_i = lr_mov_y / 2.f - 0.5f;
+            // 460-parity: grey cell g sits at coarse 2g+0.5, so g=(x-0.5)/2
+            // (merge.py accumulate / the ref path). Was x/2 - 0.5, a 0.25-cell
+            // (0.5 raw-px) offset on every comparison-frame covariance fetch.
+            kmap_j = (lr_mov_x - 0.5f) / 2.f;
+            kmap_i = (lr_mov_y - 0.5f) / 2.f;
         } else {
             kmap_j = lr_mov_x - 0.5f;
             kmap_i = lr_mov_y - 0.5f;
