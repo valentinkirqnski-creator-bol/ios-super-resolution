@@ -135,8 +135,16 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // constant, which rotation turns into a visible tile grid. The
             // mask samples the SAME way, so it still grades the fetch that
             // actually happens. See FlowField::sample_bilinear.
-            f32 flowx = flow.dx(py, px);
-            f32 flowy = flow.dy(py, px);
+            f32 flowx, flowy;
+            if (cfg.affine_flow_enabled && flow.has_affine()) {
+                // Per-tile affine: displacement varies across the tile so
+                // rotation/yaw/pitch warp correctly. At a tile centre this
+                // equals flow.dx/dy(py,px), so flag-off behaviour is unchanged.
+                flow.sample_affine(lr_y, lr_x, tile_size, flowx, flowy);
+            } else {
+                flowx = flow.dx(py, px);
+                flowy = flow.dy(py, px);
+            }
 
             // Which coordinate space R lives in is decided by R's ACTUAL
             // dimensions, not Config::robustness_raw_resolution_active():
