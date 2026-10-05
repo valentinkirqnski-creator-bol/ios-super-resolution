@@ -142,7 +142,9 @@ struct TuningParams: Equatable, Codable {
     /// finest search radius -> 1, bilinear inter-level flow upscale (not the 460
     /// three-candidate re-match), and per-level ICA on the FFT grey. Off keeps
     /// the 460-derived behaviour. Algorithm parity, not bit parity.
-    var align_match_14: Bool = true
+    /// Default false: run the 460-main alignment (single finest-level ICA +
+    /// three-candidate flow upscale), not 1.4's per-level ICA + bilinear upscale.
+    var align_match_14: Bool = false
     /// Overlapping tiles for alignment (IPOL author's suggestion): after the
     /// normal align, re-measure the finest flow on a stride-Ts/2 grid (2x tiles,
     /// 50% overlap), each cell block-matched on its own Ts window. Captures
@@ -170,12 +172,14 @@ struct TuningParams: Equatable, Codable {
     /// against the image, lowest L1 residual wins. OFF: plain bilinear resize.
     ///
     /// Forced OFF by align_match_14, which is what 1.4 does.
-    var flow_upsample_candidates: Bool = false
+    /// Default true: 460-main uses the three-candidate content-aware upscale.
+    var flow_upsample_candidates: Bool = true
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
     /// -1 auto (follow sqrt guide), 0 none, 1 sqrt, 2 gamma, 3 srgb.
-    var guide_curve: Int = 1   // Sqrt
+    /// Default 0 (none/linear): 460-main's guide is linear raw, no VST.
+    var guide_curve: Int = 0   // None (460 linear guide)
     /// Per-pixel motion scale s (Wronski's per-pixel M): sample s bilinearly per
     /// pixel instead of one value per 16px tile, removing the tile-block R the
     /// paper never had. Off by default.
@@ -183,8 +187,10 @@ struct TuningParams: Equatable, Codable {
     /// poor model of local motion (flow-gradient × offset, weighted by |∇I|).
     /// Cleans rotation tile-ghosts by rejecting the worst pixels (they fall back
     /// to the reference); inert under one-direction motion. A hiding fix — it
-    /// trades some burst samples for artifact-free output. Off by default.
-    var motion_geom_reject_enabled: Bool = true
+    /// trades some burst samples for artifact-free output.
+    /// Default false: 460-main has no geometry rejection. Users can re-enable it
+    /// in Settings (Geometry Rejection) to trade burst samples for fewer ghosts.
+    var motion_geom_reject_enabled: Bool = false
     /// |∇I|·|E| threshold (intensity units). Must be LOW to reject anything:
     /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     /// drops more burst samples.
@@ -500,7 +506,9 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var zslBufferReady = 0
     @Published var tuningParams: TuningParams = {
         // Bump when app defaults change so existing installs pick up the new preset once.
-        let defaultsVersion = 13
+        // 14: 460-main-by-default preset (align_match_14 off, candidate flow
+        // upscale, linear guide, geometry rejection off).
+        let defaultsVersion = 14
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

@@ -356,7 +356,16 @@ struct Config {
     // balance gains) and always in the direction of trusting the data slightly
     // less. Guarded on bayer_mode: a non-Bayer guide is the raw plane itself,
     // with no quad averaging to account for.
+    // 460-parity for the noise model. 460-main feeds run_fast_MC a single
+    // RGB-averaged (alpha, beta) read straight from the DNG NoiseProfile, with
+    // no white-balance scaling and no per-channel green down-weighting, and
+    // scores all guide channels against that one curve. true restores that:
+    // noise_wb_gain and noise_guide_weight collapse to 1, and the per-channel
+    // robustness curves collapse to the single RGB-mean curve. false keeps the
+    // port's more-correct WB-scaled, green-weighted, per-channel variant.
+    bool noise_model_match_460 = true;
     float noise_wb_gain(int c) const {
+        if (noise_model_match_460) return 1.f;   // 460: profile used unscaled
         if (!raw_prewhitened) return 1.f;   // nothing applied yet, profile stands
         if (c < 0 || c > 2) return 1.f;
         const float g = white_balance[c] / white_balance[1];
@@ -367,6 +376,7 @@ struct Config {
     // and B give 1. Read from the CFA rather than hardcoded, so it tracks
     // whatever the guide actually did.
     float noise_guide_weight(int c) const {
+        if (noise_model_match_460) return 1.f;   // 460: equal weight all channels
         if (!bayer_mode || c < 0 || c > 2) return 1.f;
         const int n = cfa.count((uint8_t)c);
         return (n > 0) ? 1.f / (float)n : 1.f;
@@ -452,10 +462,15 @@ struct Config {
                                          : noise_beta() * fft_guide_noise_energy();
     }
     float noise_alpha_ch_robustness(int c) const {
-        return debug_noise_model_disabled ? 0.f : noise_alpha_ch(c);
+        if (debug_noise_model_disabled) return 0.f;
+        // 460: every guide channel scores against the one RGB-mean curve.
+        if (noise_model_match_460) return noise_alpha_robustness();
+        return noise_alpha_ch(c);
     }
     float noise_beta_ch_robustness(int c) const {
-        return debug_noise_model_disabled ? 0.f : noise_beta_ch(c);
+        if (debug_noise_model_disabled) return 0.f;
+        if (noise_model_match_460) return noise_beta_robustness();
+        return noise_beta_ch(c);
     }
     // Debug parity switch: ignore the camera/DNG NoiseProfile and use the
     // Pixel 4a model from the Python data/README, scaled by ISO. Robustness
