@@ -960,6 +960,18 @@ static f32 sample_bilinear_or_inf(const Image& img, f32 y, f32 x, int ch) {
     return top + (bot - top) * fy;
 }
 
+// 460-parity robustness color-distance sampling: 460 fetches the comp local-mean
+// at round(idx+flow) (nearest), inbound-tested on the rounded index, else +inf
+// so R = 0. 460's round() is numba-CUDA device round (halfway away from zero),
+// which std::lround matches. See cuda_compute_patch_dist in robustness.py.
+static f32 sample_nearest_or_inf(const Image& img, f32 y, f32 x, int ch) {
+    const int yi = (int)std::lround(y);
+    const int xi = (int)std::lround(x);
+    if (!(yi >= 0 && yi < img.h && xi >= 0 && xi < img.w))
+        return std::numeric_limits<f32>::infinity();
+    return img.at(yi, xi, ch);
+}
+
 static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     // Python OOB: HR[...] = 1/0  (+inf)
     if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
@@ -1881,7 +1893,8 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             const f32 sample_x = (f32)x + flow_x;
             const f32 sample_y = (f32)y + flow_y;
             for (int ch = 0; ch < d_p.c; ++ch) {
-                const f32 comp = sample_bilinear_or_inf(comp_means, sample_y, sample_x, ch);
+                // 460-parity: nearest (round) comp sample, not bilinear.
+                const f32 comp = sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
                 const f32 dp = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();
@@ -2025,7 +2038,8 @@ void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
             for (int ch = 0; ch < ref_means.c; ++ch) {
                 const f32 cv = raw_res
                     ? comp_means.at(y, x, ch)
-                    : sample_bilinear_or_inf(comp_means, (f32)y + fy, (f32)x + fx, ch);
+                    // 460-parity: nearest (round) comp sample, not bilinear.
+                    : sample_nearest_or_inf(comp_means, (f32)y + fy, (f32)x + fx, ch);
                 d_p.at(y, x, ch) = std::isfinite(cv)
                     ? std::fabs(ref_means.at(y, x, ch) - cv)
                     : std::numeric_limits<f32>::infinity();

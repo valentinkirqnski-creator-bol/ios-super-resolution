@@ -1737,6 +1737,21 @@ inline float rob_sample_bilinear_or_inf(device const float* img,
     return top + (bot - top) * fy;
 }
 
+// 460-parity robustness color-distance sampling: 460 takes the comp local-mean
+// at round(idx+flow) (nearest), with an inbound test on the rounded index; out
+// of bounds -> +inf so R = 0. 460's round() is numba-CUDA device round, which
+// rounds halfway away from zero (same as CPU sample_dogson's std::lround note),
+// and Metal round() matches that tie rule. See cuda_compute_patch_dist in
+// robustness.py.
+inline float rob_sample_nearest_or_inf(device const float* img,
+                                       uint h, uint w, uint nch,
+                                       float y, float x, uint ch) {
+    int yi = int(round(y));
+    int xi = int(round(x));
+    if (!(yi >= 0 && yi < int(h) && xi >= 0 && xi < int(w))) return INFINITY;
+    return img[(uint(yi) * w + uint(xi)) * nch + ch];
+}
+
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
                             device const float* raw [[buffer(1)]],
                             constant RobGuideParams& p [[buffer(2)]],
@@ -2112,8 +2127,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_t = diff_curve[curve_id];
         float sigma_p_sq = ref_vars[o];
         sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-        float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
-                                                sample_y, sample_x, ch);
+        // 460-parity: nearest (round) comp sample, not bilinear.
+        float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
+                                               sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
         float denom = d_p_sq + d_t * d_t;
@@ -2909,9 +2925,9 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         // configuration ever selects these sizes.
         if (lane != 0u) return;
         for (uint it = 0u; it < p.n_iter; ++it) {
-            // floor, not trunc -- see ica_refine_level in align.cpp.
-            float floor_fx = floor(fx);
-            float floor_fy = floor(fy);
+            // 460-parity: trunc toward zero -- see ica_refine_level in align.cpp.
+            float floor_fx = trunc(fx);
+            float floor_fy = trunc(fy);
             float frac_x = fx - floor_fx;
             float frac_y = fy - floor_fy;
             int floor_off_x = int(floor_fx);
@@ -2978,12 +2994,11 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
 
     // ts<=16: n_pix is 64 or 256, staged in threadgroup memory (see header note).
     for (uint it = 0u; it < p.n_iter; ++it) {
-        // floor, not trunc. ICA.py truncates toward zero, which turns the
-        // bilinear sample into an extrapolation for negative displacements and
-        // makes the converged flow direction-dependent. See ica_refine_level in
-        // align.cpp for the measurement.
-        float floor_fx = floor(fx);
-        float floor_fy = floor(fy);
+        // 460-parity: trunc toward zero, matching ICA.py (math.modf + int()).
+        // For negative displacements this makes the bilinear sample an
+        // extrapolation; see ica_refine_level in align.cpp.
+        float floor_fx = trunc(fx);
+        float floor_fy = trunc(fy);
         float frac_x = fx - floor_fx;
         float frac_y = fy - floor_fy;
         int floor_off_x = int(floor_fx);

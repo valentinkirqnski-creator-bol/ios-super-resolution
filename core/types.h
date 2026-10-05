@@ -490,7 +490,11 @@ struct Config {
     //
     // Also sets the ICA step clamp, which bounds one iteration to the level's
     // search radius -- so this is 3px at the finest level.
-    std::vector<int> bm_search_radii = {3, 4, 4, 4};
+    // 460-parity: finest-level radius is 1, not 3. 460's reference uses
+    // [1,4,4,4]; a wider finest window finds more near-ties on repeating
+    // structure. The regularizer rationale above is why the port had widened it
+    // to 3, but exact 460 alignment parity requires 1.
+    std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
 
     // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
@@ -878,7 +882,9 @@ struct Config {
     // the motion -- not the smoothness of the mask. Kept as a flag so the two
     // can be compared rather than assumed, and so 1.4's blocky-R behaviour is
     // still reachable.
-    bool merge_robustness_bilinear = true;
+    // 460-parity: 460 fetches R with nearest (per-tile, blocky) sampling in the
+    // merge gather. false reproduces that; true was the port's smoother variant.
+    bool merge_robustness_bilinear = false;
 
     // Build the robustness guide from compute_grey_fft instead of the
     // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
@@ -1048,7 +1054,10 @@ struct Config {
     //     near-isotropic, so no damping applies, yet the step scales as
     //     residual/gradient. Measured at 5.1px for a 30x residual. The clamp
     //     bounds ICA to what the search that preceded it could have reached.
-    bool  ica_regularize_enabled = true;
+    // 460-parity: 460 takes a plain undamped Gauss-Newton ICA step with no
+    // aperture-eigenvalue damping and no per-iteration step clamp. false
+    // reproduces that; true was the port's LM-damped variant (above).
+    bool  ica_regularize_enabled = false;
     // Legacy setting kept for old saved app preferences. The current 1D reject
     // gate uses flow_reject_1d_residual_threshold instead.
     float flow_reject_1d_ambiguity_ratio = 1.10f;
@@ -1072,7 +1081,9 @@ struct Config {
     // match at the coarsest level is 8 px x 32 abs factor = 256 raw px of error,
     // so the flag has to survive from where the mistake is made to where the
     // mask is applied. upscale_flow_460 already propagates it.
-    bool  flow_reject_ambiguous_enabled = true;
+    // 460-parity: 460 has no ambiguous-match -> r_s1 demotion step at all. false
+    // reproduces that (the port-only rejection described above is disabled).
+    bool  flow_reject_ambiguous_enabled = false;
     // A 1D tile is rejected only when enough pixels in that tile have
     // d^2/sigma^2 above this threshold after noise correction. 2.5 means the
     // aligned-frame difference is about sqrt(2.5)=1.58 expected std-devs.

@@ -777,23 +777,16 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
             f32 fy = flow.dy(ty, tx);
 
             for (int it = 0; it < n_iter; ++it) {
-                // floor, not trunc. ICA.py uses math.modf + int(), which
-                // truncates toward zero, so a negative displacement such as
-                // -0.25 yields offset 0 and fraction -0.25. bilinear_ica then
-                // evaluates m00 + (m01 - m00) * (-0.25): the right position, but
-                // reached by extrapolating from the pair to the RIGHT of it
-                // instead of interpolating from the pair that straddles it.
-                //
-                // Positive displacements interpolate, negative ones extrapolate,
-                // so the converged sub-pixel flow differs by direction. Measured
-                // on a synthetic shift at ts=16: 0.075px of spread between +0.75
-                // and -0.75, against 0.0025px with floor. It does not reduce the
-                // peak error -- both variants carry the same ~0.11px bilinear
-                // shrinkage toward zero -- but it makes that error symmetric, so
-                // frames drifting left and right land consistently rather than
-                // scattering by direction.
-                const f32 base_x = std::floor(fx);
-                const f32 base_y = std::floor(fy);
+                // 460-parity: truncation toward zero, not floor. ICA.py uses
+                // math.modf + int(), which truncates toward zero, so a negative
+                // displacement such as -0.25 yields offset 0 and fraction -0.25.
+                // bilinear_ica then evaluates m00 + (m01 - m00) * (-0.25): the
+                // right position, but reached by extrapolating from the pair to
+                // the RIGHT of it rather than interpolating from the straddling
+                // pair. (floor would make +/- displacements symmetric but does
+                // not match 460, so parity requires trunc.)
+                const f32 base_x = std::trunc(fx);
+                const f32 base_y = std::trunc(fy);
                 f32 frac_x = fx - base_x;
                 int floor_off_x = (int)base_x;
                 f32 frac_y = fy - base_y;
