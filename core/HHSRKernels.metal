@@ -2082,8 +2082,13 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // instead of max-of-sums is not the same computation and is
     // systematically more forgiving whenever which term dominates differs
     // across channels (e.g. a colored edge).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // 460-main (robustness.py): per-channel max(sigma_p^2, sigma_t^2) and
+    // per-channel Wiener shrink, THEN sum over channels. Taking the max/shrink
+    // of channel-summed terms (max-of-sums) is a different, systematically more
+    // forgiving computation when which term dominates differs across channels
+    // (e.g. a colored edge), so accumulate inside the loop.
+    sigma_sq_ = 0.f;
+    d_sq_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -2105,17 +2110,16 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
+        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
         float comp = rob_sample_bilinear_or_inf(comp_means, p.h, p.w, p.nch,
                                                 sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        float denom = d_p_sq + d_t * d_t;
+        float shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
+        d_sq_ += d_p_sq * shrink * shrink;
     }
-    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    d_sq_ = d_ms_sq * shrink * shrink;
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // pixel's tile coordinate, matching the flow sampling above. Else nearest.
     float s;
@@ -2396,11 +2400,11 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     }
     uint pidx = patch_idy * p.flow_nx + patch_idx;
 
-    // Same aggregate-then-max / aggregate-then-shrink as rob_make_mask's
-    // fixed form -- see the comment there and in apply_noise_model
-    // (robustness.cpp).
-    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
-    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    // 460-main per-channel max(sigma_p^2, sigma_t^2) and per-channel Wiener
+    // shrink, THEN sum over channels -- see the comment in rob_make_mask and in
+    // apply_noise_model (robustness.cpp).
+    float sigma_sq_ = 0.f;
+    float d_sq_ = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2416,16 +2420,15 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint curve_id = ch * p.curve_n + id;
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
+        float sigma_p_sq = ref_vars[o];
+        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        float d_p_sq = d_p_ * d_p_;
+        float denom = d_p_sq + d_t * d_t;
+        float shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
+        d_sq_ += d_p_sq * shrink * shrink;
     }
-    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
-    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
-    float d_sq_ = d_ms_sq * shrink * shrink;
 
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // raw pixel's tile coordinate. Else nearest. Raw res -> tc = gid/ts - 0.5.
