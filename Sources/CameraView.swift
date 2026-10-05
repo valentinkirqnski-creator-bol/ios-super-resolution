@@ -1141,6 +1141,11 @@ struct CameraView: View {
                          Experimental. Fits a local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. Does not model sharp depth or moving-object edges — robustness still handles those.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
+                    Text("""
+                         Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Geometry Rejection")) {

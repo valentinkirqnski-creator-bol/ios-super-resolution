@@ -87,6 +87,15 @@ struct Image {
 };
 
 // Per-tile optical flow field: shape [nTilesY, nTilesX, 2] (dx, dy).
+// Apply a row-major 3x3 homography to (x,y), returning the de-homogenised
+// result. Shared by the CPU merge/robustness; mirrored in HHSRKernels.metal.
+inline void apply_homography(const f32 H[9], f32 x, f32 y, f32& ox, f32& oy) {
+    const f32 w = H[6] * x + H[7] * y + H[8];
+    const f32 iw = (w != 0.f) ? 1.f / w : 0.f;
+    ox = (H[0] * x + H[1] * y + H[2]) * iw;
+    oy = (H[3] * x + H[4] * y + H[5]) * iw;
+}
+
 struct FlowField {
     int ny = 0;
     int nx = 0;
@@ -121,6 +130,15 @@ struct FlowField {
     // every consumer then falls back to the plain per-tile vector. See fit_affine
     // and sample_affine. Deliberately NOT allocated by the constructor.
     std::vector<f32> affine_jac;
+
+    // Global homography warp-then-refine (Config::global_homography_enabled).
+    // H maps a reference/output pixel to the ORIGINAL comparison-raw position
+    // (lr coords): the comparison grey was warped by H into the reference frame
+    // before align(), so the per-tile flow here is the small residual, and the
+    // merge/robustness compose H back at sample time: comp_pos = H*(lr + flow).
+    // Row-major 3x3, identity when not estimated (has_global_h == false).
+    f32 global_h[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+    bool has_global_h = false;
 
     FlowField() = default;
     FlowField(int ny_, int nx_) : ny(ny_), nx(nx_),
@@ -696,6 +714,14 @@ struct Config {
     // (occlusion, moving-object edges) still fall to the robustness mask. OFF by
     // default: not part of the 460-main algorithm, purely additive.
     bool affine_flow_enabled = false;
+
+    // Global homography warp-then-refine for large camera roll / global
+    // perspective. Estimates one homography between the reference and each
+    // comparison grey, warps the comparison into the reference frame before
+    // align() (so the per-tile match only cleans up a small residual), and the
+    // merge/robustness compose it back at sample time. OFF by default; does not
+    // model parallax or moving objects. See core/global_homography.h.
+    bool global_homography_enabled = false;
 
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4

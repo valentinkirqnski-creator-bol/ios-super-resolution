@@ -1,0 +1,23 @@
+#pragma once
+// Global homography warp-then-refine for large camera roll / global perspective.
+// Fresh implementation (not the existing global_prealignment code): estimates one
+// 3x3 homography between the reference and comparison GREY images, used to warp
+// the comparison into the reference frame before align(). See Config::
+// global_homography_enabled and the FlowField::global_h composition in merge /
+// robustness.
+#include "types.h"
+
+namespace hhsr {
+
+// Estimate H (row-major 3x3) mapping a REFERENCE-grey pixel to the corresponding
+// COMPARISON-grey pixel, i.e. warped(p) = comp(H*p) aligns comp onto ref. Returns
+// identity if estimation is unreliable (degenerate / worse than identity). Both
+// greys must be single channel and the same size. Coarse rotation+shift seed then
+// Lucas-Kanade homography refinement, coarse-to-fine.
+void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
+                                const Config& cfg, f32 H_out[9]);
+
+// warped(y,x) = comp_grey(H*(x,y)); out-of-bounds -> 0. Single channel.
+Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]);
+
+} // namespace hhsr

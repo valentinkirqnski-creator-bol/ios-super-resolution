@@ -150,6 +150,11 @@ struct TuningParams: Equatable, Codable {
     /// within the tile instead of by one constant vector. Experimental, off by
     /// default. Applies on the resident (fused) merge path.
     var affine_flow_enabled: Bool = false
+    /// Global homography warp-then-refine for large camera roll / global
+    /// perspective: estimate one homography per comparison frame, warp it into
+    /// the reference before alignment, compose back at merge time. Experimental,
+    /// off by default. Helps large roll; does not fix parallax/moving objects.
+    var global_homography_enabled: Bool = false
     /// Overlapping tiles for alignment (IPOL author's suggestion): after the
     /// normal align, re-measure the finest flow on a stride-Ts/2 grid (2x tiles,
     /// 50% overlap), each cell block-matched on its own Ts window. Captures
@@ -341,6 +346,7 @@ struct TuningParams: Equatable, Codable {
         case merge_arch
         case align_match_14
         case affine_flow_enabled
+        case global_homography_enabled
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
@@ -432,6 +438,7 @@ struct TuningParams: Equatable, Codable {
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
         affine_flow_enabled = try c.decodeIfPresent(Bool.self, forKey: .affine_flow_enabled) ?? affine_flow_enabled
+        global_homography_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_homography_enabled) ?? global_homography_enabled
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
@@ -2213,6 +2220,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
             "affine_flow_enabled": NSNumber(value: tuningParams.affine_flow_enabled),
+            "global_homography_enabled": NSNumber(value: tuningParams.global_homography_enabled),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),

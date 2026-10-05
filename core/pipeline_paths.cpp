@@ -11,6 +11,7 @@
 #include "prof.h"
 #include "mps_fft.h"
 #include "preset_lut.h"
+#include "global_homography.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1604,7 +1605,25 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_add_cpu("prealign#grey-dx-abs-sum",
                      std::fabs((double)(init.dx * grey_scale_x)));
         const double t_align = prof_now_ms();
-        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile_size,
+        // Global homography warp-then-refine (Config::global_homography_enabled).
+        // Estimate H between the reference and comparison GREY, warp the
+        // comparison into the reference frame, and align that -- so the per-tile
+        // match only cleans up the residual. Gated to the full-resolution FFT
+        // grey (grey == raw size), where H is already in the lr/raw coords the
+        // merge and robustness sample in; the decimate half-res grey stays on the
+        // plain path. H is stored on the flow and composed back at sample time.
+        f32 gH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+        const bool use_homog = work.global_homography_enabled &&
+                               comp_grey.h == comp.h && comp_grey.w == comp.w &&
+                               ref_grey.h == comp.h && ref_grey.w == comp.w;
+        Image warped_comp;
+        const Image* align_comp = &comp_grey;
+        if (use_homog) {
+            estimate_global_homography(ref_grey, comp_grey, work, gH);
+            warped_comp = warp_grey_by_homography(comp_grey, gH);
+            align_comp = &warped_comp;
+        }
+        FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
                                init.dx * grey_scale_x,
                                init.dy * grey_scale_y,
                                init.angle);
@@ -1618,6 +1637,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                      comp_grey.h, comp_grey.w, cons_ts,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(cons_ts));
+        // Carry the global homography (lr/raw coords) so the merge and
+        // robustness compose it back: comp_pos = H * (lr + flow).
+        if (use_homog) {
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = gH[i];
+            flow.has_global_h = true;
+        }
         // Fit the per-tile affine motion model on the finalized raw-grid flow,
         // before it is uploaded to the GPU slice (metal_frame_set_flow) and
         // before robustness/merge consume it. Off by default (Config::
