@@ -1135,6 +1135,14 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
+                Section(header: Text("Motion Model")) {
+                    Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)
+                    Text("""
+                         Experimental. Fits a local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. Does not model sharp depth or moving-object edges — robustness still handles those.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+
                 Section(header: Text("Geometry Rejection")) {
                     Toggle("Reject Misaligned Motion", isOn: $cam.tuningParams.motion_geom_reject_enabled)
                     Text("""

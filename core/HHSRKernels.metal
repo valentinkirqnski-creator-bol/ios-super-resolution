@@ -883,6 +883,11 @@ struct MergeCompParams {
     uint flow_off;
     uint cov_off;
     uint rob_off;
+    // Per-tile affine motion model (Config::affine_flow_enabled). affine_off is
+    // the element offset into the affines slice (4 floats/tile), analogous to
+    // flow_off (2 floats/tile).
+    uint affine_flow;
+    uint affine_off;
 };
 
 struct MergeRefParams {
@@ -1053,6 +1058,23 @@ inline void flow_sample_bilinear(device const float* flow, uint fny, uint fnx,
     ody = ty + (by - ty) * ay;
 }
 
+// Per-tile affine displacement (Config::affine_flow_enabled). Mirror of
+// FlowField::sample_affine in types.h: owning tile = floor(raw/ts), offset in
+// tile units centred, so at a tile centre it returns the plain vector. jac is
+// 4 floats per tile [Jxx,Jxy,Jyx,Jyy].
+inline void flow_sample_affine(device const float* flow, device const float* jac,
+                               uint fny, uint fnx, float raw_y, float raw_x, float ts,
+                               thread float& odx, thread float& ody) {
+    int px = clamp(int(floor(raw_x / ts)), 0, int(fnx) - 1);
+    int py = clamp(int(floor(raw_y / ts)), 0, int(fny) - 1);
+    uint fi = (uint(py) * fnx + uint(px)) * 2u;
+    uint ji = (uint(py) * fnx + uint(px)) * 4u;
+    float offx = raw_x / ts - 0.5f - float(px);
+    float offy = raw_y / ts - 0.5f - float(py);
+    odx = flow[fi + 0u] + jac[ji + 0u] * offx + jac[ji + 1u] * offy;
+    ody = flow[fi + 1u] + jac[ji + 2u] * offx + jac[ji + 3u] * offy;
+}
+
 inline float sample_robustness_bilinear(device const float* robustness,
                                         uint h, uint w,
                                         float y, float x) {
@@ -1086,6 +1108,7 @@ inline float sample_robustness_bilinear(device const float* robustness,
 // been its own dispatch.
 static inline void merge_comp_contrib(device const float* img,
                                       device const float* flow,
+                                      device const float* affine_jac,
                                       device const float* covs,
                                       device const float* robustness,
                                       constant MergeCompParams& p,
@@ -1100,7 +1123,10 @@ static inline void merge_comp_contrib(device const float* img,
     int px = int(lr_x / float(p.tile_size));
     int py = int(lr_y / float(p.tile_size));
     float flowx, flowy;
-    if (p.flow_bilinear != 0u) {
+    if (p.affine_flow != 0u) {
+        flow_sample_affine(flow, affine_jac, p.flow_ny, p.flow_nx, lr_y, lr_x,
+                           float(p.tile_size), flowx, flowy);
+    } else if (p.flow_bilinear != 0u) {
         flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, lr_y, lr_x,
                              float(p.tile_size), flowx, flowy);
     } else {
@@ -1206,13 +1232,14 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
                                   device const float* covs [[buffer(4)]],
                                   device const float* robustness [[buffer(5)]],
                                   constant MergeCompParams& p [[buffer(6)]],
+                                  device const float* affine_jac [[buffer(7)]],
                                   uint2 gid [[thread_position_in_grid]]) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= p.Ws || local_i >= p.band_h) return;
 
     float v0 = 0.f, v1 = 0.f, v2 = 0.f, a0 = 0.f, a1 = 0.f, a2 = 0.f;
-    merge_comp_contrib(img, flow, covs, robustness, p, hr_j, local_i, v0, v1, v2, a0, a1, a2);
+    merge_comp_contrib(img, flow, affine_jac, covs, robustness, p, hr_j, local_i, v0, v1, v2, a0, a1, a2);
 
     uint base = (local_i * p.Ws + hr_j) * p.nch;
     if (p.nch >= 1) { num[base + 0] += v0; den[base + 0] += a0; }
@@ -1251,6 +1278,10 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
                                      device const float* rob1 [[buffer(17)]],
                                      device const float* rob2 [[buffer(18)]],
                                      device const float* rob3 [[buffer(19)]],
+                                     device const float* aff0 [[buffer(20)]],
+                                     device const float* aff1 [[buffer(21)]],
+                                     device const float* aff2 [[buffer(22)]],
+                                     device const float* aff3 [[buffer(23)]],
                                      uint2 gid [[thread_position_in_grid]]) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
@@ -1260,6 +1291,7 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     device const float* flows[4] = {flow0, flow1, flow2, flow3};
     device const float* covss[4] = {cov0, cov1, cov2, cov3};
     device const float* robs[4] = {rob0, rob1, rob2, rob3};
+    device const float* affs[4] = {aff0, aff1, aff2, aff3};
 
     const uint nch = ps[0].nch;
     uint base = (local_i * ps[0].Ws + hr_j) * nch;
@@ -1270,7 +1302,7 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     if (nch >= 3) { n2 = num[base + 2]; e2 = den[base + 2]; }
 
     for (uint g = 0; g < nframes && g < 4u; ++g) {
-        merge_comp_contrib(imgs[g], flows[g], covss[g], robs[g], ps[g],
+        merge_comp_contrib(imgs[g], flows[g], affs[g], covss[g], robs[g], ps[g],
                            hr_j, local_i, n0, n1, n2, e0, e1, e2);
     }
 
@@ -1680,6 +1712,7 @@ struct RobMaskParams {
     float edge_misalign_shift_z;
     float edge_misalign_ghost_z;
     float edge_misalign_min_conf;
+    uint affine_flow;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2054,6 +2087,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const uint* tile_residual_high [[buffer(13)]],
                           device float* s_select [[buffer(14)]],
                           device const uint* match_ambiguous [[buffer(15)]],
+                          device const float* affine_jac [[buffer(16)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -2066,7 +2100,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     if (p.nch == 1u) {
         patch_idy = int(gid.y) / int(p.tile_size);
         patch_idx = int(gid.x) / int(p.tile_size);
-        if (p.flow_bilinear != 0u) {
+        if (p.affine_flow != 0u) {
+            flow_sample_affine(flow, affine_jac, p.flow_ny, p.flow_nx, float(gid.y),
+                               float(gid.x), float(p.tile_size), flow_x, flow_y);
+        } else if (p.flow_bilinear != 0u) {
             flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(gid.y),
                                  float(gid.x), float(p.tile_size), flow_x, flow_y);
         } else {
@@ -2077,7 +2114,14 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     } else {
         patch_idy = int((2.f * float(gid.y) + 0.5f) / float(p.tile_size));
         patch_idx = int((2.f * float(gid.x) + 0.5f) / float(p.tile_size));
-        if (p.flow_bilinear != 0u) {
+        if (p.affine_flow != 0u) {
+            float rdx, rdy;
+            flow_sample_affine(flow, affine_jac, p.flow_ny, p.flow_nx,
+                               2.f * float(gid.y) + 0.5f,
+                               2.f * float(gid.x) + 0.5f,
+                               float(p.tile_size), rdx, rdy);
+            flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+        } else if (p.flow_bilinear != 0u) {
             float rdx, rdy;
             flow_sample_bilinear(flow, p.flow_ny, p.flow_nx,
                                  2.f * float(gid.y) + 0.5f,
@@ -3505,6 +3549,7 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
                              constant MergeNormParams& np  [[buffer(11)]],
                              device atomic_uint* diag      [[buffer(12)]],
                              device float* prev            [[buffer(13)]],
+                             device const float* affines   [[buffer(14)]],
                              uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= np.Ws || gid.y >= np.bh) return;
     const uint hr_j = gid.x;
@@ -3516,6 +3561,7 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
     for (uint g = 0u; g < nframes; ++g) {
         merge_comp_contrib(imgs + ps[g].img_off,
                            flows + ps[g].flow_off,
+                           affines + ps[g].affine_off,
                            covs + ps[g].cov_off,
                            robs + ps[g].rob_off,
                            ps[g], hr_j, local_i,

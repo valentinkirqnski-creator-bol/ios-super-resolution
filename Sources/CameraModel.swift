@@ -145,6 +145,11 @@ struct TuningParams: Equatable, Codable {
     /// Default false: run the 460-main alignment (single finest-level ICA +
     /// three-candidate flow upscale), not 1.4's per-level ICA + bilinear upscale.
     var align_match_14: Bool = false
+    /// Per-tile affine motion model. Fits a local affine (translation + flow
+    /// Jacobian) per tile so rotation/yaw/pitch/smooth-parallax warp correctly
+    /// within the tile instead of by one constant vector. Experimental, off by
+    /// default. Applies on the resident (fused) merge path.
+    var affine_flow_enabled: Bool = false
     /// Overlapping tiles for alignment (IPOL author's suggestion): after the
     /// normal align, re-measure the finest flow on a stride-Ts/2 grid (2x tiles,
     /// 50% overlap), each cell block-matched on its own Ts window. Captures
@@ -335,6 +340,7 @@ struct TuningParams: Equatable, Codable {
         case dng_codec, dng_store_unwhitened
         case merge_arch
         case align_match_14
+        case affine_flow_enabled
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
@@ -425,6 +431,7 @@ struct TuningParams: Equatable, Codable {
         isp_local_contrast = try c.decodeIfPresent(Float.self, forKey: .isp_local_contrast) ?? isp_local_contrast
         isp_skin_protect = try c.decodeIfPresent(Bool.self, forKey: .isp_skin_protect) ?? isp_skin_protect
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
+        affine_flow_enabled = try c.decodeIfPresent(Bool.self, forKey: .affine_flow_enabled) ?? affine_flow_enabled
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
@@ -2205,6 +2212,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isp_local_contrast": NSNumber(value: tuningParams.isp_local_contrast),
             "isp_skin_protect": NSNumber(value: tuningParams.isp_skin_protect),
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
+            "affine_flow_enabled": NSNumber(value: tuningParams.affine_flow_enabled),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
