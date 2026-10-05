@@ -243,6 +243,9 @@ void metal_trim_analyze_scratch();
 
 // Drop the pinned moving grey so align_metal re-uploads instead of reusing it.
 void metal_invalidate_sticky_grey();
+// Force compute_grey_fft to materialize the grey host-side (for the CPU global
+// homography estimator). No-op effect when off.
+void metal_set_grey_force_host(bool v);
 
 // When true, reuse one GPU num/den slot (wait each band). Cuts peak RAM ~2× so
 // full-res 1× can use larger bands without jetsam. Default false (2× double-buffer).

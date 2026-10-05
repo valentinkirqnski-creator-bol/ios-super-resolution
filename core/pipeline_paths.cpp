@@ -1164,6 +1164,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     report("Reference: grey + pyramid", 0.07f);
     prof_mark_memory("ref:start");
     const double t_ref_grey = prof_now_ms();
+#if defined(__APPLE__)
+    // Global homography estimation runs on the CPU and reads the grey pixels, so
+    // the grey must be materialised host-side even on the resident GPU path.
+    metal_set_grey_force_host(work.global_homography_enabled);
+#endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     debug_dump_bin("cpp_ref_grey", ref_grey.data.data(), ref_grey.data.size());
@@ -1615,7 +1620,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         f32 gH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
         const bool use_homog = work.global_homography_enabled &&
                                comp_grey.h == comp.h && comp_grey.w == comp.w &&
-                               ref_grey.h == comp.h && ref_grey.w == comp.w;
+                               ref_grey.h == comp.h && ref_grey.w == comp.w &&
+                               // Host pixels required (CPU estimate + warp): on the
+                               // resident GPU path the grey can be header-only.
+                               ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
+                               comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c;
         Image warped_comp;
         const Image* align_comp = &comp_grey;
         if (use_homog) {

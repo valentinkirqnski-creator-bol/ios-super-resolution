@@ -210,6 +210,11 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     for (int i = 0; i < 9; ++i) H_out[i] = identity[i];
     if (ref_grey.h <= 0 || ref_grey.w <= 0 ||
         ref_grey.h != comp_grey.h || ref_grey.w != comp_grey.w) return;
+    // Require host pixels: on the device the grey can be GPU-resident with an
+    // empty host buffer (header only). Reading it would segfault; the caller
+    // forces host materialisation, but guard here regardless.
+    if (ref_grey.data.size() != (size_t)ref_grey.h * ref_grey.w * ref_grey.c ||
+        comp_grey.data.size() != (size_t)comp_grey.h * comp_grey.w * comp_grey.c) return;
 
     // Estimate at a reduced resolution (warp-then-refine tolerates an
     // imperfect H -- the per-tile align cleans up the residual), then scale the
