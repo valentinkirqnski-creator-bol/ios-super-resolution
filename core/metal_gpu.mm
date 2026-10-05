@@ -929,11 +929,16 @@ struct BurstFrames {
 
     // Per-slot stride in ELEMENTS (already rounded), and in bytes.
     size_t raw_elems = 0, cov_elems = 0, rob_elems = 0, flow_elems = 0;
+    // Affine Jacobian slice: 4 floats/tile vs flow's 2, so twice the flow stride
+    // (Config::affine_flow_enabled). Allocated with the burst; left zero when the
+    // feature is off (the kernels never read it then).
+    size_t affine_elems = 0;
 
     id<MTLBuffer> raws = nil;
     id<MTLBuffer> covs = nil;
     id<MTLBuffer> robs = nil;
     id<MTLBuffer> flows = nil;
+    id<MTLBuffer> affines = nil;
     // Pooled, single-frame: the FFT input MPSGraph must own outright (its
     // MPSGraphTensorData cannot take a buffer offset, so the frame's slice is
     // blitted in), and the per-row mask activity readback.
@@ -955,6 +960,7 @@ static inline size_t bf_raw_off(int slot)  { return (size_t)slot * g_bf.raw_elem
 static inline size_t bf_cov_off(int slot)  { return (size_t)slot * g_bf.cov_elems; }
 static inline size_t bf_rob_off(int slot)  { return (size_t)slot * g_bf.rob_elems; }
 static inline size_t bf_flow_off(int slot) { return (size_t)slot * g_bf.flow_elems; }
+static inline size_t bf_affine_off(int slot) { return (size_t)slot * g_bf.affine_elems; }
 
 // The slot the next stage call should act on, or -1 when residency is off or the
 // burst buffers are not open.
@@ -974,6 +980,7 @@ static void bf_release() {
     g_bf.covs = nil;
     g_bf.robs = nil;
     g_bf.flows = nil;
+    g_bf.affines = nil;
     g_bf.fft_in = nil;
     g_bf.rob_rows = nil;
     g_bf.fft_in_b = 0;
@@ -1040,6 +1047,9 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
                                   (size_t)g_bf.cov_stride * f) / f;
     g_bf.rob_elems  = align_slice((size_t)g_bf.rob_h * (size_t)g_bf.rob_w * f) / f;
     g_bf.flow_elems = align_slice((size_t)g_bf.flow_ny * (size_t)g_bf.flow_nx * 2u * f) / f;
+    // 4 floats/tile; 2x the flow stride guarantees the affine data fits and makes
+    // bf_affine_off(slot) == 2 * bf_flow_off(slot).
+    g_bf.affine_elems = g_bf.flow_elems * 2u;
 
     const size_t nn = (size_t)n_frames;
     // What residency is about to ask for, reported so a refusal below can be read
@@ -1055,11 +1065,12 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.covs  = buf(nullptr, nn * g_bf.cov_elems  * f);
     g_bf.robs  = buf(nullptr, nn * g_bf.rob_elems  * f);
     g_bf.flows = buf(nullptr, nn * g_bf.flow_elems * f);
+    g_bf.affines = buf(nullptr, nn * g_bf.affine_elems * f);
     g_bf.fft_in = c.scratch(g_bf.fft_in, g_bf.fft_in_b, (size_t)raw_h * (size_t)raw_w * f);
     g_bf.rob_rows = c.scratch(g_bf.rob_rows, g_bf.rob_rows_b,
                               (size_t)g_bf.rob_h * sizeof(uint32_t));
-    if (!g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows || !g_bf.fft_in ||
-        !g_bf.rob_rows) {
+    if (!g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows || !g_bf.affines ||
+        !g_bf.fft_in || !g_bf.rob_rows) {
         // Residency refused. The caller treats this as "fall back", but the
         // fallback is the online accumulator, which is far LARGER than what was
         // just refused -- so this line is where a burst that later dies in the
@@ -1091,6 +1102,16 @@ bool metal_frame_set_flow(int slot, const FlowField& flow) {
     if (bytes == 0 || bytes > g_bf.flow_elems * sizeof(float)) return false;
     memcpy((uint8_t*)[g_bf.flows contents] + bf_flow_off(slot) * sizeof(float),
            flow.flow.data(), bytes);
+    // Affine Jacobian slice (4 floats/tile). Only uploaded when the model was
+    // fitted (Config::affine_flow_enabled); otherwise the merge binds this slot
+    // but the kernel never reads it (MergeCompParams::affine_flow == 0).
+    if (g_bf.affines && flow.has_affine()) {
+        const size_t abytes = flow.affine_jac.size() * sizeof(float);
+        if (abytes <= g_bf.affine_elems * sizeof(float)) {
+            memcpy((uint8_t*)[g_bf.affines contents] + bf_affine_off(slot) * sizeof(float),
+                   flow.affine_jac.data(), abytes);
+        }
+    }
     g_bf.have_flow[(size_t)slot] = 1u;
     return true;
 }
@@ -1618,8 +1639,9 @@ struct RobMaskParamsCPU {
     float    edge_misalign_shift_z = 2.0f;
     float    edge_misalign_ghost_z = 3.0f;
     float    edge_misalign_min_conf = 0.0f;
+    uint32_t affine_flow = 0;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 128, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 132, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2453,6 +2475,13 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         b_ref_hf = g_rob_ref_hf;
     }
     id<MTLBuffer> b_flow = buf(flow.flow.data(), flow.flow.size() * sizeof(float));
+    // Per-tile affine Jacobian (Config::affine_flow_enabled). Bound unconditionally
+    // because the kernel declares the buffer; when off, b_flow stands in as a
+    // non-null placeholder the shader never reads (p.affine_flow == 0).
+    const bool rob_use_affine = cfg.affine_flow_enabled && flow.has_affine();
+    id<MTLBuffer> b_affine = rob_use_affine
+        ? buf(flow.affine_jac.data(), flow.affine_jac.size() * sizeof(float))
+        : b_flow;
     // The mask before the 5x5 minimum is scratch; the result goes into the
     // frame's slice when it is resident, so the merge reads it where it lands.
     id<MTLBuffer> b_R = resident_raw ? c.scratch(c.rob_mask, c.rob_mask_b, mask_b)
@@ -2495,6 +2524,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                         flow.match_ambiguous.size() == n_tiles;
     mp.ambiguous_enabled = amb_on ? 1u : 0u;
     mp.flow_bilinear = false ? 1u : 0u;
+    mp.affine_flow = rob_use_affine ? 1u : 0u;
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
@@ -2545,6 +2575,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_tile_residual_high offset:0 atIndex:13];
     [enc setBuffer:b_s_select offset:0 atIndex:14];
     [enc setBuffer:b_match_amb offset:0 atIndex:15];
+    [enc setBuffer:b_affine offset:0 atIndex:16];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 
@@ -3799,8 +3830,12 @@ struct MergeCompParamsCPU {
     // Element offsets into the burst-wide buffers, for the fused band kernel.
     // Zero for the single-frame kernels, which bind each frame's slice directly.
     uint32_t img_off = 0, flow_off = 0, cov_off = 0, rob_off = 0;
+    // Per-tile affine motion model (Config::affine_flow_enabled). affine_off is
+    // the element offset into the affines slice (4 floats/tile).
+    uint32_t affine_flow = 0;
+    uint32_t affine_off = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 112, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 120, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -3967,6 +4002,12 @@ static bool merge_flush_pending() {
         [enc setBuffer:e.flow offset:0 atIndex:8u + i];
         [enc setBuffer:e.cov  offset:0 atIndex:12u + i];
         [enc setBuffer:e.rob  offset:0 atIndex:16u + i];
+        // Affine Jacobian (buffers 20-23). This online/batched path does not
+        // carry the affine model, so ps[].affine_flow stays 0 and the kernel
+        // never reads these -- bind the flow buffer as a non-null placeholder
+        // (Metal requires every declared buffer set). Affine applies on the
+        // resident fused merge path. See Config::affine_flow_enabled.
+        [enc setBuffer:e.flow offset:0 atIndex:20u + i];
     }
     dispatch2(enc, c.pipe("merge_accumulate_comp_x4"), ps[0].Ws, ps[0].band_h);
     g_merge_pending.clear();
@@ -4551,6 +4592,8 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.flow_off = (uint32_t)bf_flow_off(slot);
         p.cov_off  = (uint32_t)bf_cov_off(slot);
         p.rob_off  = (uint32_t)bf_rob_off(slot);
+        p.affine_flow = cfg.affine_flow_enabled ? 1u : 0u;
+        p.affine_off  = (uint32_t)bf_affine_off(slot);
         ps.push_back(p);
     }
     // Metal still requires the params binding to be non-empty.
@@ -4632,6 +4675,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     [enc setBytes:&np length:sizeof(np) atIndex:11];
     [enc setBuffer:g_fused_diag offset:0 atIndex:12];
     [enc setBuffer:b_prev offset:0 atIndex:13];
+    [enc setBuffer:g_bf.affines offset:0 atIndex:14];
     dispatch2(enc, pipe, (NSUInteger)Ws, (NSUInteger)bh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "merge:band-fused");

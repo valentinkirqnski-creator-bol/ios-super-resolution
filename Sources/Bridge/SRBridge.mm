@@ -533,6 +533,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     g_isp = cfg.isp;
     if (tuning[@"align_match_14"])
         cfg.align_match_14 = tuning[@"align_match_14"].boolValue;
+    if (tuning[@"affine_flow_enabled"])
+        cfg.affine_flow_enabled = tuning[@"affine_flow_enabled"].boolValue;
     if (tuning[@"flow_upsample_candidates"])
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
     if (tuning[@"real_rgb_guide"])
