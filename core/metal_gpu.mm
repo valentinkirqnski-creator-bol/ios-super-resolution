@@ -1619,7 +1619,9 @@ struct RobDogsonParamsCPU {
     // the GPU twin of upscale_warp_stats, so it must match the CPU setting or
     // the two paths warp the comparison statistics differently.
     uint32_t flow_bilinear = 0;
-    uint32_t _pad1 = 0;
+    // 1 = bilinear stat interpolation instead of Dodgson quadratic (was _pad1).
+    // Config::robustness_stats_bilinear. Twin of RobDogsonParams.stat_bilinear.
+    uint32_t stat_bilinear = 0;
 };
 static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
 
@@ -1954,7 +1956,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       bool flow_bilinear) {
+                       bool flow_bilinear, bool stat_bilinear = false) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1974,6 +1976,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
     dp.flow_bilinear = flow_bilinear ? 1u : 0u;
+    dp.stat_bilinear = stat_bilinear ? 1u : 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {
@@ -2078,9 +2081,9 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd, false) ||
+                        nullptr, 0, mh, mw, cmd, false, cfg.robustness_stats_bilinear) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, false) ||
+                       nullptr, 0, vh, vw, cmd, false, cfg.robustness_stats_bilinear) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -2215,7 +2218,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    false))
+                    false, cfg.robustness_stats_bilinear))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();

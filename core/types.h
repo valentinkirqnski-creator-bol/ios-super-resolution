@@ -1061,6 +1061,17 @@ struct Config {
     float robustness_fft_guide_noise_energy = 0.25f;
 
     bool robustness_raw_resolution_enabled = false;
+    // Bilinear-stat upsampling: compute robustness at full raw resolution by
+    // bilinearly upsampling the half-res mu/sigma^2 statistics (2x) instead of
+    // the Dodgson-quadratic upscale the robustness_raw_resolution_enabled route
+    // uses. Same raw-resolution machinery (means_hires/stds_hires, rob_make_mask
+    // _raw); only the interpolation kernel differs. Unlike that route this one
+    // is NOT gated on grey_method == Decimate: on the Metal path the robustness
+    // guide is ALWAYS the half-res bayer guide (rob_run_guide_stats never builds
+    // the FFT grey), so the 2x upscale is valid whatever the alignment grey is.
+    // It still requires a half-res bayer guide (bayer_mode and not the full-res
+    // FFT guide) -- see robustness_raw_resolution_active().
+    bool robustness_stats_bilinear = false;
     // True when the raw-resolution path should actually run this call --
     // single place both conditions live, so robustness.cpp, merge.cpp and
     // the Metal dispatch code in metal_gpu.mm can't drift out of step on
@@ -1090,8 +1101,21 @@ struct Config {
     // the ordinary guide-resolution code path produces raw-resolution R from
     // them without knowing anything has changed.
     bool robustness_raw_resolution_active() const {
+        // Bilinear-stat route: raw-resolution R by bilinear upscale of the
+        // half-res bayer statistics. Valid whenever the guide is the half-res
+        // bayer guide (not the full-res FFT guide), independent of the
+        // alignment grey -- so it is NOT dead under the shipping FFT grey the
+        // way the Dodgson route below is.
+        if (robustness_stats_bilinear && bayer_mode && !robustness_fft_guide_active())
+            return true;
         return robustness_raw_resolution_enabled && !robustness_fft_guide_active() &&
                grey_method == GreyMethod::Decimate;
+    }
+    // The stat upscale uses bilinear interpolation (this toggle) rather than
+    // Dodgson quadratic (the default raw-resolution route). Only meaningful
+    // when robustness_raw_resolution_active() is true.
+    bool robustness_stats_bilinear_active() const {
+        return robustness_stats_bilinear && robustness_raw_resolution_active();
     }
     // Whether the guide is sqrt(raw), which decides both its transfer curve and
     // whether the noise curve is indexed by mean^2. The FFT guide is a linear
