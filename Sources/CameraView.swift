@@ -917,11 +917,6 @@ struct CameraView: View {
              Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Bilinear Stat Upsampling", isOn: $cam.tuningParams.robustness_stats_bilinear)
-        Text("""
-             Computes the robustness mask at raw resolution by BILINEARLY              upsampling the half-resolution mu/sigma^2 statistics (2x), instead of the              Dodgson-quadratic upscale above. Unlike "Robustness at Raw Resolution" this              works under the shipping FFT alignment grey -- on device the robustness guide              is always the half-res Bayer guide, so the 2x upscale is valid whatever the              alignment grey is. Smoother than block-nearest, cheaper and less ringing-prone              than the Dodgson kernel. Same ~4x mask pixel count. Off by default.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
     }
 
     // Two of the eight Sections live here rather than inline. The Form body
@@ -1128,6 +1123,11 @@ struct CameraView: View {
                         Toggle("Disable Noise Model", isOn: $cam.tuningParams.debug_noise_model_disabled)
                         Text("""
                              Zeroes the Poisson–Gaussian noise model the mask reads (the only place it is used, as in 460-main). R is then scored from the raw measured local variance and the unshrunk pixel difference — no noise floor forgiving small differences, no Wiener shrink. Rejects more aggressively. Alignment tile size, SNR auto-tune and kernel estimation are untouched.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Bilinear Stat Upsampling", isOn: $cam.tuningParams.robustness_stats_bilinear)
+                        Text("""
+                             Computes the mask at full raw resolution by bilinearly upsampling the half-res μ/σ² statistics (2×) instead of the default half-res guide computation. The rejection boundary lands with raw-pixel precision instead of in 2×2 Bayer blocks. Works under the shipping FFT alignment grey (the device robustness guide is always the half-res Bayer guide, so the 2× upscale is always valid). ~4× the mask pixel count — heavier. Experimental, off by default.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
