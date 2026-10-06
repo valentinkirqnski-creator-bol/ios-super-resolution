@@ -903,11 +903,6 @@ struct CameraView: View {
              Merge steerable-kernel selection law. ON = 'linear' (Python 1.4 default):              the kernel anisotropy ramps continuously with the local structure A.              OFF = 'hard_threshold' (460-main): round kernels until A>1.95, then snap to              full stretch. The two agree at A=1 and A=2 and differ only for moderately              anisotropic detail. ON = exact 1.4 parity.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("Disable Noise Model (Robustness)", isOn: $cam.tuningParams.debug_noise_model_disabled)
-        Text("""
-             Debug: zeroes the noise model as read by the robustness mask ONLY. R is then              scored from the raw measured local variance and the raw (unshrunk) pixel              difference, isolating whether a tile's colour difference reads small because              the noise model forgave it, or because the content genuinely is that flat.              Unlike the earlier version of this switch, SNR auto-tune, the alignment tile              size and kernel estimation are untouched. Diagnostic only -- leave off.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
             .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
                 + "trained network. The analytic mask decides from a colour difference "
@@ -1129,6 +1124,11 @@ struct CameraView: View {
                         ispRow("s2 (regular flow)", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")
                         ispRow("Mt (motion threshold)", $cam.tuningParams.r_Mt, 0.0...4.0, "%.2f")
                         Text("460-main: t 0.12, s1 2, s2 12, Mt 0.8. Higher t rejects more; higher s1/s2 trust frames more; Mt is the per-tile flow spread that switches s2→s1.")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Disable Noise Model", isOn: $cam.tuningParams.debug_noise_model_disabled)
+                        Text("""
+                             Zeroes the Poisson–Gaussian noise model the mask reads (the only place it is used, as in 460-main). R is then scored from the raw measured local variance and the unshrunk pixel difference — no noise floor forgiving small differences, no Wiener shrink. Rejects more aggressively. Alignment tile size, SNR auto-tune and kernel estimation are untouched.
+                             """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
                     Toggle("NN Tile-Reject Refine", isOn: $cam.tuningParams.tile_reject_nn_enabled)
