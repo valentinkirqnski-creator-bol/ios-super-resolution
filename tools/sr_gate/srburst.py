@@ -266,6 +266,53 @@ class BurstSpec:
         self.n_frames = 8
 
 
+def structured_flow_error(ny, nx, sigma, rng):
+    """Alignment error shaped the way parallax and camera rotation shape it.
+
+    Independent Gaussian noise per tile -- what this used to inject -- is the one
+    kind of error that does NOT occur in practice. A real block match goes wrong
+    for reasons that are smooth or piecewise smooth across the frame:
+
+      * ROTATION, yaw, pitch, dolly: the true displacement varies continuously
+        across the frame, so a per-tile constant lags it by an amount that drifts
+        slowly and coherently;
+      * PARALLAX: displacement is constant within a depth plane and STEPS at
+        every depth edge, so the error is near zero over most of a region and
+        jumps hard at object boundaries.
+
+    Both are coherent INSIDE a tile, which is what makes them invisible to any
+    test built on the flow field's own derivatives, and both are correlated
+    BETWEEN neighbouring tiles, which independent noise destroys.
+
+    So: a smooth low-frequency field, plus a few hard steps, per component.
+    """
+    def smooth(k):
+        f = rng.standard_normal((max(2, ny // k + 2), max(2, nx // k + 2)))
+        yi = np.clip((np.arange(ny) / k).astype(int), 0, f.shape[0] - 2)
+        xi = np.clip((np.arange(nx) / k).astype(int), 0, f.shape[1] - 2)
+        fy = (np.arange(ny) / k - yi)[:, None]
+        fx_ = (np.arange(nx) / k - xi)[None, :]
+        a = f[yi][:, xi] * (1 - fx_) + f[yi][:, xi + 1] * fx_
+        b = f[yi + 1][:, xi] * (1 - fx_) + f[yi + 1][:, xi + 1] * fx_
+        return a * (1 - fy) + b * fy
+
+    out = []
+    for _ in range(2):
+        g = smooth(max(2, int(rng.integers(3, 9))))
+        # Hard steps: a few random half-planes, which is what a depth edge or an
+        # occlusion boundary does to the matched displacement.
+        st = np.zeros((ny, nx))
+        for _ in range(int(rng.integers(0, 4))):
+            yy, xx = np.mgrid[0:ny, 0:nx]
+            th = rng.uniform(0, np.pi)
+            c = (xx - nx / 2) * np.cos(th) + (yy - ny / 2) * np.sin(th)
+            st += (c > rng.uniform(-nx / 3, nx / 3)) * rng.normal(0, 1.0)
+        v = 0.65 * g + 0.35 * st
+        sd = float(v.std())
+        out.append(v / sd * sigma if sd > 1e-9 else v)
+    return out[0], out[1]
+
+
 def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
     """Returns a dict with the raw frames, the estimated per-tile flow, the true
     per-pixel flow at output resolution, and the noise-free frames."""
@@ -450,8 +497,19 @@ def synth_burst(scene, spec: BurstSpec, rng, tile_size=16):
             fx = np.where(tile_obj & ~lock, ox - TCX, fx)
             fy = np.where(tile_obj & ~lock, oy - TCY, fy)
         if n > 0:
-            fx = fx + rng.standard_normal((ny, nx)) * spec.sigma_flow
-            fy = fy + rng.standard_normal((ny, nx)) * spec.sigma_flow
+            # Structured, not independent per tile. See structured_flow_error:
+            # the errors parallax and rotation actually produce are smooth or
+            # piecewise smooth across the frame, and that correlation between
+            # neighbouring tiles is exactly what the mask has spatial context to
+            # exploit. A third of bursts keep the old independent draw so the
+            # uncorrelated case is still represented.
+            if rng.random() < 0.67:
+                ex, ey = structured_flow_error(ny, nx, spec.sigma_flow, rng)
+            else:
+                ex = rng.standard_normal((ny, nx)) * spec.sigma_flow
+                ey = rng.standard_normal((ny, nx)) * spec.sigma_flow
+            fx = fx + ex
+            fy = fy + ey
             if spec.outlier_p > 0:
                 o = rng.random((ny, nx)) < spec.outlier_p
                 fx = np.where(o, fx + rng.uniform(-12, 12, (ny, nx)), fx)

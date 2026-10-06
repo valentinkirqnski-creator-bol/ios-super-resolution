@@ -113,13 +113,18 @@ class SRGate(nn.Module):
         y = F.interpolate(y, scale_factor=p, mode='nearest')
         return y[:, :, :h, :w]
 
-    def forward(self, x):
+    def _trunk(self, x):
+        """Everything before the 1x1 head. Split out so a correction network can
+        share the shape without duplicating the forward pass."""
         if self.coarse:
             x = torch.cat([x, self._coarse(x)], dim=1)
         for conv, d in zip(self.convs, self.dilations):
             x = F.pad(x, (d, d, d, d), mode='replicate')
             x = F.relu(conv(x))
-        return torch.sigmoid(self.head(x))
+        return x
+
+    def forward(self, x):
+        return torch.sigmoid(self.head(self._trunk(x)))
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -172,3 +177,110 @@ def merge(A_ref, B_ref, A, B, R, eps=1e-8):
     num = A_ref + (A * Rout).sum(dim=1)
     den = B_ref + (B * Rout).sum(dim=1)
     return num / den.clamp_min(eps)
+
+
+class SRGateOnlyStricter(nn.Module):
+    """The shipped mask, times a learned attenuation that can only reduce it.
+
+        R = R_base(f) * sigmoid(correction(f))
+
+    R_base is the CURRENT shipped network, frozen. sigmoid is in (0, 1), so
+
+        R <= R_base   at every pixel, for every input, for any weights
+
+    which is a property of the form and not something training has to be trusted
+    to discover. That matters because on this branch every model that was more
+    permissive than the shipped one looked worse, in all three attempts, while
+    measuring better -- mask mean 0.093 good, 0.255 artifacts, 0.482 worse, 0.681
+    worse. A mean-error loss rewards merging more, because an unrejected
+    misalignment is glaring but contributes little squared error, so the training
+    signal points the wrong way and no amount of reweighting fixes a sign.
+
+    Under this form the network cannot act on that pull at all. The only thing it
+    can learn is where the shipped mask merges something it should not.
+    """
+
+    def __init__(self, base: 'SRGate', corr: 'SRGate'):
+        super().__init__()
+        self.base = base
+        self.corr = corr
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.base.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.base.eval()          # frozen: never in training mode
+        return self
+
+    def forward(self, x):
+        with torch.no_grad():
+            r0 = self.base(x)
+        return r0 * torch.sigmoid(self.corr.head(self.corr._trunk(x)))
+
+    def n_params(self):
+        return sum(p.numel() for p in self.corr.parameters())
+
+    # The training and eval code reads the architecture off the net. Report the
+    # CORRECTION's, which is the only part being trained; both halves are the
+    # same shape anyway, so nothing can read the wrong one.
+    @property
+    def convs(self):
+        return self.corr.convs
+
+    @property
+    def cconvs(self):
+        return self.corr.cconvs
+
+    @property
+    def dilations(self):
+        return self.corr.dilations
+
+    @property
+    def coarse(self):
+        return self.corr.coarse
+
+    @property
+    def pool(self):
+        return self.corr.pool
+
+    @property
+    def coarse_dilations(self):
+        return self.corr.coarse_dilations
+
+    def checkpoint(self, **extra):
+        """Self-contained: carries BOTH weight sets, so a checkpoint can be
+        evaluated and exported without also having to track down which base it
+        was trained against."""
+        ck = _arch(self.corr)
+        ck['state_dict'] = self.corr.state_dict()
+        ck['base_state_dict'] = self.base.state_dict()
+        ck['only_stricter'] = True
+        ck.update(extra)
+        return ck
+
+
+def _arch(net):
+    return {'dilations': net.dilations, 'width': net.convs[0].weight.shape[0],
+            'in_ch': ((net.cconvs[0].weight.shape[1] // 2) if net.coarse
+                      else net.convs[0].weight.shape[1]),
+            'coarse': net.coarse, 'pool': net.pool,
+            'coarse_dilations': net.coarse_dilations}
+
+
+def plain_checkpoint(net, **extra):
+    ck = _arch(net)
+    ck['state_dict'] = net.state_dict()
+    ck.update(extra)
+    return ck
+
+
+def any_from_checkpoint(ck):
+    """from_checkpoint, but also rebuilds an only-stricter pair."""
+    if not ck.get('only_stricter'):
+        return from_checkpoint(ck)
+    base = from_checkpoint({**ck, 'state_dict': ck['base_state_dict']})
+    corr = from_checkpoint(ck)
+    net = SRGateOnlyStricter(base, corr)
+    net.eval()
+    return net

@@ -107,20 +107,31 @@ def run_gate(net, feat):
     return r.view(b, n, feat.shape[-2], feat.shape[-1])
 
 
-def evaluate(net, val):
-    """PSNR of Wronski / R=1 / the gate over the validation grid."""
+def evaluate(net, val, base=None):
+    """PSNR of Wronski / R=1 / the gate over the validation grid.
+
+    With a base net given, also the base's PSNR and mask mean, which is the
+    comparison that matters for a correction run: not "is this better than
+    Wronski" but "does this improve on what already ships"."""
     net.eval()
     rows = []
     with torch.no_grad():
         for i in range(val.n):
             d = val.batch([i])
             args = (d['A_ref'], d['B_ref'], d['A'], d['B'])
-            pg = psnr_t(gate.merge(*args, run_gate(net, d['feat'])), d['gt'])
+            Rg = run_gate(net, d['feat'])
+            pg = psnr_t(gate.merge(*args, Rg), d['gt'])
             pw = psnr_t(gate.merge(*args, d['Rw']), d['gt'])
             p1 = psnr_t(gate.merge(*args, torch.ones_like(d['Rw'])), d['gt'])
-            mr = float(run_gate(net, d['feat']).mean())
+            mr = float(Rg.mean())
+            if base is None:
+                pb, mb = float('nan'), float('nan')
+            else:
+                Rb = run_gate(base, d['feat'])
+                pb = psnr_t(gate.merge(*args, Rb), d['gt'])
+                mb = float(Rb.mean())
             rows.append((int(d['meta'][0][0]), float(d['meta'][0][1]),
-                         pw, p1, pg, mr, float(d['Rw'].mean())))
+                         pw, p1, pg, mr, float(d['Rw'].mean()), pb, mb))
     net.train()
     return rows
 
@@ -128,10 +139,30 @@ def evaluate(net, val):
 def report(rows):
     names = {0: 'jitter', 1: 'rot-only', 2: 'object', 3: 'outlier',
              4: 'parallax'}
+    has_base = not np.isnan(rows[0][7])
+    if has_base:
+        print('%-9s %-6s %-8s %-8s %-8s %-8s %-9s %-9s %-7s %-7s' %
+              ('regime', 'sig_f', 'Wronski', 'R=1', 'base', 'gate',
+               'vs base', 'vs R=1', 'meanRg', 'meanRb'))
+        for reg, sig, pw, p1, pg, mr, mw, pb, mb in sorted(
+                rows, key=lambda r: (r[0], r[1])):
+            print('%-9s %-6.2f %-8.2f %-8.2f %-8.2f %-8.2f %+-9.2f %+-9.2f '
+                  '%-7.3f %-7.3f'
+                  % (names[reg], sig, pw, p1, pb, pg, pg - pb, pg - p1, mr, mb))
+        a = np.array([[r[2], r[3], r[4], r[7], r[5], r[8]] for r in rows])
+        print('%-9s %-6s %-8.2f %-8.2f %-8.2f %-8.2f %+-9.2f %+-9.2f %-7.3f '
+              '%-7.3f'
+              % ('MEAN', '', a[:, 0].mean(), a[:, 1].mean(), a[:, 3].mean(),
+                 a[:, 2].mean(), (a[:, 2] - a[:, 3]).mean(),
+                 (a[:, 2] - a[:, 1]).mean(), a[:, 4].mean(), a[:, 5].mean()))
+        # Selected on gain over the BASE. Gain over Wronski would be dominated
+        # by what the base already won and would barely move between steps.
+        return float((a[:, 2] - a[:, 3]).mean())
     print('%-9s %-6s %-8s %-8s %-8s %-10s %-9s %-7s %-7s' %
           ('regime', 'sig_f', 'Wronski', 'R=1', 'gate', 'vs Wronski', 'vs R=1',
            'meanRg', 'meanRw'))
-    for reg, sig, pw, p1, pg, mr, mw in sorted(rows, key=lambda r: (r[0], r[1])):
+    for reg, sig, pw, p1, pg, mr, mw, _pb, _mb in sorted(
+            rows, key=lambda r: (r[0], r[1])):
         print('%-9s %-6.2f %-8.2f %-8.2f %-8.2f %+-10.2f %+-9.2f %-7.3f %-7.3f'
               % (names[reg], sig, pw, p1, pg, pg - pw, pg - p1, mr, mw))
     a = np.array([[r[2], r[3], r[4]] for r in rows])
@@ -139,6 +170,12 @@ def report(rows):
           % ('MEAN', '', a[:, 0].mean(), a[:, 1].mean(), a[:, 2].mean(),
              (a[:, 2] - a[:, 0]).mean(), (a[:, 2] - a[:, 1]).mean()))
     return float((a[:, 2] - a[:, 0]).mean())
+
+
+def save_ck(net, **extra):
+    if isinstance(net, gate.SRGateOnlyStricter):
+        return net.checkpoint(**extra)
+    return gate.plain_checkpoint(net, **extra)
 
 
 def main():
@@ -162,6 +199,12 @@ def main():
                     help='train on only the first N feature channels. The set only '
                          'ever grows by appending, so this ablates the additions '
                          'against the SAME bursts rather than a rebuilt dataset.')
+    ap.add_argument('--base', default='',
+                    help='checkpoint to freeze as R_base and train a correction '
+                         'on top of, as R = R_base * sigmoid(corr). The result '
+                         'is then <= R_base at every pixel BY CONSTRUCTION, so '
+                         'it cannot come out more permissive than what ships, '
+                         'whatever the loss prefers.')
     ap.add_argument('--eval-every', type=float, default=300.0,
                     help='seconds between validation passes')
     a = ap.parse_args()
@@ -176,10 +219,30 @@ def main():
     val = Split(root, 'val')
     print('bursts: %d train, %d val  (memory mapped)' % (train.n, val.n))
 
-    net = gate.SRGate(in_ch=a.in_ch or gate.NUM_FEATURES, coarse=not a.no_coarse)
-    print('sr_gate: %d parameters, %d input channels'
-          % (net.n_params(), net.convs[0].weight.shape[1]))
-    opt = torch.optim.Adam(net.parameters(), lr=a.lr)
+    base_net = None
+    if a.base:
+        bp = a.base if os.path.isabs(a.base) else os.path.join(here, a.base)
+        base_net = gate.from_checkpoint(torch.load(bp, map_location='cpu',
+                                                   weights_only=False))
+        bch = base_net.convs[0].weight.shape[1]
+        corr = gate.SRGate(in_ch=(base_net.cconvs[0].weight.shape[1] // 2)
+                           if base_net.coarse else bch,
+                           dilations=base_net.dilations, coarse=base_net.coarse,
+                           pool=base_net.pool,
+                           coarse_dilations=base_net.coarse_dilations)
+        # The correction head starts at bias +2, so sigmoid(2) = 0.88: it opens
+        # NEAR pass-through but not at it, because a saturated sigmoid has no
+        # gradient and the run would never start moving.
+        net = gate.SRGateOnlyStricter(base_net, corr)
+        print('only-stricter: %d trainable parameters on a frozen base from %s'
+              % (net.n_params(), a.base))
+    else:
+        net = gate.SRGate(in_ch=a.in_ch or gate.NUM_FEATURES,
+                          coarse=not a.no_coarse)
+        print('sr_gate: %d parameters, %d input channels'
+              % (net.n_params(), net.convs[0].weight.shape[1]))
+    opt = torch.optim.Adam([q for q in net.parameters() if q.requires_grad],
+                           lr=a.lr)
     budget = a.minutes * 60.0
     t0 = time.time()
 
@@ -236,31 +299,20 @@ def main():
                   flush=True)
         if time.time() - eval_t > a.eval_every:
             eval_t = time.time()
-            g = report(evaluate(net, val))
-            print('  [eval @ step %d] mean gain vs Wronski %+.2f dB' % (step, g),
-                  flush=True)
+            g = report(evaluate(net, val, base_net))
+            print('  [eval @ step %d] mean gain vs %s %+.2f dB'
+                  % (step, 'base' if base_net else 'Wronski', g), flush=True)
             if g > best:
                 best = g
-                torch.save({'state_dict': net.state_dict(),
-                            'dilations': net.dilations, 'width': gate.WIDTH,
-                            'in_ch': (net.cconvs[0].weight.shape[1] // 2) if net.coarse
-                         else net.convs[0].weight.shape[1],
-                'coarse': net.coarse, 'pool': net.pool,
-                'coarse_dilations': net.coarse_dilations, 'steps': step,
-                            'val_gain': g}, outp)
+                torch.save(save_ck(net, steps=step, val_gain=g), outp)
                 print('  saved (best so far)', flush=True)
 
     print('trained %d steps in %.0fs' % (step, time.time() - t0))
-    g = report(evaluate(net, val))
-    print('final mean gain vs Wronski %+.2f dB (best checkpoint %+.2f)'
-          % (g, best))
+    g = report(evaluate(net, val, base_net))
+    print('final mean gain vs %s %+.2f dB (best checkpoint %+.2f)'
+          % ('base' if base_net else 'Wronski', g, best))
     if g >= best:
-        torch.save({'state_dict': net.state_dict(), 'dilations': net.dilations,
-                    'width': gate.WIDTH, 'in_ch': (net.cconvs[0].weight.shape[1] // 2) if net.coarse
-                         else net.convs[0].weight.shape[1],
-                'coarse': net.coarse, 'pool': net.pool,
-                'coarse_dilations': net.coarse_dilations,
-                    'steps': step, 'val_gain': g}, outp)
+        torch.save(save_ck(net, steps=step, val_gain=g), outp)
         print('saved final to', outp)
     else:
         print('kept the earlier checkpoint at', outp)

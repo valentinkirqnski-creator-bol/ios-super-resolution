@@ -145,11 +145,14 @@ def main():
     # training: regimes sampled with the moving-object case over-weighted,
     # because that is the one where a mask has to be SELECTIVE rather than
     # uniformly permissive or uniformly strict.
-    # Weighted for the burstsr motion: handheld translation through a scene
-    # with a large depth range. Regime 4 (parallax) dominates because that is
-    # the capability being added, but regime 0 keeps a third of the set so the
-    # static-scene behaviour this model is already good at is not trained away.
-    weights = np.array([0.30, 0.07, 0.15, 0.08, 0.40])
+    # Weighted back towards the ordinary regimes. The capability being added
+    # this time is not a scene type -- it is the SHAPE of the alignment error,
+    # which srburst.structured_flow_error now gives every regime: smooth and
+    # piecewise-smooth per-tile flow error, of the kind rotation and parallax
+    # produce, instead of independent per-tile noise. Loading up on the explicit
+    # parallax regime was measured to make the model worse in practice (4b86d6b,
+    # reverted in 7251fa3), so it keeps only a small share here.
+    weights = np.array([0.36, 0.16, 0.20, 0.12, 0.16])
     for i in range(a.train):
         regime = int(np.searchsorted(np.cumsum(weights), rng.random()))
         jobs.append(('train', i, train_files[i % len(train_files)],
