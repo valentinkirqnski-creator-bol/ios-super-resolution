@@ -24,25 +24,12 @@ the detail their offsets contribute -- and misaligned regions pay for being
 merged, because the target does not have their ghost. Nothing has to be
 hand-weighted to balance those two; the merge prices both.
 
-Three terms are added to the plain L1:
+Two terms are added to the plain L1:
 
   * edge weighting, because ghosting and lost detail both live on edges and a
     flat mean over a mostly flat photo hides them;
   * a gradient-matching term on the luminance, which is what actually reads as
-    doubling or smearing to a viewer and which a pixel L1 is largely blind to;
-  * a GHOST term: extra weight where an edge and a real misalignment coincide
-    (see ghost_risk). Edge weighting on its own was measured to produce a net
-    that is uniformly cautious rather than selective -- mean R near 0.5
-    everywhere, and only 0.231 on genuinely misaligned edges where Wronski
-    reaches 0.021, which is visible as edge thickening even while the mean PSNR
-    improves. The product of the two is what prices that specific failure.
-
-The ghost term reads the true flow error, so a word on why that is not the R*
-label this file opens by rejecting. It is used as a WEIGHT, never as a target:
-it says a mistake at this pixel is expensive, not that the answer at this pixel
-is zero. The target is still the merged image under perfect alignment, so an
-aliased well-aligned edge is still paid for if it is rejected -- the weight just
-stops a wrongly placed frame from being free.
+    doubling or smearing to a viewer and which a pixel L1 is largely blind to.
 """
 from __future__ import annotations
 
@@ -57,8 +44,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate
 
-FIELDS = ('feat', 'A', 'B', 'A_ref', 'B_ref', 'gt', 'edge', 'Rw', 'ferr',
-          'meta')
+FIELDS = ('feat', 'A', 'B', 'A_ref', 'B_ref', 'gt', 'edge', 'Rw', 'meta')
 
 
 class Split:
@@ -88,123 +74,15 @@ def lum_grad(x):
     return g[..., :, 1:] - g[..., :, :-1], g[..., 1:, :] - g[..., :-1, :]
 
 
-def ghost_risk(ferr, hs, ws, thresh=1.6):
-    """Where a REAL misalignment is available to ghost, on the loss grid.
-
-    ferr (batch, N, gh, gw) is the exact error of the flow the merge used, in
-    raw pixels. Reduced over frames with a max, because one badly placed frame
-    is enough to thicken an edge -- an average would let seven good frames hide
-    it. Then nearest-upsampled to the output grid the loss lives on.
-
-    1.6 px is where this project measured rejection to stop being net harmful
-    on the merged image. Below it an offset is mostly the sub-pixel signal the
-    SR merge feeds on, so weighting those pixels harder would be asking the net
-    to reject the thing it exists to preserve.
-
-    Used ONLY as a loss weight. As a TARGET this quantity is the R* label that
-    was measured to over-reject across the whole sub-pixel band; weighting says
-    "a mistake here is expensive", which is a different statement from "the
-    answer here is 0".
-    """
-    g = (ferr.amax(dim=1) > thresh).float().unsqueeze(1)
-    return torch.nn.functional.interpolate(g, size=(hs, ws), mode='nearest')[:, 0]
-
-
-def keep_value(ferr, hs, ws, thresh=1.6):
-    """Where EVERY frame is well aligned, so merging is unambiguously right.
-
-    The exact complement of ghost_risk: amax <= thresh against its amax >
-    thresh. A min over frames was tried first and is wrong -- "at least one of
-    seven frames is usable" is true for 99.5% of pixels, which makes the term
-    uniform, and a uniform weight only SCALES the loss. Every intervention that
-    merely scaled this mask has measured as doing nothing to its selectivity,
-    so a weight that cannot discriminate is not worth adding.
-    """
-    k = (ferr.amax(dim=1) <= thresh).float().unsqueeze(1)
-    return torch.nn.functional.interpolate(k, size=(hs, ws), mode='nearest')[:, 0]
-
-
-def losses(out, gt, edge, ghost=None, floor=None, keep=None, w_edge=3.0,
-           w_grad=1.0, w_ghost=6.0, w_keep=4.0):
+def losses(out, gt, edge, w_edge=3.0, w_grad=1.0):
     l1 = (out - gt).abs().mean()
     norm = edge.flatten(1).mean(dim=1).clamp_min(1e-6).view(-1, 1, 1)
-    en = (edge / norm).clamp(0, 8)
-    ew = 1.0 + w_edge * en
-    if ghost is not None:
-        # Extra weight only where BOTH hold: there is an edge, and there is a
-        # real misalignment on it.
-        #
-        # The product is the point. Weighting edges alone is what the net
-        # already had, and it made the net uniformly cautious -- measured mean R
-        # near 0.5 everywhere, including 0.231 on genuinely misaligned edges
-        # where Wronski reaches 0.021. Weighting misalignment alone would pay
-        # for flat-area ghosts nobody sees. The product pays for exactly the
-        # failure that is visible: detail from a wrongly placed frame laid over
-        # an edge, which is what reads as thickening.
-        # (1 + en), NOT en. This gating was the bug that made v6 ghost.
-        #
-        # `edge` comes from the GROUND TRUTH, so en marks where structure SHOULD
-        # be. A ghost is structure where it should NOT be -- a wire smeared
-        # across open sky -- and there en ~ 0, so an en-gated penalty vanishes at
-        # exactly the pixels the artifact occupies. Worse, the keep term below
-        # carries (1 + en) and so kept full strength there, which left the loss
-        # actively pushing R UP wherever a ghost would land.
-        #
-        # A ghost is in fact MOST conspicuous against a smooth background, not
-        # least. So merging damage must cost something everywhere, and more on an
-        # edge -- never nothing off one.
-        ew = ew + w_ghost * (1.0 + en) * ghost
-    if keep is not None:
-        # The complement of the ghost term, and the one that was missing.
-        #
-        # ghost pays for MERGING damage. Nothing paid for DISCARDING good
-        # signal, and that asymmetry is the over-rejection: measured on
-        # APC_1186, 100% of pixels are well aligned under realistic motion and
-        # the mask still rejected about 30% of them, where Wronski rejected 8%.
-        # The plain L1 does technically pay -- the target holds the detail a
-        # rejected aligned pixel threw away -- but a fraction of a dB on an easy
-        # burst was worth nothing beside ten on a broken one.
-        #
-        # Weighted by 1+en rather than en: a ghost is only visible on an edge,
-        # but throwing away a well-aligned FLAT region costs real noise
-        # reduction, so it must not be free away from edges.
-        ew = ew + w_keep * (1.0 + en) * keep
-    per = ((out - gt).abs().mean(dim=1) * ew).flatten(1).mean(dim=1)
-    if floor is not None:
-        # Each burst scored against ITS OWN achievable error, not in absolute
-        # terms.
-        #
-        # Without this a burst with a 400 px runaway object contributes a loss
-        # tens of times larger than a near-static one, so the gradient is
-        # written almost entirely by the broken bursts and the net learns to be
-        # cautious as a prior. That is visible in every measurement taken today:
-        # mean R 0.58 on a STATIC burst where R=1 is correct and the gate gives
-        # away 0.47 dB for nothing. Dividing by the loss R=1 would have incurred
-        # makes "you lost 0.5 dB on an easy burst" and "you lost 10 dB on a hard
-        # one" comparable statements, which is what reweighting the regimes was
-        # a crude attempt at.
-        per = per / floor.clamp_min(1e-6)
-    l1e = per.mean()
+    ew = 1.0 + w_edge * (edge / norm).clamp(0, 8)
+    l1e = ((out - gt).abs().mean(dim=1) * ew).mean()
     ax, ay = lum_grad(out)
     bx, by = lum_grad(gt)
     lg = (ax - bx).abs().mean() + (ay - by).abs().mean()
     return l1, l1e, lg, l1e + w_grad * lg
-
-
-def r1_floor(d, edge, w_edge=3.0):
-    """Per-burst edge-weighted error at R=1, detached. The scale each burst's
-    own loss is measured against."""
-    with torch.no_grad():
-        # Ones on the MASK lattice, which is what gate.merge takes -- it does
-        # the nearest upsample to the output grid itself. Built from feat rather
-        # than from A (which is already at output resolution) or from Rw (which
-        # the training batch does not fetch).
-        f = d['feat']
-        ones = torch.ones(f.shape[0], f.shape[1], f.shape[-2], f.shape[-1])
-        o = gate.merge(d['A_ref'], d['B_ref'], d['A'], d['B'], ones)
-        norm = edge.flatten(1).mean(dim=1).clamp_min(1e-6).view(-1, 1, 1)
-        ew = 1.0 + w_edge * (edge / norm).clamp(0, 8)
-        return ((o - d['gt']).abs().mean(dim=1) * ew).flatten(1).mean(dim=1)
 
 
 def psnr_t(out, gt):
@@ -284,15 +162,6 @@ def main():
                     help='train on only the first N feature channels. The set only '
                          'ever grows by appending, so this ablates the additions '
                          'against the SAME bursts rather than a rebuilt dataset.')
-    ap.add_argument('--w-keep', type=float, default=4.0,
-                    help='weight on not discarding well-aligned signal. This '
-                         'and --w-ghost ARE the over-rejection vs edge-precision '
-                         'trade: at 4.0 the mask reaches within 0.02 dB of R=1 '
-                         'on a static burst but its edge/real rises to 0.381 '
-                         'from 0.139, i.e. it merges misaligned edges it should '
-                         'reject.')
-    ap.add_argument('--w-ghost', type=float, default=6.0,
-                    help='weight on not merging a real misalignment on an edge')
     ap.add_argument('--eval-every', type=float, default=300.0,
                     help='seconds between validation passes')
     a = ap.parse_args()
@@ -324,13 +193,7 @@ def main():
         d = train.batch(idx)
         out = gate.merge(d['A_ref'], d['B_ref'], d['A'], d['B'],
                          run_gate(net, d['feat']))
-        _, _, _, loss = losses(out, d['gt'], d['edge'],
-                               ghost_risk(d['ferr'], out.shape[-2],
-                                          out.shape[-1]),
-                               r1_floor(d, d['edge']),
-                               keep_value(d['ferr'], out.shape[-2],
-                                          out.shape[-1]),
-                               w_ghost=a.w_ghost, w_keep=a.w_keep)
+        _, _, _, loss = losses(out, d['gt'], d['edge'])
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -353,17 +216,10 @@ def main():
     step = 0
     while step < total_steps and time.time() - t0 < budget:
         idx = sorted(rng.choice(train.n, size=a.batch, replace=False).tolist())
-        d = train.batch(idx, ('feat', 'A', 'B', 'A_ref', 'B_ref', 'gt',
-                              'edge', 'ferr'))
+        d = train.batch(idx, ('feat', 'A', 'B', 'A_ref', 'B_ref', 'gt', 'edge'))
         R = run_gate(net, d['feat'])
         out = gate.merge(d['A_ref'], d['B_ref'], d['A'], d['B'], R)
-        l1, l1e, lg, loss = losses(out, d['gt'], d['edge'],
-                                   ghost_risk(d['ferr'], out.shape[-2],
-                                              out.shape[-1]),
-                                   r1_floor(d, d['edge']),
-                                   keep_value(d['ferr'], out.shape[-2],
-                                              out.shape[-1]),
-                                   w_ghost=a.w_ghost, w_keep=a.w_keep)
+        l1, l1e, lg, loss = losses(out, d['gt'], d['edge'])
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -389,7 +245,7 @@ def main():
                             'dilations': net.dilations, 'width': gate.WIDTH,
                             'in_ch': (net.cconvs[0].weight.shape[1] // 2) if net.coarse
                          else net.convs[0].weight.shape[1],
-                'coarse': net.coarse, 'pool': net.pool, 'out_temp': net.out_temp,
+                'coarse': net.coarse, 'pool': net.pool,
                 'coarse_dilations': net.coarse_dilations, 'steps': step,
                             'val_gain': g}, outp)
                 print('  saved (best so far)', flush=True)
@@ -402,7 +258,7 @@ def main():
         torch.save({'state_dict': net.state_dict(), 'dilations': net.dilations,
                     'width': gate.WIDTH, 'in_ch': (net.cconvs[0].weight.shape[1] // 2) if net.coarse
                          else net.convs[0].weight.shape[1],
-                'coarse': net.coarse, 'pool': net.pool, 'out_temp': net.out_temp,
+                'coarse': net.coarse, 'pool': net.pool,
                 'coarse_dilations': net.coarse_dilations,
                     'steps': step, 'val_gain': g}, outp)
         print('saved final to', outp)

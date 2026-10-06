@@ -64,27 +64,6 @@ def interesting(c):
     return (gx + gy) > 0.004
 
 
-def textured(c):
-    """The relaxed test for a dark crop: a much lower brightness floor than
-    interesting(), but not none at all.
-
-    0.005 against interesting()'s 0.02. APC_1261 is a real low-light scene --
-    mean 0.0124, 83% of it under 0.02 -- and only 3 of 24 crops from it pass the
-    strict screen, so without a relaxed path the whole scene is absent from
-    training. But a floor is still needed: a crop at mean 0.0009 whose only
-    gradient is 0.0012 is photon noise, not detail, and training on it would
-    teach the network that an enormous d^2/sigma^2 is normal, which is the
-    opposite of what this scene is being added to fix.
-    """
-    g = c.mean(axis=2)
-    m = g.mean()
-    if m > 0.9 or m < 0.005:
-        return False
-    gx = np.abs(np.diff(g, axis=1)).mean()
-    gy = np.abs(np.diff(g, axis=0)).mean()
-    return (gx + gy) > 0.0025
-
-
 def save(d, path):
     np.savez_compressed(
         path,
@@ -96,38 +75,26 @@ def save(d, path):
         B_ref=d['B_ref'].astype(np.float16),
         gt=d['gt'].astype(np.float32),
         edge=d['edge'].astype(np.float16),
-        ferr=d['ferr'].astype(np.float16),
         meta=np.array([d['regime'], d['sigma_flow'], d['noise_gain'],
                        d['tile_size']], np.float32),
     )
 
 
 def one(args):
-    kind, idx, dng, seed, out, cache, regime, level = args
+    kind, idx, dng, seed, out, cache, regime, sigma = args
     rng = np.random.default_rng(seed)
     scene = scene_cache(dng, cache)
     if scene is None:
         return None
-    # A shadowed crop is accepted after a few tries rather than skipped.
-    #
-    # interesting() screens on the crop MEAN, which rejects the shadow side of a
-    # high-dynamic-range daylight frame -- and APC_1186, the scene the mask was
-    # reported over-rejecting on, is exactly that: 25% of it below 0.02 with no
-    # clipping. Screening those out is why such crops were under-represented.
-    # Texture is still required, because a crop with no detail teaches nothing
-    # about merging detail; only the brightness floor is relaxed.
-    c = None
-    for attempt in range(24):
-        cand = crop(scene, rng)
-        if interesting(cand):
-            c = cand
+    for _ in range(24):
+        c = crop(scene, rng)
+        if interesting(c):
             break
-        if attempt >= 16 and textured(cand):
-            c = cand
-            break
-    if c is None:
+    else:
         return None
-    spec = srburst.BurstSpec(rng, regime=regime, level=level)
+    spec = srburst.BurstSpec(rng, regime=regime)
+    if sigma is not None:
+        spec.sigma_flow = float(sigma)
     d = build.build_burst(c, spec, rng)
     path = os.path.join(out, kind, '%s_%04d.npz' % (kind, idx))
     save(d, path)
@@ -140,13 +107,6 @@ def main():
     ap.add_argument('--train', type=int, default=72)
     ap.add_argument('--val', type=int, default=24)
     ap.add_argument('--jobs', type=int, default=6)
-    ap.add_argument('--regimes', default='',
-                    help='comma list restricting which regimes are built, e.g. '
-                         '"0" for CAMERA MOTION ONLY -- translation, roll, yaw, '
-                         'pitch and dolly, with no independently moving subject, '
-                         'no parallax and no gross outliers. Levels are then '
-                         'sampled UNIFORMLY so every magnitude band from '
-                         'sub-pixel to 250 px gets equal weight.')
     ap.add_argument('--test', type=int, default=0,
                     help='also build a TEST grid, from the val scenes but with '
                          'different crops, seeds and regime draws. The '
@@ -182,54 +142,35 @@ def main():
         print('   train-only source:', os.path.basename(q))
 
     jobs = []
-    # Training: regime and motion LEVEL drawn independently.
-    #
-    # The level is srburst's stratified magnitude ladder, 0 (sub-pixel, a
-    # near-tripod shot) to 4 (up to 250 px). Drawing it explicitly is what
-    # guarantees the small end is covered: when every magnitude came from one
-    # wide log-uniform, coverage of any particular band was left to the seed,
-    # and the two bands that mattered most were the thinnest -- a static shot,
-    # and a subject drifting slowly enough for the block match to follow.
-    #
-    # Levels are weighted toward the small end because that is where the
-    # measured failure is: on APC_1186, 100% of pixels are well aligned under
-    # realistic motion and the mask still rejected ~30% of them. Regime 4 is
-    # parallax, which is its own failure mode -- everywhere at once, tied to
-    # scene structure, and wrong on both sides of every depth edge.
-    r_w = np.array([0.34, 0.12, 0.22, 0.10, 0.22])
-    l_w = np.array([0.26, 0.24, 0.20, 0.16, 0.14])
-    only = [int(v) for v in a.regimes.split(',') if v.strip() != ''] if a.regimes else None
-    if only:
-        # Restricted build: the named regimes only, and levels uniform so the
-        # magnitude ladder is swept evenly instead of being weighted small.
-        r_w = np.zeros(5)
-        for q in only:
-            r_w[q] = 1.0 / len(only)
-        l_w = np.full(5, 0.2)
-        print('regimes restricted to %s, levels uniform' % only)
+    # training: regimes sampled with the moving-object case over-weighted,
+    # because that is the one where a mask has to be SELECTIVE rather than
+    # uniformly permissive or uniformly strict.
+    # Weighted for the burstsr motion: handheld translation through a scene
+    # with a large depth range. Regime 4 (parallax) dominates because that is
+    # the capability being added, but regime 0 keeps a third of the set so the
+    # static-scene behaviour this model is already good at is not trained away.
+    weights = np.array([0.30, 0.07, 0.15, 0.08, 0.40])
     for i in range(a.train):
-        regime = int(np.searchsorted(np.cumsum(r_w), rng.random()))
-        level = int(np.searchsorted(np.cumsum(l_w), rng.random()))
+        regime = int(np.searchsorted(np.cumsum(weights), rng.random()))
         jobs.append(('train', i, train_files[i % len(train_files)],
-                     1000 + i, out, cache, regime, level))
-    # Validation and test: the full 5x5 regime x level grid, so the report is a
-    # sweep over both axes rather than an average that hides either.
+                     1000 + i, out, cache, regime, None))
+    # validation: the full grid, so the report is a sweep and not an average
     k = 0
-    grid = only if only else list(range(5))
-    for regime in grid:
-        for level in range(5):
-            for rep in range(1 if len(grid) > 1 else 5):
+    for regime in (0, 1, 2, 3, 4):
+        for s in VAL_SIGMAS:
+            for rep in range(max(1, a.val // 20)):
                 jobs.append(('val', k, val_files[k % len(val_files)],
-                             500000 + k, out, cache, regime, level))
+                             500000 + k, out, cache, regime, s))
                 k += 1
     n_test = 0
     if a.test:
-        for regime in grid:
-            for level in range(5):
-                jobs.append(('test', n_test,
-                             val_files[(n_test + 3) % len(val_files)],
-                             900000 + n_test * 7, out, cache, regime, level))
-                n_test += 1
+        for regime in (0, 1, 2, 3, 4):
+            for sv in VAL_SIGMAS:
+                for rep in range(max(1, a.test // 20)):
+                    jobs.append(('test', n_test,
+                                 val_files[(n_test + 3) % len(val_files)],
+                                 900000 + n_test * 7, out, cache, regime, sv))
+                    n_test += 1
     print('bursts to build: %d train + %d val + %d test' % (a.train, k, n_test))
 
     # Warm the scene cache serially: rawpy is not fork-safe here and the

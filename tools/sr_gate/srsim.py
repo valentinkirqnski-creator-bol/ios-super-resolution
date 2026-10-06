@@ -424,17 +424,6 @@ def compute_d_sigma(ref_means, ref_vars, comp_means, flow, cfg, std_curve, diff_
     sigma_md_sq = np.zeros((h, w), np.float64)
     d_ms_sq = np.zeros((h, w), np.float64)
     d_md_sq = np.zeros((h, w), np.float64)
-    # The largest PER-CHANNEL ratio, alongside the summed one.
-    #
-    # Summing first dilutes a misalignment that lives in one or two channels.
-    # Measured on a white-on-red tile offset (probe_colour.py), the per-channel
-    # maximum is 3.55x the summed ratio, and exp(-a) reads 0.159 summed against
-    # 0.068 per-channel -- the summed form calls a plain colour-edge
-    # misalignment less than half as much evidence as it is. Across a white/red
-    # boundary the RED channel barely changes while green and blue change
-    # completely, so two channels carry the signal and the denominator collects
-    # variance from all three.
-    a_max = np.zeros((h, w), np.float64)
     for ch in range(nch):
         rm = ref_means if nch == 1 else ref_means[..., ch]
         rv = ref_vars if nch == 1 else ref_vars[..., ch]
@@ -450,11 +439,6 @@ def compute_d_sigma(ref_means, ref_vars, comp_means, flow, cfg, std_curve, diff_
         sigma_md_sq += curve_lookup(sc_, bidx).astype(np.float64) ** 2
         d_ms_sq += d_p.astype(np.float64) ** 2
         d_md_sq += curve_lookup(dc_, bidx).astype(np.float64) ** 2
-        s_c = np.maximum(rv.astype(np.float64),
-                         curve_lookup(sc_, bidx).astype(np.float64) ** 2)
-        with np.errstate(invalid='ignore', divide='ignore'):
-            a_c = d_p.astype(np.float64) ** 2 / np.maximum(s_c, 1e-20)
-        a_max = np.maximum(a_max, np.nan_to_num(a_c, nan=0.0, posinf=1e30))
 
     sigma_sq = np.maximum(sigma_ms_sq, sigma_md_sq)
     with np.errstate(invalid='ignore', divide='ignore'):
@@ -467,8 +451,7 @@ def compute_d_sigma(ref_means, ref_vars, comp_means, flow, cfg, std_curve, diff_
     # residual the noise correction removed. build_features turns them into
     # channels 8-11.
     comps = dict(sigma_ms_sq=sigma_ms_sq, sigma_md_sq=sigma_md_sq,
-                 d_ms_sq=d_ms_sq, d_md_sq=d_md_sq, shrink=shrink,
-                 a_max=a_max)
+                 d_ms_sq=d_ms_sq, d_md_sq=d_md_sq, shrink=shrink)
     return d_sq.astype(np.float32), sigma_sq.astype(np.float32), comps
 
 
@@ -601,7 +584,7 @@ def wronski_robustness(d_sq, sigma_sq, flow, ref_means, cfg, geom_reject=True):
 # features for the gate
 # --------------------------------------------------------------------------
 
-NUM_FEATURES = 13
+NUM_FEATURES = 12
 FEATURE_NAMES = ('exp_a', 'log_a', 'snr', 'subpix', 'span', 'emag', 'grad', 'dir_e',
                  'shrink', 'sigdom', 'd_rel', 'varmatch')
 
@@ -761,16 +744,11 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
 
     if comps is None:
         return f
-    # ---- 8: the largest PER-CHANNEL d^2/sigma^2 -------------------------
-    # Shipped, so it must stay at index 8: the C++ consumes the first
-    # SRG_FEATURES channels and the set has to remain a contiguous prefix.
-    am = comps['a_max']
-    f[8] = np.clip(np.log1p(np.minimum(am, 1e12)) * F_LOG_A_SCALE, 0.0, 1.0)
-    # ---- 9-12: the terms Eq. 6 reduced away, measured neutral ------------
-    f[9] = np.clip(comps['shrink'], 0.0, 1.0)
+    # ---- 8-11: the terms Eq. 6 reduced away -----------------------------
+    f[8] = np.clip(comps['shrink'], 0.0, 1.0)
     sms = comps['sigma_ms_sq']
     smd = comps['sigma_md_sq']
-    f[10] = np.clip(sms / np.maximum(sms + smd, 1e-30), 0.0, 1.0)
+    f[9] = np.clip(sms / np.maximum(sms + smd, 1e-30), 0.0, 1.0)
     d_ms = np.sqrt(np.maximum(comps['d_ms_sq'], 0.0))
     bri = np.clip(bri_sum / float(nch), 0.0, 1.0)
     # Denominator floored at 1% of full scale, not at an epsilon: with an
@@ -779,10 +757,10 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
     # "this pixel is dark" detector. At 0.01 that drops to +0.27 with no change
     # in how much of the top end clips (1.5% either way, and those are genuine
     # large residuals rather than the dark-pixel artifact).
-    f[11] = np.clip(np.log1p(np.minimum(d_ms / (bri + F_DREL_FLOOR), 1e12)) *
+    f[10] = np.clip(np.log1p(np.minimum(d_ms / (bri + F_DREL_FLOOR), 1e12)) *
                     F_DREL_SCALE, 0.0, 1.0)
     if comp_vars_warped is None:
-        f[12] = 0.0
+        f[11] = 0.0
     else:
         n = np.maximum(nvar, 1e-20)
         cv = comp_vars_warped.astype(np.float64)
@@ -793,5 +771,5 @@ def build_features(d_sq, sigma_sq, ref_means, ref_vars, flow, cfg,
         # A fetch outside the comparison frame has no texture to compare with, so
         # it reads as maximal mismatch -- the same direction Eq. 6 takes it with
         # its +inf residual.
-        f[12] = np.where(ok, np.clip(lr * F_VARMATCH_SCALE, 0.0, 1.0), 1.0)
+        f[11] = np.where(ok, np.clip(lr * F_VARMATCH_SCALE, 0.0, 1.0), 1.0)
     return f
