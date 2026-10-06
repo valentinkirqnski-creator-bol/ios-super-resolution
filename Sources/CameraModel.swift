@@ -287,6 +287,25 @@ struct TuningParams: Equatable, Codable {
     /// kernel degrades to the fixed formula on its own; a wrong one would not,
     /// so this toggle is the way back.
     var sr_gate_enabled: Bool = true
+
+    /// Apply the geometry-rejection test on top of the neural mask instead of
+    /// letting the network replace it along with the fixed formula.
+    ///
+    /// The network replaces Eq. 7-9, which is what it was trained to do, and in
+    /// doing so also skips geometry rejection -- which is not part of Eq. 7-9
+    /// and tests something else: whether one motion vector per tile describes
+    /// the motion in that tile at all. Camera rotation and parallax are exactly
+    /// where it does not, and the network's eight features see that poorly.
+    ///
+    /// Measured on 110 synthesised bursts (tools/sr_gate/data_se): the fixed
+    /// formula with this test on rejects 27.2% of the neural mask's weight that
+    /// the neural mask keeps.
+    ///
+    /// Only ever takes weight away, and only where the test fires, so a static
+    /// scene comes through bit-identical to the neural mask alone. It inherits
+    /// the test's bluntness, though: it falsely rejects about 2.2% of correctly
+    /// aligned pixels, most of them on thin lines and strong edges.
+    var sr_gate_geom_reject_enabled: Bool = false
     /// Learned REFINEMENT of the analytic mask -- a different network with the
     /// opposite relationship to it from use_neural_robustness above. That one
     /// replaces Wronski Eq. 5-9; this one keeps it authoritative and may only
@@ -408,7 +427,7 @@ struct TuningParams: Equatable, Codable {
         case edge_misalign_enabled, edge_misalign_edge_snr
         case edge_misalign_shift_z, edge_misalign_min_conf
         case kernel_selection_linear
-        case use_neural_robustness, sr_gate_enabled
+        case use_neural_robustness, sr_gate_enabled, sr_gate_geom_reject_enabled
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
@@ -509,6 +528,7 @@ struct TuningParams: Equatable, Codable {
         edge_misalign_min_conf = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_min_conf) ?? edge_misalign_min_conf
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         sr_gate_enabled = try c.decodeIfPresent(Bool.self, forKey: .sr_gate_enabled) ?? sr_gate_enabled
+        sr_gate_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .sr_gate_geom_reject_enabled) ?? sr_gate_geom_reject_enabled
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
@@ -2293,6 +2313,7 @@ final class CameraModel: NSObject, ObservableObject {
             "edge_misalign_min_conf": NSNumber(value: tuningParams.edge_misalign_min_conf),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "sr_gate_enabled": NSNumber(value: tuningParams.sr_gate_enabled),
+            "sr_gate_geom_reject_enabled": NSNumber(value: tuningParams.sr_gate_geom_reject_enabled),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),

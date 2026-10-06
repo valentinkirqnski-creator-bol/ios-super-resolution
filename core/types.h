@@ -798,6 +798,36 @@ struct Config {
     // reject. See tools/sr_gate/ for the measurements and the training.
     bool sr_gate_enabled = false;
 
+    // Apply the geometry-rejection test (motion_geom_reject, same
+    // |grad I| * |E| criterion and the same thresholds) ON TOP of the sr_gate
+    // mask, instead of letting the gate replace it along with the rest of
+    // Eq. 7-9.
+    //
+    // The gate returns early and so skips the whole analytic path, geometry
+    // rejection included. That is right for Eq. 7-9 -- the gate was trained to
+    // replace them -- but geometry rejection answers a question the gate's
+    // features answer badly: the per-tile TRANSLATION being a poor model of the
+    // local motion, which is what camera rotation and parallax produce. Measured
+    // on tools/sr_gate/data_se, the analytic mask with this test on rejects
+    // 27.2% of the gate's mask mass that the gate keeps.
+    //
+    // Only ever takes weight away: R = R_gate * keep, keep in {0, 1}. Where the
+    // test does not fire the gate's mask is passed through bit-identically, so a
+    // static scene is unaffected by construction rather than by tuning.
+    //
+    // The rejection is DILATED by the same 5x5 minimum Eq. 9 applies, rather
+    // than that minimum being run over the whole gate mask. Both halves of that
+    // matter: an isolated rejection reads as speckle while a dilated one reads
+    // as a clean hole, and running the 5x5 minimum over the gate's own output
+    // costs a measured 2.00 dB on this guide for reasons that have nothing to do
+    // with rotation.
+    //
+    // Honest about what it inherits: this test falsely rejects 2.2% of
+    // CORRECTLY aligned pixels (4.6% of thin lines, 5.6% of the strongest
+    // gradients) -- see tools/rob_refine/README.md, which measures a network
+    // doing the same job at 0.4%. The threshold below is the knob for that.
+    bool sr_gate_geom_reject_enabled = false;
+
     // Handheld-Multi-Frame-Super-Resolution-1.4 parity: build the robustness
     // GUIDE as sqrt(raw) (a variance-stabilizing transform) instead of the
     // linear channel average, exactly as 1.4's cuda_compute_guide_image does.

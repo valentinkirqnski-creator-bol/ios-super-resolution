@@ -1095,6 +1095,22 @@ struct CameraView: View {
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
+            Toggle("Reject Rotation & Parallax", isOn: $cam.tuningParams.sr_gate_geom_reject_enabled)
+                .disabled(!cam.tuningParams.sr_gate_enabled)
+            if !cam.tuningParams.sr_gate_enabled {
+                Text("Needs the Neural Robustness Mask above to be ON. With it off the fixed formula already applies this test.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+            Text("""
+                 Adds a second test on top of the neural mask: it throws away pixels where one motion vector for the whole tile cannot describe the motion inside it. That is what camera rotation and parallax do, and the neural mask alone is weak on both.
+
+                 The neural mask replaced the fixed formula wholesale, including this test, which was never part of it. On synthesised bursts the fixed formula with this test on throws away 27.2% of what the neural mask keeps.
+
+                 It can only remove, never add, and only where the test fires, so static scenes look exactly as they do with it off. The cost is bluntness: it also rejects about 2.2% of correctly aligned pixels, mostly thin lines and strong edges, so fine detail can soften on scenes that did not need it.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
         }
     }
 

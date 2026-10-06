@@ -2605,6 +2605,102 @@ kernel void sr_gate_head(device float* R [[buffer(0)]],
     R[uint(y) * p.w + gid.x] = 1.f / (1.f + exp(-s));
 }
 
+// ==== sr_gate + geometry rejection (Config::sr_gate_geom_reject_enabled) ===
+//
+// The gate replaces Eq. 7-9, which is what it was trained for, and so also skips
+// geometry rejection -- which is NOT part of Eq. 7-9 and answers a different
+// question: whether the per-tile translation models the local motion at all.
+// That is the failure camera rotation and parallax produce, and the gate's eight
+// features see it poorly.
+//
+// Two kernels rather than one because the rejection is DILATED: the 5x5 minimum
+// needs every neighbour's keep value decided before any of them is read, which
+// one kernel cannot guarantee without a device-wide barrier.
+//
+// The test below is the twin of the one inside rob_mask above and of
+// geom_reject_keep in robustness.cpp -- same criteria, same thresholds, same
+// Config fields. Three copies is two too many, but the alternative is a shared
+// header for code that has to index three different buffer layouts; the comment
+// in each points at the other two.
+struct SrGateGeomParams {
+    uint  h, w, nch, tile_size, flow_ny, flow_nx;
+    uint  geom_relative;
+    float geom_reject_threshold;
+    float geom_noise_floor_mult;
+    float geom_reject_threshold_relative;
+    float alpha, beta;
+};
+
+kernel void sr_gate_geom_keep(device float* keep [[buffer(0)]],
+                              device const float* flow [[buffer(1)]],
+                              device const float* ref_means [[buffer(2)]],
+                              constant SrGateGeomParams& p [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    const uint o = gid.y * p.w + gid.x;
+    if (p.flow_ny < 3u || p.flow_nx < 3u) { keep[o] = 1.0f; return; }
+
+    float sc = (p.nch == 3u) ? 2.0f : 1.0f;
+    int patch_idy, patch_idx;
+    if (p.nch == 3u) {
+        patch_idy = int((2.0f * float(gid.y) + 0.5f) / float(p.tile_size));
+        patch_idx = int((2.0f * float(gid.x) + 0.5f) / float(p.tile_size));
+    } else {
+        patch_idy = int(gid.y) / int(p.tile_size);
+        patch_idx = int(gid.x) / int(p.tile_size);
+    }
+    patch_idy = clamp(patch_idy, 0, int(p.flow_ny) - 1);
+    patch_idx = clamp(patch_idx, 0, int(p.flow_nx) - 1);
+
+    int ptu = clamp(patch_idy - 1, 0, int(p.flow_ny) - 1), ptd = clamp(patch_idy + 1, 0, int(p.flow_ny) - 1);
+    int pxl = clamp(patch_idx - 1, 0, int(p.flow_nx) - 1), pxr = clamp(patch_idx + 1, 0, int(p.flow_nx) - 1);
+    float i2 = 1.0f / (2.0f * float(p.tile_size));
+    uint fr = (uint(patch_idy) * p.flow_nx + uint(pxr)) * 2u, fl = (uint(patch_idy) * p.flow_nx + uint(pxl)) * 2u;
+    uint fd = (uint(ptd) * p.flow_nx + uint(patch_idx)) * 2u, fu = (uint(ptu) * p.flow_nx + uint(patch_idx)) * 2u;
+    float gdxdx = (flow[fr + 0u] - flow[fl + 0u]) * i2, gdydx = (flow[fr + 1u] - flow[fl + 1u]) * i2;
+    float gdxdy = (flow[fd + 0u] - flow[fu + 0u]) * i2, gdydy = (flow[fd + 1u] - flow[fu + 1u]) * i2;
+    float rawx = sc * float(gid.x) + 0.5f * (sc - 1.0f), rawy = sc * float(gid.y) + 0.5f * (sc - 1.0f);
+    float u = rawx - (float(patch_idx) + 0.5f) * float(p.tile_size);
+    float v = rawy - (float(patch_idy) + 0.5f) * float(p.tile_size);
+    float ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v;
+    float Emag = sqrt(ex * ex + ey * ey);
+    int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
+    int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
+    float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] - ref_means[(gid.y * p.w + uint(xl)) * p.nch]) / sc;
+    float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] - ref_means[(uint(yu) * p.w + gid.x) * p.nch]) / sc;
+    float gmag = sqrt(gix * gix + giy * giy);
+    bool rej = (gmag * Emag) > p.geom_reject_threshold;
+    if (!rej && p.geom_relative != 0u) {
+        float bri = rob_brightness(ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x));
+        float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f)) / sc;
+        float gmag_dn = max(0.f, gmag - p.geom_noise_floor_mult * nsig);
+        rej = (gmag_dn / (bri + 1e-4f)) * Emag > p.geom_reject_threshold_relative;
+    }
+    keep[o] = rej ? 0.0f : 1.0f;
+}
+
+// R *= min over the 5x5 neighbourhood of keep. On a 0/1 image that minimum is a
+// dilation of the zeros, which is the point: an isolated rejection reads as
+// speckle, a dilated one reads as a clean hole. Note this dilates the REJECTION
+// only -- it is not Eq. 9's minimum over the gate's own mask, which costs a
+// measured 2.00 dB on this guide for reasons unrelated to rotation.
+kernel void sr_gate_geom_apply(device float* R [[buffer(0)]],
+                               device const float* keep [[buffer(1)]],
+                               constant SrGateGeomParams& p [[buffer(2)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    float m = 1.0f;
+    for (int dy = -2; dy <= 2; ++dy) {
+        int yy = clamp(int(gid.y) + dy, 0, int(p.h) - 1);
+        for (int dx = -2; dx <= 2; ++dx) {
+            int xx = clamp(int(gid.x) + dx, 0, int(p.w) - 1);
+            m = min(m, keep[uint(yy) * p.w + uint(xx)]);
+        }
+    }
+    R[gid.y * p.w + gid.x] *= m;
+}
+
+
 // ---- learned refinement of the analytic mask (Config::
 // robustness_refine_nn_enabled) ------------------------------------------
 //

@@ -1773,6 +1773,74 @@ static id<MTLBuffer> srg_weights() {
 // curve_n is passed in rather than read from g_rob_curve_n: that global is
 // declared several hundred lines below this helper, and depending on where the
 // helper happens to sit in the file is how this failed to compile the first time.
+// Keep in lockstep with SrGateGeomParams in HHSRKernels.metal: same fields,
+// same order. A mismatch here is silent on the shader side.
+struct SrGateGeomParamsCPU {
+    uint32_t h = 0, w = 0, nch = 0, tile_size = 0, flow_ny = 0, flow_nx = 0;
+    uint32_t geom_relative = 0;
+    float geom_reject_threshold = 0.f;
+    float geom_noise_floor_mult = 0.f;
+    float geom_reject_threshold_relative = 0.f;
+    float alpha = 0.f, beta = 0.f;
+};
+
+// Geometry rejection applied to the gate's mask
+// (Config::sr_gate_geom_reject_enabled). Encoded after the head kernel has
+// written R, into the same b_out the merge reads, so it needs no extra plane
+// beyond the one-channel keep mask.
+//
+// Returning false here must leave R ALONE rather than half-attenuated, so
+// everything that can fail is checked before the first encoder is created.
+static bool rob_run_sr_gate_geom(id<MTLBuffer> b_out, size_t out_off_bytes,
+                                 id<MTLBuffer> b_ref_m, id<MTLBuffer> b_flow,
+                                 int gh, int gw, int nch, int tile_size,
+                                 const FlowField& flow, const Config& cfg,
+                                 id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> p_keep = c.pipe("sr_gate_geom_keep");
+    id<MTLComputePipelineState> p_apply = c.pipe("sr_gate_geom_apply");
+    if (!p_keep || !p_apply || !b_ref_m || !b_flow) return false;
+    if (gh <= 0 || gw <= 0 || tile_size <= 0 || flow.ny < 3 || flow.nx < 3)
+        return false;
+    id<MTLBuffer> b_keep = buf(nullptr, (size_t)gh * (size_t)gw * sizeof(float));
+    if (!b_keep) return false;
+
+    SrGateGeomParamsCPU gp{};
+    gp.h = (uint32_t)gh;
+    gp.w = (uint32_t)gw;
+    gp.nch = (uint32_t)nch;
+    gp.tile_size = (uint32_t)tile_size;
+    gp.flow_ny = (uint32_t)flow.ny;
+    gp.flow_nx = (uint32_t)flow.nx;
+    gp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
+    gp.geom_reject_threshold = cfg.motion_geom_reject_threshold;
+    gp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
+    gp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
+    // The ROBUSTNESS noise pair, matching what the analytic kernel's own copy of
+    // this test uses -- not noise_alpha()/noise_beta().
+    gp.alpha = cfg.noise_alpha_robustness();
+    gp.beta = cfg.noise_beta_robustness();
+
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    if (!e) return false;
+    [e setBuffer:b_keep offset:0 atIndex:0];
+    [e setBuffer:b_flow offset:0 atIndex:1];
+    [e setBuffer:b_ref_m offset:0 atIndex:2];
+    [e setBytes:&gp length:sizeof(gp) atIndex:3];
+    dispatch2(e, p_keep, (NSUInteger)gw, (NSUInteger)gh);
+    [e endEncoding];
+
+    // Separate encoder: the 5x5 minimum reads neighbours the first pass wrote.
+    e = [cmd computeCommandEncoder];
+    if (!e) return false;
+    [e setBuffer:b_out offset:out_off_bytes atIndex:0];
+    [e setBuffer:b_keep offset:0 atIndex:1];
+    [e setBytes:&gp length:sizeof(gp) atIndex:2];
+    dispatch2(e, p_apply, (NSUInteger)gw, (NSUInteger)gh);
+    [e endEncoding];
+    return true;
+}
+
 static bool rob_run_sr_gate(id<MTLBuffer> b_out, size_t out_off_bytes,
                             id<MTLBuffer> b_gmeans, id<MTLBuffer> b_ref_m,
                             id<MTLBuffer> b_ref_v, id<MTLBuffer> b_std,
@@ -2842,6 +2910,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                                        b_ref_v, b_std, b_diff, b_flow, gh, gw,
                                        nch, tile_size, g_rob_curve_n, flow, cfg,
                                        cmd);
+        // Geometry rejection on top of the learned mask, the GPU twin of the
+        // block in compute_robustness_core. Failing to encode it leaves the
+        // gate's mask untouched, which is the safe direction: the pipeline gets
+        // the mask it has today rather than a partly attenuated one.
+        if (sr_gate_done && cfg.sr_gate_geom_reject_enabled &&
+            cfg.motion_geom_reject_enabled) {
+            rob_run_sr_gate_geom(b_out, out_off_bytes, b_ref_m, b_flow, gh, gw,
+                                 nch, tile_size, flow, cfg, cmd);
+        }
         if (sr_gate_done && want_s_select) {
             // The gate makes no s1/s2 choice, and no kernel writes the selector
             // on this path. Report the strict prior uniformly so the split
