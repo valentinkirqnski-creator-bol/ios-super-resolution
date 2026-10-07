@@ -1686,7 +1686,7 @@ struct RobDogsonParams {
     uint flow_ny, flow_nx;
     float s;          // always 2.f (Python CUDA hardcode)
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad0)
-    uint stat_bilinear;  // 1 = bilinear stat interpolation, not Dodgson (was _pad1)
+    uint _pad1;
 };
 
 struct RobMaskParams {
@@ -1983,25 +1983,6 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
         float val;
         if (!(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w))) {
             val = INFINITY;
-        } else if (p.stat_bilinear != 0u) {
-            // Bilinear stat upsampling (Config::robustness_stats_bilinear).
-            // Twin of sample_bilinear_or_inf in robustness.cpp -- 2x2 taps with
-            // clamp-to-edge on the +1 neighbour. The OOB->INFINITY guard above
-            // is the same bound as the Dodgson route, so the +inf -> R = 0
-            // behaviour is preserved.
-            int y0 = int(floor(LR_y));
-            int x0 = int(floor(LR_x));
-            int y1 = min(y0 + 1, int(p.in_h) - 1);
-            int x1 = min(x0 + 1, int(p.in_w) - 1);
-            float fy = LR_y - float(y0);
-            float fx = LR_x - float(x0);
-            float v00 = stats[(uint(y0) * p.in_w + uint(x0)) * p.nch + ch];
-            float v01 = stats[(uint(y0) * p.in_w + uint(x1)) * p.nch + ch];
-            float v10 = stats[(uint(y1) * p.in_w + uint(x0)) * p.nch + ch];
-            float v11 = stats[(uint(y1) * p.in_w + uint(x1)) * p.nch + ch];
-            float top = v00 + (v01 - v00) * fx;
-            float bot = v10 + (v11 - v10) * fx;
-            val = top + (bot - top) * fy;
         } else {
             int center_y = lround_away(LR_y);
             int center_x = lround_away(LR_x);

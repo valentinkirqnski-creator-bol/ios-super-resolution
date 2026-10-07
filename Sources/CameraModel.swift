@@ -290,13 +290,10 @@ struct TuningParams: Equatable, Codable {
     /// (compute_guide_image) on every path. The Metal robustness backend already
     /// builds that guide unconditionally, so this does not change device output;
     /// it aligns the CPU/reference path and the config flags with what ships.
-    var robustness_raw_resolution_enabled: Bool = false
-    /// Bilinear stat upsampling: compute robustness at full raw resolution by
-    /// bilinearly upsampling the half-res mu/sigma^2 statistics (2x) instead of
-    /// the half-res guide computation. Unlike robustness_raw_resolution_enabled
-    /// this runs under the shipping FFT alignment grey (the Metal robustness
-    /// guide is always the half-res bayer guide). Off by default.
-    var robustness_stats_bilinear: Bool = false
+    /// Algorithm 6 (Monod): robustness at full resolution by Dodgson x2 upscaling
+    /// + flow-warping the half-res guide statistics. Guide stays half res; runs
+    /// under the shipping full-res FFT alignment. Default ON.
+    var robustness_raw_resolution_enabled: Bool = true
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
@@ -366,7 +363,6 @@ struct TuningParams: Equatable, Codable {
         case edge_misalign_shift_z, edge_misalign_ghost_z, edge_misalign_min_conf
         case align_ambiguous_fallback_enabled
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
-        case robustness_stats_bilinear
         case kernel_selection_linear
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
@@ -472,7 +468,6 @@ struct TuningParams: Equatable, Codable {
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
-        robustness_stats_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_stats_bilinear) ?? robustness_stats_bilinear
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
@@ -536,7 +531,9 @@ final class CameraModel: NSObject, ObservableObject {
         // Bump when app defaults change so existing installs pick up the new preset once.
         // 14: 460-main-by-default preset (align_match_14 off, candidate flow
         // upscale, linear guide, geometry rejection off).
-        let defaultsVersion = 14
+        // 15: Algorithm 6 full-resolution robustness ON by default (half-res
+        // guide, Dodgson x2 upscale of the statistics); bilinear-stat toggle removed.
+        let defaultsVersion = 15
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
@@ -2256,7 +2253,6 @@ final class CameraModel: NSObject, ObservableObject {
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
-            "robustness_stats_bilinear": NSNumber(value: tuningParams.robustness_stats_bilinear),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),

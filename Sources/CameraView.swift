@@ -1125,9 +1125,9 @@ struct CameraView: View {
                              Zeroes the Poisson–Gaussian noise model the mask reads (the only place it is used, as in 460-main). R is then scored from the raw measured local variance and the unshrunk pixel difference — no noise floor forgiving small differences, no Wiener shrink. Rejects more aggressively. Alignment tile size, SNR auto-tune and kernel estimation are untouched.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
-                        Toggle("Bilinear Stat Upsampling", isOn: $cam.tuningParams.robustness_stats_bilinear)
+                        Toggle("Full-Res Robustness (Algorithm 6)", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
                         Text("""
-                             Computes the mask at full raw resolution by bilinearly upsampling the half-res μ/σ² statistics (2×) instead of the default half-res guide computation. The rejection boundary lands with raw-pixel precision instead of in 2×2 Bayer blocks. Works under the shipping FFT alignment grey (the device robustness guide is always the half-res Bayer guide, so the 2× upscale is always valid). ~4× the mask pixel count — heavier. Experimental, off by default.
+                             The paper's Algorithm 6: the guide stays half-resolution (Algorithm 7) and the local statistics σp/µp are Dodgson ×2 upscaled and flow-warped to full H×W resolution, so the mask lands with raw-pixel precision instead of in 2×2 Bayer blocks. No full-resolution guide is ever built. Runs under the full-res FFT alignment. ~4× the mask pixel count — heavier. Default ON.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }

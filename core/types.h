@@ -1060,62 +1060,31 @@ struct Config {
     // the measured local variance of a flat patch rather than trusted.
     float robustness_fft_guide_noise_energy = 0.25f;
 
-    bool robustness_raw_resolution_enabled = false;
-    // Bilinear-stat upsampling: compute robustness at full raw resolution by
-    // bilinearly upsampling the half-res mu/sigma^2 statistics (2x) instead of
-    // the Dodgson-quadratic upscale the robustness_raw_resolution_enabled route
-    // uses. Same raw-resolution machinery (means_hires/stds_hires, rob_make_mask
-    // _raw); only the interpolation kernel differs. Unlike that route this one
-    // is NOT gated on grey_method == Decimate: on the Metal path the robustness
-    // guide is ALWAYS the half-res bayer guide (rob_run_guide_stats never builds
-    // the FFT grey), so the 2x upscale is valid whatever the alignment grey is.
-    // It still requires a half-res bayer guide (bayer_mode and not the full-res
-    // FFT guide) -- see robustness_raw_resolution_active().
-    bool robustness_stats_bilinear = false;
-    // True when the raw-resolution path should actually run this call --
-    // single place both conditions live, so robustness.cpp, merge.cpp and
-    // the Metal dispatch code in metal_gpu.mm can't drift out of step on
-    // which one gates it.
-    // Whether the guide is built from the full-resolution FFT grey.
-    //
-    // robustness_raw_resolution_enabled reaches this too, and that is the point:
-    // it used to be silently discarded. The old predicate required the Decimate
-    // grey, because the only raw-resolution route it knew was the Dodgson
-    // upscale of the half-res statistics, and that upscale assumes the guide is
-    // half res. grey_method defaults to FFT, so the toggle flipped a bool that
-    // the predicate then threw away and the setting did nothing at all in the
-    // shipping configuration -- a dead switch rather than a reported conflict.
-    //
-    // With the FFT grey there is no conflict to report: the guide is ALREADY at
-    // raw resolution, so asking for raw-resolution R means using it directly,
-    // with no upscale anywhere. That is strictly more information than the
-    // Dodgson route, which only ever bought positions.
+    // Algorithm 6 (Monod, "Implementing Handheld Burst Super-resolution"):
+    // compute robustness at FULL H x W resolution by Dodgson x2 upscaling and
+    // flow-warping the local statistics (sigma_p, mu_p) that are computed on the
+    // HALF-RES 3-channel Bayer guide (Algorithm 7). The guide stays half res;
+    // only the statistics are upscaled to the LR reference pose. Runs under ANY
+    // alignment grey -- on Metal the robustness guide is always the half-res
+    // Bayer guide (rob_run_guide_stats), and on the CPU reference compute_guide
+    // builds the half-res Bayer guide whenever robustness_fft_guide_active() is
+    // false -- so this is live under the shipping full-res FFT alignment.
+    bool robustness_raw_resolution_enabled = true;
+    // Whether the robustness guide is built from the full-resolution FFT grey
+    // instead of the half-res 3-channel Bayer guide. Algorithm 6 keeps the guide
+    // at H/2 x W/2 and upscales the statistics, so this full-res-guide route is a
+    // separate experiment, default off, and is NOT implied by raw-resolution R
+    // any more (that would make the guide full res, which Algorithm 6 never does).
     bool robustness_fft_guide_active() const {
-        return bayer_mode && grey_method == GreyMethod::FFT &&
-               (robustness_fft_guide || robustness_raw_resolution_enabled);
+        return bayer_mode && grey_method == GreyMethod::FFT && robustness_fft_guide;
     }
-    // The Dodgson-upscale route specifically. Every consumer of this means "the
-    // reference statistics were upscaled and live in means_hires/stds_hires",
-    // which is true of that route and only that route -- the FFT guide needs no
-    // hires buffers because its own statistics are already full resolution, and
-    // the ordinary guide-resolution code path produces raw-resolution R from
-    // them without knowing anything has changed.
+    // The Dodgson-upscale route (Algorithm 6). Every consumer means "the
+    // reference statistics were upscaled and live in means_hires/stds_hires".
+    // No grey_method gate: the guide is half res on both paths, so the x2 upscale
+    // is always valid. Mutually exclusive with the full-res FFT guide (which
+    // needs no upscale), hence the !robustness_fft_guide_active() guard.
     bool robustness_raw_resolution_active() const {
-        // Bilinear-stat route: raw-resolution R by bilinear upscale of the
-        // half-res bayer statistics. Valid whenever the guide is the half-res
-        // bayer guide (not the full-res FFT guide), independent of the
-        // alignment grey -- so it is NOT dead under the shipping FFT grey the
-        // way the Dodgson route below is.
-        if (robustness_stats_bilinear && bayer_mode && !robustness_fft_guide_active())
-            return true;
-        return robustness_raw_resolution_enabled && !robustness_fft_guide_active() &&
-               grey_method == GreyMethod::Decimate;
-    }
-    // The stat upscale uses bilinear interpolation (this toggle) rather than
-    // Dodgson quadratic (the default raw-resolution route). Only meaningful
-    // when robustness_raw_resolution_active() is true.
-    bool robustness_stats_bilinear_active() const {
-        return robustness_stats_bilinear && robustness_raw_resolution_active();
+        return robustness_raw_resolution_enabled && !robustness_fft_guide_active();
     }
     // Whether the guide is sqrt(raw), which decides both its transfer curve and
     // whether the noise curve is indexed by mean^2. The FFT guide is a linear

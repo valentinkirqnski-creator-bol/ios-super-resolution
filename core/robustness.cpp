@@ -999,8 +999,7 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
 
 static Image upscale_warp_stats(const Image& guide_stats,
                                 bool is_ref, const FlowField* flow, int tile_size,
-                                int num_threads, bool bilinear_flow,
-                                bool stat_bilinear = false) {
+                                int num_threads, bool bilinear_flow) {
     const int nc = guide_stats.c;
     // Match Python upscale_warp_stats sizing: 3ch -> 2x, else same size
     const int out_h = (nc == 3) ? guide_stats.h * 2 : guide_stats.h;
@@ -1031,12 +1030,7 @@ static Image upscale_warp_stats(const Image& guide_stats,
             f32 LR_y = (y + flow_y + 0.5f) / s - 0.5f;
             f32 LR_x = (x + flow_x + 0.5f) / s - 0.5f;
             for (int ch = 0; ch < nc; ++ch) {
-                // Bilinear stat upsampling (Config::robustness_stats_bilinear)
-                // vs the default Dodgson-quadratic. Twin of rob_upscale_dogson's
-                // stat_bilinear branch in HHSRKernels.metal.
-                out.at(y, x, ch) = stat_bilinear
-                    ? sample_bilinear_or_inf(guide_stats, LR_y, LR_x, ch)
-                    : sample_dogson(guide_stats, LR_y, LR_x, ch);
+                out.at(y, x, ch) = sample_dogson(guide_stats, LR_y, LR_x, ch);
             }
         }
     });
@@ -1437,11 +1431,9 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // never warps the reference's own stats -- only Gn's). Once per
         // burst here, not once per comparison frame.
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
-                                            0, cfg.num_threads, false,
-                                            cfg.robustness_stats_bilinear);
+                                            0, cfg.num_threads, false);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
-                                           0, cfg.num_threads, false,
-                                           cfg.robustness_stats_bilinear);
+                                           0, cfg.num_threads, false);
     }
     return st;
 #endif
@@ -1507,8 +1499,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
-                                        tile_size, cfg.num_threads, false,
-                                        cfg.robustness_stats_bilinear);
+                                        tile_size, cfg.num_threads, false);
     }
 
     const Image& ref_means = ref_stats.means_hires;
