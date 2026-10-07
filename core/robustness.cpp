@@ -559,28 +559,95 @@ static const NoiseCurves& make_noise_curves_channel_sqrt(f32 alpha, f32 beta, in
     return noise_curves_cached(alpha, beta, /*sqrt_domain=*/true);
 }
 
+// --- IEC sRGB perceptual-domain robustness (Config::robustness_srgb_active) ---
+// INTENTIONAL: compute the robustness statistic (d, sigma_p, sigma_t and hence
+// R) on the PERCEPTUALLY-encoded guide (IEC sRGB) instead of linear sensor RGB,
+// following the Wronski/TAA reading that robustness should measure perceptually-
+// relevant colour differences. Only the dedicated robustness guide is sRGB-
+// encoded (apply_guide_curve / rob_guide_curve, curve 3); the raw sensor planes,
+// the merge/accumulation and the output stay linear and are NOT touched.
+//
+// d and sigma_p come directly from the sRGB-encoded guide (mean/variance of sRGB
+// values). sigma_t must live in the SAME domain, so rather than invent a new
+// noise model we transform the EXISTING linear curve by local error propagation
+// of the sRGB OETF f:
+//
+//     sigma_srgb(b) ~= sigma_linear(b) * |f'(b)|,    b = linear brightness.
+//
+// The guide stores sRGB values and the mask indexes the curve by the guide mean
+// directly (sqrt_index = 0, since robustness_guide_sqrt_active() is false when
+// guide_curve == 3), so the curve must be indexed by the sRGB-ENCODED brightness
+// s: for bin i, s = i/N, the linear brightness is b = f^{-1}(s) (sRGB EOTF), we
+// read the linear curve at b and scale by f'(b). f and f^{-1} are the exact
+// piecewise IEC sRGB transfer, so the sRGB TOE (the 12.92 linear segment, where
+// |f'| = 12.92) is handled rather than assuming one gamma derivative everywhere.
+static inline f32 srgb_eotf(f32 s) {  // encoded -> linear
+    s = clampf(s, 0.f, 1.f);
+    return (s <= 0.04045f) ? (s / 12.92f) : std::pow((s + 0.055f) / 1.055f, 2.4f);
+}
+static inline f32 srgb_oetf_deriv(f32 b) {  // d(sRGB)/d(linear) at linear b
+    b = clampf(b, 0.f, 1.f);
+    if (b <= 0.0031308f) return 12.92f;  // linear toe segment
+    return (1.055f / 2.4f) * std::pow(b, 1.f / 2.4f - 1.f);
+}
+static NoiseCurves srgb_transform_curve(const NoiseCurves& lin) {
+    NoiseCurves out;
+    const int N = k_n_brightness;
+    const int lin_n = (int)lin.std_curve.size();
+    if (lin_n == 0) return out;
+    out.std_curve.resize((size_t)N + 1);
+    out.diff_curve.resize((size_t)N + 1);
+    for (int i = 0; i <= N; ++i) {
+        const f32 s = (f32)i / (f32)N;       // sRGB-encoded brightness (= guide value)
+        const f32 b = srgb_eotf(s);          // linear brightness
+        const f32 d = srgb_oetf_deriv(b);    // |f'(b)|, exact piecewise (incl. toe)
+        int j = (int)std::lround((double)b * (double)N);
+        j = std::min(std::max(j, 0), lin_n - 1);
+        out.std_curve[(size_t)i]  = lin.std_curve[(size_t)j]  * d;
+        out.diff_curve[(size_t)i] = lin.diff_curve[(size_t)j] * d;
+    }
+    return out;
+}
+static const NoiseCurves& make_noise_curves_srgb(f32 alpha, f32 beta) {
+    static std::mutex mu;
+    struct Entry { f32 a, b; std::unique_ptr<NoiseCurves> nc; };
+    static std::vector<Entry> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& e : cache) if (e.a == alpha && e.b == beta) return *e.nc;
+    // Source is the EXISTING linear curve (shared cache); transform a copy.
+    auto nc = std::make_unique<NoiseCurves>(srgb_transform_curve(make_noise_curves(alpha, beta)));
+    cache.push_back(Entry{alpha, beta, std::move(nc)});
+    return *cache.back().nc;
+}
+static const NoiseCurves& make_noise_curves_srgb_channel(f32 alpha, f32 beta, int ch) {
+    (void)ch;  // keys on (alpha, beta), same as the linear/sqrt channel caches
+    return make_noise_curves_srgb(alpha, beta);
+}
+
 // Mask-only variants: honour Config::debug_noise_model_disabled by building
 // the curves from alpha = beta = 0 (so sigma_t = d_t = 0 in every bin),
 // while make_noise_curves(cfg) itself stays ungated -- it is shared with SNR
 // auto-tuning via noise_std_at_brightness, and gating it there changed the
 // alignment tile size and merge constants along with the mask (measured:
 // tile 16 -> 32), which is exactly what a diagnostic probe must not do.
-// robustness_guide_sqrt routes to the sqrt-domain caches (1.4 parity).
+// robustness_guide_sqrt routes to the sqrt-domain caches (1.4 parity);
+// robustness_srgb_active() routes to the sRGB-domain caches (perceptual).
 static const NoiseCurves& mask_noise_curves(const Config& cfg) {
+    const bool srgb = cfg.robustness_srgb_active();
     const bool sq = cfg.robustness_guide_sqrt_active();
-    if (cfg.debug_noise_model_disabled)
-        return sq ? make_noise_curves_sqrt(0.f, 0.f) : make_noise_curves(0.f, 0.f);
-    const f32 a = cfg.noise_alpha_robustness(), b = cfg.noise_beta_robustness();
+    const f32 a = cfg.debug_noise_model_disabled ? 0.f : cfg.noise_alpha_robustness();
+    const f32 b = cfg.debug_noise_model_disabled ? 0.f : cfg.noise_beta_robustness();
+    if (srgb) return make_noise_curves_srgb(a, b);
     return sq ? make_noise_curves_sqrt(a, b) : make_noise_curves(a, b);
 }
 static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
+    const bool srgb = cfg.robustness_srgb_active();
     const bool sq = cfg.robustness_guide_sqrt_active();
-    if (cfg.debug_noise_model_disabled)
-        return sq ? make_noise_curves_channel_sqrt(0.f, 0.f, ch)
-                  : make_noise_curves_channel(0.f, 0.f, ch);
-    return sq ? make_noise_curves_channel_sqrt(cfg.noise_alpha_ch_robustness(ch),
-                                               cfg.noise_beta_ch_robustness(ch), ch)
-              : make_noise_curves_channel(cfg, ch);
+    const f32 a = cfg.debug_noise_model_disabled ? 0.f : cfg.noise_alpha_ch_robustness(ch);
+    const f32 b = cfg.debug_noise_model_disabled ? 0.f : cfg.noise_beta_ch_robustness(ch);
+    if (srgb) return make_noise_curves_srgb_channel(a, b, ch);
+    return sq ? make_noise_curves_channel_sqrt(a, b, ch)
+              : make_noise_curves_channel(a, b, ch);
 }
 
 } // namespace

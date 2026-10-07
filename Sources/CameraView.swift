@@ -1125,6 +1125,15 @@ struct CameraView: View {
                         ispRow("Mt (motion threshold)", $cam.tuningParams.r_Mt, 0.0...4.0, "%.2f")
                         Text("460-main: t 0.12, s1 2, s2 12, Mt 0.8. Higher t rejects more; higher s1/s2 trust frames more; Mt is the per-tile flow spread that switches s2→s1.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Picker("Color Domain", selection: $cam.tuningParams.guide_curve) {
+                            Text("Linear").tag(0)
+                            Text("Sqrt VST").tag(1)
+                            Text("sRGB").tag(3)
+                        }
+                        Text("""
+                             Color space d, σ and R are measured in (reconstruction/merge stay linear regardless). Linear (460-main): raw sensor RGB. Sqrt VST: variance-stabilized (1.4). sRGB: the guide is IEC-sRGB encoded so the residual tracks perceptually-relevant color differences (Wronski/TAA reading); the noise floor σ_t is moved to sRGB from the linear curve by OETF error propagation, so d and σ stay in one domain. Only the robustness guide is transformed — raw planes, merge and output are untouched.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("Disable Noise Model", isOn: $cam.tuningParams.debug_noise_model_disabled)
                         Text("""
                              Zeroes the Poisson–Gaussian noise model the mask reads (the only place it is used, as in 460-main). R is then scored from the raw measured local variance and the unshrunk pixel difference — no noise floor forgiving small differences, no Wiener shrink. Rejects more aggressively. Alignment tile size, SNR auto-tune and kernel estimation are untouched.

@@ -1105,8 +1105,23 @@ struct Config {
     // whether the noise curve is indexed by mean^2. The FFT guide is a linear
     // low pass of the raw, so it is indexed by brightness directly; applying
     // sqrt to it would not even be the same thing as low-passing sqrt(raw).
+    // guide_curve == 3 is the sRGB perceptual route (see below), which owns the
+    // noise domain, so sqrt yields to it.
     bool robustness_guide_sqrt_active() const {
-        return robustness_guide_sqrt && !robustness_fft_guide_active();
+        return robustness_guide_sqrt && !robustness_fft_guide_active() && guide_curve != 3;
+    }
+    // IEC sRGB perceptual-domain robustness (guide_curve == 3). The dedicated
+    // robustness guide is sRGB-encoded (apply_guide_curve / rob_guide_curve
+    // curve 3), so d and the local-variance sigma_p are measured on perceptually
+    // encoded RGB rather than linear sensor RGB -- the Wronski/TAA reading that
+    // the robustness statistic should track perceptually-relevant colour
+    // differences. sigma_t is moved to the same domain from the EXISTING linear
+    // curve by sRGB-OETF error propagation (see make_noise_curves_srgb in
+    // robustness.cpp). The raw sensor planes, the merge and the output stay
+    // linear and untouched -- only the guide/d/sigma/R are sRGB. Mutually
+    // exclusive with the sqrt-VST and full-res FFT guide routes.
+    bool robustness_srgb_active() const {
+        return guide_curve == 3 && !robustness_fft_guide_active();
     }
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to

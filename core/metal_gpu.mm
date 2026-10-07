@@ -2027,6 +2027,10 @@ static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
 static bool g_rob_curve_pixel4a = false;
 static int g_rob_curve_pixel4a_iso = 0;
+// Noise-curve domain the cached buffers were built in: 0 linear, 1 sqrt-VST,
+// 2 sRGB. The (alpha,beta) check below can't see a domain switch at the same
+// ISO (e.g. toggling the robustness colour domain), so track it explicitly.
+static int g_rob_curve_domain = -1;
 
 static void clear_rob_ref_gpu() {
     g_rob_ref_hf = nil;
@@ -2047,6 +2051,7 @@ static void clear_rob_ref_gpu() {
     }
     g_rob_curve_pixel4a = false;
     g_rob_curve_pixel4a_iso = 0;
+    g_rob_curve_domain = -1;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -2221,9 +2226,12 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         return Image();
 
     const int curve_nch = std::max(1, std::min(3, nch));
+    const int curve_domain = cfg.robustness_srgb_active() ? 2
+                             : (cfg.robustness_guide_sqrt_active() ? 1 : 0);
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != false ||
-        g_rob_curve_pixel4a_iso != 0;
+        g_rob_curve_pixel4a_iso != 0 ||
+        g_rob_curve_domain != curve_domain;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -2256,6 +2264,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         g_rob_curve_n = n;
         g_rob_curve_pixel4a = false;
         g_rob_curve_pixel4a_iso = 0;
+        g_rob_curve_domain = curve_domain;
     }
     if (g_rob_curve_n == 0) return Image();
 
@@ -2435,9 +2444,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // (curves are concatenated into one buffer, so a partial rebuild isn't
     // meaningfully cheaper).
     const int curve_nch = std::max(1, std::min(3, nch));
+    const int curve_domain = cfg.robustness_srgb_active() ? 2
+                             : (cfg.robustness_guide_sqrt_active() ? 1 : 0);
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != false ||
-        g_rob_curve_pixel4a_iso != 0;
+        g_rob_curve_pixel4a_iso != 0 ||
+        g_rob_curve_domain != curve_domain;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -2470,6 +2482,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         g_rob_curve_n = n;
         g_rob_curve_pixel4a = false;
         g_rob_curve_pixel4a_iso = 0;
+        g_rob_curve_domain = curve_domain;
     }
     if (g_rob_curve_n == 0) return Image();
     id<MTLBuffer> b_std = g_rob_std_curve;
