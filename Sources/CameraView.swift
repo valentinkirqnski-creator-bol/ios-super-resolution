@@ -1125,9 +1125,9 @@ struct CameraView: View {
                              Zeroes the Poisson–Gaussian noise model the mask reads (the only place it is used, as in 460-main). R is then scored from the raw measured local variance and the unshrunk pixel difference — no noise floor forgiving small differences, no Wiener shrink. Rejects more aggressively. Alignment tile size, SNR auto-tune and kernel estimation are untouched.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
-                        Toggle("Full-Res Robustness (Algorithm 6)", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
+                        Toggle("Dodgson Stat Upsampling (Algorithm 6)", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
                         Text("""
-                             The paper's Algorithm 6: the guide stays half-resolution (Algorithm 7) and the local statistics σp/µp are Dodgson ×2 upscaled and flow-warped to full H×W resolution, so the mask lands with raw-pixel precision instead of in 2×2 Bayer blocks. No full-resolution guide is ever built. Runs under the full-res FFT alignment. ~4× the mask pixel count — heavier. Default ON.
+                             Off (default): the mask is computed on the half-resolution guide and keeps GPU frame residency (faster). On: the paper's Algorithm 6 — the guide stays half-res, but the local statistics σp/µp are Dodgson ×2 upscaled and flow-warped to full H×W resolution, so the mask lands at raw-pixel precision instead of in 2×2 Bayer blocks. No full-resolution guide is ever built; alignment stays full-res FFT. Heavier, and it disables GPU frame residency, so it is slower per frame.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }

@@ -292,8 +292,10 @@ struct TuningParams: Equatable, Codable {
     /// it aligns the CPU/reference path and the config flags with what ships.
     /// Algorithm 6 (Monod): robustness at full resolution by Dodgson x2 upscaling
     /// + flow-warping the half-res guide statistics. Guide stays half res; runs
-    /// under the shipping full-res FFT alignment. Default ON.
-    var robustness_raw_resolution_enabled: Bool = true
+    /// under the shipping full-res FFT alignment. OPT-IN (default off): it runs a
+    /// host-side raw-res mask that disables GPU frame residency, so the default
+    /// path is the half-res-guide robustness that keeps residency active.
+    var robustness_raw_resolution_enabled: Bool = false
     // HDR JPG finish (core/finish_hdr.cpp), the render behind the JPG export and
     // the DNG's Photos preview. Defaults mirror FinishHdrParams; keep them in
     // step or Settings will show one value and the render use another.
@@ -533,7 +535,9 @@ final class CameraModel: NSObject, ObservableObject {
         // upscale, linear guide, geometry rejection off).
         // 15: Algorithm 6 full-resolution robustness ON by default (half-res
         // guide, Dodgson x2 upscale of the statistics); bilinear-stat toggle removed.
-        let defaultsVersion = 15
+        // 16: Dodgson full-res robustness back OFF by default -- it is opt-in and
+        // disables GPU frame residency; the default path keeps residency active.
+        let defaultsVersion = 16
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

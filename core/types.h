@@ -1069,7 +1069,13 @@ struct Config {
     // Bayer guide (rob_run_guide_stats), and on the CPU reference compute_guide
     // builds the half-res Bayer guide whenever robustness_fft_guide_active() is
     // false -- so this is live under the shipping full-res FFT alignment.
-    bool robustness_raw_resolution_enabled = true;
+    //
+    // OPT-IN (default off): the Dodgson route runs a host-side raw-resolution
+    // mask that is not written into the GPU-resident robustness slice, so it
+    // forces metal_frames_begin to decline residency (slower). The DEFAULT path
+    // is therefore the half-res-guide robustness, which keeps GPU frame residency
+    // active. Turn this on for Algorithm 6's upscaled mask at the cost of residency.
+    bool robustness_raw_resolution_enabled = false;
     // Whether the robustness guide is built from the full-resolution FFT grey
     // instead of the half-res 3-channel Bayer guide. Algorithm 6 keeps the guide
     // at H/2 x W/2 and upscales the statistics, so this full-res-guide route is a
