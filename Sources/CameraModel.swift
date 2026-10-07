@@ -98,6 +98,12 @@ struct TuningParams: Equatable, Codable {
     var k_shrink: Float = 1.0
     var snr_auto_tune: Bool = false
     var alignment_tile_size: Int = 16
+    /// Put the smaller tile on the FINEST alignment level instead of the coarsest
+    /// (bm_tile_sizes {16,16,16,8} -> {8,16,16,16}), so the final per-tile motion
+    /// vector has less within-tile rotation error and the merge flow grid is
+    /// raw/8. Coarse levels stay 16. Opt-in (default off); 8px tiles match more
+    /// noisily in flat areas.
+    var align_fine_finest_tile: Bool = false
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -346,7 +352,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, alignment_tile_size
+        case snr_auto_tune, alignment_tile_size, align_fine_finest_tile
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
@@ -404,6 +410,7 @@ struct TuningParams: Equatable, Codable {
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
+        align_fine_finest_tile = try c.decodeIfPresent(Bool.self, forKey: .align_fine_finest_tile) ?? align_fine_finest_tile
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
         global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
@@ -2206,6 +2213,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
+            "align_fine_finest_tile": NSNumber(value: tuningParams.align_fine_finest_tile),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
             "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),

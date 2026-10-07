@@ -570,6 +570,15 @@ struct Config {
     std::vector<int> bm_factors      = {1, 2, 4, 4};
     std::vector<int> bm_tile_sizes   = {16, 16, 16, 8}; // filled by SNR when tile_size=SNR_based
     std::vector<f32> bm_tile_size_factors = {1.f, 1.f, 1.f, 0.5f};
+    // Put the 0.5 tile-size factor on the FINEST level instead of the coarsest,
+    // i.e. bm_tile_sizes {16,16,16,8} -> {8,16,16,16}. A smaller FINAL-level tile
+    // halves the within-tile extent, so the single per-tile motion vector has
+    // less spatial error from rotation/local motion (max error ~ omega * tile/2).
+    // The merge consumes bm_tile_sizes[0], so this also halves the merged flow
+    // grid to raw/8. Trade-off: 8px tiles block-match more noisily (less content,
+    // more aperture ambiguity) and there are ~4x more of them. Coarse levels stay
+    // 16 for a robust global estimate. Applied in set_alignment_tile_sizes.
+    bool align_fine_finest_tile = false;
     // Finest level raised from 1 to 2.
     //
     // The align_ica_per_level comment below works out the budget: with factors

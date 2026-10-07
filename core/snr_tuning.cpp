@@ -30,7 +30,14 @@ static void set_alignment_tile_sizes(Config& cfg, int base_tile_size) {
     if (base_tile_size <= 0) return;
     cfg.bm_tile_sizes.clear();
     cfg.bm_tile_sizes.reserve(cfg.bm_tile_size_factors.size());
-    for (f32 f : cfg.bm_tile_size_factors) {
+    // align_fine_finest_tile: move the small (0.5) factor from the coarsest to
+    // the FINEST level -- {1,1,1,0.5} -> {0.5,1,1,1}, i.e. {16,16,16,8} ->
+    // {8,16,16,16}. Finest/merge tile halves (less within-tile rotation error);
+    // coarse levels stay large for a robust global estimate. See Config.
+    std::vector<f32> factors = cfg.bm_tile_size_factors;
+    if (cfg.align_fine_finest_tile && factors.size() >= 2)
+        std::swap(factors.front(), factors.back());
+    for (f32 f : factors) {
         int ts = (int)(base_tile_size * f);
         // Keep the Metal alignment path resident for manual 8px tiles: the
         // coarsest level would otherwise become 4px from the 0.5 factor.

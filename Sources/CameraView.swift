@@ -1104,6 +1104,11 @@ struct CameraView: View {
                         Text("32").tag(32)
                         Text("64").tag(64)
                     }
+                    Toggle("Fine Final Tile (8px)", isOn: $cam.tuningParams.align_fine_finest_tile)
+                    Text("""
+                         Puts the smaller tile on the FINEST alignment level instead of the coarsest: {16,16,16,8} → {8,16,16,16}. The last refinement (and the merge flow grid) use 8px tiles, halving the within-tile extent so the single per-tile motion vector has less rotation/local-motion error. Coarse levels stay 16 for a robust global estimate. Trade-off: 8px tiles match more noisily in flat/low-light areas. Scales with the tile size above (so 32 → {16,32,32,32}).
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                 }
 

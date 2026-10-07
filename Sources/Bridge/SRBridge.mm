@@ -468,6 +468,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.alignment_tile_size =
             (ts == 8 || ts == 16 || ts == 32 || ts == 64) ? ts : 0;
     }
+    if (tuning[@"align_fine_finest_tile"])
+        cfg.align_fine_finest_tile = tuning[@"align_fine_finest_tile"].boolValue;
     if (tuning[@"global_prealignment_enabled"])
         cfg.global_prealignment_enabled = tuning[@"global_prealignment_enabled"].boolValue;
     if (tuning[@"global_prealignment_choose_reference"])
