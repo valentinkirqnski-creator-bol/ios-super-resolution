@@ -35,6 +35,18 @@ static f32 butterfly_reduce_sum(std::vector<f32>& s, int n) {
     return s[0];
 }
 
+// ica_kernel_8 with ICAConfig.clip: the butterfly reduction clamps EACH ADDED
+// summand to +/- clip before accumulating (s[tid] += clamp(s[tid+N])), while
+// the first term and the final step stay unclamped. A main quirk reproduced
+// verbatim -- see align_lvl_ica / ica_kernel_8 in ICA.py.
+static f32 butterfly_reduce_sum_clamped(std::vector<f32>& s, int n, f32 clip) {
+    for (int N = n / 2; N > 0; N /= 2) {
+        for (int tid = 0; tid < N; ++tid)
+            s[(size_t)tid] += std::max(std::min(s[(size_t)tid + N], clip), -clip);
+    }
+    return s[0];
+}
+
 // One warp: `v += __shfl_down_sync(0xffffffff, v, offset)` for offset=16..1.
 // Out-of-range source returns the lane's own value (CUDA shfl_down rule).
 // Returns what lane 0 holds after the reduce (the only value the kernels use).
@@ -154,6 +166,16 @@ static f32 ica_damp_ratio(const Config& cfg) {
 static f32 ica_max_step(const Config& cfg, int search_radius) {
     if (!cfg.ica_regularize_enabled) return 0.f;
     return (f32)std::max(1, search_radius);
+}
+
+// IPOL main ICAConfig.clip: clamp the ICA step to the level's search radius.
+// Off when the LM experiment (ica_regularize_enabled) is on, which brings its
+// own magnitude clamp via ica_max_step. 0 disables. See ica_refine_level for
+// the tile-size-specific application (per-axis for ts 16/32, summand for ts 8,
+// none for ts 64 -- matching main's four kernels).
+static f32 ica_clip_radius(const Config& cfg, int search_radius) {
+    if (!cfg.ica_clip || cfg.ica_regularize_enabled) return 0.f;
+    return (f32)search_radius;
 }
 
 static f32 clamped_ambiguity_ratio(const Config& cfg) {
@@ -735,11 +757,11 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                               const HessianField& hessian,
                               FlowField& flow, int tile_size, int n_iter,
                               int num_threads,
-                              f32 damp_ratio, f32 max_step) {
+                              f32 damp_ratio, f32 max_step, f32 clip_radius) {
 #ifdef __APPLE__
     // Metal ica_kernel_8/16 — same math/order as CPU path below / Python ICA.py.
     if (ica_refine_level_metal(ref, gradx, grady, hessian.data, moving, flow,
-                               tile_size, n_iter, damp_ratio, max_step))
+                               tile_size, n_iter, damp_ratio, max_step, clip_radius))
         return;
 #endif
     int ny = flow.ny, nx = flow.nx;
@@ -860,10 +882,16 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                             s_B1[(size_t)tid] = -grady.at(py, px) * gradt;
                         }
                     }
+                    // IPOL main ICAConfig.clip: ts 8 (ica_kernel_8) clamps the
+                    // reduction summands, not the step; ts 16/32 reduce plainly
+                    // and clamp the step per-axis (below).
+                    const bool summand_clip = (ts == 8 && clip_radius > 0.f);
                     f32 B0, B1;
                     if (ts == 8 || ts == 16) {
-                        B0 = butterfly_reduce_sum(s_B0, n_pix);
-                        B1 = butterfly_reduce_sum(s_B1, n_pix);
+                        B0 = summand_clip ? butterfly_reduce_sum_clamped(s_B0, n_pix, clip_radius)
+                                          : butterfly_reduce_sum(s_B0, n_pix);
+                        B1 = summand_clip ? butterfly_reduce_sum_clamped(s_B1, n_pix, clip_radius)
+                                          : butterfly_reduce_sum(s_B1, n_pix);
                     } else {
                         int nt = n_pix;
                         if (nt % 32) nt = ((nt + 31) / 32) * 32;
@@ -872,6 +900,12 @@ static void ica_refine_level(const Image& ref, const Image& gradx,
                     }
                     f32 dfx = det_inv * (h11 * B0 - h01 * B1);
                     f32 dfy = det_inv * (-h10 * B0 + h00 * B1);
+                    // ts 16/32 (ica_kernel_16/32): clamp the step per-axis to the
+                    // search radius. ts 8 does not (summands were clamped above).
+                    if (clip_radius > 0.f && (ts == 16 || ts == 32)) {
+                        dfx = std::max(std::min(dfx, clip_radius), -clip_radius);
+                        dfy = std::max(std::min(dfy, clip_radius), -clip_radius);
+                    }
                     if (max_step > 0.f) {
                         const f32 st = std::sqrt(dfx * dfx + dfy * dfy);
                         if (st > max_step) {
@@ -1279,7 +1313,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 ica_refine_level(r, L.gx, L.gy, m, L.hess, flow, ts,
                                  cfg.ica_n_iter, cfg.num_threads,
                                  ica_damp_ratio(cfg),
-                                 ica_max_step(cfg, radius));
+                                 ica_max_step(cfg, radius),
+                                 ica_clip_radius(cfg, radius));
         }
     }
 
@@ -1298,7 +1333,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         ica_refine_level(ref_grey, gx, gy, moving_grey, finest_hess, flow,
                          cfg.grey_tile_size(tile_size),
                          cfg.ica_n_iter, cfg.num_threads,
-                         ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius));
+                         ica_damp_ratio(cfg), ica_max_step(cfg, finest_radius),
+                         ica_clip_radius(cfg, finest_radius));
     }
     const HessianField* mark_hess = nullptr;
     if (!finest_hess.data.empty() && finest_hess.ny == flow.ny &&

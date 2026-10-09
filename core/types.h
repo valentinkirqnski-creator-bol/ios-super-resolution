@@ -1232,6 +1232,13 @@ struct Config {
     // aperture-eigenvalue damping and no per-iteration step clamp. false
     // reproduces that; true was the port's LM-damped variant (above).
     bool  ica_regularize_enabled = false;
+    // IPOL main ICAConfig.clip (default True): clamp each ICA iteration's step to
+    // the level's block-matching search radius. main's kernels do this in a
+    // tile-size-specific way -- ts 16/32 clamp the step per-axis, ts 8 clamps the
+    // reduction SUMMANDS instead (and leaves the step free), ts 64 does not clamp
+    // at all. Reproduced exactly (see ica_refine_level in align.cpp). Independent
+    // of the ica_regularize_enabled LM experiment, which supersedes it when on.
+    bool  ica_clip = true;
     // Legacy setting kept for old saved app preferences. The current 1D reject
     // gate uses flow_reject_1d_residual_threshold instead.
     float flow_reject_1d_ambiguity_ratio = 1.10f;

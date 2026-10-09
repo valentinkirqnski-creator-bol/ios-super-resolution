@@ -124,11 +124,14 @@ bool block_match_level_L1_metal(const Image& ref, const Image& moving,
 // hess: packed [ny*nx*4] = 00,01,10,11. Returns false if ts not in {8,16}.
 // damp_ratio: Levenberg-Marquardt damping toward that eigenvalue ratio, 0 off.
 // max_step: per-iteration displacement bound in pixels, 0 off.
+// clip_radius: IPOL main ICAConfig.clip radius, 0 off. Applied per tile size
+//   (per-axis step clamp for ts 16/32, summand clamp for ts 8, none for ts 64).
 bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& grady,
                             const std::vector<float>& hess_packed,
                             const Image& moving, FlowField& flow,
                             int tile_size, int n_iter,
-                            float damp_ratio = 0.f, float max_step = 0.f);
+                            float damp_ratio = 0.f, float max_step = 0.f,
+                            float clip_radius = 0.f);
 
 // Exact cuda_downsample / grey_pyramid.cpp downsample_by (valid gauss + stride).
 bool downsample_by_metal(const Image& src, int factor, Image& out);

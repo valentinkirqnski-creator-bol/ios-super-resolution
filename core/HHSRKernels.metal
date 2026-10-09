@@ -2983,7 +2983,7 @@ struct IcaParams {
     uint clamp_edge; // 1 → ica_kernel_8 clamp; 0 → ica_kernel_16 zero-OOB
     float damp_ratio;  // LM damping toward this eigenvalue ratio; 0 disables
     float max_step;    // per-iteration displacement bound in px; 0 disables
-    uint _pad0;        // 48 bytes for setBytes
+    float clip_radius; // IPOL main ICAConfig.clip radius; 0 disables (48 bytes)
 };
 
 inline float sample_mov(device const float* mov, int y, int x,
@@ -3157,6 +3157,12 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
             }
             float dfx = det_inv * (h11 * B0 - h01 * B1);
             float dfy = det_inv * (-h10 * B0 + h00 * B1);
+            // IPOL main ICAConfig.clip: ts 32 (ica_kernel_32) clamps the step
+            // per-axis to the search radius; ts 64 (ica_kernel_64) never clips.
+            if (p.clip_radius > 0.f && ts == 32) {
+                dfx = clamp(dfx, -p.clip_radius, p.clip_radius);
+                dfy = clamp(dfy, -p.clip_radius, p.clip_radius);
+            }
             if (p.max_step > 0.f) {
                 float st = sqrt(dfx * dfx + dfy * dfy);
                 if (st > p.max_step) { float k = p.max_step / st; dfx *= k; dfy *= k; }
@@ -3203,11 +3209,16 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // butterfly_reduce_sum_metal, unrolled across lanes: identical pairing
-        // and identical addition order, therefore identical sums.
+        // and identical addition order, therefore identical sums. IPOL main
+        // ICAConfig.clip at ts 8 (ica_kernel_8) clamps each ADDED summand to the
+        // search radius during this reduction; ts 16 reduces plainly and clamps
+        // the step below. (ts 8 leaves the step itself unclamped.)
+        const bool summand_clip = (ts == 8 && p.clip_radius > 0.f);
+        const float cr = p.clip_radius;
         for (int N = n_pix / 2; N > 0; N /= 2) {
             for (int t = int(lane); t < N; t += int(lanes)) {
-                s_B0[t] += s_B0[t + N];
-                s_B1[t] += s_B1[t + N];
+                s_B0[t] += summand_clip ? clamp(s_B0[t + N], -cr, cr) : s_B0[t + N];
+                s_B1[t] += summand_clip ? clamp(s_B1[t + N], -cr, cr) : s_B1[t + N];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -3218,6 +3229,11 @@ kernel void ica_refine_tile(device const float* ref [[buffer(0)]],
         float B1 = s_B1[0];
         float dfx = det_inv * (h11 * B0 - h01 * B1);
         float dfy = det_inv * (-h10 * B0 + h00 * B1);
+        // ts 16 (ica_kernel_16): clamp the step per-axis to the search radius.
+        if (p.clip_radius > 0.f && ts == 16) {
+            dfx = clamp(dfx, -p.clip_radius, p.clip_radius);
+            dfy = clamp(dfy, -p.clip_radius, p.clip_radius);
+        }
         if (p.max_step > 0.f) {
             float st = sqrt(dfx * dfx + dfy * dfy);
             if (st > p.max_step) { float k = p.max_step / st; dfx *= k; dfy *= k; }

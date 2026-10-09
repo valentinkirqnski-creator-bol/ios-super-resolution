@@ -3031,12 +3031,17 @@ static float ica_max_step_metal(const Config& cfg, int search_radius) {
     if (!cfg.ica_regularize_enabled) return 0.f;
     return (float)std::max(1, search_radius);
 }
+// Mirrors ica_clip_radius in align.cpp (IPOL main ICAConfig.clip).
+static float ica_clip_radius_metal(const Config& cfg, int search_radius) {
+    if (!cfg.ica_clip || cfg.ica_regularize_enabled) return 0.f;
+    return (float)search_radius;
+}
 
 static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy,
                      id<MTLBuffer> b_hess, id<MTLBuffer> b_mov, id<MTLBuffer> b_flow,
                      int ref_h, int ref_w, int mov_h, int mov_w,
                      int ny, int nx, int tile_size, int n_iter,
-                     float damp_ratio, float max_step) {
+                     float damp_ratio, float max_step, float clip_radius) {
     if (tile_size != 8 && tile_size != 16 && tile_size != 32 && tile_size != 64)
         return false;
     if (n_iter < 0) return false;
@@ -3048,7 +3053,7 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
         uint32_t clamp_edge;
         float damp_ratio = 0.f;   // LM damping toward this eigenvalue ratio
         float max_step = 0.f;     // per-iteration displacement bound, px
-        uint32_t _pad0 = 0;
+        float clip_radius = 0.f;  // IPOL main ICAConfig.clip radius, 0 off
     };
     static_assert(sizeof(IcaParamsCPU) == 48, "IcaParamsCPU layout");
     IcaParamsCPU p{};
@@ -3063,6 +3068,7 @@ static bool ica_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_gx, id<MTLBuffer> b_gy
     p.clamp_edge = (tile_size == 8) ? 1u : 0u;
     p.damp_ratio = damp_ratio;
     p.max_step = max_step;
+    p.clip_radius = clip_radius;
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return false;
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -3172,7 +3178,7 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
                             const std::vector<float>& hess_packed,
                             const Image& moving, FlowField& flow,
                             int tile_size, int n_iter,
-                            float damp_ratio, float max_step) {
+                            float damp_ratio, float max_step, float clip_radius) {
     if (!metal_gpu_init()) return false;
     if (tile_size != 8 && tile_size != 16 && tile_size != 32 && tile_size != 64)
         return false;
@@ -3192,7 +3198,7 @@ bool ica_refine_level_metal(const Image& ref, const Image& gradx, const Image& g
     if (!b_ref || !b_gx || !b_gy || !b_hess || !b_mov || !b_flow) return false;
     if (!ica_bufs(b_ref, b_gx, b_gy, b_hess, b_mov, b_flow,
                   ref.h, ref.w, moving.h, moving.w, ny, nx, tile_size, n_iter,
-                  damp_ratio, max_step))
+                  damp_ratio, max_step, clip_radius))
         return false;
     // Single-stage entry point: the helper above now commits without waiting,
     // so drain before reading the result back to the host.
@@ -3694,7 +3700,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
             if (l_ny == ny && l_nx == nx &&
                 !ica_bufs(l_ref, l_gx, l_gy, l_hess, m.img, b_flow,
                           r.h, r.w, m.h, m.w, ny, nx, ts, cfg.ica_n_iter,
-                          ica_damp_ratio_metal(cfg), ica_max_step_metal(cfg, radius)))
+                          ica_damp_ratio_metal(cfg), ica_max_step_metal(cfg, radius),
+                          ica_clip_radius_metal(cfg, radius)))
                 return false;
         }
     }
@@ -3738,7 +3745,8 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
                   ref_grey.h, ref_grey.w, moving_grey.h, moving_grey.w,
                   flow_ny, flow_nx, tile_size, cfg.ica_n_iter,
                   ica_damp_ratio_metal(cfg),
-                  ica_max_step_metal(cfg, cfg.search_radius_for_level(0))))
+                  ica_max_step_metal(cfg, cfg.search_radius_for_level(0)),
+                  ica_clip_radius_metal(cfg, cfg.search_radius_for_level(0))))
         return false;
     }
 
