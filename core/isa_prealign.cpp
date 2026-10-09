@@ -1,9 +1,12 @@
 #include "isa_prealign.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <complex>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace hhsr {
@@ -18,47 +21,97 @@ int next_pow2(int n) {
     return p;
 }
 
-// Iterative radix-2 Cooley-Tukey, in place; a.size() must be a power of two.
-// No 1/N scaling (applied once by the caller, as ISA divides by W*H).
-void fft1d(std::vector<cf>& a, bool inverse) {
-    const int n = (int)a.size();
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) std::swap(a[(size_t)i], a[(size_t)j]);
+// Precomputed per-size FFT plan: bit-reversal permutation and a forward twiddle
+// table. Cached across calls/frames so the cos/sin and index work is paid once.
+struct FftPlan {
+    int n = 0;
+    std::vector<int> rev;
+    std::vector<float> twr, twi;  // cos/sin(-2*pi*t/n), t in [0, n/2)
+};
+
+static const FftPlan& fft_plan(int n) {
+    static std::mutex mu;
+    static std::vector<std::unique_ptr<FftPlan>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    for (const auto& p : cache)
+        if (p->n == n) return *p;
+    auto p = std::make_unique<FftPlan>();
+    p->n = n;
+    p->rev.resize((size_t)n);
+    int bits = 0;
+    while ((1 << bits) < n) ++bits;
+    for (int i = 0; i < n; ++i) {
+        int j = 0;
+        for (int b = 0; b < bits; ++b) j |= ((i >> b) & 1) << (bits - 1 - b);
+        p->rev[(size_t)i] = j;
     }
+    p->twr.resize((size_t)(n / 2));
+    p->twi.resize((size_t)(n / 2));
+    for (int t = 0; t < n / 2; ++t) {
+        const double a = -2.0 * kPi * (double)t / (double)n;
+        p->twr[(size_t)t] = (float)std::cos(a);
+        p->twi[(size_t)t] = (float)std::sin(a);
+    }
+    cache.push_back(std::move(p));
+    return *cache.back();
+}
+
+// In-place radix-2 FFT on one length-n row, operating on the interleaved
+// [re,im] floats of a std::complex array (layout-compatible). Manual butterflies
+// with a precomputed twiddle table -- several times faster than the std::complex
+// operator* form. No 1/N scaling (omitted, as ISA divides once and it does not
+// change the argmax). inverse: conjugate the twiddles.
+static void fft1d(cf* data, int n, const FftPlan& pl, bool inverse) {
+    float* a = reinterpret_cast<float*>(data);
+    const int* rev = pl.rev.data();
+    for (int i = 0; i < n; ++i) {
+        const int j = rev[i];
+        if (i < j) {
+            std::swap(a[2 * i], a[2 * j]);
+            std::swap(a[2 * i + 1], a[2 * j + 1]);
+        }
+    }
+    const float* twr = pl.twr.data();
+    const float* twi = pl.twi.data();
     for (int len = 2; len <= n; len <<= 1) {
-        const double ang = 2.0 * kPi / len * (inverse ? 1.0 : -1.0);
-        const cf wlen((float)std::cos(ang), (float)std::sin(ang));
+        const int half = len >> 1, step = n / len;
         for (int i = 0; i < n; i += len) {
-            cf w(1.f, 0.f);
-            for (int k = 0; k < len / 2; ++k) {
-                const cf u = a[(size_t)(i + k)];
-                const cf v = a[(size_t)(i + k + len / 2)] * w;
-                a[(size_t)(i + k)] = u + v;
-                a[(size_t)(i + k + len / 2)] = u - v;
-                w *= wlen;
+            for (int k = 0; k < half; ++k) {
+                const int t = k * step;
+                const float wr = twr[t];
+                const float wi = inverse ? -twi[t] : twi[t];
+                const int ia = i + k, ib = ia + half;
+                const float xr = a[2 * ib], xi = a[2 * ib + 1];
+                const float tr = wr * xr - wi * xi;
+                const float ti = wr * xi + wi * xr;
+                const float ur = a[2 * ia], ui = a[2 * ia + 1];
+                a[2 * ib] = ur - tr; a[2 * ib + 1] = ui - ti;
+                a[2 * ia] = ur + tr; a[2 * ia + 1] = ui + ti;
             }
         }
     }
 }
 
-// Row-major N x N complex 2D FFT: transform rows, then columns.
-void fft2d(std::vector<cf>& d, int N, bool inverse) {
-    std::vector<cf> line((size_t)N);
-    for (int y = 0; y < N; ++y) {
-        for (int x = 0; x < N; ++x) line[(size_t)x] = d[(size_t)y * N + x];
-        fft1d(line, inverse);
-        for (int x = 0; x < N; ++x) d[(size_t)y * N + x] = line[(size_t)x];
-    }
-    for (int x = 0; x < N; ++x) {
-        for (int y = 0; y < N; ++y) line[(size_t)y] = d[(size_t)y * N + x];
-        fft1d(line, inverse);
-        for (int y = 0; y < N; ++y) d[(size_t)y * N + x] = line[(size_t)y];
-    }
+static void transpose_sq(cf* d, int N) {
+    for (int y = 0; y < N; ++y)
+        for (int x = y + 1; x < N; ++x)
+            std::swap(d[(size_t)y * N + x], d[(size_t)x * N + y]);
 }
 
+// Row-major N x N complex 2D FFT. Columns are done by transpose + row FFT +
+// transpose so every 1D pass runs over contiguous memory (the strided column
+// access was the other half of the old cost).
+void fft2d(std::vector<cf>& d, int N, bool inverse) {
+    const FftPlan& pl = fft_plan(N);
+    cf* p = d.data();
+    for (int y = 0; y < N; ++y) fft1d(p + (size_t)y * N, N, pl, inverse);
+    transpose_sq(p, N);
+    for (int y = 0; y < N; ++y) fft1d(p + (size_t)y * N, N, pl, inverse);
+    transpose_sq(p, N);
+}
+
+// Bilinear sample of a th x tw scratch buffer (the resized moving grey), used
+// by the rotation warp. OOB -> 0.
 float sample_bilinear(const std::vector<float>& img, int h, int w, float y, float x) {
     if (!(y >= 0.f && y <= (float)(h - 1) && x >= 0.f && x <= (float)(w - 1)))
         return 0.f;
@@ -72,14 +125,26 @@ float sample_bilinear(const std::vector<float>& img, int h, int w, float y, floa
     return top + (bot - top) * fy;
 }
 
+// Bilinear sample straight from the single-channel Image, clamp-to-edge. Avoids
+// first copying the whole full-res grey into a vector (that copy was ~48MB and
+// the dominant serial cost / a transient RAM spike, for the sake of sampling a
+// few thousand downscaled points).
+static inline float sample_img(const Image& g, float y, float x) {
+    if (!(y >= 0.f && y <= (float)(g.h - 1) && x >= 0.f && x <= (float)(g.w - 1)))
+        return 0.f;
+    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+    const int x1 = std::min(x0 + 1, g.w - 1), y1 = std::min(y0 + 1, g.h - 1);
+    const float fx = x - (float)x0, fy = y - (float)y0;
+    const float a = g.at(y0, x0), b = g.at(y0, x1);
+    const float c = g.at(y1, x0), e = g.at(y1, x1);
+    const float top = a + (b - a) * fx;
+    const float bot = c + (e - c) * fx;
+    return top + (bot - top) * fy;
+}
+
 // Isotropic bilinear downscale of a grey Image to th x tw, then a small
 // separable Gaussian blur (ISA's DeBayerBWGaussWB blurs the tracking grey).
 std::vector<float> resize_blur(const Image& g, int th, int tw) {
-    std::vector<float> src((size_t)g.h * g.w);
-    for (int y = 0; y < g.h; ++y)
-        for (int x = 0; x < g.w; ++x)
-            src[(size_t)y * g.w + x] = g.at(y, x);
-
     std::vector<float> out((size_t)th * tw, 0.f);
     const float sx = (float)g.w / (float)tw;
     const float sy = (float)g.h / (float)th;
@@ -87,7 +152,7 @@ std::vector<float> resize_blur(const Image& g, int th, int tw) {
         const float ry = ((float)y + 0.5f) * sy - 0.5f;
         for (int x = 0; x < tw; ++x) {
             const float rx = ((float)x + 0.5f) * sx - 0.5f;
-            out[(size_t)y * tw + x] = sample_bilinear(src, g.h, g.w, ry, rx);
+            out[(size_t)y * tw + x] = sample_img(g, ry, rx);
         }
     }
 
@@ -152,71 +217,106 @@ bool estimate_isa_prealign(const Image& ref_grey, const Image& comp_grey,
     if (ref_grey.h != comp_grey.h || ref_grey.w != comp_grey.w) return false;
 
     const int cap = std::max(64, std::min(2048, cfg.isa_prealign_fft_max_dim));
-    const int longer = std::max(ref_grey.h, ref_grey.w);
-    const float factor = (longer > cap) ? (float)longer / (float)cap : 1.f;
-    const int th = std::max(8, (int)std::lround((double)ref_grey.h / factor));
-    const int tw = std::max(8, (int)std::lround((double)ref_grey.w / factor));
-    // Zero-pad to ~2x the content so the cross-correlation is LINEAR, not
-    // circular: the content sits in the top-left quadrant and the surrounding
-    // zeros let a shift up to ~max(th,tw) thumbnail px (= that x factor raw px)
-    // resolve without wrapping/aliasing into the image. Without this the long
-    // axis has little or no padding and large translations fold back on
-    // themselves, which is the main reason big camera pans were not pre-aligned.
-    const int N = next_pow2(2 * std::max(th, tw));
-    if (N < 8) return false;
-
-    const std::vector<float> refR = resize_blur(ref_grey, th, tw);
-    const std::vector<float> movR = resize_blur(comp_grey, th, tw);
-
-    // Reference spectrum, conjugated once (cross power spectrum is conj(ref)*mov).
-    std::vector<cf> refC((size_t)N * N, cf(0.f, 0.f));
-    for (int y = 0; y < th; ++y)
-        for (int x = 0; x < tw; ++x)
-            refC[(size_t)y * N + x] = cf(refR[(size_t)y * tw + x], 0.f);
-    fft2d(refC, N, /*inverse=*/false);
-    for (auto& v : refC) v = std::conj(v);
-
     const double deg2rad = kPi / 180.0;
     const float incr = (float)(std::max(0.01f, cfg.isa_prealign_rot_incr_deg) * deg2rad);
     const float range = (float)(std::max(0.f, cfg.isa_prealign_rot_range_deg) * deg2rad);
 
-    std::vector<cf> movC((size_t)N * N);
-    float best_val = -std::numeric_limits<float>::infinity();
-    float best_ang = 0.f;
-    int best_px = 0, best_py = 0;
-
-    auto scan_angle = [&](float ang) {
-        rotate_into_padded(movR, th, tw, ang, N, movC);
-        fft2d(movC, N, /*inverse=*/false);
-        for (size_t i = 0; i < movC.size(); ++i) movC[i] = refC[i] * movC[i];
-        fft2d(movC, N, /*inverse=*/true);
-        // Peak of the real part (1/N^2 scaling is a positive constant -> omit).
-        float vmax = -std::numeric_limits<float>::infinity();
-        int px = 0, py = 0;
-        for (int y = 0; y < N; ++y)
-            for (int x = 0; x < N; ++x) {
-                const float v = movC[(size_t)y * N + x].real();
-                if (v > vmax) { vmax = v; px = x; py = y; }
-            }
-        if (vmax > best_val) { best_val = vmax; best_ang = ang; best_px = px; best_py = py; }
+    // One resolution's worth of state: the resized moving grey, the conjugated
+    // reference spectrum (conj(ref) for the cross power spectrum), and the pad
+    // geometry. Zero-padding to ~2x the content (N) makes the cross-correlation
+    // LINEAR, so large shifts resolve without wrapping into the image -- the key
+    // to pre-aligning big camera pans.
+    struct Res {
+        std::vector<cf> refC;
+        std::vector<float> movR;
+        int th = 0, tw = 0, N = 0;
+        float factor = 1.f;
+    };
+    auto build_res = [&](int rcap) -> Res {
+        Res r;
+        const int longer = std::max(ref_grey.h, ref_grey.w);
+        r.factor = (longer > rcap) ? (float)longer / (float)rcap : 1.f;
+        r.th = std::max(8, (int)std::lround((double)ref_grey.h / r.factor));
+        r.tw = std::max(8, (int)std::lround((double)ref_grey.w / r.factor));
+        r.N = next_pow2(2 * std::max(r.th, r.tw));
+        const std::vector<float> refR = resize_blur(ref_grey, r.th, r.tw);
+        r.movR = resize_blur(comp_grey, r.th, r.tw);
+        r.refC.assign((size_t)r.N * r.N, cf(0.f, 0.f));
+        for (int y = 0; y < r.th; ++y)
+            for (int x = 0; x < r.tw; ++x)
+                r.refC[(size_t)y * r.N + x] = cf(refR[(size_t)y * r.tw + x], 0.f);
+        fft2d(r.refC, r.N, /*inverse=*/false);
+        for (auto& v : r.refC) v = std::conj(v);
+        return r;
     };
 
-    // Coarse pass: step 5*incr over +/-range, centred on 0 (no gyro seed).
-    if (range <= 1e-6f) {
-        scan_angle(0.f);
-    } else {
-        const float coarse_step = 5.f * incr;
+    // Score candidate angles against a resolution. Each angle is an independent
+    // rotate -> FFT -> conj-mul -> iFFT -> peak, run in parallel across
+    // cfg.num_threads into per-angle slots (no contention); the winner is picked
+    // serially (deterministic, tie -> lowest index). Each thread owns one N*N
+    // scratch buffer, so peak scratch is num_threads * N^2 complex -- this runs
+    // during analysis, below the merge memory peak, so it does not raise the
+    // app's ceiling.
+    auto scan = [&](const Res& r, const std::vector<float>& angs,
+                    float& best_val, float& best_ang, int& best_px, int& best_py) {
+        const int na = (int)angs.size();
+        std::vector<float> vals((size_t)na, -std::numeric_limits<float>::infinity());
+        std::vector<int> pxs((size_t)na, 0), pys((size_t)na, 0);
+        parallel_rows(na, cfg.num_threads, [&](int i) {
+            std::vector<cf> movC((size_t)r.N * r.N);
+            rotate_into_padded(r.movR, r.th, r.tw, angs[(size_t)i], r.N, movC);
+            fft2d(movC, r.N, /*inverse=*/false);
+            for (size_t k = 0; k < movC.size(); ++k) movC[k] = r.refC[k] * movC[k];
+            fft2d(movC, r.N, /*inverse=*/true);
+            float vmax = -std::numeric_limits<float>::infinity();
+            int px = 0, py = 0;
+            for (int y = 0; y < r.N; ++y)
+                for (int x = 0; x < r.N; ++x) {
+                    const float v = movC[(size_t)y * r.N + x].real();
+                    if (v > vmax) { vmax = v; px = x; py = y; }
+                }
+            vals[(size_t)i] = vmax; pxs[(size_t)i] = px; pys[(size_t)i] = py;
+        });
+        for (int i = 0; i < na; ++i)
+            if (vals[(size_t)i] > best_val) {
+                best_val = vals[(size_t)i]; best_ang = angs[(size_t)i];
+                best_px = pxs[(size_t)i]; best_py = pys[(size_t)i];
+            }
+    };
+
+    const float coarse_step = 5.f * incr;
+
+    // Coarse-to-fine in RESOLUTION. The coarse pass only has to localise the
+    // angle to within one coarse step; it does not need full resolution, so it
+    // runs on a quarter-area thumbnail (cap/2 -> ~4x fewer FFT points per angle)
+    // over the whole +/-range. Only the short fine pass (+/- one coarse step,
+    // ~11 angles) runs at full resolution -- the resolution the result was
+    // tuned at -- so quality is preserved while the many coarse angles get cheap.
+    float best_ang = 0.f;
+    if (range > 1e-6f) {
+        std::vector<float> coarse;
         for (float a = -range; a <= range + 0.5f * coarse_step; a += coarse_step)
-            scan_angle(a);
-    }
-    // Fine pass: step incr over +/-10*incr around the coarse best.
-    {
-        const float zero = best_ang;
-        const float fine_range = 10.f * incr;
-        for (float a = zero - fine_range; a <= zero + fine_range + 0.5f * incr; a += incr)
-            scan_angle(a);
+            coarse.push_back(a);
+        const Res rc = build_res(std::max(64, cap / 2));
+        float cval = -std::numeric_limits<float>::infinity();
+        int cpx = 0, cpy = 0;
+        scan(rc, coarse, cval, best_ang, cpx, cpy);
+        if (!std::isfinite(cval)) return false;
     }
 
+    // Fine pass at full resolution around the coarse best.
+    const Res rf = build_res(cap);
+    std::vector<float> fine;
+    if (range <= 1e-6f) {
+        fine.push_back(0.f);
+    } else {
+        for (float a = best_ang - coarse_step; a <= best_ang + coarse_step + 0.5f * incr; a += incr)
+            fine.push_back(a);
+    }
+    float best_val = -std::numeric_limits<float>::infinity();
+    float fine_ang = 0.f;
+    int best_px = 0, best_py = 0;
+    scan(rf, fine, best_val, fine_ang, best_px, best_py);
     if (!std::isfinite(best_val)) return false;
 
     // Wrap the circular-correlation peak into a signed shift (subtract the
@@ -227,15 +327,15 @@ bool estimate_isa_prealign(const Image& ref_grey, const Image& comp_grey,
     // ref->comp warp here rather than ISA's comp->ref). Verified by the
     // synthetic-recovery test in tools/.
     int px = best_px, py = best_py;
-    if (px > N / 2) px -= N;
-    if (py > N / 2) py -= N;
+    if (px > rf.N / 2) px -= rf.N;
+    if (py > rf.N / 2) py -= rf.N;
 
-    out_dx = (float)px * factor;
-    out_dy = (float)py * factor;
-    // scan_angle rotates COMP to match ref, so the angle that aligns comp is the
+    out_dx = (float)px * rf.factor;
+    out_dy = (float)py * rf.factor;
+    // scan rotates COMP to match ref, so the angle that aligns comp is the
     // negative of the port's `a` (which rotates ref-space into comp-space in
     // make_global_initial_flow). Verified by the synthetic-recovery test.
-    out_rot_rad = -best_ang;
+    out_rot_rad = -fine_ang;
     return true;
 }
 
