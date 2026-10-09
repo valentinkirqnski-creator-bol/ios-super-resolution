@@ -154,14 +154,21 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // guide-resolution path, so the flag can say "raw" while the mask
             // handed to us is guide. Trusting the flag there would sample R
             // at half the correct position everywhere.
-            // IPOL main accumulate(): R fetched NEAREST, implicitly nearest-
-            // upsampled. bayer -> i_r = min(int(lr//2 - 0.5), H/2-1); grey ->
-            // i_r = min(int(lr), H-1). (max(.,0) guards the negative edge.)
+            // R fetched NEAREST, implicitly nearest-upsampled. The guide grid
+            // maps a raw coord lr to grey coord lr/2 - 0.5 (same mapping the
+            // covariance uses, below), so the nearest guide pixel is
+            // round(lr/2 - 0.5) = floor(lr/2). IPOL main writes this as
+            // int(lr//2 - 0.5), which floor-divides BEFORE the -0.5 and then
+            // truncates, landing one guide pixel toward the origin (~2 raw px)
+            // for all but the first guide row/col -- an off-by-one that
+            // misregisters the mask from the data/kernels. Fixed here to
+            // floor(lr/2); a deliberate divergence from main. Grey path (raw-res
+            // / non-bayer): i_r = min(int(lr), H-1). (max(.,0) guards the edge.)
             const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
             f32 local_r;
             if (!rob_is_raw && cfg.bayer_mode) {
-                int i_r = std::min((int)(std::floor(lr_y * 0.5f) - 0.5f), robustness.h - 1);
-                int j_r = std::min((int)(std::floor(lr_x * 0.5f) - 0.5f), robustness.w - 1);
+                int i_r = std::min((int)std::floor(lr_y * 0.5f), robustness.h - 1);
+                int j_r = std::min((int)std::floor(lr_x * 0.5f), robustness.w - 1);
                 i_r = std::max(i_r, 0); j_r = std::max(j_r, 0);
                 local_r = robustness.at(i_r, j_r);
             } else {

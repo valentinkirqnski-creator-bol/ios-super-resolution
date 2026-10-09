@@ -1143,14 +1143,19 @@ static inline void merge_comp_contrib(device const float* img,
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
     // (merge.cpp) for the mirrored fix.
-    // IPOL main accumulate(): R fetched NEAREST (implicit nearest-upsample).
-    // bayer -> i_r = min(int(lr//2 - 0.5), rob_h-1); raw-res/grey -> int(lr).
+    // R fetched NEAREST (implicit nearest-upsample). Guide grid maps raw coord
+    // lr to grey coord lr/2 - 0.5, so the nearest guide pixel is
+    // round(lr/2 - 0.5) = floor(lr/2). IPOL main writes int(lr//2 - 0.5), which
+    // floor-divides before the -0.5 then truncates, landing one guide pixel
+    // toward the origin (~2 raw px) -- an off-by-one vs the data/kernels. Fixed
+    // to floor(lr/2) (deliberate divergence from main); raw-res/grey -> int(lr).
+    // CPU twin: accumulate_comp in merge.cpp.
     float local_r;
     {
         int iy, ix;
         if (p.raw_res_robustness == 0u && p.bayer != 0u) {
-            iy = min(int(floor(lr_y * 0.5f) - 0.5f), int(p.rob_h) - 1);
-            ix = min(int(floor(lr_x * 0.5f) - 0.5f), int(p.rob_w) - 1);
+            iy = min(int(floor(lr_y * 0.5f)), int(p.rob_h) - 1);
+            ix = min(int(floor(lr_x * 0.5f)), int(p.rob_w) - 1);
         } else {
             iy = min(int(lr_y), int(p.rob_h) - 1);
             ix = min(int(lr_x), int(p.rob_w) - 1);
