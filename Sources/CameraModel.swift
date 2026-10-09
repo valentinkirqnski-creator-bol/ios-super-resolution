@@ -306,6 +306,25 @@ struct TuningParams: Equatable, Codable {
     /// the test's bluntness, though: it falsely rejects about 2.2% of correctly
     /// aligned pixels, most of them on thin lines and strong edges.
     var sr_gate_geom_reject_enabled: Bool = false
+
+    /// Use the larger artifact-predicting network in place of the small mask.
+    ///
+    /// It does not grade each pixel directly. It estimates how much damage
+    /// merging a frame there would do, measured against that area's own noise,
+    /// and `sr_gate_tau` then decides how much damage is acceptable. Training it
+    /// that way means the tolerance is a setting rather than something frozen
+    /// into the network, so this slider changes behaviour with no retraining.
+    ///
+    /// 29,813 values against 1,761, and it sees the warped frame itself rather
+    /// than summary numbers about it, so it can recognise the signature a
+    /// fraction-of-a-pixel shift leaves at an edge. Slower per shot.
+    var sr_gate_unet_enabled: Bool = false
+
+    /// How much artifact to tolerate, in multiples of the local noise.
+    /// Lower rejects more. 0.25 left no visible artifact at all on the test
+    /// bursts; 1.0 is where it was scored.
+    var sr_gate_tau: Float = 1.0
+    var sr_gate_beta: Float = 0.5
     /// Learned REFINEMENT of the analytic mask -- a different network with the
     /// opposite relationship to it from use_neural_robustness above. That one
     /// replaces Wronski Eq. 5-9; this one keeps it authoritative and may only
@@ -428,6 +447,7 @@ struct TuningParams: Equatable, Codable {
         case edge_misalign_shift_z, edge_misalign_min_conf
         case kernel_selection_linear
         case use_neural_robustness, sr_gate_enabled, sr_gate_geom_reject_enabled
+        case sr_gate_unet_enabled, sr_gate_tau, sr_gate_beta
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
@@ -529,6 +549,9 @@ struct TuningParams: Equatable, Codable {
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         sr_gate_enabled = try c.decodeIfPresent(Bool.self, forKey: .sr_gate_enabled) ?? sr_gate_enabled
         sr_gate_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .sr_gate_geom_reject_enabled) ?? sr_gate_geom_reject_enabled
+        sr_gate_unet_enabled = try c.decodeIfPresent(Bool.self, forKey: .sr_gate_unet_enabled) ?? sr_gate_unet_enabled
+        sr_gate_tau = try c.decodeIfPresent(Float.self, forKey: .sr_gate_tau) ?? sr_gate_tau
+        sr_gate_beta = try c.decodeIfPresent(Float.self, forKey: .sr_gate_beta) ?? sr_gate_beta
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
@@ -2314,6 +2337,9 @@ final class CameraModel: NSObject, ObservableObject {
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "sr_gate_enabled": NSNumber(value: tuningParams.sr_gate_enabled),
             "sr_gate_geom_reject_enabled": NSNumber(value: tuningParams.sr_gate_geom_reject_enabled),
+            "sr_gate_unet_enabled": NSNumber(value: tuningParams.sr_gate_unet_enabled),
+            "sr_gate_tau": NSNumber(value: tuningParams.sr_gate_tau),
+            "sr_gate_beta": NSNumber(value: tuningParams.sr_gate_beta),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),

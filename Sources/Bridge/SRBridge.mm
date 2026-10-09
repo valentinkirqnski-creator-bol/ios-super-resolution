@@ -576,6 +576,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.sr_gate_enabled = tuning[@"sr_gate_enabled"].boolValue;
     if (tuning[@"sr_gate_geom_reject_enabled"])
         cfg.sr_gate_geom_reject_enabled = tuning[@"sr_gate_geom_reject_enabled"].boolValue;
+    if (tuning[@"sr_gate_unet_enabled"])
+        cfg.sr_gate_unet_enabled = tuning[@"sr_gate_unet_enabled"].boolValue;
+    if (tuning[@"sr_gate_tau"])
+        cfg.sr_gate_tau = tuning[@"sr_gate_tau"].floatValue;
+    if (tuning[@"sr_gate_beta"])
+        cfg.sr_gate_beta = tuning[@"sr_gate_beta"].floatValue;
     if (tuning[@"robustness_refine_nn_enabled"])
         cfg.robustness_refine_nn_enabled = tuning[@"robustness_refine_nn_enabled"].boolValue;
     if (tuning[@"robustness_refine_max_reduction"])

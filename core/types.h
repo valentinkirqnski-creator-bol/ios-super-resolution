@@ -828,6 +828,25 @@ struct Config {
     // doing the same job at 0.4%. The threshold below is the knob for that.
     bool sr_gate_geom_reject_enabled = false;
 
+    // The artifact-predicting U-Net, in place of the small gate
+    // (core/sr_gate_unet.cpp). 29813 parameters against 1761, 20 input channels
+    // against 8, and a 36-pixel receptive field against 13.
+    //
+    // It predicts the ARTIFACT a merge would introduce rather than the mask, so
+    // the accept/reject tolerance is sr_gate_tau below and not something baked
+    // into the weights. Needs sr_gate_enabled on: it reuses that path's domain
+    // check and feature builder.
+    bool sr_gate_unet_enabled = false;
+
+    // Tolerated artifact, in units of the local noise sigma. The whole policy.
+    // Lower rejects more: 0.25 was measured to leave NO visible artifact on the
+    // held-out set, 1.0 is the point the network was scored at. This is the knob
+    // to turn against real photographs -- it needs no retraining, because the
+    // network's output does not depend on it.
+    float sr_gate_tau = 1.0f;
+    // Softness of the decision around tau, in the same units.
+    float sr_gate_beta = 0.5f;
+
     // Handheld-Multi-Frame-Super-Resolution-1.4 parity: build the robustness
     // GUIDE as sqrt(raw) (a variance-stabilizing transform) instead of the
     // linear channel average, exactly as 1.4's cuda_compute_guide_image does.

@@ -1095,6 +1095,25 @@ struct CameraView: View {
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
+            Toggle("Artifact Network (experimental)", isOn: $cam.tuningParams.sr_gate_unet_enabled)
+                .disabled(!cam.tuningParams.sr_gate_enabled)
+            if cam.tuningParams.sr_gate_unet_enabled {
+                HStack {
+                    Text("Tolerance")
+                    Slider(value: $cam.tuningParams.sr_gate_tau, in: 0.1...3.0, step: 0.05)
+                    Text(String(format: "%.2f", cam.tuningParams.sr_gate_tau))
+                        .monospacedDigit().frame(width: 46, alignment: .trailing)
+                }
+            }
+            Text("""
+                 A bigger network that estimates how much damage merging each frame would do to each part of the picture, instead of scoring it directly. Tolerance then sets how much damage is allowed through, measured against that area's own noise: lower throws away more.
+
+                 It sees the aligned frame itself rather than summary numbers about it, so it can recognise the trace a fraction-of-a-pixel shift leaves at an edge. On test bursts it let through about a third as many visible errors as the fixed formula at the same level of detail, and none at all at a tolerance of 0.25.
+
+                 Experimental, and slower per shot. On real photos it tends to reject whole textured areas rather than just the damaged parts, so check detailed subjects like foliage before keeping it on.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
             Toggle("Reject Rotation & Parallax", isOn: $cam.tuningParams.sr_gate_geom_reject_enabled)
                 .disabled(!cam.tuningParams.sr_gate_enabled)
             if !cam.tuningParams.sr_gate_enabled {

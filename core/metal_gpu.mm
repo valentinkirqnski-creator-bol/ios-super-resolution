@@ -1773,6 +1773,224 @@ static id<MTLBuffer> srg_weights() {
 // curve_n is passed in rather than read from g_rob_curve_n: that global is
 // declared several hundred lines below this helper, and depending on where the
 // helper happens to sit in the file is how this failed to compile the first time.
+// ---- the artifact U-Net (Config::sr_gate_unet_enabled) ------------------
+//
+// GPU twin of core/sr_gate_unet.cpp. Five kernels per band:
+//   sr_gate_features    channels 0..7   (shared with the small gate)
+//   srgu_image_features channels 8..19
+//   srgu_conv x6        e1 e2 | d1 b1 b2 | u1
+//   srgu_pool, srgu_up_concat
+//   srgu_head           linear + policy -> R
+//
+// Each band carries SRGU_HALO rows of context either side and emits only its
+// centre, so the skip tensor stays inside the band and no kernel needs a
+// neighbour's output.
+
+// Keep in lockstep with the structs of the same names in HHSRKernels.metal.
+struct SrGUConvParamsCPU {
+    uint32_t w = 0, src_rows = 0;
+    int32_t src_y0 = 0, dst_y0 = 0;
+    uint32_t dst_rows = 0, in_ch = 0, out_ch = 0, dil = 1;
+    uint32_t w_off = 0, b_off = 0, relu = 1;
+};
+struct SrGUPoolParamsCPU { uint32_t w = 0, ph = 0, pw = 0, src_rows = 0, ch = 0; };
+struct SrGUUpParamsCPU { uint32_t w = 0, bh = 0, ph = 0, pw = 0, mid = 0, base = 0; };
+struct SrGUHeadParamsCPU {
+    uint32_t w = 0, dst_rows = 0;
+    int32_t dst_y0 = 0;
+    uint32_t base = 0, w_off = 0, b_off = 0;
+    float tau = 1.f, beta = 0.5f;
+};
+
+static id<MTLBuffer> g_srgu_w = nil;
+static id<MTLBuffer> srgu_weights() {
+    if (g_srgu_w) return g_srgu_w;
+    int n = 0;
+    const f32* w = sr_gate_unet_weights(&n);
+    if (!w || n != SRGU_WEIGHTS_N) return nil;
+    g_srgu_w = buf(w, (size_t)n * sizeof(f32));
+    return g_srgu_w;
+}
+
+static id<MTLBuffer> g_srgu_feat = nil, g_srgu_a = nil, g_srgu_b = nil;
+static id<MTLBuffer> g_srgu_m1 = nil, g_srgu_m2 = nil, g_srgu_cat = nil;
+static size_t g_srgu_feat_b = 0, g_srgu_a_b = 0, g_srgu_b_b = 0;
+static size_t g_srgu_m1_b = 0, g_srgu_m2_b = 0, g_srgu_cat_b = 0;
+
+static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
+                                 id<MTLBuffer> b_gmeans, id<MTLBuffer> b_ref_m,
+                                 id<MTLBuffer> b_ref_v, id<MTLBuffer> b_std,
+                                 id<MTLBuffer> b_diff, id<MTLBuffer> b_flow,
+                                 int gh, int gw, int nch, int tile_size,
+                                 size_t curve_n, const FlowField& flow,
+                                 const Config& cfg, id<MTLCommandBuffer> cmd) {
+    auto& c = ctx();
+    id<MTLComputePipelineState> p_feat = c.pipe("sr_gate_features");
+    id<MTLComputePipelineState> p_img = c.pipe("srgu_image_features");
+    id<MTLComputePipelineState> p_conv = c.pipe("srgu_conv");
+    id<MTLComputePipelineState> p_pool = c.pipe("srgu_pool");
+    id<MTLComputePipelineState> p_up = c.pipe("srgu_up_concat");
+    id<MTLComputePipelineState> p_head = c.pipe("srgu_head");
+    id<MTLBuffer> b_w = srgu_weights();
+    if (!p_feat || !p_img || !p_conv || !p_pool || !p_up || !p_head || !b_w)
+        return false;
+    if (gh <= 0 || gw <= 0 || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0 ||
+        curve_n == 0 || nch != 3)
+        return false;
+
+    // Same band and halo as the CPU reference, so the two agree row for row.
+    const int band = 128;
+    const int halo = ((SRGU_HALO + 1) / 2) * 2;
+    const int maxbh = band + 2 * halo;
+    const int pw = (gw + 1) / 2, maxph = (maxbh + 1) / 2;
+    const size_t featb = (size_t)maxbh * gw * SRGU_IN * sizeof(float);
+    const size_t baseb = (size_t)maxbh * gw * SRGU_BASE * sizeof(float);
+    const size_t midb = (size_t)maxph * pw * SRGU_MID * sizeof(float);
+    const size_t poolb = (size_t)maxph * pw * SRGU_BASE * sizeof(float);
+    const size_t catb = (size_t)maxbh * gw * (SRGU_MID + SRGU_BASE) * sizeof(float);
+    id<MTLBuffer> b_feat = srg_grow(g_srgu_feat, g_srgu_feat_b, featb);
+    id<MTLBuffer> b_e = srg_grow(g_srgu_a, g_srgu_a_b, baseb);
+    id<MTLBuffer> b_s = srg_grow(g_srgu_b, g_srgu_b_b, baseb);
+    id<MTLBuffer> b_p = srg_grow(g_srgu_m1, g_srgu_m1_b, poolb > midb ? poolb : midb);
+    id<MTLBuffer> b_m = srg_grow(g_srgu_m2, g_srgu_m2_b, midb);
+    id<MTLBuffer> b_cat = srg_grow(g_srgu_cat, g_srgu_cat_b, catb);
+    if (!b_feat || !b_e || !b_s || !b_p || !b_m || !b_cat) return false;
+
+    SrGateFeatParamsCPU fp{};
+    fp.h = (uint32_t)gh;
+    fp.w = (uint32_t)gw;
+    fp.nch = (uint32_t)nch;
+    fp.tile_size = (uint32_t)tile_size;
+    fp.flow_ny = (uint32_t)flow.ny;
+    fp.flow_nx = (uint32_t)flow.nx;
+    fp.curve_n = (uint32_t)curve_n;
+    fp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u;
+    fp.alpha_rob = cfg.noise_alpha_robustness();
+    fp.beta_rob = cfg.noise_beta_robustness();
+
+    auto conv = [&](id<MTLBuffer> dst, id<MTLBuffer> src,
+                    const SrGUConvParamsCPU& cp) -> bool {
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:dst offset:0 atIndex:0];
+        [e setBuffer:src offset:0 atIndex:1];
+        [e setBuffer:b_w offset:0 atIndex:2];
+        [e setBytes:&cp length:sizeof(cp) atIndex:3];
+        dispatch2(e, p_conv, (NSUInteger)cp.w, (NSUInteger)cp.dst_rows);
+        [e endEncoding];
+        return true;
+    };
+
+    for (int y0 = 0; y0 < gh; y0 += band) {
+        const int y1 = std::min(y0 + band, gh);
+        const int by0 = std::max(0, y0 - halo);
+        const int by1 = std::min(gh, y1 + halo);
+        const int bh = by1 - by0;
+        const int ph = (bh + 1) / 2;
+
+        // 8 statistics, then the 12 image channels, into one 20-channel buffer.
+        // The feature kernel writes SRG_FEATURES-strided; the U-Net needs
+        // SRGU_IN, so sr_gate_features is given the wider stride through its
+        // own band params and srgu_image_features fills the tail.
+        fp.dst_y0 = by0;
+        fp.dst_rows = (uint32_t)bh;
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_feat offset:0 atIndex:0];
+        [e setBuffer:b_gmeans offset:0 atIndex:1];
+        [e setBuffer:b_ref_m offset:0 atIndex:2];
+        [e setBuffer:b_ref_v offset:0 atIndex:3];
+        [e setBuffer:b_std offset:0 atIndex:4];
+        [e setBuffer:b_diff offset:0 atIndex:5];
+        [e setBuffer:b_flow offset:0 atIndex:6];
+        [e setBytes:&fp length:sizeof(fp) atIndex:7];
+        dispatch2(e, p_feat, (NSUInteger)gw, (NSUInteger)bh);
+        [e endEncoding];
+
+        e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_feat offset:0 atIndex:0];
+        [e setBuffer:b_gmeans offset:0 atIndex:1];
+        [e setBuffer:b_ref_m offset:0 atIndex:2];
+        [e setBuffer:b_flow offset:0 atIndex:3];
+        [e setBytes:&fp length:sizeof(fp) atIndex:4];
+        dispatch2(e, p_img, (NSUInteger)gw, (NSUInteger)bh);
+        [e endEncoding];
+
+        SrGUConvParamsCPU cp{};
+        cp.w = (uint32_t)gw;
+        cp.src_rows = (uint32_t)bh;
+        cp.src_y0 = by0;
+        cp.dst_y0 = by0;
+        cp.dst_rows = (uint32_t)bh;
+        cp.in_ch = SRGU_IN; cp.out_ch = SRGU_BASE; cp.dil = 1;
+        cp.w_off = SRGU_OFF_E1W; cp.b_off = SRGU_OFF_E1B; cp.relu = 1;
+        if (!conv(b_e, b_feat, cp)) return false;
+        cp.in_ch = SRGU_BASE;
+        cp.w_off = SRGU_OFF_E2W; cp.b_off = SRGU_OFF_E2B;
+        if (!conv(b_s, b_e, cp)) return false;      // b_s is the skip
+
+        SrGUPoolParamsCPU pp{};
+        pp.w = (uint32_t)gw; pp.ph = (uint32_t)ph; pp.pw = (uint32_t)pw;
+        pp.src_rows = (uint32_t)bh; pp.ch = SRGU_BASE;
+        e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_p offset:0 atIndex:0];
+        [e setBuffer:b_s offset:0 atIndex:1];
+        [e setBytes:&pp length:sizeof(pp) atIndex:2];
+        dispatch2(e, p_pool, (NSUInteger)pw, (NSUInteger)ph);
+        [e endEncoding];
+
+        // Half resolution: rows are buffer-relative, so src_y0 and dst_y0 are 0.
+        SrGUConvParamsCPU bp{};
+        bp.w = (uint32_t)pw; bp.src_rows = (uint32_t)ph;
+        bp.src_y0 = 0; bp.dst_y0 = 0; bp.dst_rows = (uint32_t)ph;
+        bp.in_ch = SRGU_BASE; bp.out_ch = SRGU_MID; bp.dil = 1;
+        bp.w_off = SRGU_OFF_D1W; bp.b_off = SRGU_OFF_D1B; bp.relu = 1;
+        if (!conv(b_m, b_p, bp)) return false;
+        bp.in_ch = SRGU_MID; bp.dil = SRGU_DIL0;
+        bp.w_off = SRGU_OFF_B1W; bp.b_off = SRGU_OFF_B1B;
+        if (!conv(b_p, b_m, bp)) return false;
+        bp.dil = SRGU_DIL1;
+        bp.w_off = SRGU_OFF_B2W; bp.b_off = SRGU_OFF_B2B;
+        if (!conv(b_m, b_p, bp)) return false;
+
+        SrGUUpParamsCPU up{};
+        up.w = (uint32_t)gw; up.bh = (uint32_t)bh; up.ph = (uint32_t)ph;
+        up.pw = (uint32_t)pw; up.mid = SRGU_MID; up.base = SRGU_BASE;
+        e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_cat offset:0 atIndex:0];
+        [e setBuffer:b_m offset:0 atIndex:1];
+        [e setBuffer:b_s offset:0 atIndex:2];
+        [e setBytes:&up length:sizeof(up) atIndex:3];
+        dispatch2(e, p_up, (NSUInteger)gw, (NSUInteger)bh);
+        [e endEncoding];
+
+        // Only the rows this band owns leave it.
+        cp.w = (uint32_t)gw;
+        cp.src_rows = (uint32_t)bh; cp.src_y0 = by0;
+        cp.dst_y0 = y0; cp.dst_rows = (uint32_t)(y1 - y0);
+        cp.in_ch = SRGU_MID + SRGU_BASE; cp.out_ch = SRGU_BASE; cp.dil = 1;
+        cp.w_off = SRGU_OFF_U1W; cp.b_off = SRGU_OFF_U1B; cp.relu = 1;
+        if (!conv(b_e, b_cat, cp)) return false;
+
+        SrGUHeadParamsCPU hp{};
+        hp.w = (uint32_t)gw; hp.dst_rows = (uint32_t)(y1 - y0); hp.dst_y0 = y0;
+        hp.base = SRGU_BASE; hp.w_off = SRGU_OFF_HW; hp.b_off = SRGU_OFF_HB;
+        hp.tau = cfg.sr_gate_tau; hp.beta = cfg.sr_gate_beta;
+        e = [cmd computeCommandEncoder];
+        if (!e) return false;
+        [e setBuffer:b_out offset:out_off_bytes atIndex:0];
+        [e setBuffer:b_e offset:0 atIndex:1];
+        [e setBuffer:b_w offset:0 atIndex:2];
+        [e setBytes:&hp length:sizeof(hp) atIndex:3];
+        dispatch2(e, p_head, (NSUInteger)gw, (NSUInteger)hp.dst_rows);
+        [e endEncoding];
+    }
+    return true;
+}
+
 // Keep in lockstep with SrGateGeomParams in HHSRKernels.metal: same fields,
 // same order. A mismatch here is silent on the shader side.
 struct SrGateGeomParamsCPU {
@@ -2905,7 +3123,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     bool sr_gate_done = false;
     // nch == 3: the weights are fitted on the three-channel half-resolution
     // guide. sr_gate_mask in core/sr_gate.cpp says why that is the shipped one.
-    if (cfg.sr_gate_enabled && nch == 3 && sr_gate_available()) {
+    if (cfg.sr_gate_enabled && cfg.sr_gate_unet_enabled && nch == 3 &&
+        sr_gate_unet_available()) {
+        // The larger gate replaces the small one entirely when it is on.
+        sr_gate_done = rob_run_sr_gate_unet(b_out, out_off_bytes, b_gmeans,
+                                            b_ref_m, b_ref_v, b_std, b_diff,
+                                            b_flow, gh, gw, nch, tile_size,
+                                            g_rob_curve_n, flow, cfg, cmd);
+    }
+    if (!sr_gate_done && cfg.sr_gate_enabled && nch == 3 && sr_gate_available()) {
         sr_gate_done = rob_run_sr_gate(b_out, out_off_bytes, b_gmeans, b_ref_m,
                                        b_ref_v, b_std, b_diff, b_flow, gh, gw,
                                        nch, tile_size, g_rob_curve_n, flow, cfg,

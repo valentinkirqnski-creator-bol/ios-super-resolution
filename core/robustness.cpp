@@ -2172,6 +2172,32 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     // differs only in what it does with the result. Everything below (the
     // s1/s2 prior, the r_t offset, the geometry rejection, the edge confidence,
     // the 5x5 minimum) is what it REPLACES, so none of it runs.
+    if (cfg.sr_gate_enabled && cfg.sr_gate_unet_enabled) {
+        // The artifact U-Net, which predicts the damage a merge would do and
+        // turns that into R through Config::sr_gate_tau. It needs the WARPED
+        // comparison guide, hence comp_means here -- the small gate works from
+        // scalar summaries and does not.
+        Image gated = sr_gate_unet_mask_image(ref_stats.means, ref_stats.stds,
+                                              comp_means, d_sq, sigma_sq, flow,
+                                              tile_size, cfg);
+        if (gated.h == h && gated.w == w) {
+            if (cfg.sr_gate_geom_reject_enabled && cfg.motion_geom_reject_enabled) {
+                const Image keep = geom_reject_keep(ref_stats, flow, tile_size,
+                                                    cfg, h, w);
+                if (keep.h == h && keep.w == w) {
+                    for (int y = 0; y < h; ++y)
+                        for (int x = 0; x < w; ++x)
+                            gated.at(y, x) *= keep.at(y, x);
+                }
+            }
+            if (s_select_out) {
+                *s_select_out = Image(h, w, 1);
+                std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
+            }
+            return gated;
+        }
+        // Out of domain or weights missing: fall through to the small gate.
+    }
     if (cfg.sr_gate_enabled) {
         Image gated = sr_gate_mask(ref_stats.means, ref_stats.stds, d_sq,
                                    sigma_sq, flow, tile_size, cfg);

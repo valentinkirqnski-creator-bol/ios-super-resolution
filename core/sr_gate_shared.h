@@ -165,4 +165,94 @@ inline void sr_gate_features_from(SRG_THREAD const struct SrGateInputs* in,
     out[SRG_F_DIR_E] = SRG_CLAMP01(log(1.0f + dproj / nsig) * SRG_DIRE_SCALE);
 }
 
+// ==========================================================================
+// The artifact U-Net (Config::sr_gate_unet_enabled)
+// ==========================================================================
+//
+// A second, larger gate that does NOT emit a mask. It predicts
+// log1p(artifact / noise_sigma) -- how much damage merging this frame at this
+// pixel would do -- and the mask comes afterwards from a policy whose tolerance
+// is Config::sr_gate_tau. The eight statistics above are not enough for that:
+// they summarise the residual and cannot carry its spatial structure, and a
+// displacement across an edge leaves a signed +/- residual pair that |d|
+// reduces to "large d beside a large gradient". So twelve image-domain channels
+// are appended -- the reference guide, the WARPED comparison guide, their
+// signed difference, both luminance gradient magnitudes and their dot product.
+//
+// Appended, never interleaved: channels 0..7 are byte-identical to the small
+// gate's, so both read the same feature builder for that part.
+//
+// Shape constants are emitted by tools/sr_gate/export_unet.py; if they drift
+// from the generated weight blob the static_assert there fails to compile.
+#define SRGU_IN 20
+#define SRGU_IMG 12
+#define SRGU_BASE 16
+#define SRGU_MID 28
+#define SRGU_DIL0 2
+#define SRGU_DIL1 4
+
+// Receptive field, in MASK pixels, by the rf += (k-1)*dilation*jump recursion
+// over e1, e2, pool, d1, b1, b2, (upsample), u1. Rows of context a band needs
+// on each side is half of it, rounded up.
+#define SRGU_RF 36
+#define SRGU_HALO 18
+
+// Flat weight-blob offsets, written out so a mismatch with the generated
+// core/sr_gate_unet_weights.h is a compile-time failure.
+#define SRGU_OFF_E1W 0
+#define SRGU_OFF_E1B (SRGU_OFF_E1W + SRGU_BASE * SRGU_IN * 9)
+#define SRGU_OFF_E2W (SRGU_OFF_E1B + SRGU_BASE)
+#define SRGU_OFF_E2B (SRGU_OFF_E2W + SRGU_BASE * SRGU_BASE * 9)
+#define SRGU_OFF_D1W (SRGU_OFF_E2B + SRGU_BASE)
+#define SRGU_OFF_D1B (SRGU_OFF_D1W + SRGU_MID * SRGU_BASE * 9)
+#define SRGU_OFF_B1W (SRGU_OFF_D1B + SRGU_MID)
+#define SRGU_OFF_B1B (SRGU_OFF_B1W + SRGU_MID * SRGU_MID * 9)
+#define SRGU_OFF_B2W (SRGU_OFF_B1B + SRGU_MID)
+#define SRGU_OFF_B2B (SRGU_OFF_B2W + SRGU_MID * SRGU_MID * 9)
+#define SRGU_OFF_U1W (SRGU_OFF_B2B + SRGU_MID)
+#define SRGU_OFF_U1B (SRGU_OFF_U1W + SRGU_BASE * (SRGU_MID + SRGU_BASE) * 9)
+#define SRGU_OFF_HW  (SRGU_OFF_U1B + SRGU_BASE)
+#define SRGU_OFF_HB  (SRGU_OFF_HW + SRGU_BASE)
+#define SRGU_WEIGHTS_N (SRGU_OFF_HB + 1)
+
+// Per-pixel image-domain inputs. The gradients are plain central differences of
+// the CHANNEL MEAN, deliberately NOT divided by the guide-to-raw scale the way
+// SrGateInputs::gix is -- the network was fitted on the unscaled ones
+// (tools/sr_gate/build.py _lum_grad), and halving them here would feed it
+// inputs it never saw.
+struct SrGateUNetInputs {
+    float ref[3];      // reference guide local means
+    float warp[3];     // comparison guide local means, warped by the flow
+    float rgx, rgy;    // d/dx, d/dy of mean(ref)
+    float wgx, wgy;    // d/dx, d/dy of mean(warp)
+};
+
+// Channels 8..19 of the U-Net's input vector. Order matches
+// tools/sr_gate/build.py image_features exactly.
+inline void sr_gate_unet_image_features(
+        SRG_THREAD const struct SrGateUNetInputs* in, SRG_THREAD float* out) {
+    out[0] = in->ref[0];
+    out[1] = in->ref[1];
+    out[2] = in->ref[2];
+    out[3] = in->warp[0];
+    out[4] = in->warp[1];
+    out[5] = in->warp[2];
+    // Signed, not absolute: the sign pair either side of an edge is the whole
+    // signature of a sub-pixel displacement, and |.| would erase it.
+    out[6] = in->warp[0] - in->ref[0];
+    out[7] = in->warp[1] - in->ref[1];
+    out[8] = in->warp[2] - in->ref[2];
+    out[9] = sqrt(in->rgx * in->rgx + in->rgy * in->rgy);
+    out[10] = sqrt(in->wgx * in->wgx + in->wgy * in->wgy);
+    out[11] = in->rgx * in->wgx + in->rgy * in->wgy;
+}
+
+// log1p(artifact) -> R. tau is the tolerated artifact in noise sigma, beta the
+// softness around it. The ONLY place the accept/reject preference lives; the
+// weights above contain no notion of it.
+inline float sr_gate_unet_mask(float pred_log1p, float tau, float beta) {
+    const float a = exp(SRG_MIN(SRG_MAX(pred_log1p, -8.0f), 8.0f)) - 1.0f;
+    return 1.0f / (1.0f + exp(-(tau - a) / SRG_MAX(beta, 1e-4f)));
+}
+
 #endif  // HHSR_SR_GATE_SHARED_H

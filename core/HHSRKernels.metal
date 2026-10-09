@@ -2417,6 +2417,24 @@ struct SrGateConvParams {
 // guide and the three-channel decimated guide: Eq. 6 already reduces to two
 // scalars, so only the summation, the tile indexing and the guide-to-raw scale
 // differ. Twin of build_sr_gate_features in core/sr_gate.cpp.
+// Bilinear sample, ZERO outside the plane. The sr_gate_features path wants
+// +inf there (no evidence -> reject); the U-Net's image channels want 0, so
+// that an out-of-frame fetch makes the residual equal the reference.
+inline float rob_sample_bilinear_zero(device const float* img, uint h, uint w,
+                                      uint nch, float y, float x, uint ch) {
+    if (!(y >= 0.f && y <= float(int(h) - 1) &&
+          x >= 0.f && x <= float(int(w) - 1))) return 0.f;
+    const int y0 = int(y), x0 = int(x);
+    const int y1 = min(y0 + 1, int(h) - 1);
+    const int x1 = min(x0 + 1, int(w) - 1);
+    const float ty = y - float(y0), tx = x - float(x0);
+    const float a = img[(uint(y0) * w + uint(x0)) * nch + ch] * (1.f - tx)
+                  + img[(uint(y0) * w + uint(x1)) * nch + ch] * tx;
+    const float b = img[(uint(y1) * w + uint(x0)) * nch + ch] * (1.f - tx)
+                  + img[(uint(y1) * w + uint(x1)) * nch + ch] * tx;
+    return a * (1.f - ty) + b * ty;
+}
+
 kernel void sr_gate_features(device float* feat [[buffer(0)]],
                              device const float* comp_means [[buffer(1)]],
                              device const float* ref_means [[buffer(2)]],
@@ -2603,6 +2621,240 @@ kernel void sr_gate_head(device float* R [[buffer(0)]],
     float s = wgt[p.b_off];
     for (uint i = 0u; i < p.in_ch; ++i) s += W0[i] * v[i];
     R[uint(y) * p.w + gid.x] = 1.f / (1.f + exp(-s));
+}
+
+// ==== the artifact U-Net (Config::sr_gate_unet_enabled) ===================
+//
+// GPU twin of core/sr_gate_unet.cpp, which is the golden reference and is
+// checked against PyTorch by tools/sr_gate/unet_parity.py (max 4.8e-07 on real
+// features). The feature compressions and the policy are NOT written here --
+// sr_gate_shared.h holds them and the CPU includes the same text.
+//
+// Banding: the net is fully convolutional with a 36-mask-pixel receptive field,
+// so a band carrying SRGU_HALO rows of context either side runs the whole
+// pool -> bottleneck -> upsample locally and emits only its centre. The skip
+// tensor never leaves the band, which is what keeps this to five kernels
+// instead of a cross-band dependency.
+//
+// Every conv clamps its row index to the BAND, not to the image: inside a band
+// the halo supplies real rows, and at the true image edge the band is already
+// clipped there, so the clamp reproduces the CPU's replicate padding exactly.
+struct SrGUConvParams {
+    uint w;              // width of this level
+    uint src_rows;       // rows held in the source buffer
+    int  src_y0;         // image row at source buffer row 0
+    int  dst_y0;
+    uint dst_rows;
+    uint in_ch, out_ch;
+    uint dil;
+    uint w_off, b_off;
+    uint relu;           // 0 on the head's producer, 1 elsewhere
+};
+
+struct SrGUPoolParams {
+    uint w, ph, pw, src_rows, ch;
+};
+
+struct SrGUUpParams {
+    uint w, bh, ph, pw, mid, base;
+};
+
+struct SrGUHeadParams {
+    uint w, dst_rows;
+    int  dst_y0;
+    uint base, w_off, b_off;
+    float tau, beta;
+};
+
+// 12 image channels appended to the 8 statistics sr_gate_features writes.
+// Runs AFTER it, over the same band, writing at offset SRG_FEATURES of each
+// pixel's 20-float vector.
+kernel void srgu_image_features(device float* feat [[buffer(0)]],
+                                device const float* comp_means [[buffer(1)]],
+                                device const float* ref_means [[buffer(2)]],
+                                device const float* flow [[buffer(3)]],
+                                constant SrGateFeatParams& p [[buffer(4)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.dst_rows) return;
+    const int y = p.dst_y0 + int(gid.y);
+    const int x = int(gid.x);
+    const uint nch = p.nch;
+    const float fsc = (nch == 3u) ? 0.5f : 1.f;
+
+    int ty, tx;
+    if (nch == 1u) {
+        ty = y / int(p.tile_size);
+        tx = x / int(p.tile_size);
+    } else {
+        ty = int((2.f * float(y) + 0.5f) / float(p.tile_size));
+        tx = int((2.f * float(x) + 0.5f) / float(p.tile_size));
+    }
+    ty = clamp(ty, 0, int(p.flow_ny) - 1);
+    tx = clamp(tx, 0, int(p.flow_nx) - 1);
+    const uint fi = (uint(ty) * p.flow_nx + uint(tx)) * 2u;
+    const float fx = flow[fi + 0u] * fsc;
+    const float fy = flow[fi + 1u] * fsc;
+
+    // Bilinear, zero outside -- matching the CPU's samp(). Out of frame
+    // contributes nothing, so the residual against the reference becomes the
+    // reference itself and reads as "very different", which is correct.
+    float warp[3];
+    float refv[3];
+    for (uint c = 0u; c < 3u; ++c) {
+        const uint cc = (nch == 3u) ? c : 0u;
+        refv[c] = ref_means[(uint(y) * p.w + uint(x)) * nch + cc];
+        const float sy = float(y) + fy, sx = float(x) + fx;
+        float v = 0.f;
+        if (sy >= 0.f && sy <= float(int(p.h) - 1) &&
+            sx >= 0.f && sx <= float(int(p.w) - 1)) {
+            const int y0 = int(sy), x0 = int(sx);
+            const int y1 = min(y0 + 1, int(p.h) - 1);
+            const int x1 = min(x0 + 1, int(p.w) - 1);
+            const float tyf = sy - float(y0), txf = sx - float(x0);
+            const float a = comp_means[(uint(y0) * p.w + uint(x0)) * nch + cc] * (1.f - txf)
+                          + comp_means[(uint(y0) * p.w + uint(x1)) * nch + cc] * txf;
+            const float b = comp_means[(uint(y1) * p.w + uint(x0)) * nch + cc] * (1.f - txf)
+                          + comp_means[(uint(y1) * p.w + uint(x1)) * nch + cc] * txf;
+            v = a * (1.f - tyf) + b * tyf;
+        }
+        warp[c] = v;
+    }
+
+    // Channel-mean central differences, interior only, zero on the border --
+    // numpy leaves those rows/columns at zero and the weights were fitted that
+    // way (tools/sr_gate/build.py _lum_grad).
+    const int xl = max(0, x - 1), xr = min(int(p.w) - 1, x + 1);
+    const int yu = max(0, y - 1), yd = min(int(p.h) - 1, y + 1);
+    const bool inx = (x > 0 && x < int(p.w) - 1);
+    const bool iny = (y > 0 && y < int(p.h) - 1);
+
+    float rgx = 0.f, rgy = 0.f, wgx = 0.f, wgy = 0.f;
+    if (inx || iny) {
+        // Local helper expanded by hand; Metal has no nested functions here.
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool is_ref = (pass == 0);
+            float mxl = 0.f, mxr = 0.f, myu = 0.f, myd = 0.f;
+            for (uint c = 0u; c < nch; ++c) {
+                if (is_ref) {
+                    mxl += ref_means[(uint(y) * p.w + uint(xl)) * nch + c];
+                    mxr += ref_means[(uint(y) * p.w + uint(xr)) * nch + c];
+                    myu += ref_means[(uint(yu) * p.w + uint(x)) * nch + c];
+                    myd += ref_means[(uint(yd) * p.w + uint(x)) * nch + c];
+                } else {
+                    mxl += rob_sample_bilinear_zero(comp_means, p.h, p.w, nch,
+                                                    float(y) + fy, float(xl) + fx, c);
+                    mxr += rob_sample_bilinear_zero(comp_means, p.h, p.w, nch,
+                                                    float(y) + fy, float(xr) + fx, c);
+                    myu += rob_sample_bilinear_zero(comp_means, p.h, p.w, nch,
+                                                    float(yu) + fy, float(x) + fx, c);
+                    myd += rob_sample_bilinear_zero(comp_means, p.h, p.w, nch,
+                                                    float(yd) + fy, float(x) + fx, c);
+                }
+            }
+            const float inv = 1.f / float(nch);
+            const float gx = inx ? 0.5f * (mxr - mxl) * inv : 0.f;
+            const float gy = iny ? 0.5f * (myd - myu) * inv : 0.f;
+            if (is_ref) { rgx = gx; rgy = gy; } else { wgx = gx; wgy = gy; }
+        }
+    }
+
+    struct SrGateUNetInputs in;
+    for (uint c = 0u; c < 3u; ++c) { in.ref[c] = refv[c]; in.warp[c] = warp[c]; }
+    in.rgx = rgx; in.rgy = rgy; in.wgx = wgx; in.wgy = wgy;
+    float img[SRGU_IMG];
+    sr_gate_unet_image_features(&in, img);
+    device float* o = feat + (uint(gid.y) * p.w + uint(gid.x)) * SRGU_IN + SRG_FEATURES;
+    for (uint i = 0u; i < uint(SRGU_IMG); ++i) o[i] = img[i];
+}
+
+kernel void srgu_conv(device float* dst [[buffer(0)]],
+                      device const float* src [[buffer(1)]],
+                      device const float* wgt [[buffer(2)]],
+                      constant SrGUConvParams& p [[buffer(3)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.dst_rows) return;
+    const int y = p.dst_y0 + int(gid.y);
+    const int x = int(gid.x);
+    const int dil = int(p.dil);
+    device const float* W0 = wgt + p.w_off;
+    device const float* B0 = wgt + p.b_off;
+
+    float acc[SRGU_MID];
+    for (uint o = 0u; o < p.out_ch; ++o) acc[o] = B0[o];
+    for (int ky = 0; ky < 3; ++ky) {
+        // Clamp to the BAND's span, which is the image's at a true edge.
+        const int yy = clamp(y + (ky - 1) * dil, p.src_y0,
+                             p.src_y0 + int(p.src_rows) - 1);
+        device const float* row = src + (uint(yy - p.src_y0) * p.w) * p.in_ch;
+        for (int kx = 0; kx < 3; ++kx) {
+            const int xx = clamp(x + (kx - 1) * dil, 0, int(p.w) - 1);
+            device const float* v = row + uint(xx) * p.in_ch;
+            const uint kidx = uint(ky * 3 + kx);
+            for (uint o = 0u; o < p.out_ch; ++o) {
+                device const float* wo = W0 + (o * p.in_ch) * 9u;
+                float s = 0.f;
+                for (uint i = 0u; i < p.in_ch; ++i) s += wo[i * 9u + kidx] * v[i];
+                acc[o] += s;
+            }
+        }
+    }
+    device float* out = dst + (uint(gid.y) * p.w + uint(x)) * p.out_ch;
+    for (uint o = 0u; o < p.out_ch; ++o)
+        out[o] = (p.relu != 0u) ? max(acc[o], 0.f) : acc[o];
+}
+
+kernel void srgu_pool(device float* dst [[buffer(0)]],
+                      device const float* src [[buffer(1)]],
+                      constant SrGUPoolParams& p [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.pw || gid.y >= p.ph) return;
+    const int r = int(gid.y), x = int(gid.x);
+    const int y0 = min(2 * r, int(p.src_rows) - 1);
+    const int y1 = min(2 * r + 1, int(p.src_rows) - 1);
+    const int x0 = min(2 * x, int(p.w) - 1);
+    const int x1 = min(2 * x + 1, int(p.w) - 1);
+    device float* o = dst + (uint(r) * p.pw + uint(x)) * p.ch;
+    device const float* a = src + (uint(y0) * p.w + uint(x0)) * p.ch;
+    device const float* b = src + (uint(y0) * p.w + uint(x1)) * p.ch;
+    device const float* c = src + (uint(y1) * p.w + uint(x0)) * p.ch;
+    device const float* d = src + (uint(y1) * p.w + uint(x1)) * p.ch;
+    for (uint i = 0u; i < p.ch; ++i)
+        o[i] = 0.25f * (a[i] + b[i] + c[i] + d[i]);
+}
+
+// Nearest upsample of the bottleneck, concatenated with the skip: the output
+// pixel carries [mid | base], in that order, matching torch.cat([y, s], dim=1).
+kernel void srgu_up_concat(device float* dst [[buffer(0)]],
+                           device const float* mid [[buffer(1)]],
+                           device const float* skip [[buffer(2)]],
+                           constant SrGUUpParams& p [[buffer(3)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.bh) return;
+    const uint r = gid.y, x = gid.x;
+    const uint sr = min(r / 2u, p.ph - 1u);
+    const uint sx = min(x / 2u, p.pw - 1u);
+    const uint cat = p.mid + p.base;
+    device float* o = dst + (r * p.w + x) * cat;
+    device const float* mi = mid + (sr * p.pw + sx) * p.mid;
+    device const float* sk = skip + (r * p.w + x) * p.base;
+    for (uint i = 0u; i < p.mid; ++i) o[i] = mi[i];
+    for (uint i = 0u; i < p.base; ++i) o[p.mid + i] = sk[i];
+}
+
+// Linear head, then the policy. This is the only place tau is applied, and it
+// is applied from sr_gate_shared.h so the CPU and GPU cannot disagree on it.
+kernel void srgu_head(device float* R [[buffer(0)]],
+                      device const float* src [[buffer(1)]],
+                      device const float* wgt [[buffer(2)]],
+                      constant SrGUHeadParams& p [[buffer(3)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.dst_rows) return;
+    const int y = p.dst_y0 + int(gid.y);
+    device const float* v = src + (uint(gid.y) * p.w + gid.x) * p.base;
+    device const float* W0 = wgt + p.w_off;
+    float z = wgt[p.b_off];
+    for (uint i = 0u; i < p.base; ++i) z += W0[i] * v[i];
+    R[uint(y) * p.w + gid.x] = sr_gate_unet_mask(z, p.tau, p.beta);
 }
 
 // ==== sr_gate + geometry rejection (Config::sr_gate_geom_reject_enabled) ===

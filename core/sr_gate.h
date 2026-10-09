@@ -94,6 +94,25 @@ Image sr_gate_infer_cpu(const Image& feat);
 // Features + inference in one call. Returns an empty Image when the gate is
 // disabled or unavailable, which every caller treats as "fall back to the
 // analytic mask" rather than as an error.
+// ---- the artifact U-Net (Config::sr_gate_unet_enabled) -------------------
+// See core/sr_gate_unet.cpp. Predicts log1p(artifact / noise sigma); the mask
+// comes from sr_gate_unet_mask() in sr_gate_shared.h, whose tolerance is
+// Config::sr_gate_tau.
+bool sr_gate_unet_available();
+// The flat weight blob, so metal_gpu.mm can upload it without including the
+// generated header. Same arrangement as sr_gate_weights() above.
+const f32* sr_gate_unet_weights(int* count);
+Image build_sr_gate_unet_features(const Image& ref_means, const Image& ref_vars,
+                                  const Image& comp_means, const Image& d_sq,
+                                  const Image& sigma_sq, const FlowField& flow,
+                                  int tile_size, const Config& cfg);
+// tau/beta explicit so the parity harness can sweep the policy without a Config.
+Image sr_gate_unet_infer_cpu(const Image& feat, f32 tau, f32 beta);
+Image sr_gate_unet_mask_image(const Image& ref_means, const Image& ref_vars,
+                              const Image& comp_means, const Image& d_sq,
+                              const Image& sigma_sq, const FlowField& flow,
+                              int tile_size, const Config& cfg);
+
 Image sr_gate_mask(const Image& ref_means, const Image& ref_vars,
                    const Image& d_sq, const Image& sigma_sq,
                    const FlowField& flow, int tile_size, const Config& cfg);
