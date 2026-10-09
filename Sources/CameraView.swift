@@ -824,240 +824,6 @@ struct CameraView: View {
         }
     }
 
-    @ViewBuilder
-    private var fineAlignmentSection: some View {
-        Toggle("Match 1.4 Alignment", isOn: $cam.tuningParams.align_match_14)
-        Text("""
-             Switches the three places the aligner (a 460-main derivative) diverges from \
-             Handheld-Multi-Frame-Super-Resolution-1.4: finest search radius drops to 1, \
-             inter-level flow upscaling becomes a plain bilinear resize (not the 460 \
-             three-candidate re-match), and ICA runs on every pyramid level of the FFT grey. \
-             Algorithm parity with 1.4, not bit parity (the FFT and GPU float order still \
-             differ upstream). Off keeps the current 460 behaviour.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Geometry Rejection (rotation)", isOn: $cam.tuningParams.motion_geom_reject_enabled)
-        Text("""
-             Rejects pixels where the per-tile translation is a poor model of the \
-             local motion (flow gradient × distance from tile centre, weighted by \
-             edge strength) — the rotation tile-ghosts. Rejected pixels fall back to \
-             the reference. Inert under one-direction motion. A hiding fix: trades \
-             some burst samples for artifact-free output. Lower threshold rejects more.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        HStack {
-            Text("Geom Threshold")
-            Spacer()
-            Text(String(format: "%.4f", cam.tuningParams.motion_geom_reject_threshold))
-        }
-        Slider(value: $cam.tuningParams.motion_geom_reject_threshold, in: 0.0...0.06)
-        Text("~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner, fewer samples kept.")
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Also catch low-light (exposure-invariant)", isOn: $cam.tuningParams.motion_geom_relative)
-        Text(cam.tuningParams.motion_geom_relative
-             ? "Adds a CONTRAST criterion (∇g/g) on top of the absolute one above: the absolute test's gradient shrinks in dim scenes so it misses low-light misalignments, while contrast is the same at any exposure. Union — keeps every good-light rejection and adds the low-light ones."
-             : "Absolute edge strength only: tuned for good light; misses misalignments in low light where gradients are weaker.")
-            .font(.caption2).foregroundColor(.secondary)
-        if cam.tuningParams.motion_geom_relative {
-            HStack {
-                Text("Geom Threshold (relative)")
-                Spacer()
-                Text(String(format: "%.3f", cam.tuningParams.motion_geom_reject_threshold_relative))
-            }
-            Slider(value: $cam.tuningParams.motion_geom_reject_threshold_relative, in: 0.0...0.20)
-            HStack {
-                Text("Noise Floor ×")
-                Spacer()
-                Text(String(format: "%.2f", cam.tuningParams.motion_geom_noise_floor_mult))
-            }
-            Slider(value: $cam.tuningParams.motion_geom_noise_floor_mult, in: 0.0...4.0)
-            Text("Noise Floor × subtracts k·σ_noise from the gradient before dividing by brightness, so dark noisy flats don't falsely reject. Lower relative threshold rejects more.")
-                .font(.caption2).foregroundColor(.secondary)
-        }
-        Toggle("Guide: Keep White Balance", isOn: $cam.tuningParams.guide_white_balance)
-        Toggle("Guide: Colour Matrix (→sRGB)", isOn: $cam.tuningParams.guide_color_matrix)
-        Picker("Guide Curve", selection: $cam.tuningParams.guide_curve) {
-            Text("Auto").tag(-1)
-            Text("None").tag(0)
-            Text("Sqrt").tag(1)
-            Text("Gamma").tag(2)
-            Text("sRGB").tag(3)
-        }
-        .pickerStyle(.segmented)
-        Text("""
-             Render the robustness guide as a real display RGB before the colour \
-             distance is measured: keep white balance, apply the camera→sRGB matrix, \
-             and a transfer curve. Separates true colour mismatches from noise. Run \
-             with the noise model OFF — the noise LUT is calibrated in the sqrt-raw \
-             guide domain and won't match once WB/matrix change it. All off/Auto = \
-             unchanged.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Ambiguous-Match Fallback", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
-        Text("""
-             ImageStackAlignator's rule: when a tile's best and second-best block-match              costs are near-tied (flat patch, aperture problem, repeating texture -- no              precise shift can be determined), apply NO shift and keep the seed from the              coarser level or global estimate, instead of trusting a match that is              indistinguishable from noise. Acts on the flow itself -- unlike the ambiguity              demotion in the robustness mask, which is inert under rotation because every              tile is already on the strict prior. Experimental -- A/B on rotating bursts.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Linear Kernel Selection (1.4)", isOn: $cam.tuningParams.kernel_selection_linear)
-        Text("""
-             Merge steerable-kernel selection law. ON = 'linear' (Python 1.4 default):              the kernel anisotropy ramps continuously with the local structure A.              OFF = 'hard_threshold' (460-main): round kernels until A>1.95, then snap to              full stretch. The two agree at A=1 and A=2 and differ only for moderately              anisotropic detail. ON = exact 1.4 parity.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-        Toggle("Learned Robustness Mask", isOn: $cam.tuningParams.use_neural_robustness)
-            .help("Replaces the analytic robustness mask (Wronski Eq. 5-9) with a small "
-                + "trained network. The analytic mask decides from a colour difference "
-                + "between 3x3 local means, which cannot see a misalignment that lands on "
-                + "similar-looking content or one finer than that window. The network sees "
-                + "the same statistics plus the estimated flow, its local spread and a wider "
-                + "neighbourhood. Measured against ground truth on synthetic bursts built "
-                + "from real raws: analytic AUC 0.638, learned 0.926. Falls back to the "
-                + "analytic mask automatically if the model is missing.")
-        Toggle("Robustness at Raw Resolution", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
-        Text("""
-             Evaluates the robustness mask at raw Bayer resolution instead of the              half-resolution guide grid: the guide-resolution local statistics are              Dodgson-upscaled and flow-warped to every raw pixel, and R is computed there,              so the rejection boundary lands with raw-pixel precision instead of in 2x2              Bayer blocks. The 5x5 local-min is applied twice (= 9x9 raw), preserving the              paper's ~10x10-raw physical safety margin that s/t/Mt were tuned against,              while the boundary stays raw-precision. The statistics themselves stay              half-resolution either way. Only takes effect with "Alignment Grey: FFT" below              turned OFF (Decimate) -- silently does nothing otherwise. ~4x the pixel count              for the mask itself.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
-    }
-
-    // Two of the eight Sections live here rather than inline. The Form body
-    // was one 343-line expression and the Swift type checker gave up on it
-    // ("unable to type-check this expression in reasonable time"); these are
-    // the two largest, and moving them lets each be checked on its own.
-    // Out of the ViewBuilder deliberately: an inline ternary in a Text is the
-    // shape that has previously pushed this file past the type-checker limit.
-    private var chooseReferenceHelp: String {
-        if cam.tuningParams.global_prealignment_choose_reference {
-            return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
-        }
-        return "Frame 0 is the merge base, so pre-alignment runs inside the alignment pass at roughly the cost of one thumbnail per frame."
-    }
-
-    @ViewBuilder
-    private var robustnessSection: some View {
-                Section(header: Text("Robustness (Motion Rejection)")) {
-                    HStack {
-                        Text("Threshold (r_t)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.r_t))
-                    }
-                    Slider(value: $cam.tuningParams.r_t, in: 0.0...1.0)
-                    
-                    HStack {
-                        Text("Penalty (r_s1)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.r_s1))
-                    }
-                    Slider(value: $cam.tuningParams.r_s1, in: 0.0...8.0)
-                    
-                    HStack {
-                        Text("Multiplier (r_s2)")
-                        Spacer()
-                        Text(String(format: "%.1f", cam.tuningParams.r_s2))
-                    }
-                    Slider(value: $cam.tuningParams.r_s2, in: 1.0...50.0)
-                    
-                    HStack {
-                        Text("Max Robustness (r_Mt)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.r_Mt))
-                    }
-                    Slider(value: $cam.tuningParams.r_Mt, in: 0.0...1.0)
-
-                    Toggle("Alignment Grey: FFT", isOn: $cam.tuningParams.alignment_grey_fft)
-                    Text(cam.tuningParams.alignment_grey_fft
-                         ? "Full-res FFT low-pass. Slower."
-                         : "2x2 Bayer quad average at half res (Wronski et al.). Much faster.")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-    }
-
-    @ViewBuilder
-    private var kernelsSection: some View {
-                Section(header: Text("Steerable Kernels (Merging)")) {
-                    Toggle("SNR Auto Tune", isOn: $cam.tuningParams.snr_auto_tune)
-
-                    Toggle("Global Pre-Alignment", isOn: $cam.tuningParams.global_prealignment_enabled)
-
-                    if cam.tuningParams.global_prealignment_enabled {
-                        Toggle("Choose Reference Frame", isOn: $cam.tuningParams.global_prealignment_choose_reference)
-                        Text(chooseReferenceHelp)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        HStack {
-                            Text("Rotation Search")
-                            Spacer()
-                            Text(String(format: "%.1f deg", cam.tuningParams.global_prealignment_rotation_range_deg))
-                        }
-                        Slider(value: $cam.tuningParams.global_prealignment_rotation_range_deg,
-                               in: 0.0...2.0,
-                               step: 0.1)
-
-                        HStack {
-                            Text("Rotation Step")
-                            Spacer()
-                            Text(String(format: "%.2f deg", cam.tuningParams.global_prealignment_rotation_step_deg))
-                        }
-                        Slider(value: $cam.tuningParams.global_prealignment_rotation_step_deg,
-                               in: 0.05...1.0,
-                               step: 0.05)
-
-                        Stepper(value: $cam.tuningParams.global_prealignment_max_shift,
-                                in: 0...64,
-                                step: 4) {
-                            HStack {
-                                Text("Global Shift")
-                                Spacer()
-                                Text("\(cam.tuningParams.global_prealignment_max_shift)")
-                            }
-                        }
-                    }
-
-                    Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
-                        Text("Auto").tag(0)
-                        Text("8").tag(8)
-                        Text("16").tag(16)
-                        Text("32").tag(32)
-                        Text("64").tag(64)
-                    }
-                    .pickerStyle(.segmented)
-                    Text("8 can follow smaller local motion in good light, but is slower and less stable on noise, straight edges, and repeated patterns. Auto keeps the SNR-based choice.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                    
-                    HStack {
-                        Text("Detail Sharpness (k_detail)")
-                        Spacer()
-                        Text(String(format: "%.2f", cam.tuningParams.k_detail))
-                    }
-                    Slider(value: $cam.tuningParams.k_detail, in: 0.1...1.0)
-                    
-                    HStack {
-                        Text("Denoise Strength (k_denoise)")
-                        Spacer()
-                        Text(String(format: "%.1f", cam.tuningParams.k_denoise))
-                    }
-                    Slider(value: $cam.tuningParams.k_denoise, in: 0.0...10.0)
-                    
-                    HStack {
-                        Text("Stretch (k_stretch)")
-                        Spacer()
-                        Text(String(format: "%.1f", cam.tuningParams.k_stretch))
-                    }
-                    Slider(value: $cam.tuningParams.k_stretch, in: 1.0...10.0)
-
-                    HStack {
-                        Text("Shrink (k_shrink)")
-                        Spacer()
-                        Text(String(format: "%.1f", cam.tuningParams.k_shrink))
-                    }
-                    Slider(value: $cam.tuningParams.k_shrink, in: 1.0...5.0)
-                    Text("Higher shrink sharpens across edges (helps small text). Default 2.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-    }
-
     private var tuningSettingsView: some View {
         NavigationView {
             Form {
@@ -1097,101 +863,51 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                 }
 
-                Section(header: Text("Advanced")) {
-                    Picker("Alignment Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
+                Section(header: Text("Alignment")) {
+                    Picker("Tile Size", selection: $cam.tuningParams.alignment_tile_size) {
+                        Text("Auto (SNR)").tag(0)
                         Text("8").tag(8)
                         Text("16").tag(16)
                         Text("32").tag(32)
                         Text("64").tag(64)
                     }
-                    Toggle("Fine Final Tile (8px)", isOn: $cam.tuningParams.align_fine_finest_tile)
-                    Text("""
-                         Puts the smaller tile on the FINEST alignment level instead of the coarsest: {16,16,16,8} → {8,16,16,16}. The last refinement (and the merge flow grid) use 8px tiles, halving the within-tile extent so the single per-tile motion vector has less rotation/local-motion error. Coarse levels stay 16 for a robust global estimate. Trade-off: 8px tiles match more noisily in flat/low-light areas. Scales with the tile size above (so 32 → {16,32,32,32}).
-                         """)
+                    Picker("Grey Method", selection: $cam.tuningParams.alignment_grey_fft) {
+                        Text("FFT").tag(true)
+                        Text("Decimate").tag(false)
+                    }
+                    Text("alignment.tile_size (SNR_based = auto picks 16/32/64) and alignment.grey_method. IPOL main defaults: SNR-based tiling, FFT grey.")
                         .font(.footnote).foregroundColor(.secondary)
-                    Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
                 }
 
-                Section(header: Text("Robustness Mask")) {
+                Section(header: Text("Robustness")) {
                     Toggle("Robustness", isOn: $cam.tuningParams.robustness_enabled)
-                    Text("""
-                         The per-pixel robustness mask (Eq. 5–9) that down-weights moving or misaligned frames during merge. Off merges every frame equally — sharper on perfectly still scenes, but ghosts anything that moved.
-                         """)
+                    Text("robustness.enabled — the per-pixel robustness mask (Alg. 6) that down-weights moving or misaligned frames during merge. Off merges every frame equally.")
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_enabled {
-                        ispRow("Threshold t", $cam.tuningParams.r_t, 0.0...0.5, "%.3f")
-                        ispRow("s1 (irregular flow)", $cam.tuningParams.r_s1, 0.0...4.0, "%.2f")
-                        ispRow("s2 (regular flow)", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")
-                        ispRow("Mt (motion threshold)", $cam.tuningParams.r_Mt, 0.0...4.0, "%.2f")
-                        Text("460-main: t 0.12, s1 2, s2 12, Mt 0.8. Higher t rejects more; higher s1/s2 trust frames more; Mt is the per-tile flow spread that switches s2→s1.")
+                        Toggle("Noise Correction", isOn: Binding(
+                            get: { !cam.tuningParams.debug_noise_model_disabled },
+                            set: { cam.tuningParams.debug_noise_model_disabled = !$0 }))
+                        Text("robustness.noise_correction — fold the Poisson–Gaussian noise model into d/σ. Off scores R from the raw measured variance and difference.")
                             .font(.footnote).foregroundColor(.secondary)
-                        Picker("Color Domain", selection: $cam.tuningParams.guide_curve) {
-                            Text("Linear").tag(0)
-                            Text("Sqrt VST").tag(1)
-                            Text("sRGB").tag(3)
-                        }
-                        Text("""
-                             Color space d, σ and R are measured in (reconstruction/merge stay linear regardless). Linear (460-main): raw sensor RGB. Sqrt VST: variance-stabilized (1.4). sRGB: the guide is IEC-sRGB encoded so the residual tracks perceptually-relevant color differences (Wronski/TAA reading); the noise floor σ_t is moved to sRGB from the linear curve by OETF error propagation, so d and σ stay in one domain. Only the robustness guide is transformed — raw planes, merge and output are untouched.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                        Toggle("Disable Noise Model", isOn: $cam.tuningParams.debug_noise_model_disabled)
-                        Text("""
-                             Zeroes the Poisson–Gaussian noise model the mask reads (the only place it is used, as in 460-main). R is then scored from the raw measured local variance and the unshrunk pixel difference — no noise floor forgiving small differences, no Wiener shrink. Rejects more aggressively. Alignment tile size, SNR auto-tune and kernel estimation are untouched.
-                             """)
-                            .font(.footnote).foregroundColor(.secondary)
-                        Toggle("Dodgson Stat Upsampling (Algorithm 6)", isOn: $cam.tuningParams.robustness_raw_resolution_enabled)
-                        Text("""
-                             Off (default): the mask is computed on the half-resolution guide and keeps GPU frame residency (faster). On: the paper's Algorithm 6 — the guide stays half-res, but the local statistics σp/µp are Dodgson ×2 upscaled and flow-warped to full H×W resolution, so the mask lands at raw-pixel precision instead of in 2×2 Bayer blocks. No full-resolution guide is ever built; alignment stays full-res FFT. Heavier, and it disables GPU frame residency, so it is slower per frame.
-                             """)
+                        Toggle("Save Robustness Mask", isOn: $cam.tuningParams.robustness_save_mask)
+                        ispRow("t", $cam.tuningParams.r_t, 0.0...0.5, "%.3f")
+                        ispRow("s1", $cam.tuningParams.r_s1, 0.0...4.0, "%.2f")
+                        ispRow("s2", $cam.tuningParams.r_s2, 1.0...30.0, "%.1f")
+                        ispRow("Mt", $cam.tuningParams.r_Mt, 0.0...4.0, "%.2f")
+                        Text("robustness.t/s1/s2/Mt. IPOL main: t 0.12, s1 2, s2 12, Mt 0.8.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
-                    Toggle("NN Tile-Reject Refine", isOn: $cam.tuningParams.tile_reject_nn_enabled)
-                    Text("""
-                         Experimental tiny neural net that only DARKENS the mask (never brightens) where a tile's single motion vector is wrong — rotation/parallax/irregular motion. Conservative by design.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
                 }
 
-                Section(header: Text("Steerable Kernels")) {
+                Section(header: Text("Merging")) {
+                    Picker("Kernel Selection", selection: $cam.tuningParams.kernel_selection_linear) {
+                        Text("Hard threshold").tag(false)
+                        Text("Linear").tag(true)
+                    }
                     ispRow("k_stretch", $cam.tuningParams.k_stretch, 1.0...8.0, "%.1f")
                     ispRow("k_shrink", $cam.tuningParams.k_shrink, 0.25...4.0, "%.2f")
-                    Text("Shape of the merge kernels along/across edges. 460-main: k_stretch 4, k_shrink 2. Higher stretch elongates kernels along edges; higher shrink narrows them across edges (sharper, noisier).")
+                    Text("merging.selection_law (IPOL main default: linear) and merging.kernel k_stretch/k_shrink (main: 4 / 2). k_detail/k_denoise/D_th/D_tr are SNR-based (auto).")
                         .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Motion Model")) {
-                    Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)
-                    Text("""
-                         Experimental. Fits a local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. Does not model sharp depth or moving-object edges — robustness still handles those.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
-                    Text("""
-                         Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Geometry Rejection")) {
-                    Toggle("Reject Misaligned Motion", isOn: $cam.tuningParams.motion_geom_reject_enabled)
-                    Text("""
-                         Drops frames' contribution in tiles where the aligned comparison frame disagrees geometrically with the reference — occlusion, subject motion, or a large residual misalignment the block search could not resolve. On by default; turning it off makes merging follow the plain reference algorithm, which can keep more detail on perfectly still scenes but may leave ghosts where anything moved.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-
-                Section(header: Text("Edge Misalignment Rejection")) {
-                    Toggle("Reject Misaligned Edges", isOn: $cam.tuningParams.edge_misalign_enabled)
-                    Text("""
-                         Attenuates the merge weight only where the reference and the aligned comparison frame actually disagree at an edge — a measured sub-pixel shift along the edge normal, or a genuine doubled edge from motion. A correctly aligned edge, however sharp, is kept at full weight, so unlike geometry rejection it never thins or drops clean detail. Targets doubled and thickened edges from hand shake and moving subjects.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.edge_misalign_enabled {
-                        ispRow("Edge SNR", $cam.tuningParams.edge_misalign_edge_snr, 1.0...12.0, "%.1f")
-                        ispRow("Shift scale (px)", $cam.tuningParams.edge_misalign_shift_z, 0.3...5.0, "%.2f")
-                        ispRow("Ghost scale", $cam.tuningParams.edge_misalign_ghost_z, 0.5...6.0, "%.2f")
-                        ispRow("Min confidence", $cam.tuningParams.edge_misalign_min_conf, 0.0...1.0, "%.2f")
-                    }
                 }
             }
             .navigationTitle("Settings")
