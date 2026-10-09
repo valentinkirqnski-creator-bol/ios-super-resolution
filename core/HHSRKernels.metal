@@ -2773,11 +2773,25 @@ kernel void srgu_image_features(device float* feat [[buffer(0)]],
     for (uint i = 0u; i < uint(SRGU_IMG); ++i) o[i] = img[i];
 }
 
-kernel void srgu_conv(device float* dst [[buffer(0)]],
-                      device const float* src [[buffer(1)]],
-                      device const float* wgt [[buffer(2)]],
-                      constant SrGUConvParams& p [[buffer(3)]],
-                      uint2 gid [[thread_position_in_grid]]) {
+// The convolution, specialised on its channel counts.
+//
+// Two things made the generic version slow enough to matter at 12 MP.
+//
+// ACCUMULATOR. With out_ch a runtime value, acc[] is dynamically indexed, and
+// Metal cannot keep a dynamically indexed array in registers -- it spills to
+// thread-local memory, so every MAC became a round trip to the stack. Making
+// OUT a template parameter puts it back in registers.
+//
+// LOOP ORDER. The old order read each input pixel's channel vector once per
+// OUTPUT channel, so the same 20 to 44 floats came out of device memory 16 to
+// 28 times per tap. Hoisting the input channel to the outer loop reads it once
+// and fans it out across the accumulator: 16x fewer activation loads on the
+// 16-channel layers, 28x on the 28-channel ones. The weights are read the same
+// number of times either way, and at 116 KB the whole blob stays in cache.
+template <uint IN, uint OUT>
+inline void srgu_conv_impl(device float* dst, device const float* src,
+                           device const float* wgt,
+                           constant SrGUConvParams& p, uint2 gid) {
     if (gid.x >= p.w || gid.y >= p.dst_rows) return;
     const int y = p.dst_y0 + int(gid.y);
     const int x = int(gid.x);
@@ -2785,29 +2799,48 @@ kernel void srgu_conv(device float* dst [[buffer(0)]],
     device const float* W0 = wgt + p.w_off;
     device const float* B0 = wgt + p.b_off;
 
-    float acc[SRGU_MID];
-    for (uint o = 0u; o < p.out_ch; ++o) acc[o] = B0[o];
+    float acc[OUT];
+    for (uint o = 0u; o < OUT; ++o) acc[o] = B0[o];
     for (int ky = 0; ky < 3; ++ky) {
-        // Clamp to the BAND's span, which is the image's at a true edge.
+        // Clamp to the BAND, which is the image at a true edge.
         const int yy = clamp(y + (ky - 1) * dil, p.src_y0,
                              p.src_y0 + int(p.src_rows) - 1);
-        device const float* row = src + (uint(yy - p.src_y0) * p.w) * p.in_ch;
+        device const float* row = src + (uint(yy - p.src_y0) * p.w) * IN;
         for (int kx = 0; kx < 3; ++kx) {
             const int xx = clamp(x + (kx - 1) * dil, 0, int(p.w) - 1);
-            device const float* v = row + uint(xx) * p.in_ch;
+            device const float* v = row + uint(xx) * IN;
             const uint kidx = uint(ky * 3 + kx);
-            for (uint o = 0u; o < p.out_ch; ++o) {
-                device const float* wo = W0 + (o * p.in_ch) * 9u;
-                float s = 0.f;
-                for (uint i = 0u; i < p.in_ch; ++i) s += wo[i * 9u + kidx] * v[i];
-                acc[o] += s;
+            for (uint i = 0u; i < IN; ++i) {
+                const float vi = v[i];
+                for (uint o = 0u; o < OUT; ++o)
+                    acc[o] += W0[(o * IN + i) * 9u + kidx] * vi;
             }
         }
     }
-    device float* out = dst + (uint(gid.y) * p.w + uint(x)) * p.out_ch;
-    for (uint o = 0u; o < p.out_ch; ++o)
+    device float* out = dst + (uint(gid.y) * p.w + uint(x)) * OUT;
+    for (uint o = 0u; o < OUT; ++o)
         out[o] = (p.relu != 0u) ? max(acc[o], 0.f) : acc[o];
 }
+
+#define SRGU_CONV_KERNEL(NAME, IN, OUT)                                       \
+kernel void NAME(device float* dst [[buffer(0)]],                             \
+                 device const float* src [[buffer(1)]],                       \
+                 device const float* wgt [[buffer(2)]],                       \
+                 constant SrGUConvParams& p [[buffer(3)]],                    \
+                 uint2 gid [[thread_position_in_grid]]) {                     \
+    srgu_conv_impl<IN, OUT>(dst, src, wgt, p, gid);                           \
+}
+
+// One per layer shape. SRGU_IN/BASE/MID are not used directly so a change to
+// them is a compile error here rather than a silently wrong kernel.
+SRGU_CONV_KERNEL(srgu_conv_20_16, 20u, 16u)   // e1
+SRGU_CONV_KERNEL(srgu_conv_16_16, 16u, 16u)   // e2
+SRGU_CONV_KERNEL(srgu_conv_16_28, 16u, 28u)   // d1
+SRGU_CONV_KERNEL(srgu_conv_28_28, 28u, 28u)   // b1, b2
+SRGU_CONV_KERNEL(srgu_conv_44_16, 44u, 16u)   // u1
+
+static_assert(SRGU_IN == 20 && SRGU_BASE == 16 && SRGU_MID == 28,
+              "srgu conv kernels are specialised on these counts");
 
 kernel void srgu_pool(device float* dst [[buffer(0)]],
                       device const float* src [[buffer(1)]],

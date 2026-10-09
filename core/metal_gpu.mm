@@ -1847,12 +1847,19 @@ static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
     auto& c = ctx();
     id<MTLComputePipelineState> p_feat = c.pipe("sr_gate_features");
     id<MTLComputePipelineState> p_img = c.pipe("srgu_image_features");
-    id<MTLComputePipelineState> p_conv = c.pipe("srgu_conv");
+    // One pipeline per layer shape: the kernels are specialised on their
+    // channel counts so the accumulator stays in registers.
+    id<MTLComputePipelineState> p_e1 = c.pipe("srgu_conv_20_16");
+    id<MTLComputePipelineState> p_e2 = c.pipe("srgu_conv_16_16");
+    id<MTLComputePipelineState> p_d1 = c.pipe("srgu_conv_16_28");
+    id<MTLComputePipelineState> p_bn = c.pipe("srgu_conv_28_28");
+    id<MTLComputePipelineState> p_u1 = c.pipe("srgu_conv_44_16");
     id<MTLComputePipelineState> p_pool = c.pipe("srgu_pool");
     id<MTLComputePipelineState> p_up = c.pipe("srgu_up_concat");
     id<MTLComputePipelineState> p_head = c.pipe("srgu_head");
     id<MTLBuffer> b_w = srgu_weights();
-    if (!p_feat || !p_img || !p_conv || !p_pool || !p_up || !p_head || !b_w)
+    if (!p_feat || !p_img || !p_e1 || !p_e2 || !p_d1 || !p_bn || !p_u1 ||
+        !p_pool || !p_up || !p_head || !b_w)
         return false;
     if (gh <= 0 || gw <= 0 || tile_size <= 0 || flow.ny <= 0 || flow.nx <= 0 ||
         curve_n == 0 || nch != 3)
@@ -1891,15 +1898,15 @@ static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
     // 8-float one: srgu_image_features fills channels 8..19 of the same pixel.
     fp.dst_stride = SRGU_IN;
 
-    auto conv = [&](id<MTLBuffer> dst, id<MTLBuffer> src,
-                    const SrGUConvParamsCPU& cp) -> bool {
+    auto conv = [&](id<MTLComputePipelineState> pipe, id<MTLBuffer> dst,
+                    id<MTLBuffer> src, const SrGUConvParamsCPU& cp) -> bool {
         id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
         if (!e) return false;
         [e setBuffer:dst offset:0 atIndex:0];
         [e setBuffer:src offset:0 atIndex:1];
         [e setBuffer:b_w offset:0 atIndex:2];
         [e setBytes:&cp length:sizeof(cp) atIndex:3];
-        dispatch2(e, p_conv, (NSUInteger)cp.w, (NSUInteger)cp.dst_rows);
+        dispatch2(e, pipe, (NSUInteger)cp.w, (NSUInteger)cp.dst_rows);
         [e endEncoding];
         return true;
     };
@@ -1948,10 +1955,10 @@ static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
         cp.dst_rows = (uint32_t)bh;
         cp.in_ch = SRGU_IN; cp.out_ch = SRGU_BASE; cp.dil = 1;
         cp.w_off = SRGU_OFF_E1W; cp.b_off = SRGU_OFF_E1B; cp.relu = 1;
-        if (!conv(b_e, b_feat, cp)) return false;
+        if (!conv(p_e1, b_e, b_feat, cp)) return false;
         cp.in_ch = SRGU_BASE;
         cp.w_off = SRGU_OFF_E2W; cp.b_off = SRGU_OFF_E2B;
-        if (!conv(b_s, b_e, cp)) return false;      // b_s is the skip
+        if (!conv(p_e2, b_s, b_e, cp)) return false;   // b_s is the skip
 
         SrGUPoolParamsCPU pp{};
         pp.w = (uint32_t)gw; pp.ph = (uint32_t)ph; pp.pw = (uint32_t)pw;
@@ -1970,13 +1977,13 @@ static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
         bp.src_y0 = 0; bp.dst_y0 = 0; bp.dst_rows = (uint32_t)ph;
         bp.in_ch = SRGU_BASE; bp.out_ch = SRGU_MID; bp.dil = 1;
         bp.w_off = SRGU_OFF_D1W; bp.b_off = SRGU_OFF_D1B; bp.relu = 1;
-        if (!conv(b_m, b_p, bp)) return false;
+        if (!conv(p_d1, b_m, b_p, bp)) return false;
         bp.in_ch = SRGU_MID; bp.dil = SRGU_DIL0;
         bp.w_off = SRGU_OFF_B1W; bp.b_off = SRGU_OFF_B1B;
-        if (!conv(b_p, b_m, bp)) return false;
+        if (!conv(p_bn, b_p, b_m, bp)) return false;
         bp.dil = SRGU_DIL1;
         bp.w_off = SRGU_OFF_B2W; bp.b_off = SRGU_OFF_B2B;
-        if (!conv(b_m, b_p, bp)) return false;
+        if (!conv(p_bn, b_m, b_p, bp)) return false;
 
         SrGUUpParamsCPU up{};
         up.w = (uint32_t)gw; up.bh = (uint32_t)bh; up.ph = (uint32_t)ph;
@@ -1996,7 +2003,7 @@ static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
         cp.dst_y0 = y0; cp.dst_rows = (uint32_t)(y1 - y0);
         cp.in_ch = SRGU_MID + SRGU_BASE; cp.out_ch = SRGU_BASE; cp.dil = 1;
         cp.w_off = SRGU_OFF_U1W; cp.b_off = SRGU_OFF_U1B; cp.relu = 1;
-        if (!conv(b_e, b_cat, cp)) return false;
+        if (!conv(p_u1, b_e, b_cat, cp)) return false;
 
         SrGUHeadParamsCPU hp{};
         hp.w = (uint32_t)gw; hp.dst_rows = (uint32_t)(y1 - y0); hp.dst_y0 = y0;
