@@ -1642,15 +1642,36 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         f32 seed_dx = init.dx * grey_scale_x;
         f32 seed_dy = init.dy * grey_scale_y;
         f32 seed_rot = init.angle;
-        if (work.isa_prealign_enabled &&
-            ref_grey.h == comp_grey.h && ref_grey.w == comp_grey.w &&
+        // ImageStackAlignator-style global pre-align (FFT cross-correlation
+        // rotation scan, core/isa_prealign.*). Opt-in. It must be APPLIED, not
+        // seeded: a seed is re-derived by the coarse-to-fine block matcher's
+        // per-level +/-R search, so it never moves the mask. Instead -- exactly
+        // like the homography path -- build a similarity H (rotation about the
+        // grey centre + translation) from the estimate, WARP the comp grey into
+        // the reference frame, align the residual from zero, and record H in
+        // flow.global_h so robustness/merge sample the registered position.
+        // Requires full-res grey (grey == raw), same coordinate constraint as
+        // the homography path; the half-res decimate grey is left unchanged.
+        bool isa_warp = false;
+        f32 isaH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+        if (work.isa_prealign_enabled && !use_homog &&
+            comp_grey.h == comp.h && comp_grey.w == comp.w &&
+            ref_grey.h == comp.h && ref_grey.w == comp.w &&
             ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
             comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c) {
             float idx = 0.f, idy = 0.f, irot = 0.f;
             if (estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot)) {
-                seed_dx = idx;
-                seed_dy = idy;
-                seed_rot = irot;
+                const f32 cx = 0.5f * (f32)(ref_grey.w - 1);
+                const f32 cy = 0.5f * (f32)(ref_grey.h - 1);
+                const f32 cs = std::cos(irot), sn = std::sin(irot);
+                // comp_pos = R(irot)*(p - c) + c + (idx, idy), as a 3x3 affine.
+                isaH[0] = cs; isaH[1] = -sn; isaH[2] = cx + idx - cs * cx + sn * cy;
+                isaH[3] = sn; isaH[4] =  cs; isaH[5] = cy + idy - sn * cx - cs * cy;
+                isaH[6] = 0.f; isaH[7] = 0.f; isaH[8] = 1.f;
+                warped_comp = warp_grey_by_homography(comp_grey, isaH);
+                align_comp = &warped_comp;
+                isa_warp = true;
+                seed_dx = seed_dy = seed_rot = 0.f;  // residual align from zero
             }
         }
         FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
@@ -1669,6 +1690,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // robustness compose it back: comp_pos = H * (lr + flow).
         if (use_homog) {
             for (int i = 0; i < 9; ++i) flow.global_h[i] = gH[i];
+            flow.has_global_h = true;
+        } else if (isa_warp) {
+            // Same composition as the homography path: comp_pos = H*(lr + flow).
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = isaH[i];
             flow.has_global_h = true;
         }
         // Fit the per-tile affine motion model on the finalized raw-grid flow,
