@@ -881,8 +881,8 @@ struct CameraView: View {
                     Text("ImageStackAlignator-style global pre-registration: an FFT phase-correlation scan estimates each frame's whole-image rotation and shift against the reference and warps it in before per-tile tracking. Helps large camera roll/pan. No gyro (the search starts at 0°). Not part of IPOL main; experimental.")
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.isa_prealign_enabled {
-                        ispRow("Roll Search (±°)", $cam.tuningParams.isa_prealign_rot_range_deg, 0.5...15.0, "%.1f")
-                        Text("How much camera ROLL the scan searches for. Raise it for large rotation; higher costs more (more angle samples). Translation range is handled automatically by the zero-padded correlation.")
+                        ispRow("Roll Search (±°)", $cam.tuningParams.isa_prealign_rot_range_deg, 0.5...45.0, "%.1f")
+                        Text("How much camera ROLL the scan searches for. The search is hierarchical, so raising this barely costs more. Translation range is handled automatically by the zero-padded correlation.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
                 }

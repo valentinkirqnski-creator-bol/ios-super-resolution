@@ -284,35 +284,48 @@ bool estimate_isa_prealign(const Image& ref_grey, const Image& comp_grey,
             }
     };
 
-    const float coarse_step = 5.f * incr;
+    const float coarse_step = 5.f * incr;         // L2 / fine window step (1 deg @ 0.2)
+    const float precoarse_step = 4.f * coarse_step;  // L1 step (4 deg)
 
-    // Coarse-to-fine in RESOLUTION. The coarse pass only has to localise the
-    // angle to within one coarse step; it does not need full resolution, so it
-    // runs on a quarter-area thumbnail (cap/2 -> ~4x fewer FFT points per angle)
-    // over the whole +/-range. Only the short fine pass (+/- one coarse step,
-    // ~11 angles) runs at full resolution -- the resolution the result was
-    // tuned at -- so quality is preserved while the many coarse angles get cheap.
+    // Candidate angles center +/- halfwidth at `step`, clamped to [-range,range]
+    // and de-duplicated (so a wide window on a narrow range collapses cleanly).
+    auto gen = [&](float center, float halfwidth, float step) {
+        std::vector<float> v;
+        for (float a = center - halfwidth; a <= center + halfwidth + 0.5f * step; a += step) {
+            const float c = std::max(-range, std::min(range, a));
+            if (v.empty() || std::fabs(c - v.back()) > 1e-6f) v.push_back(c);
+        }
+        if (v.empty()) v.push_back(std::max(-range, std::min(range, center)));
+        return v;
+    };
+    auto best_angle_of = [&](const Res& r, const std::vector<float>& angs) {
+        float bv = -std::numeric_limits<float>::infinity(), ba = 0.f;
+        int bx = 0, by = 0;
+        scan(r, angs, bv, ba, bx, by);
+        return std::isfinite(bv) ? ba : std::numeric_limits<float>::quiet_NaN();
+    };
+
+    // HIERARCHICAL coarse-to-fine, in both angle and RESOLUTION, so the cost is
+    // ~flat as the roll range grows and most work is cheap:
+    //   L1  cap/4  step 4deg  over +/-range     -> localise to ~+/-2deg (cheap, wide)
+    //   L2  cap/2  step 1deg  over +/-4deg      -> localise to ~+/-0.5deg (bounded)
+    //   L3  cap    step incr  over +/-1deg      -> final angle + translation (full res)
+    // Only L3 runs at full resolution (the resolution the result was tuned at),
+    // so adding range only grows the cheap L1 list; L2 and L3 stay fixed-size.
     float best_ang = 0.f;
     if (range > 1e-6f) {
-        std::vector<float> coarse;
-        for (float a = -range; a <= range + 0.5f * coarse_step; a += coarse_step)
-            coarse.push_back(a);
-        const Res rc = build_res(std::max(64, cap / 2));
-        float cval = -std::numeric_limits<float>::infinity();
-        int cpx = 0, cpy = 0;
-        scan(rc, coarse, cval, best_ang, cpx, cpy);
-        if (!std::isfinite(cval)) return false;
+        const Res r1 = build_res(std::max(48, cap / 4));
+        best_ang = best_angle_of(r1, gen(0.f, range, precoarse_step));
+        if (std::isnan(best_ang)) return false;
+        const Res r2 = build_res(std::max(64, cap / 2));
+        best_ang = best_angle_of(r2, gen(best_ang, precoarse_step, coarse_step));
+        if (std::isnan(best_ang)) return false;
     }
 
-    // Fine pass at full resolution around the coarse best.
+    // Fine pass at full resolution around the localised angle.
     const Res rf = build_res(cap);
-    std::vector<float> fine;
-    if (range <= 1e-6f) {
-        fine.push_back(0.f);
-    } else {
-        for (float a = best_ang - coarse_step; a <= best_ang + coarse_step + 0.5f * incr; a += incr)
-            fine.push_back(a);
-    }
+    const std::vector<float> fine =
+        (range <= 1e-6f) ? std::vector<float>{0.f} : gen(best_ang, coarse_step, incr);
     float best_val = -std::numeric_limits<float>::infinity();
     float fine_ang = 0.f;
     int best_px = 0, best_py = 0;
