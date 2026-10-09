@@ -720,6 +720,16 @@ struct Config {
     bool flow_upsample_candidates = true;
     bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
 
+    // ImageStackAlignator-style global pre-alignment (FFT cross-correlation
+    // rotation scan; see core/isa_prealign.*). Opt-in; off by default. When on,
+    // it estimates a per-frame global (translation + in-plane rotation) seed
+    // from the ref/comp grey and feeds align()'s initial_dx/dy/rotation,
+    // overriding the other pre-align seeds. Seeded from 0 (no gyro on iOS).
+    bool  isa_prealign_enabled = false;
+    float isa_prealign_rot_range_deg = 1.0f;   // ISA RotationSearchRange (+/- deg)
+    float isa_prealign_rot_incr_deg  = 0.2f;   // ISA RotationSearchIncrement (deg)
+    int   isa_prealign_fft_max_dim   = 512;    // cap FFT dim; grey downscaled to fit
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

@@ -12,6 +12,7 @@
 #include "mps_fft.h"
 #include "preset_lut.h"
 #include "global_homography.h"
+#include "isa_prealign.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1632,10 +1633,28 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             warped_comp = warp_grey_by_homography(comp_grey, gH);
             align_comp = &warped_comp;
         }
+        // ImageStackAlignator-style global pre-align (FFT cross-correlation
+        // rotation scan, core/isa_prealign.*). Opt-in; overrides the seed with a
+        // per-frame (shift + in-plane rotation) estimated straight from the
+        // UNWARPED ref/comp grey. Its output is already in grey pixels and
+        // grey-centre radians, so it is passed directly (no grey_scale). Flows
+        // through align() to both the CPU and GPU paths.
+        f32 seed_dx = init.dx * grey_scale_x;
+        f32 seed_dy = init.dy * grey_scale_y;
+        f32 seed_rot = init.angle;
+        if (work.isa_prealign_enabled &&
+            ref_grey.h == comp_grey.h && ref_grey.w == comp_grey.w &&
+            ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
+            comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c) {
+            float idx = 0.f, idy = 0.f, irot = 0.f;
+            if (estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot)) {
+                seed_dx = idx;
+                seed_dy = idy;
+                seed_rot = irot;
+            }
+        }
         FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
-                               init.dx * grey_scale_x,
-                               init.dy * grey_scale_y,
-                               init.angle);
+                               seed_dx, seed_dy, seed_rot);
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the flow is on a half-res tile grid with half-res
         // displacements, while robustness and merge both index it as

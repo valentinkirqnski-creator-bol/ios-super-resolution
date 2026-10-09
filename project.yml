@@ -47,6 +47,7 @@ targets:
           - "pipeline.cpp"
           - "pipeline_paths.cpp"
           - "global_homography.cpp"
+          - "isa_prealign.cpp"
           - "raw_io.cpp"
           - "dng_writer.cpp"
           - "ljpeg.cpp"
