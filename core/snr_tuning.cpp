@@ -55,13 +55,34 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
         return;
     }
 
-    // Python super_resolution.py: brightness = mean(ref); SNR = brightness / std_curve[round(1000*b)]
-    f32 sum = 0.f;
-    for (f32 v : ref_raw.data) sum += v;
-    f32 brightness = sum / (f32)ref_raw.data.size();
-    if (out_brightness) *out_brightness = brightness;
-    f32 sigma = noise_std_at_brightness(brightness, cfg);
-    f32 snr = (sigma > 1e-8f) ? brightness / sigma : 15.f;
+    // IPOL main estimate_image_snr (utils_image.py): per-CFA-channel SNR in dB,
+    //   SNR = 20*log10( sqrt( sum(v^2) / sum(alpha_c*v + beta_c) ) )
+    // over pixels with 0 < v < 1. The tile-size thresholds and the k_detail/
+    // k_denoise/D_th/D_tr lerps below already match the reference; only the SNR
+    // value changes (was mean-brightness / noise-std).
+    double top = 0.0, bot = 0.0;
+    const int rw = ref_raw.w, rh = ref_raw.h;
+    for (int y = 0; y < rh; ++y) {
+        for (int x = 0; x < rw; ++x) {
+            const f32 v = ref_raw.data[(size_t)y * (size_t)rw + (size_t)x];
+            if (!(v > 0.f && v < 1.f)) continue;
+            const int c = cfg.bayer_mode ? (int)cfg.cfa.p[y & 1][x & 1] : 0;
+            const f32 a = cfg.noise_alpha_ch(c), b = cfg.noise_beta_ch(c);
+            top += (double)v * (double)v;
+            bot += (double)a * (double)v + (double)b;
+        }
+    }
+    if (out_brightness) {
+        double s = 0.0; for (f32 v : ref_raw.data) s += (double)v;
+        *out_brightness = (f32)(s / (double)std::max<size_t>(1, ref_raw.data.size()));
+    }
+    f32 snr;
+    if (bot > 0.0 && top > 0.0) {
+        const f32 snr_lin = (f32)std::sqrt(top / bot);
+        snr = 20.f * std::log10(std::max(1e-6f, snr_lin));
+    } else {
+        snr = 15.f;
+    }
     snr = clampf(snr, 6.f, 30.f);
 
     // params.update_snr_config

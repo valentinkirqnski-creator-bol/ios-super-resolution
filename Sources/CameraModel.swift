@@ -96,8 +96,8 @@ struct TuningParams: Equatable, Codable {
     var k_denoise: Float = 1.0
     var k_stretch: Float = 3.0
     var k_shrink: Float = 1.0
-    var snr_auto_tune: Bool = false
-    var alignment_tile_size: Int = 16
+    var snr_auto_tune: Bool = true   // IPOL main: SNR-based tile size + k_detail/k_denoise/D_th/D_tr
+    var alignment_tile_size: Int = 0   // IPOL main: SNR_BASED (0 = auto-select 16/32/64)
     /// Put the smaller tile on the FINEST alignment level instead of the coarsest
     /// (bm_tile_sizes {16,16,16,8} -> {8,16,16,16}), so the final per-tile motion
     /// vector has less within-tile rotation error and the merge flow grid is
@@ -546,7 +546,9 @@ final class CameraModel: NSObject, ObservableObject {
         // disables GPU frame residency; the default path keeps residency active.
         // 17: begin "match IPOL main" (stage 1): sqrt-VST robustness guide
         // (guide_curve=1), bilinear inter-level flow upsample, tile-64 uncapped.
-        let defaultsVersion = 17
+        // 18: match IPOL main (stage 6): SNR-based tiling (snr_auto_tune on,
+        // alignment_tile_size auto) + per-level ICA + estimate_image_snr.
+        let defaultsVersion = 18
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

@@ -755,7 +755,12 @@ struct Config {
     // True when ICA should run on every pyramid level rather than only the
     // finest.
     bool ica_every_level() const {
-        return grey_method == GreyMethod::Decimate || align_match_14;
+        // IPOL main runs ICA at EVERY pyramid level (alignment.align_lvl), so
+        // this is always on. On the full-res FFT grey the per-level ICA cache
+        // is too large to hold level 0 (~576MB), so ica_per_level_coarse_only()
+        // runs the coarse levels in the loop and leaves the finest to the
+        // existing single pass -- finest ICA still happens either way.
+        return true;
     }
 
     // On the FFT grey, run per-level ICA on the COARSE levels only and leave
@@ -774,7 +779,11 @@ struct Config {
     // they are where the benefit is -- integer-only flow originates on the
     // coarse levels, and that is what arrives at level 0 with its budget spent.
     bool ica_per_level_coarse_only() const {
-        return align_match_14 && grey_method == GreyMethod::FFT;
+        // Device memory: the per-level ICA cache can't hold the full-res FFT
+        // grey's level 0, so on FFT run per-level ICA on the COARSE levels only
+        // (the finest is refined by the existing single pass). On the decimate
+        // grey the full set fits, so run every level.
+        return grey_method == GreyMethod::FFT;
     }
 
     // How many RAW pixels one alignment-grey pixel spans. The FFT grey is
