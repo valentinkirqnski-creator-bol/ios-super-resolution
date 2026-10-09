@@ -192,8 +192,8 @@ struct TuningParams: Equatable, Codable {
     /// against the image, lowest L1 residual wins. OFF: plain bilinear resize.
     ///
     /// Forced OFF by align_match_14, which is what 1.4 does.
-    /// Default true: 460-main uses the three-candidate content-aware upscale.
-    var flow_upsample_candidates: Bool = false  // IPOL main: bilinear inter-level flow upsample
+    /// 460-main's three-candidate content-aware inter-level flow upscale.
+    var flow_upsample_candidates: Bool = true  // 460-main candidate upsample (not IPOL main's bilinear)
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -548,7 +548,9 @@ final class CameraModel: NSObject, ObservableObject {
         // (guide_curve=1), bilinear inter-level flow upsample, tile-64 uncapped.
         // 18: match IPOL main (stage 6): SNR-based tiling (snr_auto_tune on,
         // alignment_tile_size auto) + per-level ICA + estimate_image_snr.
-        let defaultsVersion = 18
+        // 19: flow_upsample_candidates on -- 460-main's three-candidate
+        // content-aware inter-level flow upscale (replaces IPOL main's bilinear).
+        let defaultsVersion = 19
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)

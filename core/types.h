@@ -712,10 +712,12 @@ struct Config {
     // running. align_match_14 keeps its other two effects -- the level-0 search
     // radius and the per-level ICA policy below -- and no longer silently owns a
     // third.
-    // IPOL main match: the newer reference upsamples inter-level flow with a
-    // plain bilinear resize (config.alignment.flow_upscale_mode default
-    // "bilinear"), not the HDR+/460 three-candidate re-match. Default off.
-    bool flow_upsample_candidates = false;
+    // Inter-level flow upsampling. true = HDR+/460-main's three-candidate
+    // content-aware re-match (upscale_flow_460); false = IPOL main's plain
+    // bilinear resize (flow_upscale_mode "bilinear", upscale_flow_bilinear_14).
+    // DELIBERATELY set to the 460 candidate upsampler by request -- a divergence
+    // from the newer IPOL main, which uses bilinear.
+    bool flow_upsample_candidates = true;
     bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
 
     // Per-tile local affine motion model. When on, the finalized flow field is
