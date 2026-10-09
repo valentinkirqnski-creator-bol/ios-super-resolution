@@ -42,8 +42,6 @@ targets:
           - "grey_pyramid.cpp"
           - "align.cpp"
           - "robustness.cpp"
-          - "sr_gate.cpp"
-          - "sr_gate_unet.cpp"
           - "kernels.cpp"
           - "merge.cpp"
           - "pipeline.cpp"

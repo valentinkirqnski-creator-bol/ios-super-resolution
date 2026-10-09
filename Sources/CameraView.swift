@@ -1078,58 +1078,6 @@ struct CameraView: View {
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
-            Toggle("Neural Robustness Mask", isOn: $cam.tuningParams.sr_gate_enabled)
-                .disabled(cam.tuningParams.robustness_raw_resolution_enabled)
-            // A plain if rather than a ternary inside the Text: an inline ternary
-            // in a Text is the shape that has pushed this file past the type
-            // checker before.
-            if cam.tuningParams.robustness_raw_resolution_enabled {
-                Text("Unavailable while Robustness at Raw Resolution is ON. The network is trained on the standard half-resolution colour inputs and declines on anything else, which leaves the fixed formula running.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            }
-            Text("""
-                 Decides per pixel how much of each frame to merge, using a small trained network instead of the fixed formula. It was trained on the merged result, so it keeps the sub-pixel offsets that super-resolution needs while still rejecting real misalignment: ghosting and doubled edges from moving subjects or hand shake.
-
-                 Measured +5.2 dB against the fixed formula on held-out test bursts, and better in every case tested. Slightly slower per shot. Turn it off to get the previous behaviour exactly.
-                 """)
-                .font(.footnote)
-                .foregroundColor(.secondary)
-            Toggle("Artifact Network (experimental)", isOn: $cam.tuningParams.sr_gate_unet_enabled)
-                .disabled(!cam.tuningParams.sr_gate_enabled)
-            if cam.tuningParams.sr_gate_unet_enabled {
-                HStack {
-                    Text("Tolerance")
-                    Slider(value: $cam.tuningParams.sr_gate_tau, in: 0.1...3.0, step: 0.05)
-                    Text(String(format: "%.2f", cam.tuningParams.sr_gate_tau))
-                        .monospacedDigit().frame(width: 46, alignment: .trailing)
-                }
-            }
-            Text("""
-                 A bigger network that estimates how much damage merging each frame would do to each part of the picture, instead of scoring it directly. Tolerance then sets how much damage is allowed through, measured against that area's own noise: lower throws away more.
-
-                 It sees the aligned frame itself rather than summary numbers about it, so it can recognise the trace a fraction-of-a-pixel shift leaves at an edge. On test bursts it let through about a third as many visible errors as the fixed formula at the same level of detail, and none at all at a tolerance of 0.25.
-
-                 Experimental, and slower per shot. On real photos it tends to reject whole textured areas rather than just the damaged parts, so check detailed subjects like foliage before keeping it on.
-                 """)
-                .font(.footnote)
-                .foregroundColor(.secondary)
-            Toggle("Reject Rotation & Parallax", isOn: $cam.tuningParams.sr_gate_geom_reject_enabled)
-                .disabled(!cam.tuningParams.sr_gate_enabled)
-            if !cam.tuningParams.sr_gate_enabled {
-                Text("Needs the Neural Robustness Mask above to be ON. With it off the fixed formula already applies this test.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            }
-            Text("""
-                 Adds a second test on top of the neural mask: it throws away pixels where one motion vector for the whole tile cannot describe the motion inside it. That is what camera rotation and parallax do, and the neural mask alone is weak on both.
-
-                 The neural mask replaced the fixed formula wholesale, including this test, which was never part of it. On synthesised bursts the fixed formula with this test on throws away 27.2% of what the neural mask keeps.
-
-                 It can only remove, never add, and only where the test fires, so static scenes look exactly as they do with it off. The cost is bluntness: it also rejects about 2.2% of correctly aligned pixels, mostly thin lines and strong edges, so fine detail can soften on scenes that did not need it.
-                 """)
-                .font(.footnote)
-                .foregroundColor(.secondary)
         }
     }
 
