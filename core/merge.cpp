@@ -184,7 +184,11 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // the reference frame before align(), so the actual comp position is
             // H*(lr + residual_flow). Compose it back here (and the covariance is
             // then fetched at the correct comp position too).
-            if (cfg.global_homography_enabled && flow.has_global_h) {
+            // has_global_h is set by whichever feature produced the transform
+            // (global homography OR the ISA pre-align warp), so compose it here
+            // regardless of which flag is on -- matching the Metal path, which
+            // keys purely on has_global_h / have_homography.
+            if (flow.has_global_h) {
                 f32 hx, hy;
                 apply_homography(flow.global_h, lr_mov_x, lr_mov_y, hx, hy);
                 lr_mov_x = hx; lr_mov_y = hy;

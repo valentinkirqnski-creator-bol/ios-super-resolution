@@ -2131,7 +2131,7 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             // Global homography: compose H*(comp position) as the merge does.
             // The guide may be half-res (3ch), so convert guide->raw (x2), apply
             // H (raw/lr coords), convert back (/2); the full-res 1ch guide is raw.
-            if (cfg.global_homography_enabled && flow.has_global_h) {
+            if (flow.has_global_h) {
                 f32 hx, hy;
                 if (d_p.c == 1) {
                     apply_homography(flow.global_h, sample_x, sample_y, hx, hy);
@@ -2301,7 +2301,7 @@ void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
             // is half-res here, so x2 to raw / apply H / /2 back), matching the
             // merge. Only on the !raw_res (guide) branch.
             f32 s_x = (f32)x + fx, s_y = (f32)y + fy;
-            if (!raw_res && cfg.global_homography_enabled && flow.has_global_h) {
+            if (!raw_res && flow.has_global_h) {
                 f32 hx, hy;
                 apply_homography(flow.global_h, 2.f * s_x, 2.f * s_y, hx, hy);
                 s_x = 0.5f * hx; s_y = 0.5f * hy;
