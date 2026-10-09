@@ -543,6 +543,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.tile_reject_nn_enabled = tuning[@"tile_reject_nn_enabled"].boolValue;
     if (tuning[@"flow_upsample_candidates"])
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
+    if (tuning[@"isa_prealign_enabled"])
+        cfg.isa_prealign_enabled = tuning[@"isa_prealign_enabled"].boolValue;
     if (tuning[@"real_rgb_guide"])
         cfg.real_rgb_guide = tuning[@"real_rgb_guide"].boolValue;
     if (tuning[@"guide_white_balance"])

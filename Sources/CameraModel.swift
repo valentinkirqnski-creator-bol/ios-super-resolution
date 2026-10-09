@@ -194,6 +194,9 @@ struct TuningParams: Equatable, Codable {
     /// Forced OFF by align_match_14, which is what 1.4 does.
     /// 460-main's three-candidate content-aware inter-level flow upscale.
     var flow_upsample_candidates: Bool = true  // 460-main candidate upsample (not IPOL main's bilinear)
+    /// ImageStackAlignator-style global pre-alignment (FFT phase-correlation
+    /// rotation+shift scan, no gyro). Opt-in; off by default.
+    var isa_prealign_enabled: Bool = false
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -364,7 +367,7 @@ struct TuningParams: Equatable, Codable {
         case global_homography_enabled
         case tile_reject_nn_enabled
         case guide_white_balance, guide_color_matrix, guide_curve
-        case real_rgb_guide, flow_upsample_candidates
+        case real_rgb_guide, flow_upsample_candidates, isa_prealign_enabled
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
@@ -458,6 +461,7 @@ struct TuningParams: Equatable, Codable {
         global_homography_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_homography_enabled) ?? global_homography_enabled
         tile_reject_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .tile_reject_nn_enabled) ?? tile_reject_nn_enabled
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
+        isa_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .isa_prealign_enabled) ?? isa_prealign_enabled
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2252,6 +2256,7 @@ final class CameraModel: NSObject, ObservableObject {
             "global_homography_enabled": NSNumber(value: tuningParams.global_homography_enabled),
             "tile_reject_nn_enabled": NSNumber(value: tuningParams.tile_reject_nn_enabled),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
+            "isa_prealign_enabled": NSNumber(value: tuningParams.isa_prealign_enabled),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
