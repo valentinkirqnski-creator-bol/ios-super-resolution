@@ -123,9 +123,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // Python accumulate(): coarse_ref_sub_pos = output_pixel / scale.
-            const f32 lr_x = (f32)hr_j / scale;
-            const f32 lr_y = (f32)hr_i / scale;
+            // IPOL main accumulate(): lr = (output_pixel + 0.5) / scale
+            // (pixel-centre convention), not output_pixel / scale.
+            const f32 lr_x = ((f32)hr_j + 0.5f) / scale;
+            const f32 lr_y = ((f32)hr_i + 0.5f) / scale;
 
             // Python: px = int(lr_x // tile_size); no clamp on flow tile index
             const int px = (int)(lr_x / (f32)tile_size);
@@ -153,23 +154,21 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // guide-resolution path, so the flag can say "raw" while the mask
             // handed to us is guide. Trusting the flag there would sample R
             // at half the correct position everywhere.
+            // IPOL main accumulate(): R fetched NEAREST, implicitly nearest-
+            // upsampled. bayer -> i_r = min(int(lr//2 - 0.5), H/2-1); grey ->
+            // i_r = min(int(lr), H-1). (max(.,0) guards the negative edge.)
             const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
-            f32 rob_y = lr_y, rob_x = lr_x;
-            if (!rob_is_raw && cfg.bayer_mode) {
-                rob_y = (lr_y - 0.5f) / 2.f;
-                rob_x = (lr_x - 0.5f) / 2.f;
-            }
-            // Config::merge_robustness_bilinear documents why this is no longer
-            // nearest by default, and what the nearest branch was protecting.
             f32 local_r;
-            if (cfg.merge_robustness_bilinear) {
-                local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
+            if (!rob_is_raw && cfg.bayer_mode) {
+                int i_r = std::min((int)(std::floor(lr_y * 0.5f) - 0.5f), robustness.h - 1);
+                int j_r = std::min((int)(std::floor(lr_x * 0.5f) - 0.5f), robustness.w - 1);
+                i_r = std::max(i_r, 0); j_r = std::max(j_r, 0);
+                local_r = robustness.at(i_r, j_r);
             } else {
-                const int iy = std::min(robustness.h - 1,
-                                        std::max(0, (int)std::floor(rob_y + 0.5f)));
-                const int ix = std::min(robustness.w - 1,
-                                        std::max(0, (int)std::floor(rob_x + 0.5f)));
-                local_r = robustness.at(iy, ix);
+                int i_r = std::min((int)lr_y, robustness.h - 1);
+                int j_r = std::min((int)lr_x, robustness.w - 1);
+                i_r = std::max(i_r, 0); j_r = std::max(j_r, 0);
+                local_r = robustness.at(i_r, j_r);
             }
 
             f32 lr_mov_x = lr_x + flowx;
@@ -191,12 +190,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             if (!iso) {
                 f32 kmap_j, kmap_i;
                 if (cfg.bayer_mode) {
-                    // 460-parity: a half-res grey cell g sits at coarse 2g+0.5,
-                    // so g = (x-0.5)/2 (merge.py accumulate, and the ref path
-                    // below). Was x/2 - 0.5 -- a 0.25-cell (0.5 raw-px) offset on
-                    // every comparison-frame covariance fetch.
-                    kmap_j = (lr_mov_x - 0.5f) / 2.f;
-                    kmap_i = (lr_mov_y - 0.5f) / 2.f;
+                    // IPOL main accumulate(): kmap = lr_mov/2 - 0.5 (grey grid is
+                    // offset and twice sparser). Was (lr_mov-0.5)/2.
+                    kmap_j = lr_mov_x / 2.f - 0.5f;
+                    kmap_i = lr_mov_y / 2.f - 0.5f;
                 } else {
                     kmap_j = lr_mov_x - 0.5f;
                     kmap_i = lr_mov_y - 0.5f;
@@ -204,8 +201,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
 
-            const int center_j = cuda_round_to_int(lr_mov_x);
-            const int center_i = cuda_round_to_int(lr_mov_y);
+            // IPOL main: center = int(lr_mov) (truncate), not round.
+            const int center_j = (int)lr_mov_x;
+            const int center_i = (int)lr_mov_y;
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
@@ -217,8 +215,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
                     const f32 c = img.at(i, j);
 
-                    const f32 dist_x = (f32)j - lr_mov_x;
-                    const f32 dist_y = (f32)i - lr_mov_y;
+                    // IPOL main: distance measured against lr_mov - 0.5 (pixel-centre).
+                    const f32 dist_x = (f32)j - (lr_mov_x - 0.5f);
+                    const f32 dist_y = (f32)i - (lr_mov_y - 0.5f);
                     f32 z;
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
@@ -252,9 +251,12 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
         for (int hr_j = 0; hr_j < Ws; ++hr_j) {
-            // Python: coarse_ref_sub_pos = output_pixel / scale  (no +0.5)
-            const f32 coarse_x = (f32)hr_j / scale;
-            const f32 coarse_y = (f32)hr_i / scale;
+            // IPOL main merges the reference through the SAME accumulate() as the
+            // comparisons, with r = 1 and zero flow -- so the reference uses the
+            // identical pixel-centre convention: lr = (output + 0.5)/scale,
+            // kmap = lr/2 - 0.5, center = int(lr), dist = j - (lr - 0.5), 1/det.
+            const f32 coarse_x = ((f32)hr_j + 0.5f) / scale;
+            const f32 coarse_y = ((f32)hr_i + 0.5f) / scale;
 
             const f32 additional_denoise_power = 1.f;
             const int rad = 1;
@@ -263,20 +265,17 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
             if (!iso) {
                 f32 kmap_j, kmap_i;
                 if (cfg.bayer_mode) {
-                    // Python: grey_pos = (coarse - 0.5) / 2
-                    kmap_j = (coarse_x - 0.5f) / 2.f;
-                    kmap_i = (coarse_y - 0.5f) / 2.f;
+                    kmap_j = coarse_x / 2.f - 0.5f;
+                    kmap_i = coarse_y / 2.f - 0.5f;
                 } else {
-                    // Python: grey_pos = coarse  (no -0.5)
-                    kmap_j = coarse_x;
-                    kmap_i = coarse_y;
+                    kmap_j = coarse_x - 0.5f;
+                    kmap_i = coarse_y - 0.5f;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
             }
 
-            // Python: center = round(coarse)
-            const int center_j = cuda_round_to_int(coarse_x);
-            const int center_i = cuda_round_to_int(coarse_y);
+            const int center_j = (int)coarse_x;
+            const int center_i = (int)coarse_y;
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -rad; di <= rad; ++di) {
@@ -288,8 +287,8 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
                     const f32 c = img.at(i, j);
 
-                    const f32 dist_x = (f32)j - coarse_x;
-                    const f32 dist_y = (f32)i - coarse_y;
+                    const f32 dist_x = (f32)j - (coarse_x - 0.5f);
+                    const f32 dist_y = (f32)i - (coarse_y - 0.5f);
                     f32 y;
                     if (iso) y = std::max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +

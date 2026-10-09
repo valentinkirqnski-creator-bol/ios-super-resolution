@@ -1120,8 +1120,9 @@ static inline void merge_comp_contrib(device const float* img,
                                       thread float& n0, thread float& n1, thread float& n2,
                                       thread float& d0, thread float& d1, thread float& d2) {
     int hr_i = int(p.y0 + local_i);
-    float lr_x = float(hr_j) / p.scale;
-    float lr_y = float(hr_i) / p.scale;
+    // IPOL main accumulate(): lr = (output + 0.5)/scale (pixel-centre).
+    float lr_x = (float(hr_j) + 0.5f) / p.scale;
+    float lr_y = (float(hr_i) + 0.5f) / p.scale;
 
     // Match CPU merge.cpp: no clamp on flow tile index (pipeline pads so in-range).
     int px = int(lr_x / float(p.tile_size));
@@ -1142,21 +1143,19 @@ static inline void merge_comp_contrib(device const float* img,
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
     // (merge.cpp) for the mirrored fix.
-    float rob_y = lr_y, rob_x = lr_x;
-    if (p.raw_res_robustness == 0u && p.bayer != 0u) {
-        rob_y = (lr_y - 0.5f) / 2.f;
-        rob_x = (lr_x - 0.5f) / 2.f;
-    }
-    // Driven by its OWN bit, not p.flow_bilinear: interpolating the mask and
-    // interpolating the tile flow are different decisions, and sharing a flag
-    // would have made turning one on silently change the alignment the merge
-    // fetches with. See Config::merge_robustness_bilinear.
+    // IPOL main accumulate(): R fetched NEAREST (implicit nearest-upsample).
+    // bayer -> i_r = min(int(lr//2 - 0.5), rob_h-1); raw-res/grey -> int(lr).
     float local_r;
-    if (p.rob_bilinear != 0u) {
-        local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
-    } else {
-        int iy = clamp(int(floor(rob_y + 0.5f)), 0, int(p.rob_h) - 1);
-        int ix = clamp(int(floor(rob_x + 0.5f)), 0, int(p.rob_w) - 1);
+    {
+        int iy, ix;
+        if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+            iy = min(int(floor(lr_y * 0.5f) - 0.5f), int(p.rob_h) - 1);
+            ix = min(int(floor(lr_x * 0.5f) - 0.5f), int(p.rob_w) - 1);
+        } else {
+            iy = min(int(lr_y), int(p.rob_h) - 1);
+            ix = min(int(lr_x), int(p.rob_w) - 1);
+        }
+        iy = max(iy, 0); ix = max(ix, 0);
         local_r = robustness[uint(iy) * p.rob_w + uint(ix)];
     }
     // Nothing to accumulate where the frame is fully rejected. Every
@@ -1188,11 +1187,9 @@ static inline void merge_comp_contrib(device const float* img,
     if (!p.iso) {
         float kmap_j, kmap_i;
         if (p.bayer) {
-            // 460-parity: grey cell g sits at coarse 2g+0.5, so g=(x-0.5)/2
-            // (merge.py accumulate / the ref path). Was x/2 - 0.5, a 0.25-cell
-            // (0.5 raw-px) offset on every comparison-frame covariance fetch.
-            kmap_j = (lr_mov_x - 0.5f) / 2.f;
-            kmap_i = (lr_mov_y - 0.5f) / 2.f;
+            // IPOL main accumulate(): kmap = lr_mov/2 - 0.5.
+            kmap_j = lr_mov_x / 2.f - 0.5f;
+            kmap_i = lr_mov_y / 2.f - 0.5f;
         } else {
             kmap_j = lr_mov_x - 0.5f;
             kmap_i = lr_mov_y - 0.5f;
@@ -1201,8 +1198,9 @@ static inline void merge_comp_contrib(device const float* img,
                        kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
-    int center_j = lround_away(lr_mov_x);
-    int center_i = lround_away(lr_mov_y);
+    // IPOL main: center = int(lr_mov) (truncate), not round.
+    int center_j = int(lr_mov_x);
+    int center_i = int(lr_mov_y);
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -1214,8 +1212,9 @@ static inline void merge_comp_contrib(device const float* img,
 
             int channel = cfa_channel(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
-            float dist_x = float(j) - lr_mov_x;
-            float dist_y = float(i) - lr_mov_y;
+            // IPOL main: distance against lr_mov - 0.5 (pixel-centre).
+            float dist_x = float(j) - (lr_mov_x - 0.5f);
+            float dist_y = float(i) - (lr_mov_y - 0.5f);
             float z;
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
@@ -1344,8 +1343,11 @@ static inline void merge_ref_contrib(device const float* img,
                                      thread float& d0, thread float& d1, thread float& d2,
                                      thread bool& overwrite_out) {
     int hr_i = int(p.y0 + local_i);
-    float coarse_x = float(hr_j) / p.scale;
-    float coarse_y = float(hr_i) / p.scale;
+    // IPOL main merges the reference via the same accumulate() (r=1, zero flow):
+    // lr = (output + 0.5)/scale, kmap = lr/2 - 0.5, center = int(lr),
+    // dist = j - (lr - 0.5), 1/det cov.
+    float coarse_x = (float(hr_j) + 0.5f) / p.scale;
+    float coarse_y = (float(hr_i) + 0.5f) / p.scale;
 
     float local_acc_r = 0.f;
     float additional_denoise_power = 1.f;
@@ -1395,18 +1397,18 @@ static inline void merge_ref_contrib(device const float* img,
     if (!p.iso) {
         float kmap_j, kmap_i;
         if (p.bayer) {
-            kmap_j = (coarse_x - 0.5f) / 2.f;
-            kmap_i = (coarse_y - 0.5f) / 2.f;
+            kmap_j = coarse_x / 2.f - 0.5f;
+            kmap_i = coarse_y / 2.f - 0.5f;
         } else {
-            kmap_j = coarse_x;
-            kmap_i = coarse_y;
+            kmap_j = coarse_x - 0.5f;
+            kmap_i = coarse_y - 0.5f;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, p.cov_stride,
-                       kmap_i, kmap_j, ixx, ixy, iyy, false);
+                       kmap_i, kmap_j, ixx, ixy, iyy, true);
     }
 
-    int center_j = int(round(coarse_x));
-    int center_i = int(round(coarse_y));
+    int center_j = int(coarse_x);
+    int center_i = int(coarse_y);
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -1418,8 +1420,8 @@ static inline void merge_ref_contrib(device const float* img,
 
             int channel = cfa_channel_ref(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
-            float dist_x = float(j) - coarse_x;
-            float dist_y = float(i) - coarse_y;
+            float dist_x = float(j) - (coarse_x - 0.5f);
+            float dist_y = float(i) - (coarse_y - 0.5f);
             float y;
             if (p.iso) y = max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
