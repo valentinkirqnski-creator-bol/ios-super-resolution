@@ -1167,9 +1167,13 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
-            // 460-main cuda_apply_noise_model: apply max(measured, noise-floor)
-            // and the Wiener shrink PER CHANNEL, then sum over channels.
-            f32 sigma_sq_ = 0.f, d_sq_ = 0.f;
+            // IPOL main (robustness.py cuda_compute_d_sigma): SUM each term over
+            // channels first, then combine ONCE -- sigma^2 = max(Sum var_c,
+            // Sum sigma_t,c^2); a single Wiener shrink from the summed d. This
+            // "max-of-sums" differs from the older 460 per-channel "sum-of-max"
+            // (systematically less forgiving on coloured edges).
+            f32 sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+            f32 d_ms_sq = 0.f, d_md_sq = 0.f;
             for (int ch = 0; ch < n_ch; ++ch) {
                 const NoiseCurves& nc = *nc_ch[ch];
                 f32 brightness = ref_means.at(y, x, ch);
@@ -1186,14 +1190,15 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                     id_noise = (int)nc.std_curve.size() - 1;
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
-                const f32 sigma_p_sq = ref_vars.at(y, x, ch);
-                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                sigma_ms_sq += ref_vars.at(y, x, ch);
+                sigma_md_sq += sigma_t * sigma_t;
                 const f32 d_p_ = d_p.at(y, x, ch);
-                const f32 d_p_sq = d_p_ * d_p_;
-                const f32 denom = d_p_sq + d_t * d_t;
-                const f32 shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
-                d_sq_ += d_p_sq * shrink * shrink;
+                d_ms_sq += d_p_ * d_p_;
+                d_md_sq += d_t * d_t;
             }
+            const f32 sigma_sq_ = std::max(sigma_ms_sq, sigma_md_sq);
+            const f32 shrink = (d_ms_sq + d_md_sq > 0.f) ? d_ms_sq / (d_ms_sq + d_md_sq) : 0.f;
+            const f32 d_sq_ = d_ms_sq * shrink * shrink;
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
         }
@@ -1988,8 +1993,9 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 }
             }
             for (int ch = 0; ch < d_p.c; ++ch) {
-                // 460-parity: nearest (round) comp sample, not bilinear.
-                const f32 comp = sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
+                // IPOL main (cuda_warp_dogson): Dodgson biquadratic (anti-aliased)
+                // sub-pixel warp of the comp mean, replacing the 460 nearest fetch.
+                const f32 comp = sample_dogson(comp_means, sample_y, sample_x, ch);
                 const f32 dp = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();

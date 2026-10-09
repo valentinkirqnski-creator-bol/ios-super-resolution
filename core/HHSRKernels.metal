@@ -1807,6 +1807,28 @@ inline float rob_sample_nearest_or_inf(device const float* img,
     return img[(uint(yi) * w + uint(xi)) * nch + ch];
 }
 
+// IPOL main (robustness.py cuda_warp_dogson): Dodgson biquadratic (3x3) sub-pixel
+// warp of the comp local mean -- anti-aliased, replaces the 460 nearest fetch.
+// OOB -> INFINITY so R collapses to 0. Twin of sample_dogson in robustness.cpp.
+inline float rob_sample_dogson_or_inf(device const float* img,
+                                      uint h, uint w, uint nch,
+                                      float y, float x, uint ch) {
+    if (!(y >= 0.f && y < float(h) && x >= 0.f && x < float(w))) return INFINITY;
+    int cy = lround_away(y), cx = lround_away(x);
+    float w_acc = 0.f, buf = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        int y_ = clamp_edge(cy + i, int(h) - 1);
+        float wy = dogson_quadratic(float(y_) - y);
+        for (int j = -1; j <= 1; ++j) {
+            int x_ = clamp_edge(cx + j, int(w) - 1);
+            float ww = wy * dogson_quadratic(float(x_) - x);
+            buf += img[(uint(y_) * w + uint(x_)) * nch + ch] * ww;
+            w_acc += ww;
+        }
+    }
+    return buf / w_acc;
+}
+
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
                             device const float* raw [[buffer(1)]],
                             constant RobGuideParams& p [[buffer(2)]],
@@ -2200,40 +2222,37 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // of channel-summed terms (max-of-sums) is a different, systematically more
     // forgiving computation when which term dominates differs across channels
     // (e.g. a colored edge), so accumulate inside the loop.
-    sigma_sq_ = 0.f;
-    d_sq_ = 0.f;
+    // IPOL main (robustness.py cuda_compute_d_sigma + cuda_warp_dogson): SUM each
+    // term over channels, then combine ONCE (max-of-sums + single Wiener shrink),
+    // and Dodgson-warp the comp mean (anti-aliased) instead of the 460 nearest
+    // fetch. Twin of apply_noise_model in robustness.cpp.
+    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+    float d_ms_sq = 0.f, d_md_sq = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
-        // Python: id_noise = round(1000 * brightness) — no clamp.
         float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
         int id_noise = lround_away(1000.f * bidx);
-        // GPU-only: Python OOBs on non-finite / out-of-range; avoid Metal faults.
-        // Finite brightness in [0,1] -> id in [0,1000] unchanged (same as Python).
         if (!isfinite(brightness))
             id_noise = 0;
         else if (id_noise < 0)
             id_noise = 0;
         else if (id_noise >= int(p.curve_n))
             id_noise = int(p.curve_n) - 1;
-        uint id = uint(id_noise);
-        // std_curve/diff_curve hold up to 3 concatenated per-channel curves
-        // (metal_gpu.mm), each ch its own -- not one shared by every guide
-        // channel. See Config::noise_alpha_ch/noise_beta_ch (types.h).
-        uint curve_id = ch * p.curve_n + id;
+        uint curve_id = ch * p.curve_n + uint(id_noise);
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
-        float sigma_p_sq = ref_vars[o];
-        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
-        // 460-parity: nearest (round) comp sample, not bilinear.
-        float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
-                                               sample_y, sample_x, ch);
+        sigma_ms_sq += ref_vars[o];
+        sigma_md_sq += sigma_t * sigma_t;
+        float comp = rob_sample_dogson_or_inf(comp_means, p.h, p.w, p.nch,
+                                              sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
-        float d_p_sq = d_p_ * d_p_;
-        float denom = d_p_sq + d_t * d_t;
-        float shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
-        d_sq_ += d_p_sq * shrink * shrink;
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
     }
+    sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = (d_ms_sq + d_md_sq > 0.f) ? d_ms_sq / (d_ms_sq + d_md_sq) : 0.f;
+    d_sq_ = d_ms_sq * shrink * shrink;
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // pixel's tile coordinate, matching the flow sampling above. Else nearest.
     float s;
