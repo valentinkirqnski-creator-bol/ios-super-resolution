@@ -1676,6 +1676,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 seed_dx = seed_dy = seed_rot = 0.f;  // residual align from zero
             }
         }
+#if defined(__APPLE__)
+        // compute_grey_fft pinned the UNWARPED comp grey as sticky_grey, and
+        // align_metal reuses it by dimensions. When the comp was warped
+        // (homography or ISA pre-align) align MUST use the warped host grey, or
+        // it aligns the unwarped grey and global_h is then composed a SECOND time
+        // downstream -- a double transform that displaces the comp everywhere and
+        // drives the robustness mask dark even on a still burst. Dropping the pin
+        // makes align upload the warped grey, so the residual flow compensates and
+        // global_h composes exactly once.
+        if (align_comp != &comp_grey) metal_invalidate_sticky_grey();
+#endif
         FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
                                seed_dx, seed_dy, seed_rot);
         // Alignment ran on the grey. With the Bayer quad average that is half
