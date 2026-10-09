@@ -1438,7 +1438,15 @@ static Image compute_grey_fft_metal_impl(const Image& raw) {
     prof_tag_gpu(cmd, "grey:fft");
     [cmd commit];
     [cmd waitUntilCompleted];
-    if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+        // An empty mask here reaches the caller as "no comparison frame
+        // merged", which says nothing about the cause. Print what Metal
+        // reported -- a shader fault, an out-of-bounds access and the GPU
+        // watchdog all land here and need different fixes.
+        NSLog(@"[hhsr] robustness command buffer failed: status %ld error %@",
+              (long)cmd.status, cmd.error ? cmd.error : @"(none)");
+        return Image();
+    }
 
     // Pin for align_metal (moving grey) — same pixels as the host Image.
     c.sticky_grey = real_out;
@@ -1717,6 +1725,8 @@ struct SrGateFeatParamsCPU {
     float alpha_rob, beta_rob;
     int32_t dst_y0;
     uint32_t dst_rows;
+    // See SrGateFeatParams in HHSRKernels.metal.
+    uint32_t dst_stride = 0;
 };
 static_assert(sizeof(SrGateFeatParamsCPU) == 48, "SrGateFeatParamsCPU");
 
@@ -1867,6 +1877,9 @@ static bool rob_run_sr_gate_unet(id<MTLBuffer> b_out, size_t out_off_bytes,
     fp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u;
     fp.alpha_rob = cfg.noise_alpha_robustness();
     fp.beta_rob = cfg.noise_beta_robustness();
+    // The eight statistics go into a 20-float-per-pixel vector, not a tight
+    // 8-float one: srgu_image_features fills channels 8..19 of the same pixel.
+    fp.dst_stride = SRGU_IN;
 
     auto conv = [&](id<MTLBuffer> dst, id<MTLBuffer> src,
                     const SrGUConvParamsCPU& cp) -> bool {

@@ -2400,6 +2400,11 @@ struct SrGateFeatParams {
     float alpha_rob, beta_rob;
     int  dst_y0;         // image row of this band's first output row
     uint dst_rows;
+    // Floats per pixel in the destination. SRG_FEATURES for the small gate,
+    // SRGU_IN when the U-Net is packing its first eight channels into a wider
+    // vector. Explicit because the two gates share this kernel and a silently
+    // assumed stride interleaves the planes instead of failing.
+    uint dst_stride;
 };
 
 struct SrGateConvParams {
@@ -2566,7 +2571,8 @@ kernel void sr_gate_features(device float* feat [[buffer(0)]],
 
     thread float out8[SRG_FEATURES];
     sr_gate_features_from(&in, out8);
-    device float* o = feat + (uint(gid.y) * w + uint(x)) * SRG_FEATURES;
+    const uint stride = (p.dst_stride != 0u) ? p.dst_stride : uint(SRG_FEATURES);
+    device float* o = feat + (uint(gid.y) * w + uint(x)) * stride;
     for (uint i = 0u; i < uint(SRG_FEATURES); ++i) o[i] = out8[i];
 }
 
