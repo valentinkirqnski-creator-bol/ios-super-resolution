@@ -71,9 +71,9 @@ void tune_config_snr(const Image& ref_raw, Config& cfg, f32* out_brightness) {
     cfg.D_tr = lerpf(snr, 6.f, 30.f, 1.24f, 1.0f);
 
     int Ts = (snr <= 14.f) ? 64 : (snr <= 22.f) ? 32 : 16;
-    // 460-main falls back to 32 because its block matching kernels do not
-    // support tiles larger than that.
-    if (Ts > 32) Ts = 32;
+    // IPOL main match: the newer reference supports tile 64 (dedicated BM/ICA
+    // kernels), and so does this port (l1_bm_ts64, the ts==64 ICA branch), so
+    // the old "clamp to 32" 460 fallback is removed -- low-SNR bursts use 64.
     set_alignment_tile_sizes(cfg, manual_tile_size > 0 ? manual_tile_size : Ts);
 }
 

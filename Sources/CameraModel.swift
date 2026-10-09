@@ -193,13 +193,13 @@ struct TuningParams: Equatable, Codable {
     ///
     /// Forced OFF by align_match_14, which is what 1.4 does.
     /// Default true: 460-main uses the three-candidate content-aware upscale.
-    var flow_upsample_candidates: Bool = true
+    var flow_upsample_candidates: Bool = false  // IPOL main: bilinear inter-level flow upsample
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
     /// -1 auto (follow sqrt guide), 0 none, 1 sqrt, 2 gamma, 3 srgb.
     /// Default 0 (none/linear): 460-main's guide is linear raw, no VST.
-    var guide_curve: Int = 0   // None (460 linear guide)
+    var guide_curve: Int = 1   // IPOL main: sqrt-VST robustness guide (Sqrt VST)
     /// Per-pixel motion scale s (Wronski's per-pixel M): sample s bilinearly per
     /// pixel instead of one value per 16px tile, removing the tile-block R the
     /// paper never had. Off by default.
@@ -544,7 +544,9 @@ final class CameraModel: NSObject, ObservableObject {
         // guide, Dodgson x2 upscale of the statistics); bilinear-stat toggle removed.
         // 16: Dodgson full-res robustness back OFF by default -- it is opt-in and
         // disables GPU frame residency; the default path keeps residency active.
-        let defaultsVersion = 16
+        // 17: begin "match IPOL main" (stage 1): sqrt-VST robustness guide
+        // (guide_curve=1), bilinear inter-level flow upsample, tile-64 uncapped.
+        let defaultsVersion = 17
         let verKey = "TuningParamsDefaultsVersion"
         if UserDefaults.standard.integer(forKey: verKey) < defaultsVersion {
             UserDefaults.standard.set(defaultsVersion, forKey: verKey)
