@@ -7,6 +7,11 @@ from __future__ import annotations
 import os
 import sys
 
+import shutil
+import struct
+import subprocess
+import tempfile
+
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +50,132 @@ def psnr(a, b):
     return 10.0 * np.log10(1.0 / max(m, 1e-12))
 
 
-def build_burst(scene, spec, rng, tile_size=16):
+# ---------------------------------------------------------------------------
+# the REAL aligner (tools/sr_gate/align_tool.exe, built from core/align.cpp)
+# ---------------------------------------------------------------------------
+
+ALIGN_EXE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'align_tool.exe')
+
+
+def real_flow(raws, tile_size, grey_method=0):
+    """Per-tile flow as THIS pipeline's block matcher actually produces it.
+
+    The alternative -- corrupting the true flow with a chosen noise model --
+    trains the mask to recognise errors no aligner makes. What matters is where
+    this matcher fails: repeated texture, low contrast, heavy noise, large
+    displacement beyond its search range. That distribution is not guessable,
+    so it is measured by running the matcher.
+
+    Verified against known answers before use: identical frames give flow
+    exactly 0, and a 3 px roll gives dx = 2.984.
+
+    Returns None if the tool is missing, so callers can fall back rather than
+    silently train on something else.
+    """
+    if not os.path.exists(ALIGN_EXE):
+        return None
+    h, w = raws[0].shape[:2]
+    tmp = tempfile.mkdtemp(prefix='srg_align_')
+    try:
+        fi = os.path.join(tmp, 'i.bin')
+        fo = os.path.join(tmp, 'o.bin')
+        with open(fi, 'wb') as f:
+            f.write(struct.pack('<5i', h, w, int(tile_size), len(raws),
+                                int(grey_method)))
+            for r in raws:
+                f.write(np.ascontiguousarray(r, dtype=np.float32).tobytes())
+        r = subprocess.run([ALIGN_EXE, fi, fo], capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(fo):
+            return None
+        with open(fo, 'rb') as f:
+            nc, ny, nx = struct.unpack('<3i', f.read(12))
+            a = np.frombuffer(f.read(), dtype=np.float32)
+        a = a.reshape(nc, ny, nx, 2).astype(np.float32)
+        # Frame 0 is the reference and has no flow; keep the list shape the
+        # synthesiser uses so callers index it the same way.
+        return [np.zeros((ny, nx, 2), np.float32)] + [a[i] for i in range(nc)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Image-domain inputs for the gate (in ADDITION to the eight robustness
+# statistics). The scalar statistics summarise the residual; these carry its
+# spatial structure, which is what distinguishes correct alignment plus aliasing
+# from a fraction of a pixel of misalignment at an edge. A small translation
+# error across an edge produces a signed +/- residual pair; |d| alone reduces
+# that to "large d near a large gradient".
+IMG_CH = 12   # I_r(3) I_w(3) E(3) |grad I_r| |grad I_w| grad.grad
+
+
+def _lum_grad(a):
+    """(h, w, 3) -> gx, gy of the channel mean."""
+    g = a.mean(axis=2)
+    gx = np.zeros_like(g)
+    gy = np.zeros_like(g)
+    gx[:, 1:-1] = 0.5 * (g[:, 2:] - g[:, :-2])
+    gy[1:-1, :] = 0.5 * (g[2:, :] - g[:-2, :])
+    return gx, gy
+
+
+def warp_guide(comp_means, flow, cfg, nch=3):
+    """The comparison guide resampled by the ESTIMATED per-tile flow -- the same
+    fetch compute_d_sigma makes internally, lifted out so the warped image
+    itself can be handed to the network."""
+    h, w = comp_means.shape[:2]
+    ts = cfg.tile_size
+    ty, tx = srsim.tile_index_grids(h, w, ts, nch)
+    ty = np.clip(ty, 0, flow.shape[0] - 1)
+    tx = np.clip(tx, 0, flow.shape[1] - 1)
+    fsc = 0.5 if nch == 3 else 1.0
+    fx = flow[..., 0][ty, tx] * fsc
+    fy = flow[..., 1][ty, tx] * fsc
+    yy, xx = np.mgrid[0:h, 0:w]
+    out = np.zeros_like(comp_means)
+    for ch in range(comp_means.shape[2]):
+        v = srsim.sample_bilinear_or_inf(comp_means[..., ch], yy + fy, xx + fx)
+        out[..., ch] = np.nan_to_num(np.where(np.isfinite(v), v, 0.0),
+                                     nan=0.0, posinf=0.0, neginf=0.0)
+    return out
+
+
+def image_features(ref_m, comp_m, flow, cfg):
+    """-> (IMG_CH, h, w)."""
+    warped = warp_guide(comp_m, flow, cfg)
+    e = warped - ref_m
+    rgx, rgy = _lum_grad(ref_m)
+    wgx, wgy = _lum_grad(warped)
+    out = np.concatenate([
+        np.transpose(ref_m, (2, 0, 1)),
+        np.transpose(warped, (2, 0, 1)),
+        np.transpose(e, (2, 0, 1)),
+        np.sqrt(rgx * rgx + rgy * rgy)[None],
+        np.sqrt(wgx * wgx + wgy * wgy)[None],
+        (rgx * wgx + rgy * wgy)[None],
+    ], axis=0)
+    return out.astype(np.float32)
+
+
+def flow_error(true_flow_n, flow_n, gh, gw, cfg, scale=2):
+    """|F_hat - F_true| per MASK pixel, in raw pixels.
+
+    true_flow_n is per pixel at output resolution (2x raw) in raw-pixel units;
+    flow_n is the per-tile estimate the pipeline was handed. Mask pixel g maps
+    to raw 2g maps to output index 4g, hence the ::(2*scale) subsample.
+    """
+    tfx, tfy = true_flow_n
+    st = 2 * scale
+    tx_ = tfx[::st, ::st][:gh, :gw]
+    ty_ = tfy[::st, ::st][:gh, :gw]
+    ti, tj = srsim.tile_index_grids(gh, gw, cfg.tile_size, 3)
+    ti = np.clip(ti, 0, flow_n.shape[0] - 1)
+    tj = np.clip(tj, 0, flow_n.shape[1] - 1)
+    ex = flow_n[..., 0][ti, tj] - tx_
+    ey = flow_n[..., 1][ti, tj] - ty_
+    return np.sqrt(ex * ex + ey * ey).astype(np.float32)
+
+
+def build_burst(scene, spec, rng, tile_size=16, use_real_align=True):
     """-> dict(feat, Rw, A, B, A_ref, B_ref, gt, meta)
 
     feat  (N-1, NUM_FEATURES, h, w)   the gate input, guide/raw lattice
@@ -57,6 +187,16 @@ def build_burst(scene, spec, rng, tile_size=16):
     b = srburst.synth_burst(scene, spec, rng, tile_size=tile_size)
     h, w = b['h'], b['w']
     N = len(b['raws'])
+    # The flow the mask is scored against is the one the REAL matcher produces,
+    # not the synthesiser's fabricated estimate. Fall back only if the tool is
+    # missing, and say so, rather than quietly training on a different
+    # distribution.
+    rf = real_flow(b['raws'], tile_size) if use_real_align else None
+    if rf is not None and rf[1].shape[:2] == b['flows'][1].shape[:2]:
+        b['flows'] = rf
+        b['align'] = 'real'
+    else:
+        b['align'] = 'synthetic'
 
     cfg = srsim.Cfg(noise_gain=spec.noise_gain, tile_size=tile_size)
     cfg.use_decimated_guide()
@@ -79,10 +219,14 @@ def build_burst(scene, spec, rng, tile_size=16):
     B = np.zeros_like(A)
     Ag = np.zeros_like(A)
     Bg = np.zeros_like(A)
+    At = np.zeros_like(A)
+    Bt = np.zeros_like(A)
     # Only the shipped channels are stored. srsim can build 12; channels 8-11
     # measured neutral and core/sr_gate_shared.h declares 8.
     NF = 8
     feat = np.zeros((N - 1, NF, gh, gw), np.float32)
+    img = np.zeros((N - 1, IMG_CH, gh, gw), np.float32)
+    ferr = np.zeros((N - 1, gh, gw), np.float32)
     Rw = np.zeros((N - 1, gh, gw), np.float32)
 
     for n in range(1, N):
@@ -96,6 +240,13 @@ def build_burst(scene, spec, rng, tile_size=16):
         tfx, tfy = b['true_flow'][n]
         Ag[n - 1], Bg[n - 1] = srmerge.accumulate_comp_ab(
             b['raws_clean'][n], tfx[::ST, ::ST], tfy[::ST, ::ST], covs_c, cfg, ST)
+        # The SAME noisy frame fetched with the TRUE flow. Differencing this
+        # against A/B above isolates the flow error exactly: identical pixels,
+        # identical noise realisation, identical kernels -- the only thing that
+        # changed is where the merge reached for them. That difference IS the
+        # artifact this frame contributes, which is what the network predicts.
+        At[n - 1], Bt[n - 1] = srmerge.accumulate_comp_ab(
+            b['raws'][n], tfx[::ST, ::ST], tfy[::ST, ::ST], covs, cfg, ST)
 
         gm, gv = srsim.local_stats_3x3(
             srsim.compute_guide_decimate3(b['raws'][n]))
@@ -103,7 +254,52 @@ def build_burst(scene, spec, rng, tile_size=16):
                                                     cfg, std_c, diff_c)
         feat[n - 1] = srsim.build_features(d_sq, sig_sq, ref_m, ref_v,
                                            b['flows'][n], cfg)[:NF]
+        img[n - 1] = image_features(ref_m, gm, b['flows'][n], cfg)
+        ferr[n - 1] = flow_error(b['true_flow'][n], b['flows'][n], gh, gw, cfg)
         Rw[n - 1] = srsim.wronski_robustness(d_sq, sig_sq, b['flows'][n], ref_m, cfg)
+
+    # ---- the per-frame ARTIFACT target (what the network predicts) --------
+    #
+    # For frame n, the merge is run twice with everything held fixed except the
+    # flow, and the outputs differenced:
+    #
+    #   out_est  = (A_ref + A_n ) / (B_ref + B_n )   estimated flow
+    #   out_true = (A_ref + At_n) / (B_ref + Bt_n)   TRUE flow, same noisy frame
+    #   artifact = |out_est - out_true|
+    #
+    # Why this and not |dF|: 0.3 px of error in flat sky contributes nothing
+    # while 0.3 px across a hard edge is a visible double. Same displacement,
+    # opposite correct answers -- a label built from displacement cannot
+    # separate them, and this one does, because the local image content is
+    # already inside it. Why this and not the merged-image error: that mixes all
+    # seven frames into one number and leaves the network to guess which was at
+    # fault.
+    #
+    # Expressed in units of the reference frame's own noise sigma, so "1" means
+    # an artifact the size of the noise and the policy threshold is in units a
+    # viewer's eye works in. sigma is from the noise model at the local
+    # brightness, independent of any mask, so it cannot be gamed by rejecting.
+    art = np.zeros((N - 1, gh, gw), np.float32)
+    bri_ref = np.clip(ref_m.mean(axis=2), 0.0, 1.0)
+    if cfg.guide_sqrt:
+        bri_lat = bri_ref ** 2
+    else:
+        bri_lat = bri_ref
+    sig_ref = np.sqrt(np.maximum(
+        srsim.ALPHA_DNG * spec.noise_gain * bri_lat +
+        srsim.BETA_DNG * spec.noise_gain ** 2, 1e-12)).astype(np.float32)
+    for n in range(N - 1):
+        den_e = np.maximum(B_ref + B[n], 1e-8)
+        den_t = np.maximum(B_ref + Bt[n], 1e-8)
+        d = np.abs((A_ref + A[n]) / den_e - (A_ref + At[n]) / den_t)
+        d = d.mean(axis=0)                       # over colour
+        # Output lattice -> mask lattice: the mask governs a block, so take the
+        # WORST artifact in it. A mean would let one bad pixel hide behind three
+        # good ones, which is the failure being chased.
+        bh, bw = d.shape[0] // gh, d.shape[1] // gw
+        if bh >= 1 and bw >= 1:
+            d = d[:gh * bh, :gw * bw].reshape(gh, bh, gw, bw).max(axis=(1, 3))
+        art[n] = (d / np.maximum(sig_ref, 1e-8)).astype(np.float32)
 
     covs_rc = srmerge.estimate_kernels(b['raws_clean'][0], cfg)
     A_rc, B_rc = srmerge.accumulate_ref_ab(b['raws_clean'][0], covs_rc, cfg, ST)
@@ -120,7 +316,8 @@ def build_burst(scene, spec, rng, tile_size=16):
     gy[1:-1, :] = 0.5 * (g[2:, :] - g[:-2, :])
     edge = np.sqrt(gx * gx + gy * gy)
 
-    return dict(feat=feat, Rw=Rw, A=A, B=B, A_ref=A_ref, B_ref=B_ref, gt=gt,
+    return dict(feat=feat, img=img, ferr=ferr, art=art, align=b['align'],
+                Rw=Rw, A=A, B=B, A_ref=A_ref, B_ref=B_ref, gt=gt,
                 edge=edge.astype(np.float32), h=h, w=w,
                 stride=ST, guide_scale=2,
                 tile_size=tile_size, regime=b['regime'],

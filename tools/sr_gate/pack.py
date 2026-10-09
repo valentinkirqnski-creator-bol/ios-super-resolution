@@ -24,6 +24,9 @@ FIELDS = {
     'gt': np.float32,
     'edge': np.float16,
     'Rw': np.float16,
+    'img': np.float16,
+    'ferr': np.float16,
+    'art': np.float16,
     'meta': np.float32,
 }
 

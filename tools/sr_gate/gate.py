@@ -284,3 +284,123 @@ def any_from_checkpoint(ck):
     net = SRGateOnlyStricter(base, corr)
     net.eval()
     return net
+
+
+# --------------------------------------------------------------------------
+# U-Net gate: image-domain inputs, larger receptive field
+# --------------------------------------------------------------------------
+
+IMG_CH = 12          # I_r(3) I_w(3) E(3) |grad I_r| |grad I_w| grad.grad
+UNET_IN = NUM_FEATURES_SHIPPED = 8
+UNET_TOTAL_IN = 8 + IMG_CH
+
+
+class SRGateUNet(nn.Module):
+    """Encoder / bottleneck / decoder gate.
+
+    Two changes from SRGate, both aimed at evidence the old one could not reach:
+
+    INPUT. It receives the image domain as well as the scalar robustness
+    statistics -- the reference guide, the WARPED comparison guide, their signed
+    residual, both gradient magnitudes and their dot product, on top of the
+    eight statistics. The statistics summarise the residual; they cannot carry
+    its spatial structure, and that structure is what separates correct
+    alignment plus aliasing from a fraction of a pixel of misalignment at an
+    edge. A small translation error across an edge leaves a signed +/- residual
+    pair, which |d| reduces to "large d beside a large gradient".
+
+    RECEPTIVE FIELD. SRGate sees 13x13 mask pixels. Camera motion produces an
+    alignment error that is smooth over a large region, so at any one location
+    everything looks locally plausible and the evidence is in the coherence of
+    the field over a wider area. Downsampling once and dilating inside the
+    bottleneck reaches ~36 mask pixels for far less compute than stacking plain
+    convolutions would.
+
+    Replicate padding everywhere, never zeros: a zero border is an absolute
+    position code, and this project has already measured a net learning to read
+    it and then working only at the training patch size.
+    """
+
+    def __init__(self, in_ch=UNET_TOTAL_IN, base=16, mid=28, dil=(2, 4),
+                 head_bias=0.0, linear_head=False):
+        super().__init__()
+        self.in_ch = in_ch
+        self.e1 = nn.Conv2d(in_ch, base, 3)
+        self.e2 = nn.Conv2d(base, base, 3)
+        self.d1 = nn.Conv2d(base, mid, 3)
+        self.b1 = nn.Conv2d(mid, mid, 3)
+        self.b2 = nn.Conv2d(mid, mid, 3)
+        self.u1 = nn.Conv2d(mid + base, base, 3)
+        self.head = nn.Conv2d(base, 1, 1)
+        self.dil = dil
+        # linear_head: emit an unbounded value instead of a 0..1 mask. Used when
+        # the network predicts the ARTIFACT a merge would introduce (in units of
+        # the noise sigma, log1p-compressed) and the mask is derived from that by
+        # a separate policy, so the accept/reject tolerance stays a knob rather
+        # than being baked into the weights.
+        self.linear_head = linear_head
+        # Start at R = 0.5, where the sigmoid's gradient is largest and the net
+        # can move in either direction.
+        #
+        # NOT at the +2.0 bias SRGate uses. Against the supervised target R*
+        # (mean 0.147) a head opening at 0.88 has a long way down, and measured
+        # here it overshot into saturation by step 125 and stayed there: R
+        # identically 0, total variation exactly 0, no gradient through the
+        # sigmoid to climb back. Predicting 0 also SCORES well on |R - R*| --
+        # it gives exactly mean(R*) -- so nothing in the loss pulls it out.
+        nn.init.zeros_(self.head.weight)
+        nn.init.constant_(self.head.bias, head_bias)
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        s = F.relu(self._pad_conv(self.e1, x))
+        s = F.relu(self._pad_conv(self.e2, s))          # skip, full res
+        # Pad up to even so the halving is exact and the upsample lines up.
+        ph, pw = h % 2, w % 2
+        y = F.pad(s, (0, pw, 0, ph), mode='replicate') if (ph or pw) else s
+        y = F.avg_pool2d(y, 2)
+        y = F.relu(self._pad_conv(self.d1, y))
+        y = F.relu(self._pad_conv(self.b1, y, self.dil[0]))
+        y = F.relu(self._pad_conv(self.b2, y, self.dil[1]))
+        y = F.interpolate(y, scale_factor=2, mode='nearest')[..., :h, :w]
+        y = F.relu(self._pad_conv(self.u1, torch.cat([y, s], dim=1)))
+        z = self.head(y)
+        return z if self.linear_head else torch.sigmoid(z)
+
+    @staticmethod
+    def _pad_conv(conv, x, d=1):
+        x = F.pad(x, (d, d, d, d), mode='replicate')
+        return F.conv2d(x, conv.weight, conv.bias, dilation=d)
+
+    def n_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def receptive_field(self):
+        """Effective receptive field in MASK pixels, by the standard
+        rf += (k-1)*jump recursion."""
+        rf, j = 1, 1
+        for k, d, stride in ((3, 1, 1), (3, 1, 1), (2, 1, 2), (3, 1, 1),
+                             (3, self.dil[0], 1), (3, self.dil[1], 1)):
+            rf += (k - 1) * d * j
+            j *= stride
+        j //= 2                      # the upsample puts us back at full res
+        rf += (3 - 1) * 1            # decoder conv
+        return rf
+
+
+def unet_checkpoint(net, **extra):
+    ck = {'arch': 'unet', 'in_ch': net.in_ch,
+          'linear_head': bool(net.linear_head),
+          'base': net.e1.weight.shape[0], 'mid': net.d1.weight.shape[0],
+          'dil': tuple(net.dil), 'state_dict': net.state_dict()}
+    ck.update(extra)
+    return ck
+
+
+def unet_from_checkpoint(ck):
+    net = SRGateUNet(in_ch=ck['in_ch'], base=ck['base'], mid=ck['mid'],
+                     dil=tuple(ck.get('dil', (2, 4))),
+                     linear_head=bool(ck.get('linear_head', False)))
+    net.load_state_dict(ck['state_dict'])
+    net.eval()
+    return net

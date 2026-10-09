@@ -44,7 +44,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate
 
-FIELDS = ('feat', 'A', 'B', 'A_ref', 'B_ref', 'gt', 'edge', 'Rw', 'meta')
+FIELDS = ('feat', 'A', 'B', 'A_ref', 'B_ref', 'gt', 'edge', 'Rw', 'img',
+          'ferr', 'art', 'meta')
 
 
 class Split:
