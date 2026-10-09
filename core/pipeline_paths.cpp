@@ -1670,6 +1670,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 isaH[0] = cs; isaH[1] = -sn; isaH[2] = cx + idx - cs * cx + sn * cy;
                 isaH[3] = sn; isaH[4] =  cs; isaH[5] = cy + idy - sn * cx - cs * cy;
                 isaH[6] = 0.f; isaH[7] = 0.f; isaH[8] = 1.f;
+                // Upgrade the robust rigid (rotation+translation) estimate to a
+                // full 8-DOF homography by Lucas-Kanade refinement seeded from it,
+                // so the pre-align also absorbs global scale, shear and
+                // perspective ("any camera motion"). No-op (keeps the rigid seed)
+                // if the refine does not improve the fit.
+                refine_global_homography_seed(ref_grey, comp_grey, work, isaH);
                 warped_comp = warp_grey_by_homography(comp_grey, isaH);
                 align_comp = &warped_comp;
                 isa_warp = true;

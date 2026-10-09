@@ -1,4 +1,6 @@
 #include "global_homography.h"
+#include "parallel.h"
+#include <array>
 #include <cmath>
 #include <algorithm>
 #include <vector>
@@ -138,34 +140,57 @@ bool solve8(f32 A[8][8], f32 b[8], f32 x[8]) {
 // Forward-additive Lucas-Kanade homography refinement: minimise
 // sum [comp(H*p) - ref(p)]^2 over the 8 homography parameters (h8 fixed = 1).
 // Levenberg damping; reverts an iteration that increases the error.
-void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters) {
+void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
+               int num_threads) {
     f32 cur_err = warp_error(ref, comp, H);
+    const int y_lo = 1, y_hi = ref.h - 1;
+    const int rows = std::max(0, y_hi - y_lo);
+    int nt = std::max(1, std::min(resolve_threads(num_threads), std::max(1, rows)));
+    const int chunk = (rows + nt - 1) / std::max(1, nt);
     for (int it = 0; it < iters; ++it) {
-        f32 A[8][8]; f32 b[8];
-        for (int i = 0; i < 8; ++i) { b[i] = 0.f; for (int j = 0; j < 8; ++j) A[i][j] = 0.f; }
-        for (int y = 1; y < ref.h - 1; ++y) {
-            for (int x = 1; x < ref.w - 1; ++x) {
-                const f32 fx = (f32)x, fy = (f32)y;
-                const f32 D = H[6] * fx + H[7] * fy + H[8];
-                if (std::fabs(D) < 1e-6f) continue;
-                const f32 iD = 1.f / D;
-                const f32 u = (H[0] * fx + H[1] * fy + H[2]) * iD;
-                const f32 v = (H[3] * fx + H[4] * fy + H[5]) * iD;
-                if (u < 1.f || u > (f32)(comp.w - 2) || v < 1.f || v > (f32)(comp.h - 2))
-                    continue;
-                const f32 err = sample_clamp(comp, u, v) - ref.at(y, x);
-                const f32 gx = 0.5f * (sample_clamp(comp, u + 1.f, v) - sample_clamp(comp, u - 1.f, v));
-                const f32 gy = 0.5f * (sample_clamp(comp, u, v + 1.f) - sample_clamp(comp, u, v - 1.f));
-                // d(u,v)/d(h0..h7)
-                f32 J[8];
-                J[0] = gx * (fx * iD);           J[1] = gx * (fy * iD);           J[2] = gx * iD;
-                J[3] = gy * (fx * iD);           J[4] = gy * (fy * iD);           J[5] = gy * iD;
-                J[6] = -(gx * u + gy * v) * (fx * iD);
-                J[7] = -(gx * u + gy * v) * (fy * iD);
-                for (int i = 0; i < 8; ++i) {
-                    b[i] -= J[i] * err;
-                    for (int j = 0; j < 8; ++j) A[i][j] += J[i] * J[j];
+        // Per-chunk partial normal equations (double for stable accumulation),
+        // combined serially after. The pixel loop is the whole cost of LK, so
+        // chunking it across threads is what keeps the homography refine fast.
+        std::vector<std::array<double, 64>> Ap((size_t)nt);
+        std::vector<std::array<double, 8>> bp((size_t)nt);
+        for (int t = 0; t < nt; ++t) { Ap[(size_t)t].fill(0.0); bp[(size_t)t].fill(0.0); }
+        parallel_rows(nt, num_threads, [&](int t) {
+            const int ys = y_lo + t * chunk;
+            const int ye = std::min(ys + chunk, y_hi);
+            double* Aa = Ap[(size_t)t].data();
+            double* ba = bp[(size_t)t].data();
+            for (int y = ys; y < ye; ++y) {
+                for (int x = 1; x < ref.w - 1; ++x) {
+                    const f32 fx = (f32)x, fy = (f32)y;
+                    const f32 D = H[6] * fx + H[7] * fy + H[8];
+                    if (std::fabs(D) < 1e-6f) continue;
+                    const f32 iD = 1.f / D;
+                    const f32 u = (H[0] * fx + H[1] * fy + H[2]) * iD;
+                    const f32 v = (H[3] * fx + H[4] * fy + H[5]) * iD;
+                    if (u < 1.f || u > (f32)(comp.w - 2) || v < 1.f || v > (f32)(comp.h - 2))
+                        continue;
+                    const f32 err = sample_clamp(comp, u, v) - ref.at(y, x);
+                    const f32 gx = 0.5f * (sample_clamp(comp, u + 1.f, v) - sample_clamp(comp, u - 1.f, v));
+                    const f32 gy = 0.5f * (sample_clamp(comp, u, v + 1.f) - sample_clamp(comp, u, v - 1.f));
+                    f32 J[8];
+                    J[0] = gx * (fx * iD);           J[1] = gx * (fy * iD);           J[2] = gx * iD;
+                    J[3] = gy * (fx * iD);           J[4] = gy * (fy * iD);           J[5] = gy * iD;
+                    J[6] = -(gx * u + gy * v) * (fx * iD);
+                    J[7] = -(gx * u + gy * v) * (fy * iD);
+                    for (int i = 0; i < 8; ++i) {
+                        ba[i] -= (double)(J[i] * err);
+                        for (int j = 0; j < 8; ++j) Aa[i * 8 + j] += (double)(J[i] * J[j]);
+                    }
                 }
+            }
+        });
+        f32 A[8][8]; f32 b[8];
+        for (int i = 0; i < 8; ++i) {
+            double bi = 0.0; for (int t = 0; t < nt; ++t) bi += bp[(size_t)t][i];
+            b[i] = (f32)bi;
+            for (int j = 0; j < 8; ++j) {
+                double a = 0.0; for (int t = 0; t < nt; ++t) a += Ap[(size_t)t][i * 8 + j];
+                A[i][j] = (f32)a;
             }
         }
         // Levenberg damping on the diagonal.
@@ -203,6 +228,59 @@ Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]) {
     return out;
 }
 
+void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey,
+                                   const Config& cfg, f32 H_inout[9]) {
+    (void)cfg;
+    if (ref_grey.h <= 8 || ref_grey.w <= 8 ||
+        ref_grey.h != comp_grey.h || ref_grey.w != comp_grey.w) return;
+    if (ref_grey.data.size() != (size_t)ref_grey.h * ref_grey.w * ref_grey.c ||
+        comp_grey.data.size() != (size_t)comp_grey.h * comp_grey.w * comp_grey.c) return;
+
+    // Coarse-to-fine Lucas-Kanade. A single-level LK under-converges on larger
+    // scale/shear/perspective; a 3-level pyramid (each level seeded by the
+    // previous, H carried in FULL grey pixels) converges reliably. The finest
+    // level is built ONCE from the full grey (one read per image); the coarser
+    // levels are cheap 2x halvings of it -- no repeated full-grey reads.
+    // lk_refine reverts non-improving iterations, so no level worsens the fit.
+    f32 scf = 1.f;
+    const Image fine_r = downsample_to(ref_grey, 256, scf);
+    const Image fine_c = downsample_to(comp_grey, 256, scf);
+    if (fine_r.h <= 8 || fine_r.w <= 8) return;
+    const Image mid_r = downsample2x(fine_r), mid_c = downsample2x(fine_c);
+    const Image cor_r = downsample2x(mid_r), cor_c = downsample2x(mid_c);
+    struct Lvl { const Image* r; const Image* c; f32 scale; };
+    const Lvl levels[3] = { { &cor_r, &cor_c, scf * 0.25f },
+                            { &mid_r, &mid_c, scf * 0.5f },
+                            { &fine_r, &fine_c, scf } };
+
+    f32 H[9]; for (int i = 0; i < 9; ++i) H[i] = H_inout[i];
+    for (const Lvl& L : levels) {
+        if (L.r->h <= 8 || L.r->w <= 8) continue;
+        const f32 sc = L.scale;
+        const f32 S[9]    = { sc, 0, 0,  0, sc, 0,  0, 0, 1 };
+        const f32 Sinv[9] = { 1.f / sc, 0, 0,  0, 1.f / sc, 0,  0, 0, 1 };
+        f32 Hl[9]; { f32 t[9]; mat3_mul(H, Sinv, t); mat3_mul(S, t, Hl); }
+        lk_refine(*L.r, *L.c, Hl, /*iters=*/15, cfg.num_threads);
+        f32 t[9]; mat3_mul(Hl, S, t); mat3_mul(Sinv, t, H);
+    }
+
+    // Accept only if the refined homography beats the seed at the finest level
+    // and is non-degenerate; otherwise leave H_inout as the (robust) rigid seed.
+    const f32 Sf[9]  = { scf, 0, 0,  0, scf, 0,  0, 0, 1 };
+    const f32 Sfi[9] = { 1.f / scf, 0, 0,  0, 1.f / scf, 0,  0, 0, 1 };
+    f32 Href[9], Hseed[9];
+    { f32 t[9]; mat3_mul(H, Sfi, t); mat3_mul(Sf, t, Href); }
+    { f32 t[9]; mat3_mul(H_inout, Sfi, t); mat3_mul(Sf, t, Hseed); }
+    const f32 e_ref = warp_error(fine_r, fine_c, Href);
+    const f32 e_seed = warp_error(fine_r, fine_c, Hseed);
+    const f32 det2 = H[0] * H[4] - H[1] * H[3];
+    const bool degenerate = !(std::fabs(det2) > 0.25f && std::fabs(det2) < 4.f) ||
+                            !std::isfinite(e_ref);
+    if (degenerate || !(e_ref < e_seed)) return;
+
+    for (int i = 0; i < 9; ++i) H_inout[i] = H[i];
+}
+
 void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
                                 const Config& cfg, f32 H_out[9]) {
     (void)cfg;
@@ -236,7 +314,7 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
         f32 tmp[9]; mat3_mul(H, D, tmp); mat3_mul(Dinv, tmp, H);
     }
 
-    lk_refine(lk_ref, lk_comp, H, /*iters=*/40);
+    lk_refine(lk_ref, lk_comp, H, /*iters=*/40, cfg.num_threads);
 
     // Reject if the result is not meaningfully better than identity, or is
     // degenerate -- warp-then-refine must never make alignment worse.
