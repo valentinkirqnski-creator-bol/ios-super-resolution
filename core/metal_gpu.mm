@@ -1728,7 +1728,9 @@ struct SrGateFeatParamsCPU {
     // See SrGateFeatParams in HHSRKernels.metal.
     uint32_t dst_stride = 0;
 };
-static_assert(sizeof(SrGateFeatParamsCPU) == 48, "SrGateFeatParamsCPU");
+// 52, not 48: dst_stride was added so the U-Net can pack these eight
+// statistics as channels 0..7 of a wider per-pixel vector.
+static_assert(sizeof(SrGateFeatParamsCPU) == 52, "SrGateFeatParamsCPU");
 
 struct SrGateConvParamsCPU {
     uint32_t h, w;
@@ -1803,14 +1805,22 @@ struct SrGUConvParamsCPU {
     uint32_t dst_rows = 0, in_ch = 0, out_ch = 0, dil = 1;
     uint32_t w_off = 0, b_off = 0, relu = 1;
 };
+static_assert(sizeof(SrGUConvParamsCPU) == 44, "SrGUConvParamsCPU");
+
 struct SrGUPoolParamsCPU { uint32_t w = 0, ph = 0, pw = 0, src_rows = 0, ch = 0; };
+static_assert(sizeof(SrGUPoolParamsCPU) == 20, "SrGUPoolParamsCPU");
+
 struct SrGUUpParamsCPU { uint32_t w = 0, bh = 0, ph = 0, pw = 0, mid = 0, base = 0; };
+static_assert(sizeof(SrGUUpParamsCPU) == 24, "SrGUUpParamsCPU");
+
 struct SrGUHeadParamsCPU {
     uint32_t w = 0, dst_rows = 0;
     int32_t dst_y0 = 0;
     uint32_t base = 0, w_off = 0, b_off = 0;
     float tau = 1.f, beta = 0.5f;
 };
+
+static_assert(sizeof(SrGUHeadParamsCPU) == 32, "SrGUHeadParamsCPU");
 
 static id<MTLBuffer> g_srgu_w = nil;
 static id<MTLBuffer> srgu_weights() {
