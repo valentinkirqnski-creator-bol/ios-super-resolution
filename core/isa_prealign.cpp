@@ -156,7 +156,13 @@ bool estimate_isa_prealign(const Image& ref_grey, const Image& comp_grey,
     const float factor = (longer > cap) ? (float)longer / (float)cap : 1.f;
     const int th = std::max(8, (int)std::lround((double)ref_grey.h / factor));
     const int tw = std::max(8, (int)std::lround((double)ref_grey.w / factor));
-    const int N = next_pow2(std::max(th, tw));
+    // Zero-pad to ~2x the content so the cross-correlation is LINEAR, not
+    // circular: the content sits in the top-left quadrant and the surrounding
+    // zeros let a shift up to ~max(th,tw) thumbnail px (= that x factor raw px)
+    // resolve without wrapping/aliasing into the image. Without this the long
+    // axis has little or no padding and large translations fold back on
+    // themselves, which is the main reason big camera pans were not pre-aligned.
+    const int N = next_pow2(2 * std::max(th, tw));
     if (N < 8) return false;
 
     const std::vector<float> refR = resize_blur(ref_grey, th, tw);

@@ -197,6 +197,9 @@ struct TuningParams: Equatable, Codable {
     /// ImageStackAlignator-style global pre-alignment (FFT phase-correlation
     /// rotation+shift scan, no gyro). Opt-in; off by default.
     var isa_prealign_enabled: Bool = false
+    /// ISA pre-align rotation search half-range in degrees (±). Larger = handles
+    /// bigger camera roll, at more cost (more angle samples).
+    var isa_prealign_rot_range_deg: Float = 3.0
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -368,6 +371,7 @@ struct TuningParams: Equatable, Codable {
         case tile_reject_nn_enabled
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates, isa_prealign_enabled
+        case isa_prealign_rot_range_deg
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
@@ -462,6 +466,7 @@ struct TuningParams: Equatable, Codable {
         tile_reject_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .tile_reject_nn_enabled) ?? tile_reject_nn_enabled
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
         isa_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .isa_prealign_enabled) ?? isa_prealign_enabled
+        isa_prealign_rot_range_deg = try c.decodeIfPresent(Float.self, forKey: .isa_prealign_rot_range_deg) ?? isa_prealign_rot_range_deg
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2257,6 +2262,7 @@ final class CameraModel: NSObject, ObservableObject {
             "tile_reject_nn_enabled": NSNumber(value: tuningParams.tile_reject_nn_enabled),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
             "isa_prealign_enabled": NSNumber(value: tuningParams.isa_prealign_enabled),
+            "isa_prealign_rot_range_deg": NSNumber(value: tuningParams.isa_prealign_rot_range_deg),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

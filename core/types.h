@@ -726,9 +726,13 @@ struct Config {
     // from the ref/comp grey and feeds align()'s initial_dx/dy/rotation,
     // overriding the other pre-align seeds. Seeded from 0 (no gyro on iOS).
     bool  isa_prealign_enabled = false;
-    float isa_prealign_rot_range_deg = 1.0f;   // ISA RotationSearchRange (+/- deg)
+    float isa_prealign_rot_range_deg = 3.0f;   // ISA RotationSearchRange (+/- deg); raised for larger roll
     float isa_prealign_rot_incr_deg  = 0.2f;   // ISA RotationSearchIncrement (deg)
-    int   isa_prealign_fft_max_dim   = 512;    // cap FFT dim; grey downscaled to fit
+    // Content cap: the grey is downscaled so its longer side <= this, then the
+    // FFT runs on next_pow2(2*cap) (zero-padded for a linear correlation). 256
+    // keeps N=512 (cost parity with the old unpadded 512) while enabling large,
+    // non-wrapping shifts; the coarse global estimate is refined by block match.
+    int   isa_prealign_fft_max_dim   = 256;
 
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and

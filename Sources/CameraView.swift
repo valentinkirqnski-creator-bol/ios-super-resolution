@@ -878,8 +878,13 @@ struct CameraView: View {
                     Text("alignment.tile_size (SNR_based = auto picks 16/32/64) and alignment.grey_method. IPOL main defaults: SNR-based tiling, FFT grey.")
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Pre-Alignment (ISA)", isOn: $cam.tuningParams.isa_prealign_enabled)
-                    Text("ImageStackAlignator-style global pre-registration: an FFT phase-correlation scan estimates each frame's whole-image rotation and shift against the reference and seeds the aligner, before per-tile tracking. Helps large camera roll/pan. No gyro (the search starts at 0°). Not part of IPOL main; experimental.")
+                    Text("ImageStackAlignator-style global pre-registration: an FFT phase-correlation scan estimates each frame's whole-image rotation and shift against the reference and warps it in before per-tile tracking. Helps large camera roll/pan. No gyro (the search starts at 0°). Not part of IPOL main; experimental.")
                         .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.isa_prealign_enabled {
+                        ispRow("Roll Search (±°)", $cam.tuningParams.isa_prealign_rot_range_deg, 0.5...15.0, "%.1f")
+                        Text("How much camera ROLL the scan searches for. Raise it for large rotation; higher costs more (more angle samples). Translation range is handled automatically by the zero-padded correlation.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("Robustness")) {
