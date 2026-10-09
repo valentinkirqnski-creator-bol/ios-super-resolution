@@ -1135,6 +1135,16 @@ struct Config {
     bool robustness_srgb_active() const {
         return guide_curve == 3 && !robustness_fft_guide_active();
     }
+    // IPOL main noise model (the shipping default): the robustness guide is
+    // sqrt(raw) (guide_curve==1) and the noise floor is a SINGLE measured-
+    // brightness-binned sqrt LUT (make_noise_curves_main, monte_carlo.py),
+    // looked up ONCE per pixel by the MEAN channel brightness -- not a per-
+    // channel curve, and not squared-indexed (the guide is already sqrt, so the
+    // measured sqrt-brightness indexes the curve directly). guide_curve 0/3 are
+    // the linear / sRGB colour-domain experiments and keep the per-channel path.
+    bool robustness_main_noise() const {
+        return guide_curve == 1 && !robustness_fft_guide_active();
+    }
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
     // missing feature (or aperture) then no shift is applied at all." When a

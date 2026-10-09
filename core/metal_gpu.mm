@@ -1659,8 +1659,9 @@ struct RobMaskParamsCPU {
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
     uint32_t use_homography = 0;
     uint32_t tile_reject = 0;  // 1 = darken-only tile-reject NN (Config::tile_reject_nn_enabled)
+    uint32_t main_noise = 0;   // 1 = IPOL main single MC curve by mean brightness
 };
-static_assert(sizeof(RobMaskParamsCPU) == 176, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 180, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2443,9 +2444,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // change in any one channel's WB-derived value rebuilds all of them
     // (curves are concatenated into one buffer, so a partial rebuild isn't
     // meaningfully cheaper).
-    const int curve_nch = std::max(1, std::min(3, nch));
-    const int curve_domain = cfg.robustness_srgb_active() ? 2
-                             : (cfg.robustness_guide_sqrt_active() ? 1 : 0);
+    // IPOL main: a SINGLE curve (make_noise_curves_main, measured-binned by mean
+    // brightness) -> upload 1 channel; rob_make_mask indexes it by mean brightness.
+    const int curve_nch = cfg.robustness_main_noise() ? 1 : std::max(1, std::min(3, nch));
+    const int curve_domain = cfg.robustness_main_noise() ? 3
+                             : (cfg.robustness_srgb_active() ? 2
+                             : (cfg.robustness_guide_sqrt_active() ? 1 : 0));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != false ||
         g_rob_curve_pixel4a_iso != 0 ||
@@ -2560,6 +2564,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
     mp.tile_reject = cfg.tile_reject_nn_enabled ? 1u : 0u;
+    mp.main_noise = cfg.robustness_main_noise() ? 1u : 0u;  // IPOL main single MC curve by mean
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;

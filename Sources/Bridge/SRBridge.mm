@@ -551,12 +551,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_color_matrix = tuning[@"guide_color_matrix"].boolValue;
     if (tuning[@"guide_curve"]) {
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
-        // Keep the robustness colour DOMAIN self-consistent with the guide
-        // curve the UI picks: curve 1 (sqrt) is the VST route (sqrt noise curves
-        // + mean^2 index); curve 0 (linear) and curve 3 (sRGB perceptual) are
-        // not sqrt. sRGB owns its own noise domain (make_noise_curves_srgb). So
-        // a single picker drives a consistent d / sigma_p / sigma_t domain.
-        cfg.robustness_guide_sqrt = (cfg.guide_curve == 1);
+        // IPOL main (default, guide_curve==1): sqrt guide + the single measured-
+        // binned main noise LUT indexed by MEAN brightness directly (Config::
+        // robustness_main_noise), so robustness_guide_sqrt (the old per-channel
+        // sqrt + mean^2-index VST route) stays OFF. curve 0/3 are the linear /
+        // sRGB experiments and own their own noise domain.
+        cfg.robustness_guide_sqrt = false;
     }
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;

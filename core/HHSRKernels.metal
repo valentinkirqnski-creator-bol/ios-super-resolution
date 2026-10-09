@@ -1734,6 +1734,7 @@ struct RobMaskParams {
     float hmat[9];
     uint use_homography;
     uint tile_reject;  // 1 = darken-only tile-reject NN (Config::tile_reject_nn_enabled)
+    uint main_noise;   // 1 = IPOL main single MC curve looked up by MEAN brightness
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2230,27 +2231,42 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // fetch. Twin of apply_noise_model in robustness.cpp.
     float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
     float d_ms_sq = 0.f, d_md_sq = 0.f;
+    float bright_sum = 0.f;
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
-        float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
-        int id_noise = lround_away(1000.f * bidx);
-        if (!isfinite(brightness))
-            id_noise = 0;
-        else if (id_noise < 0)
-            id_noise = 0;
-        else if (id_noise >= int(p.curve_n))
-            id_noise = int(p.curve_n) - 1;
-        uint curve_id = ch * p.curve_n + uint(id_noise);
-        float sigma_t = std_curve[curve_id];
-        float d_t = diff_curve[curve_id];
+        bright_sum += brightness;
         sigma_ms_sq += ref_vars[o];
-        sigma_md_sq += sigma_t * sigma_t;
         float comp = rob_sample_dogson_or_inf(comp_means, p.h, p.w, p.nch,
                                               sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         d_ms_sq += d_p_ * d_p_;
-        d_md_sq += d_t * d_t;
+        if (p.main_noise == 0u) {
+            // Per-channel noise curve (linear / sRGB colour-domain experiments).
+            float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+            int id_noise = lround_away(1000.f * bidx);
+            if (!isfinite(brightness)) id_noise = 0;
+            else if (id_noise < 0) id_noise = 0;
+            else if (id_noise >= int(p.curve_n)) id_noise = int(p.curve_n) - 1;
+            uint curve_id = ch * p.curve_n + uint(id_noise);
+            float sigma_t = std_curve[curve_id];
+            float d_t = diff_curve[curve_id];
+            sigma_md_sq += sigma_t * sigma_t;
+            d_md_sq += d_t * d_t;
+        }
+    }
+    if (p.main_noise != 0u) {
+        // IPOL main: ONE measured-binned curve looked up by the MEAN channel
+        // brightness (robustness.py cuda_compute_d_sigma). Guide is already sqrt,
+        // so index directly (no mean^2). Curve stores sqrt(E[.]); square it back.
+        float mean_b = clamp(bright_sum / float(p.nch), 0.f, 1.f);
+        int id_noise = lround_away(float(p.curve_n - 1u) * mean_b);
+        if (id_noise < 0) id_noise = 0;
+        else if (id_noise >= int(p.curve_n)) id_noise = int(p.curve_n) - 1;
+        float sigma_t = std_curve[uint(id_noise)];
+        float d_t = diff_curve[uint(id_noise)];
+        sigma_md_sq = sigma_t * sigma_t;
+        d_md_sq = d_t * d_t;
     }
     sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
     float shrink = (d_ms_sq + d_md_sq > 0.f) ? d_ms_sq / (d_ms_sq + d_md_sq) : 0.f;

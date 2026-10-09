@@ -624,6 +624,112 @@ static const NoiseCurves& make_noise_curves_srgb_channel(f32 alpha, f32 beta, in
     return make_noise_curves_srgb(alpha, beta);
 }
 
+// --- IPOL main noise model (monte_carlo.py): single measured-binned sqrt LUT --
+// A SINGLE curve (sigma^2, d^2) binned by the MEASURED mean reference brightness,
+// in the sqrt (VST) domain, from an RGBG noise profile. Per trial at latent
+// b=(t+0.5)/T draw 3x3 sqrt'd patches for R, G (mean of two independent greens),
+// B for the reference and an independent moving frame; bin by (ref_r+ref_g+ref_b)/3;
+// accumulate sigma^2 = sum var_c and d^2 = sum (ref_c-mov_c)^2. The stored curve
+// is sqrt(E[.]) per bin (the robustness kernel squares it back). main precomputes
+// this offline at ~10M trials; on device we build it per burst at a feasible T
+// (same estimator, different realisation). Empty bins are linearly interpolated.
+// Twin of _simulate_chunk / _finalize_histograms + compute_d_sigma's single
+// lookup by mean brightness.
+static void mc_sqrt_patch(double b, double a, double bt, NumpyRandomState& rng,
+                          double& mean, double& var) {
+    double m = 0.0, m2 = 0.0;
+    for (int s = 0; s < 9; ++s) {
+        double v = b + std::sqrt(std::max(0.0, a * b + bt)) * rng.rk_gauss();
+        v = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+        v = std::sqrt(v);
+        double d = v - m; m += d / (s + 1); m2 += d * (v - m);
+    }
+    mean = m; var = std::max(m2 / 9.0, 0.0);
+}
+static void mc_green_patch(double b, double a1, double bt1, double a2, double bt2,
+                           NumpyRandomState& rng, double& mean, double& var) {
+    double m = 0.0, m2 = 0.0;
+    for (int s = 0; s < 9; ++s) {
+        double g1 = b + std::sqrt(std::max(0.0, a1 * b + bt1)) * rng.rk_gauss();
+        g1 = g1 < 0.0 ? 0.0 : (g1 > 1.0 ? 1.0 : g1);
+        double g2 = b + std::sqrt(std::max(0.0, a2 * b + bt2)) * rng.rk_gauss();
+        g2 = g2 < 0.0 ? 0.0 : (g2 > 1.0 ? 1.0 : g2);
+        double v = std::sqrt(0.5 * (g1 + g2));
+        double d = v - m; m += d / (s + 1); m2 += d * (v - m);
+    }
+    mean = m; var = std::max(m2 / 9.0, 0.0);
+}
+static const NoiseCurves& make_noise_curves_main(const Config& cfg) {
+    f32 a[4], bt[4];
+    if (cfg.debug_noise_model_disabled) {
+        for (int k = 0; k < 4; ++k) { a[k] = 0.f; bt[k] = 0.f; }
+    } else {
+        a[0] = cfg.noise_alpha_ch_robustness(0); bt[0] = cfg.noise_beta_ch_robustness(0);
+        a[1] = cfg.noise_alpha_ch_robustness(1); bt[1] = cfg.noise_beta_ch_robustness(1);
+        a[2] = cfg.noise_alpha_ch_robustness(2); bt[2] = cfg.noise_beta_ch_robustness(2);
+        a[3] = a[1]; bt[3] = bt[1];   // second green: one NoiseProfile green pair
+    }
+    static std::mutex mu;
+    struct E { f32 a[4], b[4]; std::unique_ptr<NoiseCurves> nc; };
+    static std::vector<E> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& e : cache) {
+        bool hit = true;
+        for (int k = 0; k < 4; ++k) if (e.a[k] != a[k] || e.b[k] != bt[k]) hit = false;
+        if (hit) return *e.nc;
+    }
+    const int bins = k_n_brightness + 1;
+    std::vector<double> ss(bins, 0.0), ds(bins, 0.0);
+    std::vector<long long> cn(bins, 0);
+    const long long T = 500000;   // per-burst MC budget (main uses ~10M offline)
+    NumpyRandomState rng(777u);
+    for (long long t = 0; t < T; ++t) {
+        const double lat = ((double)t + 0.5) / (double)T;
+        double rr, vr, rg, vg, rb, vb, mr, mg, mb, tmp;
+        mc_sqrt_patch(lat, a[0], bt[0], rng, rr, vr);
+        mc_green_patch(lat, a[1], bt[1], a[3], bt[3], rng, rg, vg);
+        mc_sqrt_patch(lat, a[2], bt[2], rng, rb, vb);
+        mc_sqrt_patch(lat, a[0], bt[0], rng, mr, tmp);
+        mc_green_patch(lat, a[1], bt[1], a[3], bt[3], rng, mg, tmp);
+        mc_sqrt_patch(lat, a[2], bt[2], rng, mb, tmp);
+        const double meas = (rr + rg + rb) / 3.0;
+        int idx = (int)std::floor(meas * (double)(bins - 1) + 0.5);
+        idx = idx < 0 ? 0 : (idx >= bins ? bins - 1 : idx);
+        const double dr = rr - mr, dg = rg - mg, db = rb - mb;
+        cn[idx]++; ss[idx] += vr + vg + vb; ds[idx] += dr * dr + dg * dg + db * db;
+    }
+    auto nc = std::make_unique<NoiseCurves>();
+    nc->std_curve.resize(bins); nc->diff_curve.resize(bins);
+    std::vector<double> sm(bins, 0.0), dm(bins, 0.0);
+    std::vector<char> pop(bins, 0);
+    for (int i = 0; i < bins; ++i)
+        if (cn[i] > 0) { sm[i] = ss[i] / (double)cn[i]; dm[i] = ds[i] / (double)cn[i]; pop[i] = 1; }
+    auto interp = [&](std::vector<double>& v) {
+        int prev = -1, first = -1, last = -1;
+        for (int i = 0; i < bins; ++i) if (pop[i]) { if (first < 0) first = i; last = i; }
+        if (first < 0) return;
+        for (int i = 0; i < bins; ++i) if (pop[i]) {
+            if (prev >= 0 && i - prev > 1)
+                for (int k = prev + 1; k < i; ++k) {
+                    double tt = (double)(k - prev) / (double)(i - prev);
+                    v[k] = v[prev] + tt * (v[i] - v[prev]);
+                }
+            prev = i;
+        }
+        for (int i = 0; i < first; ++i) v[i] = v[first];
+        for (int i = last + 1; i < bins; ++i) v[i] = v[last];
+    };
+    interp(sm); interp(dm);
+    for (int i = 0; i < bins; ++i) {
+        nc->std_curve[(size_t)i] = (f32)std::sqrt(std::max(0.0, sm[i]));
+        nc->diff_curve[(size_t)i] = (f32)std::sqrt(std::max(0.0, dm[i]));
+    }
+    E e; for (int k = 0; k < 4; ++k) { e.a[k] = a[k]; e.b[k] = bt[k]; }
+    e.nc = std::move(nc);
+    cache.push_back(std::move(e));
+    return *cache.back().nc;
+}
+
 // Mask-only variants: honour Config::debug_noise_model_disabled by building
 // the curves from alpha = beta = 0 (so sigma_t = d_t = 0 in every bin),
 // while make_noise_curves(cfg) itself stays ungated -- it is shared with SNR
@@ -633,6 +739,7 @@ static const NoiseCurves& make_noise_curves_srgb_channel(f32 alpha, f32 beta, in
 // robustness_guide_sqrt routes to the sqrt-domain caches (1.4 parity);
 // robustness_srgb_active() routes to the sRGB-domain caches (perceptual).
 static const NoiseCurves& mask_noise_curves(const Config& cfg) {
+    if (cfg.robustness_main_noise()) return make_noise_curves_main(cfg);  // IPOL main single LUT
     const bool srgb = cfg.robustness_srgb_active();
     const bool sq = cfg.robustness_guide_sqrt_active();
     const f32 a = cfg.debug_noise_model_disabled ? 0.f : cfg.noise_alpha_robustness();
@@ -641,6 +748,8 @@ static const NoiseCurves& mask_noise_curves(const Config& cfg) {
     return sq ? make_noise_curves_sqrt(a, b) : make_noise_curves(a, b);
 }
 static const NoiseCurves& mask_noise_curves_channel(const Config& cfg, int ch) {
+    // IPOL main uses a SINGLE curve for all channels (looked up by mean brightness).
+    if (cfg.robustness_main_noise()) return make_noise_curves_main(cfg);
     const bool srgb = cfg.robustness_srgb_active();
     const bool sq = cfg.robustness_guide_sqrt_active();
     const f32 a = cfg.debug_noise_model_disabled ? 0.f : cfg.noise_alpha_ch_robustness(ch);
@@ -1237,6 +1346,46 @@ static void apply_noise_model_1p4(const Image& d_p, const Image& ref_means,
             // dq stays +inf for an out-of-bounds sample -> exp(-inf)=0 -> R=0.
             if (std::isfinite(dq) && dq > 0.f) {
                 const f32 shrink = dq / (dq + lut.d_sq[(size_t)idx]);
+                dq *= shrink * shrink;
+            }
+            d_sq.at(y, x) = dq;
+            sigma_sq.at(y, x) = sq;
+        }
+    }
+}
+
+// IPOL main single-LUT noise correction (robustness.py cuda_compute_d_sigma):
+// identical structure to apply_noise_model_1p4, but reads the on-the-fly main
+// MC curve (make_noise_curves_main). std/diff store sqrt of the squared noise,
+// squared back here. d^2 = sum(Delta mu_c)^2 shrunk toward d_noise^2(mean
+// brightness); sigma^2 = max(sum var_c, sigma_noise^2(mean brightness)), looked
+// up once by the mean channel brightness.
+static void apply_noise_model_main(const Image& d_p, const Image& ref_means,
+                                   const Image& ref_vars, const NoiseCurves& nc,
+                                   Image& d_sq, Image& sigma_sq) {
+    const int n_ch = ref_means.c;
+    const int bins = (int)nc.std_curve.size();
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    if (bins <= 0) return;
+    for (int y = 0; y < ref_means.h; ++y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 dq = 0.f, sq = 0.f, bright = 0.f;
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const f32 dpc = d_p.at(y, x, ch);
+                dq += dpc * dpc;
+                sq += ref_vars.at(y, x, ch);
+                bright += ref_means.at(y, x, ch);
+            }
+            bright /= (f32)n_ch;
+            if (!std::isfinite(bright)) bright = 0.f;
+            bright = bright < 0.f ? 0.f : (bright > 1.f ? 1.f : bright);
+            int idx = (int)std::lround((f32)(bins - 1) * bright);
+            if (idx < 0) idx = 0; else if (idx >= bins) idx = bins - 1;
+            const f32 st = nc.std_curve[(size_t)idx], dt = nc.diff_curve[(size_t)idx];
+            sq = std::max(sq, st * st);
+            if (std::isfinite(dq) && dq > 0.f) {
+                const f32 shrink = dq / (dq + dt * dt);
                 dq *= shrink * shrink;
             }
             d_sq.at(y, x) = dq;
@@ -2005,8 +2154,12 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     }
 
     Image d_sq, sigma_sq;
-    // 1.4 parity: use the LUT's exact single-curve correction, else per-channel.
-    if (use_lut)
+    // IPOL main: single measured-binned MC curve, looked up by mean brightness.
+    // Else 1.4 LUT's single-curve correction, else the per-channel model.
+    if (cfg.robustness_main_noise())
+        apply_noise_model_main(d_p, ref_stats.means, ref_stats.stds,
+                               mask_noise_curves(cfg), d_sq, sigma_sq);
+    else if (use_lut)
         apply_noise_model_1p4(d_p, ref_stats.means, ref_stats.stds, lut14, d_sq, sigma_sq);
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
