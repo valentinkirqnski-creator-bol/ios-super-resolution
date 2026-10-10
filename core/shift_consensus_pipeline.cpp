@@ -29,7 +29,7 @@ std::vector<FlowField> compute_consensus_flows(
     // host data (GPU-only); feeding that to resize_blur reads a null buffer and
     // crashes. Bail to the normal per-frame align instead of dereferencing it.
     auto host_ready = [](const Image& im) {
-        return im.h > 0 && im.w > 0 &&
+        return im.h > 0 && im.w > 0 && im.c > 0 && !im.data.empty() &&
                im.data.size() == (size_t)im.h * (size_t)im.w * (size_t)im.c;
     };
     if (!host_ready(ref_grey)) return empty;
