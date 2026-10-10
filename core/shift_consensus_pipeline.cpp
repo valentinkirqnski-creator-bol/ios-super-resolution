@@ -23,6 +23,17 @@ std::vector<FlowField> compute_consensus_flows(
     if (frame_count < 3) return empty;               // needs >=3 for any redundancy
     if (ref_index < 0 || ref_index >= frame_count) return empty;
     if (ref_grey.h <= 0 || ref_grey.w <= 0) return empty;
+    // This pre-pass holds every frame's warped grey + pyramid simultaneously
+    // (~160MB/frame at 12MP). Above the cap it would exhaust memory and the OS
+    // kills the app, so bail to the normal per-frame align instead.
+    const int max_frames = (cfg.shift_consensus_max_frames > 0) ? cfg.shift_consensus_max_frames : 6;
+    if (frame_count > max_frames) return empty;
+
+    // Block-match the ad-hoc warped greys on the CPU path: they were never
+    // uploaded as resident GPU frames, so align_metal (the default on iOS) is
+    // driven out of its model and can crash. Slower, but it cannot crash.
+    Config ccfg = cfg;
+    ccfg.align_force_cpu = true;
 
     // Every grey is sampled on the CPU (pre-align + block match), so it MUST be
     // fully host-resident. On the Metal path a grey can carry dims with empty
@@ -94,7 +105,7 @@ std::vector<FlowField> compute_consensus_flows(
         // changes (it is keyed by pyramid address).
         metal_invalidate_sticky_grey();
 #endif
-        FlowField fl = align(wpyr[i], wpad[i], wgrey[j], cfg, tile_size, 0.f, 0.f, 0.f);
+        FlowField fl = align(wpyr[i], wpad[i], wgrey[j], ccfg, tile_size, 0.f, 0.f, 0.f);
         if (k == 0) { gny = fl.ny; gnx = fl.nx; }
         if (fl.ny != gny || fl.nx != gnx || fl.flow.empty()) return empty;
         meas[k].ny = fl.ny; meas[k].nx = fl.nx; meas[k].v = std::move(fl.flow);
