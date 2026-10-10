@@ -1104,10 +1104,16 @@ static const NoiseLut14& active_noise_lut14() {
 
 static void apply_noise_model(const Image& d_p, const Image& ref_means, const Image& ref_vars,
                               const NoiseCurves* const nc_ch[3], Image& d_sq, Image& sigma_sq,
-                              bool sqrt_index = false) {
+                              bool sqrt_index = false,
+                              Image* d_sq_ch = nullptr, Image* sigma_sq_ch = nullptr) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    // Optional PER-CHANNEL d^2/sigma^2 (ISA-style per-channel robustness). The
+    // 1-channel summed outputs above (Wronski Eq. 6 L2 norm) are unchanged and
+    // still feed the motion-irregular ratio and the refine NN.
+    if (d_sq_ch) *d_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
+    if (sigma_sq_ch) *sigma_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
     for (int y = 0; y < ref_means.h; ++y) {
         for (int x = 0; x < ref_means.w; ++x) {
             // 460-main cuda_apply_noise_model: apply max(measured, noise-floor)
@@ -1130,12 +1136,16 @@ static void apply_noise_model(const Image& d_p, const Image& ref_means, const Im
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 const f32 sigma_p_sq = ref_vars.at(y, x, ch);
-                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                const f32 sigma_c = std::max(sigma_p_sq, sigma_t * sigma_t);
+                sigma_sq_ += sigma_c;
                 const f32 d_p_ = d_p.at(y, x, ch);
                 const f32 d_p_sq = d_p_ * d_p_;
                 const f32 denom = d_p_sq + d_t * d_t;
                 const f32 shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
-                d_sq_ += d_p_sq * shrink * shrink;
+                const f32 d_c = d_p_sq * shrink * shrink;
+                d_sq_ += d_c;
+                if (d_sq_ch) d_sq_ch->at(y, x, ch) = d_c;
+                if (sigma_sq_ch) sigma_sq_ch->at(y, x, ch) = sigma_c;
             }
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
@@ -1197,10 +1207,13 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                                     const Image& ref_vars,
                                     const NoiseCurves* const nc_ch[3],
                                     Image& d_sq, Image& sigma_sq, int num_threads,
-                                    bool sqrt_index = false) {
+                                    bool sqrt_index = false,
+                                    Image* d_sq_ch = nullptr, Image* sigma_sq_ch = nullptr) {
     const int n_ch = ref_means.c;
     d_sq = Image(ref_means.h, ref_means.w, 1);
     sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    if (d_sq_ch) *d_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
+    if (sigma_sq_ch) *sigma_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
     parallel_rows(ref_means.h, num_threads, [&](int y) {
         for (int x = 0; x < ref_means.w; ++x) {
             // 460-main: per-channel max() and Wiener shrink, then sum.
@@ -1220,7 +1233,8 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                 f32 sigma_t = nc.std_curve[(size_t)id_noise];
                 f32 d_t = nc.diff_curve[(size_t)id_noise];
                 const f32 sigma_p_sq = ref_vars.at(y, x, ch);
-                sigma_sq_ += std::max(sigma_p_sq, sigma_t * sigma_t);
+                const f32 sigma_c = std::max(sigma_p_sq, sigma_t * sigma_t);
+                sigma_sq_ += sigma_c;
                 const f32 comp = comp_means.at(y, x, ch);
                 const f32 d_p_ = std::isfinite(comp)
                     ? std::fabs(brightness - comp)
@@ -1228,7 +1242,10 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
                 const f32 d_p_sq = d_p_ * d_p_;
                 const f32 denom = d_p_sq + d_t * d_t;
                 const f32 shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
-                d_sq_ += d_p_sq * shrink * shrink;
+                const f32 d_c = d_p_sq * shrink * shrink;
+                d_sq_ += d_c;
+                if (d_sq_ch) d_sq_ch->at(y, x, ch) = d_c;
+                if (sigma_sq_ch) sigma_sq_ch->at(y, x, ch) = sigma_c;
             }
             d_sq.at(y, x) = d_sq_;
             sigma_sq.at(y, x) = sigma_sq_;
@@ -1385,19 +1402,22 @@ static inline f32 sample_s_bilinear(const std::vector<f32>& S, int ny, int nx,
 }
 
 static Image local_min_5x5(const Image& R) {
-    Image r(R.h, R.w, 1);
+    const int nc = R.c;
+    Image r(R.h, R.w, nc);
     const f32 inf = std::numeric_limits<f32>::infinity();
     for (int y = 0; y < R.h; ++y) {
         for (int x = 0; x < R.w; ++x) {
-            f32 mn = inf;
-            for (int i = -2; i <= 2; ++i) {
-                int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
-                for (int j = -2; j <= 2; ++j) {
-                    int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
-                    mn = std::min(mn, R.at(yy, xx));
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 mn = inf;
+                for (int i = -2; i <= 2; ++i) {
+                    int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
+                    for (int j = -2; j <= 2; ++j) {
+                        int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
+                        mn = std::min(mn, R.at(yy, xx, ch));
+                    }
                 }
+                r.at(y, x, ch) = mn;
             }
-            r.at(y, x) = mn;
         }
     }
     return r;
@@ -1519,16 +1539,24 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     if (comp_means.h != h || comp_means.w != w || comp_means.c != nch)
         return Image();
 
-    Image d_sq, sigma_sq;
+    Image d_sq, sigma_sq, d_sq_ch, sigma_sq_ch;
     if (use_lut)
         apply_noise_model_fused_1p4(ref_means, comp_means, ref_vars, lut14,
                                     d_sq, sigma_sq, cfg.num_threads);
     else
         apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
-                                cfg.num_threads, cfg.robustness_guide_sqrt_active());
+                                cfg.num_threads, cfg.robustness_guide_sqrt_active(),
+                                &d_sq_ch, &sigma_sq_ch);
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
-    Image R(h, w, 1);
+    // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
+    // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
+    const int nmc = ref_means.c;
+    const bool per_channel = cfg.robustness_per_channel &&
+                             (d_sq_ch.c == nmc && sigma_sq_ch.c == nmc &&
+                              d_sq_ch.h == h && d_sq_ch.w == w);
+    const int rch = per_channel ? nmc : 1;
+    Image R(h, w, rch);
     if (s_select_out) *s_select_out = Image(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
@@ -1539,27 +1567,32 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
             if (patch_idy < 0 || patch_idy >= flow.ny ||
                 patch_idx < 0 || patch_idx >= flow.nx) {
-                R.at(y, x) = 0.f;
+                for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = 0.f;
                 if (s_select_out) s_select_out->at(y, x) = 0.f;
                 continue;
             }
             f32 s = S[pidx];
-            f32 sig = sigma_sq.at(y, x);
             const bool match_ambiguous =
                 cfg.flow_reject_ambiguous_enabled &&
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
-            f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
-            // design ("infinite will imply R = 0"), which makes d_sq +inf and
-            // the Wiener shrink inf/inf = NaN, so r_val is NaN. The Python
-            // clamp (CUDA fmaxf/fminf) returns the non-NaN operand and yields
-            // the intended 0; clampf's comparisons are both false for NaN and
-            // would return NaN, poisoning every merge accumulator that touches
-            // this pixel.
-            if (!std::isfinite(r_val)) r_val = 0.f;
-            R.at(y, x) = r_val;
+            // design ("infinite will imply R = 0"), which makes d^2 +inf and the
+            // Wiener shrink inf/inf = NaN; a non-finite r_val is forced to 0.
+            if (per_channel) {
+                for (int ch = 0; ch < rch; ++ch) {
+                    f32 sc = sigma_sq_ch.at(y, x, ch);
+                    f32 rc = clampf(s * std::exp(-d_sq_ch.at(y, x, ch) / sc) - cfg.r_t, 0.f, 1.f);
+                    if (!std::isfinite(rc)) rc = 0.f;
+                    R.at(y, x, ch) = rc;
+                }
+            } else {
+                f32 sig = sigma_sq.at(y, x);
+                f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+                if (!std::isfinite(r_val)) r_val = 0.f;
+                for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
+            }
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
@@ -1574,24 +1607,28 @@ Image robustness_local_min_on_guide(const Image& R) {
 }
 
 static Image local_min_5x5_on_guide(const Image& R) {
+    const int nc = R.c;
     const int gh = R.h / 2, gw = R.w / 2;
     if (gh <= 0 || gw <= 0) return local_min_5x5(R);
-    Image G(gh, gw, 1);
+    Image G(gh, gw, nc);
     for (int gy = 0; gy < gh; ++gy) {
         for (int gx = 0; gx < gw; ++gx) {
-            f32 m = R.at(2 * gy, 2 * gx);
-            m = std::min(m, R.at(2 * gy, 2 * gx + 1));
-            m = std::min(m, R.at(2 * gy + 1, 2 * gx));
-            m = std::min(m, R.at(2 * gy + 1, 2 * gx + 1));
-            G.at(gy, gx) = m;
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 m = R.at(2 * gy, 2 * gx, ch);
+                m = std::min(m, R.at(2 * gy, 2 * gx + 1, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx + 1, ch));
+                G.at(gy, gx, ch) = m;
+            }
         }
     }
     Image M = local_min_5x5(G);
-    Image out(R.h, R.w, 1);
+    Image out(R.h, R.w, nc);
     for (int y = 0; y < R.h; ++y) {
         const int gy = std::min(gh - 1, y / 2);
         for (int x = 0; x < R.w; ++x)
-            out.at(y, x) = M.at(gy, std::min(gw - 1, x / 2));
+            for (int ch = 0; ch < nc; ++ch)
+                out.at(y, x, ch) = M.at(gy, std::min(gw - 1, x / 2), ch);
     }
     return out;
 }
@@ -1941,16 +1978,23 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         }
     }
 
-    Image d_sq, sigma_sq;
+    Image d_sq, sigma_sq, d_sq_ch, sigma_sq_ch;
     // 1.4 parity: use the LUT's exact single-curve correction, else per-channel.
     if (use_lut)
         apply_noise_model_1p4(d_p, ref_stats.means, ref_stats.stds, lut14, d_sq, sigma_sq);
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
-                          cfg.robustness_guide_sqrt_active());
+                          cfg.robustness_guide_sqrt_active(), &d_sq_ch, &sigma_sq_ch);
     std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
 
-    Image R(h, w, 1);
+    // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
+    // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
+    const int nmc = ref_stats.means.c;
+    const bool per_channel = cfg.robustness_per_channel &&
+                             (d_sq_ch.c == nmc && sigma_sq_ch.c == nmc &&
+                              d_sq_ch.h == h && d_sq_ch.w == w);
+    const int rch = per_channel ? nmc : 1;
+    Image R(h, w, rch);
     if (s_select_out) *s_select_out = Image(h, w, 1);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
@@ -2023,10 +2067,20 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 }
             }
             const bool hard_reject = geom_reject;
-            f32 r_val = hard_reject
-                ? 0.f
-                : clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
-            R.at(y, x) = r_val;
+            if (hard_reject) {
+                for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = 0.f;
+            } else if (per_channel) {
+                for (int ch = 0; ch < rch; ++ch) {
+                    f32 sc2 = sigma_sq_ch.at(y, x, ch);
+                    f32 rc = clampf(s * std::exp(-d_sq_ch.at(y, x, ch) / sc2) - cfg.r_t, 0.f, 1.f);
+                    if (!std::isfinite(rc)) rc = 0.f;
+                    R.at(y, x, ch) = rc;
+                }
+            } else {
+                f32 r_val = clampf(s * std::exp(-d_sq.at(y, x) / sig) - cfg.r_t, 0.f, 1.f);
+                if (!std::isfinite(r_val)) r_val = 0.f;
+                for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
+            }
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }

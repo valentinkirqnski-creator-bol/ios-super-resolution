@@ -43,8 +43,9 @@ static inline int cuda_round_to_int(f32 x) {
     return (int)std::lround(x);
 }
 
-static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32 x) {
+static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32 x, int ch = 0) {
     if (robustness.h <= 0 || robustness.w <= 0) return 0.f;
+    if (ch >= robustness.c) ch = robustness.c - 1;   // 1ch mask -> broadcast
     y = std::min(std::max(y, 0.f), (f32)(robustness.h - 1));
     x = std::min(std::max(x, 0.f), (f32)(robustness.w - 1));
     const int y0 = (int)std::floor(y);
@@ -53,10 +54,10 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
     const int x1 = std::min(x0 + 1, robustness.w - 1);
     const f32 fy = y - (f32)y0;
     const f32 fx = x - (f32)x0;
-    const f32 top = robustness.at(y0, x0) +
-                    (robustness.at(y0, x1) - robustness.at(y0, x0)) * fx;
-    const f32 bot = robustness.at(y1, x0) +
-                    (robustness.at(y1, x1) - robustness.at(y1, x0)) * fx;
+    const f32 top = robustness.at(y0, x0, ch) +
+                    (robustness.at(y0, x1, ch) - robustness.at(y0, x0, ch)) * fx;
+    const f32 bot = robustness.at(y1, x0, ch) +
+                    (robustness.at(y1, x1, ch) - robustness.at(y1, x0, ch)) * fx;
     return top + (bot - top) * fy;
 }
 
@@ -161,15 +162,21 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             }
             // Config::merge_robustness_bilinear documents why this is no longer
             // nearest by default, and what the nearest branch was protecting.
-            f32 local_r;
+            // Per-channel robustness (ISA-style): one weight per R/G/B. A 1ch
+            // mask broadcasts (local_r[*] equal). Indexed below by the raw
+            // sample's CFA channel.
+            const int rnc = robustness.c;
+            f32 local_r[3];
             if (cfg.merge_robustness_bilinear) {
-                local_r = sample_robustness_bilinear(robustness, rob_y, rob_x);
+                for (int rc = 0; rc < 3; ++rc)
+                    local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
             } else {
                 const int iy = std::min(robustness.h - 1,
                                         std::max(0, (int)std::floor(rob_y + 0.5f)));
                 const int ix = std::min(robustness.w - 1,
                                         std::max(0, (int)std::floor(rob_x + 0.5f)));
-                local_r = robustness.at(iy, ix);
+                for (int rc = 0; rc < 3; ++rc)
+                    local_r[rc] = robustness.at(iy, ix, rc < rnc ? rc : rnc - 1);
             }
 
             f32 lr_mov_x = lr_x + flowx;
@@ -225,8 +232,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     z = std::max(0.f, z);
                     const f32 w = std::exp(-0.5f * z);
 
-                    val[channel] += w * local_r * c;
-                    acc[channel] += w * local_r;
+                    const f32 lr_c = local_r[channel < 3 ? channel : 2];
+                    val[channel] += w * lr_c * c;
+                    acc[channel] += w * lr_c;
                 }
             }
             for (int ch = 0; ch < nch; ++ch) {

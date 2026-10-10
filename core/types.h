@@ -849,6 +849,14 @@ struct Config {
     // Robustness (Eq. 5: R = s·exp(-d²/σ²) - t). Match configs/default.yaml.
     bool  robustness_enabled = true;
     bool  robustness_save_mask = true;
+    // ISA-style PER-CHANNEL robustness: a separate weight per R/G/B channel
+    // (clamp(s*exp(-d_c^2/sigma_c^2)-t)) instead of the Wronski Eq.6 single
+    // channel-summed weight. Each output channel is then merged with its own
+    // weight. OFF by default: it can introduce colour fringing (one channel
+    // rejected while another is kept), which is exactly why the paper collapses
+    // the channels via the L2 norm. CPU path honours it; the Metal (device)
+    // robustness/merge path does not yet (see rob_make_mask / the merge kernel).
+    bool  robustness_per_channel = false;
     // Debug: split the accumulated mask by which motion prior each pixel used,
     // writing _robustness_s1.pgm and _robustness_s2.pgm alongside the combined
     // one. s1 is the strict prior, applied where the flow field varies sharply
