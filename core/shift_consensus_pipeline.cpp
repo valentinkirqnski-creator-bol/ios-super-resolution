@@ -24,6 +24,16 @@ std::vector<FlowField> compute_consensus_flows(
     if (ref_index < 0 || ref_index >= frame_count) return empty;
     if (ref_grey.h <= 0 || ref_grey.w <= 0) return empty;
 
+    // Every grey is sampled on the CPU (pre-align + block match), so it MUST be
+    // fully host-resident. On the Metal path a grey can carry dims with empty
+    // host data (GPU-only); feeding that to resize_blur reads a null buffer and
+    // crashes. Bail to the normal per-frame align instead of dereferencing it.
+    auto host_ready = [](const Image& im) {
+        return im.h > 0 && im.w > 0 &&
+               im.data.size() == (size_t)im.h * (size_t)im.w * (size_t)im.c;
+    };
+    if (!host_ready(ref_grey)) return empty;
+
     const int H = ref_grey.h, W = ref_grey.w;
     const int gts = cfg.grey_tile_size(tile_size);
 
@@ -38,7 +48,8 @@ std::vector<FlowField> compute_consensus_flows(
     for (int f = 0; f < frame_count; ++f) {
         Hframe[f] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
         Image g = grey_of_frame(f);
-        if (g.h != H || g.w != W) return empty;       // precondition: full-res, matching dims
+        // Precondition: full-res, matching dims, and fully host-resident (see above).
+        if (g.h != H || g.w != W || !host_ready(g)) return empty;
         if (f == ref_index) {
             wgrey[f] = g;
         } else {

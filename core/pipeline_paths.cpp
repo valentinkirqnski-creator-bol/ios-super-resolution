@@ -1167,11 +1167,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_mark_memory("ref:start");
     const double t_ref_grey = prof_now_ms();
 #if defined(__APPLE__)
-    // Global homography AND the ISA pre-align estimate run on the CPU and read
-    // the grey pixels, so the grey must be materialised host-side even on the
-    // resident GPU path. Without this the greys are GPU-only, the host-data guard
-    // at the align call skips the estimate, and the toggle does nothing.
-    metal_set_grey_force_host(work.global_homography_enabled || work.isa_prealign_enabled);
+    // Global homography, the ISA pre-align estimate AND the shift-consensus
+    // pre-pass run on the CPU and read the grey pixels, so the grey must be
+    // materialised host-side even on the resident GPU path. Without this the
+    // greys are GPU-only with empty host data, and reading them crashes (the
+    // consensus pre-pass) or silently does nothing (the align-time guard).
+    metal_set_grey_force_host(work.global_homography_enabled || work.isa_prealign_enabled ||
+                              work.shift_consensus_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
