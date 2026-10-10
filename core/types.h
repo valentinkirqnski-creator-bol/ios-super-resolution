@@ -1094,6 +1094,12 @@ struct Config {
     // with no upscale anywhere. That is strictly more information than the
     // Dodgson route, which only ever bought positions.
     bool robustness_fft_guide_active() const {
+        // Per-channel robustness (ISA) is per-COLOUR-channel, so it needs the
+        // 3-channel RGB guide. The FFT guide is a single grey channel -- there is
+        // nothing to split -- so robustness_per_channel would be a silent no-op on
+        // it (measured: byte-identical mask). When per-channel is requested, fall
+        // back to the 3-channel half-res guide instead, which is also ISA's guide.
+        if (robustness_per_channel) return false;
         return bayer_mode && grey_method == GreyMethod::FFT &&
                (robustness_fft_guide || robustness_raw_resolution_enabled);
     }
@@ -1110,6 +1116,10 @@ struct Config {
         // res and the flow is on the raw tile grid either way, so the upscale is
         // valid under any alignment; the old grey_method==Decimate gate silently
         // disabled it under the default FFT alignment.
+        // Per-channel robustness runs on the plain guide-resolution path (the one
+        // with the per-channel kernel + resident merge). The Dodgson raw-res route
+        // on Metal (rob_make_mask_raw) is single-channel, so route around it too.
+        if (robustness_per_channel) return false;
         return robustness_raw_resolution_enabled && !robustness_fft_guide_active();
     }
     // Whether the guide is sqrt(raw), which decides both its transfer curve and

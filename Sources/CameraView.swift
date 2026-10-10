@@ -1178,7 +1178,7 @@ struct CameraView: View {
                 Section(header: Text("Robustness")) {
                     Toggle("Per-Channel Mask (ISA)", isOn: $cam.tuningParams.robustness_per_channel)
                     Text("""
-                         Builds a separate robustness mask for each guide colour channel (R, G, B) with per-channel noise statistics and Wiener shrink, the way ImageStackAlignator does, instead of one scalar mask summed across channels. Lets a coloured edge or a single-channel mismatch be rejected on the channel it actually affects. Only has an effect with the RGB (Bayer) guide; a no-op on the grey guide. Off = the 460-main single cross-channel mask.
+                         Builds a separate robustness mask for each guide colour channel (R, G, B) with per-channel noise statistics and Wiener shrink, the way ImageStackAlignator does, instead of one scalar mask summed across channels. Lets a coloured edge or a single-channel mismatch be rejected on the channel it actually affects. Needs the 3-channel RGB guide, so turning this on automatically switches the robustness guide off the single-channel full-res grey (it would otherwise have nothing to split) onto the half-res RGB guide ISA uses. Off = the 460-main single cross-channel mask.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                 }
