@@ -225,12 +225,25 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
             cinv2 = 1.f / (c * c + 1e-12f);
             g2floor = 0.15f * (f32)(sum_g2 / (double)cnt);  // down-weight below ~0.15x mean grad energy
         }
-        // Levenberg damping on the diagonal.
-        f32 tr = 0.f; for (int i = 0; i < 8; ++i) tr += A[i][i];
-        const f32 lam = 1e-3f * (tr / 8.f + 1e-6f);
-        for (int i = 0; i < 8; ++i) A[i][i] += lam;
+        // Diagonal (Jacobi) preconditioning. The homography Jacobian mixes terms
+        // in 1, x and x^2 (x up to the image size), so A is wildly ill-conditioned
+        // and gets worse with resolution -- which made the refine take vanishing
+        // steps and converge WORSE as the refine resolution rose (so higher
+        // precision did nothing or hurt). Scale each parameter by 1/sqrt(diag) so
+        // the system is well-conditioned at any resolution, damp the unit-diagonal
+        // system, solve, then unscale the step.
+        f32 s[8];
+        for (int i = 0; i < 8; ++i) s[i] = std::sqrt(std::max(A[i][i], 1e-20f));
+        f32 An[8][8]; f32 bn[8];
+        for (int i = 0; i < 8; ++i) {
+            bn[i] = b[i] / s[i];
+            for (int j = 0; j < 8; ++j) An[i][j] = A[i][j] / (s[i] * s[j]);
+        }
+        for (int i = 0; i < 8; ++i) An[i][i] += 1e-3f;  // Levenberg on the scaled system
+        f32 y[8];
+        if (!solve8(An, bn, y)) break;
         f32 d[8];
-        if (!solve8(A, b, d)) break;
+        for (int i = 0; i < 8; ++i) d[i] = y[i] / s[i];
         f32 Hn[9];
         for (int i = 0; i < 8; ++i) Hn[i] = H[i] + d[i];
         Hn[8] = 1.f;
