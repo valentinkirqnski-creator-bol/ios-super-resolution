@@ -892,6 +892,17 @@ struct CameraView: View {
                         Text("Resolution of the homography refine. It reuses the full-res grey already computed for alignment, so higher just trades compute for a tighter global fit — most useful in low light / low contrast, where a coarse fit leaves slight edge misalignment. Balanced is the shipped speed; Precise/Max are slower.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                    Toggle("Reject Ambiguous Shifts", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
+                    Text("Stops block matching from committing a WRONG shift when it can't tell: if a tile's best and second-best match are near-tied (repetitive texture, flat/low-detail regions, 1D edges), the found offset is discarded and the tile keeps its reliable seed (the coarser level's flow) instead of jumping to a spurious match. ISA's rule for unreliable patches. Targets exactly the incorrect-shift errors the robustness mask can't catch. Off by default; A/B it.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.align_ambiguous_fallback_enabled {
+                        ispRow("Ambiguity Ratio", $cam.tuningParams.flow_reject_1d_ambiguity_ratio, 1.0...1.5, "%.2f")
+                        Text("A match is \"ambiguous\" when second-best cost < this × best cost. Higher catches more near-ties (stricter, discards more uncertain shifts); 1.10 is the default.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                    Toggle("Regularize Refine (ICA)", isOn: $cam.tuningParams.ica_regularize_enabled)
+                    Text("Damps the Lucas-Kanade sub-pixel refine on 1D edges and low-gradient tiles and clamps each iteration's step, so the refine can't amplify a marginal match into a large wrong sub-pixel shift (measured ~80× step blow-up on an aperture-limited edge without it). Off by default.")
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Reject Unfittable Frames", isOn: $cam.tuningParams.prealign_reject_enabled)
                     Text("When the global pre-alignment (ISA / homography) cannot register a frame to the reference — extreme motion, motion blur, a scene change, or too little overlap — drop that whole frame from the merge instead of blending a bad transform (which ghosts). The gate is the pre-align fit (normalized correlation with the reference); frames below the threshold are dropped. Only clearly unregisterable frames are affected — slight misalignment is still handled by per-tile flow and the robustness mask. Requires a global pre-align path to be on.")
                         .font(.footnote).foregroundColor(.secondary)

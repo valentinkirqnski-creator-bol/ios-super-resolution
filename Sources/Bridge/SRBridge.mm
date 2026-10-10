@@ -594,6 +594,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.edge_misalign_min_conf = tuning[@"edge_misalign_min_conf"].floatValue;
     if (tuning[@"align_ambiguous_fallback_enabled"])
         cfg.align_ambiguous_fallback_enabled = tuning[@"align_ambiguous_fallback_enabled"].boolValue;
+    if (tuning[@"ica_regularize_enabled"])
+        cfg.ica_regularize_enabled = tuning[@"ica_regularize_enabled"].boolValue;
     if (tuning[@"debug_noise_model_disabled"])
         cfg.debug_noise_model_disabled = tuning[@"debug_noise_model_disabled"].boolValue;
     if (tuning[@"kernel_selection_linear"])
