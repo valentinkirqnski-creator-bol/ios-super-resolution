@@ -147,18 +147,27 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
     const int rows = std::max(0, y_hi - y_lo);
     int nt = std::max(1, std::min(resolve_threads(num_threads), std::max(1, rows)));
     const int chunk = (rows + nt - 1) / std::max(1, nt);
+    // Cauchy IRLS: weight w = 1 / (1 + (r/c)^2) down-weights large residuals, so
+    // moving objects and near-depth (parallax) regions stop pulling the GLOBAL
+    // fit away from the dominant static scene. The scale c is set from the mean
+    // |residual| of the previous iteration (lag-1); cinv2 = 1/c^2, starting 0 so
+    // the first iteration is unweighted (plain least squares).
+    f32 cinv2 = 0.f;
     for (int it = 0; it < iters; ++it) {
         // Per-chunk partial normal equations (double for stable accumulation),
         // combined serially after. The pixel loop is the whole cost of LK, so
         // chunking it across threads is what keeps the homography refine fast.
         std::vector<std::array<double, 64>> Ap((size_t)nt);
         std::vector<std::array<double, 8>> bp((size_t)nt);
+        std::vector<double> srp((size_t)nt, 0.0);
+        std::vector<long> cntp((size_t)nt, 0);
         for (int t = 0; t < nt; ++t) { Ap[(size_t)t].fill(0.0); bp[(size_t)t].fill(0.0); }
         parallel_rows(nt, num_threads, [&](int t) {
             const int ys = y_lo + t * chunk;
             const int ye = std::min(ys + chunk, y_hi);
             double* Aa = Ap[(size_t)t].data();
             double* ba = bp[(size_t)t].data();
+            double sr = 0.0; long cn = 0;
             for (int y = ys; y < ye; ++y) {
                 for (int x = 1; x < ref.w - 1; ++x) {
                     const f32 fx = (f32)x, fy = (f32)y;
@@ -172,17 +181,22 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                     const f32 err = sample_clamp(comp, u, v) - ref.at(y, x);
                     const f32 gx = 0.5f * (sample_clamp(comp, u + 1.f, v) - sample_clamp(comp, u - 1.f, v));
                     const f32 gy = 0.5f * (sample_clamp(comp, u, v + 1.f) - sample_clamp(comp, u, v - 1.f));
+                    const f32 w = 1.f / (1.f + err * err * cinv2);  // Cauchy robust weight
                     f32 J[8];
                     J[0] = gx * (fx * iD);           J[1] = gx * (fy * iD);           J[2] = gx * iD;
                     J[3] = gy * (fx * iD);           J[4] = gy * (fy * iD);           J[5] = gy * iD;
                     J[6] = -(gx * u + gy * v) * (fx * iD);
                     J[7] = -(gx * u + gy * v) * (fy * iD);
+                    const f32 we = w * err;
                     for (int i = 0; i < 8; ++i) {
-                        ba[i] -= (double)(J[i] * err);
-                        for (int j = 0; j < 8; ++j) Aa[i * 8 + j] += (double)(J[i] * J[j]);
+                        ba[i] -= (double)(J[i] * we);
+                        const f32 wJi = w * J[i];
+                        for (int j = 0; j < 8; ++j) Aa[i * 8 + j] += (double)(wJi * J[j]);
                     }
+                    sr += std::fabs((double)err); ++cn;
                 }
             }
+            srp[(size_t)t] = sr; cntp[(size_t)t] = cn;
         });
         f32 A[8][8]; f32 b[8];
         for (int i = 0; i < 8; ++i) {
@@ -192,6 +206,13 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                 double a = 0.0; for (int t = 0; t < nt; ++t) a += Ap[(size_t)t][i * 8 + j];
                 A[i][j] = (f32)a;
             }
+        }
+        // Robust scale for the NEXT iteration from this iteration's residuals.
+        double sum_abs = 0.0; long cnt = 0;
+        for (int t = 0; t < nt; ++t) { sum_abs += srp[(size_t)t]; cnt += cntp[(size_t)t]; }
+        if (cnt > 0) {
+            const f32 c = 2.5f * (f32)(sum_abs / (double)cnt);
+            cinv2 = 1.f / (c * c + 1e-12f);
         }
         // Levenberg damping on the diagonal.
         f32 tr = 0.f; for (int i = 0; i < 8; ++i) tr += A[i][i];
@@ -243,8 +264,8 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
     // levels are cheap 2x halvings of it -- no repeated full-grey reads.
     // lk_refine reverts non-improving iterations, so no level worsens the fit.
     f32 scf = 1.f;
-    const Image fine_r = downsample_to(ref_grey, 256, scf);
-    const Image fine_c = downsample_to(comp_grey, 256, scf);
+    const Image fine_r = downsample_to(ref_grey, 384, scf);
+    const Image fine_c = downsample_to(comp_grey, 384, scf);
     if (fine_r.h <= 8 || fine_r.w <= 8) return;
     const Image mid_r = downsample2x(fine_r), mid_c = downsample2x(fine_c);
     const Image cor_r = downsample2x(mid_r), cor_c = downsample2x(mid_c);
