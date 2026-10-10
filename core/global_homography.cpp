@@ -322,7 +322,37 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
     const f32 det2 = H[0] * H[4] - H[1] * H[3];
     const bool degenerate = !(std::fabs(det2) > 0.25f && std::fabs(det2) < 4.f) ||
                             !std::isfinite(e_ref);
-    if (degenerate || !(e_ref < e_seed)) return;
+    // Require a MARGIN, not just any improvement. On a near-still burst the true
+    // motion is dominated by sensor noise, and the 8-DOF refine will fit that
+    // noise into spurious shear/perspective that lowers the average grey error
+    // by a sliver while swinging the FRAME CORNERS by ~1px -- it warps an
+    // already-aligned frame into misalignment, worst at the periphery (measured:
+    // a 0.3px-motion input went from 0.36px corner error to 0.90px). The rigid
+    // seed is the safe fallback; only take the homography when it earns it.
+    if (degenerate || !(e_ref < 0.98f * e_seed)) return;
+
+    // Second gate: even with a real average-error win, reject a refine that
+    // moves the corners far more than the seed does (relative to identity) --
+    // the signature of noise-driven perspective. A genuine global perspective
+    // change lowers the error roughly in proportion to how far it moves pixels;
+    // noise lowers it marginally while moving corners a lot. Cap the ratio.
+    {
+        const f32 cxs[4] = {0.f, (f32)(ref_grey.w - 1), 0.f, (f32)(ref_grey.w - 1)};
+        const f32 cys[4] = {0.f, 0.f, (f32)(ref_grey.h - 1), (f32)(ref_grey.h - 1)};
+        f32 ref_move = 0.f, seed_move = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            f32 rx, ry, sx, sy;
+            apply_homography(Href,  cxs[i], cys[i], rx, ry);
+            apply_homography(Hseed, cxs[i], cys[i], sx, sy);
+            ref_move  = std::max(ref_move,  std::hypot(rx - cxs[i], ry - cys[i]));
+            seed_move = std::max(seed_move, std::hypot(sx - cxs[i], sy - cys[i]));
+        }
+        // When the seed is ~identity (still burst), allow the refine at most a
+        // small absolute corner excursion; otherwise allow it to scale with the
+        // seed's own motion. Reject wild perspective on low-motion input.
+        const f32 allowed = std::max(2.0f, 1.5f * seed_move);
+        if (ref_move > allowed) return;  // keep the rigid seed
+    }
 
     for (int i = 0; i < 9; ++i) H_inout[i] = H[i];
 }
