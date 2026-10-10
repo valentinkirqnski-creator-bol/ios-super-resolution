@@ -1200,11 +1200,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     int nlev = (int)ref_pyr.levels.size();
 
 #ifdef __APPLE__
-    // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 (or cfg.align_force_cpu,
-    // set by the shift-consensus pre-pass) forces the portable C++ path, which
-    // works on ad-hoc host greys without the resident-GPU-frame state align_metal
-    // assumes.
-    if (!cfg.align_force_cpu && !env_flag_on("HHSR_ALIGN_CPU")) {
+    // Default iOS path: Metal alignment. HHSR_ALIGN_CPU=1 forces the C++ path.
+    if (!env_flag_on("HHSR_ALIGN_CPU")) {
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
                         initial_dx, initial_dy, initial_rotation_rad)) {

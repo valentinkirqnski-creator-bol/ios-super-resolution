@@ -744,31 +744,6 @@ struct Config {
     // 384 / 640 / 1280 to hit those distinct rungs. 384 keeps the shipped speed.
     int   isa_prealign_refine_dim    = 384;
 
-    // Multi-frame shift-consistency consensus (ImageStackAlignator's "d)"
-    // outlier rejection; core/shift_consensus.*). When on, a pre-pass measures
-    // redundant pairwise per-tile tracks across the burst, solves the
-    // over-determined per-tile system A x = b on the sequential shifts, rejects
-    // the worst inconsistent measurement iteratively (ISA's 1 px^2 threshold),
-    // and feeds each frame the outlier-free consensus flow instead of its plain
-    // frame->reference track. Faithful to ISA, but MEASURED to degrade our real
-    // alignment (dense low-texture tracks violate ISA's sparse-outlier
-    // assumption; the residual is consistent parallax, not blunders), so it is
-    // off by default and opt-in for experimentation. Full strategy (every pair)
-    // unless shift_consensus_block_size > 0, then a Blocks sliding window.
-    bool  shift_consensus_enabled = false;
-    int   shift_consensus_block_size = 0;     // 0 => Full (every pair); >0 => Blocks window
-    float shift_consensus_reject_px2 = 1.0f;  // ISA checkForOutliers threshold
-    // Largest burst the shift-consensus pre-pass will run on. It holds every
-    // frame's warped grey + pyramid at once (~160MB/frame at 12MP), so a long
-    // burst would exhaust memory and the OS jetsam-kills the app. Above this it
-    // bails to the normal per-frame align. Keep small; this is an experiment.
-    int   shift_consensus_max_frames = 6;
-    // Internal: force align() onto the portable CPU path instead of Metal. Set
-    // only by the consensus pre-pass, which block-matches ad-hoc warped greys
-    // that were never uploaded as resident GPU frames -- align_metal assumes
-    // that residency and is driven out of model otherwise. Not a user setting.
-    bool  align_force_cpu = false;
-
     // Frame-level global-fit rejection. When a global pre-align path is active
     // (isa_prealign or global_homography) and the pre-aligned comparison grey
     // still correlates poorly with the reference, the frame could not be

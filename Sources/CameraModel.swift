@@ -204,11 +204,6 @@ struct TuningParams: Equatable, Codable {
     /// computed full-res grey. Higher = more precise (esp. low light), slower.
     /// Picker values 384/640/1280 hit the downsample ladder's distinct rungs.
     var isa_prealign_refine_dim: Int = 384
-    /// ImageStackAlignator multi-frame shift-consistency consensus (its "d)"
-    /// outlier rejection). Measures redundant pairwise tracks and feeds each
-    /// frame the outlier-free consensus flow. Opt-in; off by default (measured
-    /// to degrade our real bursts, kept for experimentation).
-    var shift_consensus_enabled: Bool = false
     /// Drop a comparison frame from the merge when the global pre-align
     /// (ISA / homography) cannot register it to the reference -- extreme motion,
     /// blur, scene change or tiny overlap. Gate is the pre-align fit NCC.
@@ -390,7 +385,6 @@ struct TuningParams: Equatable, Codable {
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates, isa_prealign_enabled
         case isa_prealign_rot_range_deg, isa_prealign_refine_dim
-        case shift_consensus_enabled
         case prealign_reject_enabled, prealign_reject_ncc, prealign_only_enabled
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
@@ -488,7 +482,6 @@ struct TuningParams: Equatable, Codable {
         isa_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .isa_prealign_enabled) ?? isa_prealign_enabled
         isa_prealign_rot_range_deg = try c.decodeIfPresent(Float.self, forKey: .isa_prealign_rot_range_deg) ?? isa_prealign_rot_range_deg
         isa_prealign_refine_dim = try c.decodeIfPresent(Int.self, forKey: .isa_prealign_refine_dim) ?? isa_prealign_refine_dim
-        shift_consensus_enabled = try c.decodeIfPresent(Bool.self, forKey: .shift_consensus_enabled) ?? shift_consensus_enabled
         prealign_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_reject_enabled) ?? prealign_reject_enabled
         prealign_reject_ncc = try c.decodeIfPresent(Float.self, forKey: .prealign_reject_ncc) ?? prealign_reject_ncc
         prealign_only_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_only_enabled) ?? prealign_only_enabled
@@ -2289,7 +2282,6 @@ final class CameraModel: NSObject, ObservableObject {
             "isa_prealign_enabled": NSNumber(value: tuningParams.isa_prealign_enabled),
             "isa_prealign_rot_range_deg": NSNumber(value: tuningParams.isa_prealign_rot_range_deg),
             "isa_prealign_refine_dim": NSNumber(value: tuningParams.isa_prealign_refine_dim),
-            "shift_consensus_enabled": NSNumber(value: tuningParams.shift_consensus_enabled),
             "prealign_reject_enabled": NSNumber(value: tuningParams.prealign_reject_enabled),
             "prealign_reject_ncc": NSNumber(value: tuningParams.prealign_reject_ncc),
             "prealign_only_enabled": NSNumber(value: tuningParams.prealign_only_enabled),

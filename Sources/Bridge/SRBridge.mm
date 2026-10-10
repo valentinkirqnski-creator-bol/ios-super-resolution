@@ -549,8 +549,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.isa_prealign_rot_range_deg = tuning[@"isa_prealign_rot_range_deg"].floatValue;
     if (tuning[@"isa_prealign_refine_dim"])
         cfg.isa_prealign_refine_dim = tuning[@"isa_prealign_refine_dim"].intValue;
-    if (tuning[@"shift_consensus_enabled"])
-        cfg.shift_consensus_enabled = tuning[@"shift_consensus_enabled"].boolValue;
     if (tuning[@"prealign_reject_enabled"])
         cfg.prealign_reject_enabled = tuning[@"prealign_reject_enabled"].boolValue;
     if (tuning[@"prealign_reject_ncc"])

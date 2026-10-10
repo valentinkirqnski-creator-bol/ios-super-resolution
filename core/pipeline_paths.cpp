@@ -13,7 +13,6 @@
 #include "preset_lut.h"
 #include "global_homography.h"
 #include "isa_prealign.h"
-#include "shift_consensus_pipeline.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1167,13 +1166,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     prof_mark_memory("ref:start");
     const double t_ref_grey = prof_now_ms();
 #if defined(__APPLE__)
-    // Global homography, the ISA pre-align estimate AND the shift-consensus
-    // pre-pass run on the CPU and read the grey pixels, so the grey must be
-    // materialised host-side even on the resident GPU path. Without this the
-    // greys are GPU-only with empty host data, and reading them crashes (the
-    // consensus pre-pass) or silently does nothing (the align-time guard).
-    metal_set_grey_force_host(work.global_homography_enabled || work.isa_prealign_enabled ||
-                              work.shift_consensus_enabled);
+    // Global homography AND the ISA pre-align estimate run on the CPU and read
+    // the grey pixels, so the grey must be materialised host-side even on the
+    // resident GPU path. Without this the greys are GPU-only, the host-data guard
+    // at the align call skips the estimate, and the toggle does nothing.
+    metal_set_grey_force_host(work.global_homography_enabled || work.isa_prealign_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1491,29 +1488,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         spill_pending = false;
     };
-    // ISA multi-frame shift-consistency consensus (opt-in, off by default).
-    // A pre-pass that measures the redundant pairwise tracks across the burst
-    // and hands each frame its outlier-free consensus flow; the per-frame align
-    // below is then skipped for any frame the pre-pass solved. Requires full-res
-    // grey (same constraint as the isa_warp / homography paths). Decodes every
-    // frame once here, so it is genuinely extra work -- hence opt-in.
-    std::vector<FlowField> consensus_flows;
-    if (work.shift_consensus_enabled &&
-        ref_grey.h == ref_h && ref_grey.w == ref_w) {
-        const double t_cons = prof_now_ms();
-        report("Shift consensus: measuring pairwise tracks", 0.08f);
-        auto grey_of_frame = [&](int f) -> Image {
-            if (f == ref_index) return ref_grey;
-            Image c = loader(f, work, false, ref_h, ref_w);
-            if (c.h <= 0) return Image();
-            return compute_grey(c, work.bayer_mode, work.grey_method);
-        };
-        consensus_flows = compute_consensus_flows(ref_grey, ref_index, n,
-                                                  grey_of_frame, work, tile_size);
-        prof_add_cpu("comp:shift-consensus-prepass", prof_now_ms() - t_cons);
-        prof_add_cpu("comp#shift-consensus-ok", consensus_flows.empty() ? 0.0 : 1.0);
-    }
-
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
@@ -1680,15 +1654,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // flow.global_h so robustness/merge sample the registered position.
         // Requires full-res grey (grey == raw), same coordinate constraint as
         // the homography path; the half-res decimate grey is left unchanged.
-        // The shift-consensus pre-pass already produced this frame's cleaned,
-        // raw-grid flow (with global_h). Use it and skip the per-frame align.
         FlowField flow;
-        const bool have_consensus =
-            (!consensus_flows.empty() && k >= 0 && k < (int)consensus_flows.size() &&
-             consensus_flows[(size_t)k].ny > 0 && !consensus_flows[(size_t)k].flow.empty());
-        if (have_consensus) {
-            flow = std::move(consensus_flows[(size_t)k]);
-        } else {
         bool isa_warp = false;
         f32 isaH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
         if (work.isa_prealign_enabled && !use_homog &&
@@ -1737,7 +1703,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // change / tiny overlap) -- drop it rather than merge a bad transform.
         // Skips before align/robustness/merge, exactly like the failed-align
         // path below, so the frame simply contributes nothing.
-        if (!have_consensus && work.prealign_reject_enabled &&
+        if (work.prealign_reject_enabled &&
             (isa_warp || use_homog) &&
             ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
             align_comp->data.size() == (size_t)align_comp->h * align_comp->w * align_comp->c) {
@@ -1773,7 +1739,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (int i = 0; i < 9; ++i) flow.global_h[i] = isaH[i];
             flow.has_global_h = true;
         }
-        } // end !have_consensus (per-frame align)
         // Diagnostic: global-align-only. Zero the per-tile block-match residual
         // so the merge samples purely at global_h * lr -- shows how well the
         // global pre-align registers on its own. Only meaningful when a global
