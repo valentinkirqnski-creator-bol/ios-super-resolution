@@ -771,6 +771,15 @@ struct Config {
     bool  prealign_reject_enabled = false;
     float prealign_reject_ncc     = 0.3f;     // reject frame if fit NCC < this (-1..1)
 
+    // Diagnostic: use ONLY the global pre-align transform and DISABLE the
+    // per-tile block matching -- the merge then samples each comparison frame
+    // purely at global_h * lr (zero per-tile residual flow). Lets you see how
+    // well the global alignment alone registers a burst (sub-pixel or not),
+    // isolating it from the local block-match correction. Requires a global
+    // pre-align path (isa_prealign or global_homography) to be active; otherwise
+    // there is no global transform to fall back on and this is ignored.
+    bool  prealign_only_enabled = false;
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

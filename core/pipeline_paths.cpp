@@ -1774,6 +1774,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             flow.has_global_h = true;
         }
         } // end !have_consensus (per-frame align)
+        // Diagnostic: global-align-only. Zero the per-tile block-match residual
+        // so the merge samples purely at global_h * lr -- shows how well the
+        // global pre-align registers on its own. Only meaningful when a global
+        // transform exists; otherwise zeroing would remove all alignment.
+        if (work.prealign_only_enabled && flow.has_global_h) {
+            std::fill(flow.flow.begin(), flow.flow.end(), 0.f);
+            if (flow.has_motion_prior())
+                std::fill(flow.motion_irregular.begin(), flow.motion_irregular.end(), 0u);
+            flow.affine_jac.clear();
+        }
         // Fit the per-tile affine motion model on the finalized raw-grid flow,
         // before it is uploaded to the GPU slice (metal_frame_set_flow) and
         // before robustness/merge consume it. Off by default (Config::

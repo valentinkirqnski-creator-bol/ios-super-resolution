@@ -900,6 +900,9 @@ struct CameraView: View {
                         Text("Reject a frame whose pre-align fit correlation is below this. Lower = more lenient (drop only near-uncorrelated frames); higher = stricter. 0.30 is a safe default.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                    Toggle("Global Align Only (no block match)", isOn: $cam.tuningParams.prealign_only_enabled)
+                    Text("Diagnostic: use ONLY the global pre-alignment and turn OFF the per-tile block matching, so the merge registers each frame purely by the global transform. Lets you judge how precisely the global alignment registers a handheld burst on its own. Needs a global pre-align path (Global Pre-Alignment or Global Homography) on. Expect good results only where the scene has little depth — parallax from camera translation is local and cannot be removed globally.")
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Shift Consensus (ISA)", isOn: $cam.tuningParams.shift_consensus_enabled)
                     Text("ImageStackAlignator's multi-frame outlier rejection. Instead of each frame's single track to the reference, it measures every frame-pair's track, solves the over-determined per-tile system (shift a→b + b→c must equal a→c), and iteratively rejects the worst inconsistent measurement — feeding each frame the outlier-free consensus flow. Needs full-res (FFT) grey and ≥3 frames; decodes every frame once up front, so it's slower and uses more RAM. Measured to HELP only when tracks have gross blunders (e.g. low light); on clean bursts the remaining error is parallax, which it can't fix and may slightly worsen. Experimental, off by default.")
                         .font(.footnote).foregroundColor(.secondary)

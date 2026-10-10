@@ -555,6 +555,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.prealign_reject_enabled = tuning[@"prealign_reject_enabled"].boolValue;
     if (tuning[@"prealign_reject_ncc"])
         cfg.prealign_reject_ncc = tuning[@"prealign_reject_ncc"].floatValue;
+    if (tuning[@"prealign_only_enabled"])
+        cfg.prealign_only_enabled = tuning[@"prealign_only_enabled"].boolValue;
     if (tuning[@"real_rgb_guide"])
         cfg.real_rgb_guide = tuning[@"real_rgb_guide"].boolValue;
     if (tuning[@"guide_white_balance"])
