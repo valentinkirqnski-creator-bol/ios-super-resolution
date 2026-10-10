@@ -965,6 +965,13 @@ static bool g_resident_out = false;
 static bool g_grey_force_host = false;
 void metal_set_grey_force_host(bool v) { g_grey_force_host = v; }
 
+void metal_invalidate_sticky_grey() {
+    if (!metal_gpu_init()) return;
+    auto& c = ctx();
+    c.sticky_grey = nil;
+    c.sticky_grey_h = c.sticky_grey_w = 0;
+}
+
 static inline size_t bf_raw_off(int slot)  { return (size_t)slot * g_bf.raw_elems; }
 static inline size_t bf_cov_off(int slot)  { return (size_t)slot * g_bf.cov_elems; }
 static inline size_t bf_rob_off(int slot)  { return (size_t)slot * g_bf.rob_elems; }

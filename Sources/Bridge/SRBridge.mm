@@ -537,6 +537,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.affine_flow_enabled = tuning[@"affine_flow_enabled"].boolValue;
     if (tuning[@"global_homography_enabled"])
         cfg.global_homography_enabled = tuning[@"global_homography_enabled"].boolValue;
+    if (tuning[@"isa_prealign_enabled"])
+        cfg.isa_prealign_enabled = tuning[@"isa_prealign_enabled"].boolValue;
+    if (tuning[@"isa_prealign_rot_range_deg"])
+        cfg.isa_prealign_rot_range_deg = tuning[@"isa_prealign_rot_range_deg"].floatValue;
+    if (tuning[@"isa_prealign_refine_dim"])
+        cfg.isa_prealign_refine_dim = tuning[@"isa_prealign_refine_dim"].intValue;
     if (tuning[@"flow_upsample_candidates"])
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
     if (tuning[@"real_rgb_guide"])

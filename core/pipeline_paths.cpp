@@ -12,6 +12,7 @@
 #include "mps_fft.h"
 #include "preset_lut.h"
 #include "global_homography.h"
+#include "isa_prealign.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1167,7 +1168,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 #if defined(__APPLE__)
     // Global homography estimation runs on the CPU and reads the grey pixels, so
     // the grey must be materialised host-side even on the resident GPU path.
-    metal_set_grey_force_host(work.global_homography_enabled);
+    metal_set_grey_force_host(work.global_homography_enabled || work.isa_prealign_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1625,17 +1626,50 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                // resident GPU path the grey can be header-only.
                                ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
                                comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c;
+        // ISA FFT + sub-pixel RIGID global pre-align (Config::isa_prealign_enabled).
+        // Same warp-then-align-residual scheme as the homography path above, but
+        // the transform is a rotation+translation estimated by the FFT scan and
+        // polished by refine_global_rigid_seed. Gated to full-res host grey.
+        f32 isaH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+        bool isa_warp = false;
         Image warped_comp;
         const Image* align_comp = &comp_grey;
         if (use_homog) {
             estimate_global_homography(ref_grey, comp_grey, work, gH);
             warped_comp = warp_grey_by_homography(comp_grey, gH);
             align_comp = &warped_comp;
+        } else if (work.isa_prealign_enabled &&
+                   comp_grey.h == comp.h && comp_grey.w == comp.w &&
+                   ref_grey.h == comp.h && ref_grey.w == comp.w &&
+                   ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
+                   comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c) {
+            float idx = 0.f, idy = 0.f, irot = 0.f;
+            if (estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot)) {
+                refine_global_rigid_seed(ref_grey, comp_grey, work, idx, idy, irot);
+                const f32 cx = 0.5f * (f32)(ref_grey.w - 1);
+                const f32 cy = 0.5f * (f32)(ref_grey.h - 1);
+                const f32 cs = std::cos(irot), sn = std::sin(irot);
+                isaH[0] = cs; isaH[1] = -sn; isaH[2] = cx + idx - cs * cx + sn * cy;
+                isaH[3] = sn; isaH[4] =  cs; isaH[5] = cy + idy - sn * cx - cs * cy;
+                isaH[6] = 0.f; isaH[7] = 0.f; isaH[8] = 1.f;
+                warped_comp = warp_grey_by_homography(comp_grey, isaH);
+                align_comp = &warped_comp;
+                isa_warp = true;
+            }
         }
+#if defined(__APPLE__)
+        // When the comp was warped, align_metal must re-upload the warped host
+        // grey rather than reuse the pinned (unwarped) sticky grey -- otherwise
+        // it aligns the unwarped grey and global_h is composed a second time.
+        if (align_comp != &comp_grey) metal_invalidate_sticky_grey();
+#endif
+        // A warped comp is already globally registered, so the per-tile match
+        // starts from zero; otherwise seed from the thumbnail pre-align.
+        const bool warped = use_homog || isa_warp;
         FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
-                               init.dx * grey_scale_x,
-                               init.dy * grey_scale_y,
-                               init.angle);
+                               warped ? 0.f : init.dx * grey_scale_x,
+                               warped ? 0.f : init.dy * grey_scale_y,
+                               warped ? 0.f : init.angle);
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the flow is on a half-res tile grid with half-res
         // displacements, while robustness and merge both index it as
@@ -1650,6 +1684,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // robustness compose it back: comp_pos = H * (lr + flow).
         if (use_homog) {
             for (int i = 0; i < 9; ++i) flow.global_h[i] = gH[i];
+            flow.has_global_h = true;
+        } else if (isa_warp) {
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = isaH[i];
             flow.has_global_h = true;
         }
         // Fit the per-tile affine motion model on the finalized raw-grid flow,

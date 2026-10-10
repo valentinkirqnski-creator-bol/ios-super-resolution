@@ -723,6 +723,19 @@ struct Config {
     // model parallax or moving objects. See core/global_homography.h.
     bool global_homography_enabled = false;
 
+    // ImageStackAlignator-style global pre-alignment (FFT phase-correlation
+    // rotation+shift scan, core/isa_prealign.*), upgraded to a sub-pixel RIGID
+    // (rotation+translation) Lucas-Kanade refine (refine_global_rigid_seed).
+    // Estimates one global transform per comparison frame, WARPS the comparison
+    // grey into the reference before align(), and composes it back via global_h
+    // at merge/robustness sample time (same infra as global_homography). OFF by
+    // default.
+    bool  isa_prealign_enabled = false;
+    float isa_prealign_rot_range_deg = 3.0f;   // rotation search half-range (+/- deg)
+    float isa_prealign_rot_incr_deg  = 0.2f;   // rotation search increment (deg)
+    int   isa_prealign_fft_max_dim   = 256;    // FFT content cap; N = next_pow2(2*cap)
+    int   isa_prealign_refine_dim    = 384;    // finest resolution of the rigid LK refine
+
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
     // finest-radius override lands on the CPU and the device identically.

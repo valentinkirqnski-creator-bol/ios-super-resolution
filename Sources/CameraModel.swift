@@ -155,6 +155,12 @@ struct TuningParams: Equatable, Codable {
     /// the reference before alignment, compose back at merge time. Experimental,
     /// off by default. Helps large roll; does not fix parallax/moving objects.
     var global_homography_enabled: Bool = false
+    /// ImageStackAlignator-style global pre-alignment (FFT phase-correlation
+    /// rotation+shift scan) with a sub-pixel rigid Lucas-Kanade refine. Warps
+    /// each comparison frame into the reference before block matching. Off by default.
+    var isa_prealign_enabled: Bool = false
+    var isa_prealign_rot_range_deg: Float = 3.0
+    var isa_prealign_refine_dim: Int = 384
     /// Overlapping tiles for alignment (IPOL author's suggestion): after the
     /// normal align, re-measure the finest flow on a stride-Ts/2 grid (2x tiles,
     /// 50% overlap), each cell block-matched on its own Ts window. Captures
@@ -347,6 +353,7 @@ struct TuningParams: Equatable, Codable {
         case align_match_14
         case affine_flow_enabled
         case global_homography_enabled
+        case isa_prealign_enabled, isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
         case motion_geom_reject_enabled, motion_geom_reject_threshold
@@ -439,6 +446,9 @@ struct TuningParams: Equatable, Codable {
         align_match_14 = try c.decodeIfPresent(Bool.self, forKey: .align_match_14) ?? align_match_14
         affine_flow_enabled = try c.decodeIfPresent(Bool.self, forKey: .affine_flow_enabled) ?? affine_flow_enabled
         global_homography_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_homography_enabled) ?? global_homography_enabled
+        isa_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .isa_prealign_enabled) ?? isa_prealign_enabled
+        isa_prealign_rot_range_deg = try c.decodeIfPresent(Float.self, forKey: .isa_prealign_rot_range_deg) ?? isa_prealign_rot_range_deg
+        isa_prealign_refine_dim = try c.decodeIfPresent(Int.self, forKey: .isa_prealign_refine_dim) ?? isa_prealign_refine_dim
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
@@ -2221,6 +2231,9 @@ final class CameraModel: NSObject, ObservableObject {
             "align_match_14": NSNumber(value: tuningParams.align_match_14),
             "affine_flow_enabled": NSNumber(value: tuningParams.affine_flow_enabled),
             "global_homography_enabled": NSNumber(value: tuningParams.global_homography_enabled),
+            "isa_prealign_enabled": NSNumber(value: tuningParams.isa_prealign_enabled),
+            "isa_prealign_rot_range_deg": NSNumber(value: tuningParams.isa_prealign_rot_range_deg),
+            "isa_prealign_refine_dim": NSNumber(value: tuningParams.isa_prealign_refine_dim),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),

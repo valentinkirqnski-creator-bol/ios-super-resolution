@@ -1146,6 +1146,19 @@ struct CameraView: View {
                          Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Global Pre-Alignment (ISA)", isOn: $cam.tuningParams.isa_prealign_enabled)
+                    Text("ImageStackAlignator-style global pre-registration: an FFT phase-correlation scan estimates each frame's whole-image rotation and shift against the reference, refined to sub-pixel by a rigid Lucas-Kanade step, and warps it in before per-tile block matching. Removes global roll/shift so block matching only cleans up the residual. No gyro (search starts at 0°).")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.isa_prealign_enabled {
+                        ispRow("Roll Search (±°)", $cam.tuningParams.isa_prealign_rot_range_deg, 0.5...45.0, "%.1f")
+                        Picker("Pre-Align Precision", selection: $cam.tuningParams.isa_prealign_refine_dim) {
+                            Text("Balanced").tag(384)
+                            Text("Precise").tag(640)
+                            Text("Max").tag(1280)
+                        }
+                        Text("Resolution of the sub-pixel rigid refine. Higher = tighter global fit (esp. low light), slower. Balanced is the shipped speed.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("Geometry Rejection")) {

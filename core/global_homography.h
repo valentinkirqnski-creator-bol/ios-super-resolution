@@ -17,7 +17,39 @@ namespace hhsr {
 void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
                                 const Config& cfg, f32 H_out[9]);
 
+// Lucas-Kanade refine of an EXISTING homography seed (row-major 3x3, full grey
+// pixels) into a full 8-DOF homography -- used to upgrade the ISA pre-align's
+// robust rigid (rotation+translation) estimate to one that also absorbs global
+// scale, shear and perspective ("any camera motion"). H_inout is refined in
+// place; the result is kept only if it lowers the warp error vs the seed and is
+// non-degenerate, so it never makes the seed worse. Needs host grey pixels.
+void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey,
+                                   const Config& cfg, f32 H_inout[9]);
+
+// Sub-pixel RIGID (translation + in-plane rotation about the grey centre) refine
+// of the ISA pre-align's coarse FFT estimate. 3-DOF Gauss-Newton Lucas-Kanade,
+// coarse-to-fine, seeded by (dx, dy, rot) in full grey pixels / radians and
+// refined in place. The FFT scan is quantised (integer peak on a downscaled
+// grid, 0.2-deg angle steps) so it misses the sub-pixel shift and sub-0.2-deg
+// rotation of a handheld burst, leaving large residual at the frame corners
+// (measured 13-46px for a 0.3-0.8 deg roll); this drives it to sub-pixel. Unlike
+// the 8-DOF homography refine it has no shear/perspective freedom, so it cannot
+// fit sensor noise into a warp that injects misalignment on near-still frames.
+// Kept only if it lowers the warp error vs the seed (rare flat-content
+// divergence then keeps the FFT estimate). Needs host grey pixels.
+void refine_global_rigid_seed(const Image& ref_grey, const Image& comp_grey,
+                              const Config& cfg, f32& dx, f32& dy, f32& rot);
+
 // warped(y,x) = comp_grey(H*(x,y)); out-of-bounds -> 0. Single channel.
 Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]);
+
+// Normalized cross-correlation (Pearson, in [-1,1]) between the reference grey
+// and a pre-aligned (warped) comparison grey, over their valid overlap. A frame
+// the global pre-align could register scores near 1; one it could not (extreme
+// motion, motion blur, scene change, tiny overlap) scores near 0, and
+// essentially no overlap returns -1. Used as a frame-level gate to reject
+// unfittable frames before merge. Returns 1 when it cannot be assessed (dims
+// mismatch / empty), so the caller does not reject on a non-measurement.
+f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey);
 
 } // namespace hhsr
