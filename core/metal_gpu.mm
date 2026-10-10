@@ -1693,8 +1693,9 @@ struct RobMaskRawParamsCPU {
     float    edge_misalign_shift_z = 2.0f;
     float    edge_misalign_ghost_z = 3.0f;
     float    edge_misalign_min_conf = 0.0f;
+    uint32_t per_channel = 0;  // 1 = write a separate R per guide channel (ISA)
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 112, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 116, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2267,10 +2268,13 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     }
     if (g_rob_curve_n == 0) return Image();
 
-    const size_t mask_b = (size_t)ch_h * (size_t)ch_w * sizeof(float);
+    // ISA per-channel R (Config::robustness_per_channel): a mask per guide channel.
+    const uint32_t rob_nch = (cfg.robustness_per_channel && nch == 3) ? (uint32_t)nch : 1u;
+    const size_t mask_b = (size_t)ch_h * (size_t)ch_w * sizeof(float);      // 1-ch (s_select)
+    const size_t mask_b_r = mask_b * (size_t)rob_nch;                        // per-channel R
     id<MTLBuffer> b_S = buf(S.data(), S.size() * sizeof(float));
-    id<MTLBuffer> b_R = buf(nullptr, mask_b);
-    id<MTLBuffer> b_out = buf(nullptr, mask_b);
+    id<MTLBuffer> b_R = buf(nullptr, mask_b_r);
+    id<MTLBuffer> b_out = buf(nullptr, mask_b_r);
     const bool want_s_select = (s_select_out != nullptr);
     id<MTLBuffer> b_s_select = buf(nullptr, want_s_select ? mask_b : sizeof(float));
     const size_t n_tiles = (size_t)std::max(0, flow.ny) * (size_t)std::max(0, flow.nx);
@@ -2330,6 +2334,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.edge_misalign_shift_z = cfg.edge_misalign_shift_z;
     mp.edge_misalign_ghost_z = cfg.edge_misalign_ghost_z;
     mp.edge_misalign_min_conf = cfg.edge_misalign_min_conf;
+    mp.per_channel = (rob_nch > 1u) ? 1u : 0u;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -2361,9 +2366,9 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    Image R_pre(ch_h, ch_w, 1);
-    memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    Image r = robustness_local_min_on_guide(R_pre);
+    Image R_pre(ch_h, ch_w, (int)rob_nch);
+    memcpy(R_pre.data.data(), [b_R contents], mask_b_r);
+    Image r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);

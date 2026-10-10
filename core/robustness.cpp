@@ -766,7 +766,10 @@ Image compute_guide(const Image& raw, const Config& cfg) {
     // already in the samples and "keep" means doing nothing; a raw that arrived
     // un-prewhitened gets the gains applied here instead, so the guide is the
     // same picture either way.
-    if (cfg.real_rgb_guide) {
+    // Single 460 guide path: the real-RGB guide (WB + CCM + sRGB curve) is retired
+    // so the guide can only ever be 460-main's plain linear RGB guide. Flag kept
+    // for preference compatibility but no longer selects anything.
+    if (false && cfg.real_rgb_guide) {
         f32 wb[3] = {1.f, 1.f, 1.f};
         if (!cfg.raw_prewhitened) {
             const f32 g = cfg.white_balance[1];
@@ -805,19 +808,21 @@ Image compute_guide(const Image& raw, const Config& cfg) {
         return guide;
     }
 
+    // Un-prewhiten to camera-native so the guide equals 460-main's (460 builds the
+    // guide from the un-white-balanced raw; the port's loader prewhitens). Always
+    // applied now -- guide_white_balance (keep WB) is retired for the single path.
     f32 wbu[3] = {1.f, 1.f, 1.f};
-    if (cfg.raw_prewhitened && !cfg.guide_white_balance) {
+    if (cfg.raw_prewhitened) {
         const f32 g = cfg.white_balance[1];
         for (int c = 0; c < 3; ++c) {
             const f32 wc = cfg.white_balance[c];
             wbu[c] = (std::isfinite(g) && std::isfinite(wc) && wc > 0.f) ? (g / wc) : 1.f;
         }
     }
-    // Effective transfer curve: -1 auto follows robustness_guide_sqrt so the
-    // default (no colour flags) stays byte-identical.
-    int curve = cfg.guide_curve;
-    if (curve < 0) curve = cfg.robustness_guide_sqrt_active() ? 1 : 0;
-    const bool apply_ccm = cfg.guide_color_matrix && cfg.has_cam_to_srgb;
+    // Single 460 guide path: always linear, never a colour matrix. guide_curve /
+    // guide_color_matrix are retired (kept in Config for preference compatibility).
+    const int curve = 0;                 // linear, exactly 460-main
+    const bool apply_ccm = false;
     const float* M = cfg.cam_to_srgb; // camera -> linear sRGB (same as the ISP)
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {

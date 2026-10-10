@@ -2400,6 +2400,7 @@ struct RobMaskRawParams {
     float edge_misalign_shift_z;
     float edge_misalign_ghost_z;
     float edge_misalign_min_conf;
+    uint per_channel;  // 1 = write a separate R per guide channel (ISA per-channel)
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2536,6 +2537,10 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
     // apply_noise_model (robustness.cpp).
     float sigma_sq_ = 0.f;
     float d_sq_ = 0.f;
+    // Per-channel accumulators (ISA per-channel R, Config::robustness_per_channel);
+    // used only when p.per_channel != 0. nch <= 3.
+    float d_ch[3] = {0.f, 0.f, 0.f};
+    float sig_ch[3] = {0.f, 0.f, 0.f};
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = out_o * p.nch + ch;
         float brightness = ref_means[o];
@@ -2552,13 +2557,16 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
         float sigma_p_sq = ref_vars[o];
-        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+        float sigma_c = max(sigma_p_sq, sigma_t * sigma_t);
+        sigma_sq_ += sigma_c;
         float comp = comp_means[o];
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
         float denom = d_p_sq + d_t * d_t;
         float shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
-        d_sq_ += d_p_sq * shrink * shrink;
+        float d_c = d_p_sq * shrink * shrink;
+        d_sq_ += d_c;
+        if (ch < 3u) { d_ch[ch] = d_c; sig_ch[ch] = sigma_c; }
     }
 
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
@@ -2589,22 +2597,34 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint gx = min(gid.x / 2u, p.hf_w - 1u);
         hf_reject = ref_hf_loss[gy * p.hf_w + gx] > p.hf_variance_loss_threshold;
     }
-    float r_val = (hf_reject || motion_magnitude_reject_tile)
-        ? 0.f
-        : clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
-    // An OOB Dodgson sample arrives as +inf in comp_means -> d_sq_ = +inf ->
-    // shrink inf/inf = NaN -> r_val NaN. Metal's clamp() propagates NaN; the
-    // Python reference's min/max clamp yields the intended 0. Mirror the CPU
-    // guard in compute_robustness_raw_res.
-    if (!isfinite(r_val)) r_val = 0.f;
-    if (p.edge_misalign_enabled != 0u && r_val > 0.f)
-        r_val *= rob_edge_misalign_c(ref_means, comp_means, p.h, p.w, p.nch,
-                                     int(gid.y), int(gid.x), 0.f, 0.f,
-                                     p.edge_misalign_enabled, int(p.edge_misalign_radius),
-                                     p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
-                                     p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
-                                     p.alpha, p.beta);
-    R[out_o] = r_val;
+    bool hard_reject = (hf_reject || motion_magnitude_reject_tile);
+    // Edge-misalignment confidence multiplier (1.0 when disabled/hard-rejected),
+    // applied to every channel so the per-channel path stays consistent.
+    float emc = 1.f;
+    if (p.edge_misalign_enabled != 0u && !hard_reject)
+        emc = rob_edge_misalign_c(ref_means, comp_means, p.h, p.w, p.nch,
+                                  int(gid.y), int(gid.x), 0.f, 0.f,
+                                  p.edge_misalign_enabled, int(p.edge_misalign_radius),
+                                  p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
+                                  p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
+                                  p.alpha, p.beta);
+    // rob_nch guide channels of output when per_channel (ISA), else 1.
+    uint rob_nch = (p.per_channel != 0u) ? p.nch : 1u;
+    uint obase = out_o * rob_nch;
+    if (hard_reject) {
+        for (uint ch = 0u; ch < rob_nch; ++ch) R[obase + ch] = 0.f;
+    } else if (p.per_channel != 0u) {
+        for (uint ch = 0u; ch < rob_nch; ++ch) {
+            float rc = clamp(s * exp(-d_ch[ch] / sig_ch[ch]) - p.r_t, 0.f, 1.f);
+            if (!isfinite(rc)) rc = 0.f;        // OOB Dodgson -> NaN -> 0 (CPU parity)
+            R[obase + ch] = rc * emc;
+        }
+    } else {
+        float r_val = clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
+        // An OOB Dodgson sample arrives as +inf -> d_sq_ = +inf -> NaN; force 0.
+        if (!isfinite(r_val)) r_val = 0.f;
+        R[obase] = r_val * emc;
+    }
     if (p.save_s_select != 0u)
         s_select[out_o] = (s <= p.r_s1) ? 1.f : 0.f;
 }

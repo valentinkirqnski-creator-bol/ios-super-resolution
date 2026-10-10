@@ -1093,15 +1093,17 @@ struct Config {
     // raw resolution, so asking for raw-resolution R means using it directly,
     // with no upscale anywhere. That is strictly more information than the
     // Dodgson route, which only ever bought positions.
+    // SINGLE ROBUSTNESS PATH (460-main / IPOL Algorithm 6). The robustness mask is
+    // ALWAYS built from 460's 3-channel half-res guide image (ComputeGuideImage),
+    // ALWAYS with 460's 3x3 local statistics, and ALWAYS Dodgson-x2 upscaled and
+    // flow-warped to raw resolution. The guide/resolution/domain is no longer
+    // config-dependent -- the FFT single-channel guide, the sqrt guide domain, and
+    // the guide-resolution (non-upscaled) path are all retired so the mask cannot
+    // silently change with a toggle. (The old flags robustness_fft_guide,
+    // robustness_raw_resolution_enabled, robustness_guide_sqrt are left in the
+    // struct for preference compatibility but no longer select anything here.)
     bool robustness_fft_guide_active() const {
-        // Per-channel robustness (ISA) is per-COLOUR-channel, so it needs the
-        // 3-channel RGB guide. The FFT guide is a single grey channel -- there is
-        // nothing to split -- so robustness_per_channel would be a silent no-op on
-        // it (measured: byte-identical mask). When per-channel is requested, fall
-        // back to the 3-channel half-res guide instead, which is also ISA's guide.
-        if (robustness_per_channel) return false;
-        return bayer_mode && grey_method == GreyMethod::FFT &&
-               (robustness_fft_guide || robustness_raw_resolution_enabled);
+        return false;  // retired: the guide is always 460's 3-channel RGB guide
     }
     // The Dodgson-upscale route specifically. Every consumer of this means "the
     // reference statistics were upscaled and live in means_hires/stds_hires",
@@ -1110,24 +1112,17 @@ struct Config {
     // the ordinary guide-resolution code path produces raw-resolution R from
     // them without knowing anything has changed.
     bool robustness_raw_resolution_active() const {
-        // Compute the local statistics on the half-res Bayer guide and Dodgson-x2
-        // upscale them to raw resolution (Algorithm 6) WHENEVER the toggle is on,
-        // regardless of the alignment grey (FFT or decimate). The guide is half
-        // res and the flow is on the raw tile grid either way, so the upscale is
-        // valid under any alignment; the old grey_method==Decimate gate silently
-        // disabled it under the default FFT alignment.
-        // Per-channel robustness runs on the plain guide-resolution path (the one
-        // with the per-channel kernel + resident merge). The Dodgson raw-res route
-        // on Metal (rob_make_mask_raw) is single-channel, so route around it too.
-        if (robustness_per_channel) return false;
-        return robustness_raw_resolution_enabled && !robustness_fft_guide_active();
+        // ALWAYS the Dodgson-x2 upscale+warp path for a Bayer burst: the half-res
+        // 3-channel guide statistics are upscaled and flow-warped to raw resolution
+        // (Algorithm 6). This is now the single robustness path, no longer tied to
+        // robustness_raw_resolution_enabled. Grey (non-Bayer) input needs no upscale
+        // -- its guide is already full-resolution -- so it stays false there.
+        return bayer_mode;
     }
-    // Whether the guide is sqrt(raw), which decides both its transfer curve and
-    // whether the noise curve is indexed by mean^2. The FFT guide is a linear
-    // low pass of the raw, so it is indexed by brightness directly; applying
-    // sqrt to it would not even be the same thing as low-passing sqrt(raw).
+    // The guide is always linear (460-main), never sqrt. Retired alongside the FFT
+    // guide; the noise curve is indexed by brightness directly.
     bool robustness_guide_sqrt_active() const {
-        return robustness_guide_sqrt && !robustness_fft_guide_active();
+        return false;
     }
     // ImageStackAlignator's rule for unreliable matches, in the author's own
     // words: "if we cannot determine a precise shift for a given patch due to
