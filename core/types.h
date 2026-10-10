@@ -1096,8 +1096,13 @@ struct Config {
     // the ordinary guide-resolution code path produces raw-resolution R from
     // them without knowing anything has changed.
     bool robustness_raw_resolution_active() const {
-        return robustness_raw_resolution_enabled && !robustness_fft_guide_active() &&
-               grey_method == GreyMethod::Decimate;
+        // Compute the local statistics on the half-res Bayer guide and Dodgson-x2
+        // upscale them to raw resolution (Algorithm 6) WHENEVER the toggle is on,
+        // regardless of the alignment grey (FFT or decimate). The guide is half
+        // res and the flow is on the raw tile grid either way, so the upscale is
+        // valid under any alignment; the old grey_method==Decimate gate silently
+        // disabled it under the default FFT alignment.
+        return robustness_raw_resolution_enabled && !robustness_fft_guide_active();
     }
     // Whether the guide is sqrt(raw), which decides both its transfer curve and
     // whether the noise curve is indexed by mean^2. The FFT guide is a linear
