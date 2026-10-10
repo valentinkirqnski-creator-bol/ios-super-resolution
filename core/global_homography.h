@@ -29,4 +29,13 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
 // warped(y,x) = comp_grey(H*(x,y)); out-of-bounds -> 0. Single channel.
 Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]);
 
+// Normalized cross-correlation (Pearson, in [-1,1]) between the reference grey
+// and a pre-aligned (warped) comparison grey, over their valid overlap. A frame
+// the global pre-align could register scores near 1; one it could not (extreme
+// motion, motion blur, scene change, tiny overlap) scores near 0, and
+// essentially no overlap returns -1. Used as a frame-level gate to reject
+// unfittable frames before merge. Returns 1 when it cannot be assessed (dims
+// mismatch / empty), so the caller does not reject on a non-measurement.
+f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey);
+
 } // namespace hhsr

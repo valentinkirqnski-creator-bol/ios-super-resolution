@@ -1728,6 +1728,26 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // global_h composes exactly once.
         if (align_comp != &comp_grey) metal_invalidate_sticky_grey();
 #endif
+        // Frame-level global-fit gate. If a global pre-align path ran but the
+        // pre-aligned grey still correlates poorly with the reference, this
+        // frame cannot be registered globally (extreme motion / blur / scene
+        // change / tiny overlap) -- drop it rather than merge a bad transform.
+        // Skips before align/robustness/merge, exactly like the failed-align
+        // path below, so the frame simply contributes nothing.
+        if (!have_consensus && work.prealign_reject_enabled &&
+            (isa_warp || use_homog) &&
+            ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
+            align_comp->data.size() == (size_t)align_comp->h * align_comp->w * align_comp->c) {
+            const f32 fit = prealign_fit_ncc(ref_grey, *align_comp);
+            prof_add_cpu("prealign#fit-ncc-sum", (double)fit);
+            prof_add_cpu("prealign#fit-frames", 1.0);
+            if (fit < work.prealign_reject_ncc) {
+                report("Frame " + std::to_string(k + 1) + ": rejected (no global fit)",
+                       0.08f + 0.35f * (float)(pos + 1) / std::max(1, n - 1));
+                prof_add_cpu("prealign#rejected", 1.0);
+                continue;
+            }
+        }
         flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
                                seed_dx, seed_dy, seed_rot);
         // Alignment ran on the grey. With the Bayer quad average that is half

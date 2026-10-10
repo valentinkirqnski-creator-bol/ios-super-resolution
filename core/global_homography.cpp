@@ -408,4 +408,40 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     f32 tmp[9]; mat3_mul(H, D, tmp); mat3_mul(Dinv, tmp, H_out);
 }
 
+f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey) {
+    const Image& a = ref_grey;
+    const Image& b = warped_comp_grey;
+    if (a.h <= 0 || a.w <= 0 || b.h != a.h || b.w != a.w) return 1.f; // can't assess
+    if (a.data.size() != (size_t)a.h * a.w * a.c ||
+        b.data.size() != (size_t)b.h * b.w * b.c) return 1.f;
+    // Pearson correlation over the inner 80% (the warp zeroes a border strip for
+    // any real shift; sampling the centre avoids counting that border as
+    // mismatch), subsampled for speed.
+    const int stride = 4;
+    const int y0 = a.h / 10, y1 = a.h - a.h / 10;
+    const int x0 = a.w / 10, x1 = a.w - a.w / 10;
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    long nn = 0, tot = 0;
+    for (int y = y0; y < y1; y += stride)
+        for (int x = x0; x < x1; x += stride) {
+            ++tot;
+            const float vb = b.at(y, x);
+            if (vb == 0.f) continue;              // warp out-of-bounds -> exactly 0
+            const float va = a.at(y, x);
+            sa += va; sb += vb; saa += (double)va * va; sbb += (double)vb * vb;
+            sab += (double)va * vb; ++nn;
+        }
+    if (tot <= 0) return 1.f;
+    // Barely any valid overlap means the frame hardly maps onto the reference --
+    // treat that as a definite non-fit.
+    if ((double)nn < 0.25 * (double)tot) return -1.f;
+    const double n = (double)nn;
+    const double cov = sab / n - (sa / n) * (sb / n);
+    const double va2 = saa / n - (sa / n) * (sa / n);
+    const double vb2 = sbb / n - (sb / n) * (sb / n);
+    const double den = std::sqrt(va2 * vb2);
+    if (!(den > 1e-12)) return 0.f;              // flat region: no evidence either way
+    return (f32)(cov / den);
+}
+
 } // namespace hhsr

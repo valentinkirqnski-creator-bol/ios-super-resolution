@@ -759,6 +759,18 @@ struct Config {
     int   shift_consensus_block_size = 0;     // 0 => Full (every pair); >0 => Blocks window
     float shift_consensus_reject_px2 = 1.0f;  // ISA checkForOutliers threshold
 
+    // Frame-level global-fit rejection. When a global pre-align path is active
+    // (isa_prealign or global_homography) and the pre-aligned comparison grey
+    // still correlates poorly with the reference, the frame could not be
+    // registered (extreme motion / blur / scene change / tiny overlap) -- drop
+    // it from the merge instead of blending a bad transform. The gate is the
+    // Pearson NCC (prealign_fit_ncc) over the overlap; reject below the
+    // threshold. Off by default; the threshold is deliberately lenient so only
+    // clearly unregisterable frames are dropped (small residuals are handled by
+    // the per-tile flow and the per-pixel robustness mask, not here).
+    bool  prealign_reject_enabled = false;
+    float prealign_reject_ncc     = 0.3f;     // reject frame if fit NCC < this (-1..1)
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

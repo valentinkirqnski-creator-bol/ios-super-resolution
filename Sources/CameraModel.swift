@@ -209,6 +209,11 @@ struct TuningParams: Equatable, Codable {
     /// frame the outlier-free consensus flow. Opt-in; off by default (measured
     /// to degrade our real bursts, kept for experimentation).
     var shift_consensus_enabled: Bool = false
+    /// Drop a comparison frame from the merge when the global pre-align
+    /// (ISA / homography) cannot register it to the reference -- extreme motion,
+    /// blur, scene change or tiny overlap. Gate is the pre-align fit NCC.
+    var prealign_reject_enabled: Bool = false
+    var prealign_reject_ncc: Float = 0.3
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -382,6 +387,7 @@ struct TuningParams: Equatable, Codable {
         case real_rgb_guide, flow_upsample_candidates, isa_prealign_enabled
         case isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case shift_consensus_enabled
+        case prealign_reject_enabled, prealign_reject_ncc
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
@@ -479,6 +485,8 @@ struct TuningParams: Equatable, Codable {
         isa_prealign_rot_range_deg = try c.decodeIfPresent(Float.self, forKey: .isa_prealign_rot_range_deg) ?? isa_prealign_rot_range_deg
         isa_prealign_refine_dim = try c.decodeIfPresent(Int.self, forKey: .isa_prealign_refine_dim) ?? isa_prealign_refine_dim
         shift_consensus_enabled = try c.decodeIfPresent(Bool.self, forKey: .shift_consensus_enabled) ?? shift_consensus_enabled
+        prealign_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .prealign_reject_enabled) ?? prealign_reject_enabled
+        prealign_reject_ncc = try c.decodeIfPresent(Float.self, forKey: .prealign_reject_ncc) ?? prealign_reject_ncc
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2277,6 +2285,8 @@ final class CameraModel: NSObject, ObservableObject {
             "isa_prealign_rot_range_deg": NSNumber(value: tuningParams.isa_prealign_rot_range_deg),
             "isa_prealign_refine_dim": NSNumber(value: tuningParams.isa_prealign_refine_dim),
             "shift_consensus_enabled": NSNumber(value: tuningParams.shift_consensus_enabled),
+            "prealign_reject_enabled": NSNumber(value: tuningParams.prealign_reject_enabled),
+            "prealign_reject_ncc": NSNumber(value: tuningParams.prealign_reject_ncc),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

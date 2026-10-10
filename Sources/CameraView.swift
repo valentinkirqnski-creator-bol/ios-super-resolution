@@ -892,6 +892,14 @@ struct CameraView: View {
                         Text("Resolution of the homography refine. It reuses the full-res grey already computed for alignment, so higher just trades compute for a tighter global fit — most useful in low light / low contrast, where a coarse fit leaves slight edge misalignment. Balanced is the shipped speed; Precise/Max are slower.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                    Toggle("Reject Unfittable Frames", isOn: $cam.tuningParams.prealign_reject_enabled)
+                    Text("When the global pre-alignment (ISA / homography) cannot register a frame to the reference — extreme motion, motion blur, a scene change, or too little overlap — drop that whole frame from the merge instead of blending a bad transform (which ghosts). The gate is the pre-align fit (normalized correlation with the reference); frames below the threshold are dropped. Only clearly unregisterable frames are affected — slight misalignment is still handled by per-tile flow and the robustness mask. Requires a global pre-align path to be on.")
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.prealign_reject_enabled {
+                        ispRow("Min Fit (NCC)", $cam.tuningParams.prealign_reject_ncc, 0.0...0.9, "%.2f")
+                        Text("Reject a frame whose pre-align fit correlation is below this. Lower = more lenient (drop only near-uncorrelated frames); higher = stricter. 0.30 is a safe default.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                     Toggle("Shift Consensus (ISA)", isOn: $cam.tuningParams.shift_consensus_enabled)
                     Text("ImageStackAlignator's multi-frame outlier rejection. Instead of each frame's single track to the reference, it measures every frame-pair's track, solves the over-determined per-tile system (shift a→b + b→c must equal a→c), and iteratively rejects the worst inconsistent measurement — feeding each frame the outlier-free consensus flow. Needs full-res (FFT) grey and ≥3 frames; decodes every frame once up front, so it's slower and uses more RAM. Measured to HELP only when tracks have gross blunders (e.g. low light); on clean bursts the remaining error is parallax, which it can't fix and may slightly worsen. Experimental, off by default.")
                         .font(.footnote).foregroundColor(.secondary)
