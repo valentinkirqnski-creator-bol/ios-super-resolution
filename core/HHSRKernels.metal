@@ -892,6 +892,7 @@ struct MergeCompParams {
     // lr/raw coords; composed onto the comp sample position when use_homography.
     float hmat[9];
     uint use_homography;
+    uint rob_nch;   // channels in the robustness buffer (ISA per-channel: 3, else 1)
 };
 
 struct MergeRefParams {
@@ -1081,8 +1082,10 @@ inline void flow_sample_affine(device const float* flow, device const float* jac
 
 inline float sample_robustness_bilinear(device const float* robustness,
                                         uint h, uint w,
-                                        float y, float x) {
+                                        float y, float x,
+                                        uint nch = 1u, uint ch = 0u) {
     if (h == 0u || w == 0u) return 0.f;
+    if (ch >= nch) ch = nch - 1u;
     y = clamp(y, 0.f, float(h - 1u));
     x = clamp(x, 0.f, float(w - 1u));
     int y0 = int(floor(y));
@@ -1091,12 +1094,12 @@ inline float sample_robustness_bilinear(device const float* robustness,
     int x1 = min(x0 + 1, int(w) - 1);
     float fy = y - float(y0);
     float fx = x - float(x0);
-    float top = robustness[uint(y0) * w + uint(x0)] +
-                (robustness[uint(y0) * w + uint(x1)] -
-                 robustness[uint(y0) * w + uint(x0)]) * fx;
-    float bot = robustness[uint(y1) * w + uint(x0)] +
-                (robustness[uint(y1) * w + uint(x1)] -
-                 robustness[uint(y1) * w + uint(x0)]) * fx;
+    float top = robustness[(uint(y0) * w + uint(x0)) * nch + ch] +
+                (robustness[(uint(y0) * w + uint(x1)) * nch + ch] -
+                 robustness[(uint(y0) * w + uint(x0)) * nch + ch]) * fx;
+    float bot = robustness[(uint(y1) * w + uint(x0)) * nch + ch] +
+                (robustness[(uint(y1) * w + uint(x1)) * nch + ch] -
+                 robustness[(uint(y1) * w + uint(x0)) * nch + ch]) * fx;
     return top + (bot - top) * fy;
 }
 
@@ -1151,13 +1154,23 @@ static inline void merge_comp_contrib(device const float* img,
     // interpolating the tile flow are different decisions, and sharing a flag
     // would have made turning one on silently change the alignment the merge
     // fetches with. See Config::merge_robustness_bilinear.
-    float local_r;
+    // Per-channel robustness (ISA, Config::robustness_per_channel): p.rob_nch==3
+    // => one weight per R/G/B, indexed by the gathered sample's CFA channel.
+    // p.rob_nch==1 => all three equal (the single Wronski Eq.6 weight), so the
+    // default path is unchanged.
+    const uint rnc = max(p.rob_nch, 1u);
+    float local_r0, local_r1, local_r2;
     if (p.rob_bilinear != 0u) {
-        local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
+        local_r0 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 0u);
+        local_r1 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 1u);
+        local_r2 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 2u);
     } else {
         int iy = clamp(int(floor(rob_y + 0.5f)), 0, int(p.rob_h) - 1);
         int ix = clamp(int(floor(rob_x + 0.5f)), 0, int(p.rob_w) - 1);
-        local_r = robustness[uint(iy) * p.rob_w + uint(ix)];
+        uint rbase = (uint(iy) * p.rob_w + uint(ix)) * rnc;
+        local_r0 = robustness[rbase + min(0u, rnc - 1u)];
+        local_r1 = robustness[rbase + min(1u, rnc - 1u)];
+        local_r2 = robustness[rbase + min(2u, rnc - 1u)];
     }
     // Nothing to accumulate where the frame is fully rejected. Every
     // contribution is w * local_r * c or w * local_r, so all nine taps produce
@@ -1167,7 +1180,7 @@ static inline void merge_comp_contrib(device const float* img,
     // and every term added is non-negative, since w = exp(...) > 0, local_r >= 0
     // and the normalized Bayer samples are >= 0. So no -0 can arise, and x + 0
     // is bit-identical to x for every value these accumulators can hold.
-    if (local_r <= 0.f) return;
+    if (local_r0 <= 0.f && local_r1 <= 0.f && local_r2 <= 0.f) return;
 
     float lr_mov_x = lr_x + flowx;
     float lr_mov_y = lr_y + flowy;
@@ -1226,8 +1239,9 @@ static inline void merge_comp_contrib(device const float* img,
             // ~1e-7, far below one 16-bit LSB; tools/compare_dng.py gates it.
             float w = fast::exp(-0.5f * z);
 
-            float contrib_v = w * local_r * c;
-            float contrib_a = w * local_r;
+            float lr_c = (channel == 0) ? local_r0 : (channel == 1) ? local_r1 : local_r2;
+            float contrib_v = w * lr_c * c;
+            float contrib_a = w * lr_c;
             if (channel == 0)      { val0 += contrib_v; acc0 += contrib_a; }
             else if (channel == 1) { val1 += contrib_v; acc1 += contrib_a; }
             else                   { val2 += contrib_v; acc2 += contrib_a; }
@@ -1731,6 +1745,7 @@ struct RobMaskParams {
     // Named hmat (not h) because RobMaskParams::h is the guide height.
     float hmat[9];
     uint use_homography;
+    uint per_channel;  // 1 = write a separate R per guide channel (ISA per-channel)
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2181,6 +2196,10 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     // (e.g. a colored edge), so accumulate inside the loop.
     sigma_sq_ = 0.f;
     d_sq_ = 0.f;
+    // Per-channel accumulators (ISA per-channel R, Config::robustness_per_channel).
+    // Written only when p.per_channel != 0; otherwise unused. nch <= 3.
+    float d_ch[3] = {0.f, 0.f, 0.f};
+    float sig_ch[3] = {0.f, 0.f, 0.f};
     for (uint ch = 0u; ch < p.nch; ++ch) {
         uint o = (gid.y * p.w + gid.x) * p.nch + ch;
         float brightness = ref_means[o];
@@ -2203,7 +2222,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float sigma_t = std_curve[curve_id];
         float d_t = diff_curve[curve_id];
         float sigma_p_sq = ref_vars[o];
-        sigma_sq_ += max(sigma_p_sq, sigma_t * sigma_t);
+        float sigma_c = max(sigma_p_sq, sigma_t * sigma_t);
+        sigma_sq_ += sigma_c;
         // 460-parity: nearest (round) comp sample, not bilinear.
         float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
                                                sample_y, sample_x, ch);
@@ -2211,7 +2231,9 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float d_p_sq = d_p_ * d_p_;
         float denom = d_p_sq + d_t * d_t;
         float shrink = (denom > 0.f) ? d_p_sq / denom : 0.f;
-        d_sq_ += d_p_sq * shrink * shrink;
+        float d_c = d_p_sq * shrink * shrink;
+        d_sq_ += d_c;
+        if (ch < 3u) { d_ch[ch] = d_c; sig_ch[ch] = sigma_c; }
     }
     // Per-pixel s (Wronski per-pixel M): bilinear over the tile grid at this
     // pixel's tile coordinate, matching the flow sampling above. Else nearest.
@@ -2300,10 +2322,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         }
     }
     bool hard_reject = hf_reject || geom_reject;
-    float r_val = hard_reject
-        ? 0.f
-        : clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
-    if (p.edge_misalign_enabled != 0u && r_val > 0.f) {
+    // Edge-misalignment confidence multiplier (1.0 when disabled or hard-rejected).
+    // Computed once and applied to every channel so the per-channel path stays
+    // consistent with the single-channel one. The original r_val>0 guard was only
+    // an optimization; multiplying an already-zero R by emc is still zero.
+    float emc = 1.f;
+    if (p.edge_misalign_enabled != 0u && !hard_reject) {
         // comp_means is not warped in this guide-resolution path, so sample it
         // at the per-tile flow the merge will fetch with (same convention as
         // edge_misalignment_confidence in robustness.cpp).
@@ -2319,14 +2343,28 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             uint fo = (uint(pty) * p.flow_nx + uint(ptx)) * 2u;
             fxo = 0.5f * flow[fo + 0u]; fyo = 0.5f * flow[fo + 1u];
         }
-        r_val *= rob_edge_misalign_c(ref_means, comp_means, p.h, p.w, p.nch,
-                                     int(gid.y), int(gid.x), fxo, fyo,
-                                     p.edge_misalign_enabled, int(p.edge_misalign_radius),
-                                     p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
-                                     p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
-                                     p.alpha, p.beta);
+        emc = rob_edge_misalign_c(ref_means, comp_means, p.h, p.w, p.nch,
+                                  int(gid.y), int(gid.x), fxo, fyo,
+                                  p.edge_misalign_enabled, int(p.edge_misalign_radius),
+                                  p.edge_misalign_edge_snr, p.edge_misalign_shift_z,
+                                  p.edge_misalign_ghost_z, p.edge_misalign_min_conf,
+                                  p.alpha, p.beta);
     }
-    R[gid.y * p.w + gid.x] = r_val;
+    // rob_nch guide channels of output when per_channel (ISA), else 1 (broadcast).
+    uint rob_nch = (p.per_channel != 0u) ? p.nch : 1u;
+    uint obase = (gid.y * p.w + gid.x) * rob_nch;
+    if (hard_reject) {
+        for (uint ch = 0u; ch < rob_nch; ++ch) R[obase + ch] = 0.f;
+    } else if (p.per_channel != 0u) {
+        for (uint ch = 0u; ch < rob_nch; ++ch) {
+            float rc = clamp(s * exp(-d_ch[ch] / sig_ch[ch]) - p.r_t, 0.f, 1.f);
+            if (!isfinite(rc)) rc = 0.f;
+            R[obase + ch] = rc * emc;
+        }
+    } else {
+        float r_val = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+        R[obase] = r_val * emc;
+    }
     // Which prior this pixel ended up on. Compared against r_s1 rather than
     // recomputing the conditions, so the record cannot drift from the value
     // actually used above.
@@ -2593,15 +2631,20 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     int y = int(gid.y), x = int(gid.x);
     int H = int(p.h), W = int(p.w);
-    float mn = INFINITY;
+    // 5x5 min is taken independently per channel (nch==1 normally; 3 for ISA
+    // per-channel R). nch <= 3.
+    uint nch = max(1u, p.nch);
+    float mn[3] = {INFINITY, INFINITY, INFINITY};
     for (int i = -2; i <= 2; ++i) {
         int yy = clamp_edge(y + i, H - 1);
         for (int j = -2; j <= 2; ++j) {
             int xx = clamp_edge(x + j, W - 1);
-            mn = min(mn, R[uint(yy) * p.w + uint(xx)]);
+            uint base = (uint(yy) * p.w + uint(xx)) * nch;
+            for (uint ch = 0u; ch < nch; ++ch) mn[ch] = min(mn[ch], R[base + ch]);
         }
     }
-    out[gid.y * p.w + gid.x] = mn;
+    uint obase = (gid.y * p.w + gid.x) * nch;
+    for (uint ch = 0u; ch < nch; ++ch) out[obase + ch] = mn[ch];
 }
 
 // ---- learned refinement of the analytic mask (Config::

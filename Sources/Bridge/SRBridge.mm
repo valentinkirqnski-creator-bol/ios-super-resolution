@@ -553,6 +553,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_color_matrix = tuning[@"guide_color_matrix"].boolValue;
     if (tuning[@"guide_curve"])
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
+    if (tuning[@"robustness_per_channel"])
+        cfg.robustness_per_channel = tuning[@"robustness_per_channel"].boolValue;
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])

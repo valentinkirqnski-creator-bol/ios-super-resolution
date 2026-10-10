@@ -207,6 +207,11 @@ struct TuningParams: Equatable, Codable {
     /// Default false: 460-main has no geometry rejection. Users can re-enable it
     /// in Settings (Geometry Rejection) to trade burst samples for fewer ghosts.
     var motion_geom_reject_enabled: Bool = false
+    /// ISA per-channel robustness: a separate Wronski mask per guide R/G/B channel
+    /// (reference-only statistics, per-channel Wiener shrink), instead of one scalar
+    /// mask summed across channels. Only has effect with the Bayer (3-channel) guide;
+    /// a no-op on the grey guide. Default false = 460-main's single cross-channel mask.
+    var robustness_per_channel: Bool = false
     /// |∇I|·|E| threshold (intensity units). Must be LOW to reject anything:
     /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     /// drops more burst samples.
@@ -356,6 +361,7 @@ struct TuningParams: Equatable, Codable {
         case isa_prealign_enabled, isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
+        case robustness_per_channel
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
@@ -454,6 +460,7 @@ struct TuningParams: Equatable, Codable {
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
+        robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
         motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
         motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
@@ -2239,6 +2246,7 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
+            "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
             "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
             "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),

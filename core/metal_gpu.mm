@@ -921,6 +921,10 @@ struct BurstFrames {
     int raw_h = 0, raw_w = 0;
     int cov_h = 0, cov_w = 0;
     int rob_h = 0, rob_w = 0;
+    // Guide channels stored per robustness pixel. 1 normally; 3 when ISA
+    // per-channel R is on with a Bayer (RGB) guide (Config::robustness_per_channel).
+    // rob_elems already folds this factor in, so bf_rob_off stays correct.
+    int rob_nch = 1;
     int flow_ny = 0, flow_nx = 0;
     int tile_size = 0;
     // Floats per covariance entry. 3 = xx,xy,yy; the fourth element of the old
@@ -1037,6 +1041,10 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.cov_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
     g_bf.rob_h = cfg.bayer_mode ? raw_h / 2 : raw_h;
     g_bf.rob_w = cfg.bayer_mode ? raw_w / 2 : raw_w;
+    // Per-channel R (ISA) only has meaning with the 3-channel Bayer guide; the
+    // grey guide (nch==1) leaves this at 1. Sizing the resident slice here keeps
+    // it in lockstep with the rob_nch the mask dispatch and merge compute below.
+    g_bf.rob_nch = (cfg.robustness_per_channel && cfg.bayer_mode) ? 3 : 1;
     // Round UP, not down: the aligner circular-pads the grey up to a multiple
     // of the tile before building the flow grid, so its flow is ceil(dim/tile)
     // tiles per axis. With floor, any tile size that doesn't divide the image
@@ -1054,7 +1062,8 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.raw_elems  = align_slice((size_t)raw_h * (size_t)raw_w * f) / f;
     g_bf.cov_elems  = align_slice((size_t)g_bf.cov_h * (size_t)g_bf.cov_w *
                                   (size_t)g_bf.cov_stride * f) / f;
-    g_bf.rob_elems  = align_slice((size_t)g_bf.rob_h * (size_t)g_bf.rob_w * f) / f;
+    g_bf.rob_elems  = align_slice((size_t)g_bf.rob_h * (size_t)g_bf.rob_w *
+                                  (size_t)g_bf.rob_nch * f) / f;
     g_bf.flow_elems = align_slice((size_t)g_bf.flow_ny * (size_t)g_bf.flow_nx * 2u * f) / f;
     // 4 floats/tile; 2x the flow stride guarantees the affine data fits and makes
     // bf_affine_off(slot) == 2 * bf_flow_off(slot).
@@ -1144,7 +1153,7 @@ bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
     RobStatsParamsLocal sp{};
     sp.h = (uint32_t)g_bf.rob_h;
     sp.w = (uint32_t)g_bf.rob_w;
-    sp.nch = 1u;
+    sp.nch = (uint32_t)g_bf.rob_nch;  // row is active if any channel is non-zero
     sp.pad = 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -1657,8 +1666,9 @@ struct RobMaskParamsCPU {
     uint32_t affine_flow = 0;  // 1 = per-tile affine flow (Config::affine_flow_enabled)
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
     uint32_t use_homography = 0;
+    uint32_t per_channel = 0;  // 1 = write a separate R per guide channel (ISA)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 172, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 176, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -2412,7 +2422,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         return Image();
 
     const size_t ref_b = (size_t)gh * (size_t)gw * (size_t)nch * sizeof(float);
-    const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
+    // ISA per-channel R (Config::robustness_per_channel): a separate mask per
+    // guide channel, only meaningful with the 3-channel Bayer guide. Off = 1.
+    const uint32_t rob_nch = (cfg.robustness_per_channel && nch == 3) ? (uint32_t)nch : 1u;
+    const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);          // 1-ch (s_select)
+    const size_t mask_b_r = mask_b * (size_t)rob_nch;                        // per-channel R
     id<MTLBuffer> b_ref_m = nil;
     id<MTLBuffer> b_ref_v = nil;
     if (g_rob_ref_m && g_rob_ref_v && g_rob_ref_bytes == ref_b &&
@@ -2501,14 +2515,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         : b_flow;
     // The mask before the 5x5 minimum is scratch; the result goes into the
     // frame's slice when it is resident, so the merge reads it where it lands.
-    id<MTLBuffer> b_R = resident_raw ? c.scratch(c.rob_mask, c.rob_mask_b, mask_b)
-                                     : buf(nullptr, mask_b);
+    id<MTLBuffer> b_R = resident_raw ? c.scratch(c.rob_mask, c.rob_mask_b, mask_b_r)
+                                     : buf(nullptr, mask_b_r);
     const bool rob_resident = resident_raw && g_bf.robs &&
-                              g_bf.rob_h == gh && g_bf.rob_w == gw;
+                              g_bf.rob_h == gh && g_bf.rob_w == gw &&
+                              g_bf.rob_nch == (int)rob_nch;
     id<MTLBuffer> b_out = rob_resident
         ? g_bf.robs
-        : (resident_raw ? c.scratch(c.rob_mask_min, c.rob_mask_min_b, mask_b)
-                        : buf(nullptr, mask_b));
+        : (resident_raw ? c.scratch(c.rob_mask_min, c.rob_mask_min_b, mask_b_r)
+                        : buf(nullptr, mask_b_r));
     const size_t out_off_bytes = rob_resident ? bf_rob_off(bf_slot) * sizeof(float) : 0;
     // Bound unconditionally because the kernel declares it; sized for real only
     // when asked, so the off case costs 4 bytes rather than a full mask plane.
@@ -2544,6 +2559,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.affine_flow = rob_use_affine ? 1u : 0u;
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
+    mp.per_channel = (rob_nch > 1u) ? 1u : 0u;  // ISA per-channel R
     mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
@@ -2601,7 +2617,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     RobStatsParamsCPU sp{};
     sp.h = (uint32_t)gh;
     sp.w = (uint32_t)gw;
-    sp.nch = 1u;
+    sp.nch = rob_nch;  // 5x5 min is taken per channel
     enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
@@ -2689,12 +2705,12 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         Image dims;
         dims.h = gh;
         dims.w = gw;
-        dims.c = 1;
+        dims.c = (int)rob_nch;
         return dims;
     }
 
-    Image r(gh, gw, 1);
-    memcpy(r.data.data(), (const uint8_t*)[b_out contents] + out_off_bytes, mask_b);
+    Image r(gh, gw, (int)rob_nch);
+    memcpy(r.data.data(), (const uint8_t*)[b_out contents] + out_off_bytes, mask_b_r);
     // Taken from rob_make_mask's output, not rob_local_min_5x5's: the selector
     // is a per-pixel record of which prior was applied, and eroding it would
     // smear the boundary between the two regions.
@@ -3855,8 +3871,12 @@ struct MergeCompParamsCPU {
     uint32_t affine_off = 0;
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
     uint32_t use_homography = 0;
+    // Channels in the robustness buffer: 3 for ISA per-channel R (Config::
+    // robustness_per_channel with a Bayer guide), else 1. Keep last to match
+    // MergeCompParams in HHSRKernels.metal.
+    uint32_t rob_nch = 1;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 160, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 164, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -3896,6 +3916,7 @@ struct MergeFrameGpu {
     int key = -1; // >=0: frame_id; -1: pointer-keyed
     int lr_h = 0, lr_w = 0;
     int rob_h = 0, rob_w = 0;
+    int rob_nch = 1;  // ISA per-channel R: 3, else 1
     int flow_ny = 0, flow_nx = 0;
     int cov_h = 0, cov_w = 0;
     const f32* img = nullptr;
@@ -4100,6 +4121,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.lr_w = img.w;
             e.rob_h = rob.h;
             e.rob_w = rob.w;
+            e.rob_nch = std::max(1, rob.c);
             e.flow_ny = flow.ny;
             e.flow_nx = flow.nx;
             e.cov_h = covs.h;
@@ -4148,6 +4170,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         e.b_rob = buf(rp, rob_b);
         e.rob_h = rob.h;
         e.rob_w = rob.w;
+        e.rob_nch = std::max(1, rob.c);
         e.flow = fp;
         e.cov = cp;
         e.rob = rp;
@@ -4170,6 +4193,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.lr_w = img.w;
     e.rob_h = rob.h;
     e.rob_w = rob.w;
+    e.rob_nch = std::max(1, rob.c);
     e.flow_ny = flow.ny;
     e.flow_nx = flow.nx;
     e.cov_h = covs.h;
@@ -4619,6 +4643,9 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
                             g_bf.have_homography[(size_t)slot]) ? 1u : 0u;
         if (g_bf.homography.size() >= (size_t)(slot + 1) * 9u)
             for (int i = 0; i < 9; ++i) p.hmat[i] = g_bf.homography[(size_t)slot * 9u + i];
+        // Resident rob slice stride already folds in rob_nch (bf_reserve), so
+        // rob_off above lands on the right frame; tell the kernel the channel count.
+        p.rob_nch = (uint32_t)std::max(1, g_bf.rob_nch);
         ps.push_back(p);
     }
     // Metal still requires the params binding to be non-empty.
@@ -4860,6 +4887,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)comp_raw.w;
         p.rob_h = (uint32_t)robustness.h;
         p.rob_w = (uint32_t)robustness.w;
+        p.rob_nch = (uint32_t)std::max(1, robustness.c);
         p.flow_ny = (uint32_t)flow.ny;
         p.flow_nx = (uint32_t)flow.nx;
         p.cov_h = covs.h > 0 ? (uint32_t)covs.h : 1u;
@@ -4874,6 +4902,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
         p.lr_w = (uint32_t)hit->lr_w;
         p.rob_h = (uint32_t)std::max(1, hit->rob_h);
         p.rob_w = (uint32_t)std::max(1, hit->rob_w);
+        p.rob_nch = (uint32_t)std::max(1, hit->rob_nch);
         p.flow_ny = (uint32_t)std::max(1, hit->flow_ny);
         p.flow_nx = (uint32_t)std::max(1, hit->flow_nx);
         p.cov_h = hit->cov_h > 0 ? (uint32_t)hit->cov_h : 1u;
