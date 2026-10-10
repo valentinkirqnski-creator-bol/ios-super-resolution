@@ -1627,9 +1627,14 @@ struct RobDogsonParamsCPU {
     // the GPU twin of upscale_warp_stats, so it must match the CPU setting or
     // the two paths warp the comparison statistics differently.
     uint32_t flow_bilinear = 0;
-    uint32_t _pad1 = 0;
+    // Global pre-align homography, composed into the comp-stats warp so the
+    // Dodgson-upscaled statistics line up with the comp pixels the merge fetches
+    // (comp_pos = H*(raw+flow)). Without it a warped comp is scored at the wrong
+    // place and R goes dark. Mirrors upscale_warp_stats / RobDogsonParams.
+    float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};
+    uint32_t use_homography = 0;   // was _pad1
 };
-static_assert(sizeof(RobDogsonParamsCPU) == 48, "RobDogsonParamsCPU");
+static_assert(sizeof(RobDogsonParamsCPU) == 84, "RobDogsonParamsCPU");
 
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
@@ -1983,6 +1988,12 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
     dp.flow_bilinear = flow_bilinear ? 1u : 0u;
+    // Compose the global pre-align homography for the comparison stats only, the
+    // same transform the merge applies (comp_pos = H*(lr+flow)). Identity/off for
+    // the reference stats and when no global transform was estimated.
+    dp.use_homography = (!is_ref && flow && flow->has_global_h) ? 1u : 0u;
+    if (dp.use_homography)
+        for (int i = 0; i < 9; ++i) dp.hmat[i] = flow->global_h[i];
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {

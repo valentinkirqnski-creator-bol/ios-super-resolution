@@ -1700,7 +1700,12 @@ struct RobDogsonParams {
     uint flow_ny, flow_nx;
     float s;          // always 2.f (Python CUDA hardcode)
     uint flow_bilinear;  // 1 = interpolate the tile flow (was _pad0)
-    uint _pad1;
+    // Global pre-align homography (ISA / homography warp-then-refine): the comp
+    // statistics must be warped by comp_pos = H*(raw+flow) to match the comp
+    // pixels the merge fetches, else a warped comp is scored at the wrong place
+    // and R goes dark. Composed only for the comparison stats (is_ref==0).
+    float hmat[9];        // row-major 3x3, lr/raw coords
+    uint use_homography;  // 1 = apply hmat (was _pad1)
 };
 
 struct RobMaskParams {
@@ -1990,8 +1995,18 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
             }
         }
     }
-    float LR_y = (float(y) + flow_y + 0.5f) / p.s - 0.5f;
-    float LR_x = (float(x) + flow_x + 0.5f) / p.s - 0.5f;
+    // comp_pos = global_h * (raw + flow), then /s -- twin of upscale_warp_stats
+    // in robustness.cpp. Only for the comparison stats; the reference is not warped.
+    float cxp = float(x) + flow_x, cyp = float(y) + flow_y;
+    if (p.is_ref == 0u && p.use_homography != 0u) {
+        float wq = p.hmat[6] * cxp + p.hmat[7] * cyp + p.hmat[8];
+        float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
+        float hx = (p.hmat[0] * cxp + p.hmat[1] * cyp + p.hmat[2]) * iwq;
+        float hy = (p.hmat[3] * cxp + p.hmat[4] * cyp + p.hmat[5]) * iwq;
+        cxp = hx; cyp = hy;
+    }
+    float LR_y = (cyp + 0.5f) / p.s - 0.5f;
+    float LR_x = (cxp + 0.5f) / p.s - 0.5f;
 
     for (uint ch = 0u; ch < p.nch; ++ch) {
         float val;
