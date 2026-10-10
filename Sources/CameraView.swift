@@ -884,6 +884,13 @@ struct CameraView: View {
                         ispRow("Roll Search (±°)", $cam.tuningParams.isa_prealign_rot_range_deg, 0.5...45.0, "%.1f")
                         Text("How much camera ROLL the scan searches for. The search is hierarchical, so raising this barely costs more. Translation range is handled automatically by the zero-padded correlation.")
                             .font(.footnote).foregroundColor(.secondary)
+                        Picker("Pre-Align Precision", selection: $cam.tuningParams.isa_prealign_refine_dim) {
+                            Text("Balanced").tag(384)
+                            Text("Precise").tag(640)
+                            Text("Max").tag(1280)
+                        }
+                        Text("Resolution of the homography refine. It reuses the full-res grey already computed for alignment, so higher just trades compute for a tighter global fit — most useful in low light / low contrast, where a coarse fit leaves slight edge misalignment. Balanced is the shipped speed; Precise/Max are slower.")
+                            .font(.footnote).foregroundColor(.secondary)
                     }
                 }
 

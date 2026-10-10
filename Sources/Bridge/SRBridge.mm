@@ -547,6 +547,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.isa_prealign_enabled = tuning[@"isa_prealign_enabled"].boolValue;
     if (tuning[@"isa_prealign_rot_range_deg"])
         cfg.isa_prealign_rot_range_deg = tuning[@"isa_prealign_rot_range_deg"].floatValue;
+    if (tuning[@"isa_prealign_refine_dim"])
+        cfg.isa_prealign_refine_dim = tuning[@"isa_prealign_refine_dim"].intValue;
     if (tuning[@"real_rgb_guide"])
         cfg.real_rgb_guide = tuning[@"real_rgb_guide"].boolValue;
     if (tuning[@"guide_white_balance"])

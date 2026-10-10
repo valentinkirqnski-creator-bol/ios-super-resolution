@@ -733,6 +733,16 @@ struct Config {
     // keeps N=512 (cost parity with the old unpadded 512) while enabling large,
     // non-wrapping shifts; the coarse global estimate is refined by block match.
     int   isa_prealign_fft_max_dim   = 256;
+    // Finest resolution (longer side, px) of the Lucas-Kanade homography refine.
+    // The full-res FFT grey is already computed for block matching and handed to
+    // the refine, so this only trades LK compute for precision -- higher =
+    // tighter global alignment (esp. low-light/low-contrast), more cost. The
+    // refine downscales the already-available grey to this; the coarser pyramid
+    // levels are cheap halvings of it. NOTE: downsample_to only halves, so the
+    // effective finest size snaps to a power-of-two fraction of the full grey
+    // (e.g. 252/504/1008 px for a 4032-wide frame); the Settings picker uses
+    // 384 / 640 / 1280 to hit those distinct rungs. 384 keeps the shipped speed.
+    int   isa_prealign_refine_dim    = 384;
 
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and

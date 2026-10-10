@@ -262,7 +262,6 @@ Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]) {
 
 void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey,
                                    const Config& cfg, f32 H_inout[9]) {
-    (void)cfg;
     if (ref_grey.h <= 8 || ref_grey.w <= 8 ||
         ref_grey.h != comp_grey.h || ref_grey.w != comp_grey.w) return;
     if (ref_grey.data.size() != (size_t)ref_grey.h * ref_grey.w * ref_grey.c ||
@@ -274,9 +273,11 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
     // level is built ONCE from the full grey (one read per image); the coarser
     // levels are cheap 2x halvings of it -- no repeated full-grey reads.
     // lk_refine reverts non-improving iterations, so no level worsens the fit.
+    // Reuse the already-computed full-res grey at the requested finest size.
+    const int fine_dim = std::max(128, std::min(2048, cfg.isa_prealign_refine_dim));
     f32 scf = 1.f;
-    const Image fine_r = downsample_to(ref_grey, 384, scf);
-    const Image fine_c = downsample_to(comp_grey, 384, scf);
+    const Image fine_r = downsample_to(ref_grey, fine_dim, scf);
+    const Image fine_c = downsample_to(comp_grey, fine_dim, scf);
     if (fine_r.h <= 8 || fine_r.w <= 8) return;
     const Image mid_r = downsample2x(fine_r), mid_c = downsample2x(fine_c);
     const Image cor_r = downsample2x(mid_r), cor_c = downsample2x(mid_c);
