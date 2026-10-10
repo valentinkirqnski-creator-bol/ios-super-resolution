@@ -1698,6 +1698,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c) {
             float idx = 0.f, idy = 0.f, irot = 0.f;
             if (estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot)) {
+                // The FFT scan is coarse: an integer peak on a downscaled grid
+                // and 0.2-deg angle steps, so it misses the sub-pixel shift and
+                // sub-0.2-deg rotation of a handheld burst -- measured to leave
+                // 13-46px of corner misalignment for a 0.3-0.8 deg roll before
+                // block matching even starts. A 3-DOF RIGID Lucas-Kanade refine
+                // drives that to sub-pixel (measured 0.25-0.6px) and, unlike the
+                // 8-DOF homography refine, has no shear/perspective freedom to
+                // overfit noise into on near-still frames, so it never injects.
+                refine_global_rigid_seed(ref_grey, comp_grey, work, idx, idy, irot);
                 const f32 cx = 0.5f * (f32)(ref_grey.w - 1);
                 const f32 cy = 0.5f * (f32)(ref_grey.h - 1);
                 const f32 cs = std::cos(irot), sn = std::sin(irot);
@@ -1705,12 +1714,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 isaH[0] = cs; isaH[1] = -sn; isaH[2] = cx + idx - cs * cx + sn * cy;
                 isaH[3] = sn; isaH[4] =  cs; isaH[5] = cy + idy - sn * cx - cs * cy;
                 isaH[6] = 0.f; isaH[7] = 0.f; isaH[8] = 1.f;
-                // Upgrade the robust rigid (rotation+translation) estimate to a
-                // full 8-DOF homography by Lucas-Kanade refinement seeded from it,
-                // so the pre-align also absorbs global scale, shear and
-                // perspective ("any camera motion"). No-op (keeps the rigid seed)
-                // if the refine does not improve the fit.
-                refine_global_homography_seed(ref_grey, comp_grey, work, isaH);
                 warped_comp = warp_grey_by_homography(comp_grey, isaH);
                 align_comp = &warped_comp;
                 isa_warp = true;

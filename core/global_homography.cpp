@@ -78,6 +78,102 @@ f32 warp_error(const Image& ref, const Image& comp, const f32 H[9]) {
     return (f32)(acc / (double)cnt);
 }
 
+// Build a rigid (rotation about centre + translation) homography in `g`'s
+// coordinates. Shared by the rigid refine and its accept guard.
+static inline void rigid_to_H(const Image& g, f32 dx, f32 dy, f32 rot, f32 H[9]) {
+    const f32 cx = 0.5f * (f32)(g.w - 1), cy = 0.5f * (f32)(g.h - 1);
+    const f32 cs = std::cos(rot), sn = std::sin(rot);
+    H[0] = cs; H[1] = -sn; H[2] = cx + dx - cs * cx + sn * cy;
+    H[3] = sn; H[4] =  cs; H[5] = cy + dy - sn * cx - cs * cy;
+    H[6] = 0.f; H[7] = 0.f; H[8] = 1.f;
+}
+
+}  // anonymous namespace -- reopened after the (externally-linked) rigid refine
+
+// Externally visible (declared in global_homography.h); its helpers above keep
+// internal linkage but stay visible to it within this translation unit.
+void refine_global_rigid_seed(const Image& ref_grey, const Image& comp_grey,
+                              const Config& cfg, f32& dx, f32& dy, f32& rot) {
+    if (ref_grey.h <= 8 || ref_grey.w <= 8 ||
+        ref_grey.h != comp_grey.h || ref_grey.w != comp_grey.w) return;
+    if (ref_grey.data.size() != (size_t)ref_grey.h * ref_grey.w * ref_grey.c ||
+        comp_grey.data.size() != (size_t)comp_grey.h * comp_grey.w * comp_grey.c) return;
+
+    const int fine_dim = std::max(128, std::min(2048, cfg.isa_prealign_refine_dim));
+    f32 scf = 1.f;
+    const Image fine_r = downsample_to(ref_grey, fine_dim, scf);
+    const Image fine_c = downsample_to(comp_grey, fine_dim, scf);
+    if (fine_r.h <= 8 || fine_r.w <= 8) return;
+    const Image mid_r = downsample2x(fine_r), mid_c = downsample2x(fine_c);
+    const Image cor_r = downsample2x(mid_r), cor_c = downsample2x(mid_c);
+    struct Lvl { const Image* r; const Image* c; f32 scale; };  // scale = level_px / full_px
+    const Lvl levels[3] = { { &cor_r, &cor_c, scf * 0.25f },
+                            { &mid_r, &mid_c, scf * 0.5f },
+                            { &fine_r, &fine_c, scf } };
+
+    // (tx, ty) carried in FULL-res pixels; rot in radians (scale-invariant).
+    f32 tx = dx, ty = dy, th = rot;
+    for (const Lvl& L : levels) {
+        const Image& R = *L.r; const Image& C = *L.c;
+        if (R.h <= 8 || R.w <= 8) continue;
+        const f32 s = L.scale;                    // full -> level
+        const f32 cx = 0.5f * (f32)(R.w - 1), cy = 0.5f * (f32)(R.h - 1);
+        f32 ltx = tx * s, lty = ty * s;           // translation at this level
+        const int y0 = R.h / 8, y1 = R.h - R.h / 8, x0 = R.w / 8, x1 = R.w - R.w / 8;
+        for (int it = 0; it < 20; ++it) {
+            double Hm[3][3] = {{0,0,0},{0,0,0},{0,0,0}}, b[3] = {0,0,0};
+            const f32 cs = std::cos(th), sn = std::sin(th);
+            for (int y = y0; y < y1; y += 2)
+                for (int x = x0; x < x1; x += 2) {
+                    const f32 X = (f32)x - cx, Y = (f32)y - cy;
+                    const f32 wx = cs * X - sn * Y + cx + ltx;
+                    const f32 wy = sn * X + cs * Y + cy + lty;
+                    if (!(wx >= 1.f && wx < R.w - 1 && wy >= 1.f && wy < R.h - 1)) continue;
+                    const f32 cv = sample_clamp(C, wx, wy), rv = R.at(y, x);
+                    const f32 gx = 0.5f * (sample_clamp(C, wx + 1, wy) - sample_clamp(C, wx - 1, wy));
+                    const f32 gy = 0.5f * (sample_clamp(C, wx, wy + 1) - sample_clamp(C, wx, wy - 1));
+                    const f32 dwx = -sn * X - cs * Y, dwy = cs * X - sn * Y;  // d(wx,wy)/dtheta
+                    const f32 J[3] = { gx, gy, gx * dwx + gy * dwy };
+                    const f32 r = cv - rv;
+                    for (int a = 0; a < 3; ++a) { b[a] -= J[a] * r;
+                        for (int c2 = 0; c2 < 3; ++c2) Hm[a][c2] += J[a] * J[c2]; }
+                }
+            for (int a = 0; a < 3; ++a) Hm[a][a] += 1e-3 * Hm[a][a] + 1e-9;  // Levenberg
+            double A[3][4];
+            for (int a = 0; a < 3; ++a) { for (int c2 = 0; c2 < 3; ++c2) A[a][c2] = Hm[a][c2]; A[a][3] = b[a]; }
+            bool ok = true;
+            for (int c2 = 0; c2 < 3 && ok; ++c2) {
+                int p = c2; for (int r2 = c2 + 1; r2 < 3; ++r2) if (std::fabs(A[r2][c2]) > std::fabs(A[p][c2])) p = r2;
+                for (int k = 0; k < 4; ++k) std::swap(A[c2][k], A[p][k]);
+                if (std::fabs(A[c2][c2]) < 1e-20) { ok = false; break; }
+                const double iv = 1.0 / A[c2][c2];
+                for (int k = 0; k < 4; ++k) A[c2][k] *= iv;
+                for (int r2 = 0; r2 < 3; ++r2) if (r2 != c2) { const double f = A[r2][c2];
+                    for (int k = 0; k < 4; ++k) A[r2][k] -= f * A[c2][k]; }
+            }
+            if (!ok) break;
+            const f32 d_tx = (f32)A[0][3], d_ty = (f32)A[1][3], d_th = (f32)A[2][3];
+            if (!(std::isfinite(d_tx) && std::isfinite(d_ty) && std::isfinite(d_th))) break;
+            ltx += d_tx; lty += d_ty; th += d_th;
+            if (std::fabs(d_tx) + std::fabs(d_ty) < 1e-3f && std::fabs(d_th) < 1e-6f) break;
+        }
+        tx = ltx / s; ty = lty / s;               // back to full-res translation
+    }
+
+    // Accept only if the refine lowers the warp error vs the seed (finest level).
+    if (!(std::isfinite(tx) && std::isfinite(ty) && std::isfinite(th))) return;
+    f32 Href[9], Hseed[9];
+    rigid_to_H(fine_r, tx * scf, ty * scf, th, Href);
+    rigid_to_H(fine_r, dx * scf, dy * scf, rot, Hseed);
+    const f32 e_ref = warp_error(fine_r, fine_c, Href);
+    const f32 e_seed = warp_error(fine_r, fine_c, Hseed);
+    if (!std::isfinite(e_ref) || !(e_ref <= e_seed)) return;  // keep the FFT seed
+
+    dx = tx; dy = ty; rot = th;
+}
+
+namespace {  // reopened: the remaining helpers below stay internal
+
 // Coarse rotation (about the image centre) + integer shift search, maximising
 // negative SSD (minimising error). Builds an affine homography seed. Handles
 // large roll, which Lucas-Kanade alone cannot converge to from identity.
