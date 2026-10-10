@@ -247,12 +247,6 @@ void metal_invalidate_sticky_grey();
 // homography estimator). No-op effect when off.
 void metal_set_grey_force_host(bool v);
 
-// Drop the pinned sticky grey so the next align_metal re-uploads its moving grey
-// from host instead of reusing the (unwarped) pinned one. Needed when the comp
-// grey was warped (global pre-align) -- otherwise align_metal aligns the
-// unwarped grey and global_h is composed a second time (double transform).
-void metal_invalidate_sticky_grey();
-
 // When true, reuse one GPU num/den slot (wait each band). Cuts peak RAM ~2× so
 // full-res 1× can use larger bands without jetsam. Default false (2× double-buffer).
 void metal_merge_set_single_acc_slot(bool enabled);
