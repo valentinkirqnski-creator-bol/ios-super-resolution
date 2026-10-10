@@ -152,14 +152,20 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
     // fit away from the dominant static scene. The scale c is set from the mean
     // |residual| of the previous iteration (lag-1); cinv2 = 1/c^2, starting 0 so
     // the first iteration is unweighted (plain least squares).
-    f32 cinv2 = 0.f;
+    //
+    // Gradient (signal) weight w_sig = g2 / (g2 + g2floor) additionally
+    // down-weights low-gradient, noise-dominated flats -- the key low-light
+    // accuracy fix: in dim scenes the flats are mostly sensor noise, and letting
+    // them into the normal equations makes the rotation/perspective params noisy.
+    // g2floor is a fraction of the mean gradient-energy of the previous iteration.
+    f32 cinv2 = 0.f, g2floor = 0.f;
     for (int it = 0; it < iters; ++it) {
         // Per-chunk partial normal equations (double for stable accumulation),
         // combined serially after. The pixel loop is the whole cost of LK, so
         // chunking it across threads is what keeps the homography refine fast.
         std::vector<std::array<double, 64>> Ap((size_t)nt);
         std::vector<std::array<double, 8>> bp((size_t)nt);
-        std::vector<double> srp((size_t)nt, 0.0);
+        std::vector<double> srp((size_t)nt, 0.0), sg2p((size_t)nt, 0.0);
         std::vector<long> cntp((size_t)nt, 0);
         for (int t = 0; t < nt; ++t) { Ap[(size_t)t].fill(0.0); bp[(size_t)t].fill(0.0); }
         parallel_rows(nt, num_threads, [&](int t) {
@@ -167,7 +173,7 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
             const int ye = std::min(ys + chunk, y_hi);
             double* Aa = Ap[(size_t)t].data();
             double* ba = bp[(size_t)t].data();
-            double sr = 0.0; long cn = 0;
+            double sr = 0.0, sg2 = 0.0; long cn = 0;
             for (int y = ys; y < ye; ++y) {
                 for (int x = 1; x < ref.w - 1; ++x) {
                     const f32 fx = (f32)x, fy = (f32)y;
@@ -181,7 +187,9 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                     const f32 err = sample_clamp(comp, u, v) - ref.at(y, x);
                     const f32 gx = 0.5f * (sample_clamp(comp, u + 1.f, v) - sample_clamp(comp, u - 1.f, v));
                     const f32 gy = 0.5f * (sample_clamp(comp, u, v + 1.f) - sample_clamp(comp, u, v - 1.f));
-                    const f32 w = 1.f / (1.f + err * err * cinv2);  // Cauchy robust weight
+                    const f32 g2 = gx * gx + gy * gy;
+                    const f32 wsig = (g2floor > 0.f) ? g2 / (g2 + g2floor) : 1.f;
+                    const f32 w = wsig / (1.f + err * err * cinv2);  // signal x Cauchy
                     f32 J[8];
                     J[0] = gx * (fx * iD);           J[1] = gx * (fy * iD);           J[2] = gx * iD;
                     J[3] = gy * (fx * iD);           J[4] = gy * (fy * iD);           J[5] = gy * iD;
@@ -193,10 +201,10 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                         const f32 wJi = w * J[i];
                         for (int j = 0; j < 8; ++j) Aa[i * 8 + j] += (double)(wJi * J[j]);
                     }
-                    sr += std::fabs((double)err); ++cn;
+                    sr += std::fabs((double)err); sg2 += (double)g2; ++cn;
                 }
             }
-            srp[(size_t)t] = sr; cntp[(size_t)t] = cn;
+            srp[(size_t)t] = sr; sg2p[(size_t)t] = sg2; cntp[(size_t)t] = cn;
         });
         f32 A[8][8]; f32 b[8];
         for (int i = 0; i < 8; ++i) {
@@ -207,12 +215,15 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                 A[i][j] = (f32)a;
             }
         }
-        // Robust scale for the NEXT iteration from this iteration's residuals.
-        double sum_abs = 0.0; long cnt = 0;
-        for (int t = 0; t < nt; ++t) { sum_abs += srp[(size_t)t]; cnt += cntp[(size_t)t]; }
+        // Robust residual scale AND gradient floor for the NEXT iteration.
+        double sum_abs = 0.0, sum_g2 = 0.0; long cnt = 0;
+        for (int t = 0; t < nt; ++t) {
+            sum_abs += srp[(size_t)t]; sum_g2 += sg2p[(size_t)t]; cnt += cntp[(size_t)t];
+        }
         if (cnt > 0) {
             const f32 c = 2.5f * (f32)(sum_abs / (double)cnt);
             cinv2 = 1.f / (c * c + 1e-12f);
+            g2floor = 0.15f * (f32)(sum_g2 / (double)cnt);  // down-weight below ~0.15x mean grad energy
         }
         // Levenberg damping on the diagonal.
         f32 tr = 0.f; for (int i = 0; i < 8; ++i) tr += A[i][i];
