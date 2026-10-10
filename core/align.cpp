@@ -1160,6 +1160,135 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
+// ---- forward-backward consistency (Config::flow_fb_consistency_enabled) -----
+//
+// Bilinear sample of a tile-grid flow at a tile coordinate (tcy,tcx already in
+// tile units, i.e. grey_pixel / tile_size). Clamps to the grid edge.
+static void fb_sample_flow(const FlowField& f, f32 tcy, f32 tcx,
+                           f32& out_dx, f32& out_dy) {
+    int y0 = (int)std::floor(tcy), x0 = (int)std::floor(tcx);
+    f32 ay = tcy - (f32)y0, ax = tcx - (f32)x0;
+    int iy0 = std::max(0, std::min(y0,     f.ny - 1));
+    int iy1 = std::max(0, std::min(y0 + 1, f.ny - 1));
+    int ix0 = std::max(0, std::min(x0,     f.nx - 1));
+    int ix1 = std::max(0, std::min(x0 + 1, f.nx - 1));
+    auto at = [&](int iy, int ix, int c) -> f32 {
+        return f.flow[((size_t)iy * f.nx + ix) * 2 + c];
+    };
+    f32 tx = at(iy0, ix0, 0) + (at(iy0, ix1, 0) - at(iy0, ix0, 0)) * ax;
+    f32 bx = at(iy1, ix0, 0) + (at(iy1, ix1, 0) - at(iy1, ix0, 0)) * ax;
+    f32 ty = at(iy0, ix0, 1) + (at(iy0, ix1, 1) - at(iy0, ix0, 1)) * ax;
+    f32 by = at(iy1, ix0, 1) + (at(iy1, ix1, 1) - at(iy1, ix0, 1)) * ax;
+    out_dx = tx + (bx - tx) * ay;
+    out_dy = ty + (by - ty) * ay;
+}
+
+// Flag blunder tiles by round-trip error and replace them with the component-wise
+// median of the consistent tiles in a window. fwd/bwd share the (ny,nx) tile grid;
+// gts is the grey-pixel tile size the flow was measured at. In place on fwd.
+static void apply_fb_consistency(FlowField& fwd, const FlowField& bwd,
+                                 int gts, const Config& cfg) {
+    if (fwd.ny <= 0 || fwd.nx <= 0 || gts <= 0) return;
+    if (bwd.ny != fwd.ny || bwd.nx != fwd.nx) return;  // grids must match
+    const int ny = fwd.ny, nx = fwd.nx;
+    const f32 alpha = cfg.flow_fb_alpha;
+    const f32 beta = cfg.flow_fb_beta;
+
+    std::vector<uint8_t> flagged((size_t)ny * nx, 0u);
+    size_t n_flagged = 0;
+    for (int iy = 0; iy < ny; ++iy) {
+        for (int ix = 0; ix < nx; ++ix) {
+            const size_t t = (size_t)iy * nx + ix;
+            const f32 fx = fwd.flow[t * 2 + 0], fy = fwd.flow[t * 2 + 1];
+            // Forward destination in grey pixels -> backward tile coordinate.
+            const f32 cx = ((f32)ix + 0.5f) * (f32)gts + fx;
+            const f32 cy = ((f32)iy + 0.5f) * (f32)gts + fy;
+            f32 bx, by;
+            fb_sample_flow(bwd, cy / (f32)gts - 0.5f, cx / (f32)gts - 0.5f, bx, by);
+            const f32 rx = fx + bx, ry = fy + by;       // round-trip residual
+            const f32 e2 = rx * rx + ry * ry;
+            const f32 fmag2 = fx * fx + fy * fy;
+            const f32 bmag2 = bx * bx + by * by;
+            if (!std::isfinite(e2) ||
+                e2 > alpha * (fmag2 + bmag2) + beta) {
+                flagged[t] = 1u;
+                ++n_flagged;
+            }
+        }
+    }
+    prof_add_cpu("fb#flagged", (double)n_flagged);
+    prof_add_cpu("fb#flagged-frac",
+                 ny * nx > 0 ? (double)n_flagged / (double)(ny * nx) : 0.0);
+    if (n_flagged == 0) return;
+
+    // Replace each flagged tile by the median of consistent neighbours. Read from
+    // the ORIGINAL field (snapshot) so one correction never seeds another.
+    const std::vector<f32> src = fwd.flow;
+    const int r = std::max(1, cfg.flow_fb_fill_radius);
+    std::vector<f32> mx, my;
+    mx.reserve((size_t)(2 * r + 1) * (2 * r + 1));
+    my.reserve((size_t)(2 * r + 1) * (2 * r + 1));
+    for (int iy = 0; iy < ny; ++iy) {
+        for (int ix = 0; ix < nx; ++ix) {
+            const size_t t = (size_t)iy * nx + ix;
+            if (!flagged[t]) continue;
+            mx.clear(); my.clear();
+            for (int dy = -r; dy <= r; ++dy) {
+                int ny0 = iy + dy;
+                if (ny0 < 0 || ny0 >= ny) continue;
+                for (int dx = -r; dx <= r; ++dx) {
+                    int nx0 = ix + dx;
+                    if (nx0 < 0 || nx0 >= nx) continue;
+                    const size_t s = (size_t)ny0 * nx + nx0;
+                    if (flagged[s]) continue;             // consistent neighbours only
+                    mx.push_back(src[s * 2 + 0]);
+                    my.push_back(src[s * 2 + 1]);
+                }
+            }
+            if (mx.empty()) continue;                     // no anchor -> keep forward
+            const size_t mid = mx.size() / 2;
+            std::nth_element(mx.begin(), mx.begin() + mid, mx.end());
+            std::nth_element(my.begin(), my.begin() + mid, my.end());
+            fwd.flow[t * 2 + 0] = mx[mid];
+            fwd.flow[t * 2 + 1] = my[mid];
+        }
+    }
+}
+
+// Guards the recursive backward align() so it does not itself spawn a backward
+// pass. Not thread-local-across-frames state: align() is called once per frame on
+// the pipeline thread, and the backward call completes before this clears.
+static thread_local bool g_fb_backward_active = false;
+
+static void maybe_fb_correct(FlowField& flow, const Image& ref_grey,
+                             const Image& moving_grey, const Config& cfg,
+                             int tile_size, f32 idx, f32 idy, f32 irot) {
+    if (!cfg.flow_fb_consistency_enabled) return;
+    if (g_fb_backward_active) return;                     // inside the backward pass
+    // The backward pass needs host pixels for both greys to build its pyramid and
+    // upload. The pipeline computes host greys whenever this is on (see the
+    // force-host set in pipeline_paths), but guard anyway.
+    if (ref_grey.data.empty() || moving_grey.data.empty()) return;
+
+    const int gts = cfg.grey_tile_size(tile_size);
+    Image comp_padded = pad_image_circular(moving_grey, gts);
+    Pyramid comp_pyr = build_pyramid(comp_padded, cfg.bm_factors);
+#ifdef __APPLE__
+    // Forward align pinned the comp grey as sticky_grey; the backward moving is the
+    // REFERENCE grey, which has the same dimensions, so align_metal would otherwise
+    // reuse the pinned comp pixels. Drop it so the backward pass uploads ref_grey.
+    metal_invalidate_sticky_grey();
+#endif
+    g_fb_backward_active = true;
+    FlowField bwd = align(comp_pyr, moving_grey, ref_grey, cfg, tile_size,
+                          -idx, -idy, -irot);
+    g_fb_backward_active = false;
+#ifdef __APPLE__
+    metal_invalidate_sticky_grey();  // leave nothing stale for the next frame's grey
+#endif
+    apply_fb_consistency(flow, bwd, gts, cfg);
+}
+
 FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                 const Image& moving_grey, const Config& cfg, int tile_size,
                 f32 initial_dx, f32 initial_dy, f32 initial_rotation_rad) {
@@ -1171,6 +1300,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         FlowField flow_gpu;
         if (align_metal(ref_pyr, ref_grey, moving_grey, cfg, tile_size, flow_gpu,
                         initial_dx, initial_dy, initial_rotation_rad)) {
+            maybe_fb_correct(flow_gpu, ref_grey, moving_grey, cfg, tile_size,
+                             initial_dx, initial_dy, initial_rotation_rad);
             mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
             mark_motion_irregular_tiles(flow_gpu, cfg);
             return flow_gpu;
@@ -1309,6 +1440,8 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                g_ref_ica_cache.levels[0].hess.nx == flow.nx) {
         mark_hess = &g_ref_ica_cache.levels[0].hess;
     }
+    maybe_fb_correct(flow, ref_grey, moving_grey, cfg, tile_size,
+                     initial_dx, initial_dy, initial_rotation_rad);
     mark_aperture_limited_tiles(flow, mark_hess, cfg);
     mark_motion_irregular_tiles(flow, cfg);
     return flow;

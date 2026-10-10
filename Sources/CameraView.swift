@@ -1161,6 +1161,20 @@ struct CameraView: View {
                     }
                 }
 
+                Section(header: Text("Forward-Backward Consistency")) {
+                    Toggle("FB Flow Check", isOn: $cam.tuningParams.flow_fb_consistency_enabled)
+                    Text("""
+                         Aligns each frame both ways (reference→frame and frame→reference) and, where the round trip disagrees, replaces that tile's motion vector with the median of its consistent neighbours. Catches bad block matches, occlusions and repeated-pattern lock that a one-way search can't see, improving the optical flow itself. Correctly aligned tiles — including the sub-pixel offsets super-resolution feeds on — are left untouched. Costs roughly double the alignment time.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.flow_fb_consistency_enabled {
+                        ispRow("FB tolerance α", $cam.tuningParams.flow_fb_alpha, 0.0...0.5, "%.3f")
+                        ispRow("FB floor β (px²)", $cam.tuningParams.flow_fb_beta, 0.0...4.0, "%.2f")
+                        Text("Lower α/β flag more aggressively. Defaults keep sub-pixel offsets safe and flag only round-trip errors above ~1.5px.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+
                 Section(header: Text("Robustness")) {
                     Toggle("Per-Channel Mask (ISA)", isOn: $cam.tuningParams.robustness_per_channel)
                     Text("""

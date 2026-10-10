@@ -212,6 +212,16 @@ struct TuningParams: Equatable, Codable {
     /// mask summed across channels. Only has effect with the Bayer (3-channel) guide;
     /// a no-op on the grey guide. Default false = 460-main's single cross-channel mask.
     var robustness_per_channel: Bool = false
+    /// Forward-backward consistency check in alignment: align comp->ref as well as
+    /// ref->comp, and where the round-trip disagrees (a blunder: bad block match,
+    /// occlusion, repeated-pattern lock) replace the tile's flow with the median of
+    /// its consistent neighbours. Improves the optical flow itself, not a merge
+    /// weight. ~2x alignment cost. Off by default.
+    var flow_fb_consistency_enabled: Bool = false
+    /// FB gate e_FB^2 > alpha*(|F|^2+|B|^2) + beta (beta in grey-px^2). Lower = stricter
+    /// (flags more). Defaults keep sub-pixel offsets safe, flag ~>1.5px contradictions.
+    var flow_fb_alpha: Float = 0.05
+    var flow_fb_beta: Float = 1.0
     /// |∇I|·|E| threshold (intensity units). Must be LOW to reject anything:
     /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     /// drops more burst samples.
@@ -362,6 +372,7 @@ struct TuningParams: Equatable, Codable {
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
         case robustness_per_channel
+        case flow_fb_consistency_enabled, flow_fb_alpha, flow_fb_beta
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
         case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
@@ -461,6 +472,9 @@ struct TuningParams: Equatable, Codable {
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
+        flow_fb_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_fb_consistency_enabled) ?? flow_fb_consistency_enabled
+        flow_fb_alpha = try c.decodeIfPresent(Float.self, forKey: .flow_fb_alpha) ?? flow_fb_alpha
+        flow_fb_beta = try c.decodeIfPresent(Float.self, forKey: .flow_fb_beta) ?? flow_fb_beta
         motion_geom_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_reject_enabled) ?? motion_geom_reject_enabled
         motion_geom_reject_threshold = try c.decodeIfPresent(Float.self, forKey: .motion_geom_reject_threshold) ?? motion_geom_reject_threshold
         motion_geom_relative = try c.decodeIfPresent(Bool.self, forKey: .motion_geom_relative) ?? motion_geom_relative
@@ -2247,6 +2261,9 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
+            "flow_fb_consistency_enabled": NSNumber(value: tuningParams.flow_fb_consistency_enabled),
+            "flow_fb_alpha": NSNumber(value: tuningParams.flow_fb_alpha),
+            "flow_fb_beta": NSNumber(value: tuningParams.flow_fb_beta),
             "motion_geom_reject_enabled": NSNumber(value: tuningParams.motion_geom_reject_enabled),
             "motion_geom_reject_threshold": NSNumber(value: tuningParams.motion_geom_reject_threshold),
             "motion_geom_relative": NSNumber(value: tuningParams.motion_geom_relative),

@@ -555,6 +555,12 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"robustness_per_channel"])
         cfg.robustness_per_channel = tuning[@"robustness_per_channel"].boolValue;
+    if (tuning[@"flow_fb_consistency_enabled"])
+        cfg.flow_fb_consistency_enabled = tuning[@"flow_fb_consistency_enabled"].boolValue;
+    if (tuning[@"flow_fb_alpha"])
+        cfg.flow_fb_alpha = tuning[@"flow_fb_alpha"].floatValue;
+    if (tuning[@"flow_fb_beta"])
+        cfg.flow_fb_beta = tuning[@"flow_fb_beta"].floatValue;
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])

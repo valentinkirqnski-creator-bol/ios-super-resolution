@@ -1176,6 +1176,34 @@ struct Config {
 
     bool  align_ambiguous_fallback_enabled = false;
 
+    // Forward-backward consistency check IN alignment (not robustness): after the
+    // forward flow (ref->comp) is produced, align comp->ref independently and, for
+    // each tile, sample the backward flow at the forward-predicted destination. The
+    // round-trip error e_FB = ||F(x) + B(x+F(x))|| is large exactly where the match
+    // is a blunder -- a bad block match, unstable ICA, an occlusion, or a repeated
+    // pattern the two directions disagree on. Parallax and the sub-pixel offsets SR
+    // feeds on cancel in both directions, so they are NOT flagged (this is why it is
+    // safe where the removed ISA shift-consensus was not -- see isa-shift-consensus).
+    //
+    // The backward pass is a full second align() with the frames swapped, so it runs
+    // on whichever backend align() uses (GPU on device, CPU in the harness). ~2x
+    // alignment cost; OFF by default.
+    bool  flow_fb_consistency_enabled = false;
+    // Relative gate (the standard Sundaram form): a tile is a blunder when
+    //   e_FB^2 > alpha*(||F||^2 + ||B||^2) + beta   (beta in grey-px^2).
+    // alpha tolerates error that grows with motion magnitude; beta is the floor that
+    // keeps small still-frame flows from being flagged on noise. Tuned so sub-pixel
+    // offsets (SR signal) stay well under the gate and only ~>1.5px contradictions
+    // trip it.
+    float flow_fb_alpha = 0.05f;
+    float flow_fb_beta = 1.0f;
+    // Flagged tiles are not dropped (rejection is net-harmful below ~1.6px flow error
+    // -- see refine-subpixel-is-sr-signal). They are REPLACED by the component-wise
+    // median of the CONSISTENT tiles in a (2r+1)^2 window -- the neighbour-consensus
+    // flow fix (tile-reject-domain-retrain) with FB as the detector. A flagged tile
+    // with no consistent neighbour in range keeps its forward flow.
+    int   flow_fb_fill_radius = 2;
+
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
     // high. This does not repair flow; it rejects unsafe 1D tiles.
