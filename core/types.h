@@ -744,6 +744,21 @@ struct Config {
     // 384 / 640 / 1280 to hit those distinct rungs. 384 keeps the shipped speed.
     int   isa_prealign_refine_dim    = 384;
 
+    // Multi-frame shift-consistency consensus (ImageStackAlignator's "d)"
+    // outlier rejection; core/shift_consensus.*). When on, a pre-pass measures
+    // redundant pairwise per-tile tracks across the burst, solves the
+    // over-determined per-tile system A x = b on the sequential shifts, rejects
+    // the worst inconsistent measurement iteratively (ISA's 1 px^2 threshold),
+    // and feeds each frame the outlier-free consensus flow instead of its plain
+    // frame->reference track. Faithful to ISA, but MEASURED to degrade our real
+    // alignment (dense low-texture tracks violate ISA's sparse-outlier
+    // assumption; the residual is consistent parallax, not blunders), so it is
+    // off by default and opt-in for experimentation. Full strategy (every pair)
+    // unless shift_consensus_block_size > 0, then a Blocks sliding window.
+    bool  shift_consensus_enabled = false;
+    int   shift_consensus_block_size = 0;     // 0 => Full (every pair); >0 => Blocks window
+    float shift_consensus_reject_px2 = 1.0f;  // ISA checkForOutliers threshold
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

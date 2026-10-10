@@ -892,6 +892,9 @@ struct CameraView: View {
                         Text("Resolution of the homography refine. It reuses the full-res grey already computed for alignment, so higher just trades compute for a tighter global fit — most useful in low light / low contrast, where a coarse fit leaves slight edge misalignment. Balanced is the shipped speed; Precise/Max are slower.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                    Toggle("Shift Consensus (ISA)", isOn: $cam.tuningParams.shift_consensus_enabled)
+                    Text("ImageStackAlignator's multi-frame outlier rejection. Instead of each frame's single track to the reference, it measures every frame-pair's track, solves the over-determined per-tile system (shift a→b + b→c must equal a→c), and iteratively rejects the worst inconsistent measurement — feeding each frame the outlier-free consensus flow. Needs full-res (FFT) grey and ≥3 frames; decodes every frame once up front, so it's slower and uses more RAM. Measured to HELP only when tracks have gross blunders (e.g. low light); on clean bursts the remaining error is parallax, which it can't fix and may slightly worsen. Experimental, off by default.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Robustness")) {

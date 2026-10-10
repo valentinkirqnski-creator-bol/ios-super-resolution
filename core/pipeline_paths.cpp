@@ -13,6 +13,7 @@
 #include "preset_lut.h"
 #include "global_homography.h"
 #include "isa_prealign.h"
+#include "shift_consensus_pipeline.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
 #include "neural_flow.h"
@@ -1488,6 +1489,29 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         spill_pending = false;
     };
+    // ISA multi-frame shift-consistency consensus (opt-in, off by default).
+    // A pre-pass that measures the redundant pairwise tracks across the burst
+    // and hands each frame its outlier-free consensus flow; the per-frame align
+    // below is then skipped for any frame the pre-pass solved. Requires full-res
+    // grey (same constraint as the isa_warp / homography paths). Decodes every
+    // frame once here, so it is genuinely extra work -- hence opt-in.
+    std::vector<FlowField> consensus_flows;
+    if (work.shift_consensus_enabled &&
+        ref_grey.h == ref_h && ref_grey.w == ref_w) {
+        const double t_cons = prof_now_ms();
+        report("Shift consensus: measuring pairwise tracks", 0.08f);
+        auto grey_of_frame = [&](int f) -> Image {
+            if (f == ref_index) return ref_grey;
+            Image c = loader(f, work, false, ref_h, ref_w);
+            if (c.h <= 0) return Image();
+            return compute_grey(c, work.bayer_mode, work.grey_method);
+        };
+        consensus_flows = compute_consensus_flows(ref_grey, ref_index, n,
+                                                  grey_of_frame, work, tile_size);
+        prof_add_cpu("comp:shift-consensus-prepass", prof_now_ms() - t_cons);
+        prof_add_cpu("comp#shift-consensus-ok", consensus_flows.empty() ? 0.0 : 1.0);
+    }
+
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
@@ -1654,6 +1678,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // flow.global_h so robustness/merge sample the registered position.
         // Requires full-res grey (grey == raw), same coordinate constraint as
         // the homography path; the half-res decimate grey is left unchanged.
+        // The shift-consensus pre-pass already produced this frame's cleaned,
+        // raw-grid flow (with global_h). Use it and skip the per-frame align.
+        FlowField flow;
+        const bool have_consensus =
+            (!consensus_flows.empty() && k >= 0 && k < (int)consensus_flows.size() &&
+             consensus_flows[(size_t)k].ny > 0 && !consensus_flows[(size_t)k].flow.empty());
+        if (have_consensus) {
+            flow = std::move(consensus_flows[(size_t)k]);
+        } else {
         bool isa_warp = false;
         f32 isaH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
         if (work.isa_prealign_enabled && !use_homog &&
@@ -1693,7 +1726,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // global_h composes exactly once.
         if (align_comp != &comp_grey) metal_invalidate_sticky_grey();
 #endif
-        FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
+        flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
                                seed_dx, seed_dy, seed_rot);
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the flow is on a half-res tile grid with half-res
@@ -1715,6 +1748,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (int i = 0; i < 9; ++i) flow.global_h[i] = isaH[i];
             flow.has_global_h = true;
         }
+        } // end !have_consensus (per-frame align)
         // Fit the per-tile affine motion model on the finalized raw-grid flow,
         // before it is uploaded to the GPU slice (metal_frame_set_flow) and
         // before robustness/merge consume it. Off by default (Config::
