@@ -736,6 +736,34 @@ struct Config {
     int   isa_prealign_fft_max_dim   = 256;    // FFT content cap; N = next_pow2(2*cap)
     int   isa_prealign_refine_dim    = 384;    // finest resolution of the rigid LK refine
 
+    // Gyro-seeded global pre-alignment (IMU sensor fusion). The capture layer
+    // integrates the gyroscope between each comparison frame's and the reference
+    // frame's timestamps, and converts the inter-frame camera rotation to an
+    // IMAGE-PLANE rigid seed -- roll about the optical axis -> image rotation
+    // (rad); pitch/yaw -> image shift (focal_px * angle), expressed in GREY
+    // pixels. These are stored per burst frame as {dx, dy, rot, valid} in
+    // gyro_seed and indexed by the ABSOLUTE frame index. When a valid seed exists
+    // it REPLACES the ISA FFT angle scan as the coarse global pre-align seed: the
+    // gyro is scene-independent, so it works where image estimation fails
+    // (textureless, dominant moving subject, motion blur) and handles arbitrarily
+    // large/fast rotation with no basin problem. The existing rigid LK refine
+    // (refine_global_rigid_seed) then polishes it against the image, and -- since
+    // it reverts non-improving iterations -- is the built-in consistency gate:
+    // the result can only improve on the gyro seed, never drift away from it.
+    // Default off; an empty gyro_seed means no IMU data (falls back to the scan).
+    bool  gyro_prealign_enabled = false;
+    std::vector<f32> gyro_seed;   // 4 floats per frame: dx, dy, rot_rad, valid(0|1)
+
+    // Reads the gyro rigid seed for a frame, or false if absent/invalid.
+    bool gyro_seed_for(int frame_index, f32& dx, f32& dy, f32& rot) const {
+        if (!gyro_prealign_enabled || frame_index < 0) return false;
+        const size_t o = (size_t)frame_index * 4u;
+        if (o + 4u > gyro_seed.size()) return false;
+        if (gyro_seed[o + 3u] == 0.f) return false;   // valid flag clear
+        dx = gyro_seed[o + 0u]; dy = gyro_seed[o + 1u]; rot = gyro_seed[o + 2u];
+        return true;
+    }
+
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
     // finest-radius override lands on the CPU and the device identically.

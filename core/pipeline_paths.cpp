@@ -1638,13 +1638,29 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             estimate_global_homography(ref_grey, comp_grey, work, gH);
             warped_comp = warp_grey_by_homography(comp_grey, gH);
             align_comp = &warped_comp;
-        } else if (work.isa_prealign_enabled &&
+        } else if ((work.isa_prealign_enabled || work.gyro_prealign_enabled) &&
                    comp_grey.h == comp.h && comp_grey.w == comp.w &&
                    ref_grey.h == comp.h && ref_grey.w == comp.w &&
                    ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
                    comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c) {
             float idx = 0.f, idy = 0.f, irot = 0.f;
-            if (estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot)) {
+            bool seeded = false;
+            // IMU sensor fusion: the gyro supplies the coarse global rigid seed
+            // (scene-independent) IN PLACE OF the ISA FFT angle scan when a valid
+            // per-frame seed is present. The seed is in grey pixels + radians (the
+            // capture layer did the gyro->image-plane conversion). Falls back to
+            // the FFT scan when there is no gyro data for this frame.
+            f32 gdx = 0.f, gdy = 0.f, grot = 0.f;
+            if (work.gyro_seed_for(k, gdx, gdy, grot)) {
+                idx = gdx; idy = gdy; irot = grot;
+                seeded = true;
+            } else if (work.isa_prealign_enabled) {
+                seeded = estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot);
+            }
+            if (seeded) {
+                // Rigid LK refine polishes the seed (gyro or scan) to sub-pixel
+                // against the image and reverts non-improving iterations, so the
+                // gyro seed is never made worse -- the built-in consistency gate.
                 refine_global_rigid_seed(ref_grey, comp_grey, work, idx, idy, irot);
                 const f32 cx = 0.5f * (f32)(ref_grey.w - 1);
                 const f32 cy = 0.5f * (f32)(ref_grey.h - 1);
