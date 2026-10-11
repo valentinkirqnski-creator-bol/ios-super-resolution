@@ -700,117 +700,35 @@ void prewarm_noise_curves(const Config& cfg) {
 // Not in the anonymous namespace below: neural_flow's caller (pipeline_paths.cpp)
 // needs the exact same guide image the classical robustness path scores
 // against, rather than re-deriving its own and risking the two drifting.
-// Guide transfer curve: 0 linear, 1 sqrt (variance-stabilizing, 1.4), 2 gamma
-// 1/2.2, 3 IEC sRGB. Twin of _apply_guide_curve in the Metal kernel.
-static inline f32 apply_guide_curve(f32 v, int curve) {
-    switch (curve) {
-        case 1: return std::sqrt(std::max(0.f, v));
-        case 2: { f32 vc = std::min(std::max(v, 0.f), 1.f); return std::pow(vc, 1.f / 2.2f); }
-        case 3: { f32 vc = std::min(std::max(v, 0.f), 1.f);
-                  return vc <= 0.0031308f ? 12.92f * vc
-                                          : 1.055f * std::pow(vc, 1.f / 2.4f) - 0.055f; }
-        default: return v; // 0 = linear
-    }
-}
 
+// Algorithm 7 (ComputeGuideImage) -- the ONE and only guide. For a Bayer frame:
+// a half-res 3-channel guide, G(x,y) = [ R, mean(the two greens), B ], read
+// straight off the raw 2x2 cell by CFA colour. There is no FFT guide, no sqrt/
+// gamma/sRGB transfer curve, no colour matrix and no real-RGB variant any more --
+// every one of those alternate paths was removed so the guide is unconditional.
+//
+// The one adjustment vs the literal pseudocode: the loader prewhitens the raw
+// (site *= white_balance[c]/white_balance[1]), so the guide un-prewhitens
+// (undo = wb[1]/wb[c]) to recover the camera-native samples Algorithm 7 reads.
+// With a raw that was never prewhitened this is identity and the guide is the
+// pseudocode verbatim.
 Image compute_guide(const Image& raw, const Config& cfg) {
-    // Full-resolution single-channel guide, straight out of the FFT low pass.
-    // The CFA checkerboard sits at the corners of the spectrum, so zeroing the
-    // outer half on both axes removes it without demosaicing and without
-    // decimating: one guide sample per RAW pixel, phase-correct, so R lands on
-    // the raw lattice with nothing upscaled anywhere. Config::
-    // robustness_fft_guide documents what that costs.
-    if (cfg.robustness_fft_guide_active()) {
-        Image g = compute_grey_fft(raw);
-        // compute_grey_fft returns an empty image when its Metal path is
-        // present but fails. Falling through to the decimated guide would
-        // silently change R's resolution mid-burst, which the merge detects by
-        // DIMENSION and would then sample at half the correct position, so this
-        // has to be a hard failure rather than a fallback.
-        if (g.h == raw.h && g.w == raw.w && g.c == 1) return g;
-        return Image();
-    }
     if (!cfg.bayer_mode) {
-        // Python: guide_img = raw.reshape((1, H, W))
+        // Non-Bayer degenerate case: the guide is the single-channel frame itself
+        // (460's guide_img = raw.reshape((1, H, W))). Algorithm 7 is Bayer-only.
         Image g(raw.h, raw.w, 1);
         g.data = raw.data;
         return g;
     }
-    int gh = raw.h / 2, gw = raw.w / 2;
+    const int gh = raw.h / 2, gw = raw.w / 2;
     Image guide(gh, gw, 3);
-    // Divisor per colour taken from the CFA rather than assumed. Bit-identical
-    // to the previous 0.5*gsum for any Bayer pattern -- scaling by 1 and by 1/2
-    // are both exact in IEEE754 -- but it stays correct, and stays in step with
-    // Config::noise_guide_weight, if a pattern ever arrives with a different
-    // count.
+    // Per-colour divisor from the CFA: green = mean of its two samples, R/B single.
     f32 inv[3];
     for (int c = 0; c < 3; ++c) {
         const int n = cfg.cfa.count((uint8_t)c);
         inv[c] = (n > 0) ? 1.f / (f32)n : 0.f;
     }
-    // 1.4 parity: 1.4 builds the guide from the UN-prewhitened raw. The port's
-    // loader prewhitens (site *= white_balance[c]/white_balance[1]) and the
-    // rest of the pipeline depends on that, so undo it HERE, in the guide
-    // only, to recover sqrt(raw) exactly as 1.4's cuda_compute_guide_image
-    // sees it. undo = wb[1]/wb[c] (green = 1); disabled when the raw was not
-    // prewhitened. This makes the noise-off mask's guide domain match 1.4.
-    // Un-prewhiten to camera-native (1.4 parity) UNLESS the guide is asked to
-    // keep white balance (guide_white_balance) -- a real-RGB guide wants WB, and
-    // the port's raw is already white-balanced by the loader's prewhitening.
-    // Real-RGB guide (Config::real_rgb_guide). Self-contained: it does not read
-    // guide_white_balance / guide_color_matrix / guide_curve at all, and returns
-    // before them, so the two schemes cannot interleave.
-    //
-    // white balance kept -> camera->sRGB -> IEC sRGB curve. The loader
-    // prewhitens (raw_io.cpp: site *= wb[c]/wb[1]), so on that path WB is
-    // already in the samples and "keep" means doing nothing; a raw that arrived
-    // un-prewhitened gets the gains applied here instead, so the guide is the
-    // same picture either way.
-    // Single 460 guide path: the real-RGB guide (WB + CCM + sRGB curve) is retired
-    // so the guide can only ever be 460-main's plain linear RGB guide. Flag kept
-    // for preference compatibility but no longer selects anything.
-    if (false && cfg.real_rgb_guide) {
-        f32 wb[3] = {1.f, 1.f, 1.f};
-        if (!cfg.raw_prewhitened) {
-            const f32 g = cfg.white_balance[1];
-            for (int c = 0; c < 3; ++c) {
-                const f32 wc = cfg.white_balance[c];
-                wb[c] = (std::isfinite(g) && std::isfinite(wc) && g > 0.f) ? (wc / g) : 1.f;
-            }
-        }
-        // No matrix available means no real RGB to speak of; WB plus the curve
-        // is still a better-conditioned guide than sensor space, so carry on
-        // rather than silently reverting to the 1.4 guide the caller did not ask
-        // for.
-        const bool ccm = cfg.has_cam_to_srgb;
-        const float* M = cfg.cam_to_srgb;
-        for (int y = 0; y < gh; ++y) {
-            for (int x = 0; x < gw; ++x) {
-                f32 sum[3] = {0.f, 0.f, 0.f};
-                for (int i = 0; i < 2; ++i)
-                    for (int j = 0; j < 2; ++j) {
-                        const uint8_t c = cfg.cfa.p[i][j];
-                        if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
-                    }
-                f32 rgb[3] = {sum[0] * inv[0] * wb[0],
-                              sum[1] * inv[1] * wb[1],
-                              sum[2] * inv[2] * wb[2]};
-                if (ccm) {
-                    const f32 r = rgb[0], gr = rgb[1], b = rgb[2];
-                    rgb[0] = M[0] * r + M[1] * gr + M[2] * b;
-                    rgb[1] = M[3] * r + M[4] * gr + M[5] * b;
-                    rgb[2] = M[6] * r + M[7] * gr + M[8] * b;
-                }
-                for (int c = 0; c < 3; ++c)
-                    guide.at(y, x, c) = apply_guide_curve(rgb[c], 3);  // IEC sRGB
-            }
-        }
-        return guide;
-    }
-
-    // Un-prewhiten to camera-native so the guide equals 460-main's (460 builds the
-    // guide from the un-white-balanced raw; the port's loader prewhitens). Always
-    // applied now -- guide_white_balance (keep WB) is retired for the single path.
+    // Un-prewhiten to camera-native so the guide equals 460-main's / Algorithm 7's.
     f32 wbu[3] = {1.f, 1.f, 1.f};
     if (cfg.raw_prewhitened) {
         const f32 g = cfg.white_balance[1];
@@ -819,11 +737,6 @@ Image compute_guide(const Image& raw, const Config& cfg) {
             wbu[c] = (std::isfinite(g) && std::isfinite(wc) && wc > 0.f) ? (g / wc) : 1.f;
         }
     }
-    // Single 460 guide path: always linear, never a colour matrix. guide_curve /
-    // guide_color_matrix are retired (kept in Config for preference compatibility).
-    const int curve = 0;                 // linear, exactly 460-main
-    const bool apply_ccm = false;
-    const float* M = cfg.cam_to_srgb; // camera -> linear sRGB (same as the ISP)
     for (int y = 0; y < gh; ++y) {
         for (int x = 0; x < gw; ++x) {
             f32 sum[3] = {0.f, 0.f, 0.f};
@@ -833,17 +746,8 @@ Image compute_guide(const Image& raw, const Config& cfg) {
                     if (c < 3) sum[c] += raw.at(2 * y + i, 2 * x + j);
                 }
             }
-            f32 rgb[3] = {sum[0] * inv[0] * wbu[0],
-                          sum[1] * inv[1] * wbu[1],
-                          sum[2] * inv[2] * wbu[2]};
-            if (apply_ccm) {
-                const f32 r = rgb[0], gr = rgb[1], b = rgb[2];
-                rgb[0] = M[0] * r + M[1] * gr + M[2] * b;
-                rgb[1] = M[3] * r + M[4] * gr + M[5] * b;
-                rgb[2] = M[6] * r + M[7] * gr + M[8] * b;
-            }
             for (int c = 0; c < 3; ++c)
-                guide.at(y, x, c) = apply_guide_curve(rgb[c], curve);
+                guide.at(y, x, c) = sum[c] * inv[c] * wbu[c];
         }
     }
     return guide;

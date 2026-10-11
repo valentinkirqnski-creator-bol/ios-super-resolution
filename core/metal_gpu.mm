@@ -1603,15 +1603,9 @@ struct RobGuideParamsCPU {
     uint32_t raw_h, raw_w, guide_h, guide_w;
     uint32_t bayer;
     uint32_t cfa00, cfa01, cfa10, cfa11;
-    float wb0, wb1, wb2;
-    uint32_t sqrt_guide = 0; // 1 = sqrt VST guide (1.4); was _pad0
-    uint32_t guide_ccm = 0;  // 1 = apply cam_to_srgb to the guide RGB
-    int32_t  guide_curve = 1; // 0 none, 1 sqrt, 2 gamma, 3 srgb (host-resolved)
-    float    ccm[9] = {1,0,0, 0,1,0, 0,0,1};
-    uint32_t real_rgb = 0;   // 1 = Config::real_rgb_guide (own branch in the kernel)
-    uint32_t _pad_rrg[3] = {0, 0, 0};
+    float wb0, wb1, wb2;   // WB-undo factors (Algorithm 7 camera-native recovery)
 };
-static_assert(sizeof(RobGuideParamsCPU) == 112, "RobGuideParamsCPU");
+static_assert(sizeof(RobGuideParamsCPU) == 48, "RobGuideParamsCPU");
 
 struct RobStatsParamsCPU {
     uint32_t h, w, nch, _pad0 = 0;
@@ -1881,11 +1875,12 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
         gp.cfa01 = cfg.cfa.p[0][1];
         gp.cfa10 = cfg.cfa.p[1][0];
         gp.cfa11 = cfg.cfa.p[1][1];
-        // 1.4 parity: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1) so
-        // it is sqrt(raw), matching 1.4's cuda_compute_guide_image -- the CPU
-        // compute_guide twin does the same. Skipped when guide_white_balance is
-        // on (a real-RGB guide keeps WB) or the raw was not prewhitened.
-        if (cfg.raw_prewhitened && !cfg.guide_white_balance) {
+        // Algorithm 7 only: un-prewhiten the guide (undo = wb[1]/wb[c], green = 1)
+        // to recover the camera-native samples the guide is built from. Applied
+        // whenever the loader prewhitened the raw; identity otherwise. There is no
+        // sqrt/curve/colour-matrix/real-RGB processing any more -- the guide is the
+        // plain linear 460/Algorithm-7 RGB guide, same as the CPU compute_guide.
+        if (cfg.raw_prewhitened) {
             const float g = cfg.white_balance[1];
             auto undo = [&](int c) {
                 const float wc = cfg.white_balance[c];
@@ -1898,35 +1893,6 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
             gp.wb0 = 1.f;
             gp.wb1 = 1.f;
             gp.wb2 = 1.f;
-        }
-        gp.sqrt_guide = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity (unused when curve set)
-        // Guide colour processing: camera->sRGB matrix + transfer curve. Curve
-        // -1 auto follows robustness_guide_sqrt so the default is unchanged.
-        int gcurve = cfg.guide_curve;
-        if (gcurve < 0) gcurve = cfg.robustness_guide_sqrt ? 1 : 0;
-        gp.guide_curve = (int32_t)gcurve;
-        gp.guide_ccm = (cfg.guide_color_matrix && cfg.has_cam_to_srgb) ? 1u : 0u;
-        for (int k = 0; k < 9; ++k) gp.ccm[k] = cfg.cam_to_srgb[k];
-        // Real-RGB guide overrides all of the above. wb0..2 stop being
-        // un-prewhiten factors and become the gains to APPLY: 1.0 when the
-        // loader already prewhitened (raw_io.cpp), wb[c]/wb[1] otherwise, so
-        // the guide is the same picture on either path. Curve is forced to IEC
-        // sRGB inside the kernel. Mirrors compute_guide's real_rgb_guide branch.
-        gp.real_rgb = cfg.real_rgb_guide ? 1u : 0u;
-        if (cfg.real_rgb_guide) {
-            if (cfg.raw_prewhitened) {
-                gp.wb0 = gp.wb1 = gp.wb2 = 1.f;
-            } else {
-                const float g = cfg.white_balance[1];
-                auto gain = [&](int c) {
-                    const float wc = cfg.white_balance[c];
-                    return (std::isfinite(g) && std::isfinite(wc) && g > 0.f) ? (wc / g) : 1.f;
-                };
-                gp.wb0 = gain(0);
-                gp.wb1 = gain(1);
-                gp.wb2 = gain(2);
-            }
-            gp.guide_ccm = cfg.has_cam_to_srgb ? 1u : 0u;
         }
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
