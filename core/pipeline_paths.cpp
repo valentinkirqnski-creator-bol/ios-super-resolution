@@ -990,6 +990,60 @@ static bool choose_online_merge(int mode, int Hs, int Ws, int nch, int n,
     return true;
 }
 
+// Global pre-alignment transform for one comparison frame: homography
+// (Config::global_homography_enabled) or rigid ISA/gyro seed + sub-pixel LK
+// refine (Config::isa_prealign_enabled / gyro_prealign_enabled), both gated to
+// the full-resolution host grey. Returns the transform H (lr/raw coords), whether
+// a warp applies, and the warped grey. DETERMINISTIC in (ref_grey, comp_grey,
+// work, frame_index) -- the trajectory-consensus pre-pass and the main analyze
+// loop both call this so they pre-align each frame identically, and the residual
+// the consensus measures is the same residual the per-tile match cleans up.
+struct GlobalWarp {
+    f32 H[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+    bool warped = false;
+    Image warped_grey;   // populated only when warped
+};
+
+static GlobalWarp estimate_global_warp(const Image& ref_grey, const Image& comp_grey,
+                                       int raw_h, int raw_w, int frame_index,
+                                       const Config& work) {
+    GlobalWarp g;
+    const bool full_res =
+        comp_grey.h == raw_h && comp_grey.w == raw_w &&
+        ref_grey.h == raw_h && ref_grey.w == raw_w &&
+        ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
+        comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c;
+    if (!full_res) return g;
+    if (work.global_homography_enabled) {
+        estimate_global_homography(ref_grey, comp_grey, work, g.H);
+        g.warped_grey = warp_grey_by_homography(comp_grey, g.H);
+        g.warped = true;
+        return g;
+    }
+    if (work.isa_prealign_enabled || work.gyro_prealign_enabled) {
+        float idx = 0.f, idy = 0.f, irot = 0.f;
+        bool seeded = false;
+        f32 gdx = 0.f, gdy = 0.f, grot = 0.f;
+        if (work.gyro_seed_for(frame_index, gdx, gdy, grot)) {
+            idx = gdx; idy = gdy; irot = grot; seeded = true;
+        } else if (work.isa_prealign_enabled) {
+            seeded = estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot);
+        }
+        if (seeded) {
+            refine_global_rigid_seed(ref_grey, comp_grey, work, idx, idy, irot);
+            const f32 cx = 0.5f * (f32)(ref_grey.w - 1);
+            const f32 cy = 0.5f * (f32)(ref_grey.h - 1);
+            const f32 cs = std::cos(irot), sn = std::sin(irot);
+            g.H[0] = cs; g.H[1] = -sn; g.H[2] = cx + idx - cs * cx + sn * cy;
+            g.H[3] = sn; g.H[4] =  cs; g.H[5] = cy + idy - sn * cx - cs * cy;
+            g.H[6] = 0.f; g.H[7] = 0.f; g.H[8] = 1.f;
+            g.warped_grey = warp_grey_by_homography(comp_grey, g.H);
+            g.warped = true;
+        }
+    }
+    return g;
+}
+
 } // namespace
 
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
@@ -1475,26 +1529,38 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         const int gts = std::max(1, work.grey_tile_size(tile_size));
         const int rad = std::max(1, work.flow_consensus_search_radius);
         std::vector<CoarseFlow> direct((size_t)n), chain((size_t)n);
-        Image prev_grey;          // rolling: grey of frame (f-1)
+        // Rolling: the previous frame's grey, already pre-aligned into the
+        // reference frame (so the chain match measures the residual trajectory,
+        // the same frame the per-tile flow lives in).
+        Image prev_grey;
         bool have_prev = false;
         for (int f = 0; f < n; ++f) {
-            Image grey_f;
+            Image match_grey;          // grey warped into the reference frame
             if (f == ref_index) {
-                grey_f = ref_grey;   // already built; copied into the rolling slot
+                match_grey = ref_grey;              // identity: it IS the reference
             } else {
                 Image raw_f = loader(f, work, false, ref_h, ref_w);
-                if (raw_f.h > 0 && raw_f.w > 0)
-                    grey_f = compute_grey(raw_f, work.bayer_mode, work.grey_method);
+                if (raw_f.h > 0 && raw_f.w > 0) {
+                    Image grey_f = compute_grey(raw_f, work.bayer_mode, work.grey_method);
+                    const int rfh = raw_f.h, rfw = raw_f.w;
+                    raw_f = Image();   // free the raw before the (cheap) warp
+                    // SAME transform the analyze loop will apply to this frame, so
+                    // the consensus measures the residual the per-tile match sees.
+                    GlobalWarp gw_f = estimate_global_warp(ref_grey, grey_f, rfh, rfw,
+                                                           f, work);
+                    match_grey = gw_f.warped ? std::move(gw_f.warped_grey)
+                                             : std::move(grey_f);
+                }
             }
-            if (grey_f.h <= 0 || grey_f.w <= 0) { have_prev = false; continue; }
+            if (match_grey.h <= 0 || match_grey.w <= 0) { have_prev = false; continue; }
             if (f != ref_index)
-                direct[(size_t)f] = coarse_block_match(ref_grey, grey_f, gts, rad,
+                direct[(size_t)f] = coarse_block_match(ref_grey, match_grey, gts, rad,
                                                        0.f, 0.f, work.num_threads);
             if (have_prev)
-                chain[(size_t)(f - 1)] = coarse_block_match(prev_grey, grey_f, gts,
+                chain[(size_t)(f - 1)] = coarse_block_match(prev_grey, match_grey, gts,
                                                             rad, 0.f, 0.f,
                                                             work.num_threads);
-            prev_grey = std::move(grey_f);
+            prev_grey = std::move(match_grey);
             have_prev = true;
         }
         traj = solve_trajectory_consensus(direct, chain, ref_index,
@@ -1657,68 +1723,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_add_cpu("prealign#grey-dx-abs-sum",
                      std::fabs((double)(init.dx * grey_scale_x)));
         const double t_align = prof_now_ms();
-        // Global homography warp-then-refine (Config::global_homography_enabled).
-        // Estimate H between the reference and comparison GREY, warp the
-        // comparison into the reference frame, and align that -- so the per-tile
-        // match only cleans up the residual. Gated to the full-resolution FFT
-        // grey (grey == raw size), where H is already in the lr/raw coords the
-        // merge and robustness sample in; the decimate half-res grey stays on the
-        // plain path. H is stored on the flow and composed back at sample time.
-        f32 gH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
-        const bool use_homog = work.global_homography_enabled &&
-                               comp_grey.h == comp.h && comp_grey.w == comp.w &&
-                               ref_grey.h == comp.h && ref_grey.w == comp.w &&
-                               // Host pixels required (CPU estimate + warp): on the
-                               // resident GPU path the grey can be header-only.
-                               ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
-                               comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c;
-        // ISA FFT + sub-pixel RIGID global pre-align (Config::isa_prealign_enabled).
-        // Same warp-then-align-residual scheme as the homography path above, but
-        // the transform is a rotation+translation estimated by the FFT scan and
-        // polished by refine_global_rigid_seed. Gated to full-res host grey.
-        f32 isaH[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
-        bool isa_warp = false;
-        Image warped_comp;
-        const Image* align_comp = &comp_grey;
-        if (use_homog) {
-            estimate_global_homography(ref_grey, comp_grey, work, gH);
-            warped_comp = warp_grey_by_homography(comp_grey, gH);
-            align_comp = &warped_comp;
-        } else if ((work.isa_prealign_enabled || work.gyro_prealign_enabled) &&
-                   comp_grey.h == comp.h && comp_grey.w == comp.w &&
-                   ref_grey.h == comp.h && ref_grey.w == comp.w &&
-                   ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
-                   comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c) {
-            float idx = 0.f, idy = 0.f, irot = 0.f;
-            bool seeded = false;
-            // IMU sensor fusion: the gyro supplies the coarse global rigid seed
-            // (scene-independent) IN PLACE OF the ISA FFT angle scan when a valid
-            // per-frame seed is present. The seed is in grey pixels + radians (the
-            // capture layer did the gyro->image-plane conversion). Falls back to
-            // the FFT scan when there is no gyro data for this frame.
-            f32 gdx = 0.f, gdy = 0.f, grot = 0.f;
-            if (work.gyro_seed_for(k, gdx, gdy, grot)) {
-                idx = gdx; idy = gdy; irot = grot;
-                seeded = true;
-            } else if (work.isa_prealign_enabled) {
-                seeded = estimate_isa_prealign(ref_grey, comp_grey, work, idx, idy, irot);
-            }
-            if (seeded) {
-                // Rigid LK refine polishes the seed (gyro or scan) to sub-pixel
-                // against the image and reverts non-improving iterations, so the
-                // gyro seed is never made worse -- the built-in consistency gate.
-                refine_global_rigid_seed(ref_grey, comp_grey, work, idx, idy, irot);
-                const f32 cx = 0.5f * (f32)(ref_grey.w - 1);
-                const f32 cy = 0.5f * (f32)(ref_grey.h - 1);
-                const f32 cs = std::cos(irot), sn = std::sin(irot);
-                isaH[0] = cs; isaH[1] = -sn; isaH[2] = cx + idx - cs * cx + sn * cy;
-                isaH[3] = sn; isaH[4] =  cs; isaH[5] = cy + idy - sn * cx - cs * cy;
-                isaH[6] = 0.f; isaH[7] = 0.f; isaH[8] = 1.f;
-                warped_comp = warp_grey_by_homography(comp_grey, isaH);
-                align_comp = &warped_comp;
-                isa_warp = true;
-            }
-        }
+        // Global pre-alignment (homography, or rigid ISA/gyro seed + LK refine):
+        // warp the comparison grey into the reference frame so the per-tile match
+        // only cleans up the residual. Gated to the full-resolution host grey,
+        // where H is already in the lr/raw coords the merge and robustness sample
+        // in. H is stored on the flow and composed back at sample time. Factored
+        // into estimate_global_warp so the consensus pre-pass pre-aligns each
+        // frame identically (see GlobalWarp).
+        GlobalWarp gw = estimate_global_warp(ref_grey, comp_grey, comp.h, comp.w,
+                                             k, work);
+        const Image* align_comp = gw.warped ? &gw.warped_grey : &comp_grey;
 #if defined(__APPLE__)
         // When the comp was warped, align_metal must re-upload the warped host
         // grey rather than reuse the pinned (unwarped) sticky grey -- otherwise
@@ -1727,7 +1741,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 #endif
         // A warped comp is already globally registered, so the per-tile match
         // starts from zero; otherwise seed from the thumbnail pre-align.
-        const bool warped = use_homog || isa_warp;
+        const bool warped = gw.warped;
         FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size,
                                warped ? 0.f : init.dx * grey_scale_x,
                                warped ? 0.f : init.dy * grey_scale_y,
@@ -1735,13 +1749,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // Multi-frame trajectory consensus correction: replace blunder tiles in
         // this frame's grey-grid flow with the burst-wide consensus before it is
         // remapped to the raw grid (so the correction, in grey px, is carried
-        // through by flow_to_raw_tile_grid like any other flow). Skipped when the
-        // comp was globally warped -- its flow is a residual in the warped frame,
-        // which the unwarped consensus grid does not match (combining the two is
-        // future work). apply_consensus_correction only touches tiles that are
-        // trusted (redundantly measured) AND disagree beyond the reject threshold,
-        // so a clean sub-pixel offset or an unverifiable tile is left untouched.
-        if (work.flow_consensus_enabled && traj_ready && !warped &&
+        // through by flow_to_raw_tile_grid like any other flow). Works for both
+        // the plain and the globally-warped paths: the pre-pass pre-aligns each
+        // frame with the SAME estimate_global_warp the loop just used, so when
+        // this frame is warped its consensus is the residual trajectory in the
+        // same warped frame, matching the residual `flow` tile for tile.
+        // apply_consensus_correction only touches tiles that are trusted
+        // (redundantly measured) AND disagree beyond the reject threshold, so a
+        // clean sub-pixel offset or an unverifiable tile is left untouched.
+        if (work.flow_consensus_enabled && traj_ready &&
             k >= 0 && k < (int)traj.flow.size() && traj.flow[(size_t)k].ny > 0) {
             apply_consensus_correction(flow, traj.flow[(size_t)k],
                                        traj.trusted[(size_t)k],
@@ -1757,13 +1773,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                      comp_grey.h, comp_grey.w, cons_ts,
                                      work.r_Mt, work.num_threads,
                                      work.grey_tile_size(cons_ts));
-        // Carry the global homography (lr/raw coords) so the merge and
-        // robustness compose it back: comp_pos = H * (lr + flow).
-        if (use_homog) {
-            for (int i = 0; i < 9; ++i) flow.global_h[i] = gH[i];
-            flow.has_global_h = true;
-        } else if (isa_warp) {
-            for (int i = 0; i < 9; ++i) flow.global_h[i] = isaH[i];
+        // Carry the global transform (lr/raw coords) so the merge and robustness
+        // compose it back: comp_pos = H * (lr + flow).
+        if (gw.warped) {
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = gw.H[i];
             flow.has_global_h = true;
         }
         // Fit the per-tile affine motion model on the finalized raw-grid flow,
