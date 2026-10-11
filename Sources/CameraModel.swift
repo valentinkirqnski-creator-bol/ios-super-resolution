@@ -2842,13 +2842,15 @@ final class GyroTracker {
               let qRef = attitude(at: frameTimes[refIndex]) else { return [] }
         var out: [NSNumber] = []
         out.reserveCapacity(frameTimes.count * 4)
+        let invalid4: [NSNumber] = [NSNumber(value: 0.0), NSNumber(value: 0.0),
+                                    NSNumber(value: 0.0), NSNumber(value: 0.0)]
         for (i, t) in frameTimes.enumerated() {
             if i == refIndex {
-                out.append(contentsOf: [0, 0, 0, 0].map { NSNumber(value: Double($0)) })
+                out.append(contentsOf: invalid4)   // reference frame: no seed
                 continue
             }
             guard let q = attitude(at: t) else {
-                out.append(contentsOf: [0, 0, 0, 0].map { NSNumber(value: 0.0) })
+                out.append(contentsOf: invalid4)   // no attitude -> invalid, core falls back
                 continue
             }
             let (roll, pitch, yaw) = Self.relativeRPY(from: qRef, to: q)
