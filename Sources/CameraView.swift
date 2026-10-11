@@ -1187,14 +1187,14 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
-                    Toggle("Reject HF Artifacts", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
+                    Toggle("HF Artifact Rejection", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
                     Text("""
-                         Wronski et al. Drops a frame's contribution only where BOTH hold: the reference patch is almost entirely high-frequency (most of its local detail vanishes under a blur, above T_L) AND the per-tile motion is locally irregular (the same r_Mt test that drives the motion prior). Targets the blocky ghosts repetitive fine texture causes — roof tiles, fences, fabric weave, resolution charts — where block matching locks onto the wrong period, while leaving cleanly-tracked detail (hair, fur) and smooth noisy areas untouched. The reference frame stays the fallback. Off by default; it changes which pixels merge.
+                         Wronski et al. Drops a frame's contribution only where BOTH hold: the reference patch is almost entirely high-frequency (most of its local detail vanishes under a blur, above Variance Loss) AND the per-tile motion is locally irregular (the same r_Mt test that drives the motion prior). Targets the blocky ghosts repetitive fine texture causes — roof tiles, fences, fabric weave, resolution charts — where block matching locks onto the wrong period, while leaving cleanly-tracked detail (hair, fur) and smooth noisy areas untouched. The reference frame stays the fallback. Off by default; it changes which pixels merge.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.hf_artifact_removal_enabled {
-                        ispRow("HF loss T_L", $cam.tuningParams.hf_variance_loss_threshold, 0.1...0.95, "%.2f")
-                        Text("Reject above this variance-loss. Lower = rejects more. Reference points: flat wall ~0.04, face ~0.19, brick ~0.83, checkerboard ~0.92.")
+                        ispRow("Variance Loss", $cam.tuningParams.hf_variance_loss_threshold, 0.50...0.99, "%.2f")
+                        Text("Reject above this variance-loss (how much local detail a blur destroys). Lower = rejects more. Reference points: flat wall ~0.04, face ~0.19, brick ~0.83, checkerboard ~0.92.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
                 }
