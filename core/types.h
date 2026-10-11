@@ -1026,8 +1026,16 @@ struct Config {
     // can be compared rather than assumed, and so 1.4's blocky-R behaviour is
     // still reachable.
     // 460-parity: 460 fetches R with nearest (per-tile, blocky) sampling in the
-    // merge gather. false reproduces that; true was the port's smoother variant.
-    bool merge_robustness_bilinear = false;
+    // merge gather. false reproduces that; true is the port's smoother variant.
+    //
+    // DEFAULT true: the robustness mask is now a full-resolution Dodgson-upscaled
+    // map (Algorithm 6), so reading it with bilinear interpolation at the output
+    // pixel's sub-pixel reference position is the matching sampling -- nearest
+    // would snap to the nearest raw pixel and throw away the sub-pixel part the
+    // upscale paid for, quantising the rejection boundary to raw-pixel (~1 SR px)
+    // granularity. This only affects the mask WEIGHT (it does not move the image
+    // or the flow), so it is independent of the Dodgson warp that builds R.
+    bool merge_robustness_bilinear = true;
 
     // Build the robustness guide from compute_grey_fft instead of the
     // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
