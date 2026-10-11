@@ -1159,6 +1159,9 @@ struct CameraView: View {
                         Text("Resolution of the sub-pixel rigid refine. Higher = tighter global fit (esp. low light), slower. Balanced is the shipped speed.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
+                    Toggle("Gyro Pre-Alignment (IMU)", isOn: $cam.tuningParams.gyro_prealign_enabled)
+                    Text("Uses the gyroscope to measure the camera's rotation between frames and seed the global pre-align directly, instead of estimating it from the image. Scene-independent, so it works where image estimation struggles — textureless walls, a moving subject, or motion blur — and handles large/fast rotation. The rigid refine still validates against the image. First pass: live (shutter) bursts only; needs on-device calibration.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("Forward-Backward Consistency")) {

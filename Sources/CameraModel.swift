@@ -5,6 +5,7 @@ import SwiftUI
 import Combine
 import ImageIO
 import AudioToolbox
+import CoreMotion
 
 /// Final save format after SR (DNG always produced; JPG is a tone-mapped export).
 enum ExportFormat: String, CaseIterable, Identifiable, Codable {
@@ -217,6 +218,12 @@ struct TuningParams: Equatable, Codable {
     /// occlusion, repeated-pattern lock) replace the tile's flow with the median of
     /// its consistent neighbours. Improves the optical flow itself, not a merge
     /// weight. ~2x alignment cost. Off by default.
+    /// Gyro-seeded global pre-alignment (IMU sensor fusion). When on, the app
+    /// integrates the gyroscope between frame timestamps and feeds a per-frame
+    /// rigid seed to the global pre-align, in place of the image FFT angle scan.
+    /// Scene-independent, so it works where image estimation fails. Off by default;
+    /// requires the capture-side gyro (CMMotionManager) to produce a seed.
+    var gyro_prealign_enabled: Bool = false
     var flow_fb_consistency_enabled: Bool = false
     /// FB gate e_FB^2 > alpha*(|F|^2+|B|^2) + beta (beta in grey-px^2). Lower = stricter
     /// (flags more). Defaults keep sub-pixel offsets safe, flag ~>1.5px contradictions.
@@ -372,6 +379,7 @@ struct TuningParams: Equatable, Codable {
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
         case robustness_per_channel
+        case gyro_prealign_enabled
         case flow_fb_consistency_enabled, flow_fb_alpha, flow_fb_beta
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
@@ -472,6 +480,7 @@ struct TuningParams: Equatable, Codable {
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
+        gyro_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .gyro_prealign_enabled) ?? gyro_prealign_enabled
         flow_fb_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_fb_consistency_enabled) ?? flow_fb_consistency_enabled
         flow_fb_alpha = try c.decodeIfPresent(Float.self, forKey: .flow_fb_alpha) ?? flow_fb_alpha
         flow_fb_beta = try c.decodeIfPresent(Float.self, forKey: .flow_fb_beta) ?? flow_fb_beta
@@ -822,6 +831,12 @@ final class CameraModel: NSObject, ObservableObject {
     private var lastBackSelection: CameraSelection = .wide
 
     private var activeFrameCount = CameraModel.persistedFrameCount()
+    /// Gyro-seeded pre-alignment (IMU). Runs while the session is live, buffering
+    /// device attitude; frame capture times are recorded per burst frame in the
+    /// delegate; processBurst turns them into the per-frame rigid seed. Gated by
+    /// tuningParams.gyro_prealign_enabled. See GyroTracker (bottom of this file).
+    private let gyroTracker = GyroTracker()
+    private var frameCaptureTimes: [Double] = []
     /// Session-queue copy of cropZoom, so capture never reads published state
     /// from the wrong thread.
     private var activeCropZoom: CGFloat = 1
@@ -1502,6 +1517,7 @@ final class CameraModel: NSObject, ObservableObject {
     private func startPreviewIfNeeded() {
         guard isAppActive, !previewSuspended, !session.isRunning else { return }
         session.startRunning()
+        gyroTracker.start()   // buffer device attitude while the session is live (cheap)
         DispatchQueue.main.async {
             self.isSessionRunning = self.session.isRunning
             self.startAutoExposureSyncIfNeeded()
@@ -1871,6 +1887,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.readyBurstDir = nil
             self.capturedRawFrames.removeAll(keepingCapacity: true)
             self.capturedDNGs.removeAll(keepingCapacity: true)
+            self.frameCaptureTimes.removeAll(keepingCapacity: true)
             self.burstInputMode = .undecided
             self.currentBurstTotal = self.activeFrameCount
             self.capturesRequested = 0
@@ -1893,6 +1910,7 @@ final class CameraModel: NSObject, ObservableObject {
             self.capturesProcessed = self.currentBurstTotal
             self.capturedRawFrames.removeAll(keepingCapacity: true)
             self.capturedDNGs.removeAll(keepingCapacity: true)
+            self.frameCaptureTimes.removeAll(keepingCapacity: true)
             self.burstInputMode = .undecided
             self.captureKind = .none
             self.removeBurstDir(dir)
@@ -2261,6 +2279,7 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
+            "gyro_prealign_enabled": NSNumber(value: tuningParams.gyro_prealign_enabled),
             "flow_fb_consistency_enabled": NSNumber(value: tuningParams.flow_fb_consistency_enabled),
             "flow_fb_alpha": NSNumber(value: tuningParams.flow_fb_alpha),
             "flow_fb_beta": NSNumber(value: tuningParams.flow_fb_beta),
@@ -2301,6 +2320,29 @@ final class CameraModel: NSObject, ObservableObject {
                 if stage.hasPrefix("Error") { self?.lastPipelineError = stage }
             }
         }
+        // Gyro-seeded pre-alignment: turn the buffered device attitude + per-frame
+        // capture times into the per-frame rigid seed and hand it to the bridge for
+        // the next process call. Only when the toggle is on AND we recorded a time
+        // for every frame of THIS burst (so ZSL/imported bursts, which have no live
+        // gyro window, fall back to the image estimate). refIndex 0 assumes the
+        // core uses the first frame as the reference -- needs on-device check.
+        let gyroFrameCount = (!usingDocDNGs && rawFrames.count >= 2) ? rawFrames.count : paths.count
+        if tuningParams.gyro_prealign_enabled, frameCaptureTimes.count == gyroFrameCount {
+            var focalPx = 0.0
+            if let d = device {
+                let dims = CMVideoFormatDescriptionGetDimensions(d.activeFormat.formatDescription)
+                let longSide = Double(max(dims.width, dims.height))
+                let fov = Double(d.activeFormat.videoFieldOfView) * .pi / 180.0
+                if fov > 0 { focalPx = (longSide * 0.5) / tan(fov * 0.5) }
+            }
+            let seed = (focalPx > 0)
+                ? gyroTracker.seed(frameTimes: frameCaptureTimes, refIndex: 0, focalPx: focalPx)
+                : []
+            SRBridge.setGyroSeed(seed)
+        } else {
+            SRBridge.setGyroSeed([])   // clear any stale seed from a prior burst
+        }
+
         let ok: Bool
         if !usingDocDNGs && rawFrames.count >= 2 {
             ok = SRBridge.processRawFrames(
@@ -2643,6 +2685,14 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
             if !storedFrame { return }
         }
 
+        // Record this frame's capture time (gyro pre-align). photo.timestamp is a
+        // CMTime in the capture session clock; CMTimeGetSeconds is comparable to
+        // CMDeviceMotion.timestamp (both host/boot seconds) -- an assumption that
+        // needs on-device verification. One entry per stored frame, capture order.
+        if tuningParams.gyro_prealign_enabled {
+            frameCaptureTimes.append(CMTimeGetSeconds(photo.timestamp))
+        }
+
         capturesProcessed += 1
         DispatchQueue.main.async {
             self.progress = Float(self.capturesProcessed) / Float(self.currentBurstTotal) * 0.15
@@ -2730,5 +2780,97 @@ extension CameraModel: AVCapturePhotoCaptureDelegate {
                 self.pumpZSL()
             }
         }
+    }
+}
+
+// MARK: - Gyro-seeded pre-alignment (IMU sensor fusion)
+//
+// Buffers device attitude (CMDeviceMotion) while the capture session is live and,
+// per burst, turns it into the per-frame image-plane rigid seed Config::gyro_seed
+// consumes. FIRST PASS: the three constants below (axis->image signs) plus the
+// focal-length derivation and the motion/photo timestamp relationship all need
+// ON-DEVICE CALIBRATION -- flip a sign if a lens/orientation pushes frames the
+// wrong way. Gated by tuningParams.gyro_prealign_enabled, so it is inert unless
+// explicitly enabled, and it only ever SEEDS the pre-align (the rigid LK refine
+// still validates against the image), so a miscalibration degrades gracefully.
+final class GyroTracker {
+    private let motion = CMMotionManager()
+    private var samples: [(t: Double, q: CMQuaternion)] = []
+    private let lock = NSLock()
+    private let maxSamples = 2000   // ~10s at 200Hz; bounded ring
+
+    // CALIBRATION CONSTANTS (verify on device):
+    private let signRot: Double = 1.0   // roll (optical axis) -> image rotation
+    private let signDx:  Double = 1.0   // yaw  -> horizontal image shift
+    private let signDy:  Double = 1.0   // pitch -> vertical image shift
+
+    func start() {
+        guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
+        lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+        motion.deviceMotionUpdateInterval = 1.0 / 200.0
+        let q = OperationQueue()
+        q.qualityOfService = .userInitiated
+        motion.startDeviceMotionUpdates(to: q) { [weak self] dm, _ in
+            guard let self = self, let dm = dm else { return }
+            let att = dm.attitude.quaternion
+            self.lock.lock()
+            self.samples.append((dm.timestamp, att))
+            if self.samples.count > self.maxSamples {
+                self.samples.removeFirst(self.samples.count - self.maxSamples)
+            }
+            self.lock.unlock()
+        }
+    }
+
+    func stop() { motion.stopDeviceMotionUpdates() }
+
+    private func attitude(at t: Double) -> CMQuaternion? {
+        lock.lock(); defer { lock.unlock() }
+        guard !samples.isEmpty else { return nil }
+        var best = samples[0]; var bestd = abs(samples[0].t - t)
+        for s in samples {
+            let d = abs(s.t - t)
+            if d < bestd { bestd = d; best = s }
+        }
+        return bestd <= 0.05 ? best.q : nil   // require a sample within 50ms
+    }
+
+    /// Per-frame {dx, dy, rot, valid} in reference-grey pixels/radians. Empty if
+    /// attitudes are missing (core then falls back to the image FFT scan).
+    func seed(frameTimes: [Double], refIndex: Int, focalPx: Double) -> [NSNumber] {
+        guard refIndex >= 0, refIndex < frameTimes.count,
+              let qRef = attitude(at: frameTimes[refIndex]) else { return [] }
+        var out: [NSNumber] = []
+        out.reserveCapacity(frameTimes.count * 4)
+        for (i, t) in frameTimes.enumerated() {
+            if i == refIndex {
+                out.append(contentsOf: [0, 0, 0, 0].map { NSNumber(value: Double($0)) })
+                continue
+            }
+            guard let q = attitude(at: t) else {
+                out.append(contentsOf: [0, 0, 0, 0].map { NSNumber(value: 0.0) })
+                continue
+            }
+            let (roll, pitch, yaw) = Self.relativeRPY(from: qRef, to: q)
+            out.append(NSNumber(value: signDx * focalPx * yaw))   // dx
+            out.append(NSNumber(value: signDy * focalPx * pitch)) // dy
+            out.append(NSNumber(value: signRot * roll))           // rot (rad)
+            out.append(NSNumber(value: 1.0))                      // valid
+        }
+        return out
+    }
+
+    /// Relative roll/pitch/yaw (rad, small-angle) from attitude a to attitude b.
+    private static func relativeRPY(from a: CMQuaternion, to b: CMQuaternion)
+        -> (roll: Double, pitch: Double, yaw: Double) {
+        // q_rel = b * conj(a)
+        let ax = -a.x, ay = -a.y, az = -a.z, aw = a.w
+        let rw = b.w*aw - b.x*ax - b.y*ay - b.z*az
+        let rx = b.w*ax + b.x*aw + b.y*az - b.z*ay
+        let ry = b.w*ay - b.x*az + b.y*aw + b.z*ax
+        let rz = b.w*az + b.x*ay - b.y*ax + b.z*aw
+        // For a near-identity unit quaternion, axis*angle ~= 2*(rx,ry,rz).
+        let s = (rw >= 0 ? 2.0 : -2.0)
+        return (roll: s * rz, pitch: s * rx, yaw: s * ry)
     }
 }

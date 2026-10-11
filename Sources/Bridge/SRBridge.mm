@@ -437,7 +437,18 @@ static inline void render_python14_pixel(float r, float g, float b,
     sb = to_srgb_gamma(clampf(sb, 0.f, 1.f));
 }
 
+// Pending gyro rigid seed (4 floats/frame: dx,dy,rot,valid), set by +setGyroSeed:
+// and consumed by the next ApplyTuningParams. Static because the seed is runtime
+// capture data, not a tuning scalar, and the process entry points are one-shot.
+static std::vector<float> g_pending_gyro_seed;
+
 static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Config& cfg) {
+    // Gyro seed is applied even when `tuning` is nil, then cleared (one-shot).
+    if (tuning && tuning[@"gyro_prealign_enabled"])
+        cfg.gyro_prealign_enabled = tuning[@"gyro_prealign_enabled"].boolValue;
+    if (cfg.gyro_prealign_enabled && !g_pending_gyro_seed.empty())
+        cfg.gyro_seed = g_pending_gyro_seed;
+    g_pending_gyro_seed.clear();  // consume: one seed per process call
     if (!tuning) return;
     if (tuning[@"r_t"]) cfg.r_t = tuning[@"r_t"].floatValue;
     if (tuning[@"r_s1"]) cfg.r_s1 = tuning[@"r_s1"].floatValue;
@@ -991,6 +1002,13 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 }
 
 @implementation SRBridge
+
++ (void)setGyroSeed:(NSArray<NSNumber *> *)seed {
+    g_pending_gyro_seed.clear();
+    if (seed.count == 0) return;
+    g_pending_gyro_seed.reserve(seed.count);
+    for (NSNumber *n in seed) g_pending_gyro_seed.push_back(n.floatValue);
+}
 
 + (BOOL)processDNGs:(NSArray<NSString *> *)paths
              toPath:(NSString *)outPath

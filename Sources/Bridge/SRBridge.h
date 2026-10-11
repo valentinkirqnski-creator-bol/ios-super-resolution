@@ -62,6 +62,14 @@ NS_ASSUME_NONNULL_BEGIN
 + (UIImage *)embedJPEGPreviewInDNG:(NSString *)dngPath
                            maxSide:(NSInteger)maxSide;
 
+// Gyro-seeded global pre-alignment (IMU sensor fusion). Set the per-frame
+// image-plane rigid seed before the next processDNGs/processRawFrames call; it is
+// consumed by that call and then cleared. The array is 4 floats per burst frame
+// -- {dx, dy, rot_radians, valid(0|1)} -- indexed by the absolute frame index, in
+// reference-grey pixels. Pass nil or an empty array to clear. Only used when
+// tuningParams["gyro_prealign_enabled"] is true; see Config::gyro_seed.
++ (void)setGyroSeed:(nullable NSArray<NSNumber *> *)seed;
+
 @end
 
 NS_ASSUME_NONNULL_END
