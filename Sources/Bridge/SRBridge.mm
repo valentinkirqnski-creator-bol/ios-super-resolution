@@ -570,6 +570,14 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
     if (tuning[@"hf_variance_loss_threshold"])
         cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
+    if (tuning[@"flow_consensus_enabled"])
+        cfg.flow_consensus_enabled = tuning[@"flow_consensus_enabled"].boolValue;
+    if (tuning[@"flow_consensus_reject_px"])
+        cfg.flow_consensus_reject_px = tuning[@"flow_consensus_reject_px"].floatValue;
+    if (tuning[@"flow_consensus_search_radius"])
+        cfg.flow_consensus_search_radius = tuning[@"flow_consensus_search_radius"].intValue;
+    if (tuning[@"flow_consensus_robust_c"])
+        cfg.flow_consensus_robust_c = tuning[@"flow_consensus_robust_c"].floatValue;
     if (tuning[@"flow_fb_consistency_enabled"])
         cfg.flow_fb_consistency_enabled = tuning[@"flow_fb_consistency_enabled"].boolValue;
     if (tuning[@"flow_fb_alpha"])

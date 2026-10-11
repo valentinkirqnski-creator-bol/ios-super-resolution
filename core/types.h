@@ -1248,6 +1248,33 @@ struct Config {
     // with no consistent neighbour in range keeps its forward flow.
     int   flow_fb_fill_radius = 2;
 
+    // Multi-frame trajectory consensus for the per-tile flow (Cheng et al.,
+    // doi:10.1038/nmeth.2472 -- cryo-EM patch-trajectory motion correction,
+    // adapted). The reference aligner measures each frame's shift to the
+    // reference independently; this additionally measures the ADJACENT-frame
+    // ("chain") shifts and solves, per tile, a robust over-determined system
+    // for the trajectory ref->f. The redundancy -- direct ref->f vs chained
+    // ref->(f-1)->f -- lets a single block-match BLUNDER (a repeated-pattern
+    // mis-lock, an occlusion) be out-voted and corrected, while genuine
+    // parallax stays (it is consistent across the direct and chained paths, so
+    // the solve keeps it). A detected blunder tile falls back to the consensus;
+    // clean tiles keep the refined sub-pixel flow untouched (the SR signal).
+    // See core/flow_consensus.*. A pre-pass over the burst builds the coarse
+    // measurements before the main align/merge loop -- extra decode + block
+    // match, but bounded extra RAM (a rolling pair of greys + the tiny flow
+    // fields). OFF by default; it changes the displacement field.
+    bool  flow_consensus_enabled = false;
+    // A tile's refined flow is replaced by the consensus only when the two
+    // disagree by more than this (grey px, Euclidean) -- i.e. a blunder, not a
+    // sub-pixel refinement. Lower corrects more aggressively.
+    float flow_consensus_reject_px = 3.0f;
+    // Coarse block-match search radius (grey px) for the pre-pass measurements,
+    // around the per-frame thumbnail pre-align seed.
+    int   flow_consensus_search_radius = 6;
+    // Cauchy robust scale (grey px) in the trajectory IRLS: residuals past ~this
+    // are treated as outliers. Larger = more forgiving.
+    float flow_consensus_robust_c = 1.5f;
+
     // Test switch from the aperture experiments: force merge robustness to zero
     // only when a tile is one-dimensional and its aligned guide residual is
     // high. This does not repair flow; it rejects unsafe 1D tiles.

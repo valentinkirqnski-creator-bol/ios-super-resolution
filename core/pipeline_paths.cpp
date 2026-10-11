@@ -12,6 +12,7 @@
 #include "mps_fft.h"
 #include "preset_lut.h"
 #include "global_homography.h"
+#include "flow_consensus.h"
 #include "isa_prealign.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1457,6 +1458,51 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     cached.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
     cached_meta.reserve(use_online ? 0 : (size_t)std::max(0, n - 1));
 
+    // ---- Multi-frame trajectory consensus pre-pass (Config::flow_consensus_*) -
+    // Build the coarse per-tile DIRECT shifts (reference->f) and the adjacent-
+    // frame CHAIN shifts (f->f+1) over the whole burst, then robustly solve each
+    // tile's trajectory. The redundancy -- direct ref->f versus chained
+    // ref->(f-1)->f -- lets a block-match BLUNDER be out-voted and corrected
+    // while parallax, consistent across both paths, is preserved. Consumed as a
+    // correction on each frame's host flow in the loop below, so both the CPU and
+    // the Metal merges pick it up with no kernel change. Costs an extra coarse
+    // decode + match per frame; the extra RAM is a rolling pair of greys plus the
+    // tiny per-frame flow fields. Off by default. See core/flow_consensus.*.
+    TrajectoryConsensus traj;
+    bool traj_ready = false;
+    if (work.flow_consensus_enabled && n >= 3 && ref_grey.h > 0 && ref_grey.w > 0) {
+        report("Trajectory consensus", 0.07f);
+        const int gts = std::max(1, work.grey_tile_size(tile_size));
+        const int rad = std::max(1, work.flow_consensus_search_radius);
+        std::vector<CoarseFlow> direct((size_t)n), chain((size_t)n);
+        Image prev_grey;          // rolling: grey of frame (f-1)
+        bool have_prev = false;
+        for (int f = 0; f < n; ++f) {
+            Image grey_f;
+            if (f == ref_index) {
+                grey_f = ref_grey;   // already built; copied into the rolling slot
+            } else {
+                Image raw_f = loader(f, work, false, ref_h, ref_w);
+                if (raw_f.h > 0 && raw_f.w > 0)
+                    grey_f = compute_grey(raw_f, work.bayer_mode, work.grey_method);
+            }
+            if (grey_f.h <= 0 || grey_f.w <= 0) { have_prev = false; continue; }
+            if (f != ref_index)
+                direct[(size_t)f] = coarse_block_match(ref_grey, grey_f, gts, rad,
+                                                       0.f, 0.f, work.num_threads);
+            if (have_prev)
+                chain[(size_t)(f - 1)] = coarse_block_match(prev_grey, grey_f, gts,
+                                                            rad, 0.f, 0.f,
+                                                            work.num_threads);
+            prev_grey = std::move(grey_f);
+            have_prev = true;
+        }
+        traj = solve_trajectory_consensus(direct, chain, ref_index,
+                                          work.flow_consensus_robust_c,
+                                          /*iters=*/8, work.num_threads);
+        traj_ready = !traj.flow.empty();
+    }
+
     // pref_k / pref_fut are declared above: the first comparison decode is
     // already in flight, launched before the reference analysis began.
     std::future<bool> spill_fut;
@@ -1686,6 +1732,21 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                warped ? 0.f : init.dx * grey_scale_x,
                                warped ? 0.f : init.dy * grey_scale_y,
                                warped ? 0.f : init.angle);
+        // Multi-frame trajectory consensus correction: replace blunder tiles in
+        // this frame's grey-grid flow with the burst-wide consensus before it is
+        // remapped to the raw grid (so the correction, in grey px, is carried
+        // through by flow_to_raw_tile_grid like any other flow). Skipped when the
+        // comp was globally warped -- its flow is a residual in the warped frame,
+        // which the unwarped consensus grid does not match (combining the two is
+        // future work). apply_consensus_correction only touches tiles that are
+        // trusted (redundantly measured) AND disagree beyond the reject threshold,
+        // so a clean sub-pixel offset or an unverifiable tile is left untouched.
+        if (work.flow_consensus_enabled && traj_ready && !warped &&
+            k >= 0 && k < (int)traj.flow.size() && traj.flow[(size_t)k].ny > 0) {
+            apply_consensus_correction(flow, traj.flow[(size_t)k],
+                                       traj.trusted[(size_t)k],
+                                       work.flow_consensus_reject_px);
+        }
         // Alignment ran on the grey. With the Bayer quad average that is half
         // resolution, so the flow is on a half-res tile grid with half-res
         // displacements, while robustness and merge both index it as

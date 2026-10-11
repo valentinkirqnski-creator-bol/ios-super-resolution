@@ -1178,6 +1178,19 @@ struct CameraView: View {
                     }
                 }
 
+                Section(header: Text("Trajectory Consensus")) {
+                    Toggle("Multi-Frame Consensus", isOn: $cam.tuningParams.flow_consensus_enabled)
+                    Text("""
+                         Cheng et al. (cryo-EM motion correction). As well as each frame's shift to the reference, it measures the shift between adjacent frames, then solves each tile's whole trajectory across the burst robustly. Because the direct shift (reference→frame) and the chained shift (reference→previous→frame) must agree, a single block-match blunder — a repeated-pattern mis-lock or an occlusion — stands out and is corrected to the consensus, while real parallax (consistent along both paths) is kept. Only tiles that are both redundantly measured and in clear disagreement are overridden; clean and unverifiable tiles keep their flow. Costs an extra coarse pass over the burst. Skipped on frames handled by global pre-alignment.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.flow_consensus_enabled {
+                        ispRow("Reject above (grey px)", $cam.tuningParams.flow_consensus_reject_px, 1.0...8.0, "%.1f")
+                        Text("A tile is corrected only when its flow and the consensus differ by more than this. Lower corrects more aggressively; too low can erode the sub-pixel offsets super-resolution feeds on.")
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+
                 Section(header: Text("Robustness")) {
                     Toggle("Per-Channel Mask (ISA)", isOn: $cam.tuningParams.robustness_per_channel)
                     Text("""

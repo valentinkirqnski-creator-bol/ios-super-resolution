@@ -242,6 +242,17 @@ struct TuningParams: Equatable, Codable {
     /// (flags more). Defaults keep sub-pixel offsets safe, flag ~>1.5px contradictions.
     var flow_fb_alpha: Float = 0.05
     var flow_fb_beta: Float = 1.0
+    /// Multi-frame trajectory consensus (Cheng et al., doi:10.1038/nmeth.2472).
+    /// Measures the adjacent-frame ("chain") shifts in addition to each frame's
+    /// direct shift to the reference and robustly solves each tile's trajectory,
+    /// so a block-match blunder (repeated-pattern mis-lock, occlusion) is out-voted
+    /// and corrected while parallax -- consistent across the direct and chained
+    /// paths -- is preserved. Costs an extra coarse pass over the burst. Off by
+    /// default; changes the displacement field.
+    var flow_consensus_enabled: Bool = false
+    /// A tile's refined flow is replaced by the consensus only when the two disagree
+    /// by more than this (grey px) -- a blunder, not a sub-pixel refinement.
+    var flow_consensus_reject_px: Float = 3.0
     /// |∇I|·|E| threshold (intensity units). Must be LOW to reject anything:
     /// ~0.02 rejects ~15%, 0.03 ~10%, 0.06 ~3% (near-inert). Lower = cleaner but
     /// drops more burst samples.
@@ -394,6 +405,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_per_channel
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case gyro_prealign_enabled
+        case flow_consensus_enabled, flow_consensus_reject_px
         case flow_fb_consistency_enabled, flow_fb_alpha, flow_fb_beta
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
@@ -497,6 +509,8 @@ struct TuningParams: Equatable, Codable {
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         gyro_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .gyro_prealign_enabled) ?? gyro_prealign_enabled
+        flow_consensus_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_consensus_enabled) ?? flow_consensus_enabled
+        flow_consensus_reject_px = try c.decodeIfPresent(Float.self, forKey: .flow_consensus_reject_px) ?? flow_consensus_reject_px
         flow_fb_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_fb_consistency_enabled) ?? flow_fb_consistency_enabled
         flow_fb_alpha = try c.decodeIfPresent(Float.self, forKey: .flow_fb_alpha) ?? flow_fb_alpha
         flow_fb_beta = try c.decodeIfPresent(Float.self, forKey: .flow_fb_beta) ?? flow_fb_beta
@@ -2298,6 +2312,8 @@ final class CameraModel: NSObject, ObservableObject {
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "gyro_prealign_enabled": NSNumber(value: tuningParams.gyro_prealign_enabled),
+            "flow_consensus_enabled": NSNumber(value: tuningParams.flow_consensus_enabled),
+            "flow_consensus_reject_px": NSNumber(value: tuningParams.flow_consensus_reject_px),
             "flow_fb_consistency_enabled": NSNumber(value: tuningParams.flow_fb_consistency_enabled),
             "flow_fb_alpha": NSNumber(value: tuningParams.flow_fb_alpha),
             "flow_fb_beta": NSNumber(value: tuningParams.flow_fb_beta),
