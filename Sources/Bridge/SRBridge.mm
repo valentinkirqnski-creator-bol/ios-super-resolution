@@ -566,10 +566,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"robustness_per_channel"])
         cfg.robustness_per_channel = tuning[@"robustness_per_channel"].boolValue;
-    if (tuning[@"hf_reject_enabled"])
-        cfg.hf_reject_enabled = tuning[@"hf_reject_enabled"].boolValue;
-    if (tuning[@"hf_reject_tl"]) cfg.hf_reject_tl = tuning[@"hf_reject_tl"].floatValue;
-    if (tuning[@"hf_reject_td"]) cfg.hf_reject_td = tuning[@"hf_reject_td"].floatValue;
+    if (tuning[@"hf_artifact_removal_enabled"])
+        cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
+    if (tuning[@"hf_variance_loss_threshold"])
+        cfg.hf_variance_loss_threshold = tuning[@"hf_variance_loss_threshold"].floatValue;
     if (tuning[@"flow_fb_consistency_enabled"])
         cfg.flow_fb_consistency_enabled = tuning[@"flow_fb_consistency_enabled"].boolValue;
     if (tuning[@"flow_fb_alpha"])

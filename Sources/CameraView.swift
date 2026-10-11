@@ -1187,15 +1187,14 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
-                    Toggle("Reject HF Misalignment", isOn: $cam.tuningParams.hf_reject_enabled)
+                    Toggle("Reject HF Artifacts", isOn: $cam.tuningParams.hf_artifact_removal_enabled)
                     Text("""
-                         Wronski S.3. Drops a frame's contribution only where BOTH hold: the area is dominated by repetitive high-frequency texture (most of its local detail disappears under a blur) AND the per-tile motion is locally inconsistent. Targets the blocky artifacts fine repetitive patterns cause — roof tiles, fences, fabric weave, resolution charts — while leaving cleanly-tracked detail (hair, foliage) and smooth areas untouched. The reference frame stays the fallback. Trade-off: some correctly-aligned fine detail is also dropped.
+                         Wronski et al. Drops a frame's contribution only where BOTH hold: the reference patch is almost entirely high-frequency (most of its local detail vanishes under a blur, above T_L) AND the per-tile motion is locally irregular (the same r_Mt test that drives the motion prior). Targets the blocky ghosts repetitive fine texture causes — roof tiles, fences, fabric weave, resolution charts — where block matching locks onto the wrong period, while leaving cleanly-tracked detail (hair, fur) and smooth noisy areas untouched. The reference frame stays the fallback. Off by default; it changes which pixels merge.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.hf_reject_enabled {
-                        ispRow("HF loss T_L", $cam.tuningParams.hf_reject_tl, 0.1...0.95, "%.2f")
-                        ispRow("Flow spread T_D (px)", $cam.tuningParams.hf_reject_td, 0.3...6.0, "%.2f")
-                        Text("Reject where variance-loss > T_L and tile-flow spread > T_D. Lower = rejects more. Reference points: smooth wall ~0.04, brick ~0.83, checkerboard ~0.92.")
+                    if cam.tuningParams.hf_artifact_removal_enabled {
+                        ispRow("HF loss T_L", $cam.tuningParams.hf_variance_loss_threshold, 0.1...0.95, "%.2f")
+                        Text("Reject above this variance-loss. Lower = rejects more. Reference points: flat wall ~0.04, face ~0.19, brick ~0.83, checkerboard ~0.92.")
                             .font(.footnote).foregroundColor(.secondary)
                     }
                 }

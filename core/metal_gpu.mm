@@ -2052,7 +2052,7 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     // a silent no-op. This block previously sat after the commit, which crashed
     // as soon as high-frequency rejection was switched on.
     id<MTLBuffer> b_ref_hf_loss = nil;
-    if (false &&
+    if (cfg.hf_artifact_removal_enabled &&
         !rob_run_hf_loss(b_guide, b_means, b_vars, b_ref_hf_loss, gh, gw, nch, cfg, cmd))
         return RefStats();
 
@@ -2177,10 +2177,14 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     auto& c = ctx();
 
     std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
-    // Bound to the kernel but no longer populated (its only consumer, the
-    // motion-edge guard, was removed; the hf branch still reads it as zeros).
-    motion_irregular.assign(S.size(), 0u);
+    // HF-artifact rejection reads the per-tile irregular-motion flags (r_Mt
+    // test). Populate them only when the feature is on; otherwise the kernel's
+    // hf branch is disabled and the buffer stays an inert zero field.
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                       cfg.hf_artifact_removal_enabled ? &motion_irregular
+                                                                       : nullptr);
+    if (!cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -2272,7 +2276,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // init_robustness alongside the guide-grid ref stats; the kernel reads
     // it at gid/2. Inert dummy when hf rejection is off.
     id<MTLBuffer> b_ref_hf = b_motion;
-    if (false) {
+    if (cfg.hf_artifact_removal_enabled) {
         const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
         if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
         b_ref_hf = g_rob_ref_hf;
@@ -2296,8 +2300,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.chain_reject_enabled = 0u;
     mp.r_s_chain = 0.f;
     mp.motion_magnitude_veto_enabled = 0u;
-    mp.hf_enabled = false ? 1u : 0u;
-    mp.hf_variance_loss_threshold = 0.f;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
     mp.hf_h = (uint32_t)gh;
     mp.hf_w = (uint32_t)gw;
     // alpha/beta stay for the noise model (debug-gated accessors).
@@ -2380,10 +2384,14 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     }
 
     std::vector<uint32_t> motion_irregular;
-    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2, nullptr);
-    // Bound to the kernel but no longer populated (its only consumer, the
-    // motion-edge guard, was removed; the hf branch still reads it as zeros).
-    motion_irregular.assign(S.size(), 0u);
+    // HF-artifact rejection reads the per-tile irregular-motion flags (r_Mt
+    // test). Populate them only when the feature is on; otherwise the kernel's
+    // hf branch is disabled and the buffer stays an inert zero field.
+    std::vector<f32> S = rob_compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                       cfg.hf_artifact_removal_enabled ? &motion_irregular
+                                                                       : nullptr);
+    if (!cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -2483,7 +2491,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     const size_t hf_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_ref_hf = b_ref_v;
-    if (false) {
+    if (cfg.hf_artifact_removal_enabled) {
         if (!g_rob_ref_hf || g_rob_ref_hf_bytes != hf_b) return Image();
         b_ref_hf = g_rob_ref_hf;
     }
@@ -2526,8 +2534,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.curve_n = (uint32_t)g_rob_curve_n;
     mp.bayer = cfg.bayer_mode ? 1u : 0u;
     mp.r_t = cfg.r_t;
-    mp.hf_enabled = false ? 1u : 0u;
-    mp.hf_variance_loss_threshold = 0.f;
+    mp.hf_enabled = cfg.hf_artifact_removal_enabled ? 1u : 0u;
+    mp.hf_variance_loss_threshold = cfg.hf_variance_loss_threshold;
     mp.alpha = cfg.noise_alpha();
     mp.beta = cfg.noise_beta();
     mp.flow_reject_1d_residual_threshold = 0.f;

@@ -12,7 +12,6 @@
 #include "mps_fft.h"
 #include "preset_lut.h"
 #include "global_homography.h"
-#include "hf_reject.h"
 #include "isa_prealign.h"
 #if defined(__APPLE__)
 #include "metal_gpu.h"
@@ -1781,22 +1780,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   rob_s_select_ptr,
                                                   frames_resident ? k : -1);
             covs = cov_fut.get();
-        }
-        // High-frequency misalignment rejection (core/hf_reject, Wronski S.3):
-        // zero this comparison frame's R where the guide is dominated by
-        // high-frequency texture AND the per-tile flow is locally inconsistent.
-        // Off by default (work.hf_reject_enabled). Applied host-side to the finished
-        // mask -- the 5x5 min already ran inside compute_robustness, so the
-        // rejection is post-min (zeroed, not further dilated), a minor deviation
-        // from the paper's reject-then-min order that is fine because the mask is
-        // per-tile granular. `rob` is the host Image the non-resident merge
-        // consumes, so no GPU round-trip is needed. The guide is the same half-res
-        // guide robustness used; flow is the raw-grid field, so D is in raw px.
-        if (work.hf_reject_enabled && rob.h > 0 && rob.w > 0 &&
-            flow.ny > 0 && flow.nx > 0) {
-            const Image hf_guide = compute_guide(comp, work);
-            const int gts = std::max(1, hf_guide.w / flow.nx);
-            hf_reject_apply(rob, hf_guide, flow, gts, work);
         }
         // Folded in here rather than beside absorb_robustness_sum, because that
         // call is made in only two of the three stash branches -- the cached

@@ -885,21 +885,6 @@ struct Config {
     // the channels via the L2 norm. CPU path honours it; the Metal (device)
     // robustness/merge path does not yet (see rob_make_mask / the merge kernel).
     bool  robustness_per_channel = false;
-
-    // High-frequency misalignment rejection (core/hf_reject.*), a fresh,
-    // self-contained implementation of Wronski S.3. After R is computed, a region
-    // is forced to R=0 only where BOTH: (A) most local guide variance is destroyed
-    // by a 3x3 low-pass (repetitive fine texture), L > hf_reject_tl; and (B) the
-    // per-tile displacement varies sharply across the tile neighbourhood,
-    // D > hf_reject_td (grey px). Applied to the comparison frame before the 5x5
-    // min; the reference stays the fallback. Off by default -- it changes which
-    // pixels merge; thresholds are starting points, tune per the S.3 trade-off.
-    bool  hf_reject_enabled = false;
-    f32   hf_reject_tl = 0.6f;       // variance-loss threshold (brick~0.83, checker~0.92)
-    f32   hf_reject_td = 1.5f;       // tile-neighbour displacement spread, grey px
-    f32   hf_reject_min_var = 1.0e-4f; // min local guide variance to consider (skip flats)
-    int   hf_reject_win = 5;         // local-variance window (guide px)
-
     // Debug: split the accumulated mask by which motion prior each pixel used,
     // writing _robustness_s1.pgm and _robustness_s2.pgm alongside the combined
     // one. s1 is the strict prior, applied where the flow field varies sharply
@@ -1344,10 +1329,12 @@ struct Config {
     // high-frequency signal, so condition 1 spares it.
     //
     // Off by default: it changes which pixels merge, so enable it deliberately.
+    bool  hf_artifact_removal_enabled = false;
     // loss = 1 - variance_lowpass / variance_original, both noise-corrected.
     // Above this the patch counts as high-frequency. Reference points measured
     // on typical content: flat wall ~0.04, face ~0.19, brick ~0.83,
     // checkerboard ~0.92.
+    float hf_variance_loss_threshold = 0.75f;
     // The patch is skipped unless its signal variance exceeds this multiple of
     // the estimated sensor noise variance. This is what stops ISO 6400 noise
     // reading as high-frequency detail, and it scales with brightness through

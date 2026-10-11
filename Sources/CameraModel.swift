@@ -213,6 +213,19 @@ struct TuningParams: Equatable, Codable {
     /// mask summed across channels. Only has effect with the Bayer (3-channel) guide;
     /// a no-op on the grey guide. Default false = 460-main's single cross-channel mask.
     var robustness_per_channel: Bool = false
+    /// High-frequency artifact rejection (Wronski et al.): force R=0 where the
+    /// reference patch is almost entirely high-frequency (a low-pass destroys most
+    /// of its local variance, loss > hf_variance_loss_threshold) AND the local flow
+    /// field is irregular (the r_Mt motion-prior test). Block matching cannot
+    /// resolve repetitive fine texture (the aperture problem), so it locks onto the
+    /// wrong period and produces blocky ghosts; both conditions together catch that
+    /// while sparing cleanly-tracked detail (hair, fur) and noisy flats. Off by
+    /// default — it changes which pixels merge.
+    var hf_artifact_removal_enabled: Bool = false
+    /// loss = 1 - variance_lowpass / variance_original, both noise-corrected; above
+    /// this a patch counts as high-frequency. Reference points: flat wall ~0.04,
+    /// face ~0.19, brick ~0.83, checkerboard ~0.92.
+    var hf_variance_loss_threshold: Float = 0.75
     /// Forward-backward consistency check in alignment: align comp->ref as well as
     /// ref->comp, and where the round-trip disagrees (a blunder: bad block match,
     /// occlusion, repeated-pattern lock) replace the tile's flow with the median of
@@ -224,13 +237,6 @@ struct TuningParams: Equatable, Codable {
     /// Scene-independent, so it works where image estimation fails. Off by default;
     /// requires the capture-side gyro (CMMotionManager) to produce a seed.
     var gyro_prealign_enabled: Bool = false
-    /// High-frequency misalignment rejection (Wronski S.3): zero a source frame's
-    /// robustness where the guide is dominated by repetitive high-frequency texture
-    /// AND the per-tile flow is locally unstable. Targets blocky artifacts on fine
-    /// repetitive patterns (roofs, fences, charts). Off by default.
-    var hf_reject_enabled: Bool = false
-    var hf_reject_tl: Float = 0.6   // variance-loss threshold (checker~0.9, wall~0.04)
-    var hf_reject_td: Float = 1.5   // per-tile flow spread threshold (raw px)
     var flow_fb_consistency_enabled: Bool = false
     /// FB gate e_FB^2 > alpha*(|F|^2+|B|^2) + beta (beta in grey-px^2). Lower = stricter
     /// (flags more). Defaults keep sub-pixel offsets safe, flag ~>1.5px contradictions.
@@ -386,8 +392,8 @@ struct TuningParams: Equatable, Codable {
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
         case robustness_per_channel
+        case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case gyro_prealign_enabled
-        case hf_reject_enabled, hf_reject_tl, hf_reject_td
         case flow_fb_consistency_enabled, flow_fb_alpha, flow_fb_beta
         case motion_geom_reject_enabled, motion_geom_reject_threshold
         case motion_geom_relative, motion_geom_noise_floor_mult, motion_geom_reject_threshold_relative
@@ -488,10 +494,9 @@ struct TuningParams: Equatable, Codable {
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
+        hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
+        hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         gyro_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .gyro_prealign_enabled) ?? gyro_prealign_enabled
-        hf_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_reject_enabled) ?? hf_reject_enabled
-        hf_reject_tl = try c.decodeIfPresent(Float.self, forKey: .hf_reject_tl) ?? hf_reject_tl
-        hf_reject_td = try c.decodeIfPresent(Float.self, forKey: .hf_reject_td) ?? hf_reject_td
         flow_fb_consistency_enabled = try c.decodeIfPresent(Bool.self, forKey: .flow_fb_consistency_enabled) ?? flow_fb_consistency_enabled
         flow_fb_alpha = try c.decodeIfPresent(Float.self, forKey: .flow_fb_alpha) ?? flow_fb_alpha
         flow_fb_beta = try c.decodeIfPresent(Float.self, forKey: .flow_fb_beta) ?? flow_fb_beta
@@ -2290,10 +2295,9 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
+            "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
+            "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "gyro_prealign_enabled": NSNumber(value: tuningParams.gyro_prealign_enabled),
-            "hf_reject_enabled": NSNumber(value: tuningParams.hf_reject_enabled),
-            "hf_reject_tl": NSNumber(value: tuningParams.hf_reject_tl),
-            "hf_reject_td": NSNumber(value: tuningParams.hf_reject_td),
             "flow_fb_consistency_enabled": NSNumber(value: tuningParams.flow_fb_consistency_enabled),
             "flow_fb_alpha": NSNumber(value: tuningParams.flow_fb_alpha),
             "flow_fb_beta": NSNumber(value: tuningParams.flow_fb_beta),

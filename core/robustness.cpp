@@ -1365,6 +1365,16 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     // (H/2 x W/2 x RGB for Bayer), not upsampled back to raw resolution.
     st.means = std::move(means);
     st.stds  = std::move(vars);
+    if (cfg.hf_artifact_removal_enabled) {
+        // High-frequency variance-loss map on the reference guide: how much of
+        // each pixel's local variance a 5x5 low-pass destroys, noise-corrected.
+        // Read later (with motion_irregular) to reject repetitive HF texture the
+        // block matcher cannot track. Guide resolution, same grid as st.means.
+        Image lp_guide = local_lowpass_gaussian5x5(guide);
+        Image lp_means, lp_vars;
+        local_stats_3x3(lp_guide, lp_means, lp_vars);
+        st.hf_loss = high_frequency_loss_map_adaptive(st.means, st.stds, lp_vars, cfg);
+    }
     if (cfg.robustness_raw_resolution_active()) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
@@ -1456,7 +1466,15 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         apply_noise_model_fused(ref_means, comp_means, ref_vars, nc_ch, d_sq, sigma_sq,
                                 cfg.num_threads, cfg.robustness_guide_sqrt_active(),
                                 &d_sq_ch, &sigma_sq_ch);
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+    // HF-artifact rejection needs the per-tile irregular-motion flags (the r_Mt
+    // test); request them from compute_s only when the feature is on.
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                   cfg.hf_artifact_removal_enabled ? &motion_irregular
+                                                                   : nullptr);
+    if (!cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
+    const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
 
     // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
     // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
@@ -1486,6 +1504,24 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
+            // HF-artifact rejection: force R=0 where the reference patch is
+            // almost entirely high-frequency (hf_loss above threshold) AND the
+            // local flow field is irregular (same r_Mt test as the motion
+            // prior). Both required -- hair tracks cleanly (irregular=0), a noisy
+            // flat wall has no real HF signal (hf_loss~0). hf_loss is at guide
+            // resolution, so map this raw pixel down to its parent guide pixel.
+            if (cfg.hf_artifact_removal_enabled && have_hf_loss &&
+                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u) {
+                const int gy = std::min(std::max(y / 2, 0),
+                                        std::max(0, ref_stats.hf_loss.h - 1));
+                const int gx = std::min(std::max(x / 2, 0),
+                                        std::max(0, ref_stats.hf_loss.w - 1));
+                if (ref_stats.hf_loss.at(gy, gx) > cfg.hf_variance_loss_threshold) {
+                    for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = 0.f;
+                    if (s_select_out) s_select_out->at(y, x) = 0.f;
+                    continue;
+                }
+            }
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
             // design ("infinite will imply R = 0"), which makes d^2 +inf and the
             // Wiener shrink inf/inf = NaN; a non-finite r_val is forced to 0.
@@ -1894,7 +1930,15 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
                           cfg.robustness_guide_sqrt_active(), &d_sq_ch, &sigma_sq_ch);
-    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2);
+    // HF-artifact rejection needs the per-tile irregular-motion flags (the r_Mt
+    // test); request them from compute_s only when the feature is on.
+    std::vector<uint32_t> motion_irregular;
+    std::vector<f32> S = compute_s(flow, cfg.r_Mt, cfg.r_s1, cfg.r_s2,
+                                   cfg.hf_artifact_removal_enabled ? &motion_irregular
+                                                                   : nullptr);
+    if (!cfg.hf_artifact_removal_enabled)
+        motion_irregular.assign(S.size(), 0u);
+    const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
 
     // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
     // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
@@ -1929,6 +1973,18 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 pidx < flow.match_ambiguous.size() &&
                 flow.match_ambiguous[pidx] != 0u;
             if (match_ambiguous) s = std::min(s, cfg.r_s1);
+            // HF-artifact rejection: force R=0 where the reference patch is
+            // almost entirely high-frequency (hf_loss above threshold) AND the
+            // local flow field is irregular (same r_Mt test as the motion
+            // prior). Both required -- hair tracks cleanly (irregular=0), a noisy
+            // flat wall has no real HF signal (hf_loss~0). Here the mask loop and
+            // hf_loss share the guide grid, so (y,x) indexes it directly.
+            bool hf_reject = false;
+            if (cfg.hf_artifact_removal_enabled && have_hf_loss &&
+                pidx < motion_irregular.size() && motion_irregular[pidx] != 0u &&
+                y < ref_stats.hf_loss.h && x < ref_stats.hf_loss.w) {
+                hf_reject = ref_stats.hf_loss.at(y, x) > cfg.hf_variance_loss_threshold;
+            }
             // Geometry-aware rejection (Config::motion_geom_reject_enabled):
             // reject where the per-tile TRANSLATION is a poor model of the local
             // motion. E = flow-gradient * offset-from-tile-centre (within-tile
@@ -1975,7 +2031,7 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                                   cfg.motion_geom_reject_threshold_relative;
                 }
             }
-            const bool hard_reject = geom_reject;
+            const bool hard_reject = geom_reject || hf_reject;
             if (hard_reject) {
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = 0.f;
             } else if (per_channel) {
