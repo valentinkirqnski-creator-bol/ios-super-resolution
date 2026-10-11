@@ -4936,6 +4936,14 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // looked wrong. Invisible with a guide mask, where 0 is correct anyway.
     p.raw_res_robustness =
         (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
+    // Global pre-align homography: the comp pixels are fetched at comp_pos =
+    // H*(lr+flow). The resident fused path reads H from g_bf.homography; this
+    // non-resident path has the frame's flow in hand, so take it straight from
+    // there. Without this the merge ignored H entirely and a pre-aligned burst
+    // was fetched in the wrong pose -> ghosted/blurred output. Identity when no
+    // global transform was estimated, so pre-align-off is unchanged.
+    p.use_homography = flow.has_global_h ? 1u : 0u;
+    for (int i = 0; i < 9; ++i) p.hmat[i] = flow.global_h[i];
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
