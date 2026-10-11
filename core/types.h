@@ -1028,14 +1028,17 @@ struct Config {
     // 460-parity: 460 fetches R with nearest (per-tile, blocky) sampling in the
     // merge gather. false reproduces that; true is the port's smoother variant.
     //
-    // DEFAULT true: the robustness mask is now a full-resolution Dodgson-upscaled
-    // map (Algorithm 6), so reading it with bilinear interpolation at the output
-    // pixel's sub-pixel reference position is the matching sampling -- nearest
-    // would snap to the nearest raw pixel and throw away the sub-pixel part the
-    // upscale paid for, quantising the rejection boundary to raw-pixel (~1 SR px)
-    // granularity. This only affects the mask WEIGHT (it does not move the image
-    // or the flow), so it is independent of the Dodgson warp that builds R.
-    bool merge_robustness_bilinear = true;
+    // DEFAULT false (nearest). R is a REJECTION mask (0 = drop this comparison
+    // pixel), and Eq. 9's 5x5 local-min deliberately DILATES the R=0 regions to
+    // leave a safety margin around ghosts. Bilinear fetch smooths the 0<->1
+    // boundary, so the outer ring of a rejected region gets a fractional weight
+    // and re-admits the misaligned comparison content the mask was there to
+    // exclude -- a visible ghost/doubling, and it erodes the Eq. 9 margin. The
+    // asymmetry is the point: over-rejecting a clean pixel costs invisible SNR,
+    // under-rejecting a misaligned one is visible. So nearest (hard boundary) is
+    // correct for a rejection mask; this matched 460/IPOL and was measured to add
+    // misalignment when turned on. Build 75 flipped it true by mistake; reverted.
+    bool merge_robustness_bilinear = false;
 
     // Build the robustness guide from compute_grey_fft instead of the
     // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
