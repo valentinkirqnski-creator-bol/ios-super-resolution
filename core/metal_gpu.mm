@@ -3933,6 +3933,11 @@ struct MergeFrameGpu {
     int lr_h = 0, lr_w = 0;
     int rob_h = 0, rob_w = 0;
     int rob_nch = 1;  // ISA per-channel R: 3, else 1
+    // Global pre-align homography captured at upload time. The prefetch path
+    // clears the host flow after caching the frame, so the deferred merge can no
+    // longer read flow.global_h from its argument -- it must come from here.
+    int has_global_h = 0;
+    float hmat[9] = {1,0,0, 0,1,0, 0,0,1};
     int flow_ny = 0, flow_nx = 0;
     int cov_h = 0, cov_w = 0;
     const f32* img = nullptr;
@@ -4138,6 +4143,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.rob_h = rob.h;
             e.rob_w = rob.w;
             e.rob_nch = std::max(1, rob.c);
+            e.has_global_h = flow.has_global_h ? 1 : 0;
+            for (int i = 0; i < 9; ++i) e.hmat[i] = flow.global_h[i];
             e.flow_ny = flow.ny;
             e.flow_nx = flow.nx;
             e.cov_h = covs.h;
@@ -4187,6 +4194,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         e.rob_h = rob.h;
         e.rob_w = rob.w;
         e.rob_nch = std::max(1, rob.c);
+        e.has_global_h = flow.has_global_h ? 1 : 0;
+        for (int i = 0; i < 9; ++i) e.hmat[i] = flow.global_h[i];
         e.flow = fp;
         e.cov = cp;
         e.rob = rp;
@@ -4210,6 +4219,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.rob_h = rob.h;
     e.rob_w = rob.w;
     e.rob_nch = std::max(1, rob.c);
+    e.has_global_h = flow.has_global_h ? 1 : 0;
+    for (int i = 0; i < 9; ++i) e.hmat[i] = flow.global_h[i];
     e.flow_ny = flow.ny;
     e.flow_nx = flow.nx;
     e.cov_h = covs.h;
@@ -4937,13 +4948,20 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     p.raw_res_robustness =
         (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
     // Global pre-align homography: the comp pixels are fetched at comp_pos =
-    // H*(lr+flow). The resident fused path reads H from g_bf.homography; this
-    // non-resident path has the frame's flow in hand, so take it straight from
-    // there. Without this the merge ignored H entirely and a pre-aligned burst
-    // was fetched in the wrong pose -> ghosted/blurred output. Identity when no
-    // global transform was estimated, so pre-align-off is unchanged.
-    p.use_homography = flow.has_global_h ? 1u : 0u;
-    for (int i = 0; i < 9; ++i) p.hmat[i] = flow.global_h[i];
+    // H*(lr+flow). Without it a pre-aligned burst is fetched in the wrong pose ->
+    // ghosted/blurred output. The direct call has the frame's flow in hand, but
+    // the PREFETCH path uploads the frame then clears the host flow, so the
+    // deferred merge arrives with an empty flow arg -- then H has to come from the
+    // cache entry captured at upload (acquire_frame_gpu). Identity when no global
+    // transform was estimated, so pre-align-off is unchanged.
+    bool hg = flow.has_global_h;
+    const float* H = flow.global_h;
+    if (!hg && frame_id >= 0) {
+        for (const MergeFrameGpu& e : g_merge_frames)
+            if (e.key == frame_id) { hg = (e.has_global_h != 0); H = e.hmat; break; }
+    }
+    p.use_homography = hg ? 1u : 0u;
+    for (int i = 0; i < 9; ++i) p.hmat[i] = H[i];
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
