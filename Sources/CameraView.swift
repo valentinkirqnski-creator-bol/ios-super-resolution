@@ -1202,6 +1202,11 @@ struct CameraView: View {
                          The robustness mask's 5×5 minimum (Wronski Eq. 9) is computed on the half-resolution guide and brought back to full resolution. Off (default) = nearest, so every 2×2 pixel block gets one value — the mask has hard, square edges. On = bilinear, which ramps between cells for rounder, smoother mask contours. Trade-off: interpolating a minimum raises the values along a rejected↔kept seam, so it softens the rejection boundary and can let back a sliver of what the mask rejected (ghosts on moving/repetitive edges). Cosmetic unless you're chasing blocky mask artifacts; measure the result.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Disable Noise Model", isOn: $cam.tuningParams.debug_noise_model_disabled)
+                    Text("""
+                         Diagnostic: zeroes the Poisson–Gaussian sensor-noise model as read by the robustness mask ONLY. R is then scored from the raw measured local variance and the raw (un-shrunk) pixel difference, with no noise floor subtracted — so a tile's colour difference is taken at face value instead of being forgiven as "within noise". Isolates whether a mismatch reads small because the noise model excused it or because the content genuinely is that flat. Alignment, kernels and SNR auto-tune are untouched. Leave OFF for normal use.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
