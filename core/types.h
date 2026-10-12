@@ -898,6 +898,24 @@ struct Config {
     // paths (both call local_min_5x5_on_guide after R is built).
     bool  robustness_min_upsample_bilinear = false;
 
+    // Perceptual-space robustness (reworked mask). The sensor is Poisson-Gaussian
+    // (var = alpha*x + beta), and the human eye is near-logarithmic, so a fixed
+    // colour difference in LINEAR space is neither a fixed amount of noise nor a
+    // fixed amount of perceived error -- a misalignment that is glaring in the
+    // shadows produces a tiny linear d and slips under the mask, while a harmless
+    // highlight difference produces a large linear d and is over-rejected. The
+    // square root is the variance-stabilising transform for this sensor model AND
+    // a good perceptual curve, so computing the local std and the colour distance
+    // on g = sqrt(max(x,0)) fixes both at once: one threshold then means one
+    // perceptual / one-sigma error everywhere. When on, the guide is transformed
+    // to sqrt space before the local statistics, and the mask's noise term is the
+    // matching sqrt-space variance (delta method for y=sqrt(x): var(y) =
+    // var(x)/(4x) = (alpha*x+beta)/(4x), x reconstructed as the square of the
+    // sqrt-space local mean). Distinct from the 1.4 robustness_guide_sqrt path,
+    // which indexes the LINEAR noise curve by mean^2 and omits that 1/(4x)
+    // Jacobian. Off by default; changes which pixels merge -- measure.
+    bool  robustness_perceptual_sqrt = false;
+
     // Debug: split the accumulated mask by which motion prior each pixel used,
     // writing _robustness_s1.pgm and _robustness_s2.pgm alongside the combined
     // one. s1 is the strict prior, applied where the flow field varies sharply

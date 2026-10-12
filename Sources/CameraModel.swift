@@ -218,6 +218,12 @@ struct TuningParams: Equatable, Codable {
     /// interpolates the 5x5-min result, which softens the rejection boundary and
     /// can re-admit a sliver of what the min rejected — a visual/quality trade-off.
     var robustness_min_upsample_bilinear: Bool = false
+    /// Perceptual-space robustness: compute the mask's local std and colour distance
+    /// on sqrt(max(x,0)) of the guide — the variance-stabilizing / perceptual
+    /// transform for the Poisson-Gaussian sensor — with a matching sqrt-space noise
+    /// term, so one threshold means one perceptual / one-sigma error at every
+    /// brightness (shadows included). Off by default.
+    var robustness_perceptual_sqrt: Bool = false
     /// High-frequency artifact rejection (Wronski et al.): force R=0 where the
     /// reference patch is almost entirely high-frequency (a low-pass destroys most
     /// of its local variance, loss > hf_variance_loss_threshold) AND the local flow
@@ -409,6 +415,7 @@ struct TuningParams: Equatable, Codable {
         case real_rgb_guide, flow_upsample_candidates
         case robustness_per_channel
         case robustness_min_upsample_bilinear
+        case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case gyro_prealign_enabled
         case flow_consensus_enabled, flow_consensus_reject_px
@@ -513,6 +520,7 @@ struct TuningParams: Equatable, Codable {
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
         robustness_min_upsample_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_min_upsample_bilinear) ?? robustness_min_upsample_bilinear
+        robustness_perceptual_sqrt = try c.decodeIfPresent(Bool.self, forKey: .robustness_perceptual_sqrt) ?? robustness_perceptual_sqrt
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
         gyro_prealign_enabled = try c.decodeIfPresent(Bool.self, forKey: .gyro_prealign_enabled) ?? gyro_prealign_enabled
@@ -2317,6 +2325,7 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
             "robustness_min_upsample_bilinear": NSNumber(value: tuningParams.robustness_min_upsample_bilinear),
+            "robustness_perceptual_sqrt": NSNumber(value: tuningParams.robustness_perceptual_sqrt),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
             "gyro_prealign_enabled": NSNumber(value: tuningParams.gyro_prealign_enabled),

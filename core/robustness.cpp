@@ -713,11 +713,20 @@ void prewarm_noise_curves(const Config& cfg) {
 // With a raw that was never prewhitened this is identity and the guide is the
 // pseudocode verbatim.
 Image compute_guide(const Image& raw, const Config& cfg) {
+    // Perceptual-space robustness (Config::robustness_perceptual_sqrt): map the
+    // guide to the variance-stabilised / perceptual domain g = sqrt(max(x,0))
+    // BEFORE any local statistic, so the local std and the colour distance are
+    // both measured there. Applied to the finished guide below.
+    auto to_perceptual = [&](Image& img) {
+        if (!cfg.robustness_perceptual_sqrt) return;
+        for (f32& v : img.data) v = std::sqrt(std::max(v, 0.f));
+    };
     if (!cfg.bayer_mode) {
         // Non-Bayer degenerate case: the guide is the single-channel frame itself
         // (460's guide_img = raw.reshape((1, H, W))). Algorithm 7 is Bayer-only.
         Image g(raw.h, raw.w, 1);
         g.data = raw.data;
+        to_perceptual(g);
         return g;
     }
     const int gh = raw.h / 2, gw = raw.w / 2;
@@ -750,6 +759,7 @@ Image compute_guide(const Image& raw, const Config& cfg) {
                 guide.at(y, x, c) = sum[c] * inv[c] * wbu[c];
         }
     }
+    to_perceptual(guide);
     return guide;
 }
 
@@ -1162,6 +1172,97 @@ static void apply_noise_model_fused(const Image& ref_means, const Image& comp_me
     });
 }
 
+// ---- Perceptual-space (VST sqrt) robustness noise term ----------------------
+// Config::robustness_perceptual_sqrt. The guide has been mapped to g=sqrt(max(x,0))
+// before the local statistics, so the local mean mu, the measured local variance
+// var_p and the colour difference diff are all in sqrt space. The sensor noise in
+// that space, by the delta method for y=sqrt(x) with var(x)=a*x+b, is
+// nvar = (a*x+b)/(4x), x=mu^2 the reconstructed linear mean. Same 460 Wiener
+// structure as apply_noise_model_fused -- a measured-or-model sigma and a distance
+// shrunk by dp^2/(dp^2+nvar) -- but with that single sqrt-space noise variance in
+// place of the separate linear std/diff curves (which no longer apply once the
+// guide is non-linear). a==b==0 (debug_noise_model_disabled) degenerates to the
+// raw variance + raw squared difference, exactly as the linear path does.
+static inline void perceptual_sqrt_term(f32 mu, f32 diff, f32 var_p,
+                                        f32 a, f32 b, f32& d_c, f32& sigma_c) {
+    const f32 x = std::max(mu * mu, 1.0e-6f);
+    f32 nvar = (std::max(a, 0.f) * x + std::max(b, 0.f)) / (4.f * x);
+    if (!std::isfinite(nvar) || nvar < 0.f) nvar = 0.f;
+    sigma_c = std::max(var_p, nvar);
+    if (!std::isfinite(diff)) { d_c = std::numeric_limits<f32>::infinity(); return; }
+    const f32 dp2 = diff * diff;
+    const f32 denom = dp2 + nvar;
+    const f32 shrink = (denom > 0.f) ? dp2 / denom : 0.f;
+    d_c = dp2 * shrink * shrink;
+}
+
+// Raw-res twin (fused: derive diff inline from ref/comp means), mirroring
+// apply_noise_model_fused's signature so it is a drop-in under the flag.
+static void apply_noise_model_fused_perceptual(
+    const Image& ref_means, const Image& comp_means, const Image& ref_vars,
+    const Config& cfg, Image& d_sq, Image& sigma_sq, int num_threads,
+    Image* d_sq_ch, Image* sigma_sq_ch) {
+    const int n_ch = ref_means.c;
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    if (d_sq_ch) *d_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
+    if (sigma_sq_ch) *sigma_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
+    parallel_rows(ref_means.h, num_threads, [&](int y) {
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 d_sum = 0.f, s_sum = 0.f;
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const f32 a = (n_ch == 3) ? cfg.noise_alpha_ch_robustness(ch)
+                                          : cfg.noise_alpha_robustness();
+                const f32 b = (n_ch == 3) ? cfg.noise_beta_ch_robustness(ch)
+                                          : cfg.noise_beta_robustness();
+                const f32 mu = ref_means.at(y, x, ch);
+                const f32 comp = comp_means.at(y, x, ch);
+                const f32 diff = std::isfinite(comp)
+                    ? std::fabs(mu - comp)
+                    : std::numeric_limits<f32>::infinity();
+                f32 d_c, s_c;
+                perceptual_sqrt_term(mu, diff, ref_vars.at(y, x, ch), a, b, d_c, s_c);
+                d_sum += d_c; s_sum += s_c;
+                if (d_sq_ch) d_sq_ch->at(y, x, ch) = d_c;
+                if (sigma_sq_ch) sigma_sq_ch->at(y, x, ch) = s_c;
+            }
+            d_sq.at(y, x) = d_sum;
+            sigma_sq.at(y, x) = s_sum;
+        }
+    });
+}
+
+// Guide-res twin (takes the precomputed per-channel |ref-comp| difference image),
+// mirroring apply_noise_model's signature.
+static void apply_noise_model_perceptual(
+    const Image& d_p, const Image& ref_means, const Image& ref_vars,
+    const Config& cfg, Image& d_sq, Image& sigma_sq,
+    Image* d_sq_ch, Image* sigma_sq_ch) {
+    const int n_ch = ref_means.c;
+    d_sq = Image(ref_means.h, ref_means.w, 1);
+    sigma_sq = Image(ref_means.h, ref_means.w, 1);
+    if (d_sq_ch) *d_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
+    if (sigma_sq_ch) *sigma_sq_ch = Image(ref_means.h, ref_means.w, n_ch);
+    for (int y = 0; y < ref_means.h; ++y)
+        for (int x = 0; x < ref_means.w; ++x) {
+            f32 d_sum = 0.f, s_sum = 0.f;
+            for (int ch = 0; ch < n_ch; ++ch) {
+                const f32 a = (n_ch == 3) ? cfg.noise_alpha_ch_robustness(ch)
+                                          : cfg.noise_alpha_robustness();
+                const f32 b = (n_ch == 3) ? cfg.noise_beta_ch_robustness(ch)
+                                          : cfg.noise_beta_robustness();
+                f32 d_c, s_c;
+                perceptual_sqrt_term(ref_means.at(y, x, ch), d_p.at(y, x, ch),
+                                     ref_vars.at(y, x, ch), a, b, d_c, s_c);
+                d_sum += d_c; s_sum += s_c;
+                if (d_sq_ch) d_sq_ch->at(y, x, ch) = d_c;
+                if (sigma_sq_ch) sigma_sq_ch->at(y, x, ch) = s_c;
+            }
+            d_sq.at(y, x) = d_sum;
+            sigma_sq.at(y, x) = s_sum;
+        }
+}
+
 // 1.4 single-curve noise correction, fused (Δμ derived inline from ref/comp
 // means, no materialised d_p). Raw-resolution twin of apply_noise_model_1p4.
 static void apply_noise_model_fused_1p4(const Image& ref_means, const Image& comp_means,
@@ -1414,7 +1515,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     }
 
     const NoiseLut14& lut14 = active_noise_lut14();
-    const bool use_lut = lut14.valid && !cfg.debug_noise_model_disabled;
+    const bool use_lut = lut14.valid && !cfg.debug_noise_model_disabled &&
+                         !cfg.robustness_perceptual_sqrt;
     const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
     if (!use_lut) {
         if (ref_stats.means.c == 3) {
@@ -1459,7 +1561,12 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         return Image();
 
     Image d_sq, sigma_sq, d_sq_ch, sigma_sq_ch;
-    if (use_lut)
+    if (cfg.robustness_perceptual_sqrt)
+        // Guide is already sqrt space; score d and sigma there (from scratch).
+        apply_noise_model_fused_perceptual(ref_means, comp_means, ref_vars, cfg,
+                                           d_sq, sigma_sq, cfg.num_threads,
+                                           &d_sq_ch, &sigma_sq_ch);
+    else if (use_lut)
         apply_noise_model_fused_1p4(ref_means, comp_means, ref_vars, lut14,
                                     d_sq, sigma_sq, cfg.num_threads);
     else
@@ -1877,7 +1984,8 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     // LUT is used the per-channel Monte-Carlo curves are NOT built at all, so
     // the runtime MC cost disappears.
     const NoiseLut14& lut14 = active_noise_lut14();
-    const bool use_lut = lut14.valid && !cfg.debug_noise_model_disabled;
+    const bool use_lut = lut14.valid && !cfg.debug_noise_model_disabled &&
+                         !cfg.robustness_perceptual_sqrt;
     // One curve per guide channel (3 for Bayer, matching R/(G1+G2)/2/B; 1
     // otherwise) rather than one curve shared by all channels -- see
     // Config::noise_alpha_ch/noise_beta_ch and make_noise_curves_channel.
@@ -1958,7 +2066,11 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
 
     Image d_sq, sigma_sq, d_sq_ch, sigma_sq_ch;
     // 1.4 parity: use the LUT's exact single-curve correction, else per-channel.
-    if (use_lut)
+    if (cfg.robustness_perceptual_sqrt)
+        // Guide is already sqrt space; score d and sigma there (from scratch).
+        apply_noise_model_perceptual(d_p, ref_stats.means, ref_stats.stds, cfg,
+                                     d_sq, sigma_sq, &d_sq_ch, &sigma_sq_ch);
+    else if (use_lut)
         apply_noise_model_1p4(d_p, ref_stats.means, ref_stats.stds, lut14, d_sq, sigma_sq);
     else
         apply_noise_model(d_p, ref_stats.means, ref_stats.stds, nc_ch, d_sq, sigma_sq,
@@ -2154,7 +2266,12 @@ void robustness_correspondence(const Image& ref_means, const Image& ref_vars,
         }
     });
     const NoiseLut14& lut14 = active_noise_lut14();
-    if (lut14.valid && !cfg.debug_noise_model_disabled) {
+    if (cfg.robustness_perceptual_sqrt) {
+        // Guide already sqrt space (keeps the refine feature builder consistent
+        // with the analytic mask under the flag).
+        apply_noise_model_perceptual(d_p, ref_means, ref_vars, cfg, d_sq, sigma_sq,
+                                     nullptr, nullptr);
+    } else if (lut14.valid && !cfg.debug_noise_model_disabled) {
         apply_noise_model_1p4(d_p, ref_means, ref_vars, lut14, d_sq, sigma_sq);
     } else {
         const NoiseCurves* nc_ch[3] = {nullptr, nullptr, nullptr};
