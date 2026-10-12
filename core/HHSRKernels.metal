@@ -1663,6 +1663,7 @@ struct RobGuideParams {
     uint bayer; // 1 = Bayer → RGB guide
     uint cfa00, cfa01, cfa10, cfa11;
     float wb0, wb1, wb2;  // WB-undo factors (Algorithm 7 camera-native recovery)
+    uint perceptual_sqrt; // 1 = map the guide to sqrt(max(x,0)) (perceptual/VST)
 };
 
 struct RobStatsParams {
@@ -1833,6 +1834,14 @@ kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
     float undo[3] = {p.wb0, p.wb1, p.wb2};
     for (uint c = 0u; c < 3u; ++c)
         guide[o + c] = (cnt[c] > 0u) ? (sum[c] / float(cnt[c])) * undo[c] : 0.f;
+    // Perceptual-space robustness: map the guide to the variance-stabilising /
+    // perceptual domain sqrt(max(x,0)) so the downstream local std and colour
+    // distance are measured there (Config::robustness_perceptual_sqrt). Mirrors
+    // the CPU compute_guide. The mask kernels' sqrt-space noise is supplied via
+    // the VST-shaped noise curves + sqrt_index, so no kernel noise change here.
+    if (p.perceptual_sqrt != 0u)
+        for (uint c = 0u; c < 3u; ++c)
+            guide[o + c] = sqrt(max(guide[o + c], 0.f));
 }
 
 // Parameters for the high-frequency variance-loss map.

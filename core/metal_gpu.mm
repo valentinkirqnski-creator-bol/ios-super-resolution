@@ -1604,8 +1604,9 @@ struct RobGuideParamsCPU {
     uint32_t bayer;
     uint32_t cfa00, cfa01, cfa10, cfa11;
     float wb0, wb1, wb2;   // WB-undo factors (Algorithm 7 camera-native recovery)
+    uint32_t perceptual_sqrt;  // 1 = sqrt(max(x,0)) guide (perceptual/VST)
 };
-static_assert(sizeof(RobGuideParamsCPU) == 48, "RobGuideParamsCPU");
+static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
 
 struct RobStatsParamsCPU {
     uint32_t h, w, nch, _pad0 = 0;
@@ -1894,6 +1895,7 @@ static bool rob_run_guide_stats(const Image& raw, const Config& cfg,
             gp.wb1 = 1.f;
             gp.wb2 = 1.f;
         }
+        gp.perceptual_sqrt = cfg.robustness_perceptual_sqrt ? 1u : 0u;
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         if (!enc) return false;
         [enc setBuffer:b_guide offset:0 atIndex:0];
@@ -2013,6 +2015,24 @@ static float g_rob_curve_beta[3]  = {std::numeric_limits<float>::quiet_NaN(),
                                      std::numeric_limits<float>::quiet_NaN()};
 static bool g_rob_curve_pixel4a = false;
 static int g_rob_curve_pixel4a_iso = 0;
+static bool g_rob_curve_perceptual = false;  // curves currently hold the VST shape
+
+// VST sqrt-space noise curve for Config::robustness_perceptual_sqrt. With
+// sqrt_index on, the mask kernel indexes by id = round(1000*mean^2) =
+// round(1000*x_linear), so entry id corresponds to linear mean x = id/1000.
+// Storing sqrt of the delta-method noise variance (a*x+b)/(4x) makes the kernel's
+// sigma_t^2 and d_t^2 equal that variance -- identical to
+// apply_noise_model_fused_perceptual on the CPU (the per-tile 1/1000 quantisation
+// of x aside). One curve serves both the sigma floor and the d-shrink.
+static void rob_build_vst_curve(f32 a, f32 b, size_t n, std::vector<f32>& out) {
+    out.resize(n);
+    for (size_t id = 0; id < n; ++id) {
+        const f32 x = std::max((f32)id / 1000.f, 1.0e-6f);
+        f32 nv = (std::max(a, 0.f) * x + std::max(b, 0.f)) / (4.f * x);
+        if (!std::isfinite(nv) || nv < 0.f) nv = 0.f;
+        out[id] = std::sqrt(nv);
+    }
+}
 
 static void clear_rob_ref_gpu() {
     g_rob_ref_hf = nil;
@@ -2033,6 +2053,7 @@ static void clear_rob_ref_gpu() {
     }
     g_rob_curve_pixel4a = false;
     g_rob_curve_pixel4a_iso = 0;
+    g_rob_curve_perceptual = false;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -2213,7 +2234,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != false ||
-        g_rob_curve_pixel4a_iso != 0;
+        g_rob_curve_pixel4a_iso != 0 ||
+        g_rob_curve_perceptual != cfg.robustness_perceptual_sqrt;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -2224,7 +2246,14 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         size_t n = 0;
         for (int ch = 0; ch < curve_nch; ++ch) {
             std::vector<f32> std_curve, diff_curve;
-            if (curve_nch == 3)
+            if (cfg.robustness_perceptual_sqrt) {
+                // VST sqrt-space noise (same analytic term as the CPU path),
+                // shaped into the curve the sqrt_index kernel will read.
+                const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
+                const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
+                rob_build_vst_curve(a, b, 1001u, std_curve);
+                diff_curve = std_curve;  // one VST noise for both floor and shrink
+            } else if (curve_nch == 3)
                 fetch_noise_curves_channel(cfg, ch, std_curve, diff_curve);
             else
                 fetch_noise_curves(cfg, std_curve, diff_curve);
@@ -2246,6 +2275,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         g_rob_curve_n = n;
         g_rob_curve_pixel4a = false;
         g_rob_curve_pixel4a_iso = 0;
+        g_rob_curve_perceptual = cfg.robustness_perceptual_sqrt;
     }
     if (g_rob_curve_n == 0) return Image();
 
@@ -2307,7 +2337,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // alpha/beta stay for the noise model (debug-gated accessors).
     mp.alpha = cfg.noise_alpha_robustness();
     mp.beta = cfg.noise_beta_robustness();
-    mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
+    mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
+                     cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.edge_misalign_enabled = cfg.edge_misalign_enabled ? 1u : 0u;
     mp.edge_misalign_radius = (uint32_t)std::max(1, std::min(cfg.edge_misalign_radius, 4));
@@ -2439,7 +2470,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != false ||
-        g_rob_curve_pixel4a_iso != 0;
+        g_rob_curve_pixel4a_iso != 0 ||
+        g_rob_curve_perceptual != cfg.robustness_perceptual_sqrt;
     for (int ch = 0; ch < curve_nch && !curves_stale; ++ch) {
         const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
         const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
@@ -2450,7 +2482,14 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         size_t n = 0;
         for (int ch = 0; ch < curve_nch; ++ch) {
             std::vector<f32> std_curve, diff_curve;
-            if (curve_nch == 3)
+            if (cfg.robustness_perceptual_sqrt) {
+                // VST sqrt-space noise (same analytic term as the CPU path),
+                // shaped into the curve the sqrt_index kernel will read.
+                const f32 a = (curve_nch == 3) ? cfg.noise_alpha_ch_robustness(ch) : cfg.noise_alpha_robustness();
+                const f32 b = (curve_nch == 3) ? cfg.noise_beta_ch_robustness(ch) : cfg.noise_beta_robustness();
+                rob_build_vst_curve(a, b, 1001u, std_curve);
+                diff_curve = std_curve;  // one VST noise for both floor and shrink
+            } else if (curve_nch == 3)
                 fetch_noise_curves_channel(cfg, ch, std_curve, diff_curve);
             else
                 fetch_noise_curves(cfg, std_curve, diff_curve);
@@ -2472,6 +2511,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         g_rob_curve_n = n;
         g_rob_curve_pixel4a = false;
         g_rob_curve_pixel4a_iso = 0;
+        g_rob_curve_perceptual = cfg.robustness_perceptual_sqrt;
     }
     if (g_rob_curve_n == 0) return Image();
     id<MTLBuffer> b_std = g_rob_std_curve;
@@ -2550,7 +2590,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
     mp.per_channel = (rob_nch > 1u) ? 1u : 0u;  // ISA per-channel R
-    mp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u; // 1.4 parity
+    mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
+                     cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
     mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
     mp.geom_reject_threshold = cfg.motion_geom_reject_threshold;
