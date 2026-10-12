@@ -1223,7 +1223,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 #if defined(__APPLE__)
     // Global homography estimation runs on the CPU and reads the grey pixels, so
     // the grey must be materialised host-side even on the resident GPU path.
-    metal_set_grey_force_host(work.global_homography_enabled || work.isa_prealign_enabled);
+    // Every feature that reads GREY PIXELS on the host must be in this set, or
+    // on-device (where the grey is otherwise GPU-resident / header-only) its
+    // host-side stage silently no-ops behind its own data-size guard:
+    //   - global homography / ISA / gyro warp estimation (estimate_global_warp),
+    //   - the measured per-tile affine (affine_ica_refine, build 89 -- without
+    //     this it silently fell back to the inferred fit, which is also why the
+    //     toggle "did almost nothing" on device),
+    //   - the FB backward align and the trajectory-consensus coarse matches.
+    metal_set_grey_force_host(work.global_homography_enabled ||
+                              work.isa_prealign_enabled ||
+                              work.gyro_prealign_enabled ||
+                              work.affine_flow_enabled ||
+                              work.flow_fb_consistency_enabled ||
+                              work.flow_consensus_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);

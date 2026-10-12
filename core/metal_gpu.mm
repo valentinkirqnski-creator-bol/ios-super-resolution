@@ -3974,11 +3974,16 @@ struct MergeFrameGpu {
     const f32* flow = nullptr;
     const f32* cov = nullptr;
     const f32* rob = nullptr;
+    // Per-tile affine Jacobian (Config::affine_flow_enabled), captured at upload
+    // for the same reason as hmat above: the prefetch path clears the host flow,
+    // so the deferred merge cannot read flow.affine_jac from its argument.
+    const f32* affine = nullptr;
     id<MTLBuffer> b_img = nil;
     id<MTLBuffer> b_flow = nil;
     id<MTLBuffer> b_cov = nil;
     id<MTLBuffer> b_rob = nil;
-    size_t img_b = 0, flow_b = 0, cov_b = 0, rob_b = 0;
+    id<MTLBuffer> b_affine = nil;
+    size_t img_b = 0, flow_b = 0, cov_b = 0, rob_b = 0, affine_b = 0;
 };
 
 struct MergeRefGpu {
@@ -4026,7 +4031,7 @@ static void merge_enc_close() {
 // most of the traffic: 7 frames go from 7 accumulator round trips to 2.
 static constexpr uint32_t kMergeFuseMax = 4u;
 struct PendingMergeComp {
-    id<MTLBuffer> img = nil, flow = nil, cov = nil, rob = nil;
+    id<MTLBuffer> img = nil, flow = nil, cov = nil, rob = nil, affine = nil;
     MergeCompParamsCPU p{};
 };
 static std::vector<PendingMergeComp> g_merge_pending;
@@ -4095,12 +4100,12 @@ static bool merge_flush_pending() {
         [enc setBuffer:e.flow offset:0 atIndex:8u + i];
         [enc setBuffer:e.cov  offset:0 atIndex:12u + i];
         [enc setBuffer:e.rob  offset:0 atIndex:16u + i];
-        // Affine Jacobian (buffers 20-23). This online/batched path does not
-        // carry the affine model, so ps[].affine_flow stays 0 and the kernel
-        // never reads these -- bind the flow buffer as a non-null placeholder
-        // (Metal requires every declared buffer set). Affine applies on the
-        // resident fused merge path. See Config::affine_flow_enabled.
-        [enc setBuffer:e.flow offset:0 atIndex:20u + i];
+        // Affine Jacobian (buffers 20-23), carried per frame since build 90 --
+        // residency has been off since build 70, so this banded/online path is
+        // the one that actually merges on device and it must apply the affine
+        // itself. The flow buffer stands in as a non-null placeholder when the
+        // frame has no affine model (ps[].affine_flow == 0, kernel never reads).
+        [enc setBuffer:(e.affine ? e.affine : e.flow) offset:0 atIndex:20u + i];
     }
     dispatch2(enc, c.pipe("merge_accumulate_comp_x4"), ps[0].Ws, ps[0].band_h);
     g_merge_pending.clear();
@@ -4134,21 +4139,25 @@ static bool copy_into(id<MTLBuffer> slot, const f32* data, size_t nbytes) {
 static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
                               const CovField& covs, const Image& rob, int frame_key,
                               __strong id<MTLBuffer>& b_img, __strong id<MTLBuffer>& b_flow,
-                              __strong id<MTLBuffer>& b_cov, __strong id<MTLBuffer>& b_rob) {
+                              __strong id<MTLBuffer>& b_cov, __strong id<MTLBuffer>& b_rob,
+                              __strong id<MTLBuffer>& b_affine) {
     const f32* ip = img.data.empty() ? nullptr : img.data.data();
     const f32* fp = flow.flow.empty() ? nullptr : flow.flow.data();
     const f32* cp = covs.cov.empty() ? nullptr : covs.cov.data();
     const f32* rp = rob.data.empty() ? nullptr : rob.data.data();
+    const f32* ap = flow.has_affine() ? flow.affine_jac.data() : nullptr;
     const size_t img_b = img.data.size() * sizeof(float);
     const size_t flow_b = flow.flow.size() * sizeof(float);
     const size_t cov_b = covs.cov.size() * sizeof(float);
     const size_t rob_b = rob.data.size() * sizeof(float);
+    const size_t affine_b = ap ? flow.affine_jac.size() * sizeof(float) : 0;
 
     auto finish = [&](MergeFrameGpu& e) -> bool {
         b_img = e.b_img;
         b_flow = e.b_flow;
         b_cov = e.b_cov;
         b_rob = e.b_rob;
+        b_affine = e.b_affine;   // nil when the burst has no affine model
         if (!b_cov) {
             static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
             b_cov = buf(kDummyCov, sizeof(kDummyCov));
@@ -4183,15 +4192,19 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.flow = fp;
             e.cov = cp;
             e.rob = rp;
+            e.affine = ap;
             e.img_b = img_b;
             e.flow_b = flow_b;
             e.cov_b = cov_b;
             e.rob_b = rob_b;
+            e.affine_b = affine_b;
             e.b_img = buf(ip, img_b);
             e.b_flow = buf(fp, flow_b);
             e.b_cov = cov_b ? buf(cp, cov_b) : nil;
             e.b_rob = buf(rp, rob_b);
+            e.b_affine = affine_b ? buf(ap, affine_b) : nil;
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
+            if (affine_b && !e.b_affine) return false;
             if (!e.b_cov) {
                 static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
                 e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
@@ -4221,6 +4234,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         e.b_flow = buf(fp, flow_b);
         e.b_cov = cov_b ? buf(cp, cov_b) : nil;
         e.b_rob = buf(rp, rob_b);
+        e.b_affine = affine_b ? buf(ap, affine_b) : nil;
         e.rob_h = rob.h;
         e.rob_w = rob.w;
         e.rob_nch = std::max(1, rob.c);
@@ -4229,11 +4243,14 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         e.flow = fp;
         e.cov = cp;
         e.rob = rp;
+        e.affine = ap;
         e.img_b = img_b;
         e.flow_b = flow_b;
         e.cov_b = cov_b;
         e.rob_b = rob_b;
+        e.affine_b = affine_b;
         if (!e.b_flow || !e.b_rob) return false;
+        if (affine_b && !e.b_affine) return false;
         if (!e.b_cov) {
             static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
             e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
@@ -4259,15 +4276,19 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.flow = fp;
     e.cov = cp;
     e.rob = rp;
+    e.affine = ap;
     e.img_b = img_b;
     e.flow_b = flow_b;
     e.cov_b = cov_b;
     e.rob_b = rob_b;
+    e.affine_b = affine_b;
     e.b_img = buf(ip, img_b);
     e.b_flow = buf(fp, flow_b);
     e.b_cov = cov_b ? buf(cp, cov_b) : nil;
     e.b_rob = buf(rp, rob_b);
+    e.b_affine = affine_b ? buf(ap, affine_b) : nil;
     if (!e.b_img || !e.b_flow || !e.b_rob) return false;
+    if (affine_b && !e.b_affine) return false;
     if (!e.b_cov) {
         static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
         e.b_cov = buf(kDummyCov, sizeof(kDummyCov));
@@ -4890,9 +4911,10 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
                                 int frame_id) {
     if (!metal_gpu_init() || frame_id < 0) return false;
     if (comp_raw.h <= 0 || comp_raw.w <= 0) return false;
-    id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil;
+    id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil,
+                  b_affine = nil;
     return acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
-                             b_img, b_flow, b_cov, b_rob);
+                             b_img, b_flow, b_cov, b_rob, b_affine);
 }
 
 bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
@@ -4913,9 +4935,10 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
 
     if (!ensure_acc_buffers((size_t)acc_h * acc_w * acc_c, start_band)) return false;
 
-    id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil;
+    id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil,
+                  b_affine = nil;
     if (!acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
-                           b_img, b_flow, b_cov, b_rob))
+                           b_img, b_flow, b_cov, b_rob, b_affine))
         return false;
 
     MergeCompParamsCPU p{};
@@ -4992,6 +5015,13 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     }
     p.use_homography = hg ? 1u : 0u;
     for (int i = 0; i < 9; ++i) p.hmat[i] = H[i];
+    // Per-tile affine (Config::affine_flow_enabled) on the banded/online merge --
+    // the path that actually runs with residency off. b_affine comes from
+    // acquire_frame_gpu (and so from the cache entry on the prefetch path, the
+    // same way hmat does). affine_off is 0 here: the banded path binds one
+    // buffer per frame, unlike the resident fused path's slice offsets.
+    p.affine_flow = (cfg.affine_flow_enabled && b_affine != nil) ? 1u : 0u;
+    p.affine_off = 0u;
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
@@ -5001,6 +5031,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     (void)slot;
     PendingMergeComp pend;
     pend.img = b_img; pend.flow = b_flow; pend.cov = b_cov; pend.rob = b_rob;
+    pend.affine = b_affine;
     pend.p = p;
     g_merge_pending.push_back(pend);
     if (g_merge_pending.size() >= (size_t)kMergeFuseMax && !merge_flush_pending())
