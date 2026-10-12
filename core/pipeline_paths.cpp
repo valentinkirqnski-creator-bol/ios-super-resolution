@@ -1779,12 +1779,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (int i = 0; i < 9; ++i) flow.global_h[i] = gw.H[i];
             flow.has_global_h = true;
         }
-        // Fit the per-tile affine motion model on the finalized raw-grid flow,
-        // before it is uploaded to the GPU slice (metal_frame_set_flow) and
-        // before robustness/merge consume it. Off by default (Config::
-        // affine_flow_enabled); leaves flow.affine_jac empty otherwise so every
-        // consumer keeps the plain per-tile vector.
-        if (work.affine_flow_enabled) flow.fit_affine();
+        // Per-tile affine motion model on the finalized raw-grid flow, before it
+        // is uploaded to the GPU slice (metal_frame_set_flow) and before
+        // robustness/merge consume it. align() now MEASURES it per tile against
+        // the pixels (affine_ica_refine, seeded by fit_affine) on the grey grid
+        // and flow_to_raw_tile_grid carries the Jacobian here, so the inferred
+        // fit below is only the fallback for a flow that arrived without one
+        // (e.g. a header-only grey skipped the measurement). Off by default
+        // (Config::affine_flow_enabled); leaves flow.affine_jac empty otherwise
+        // so every consumer keeps the plain per-tile vector.
+        if (work.affine_flow_enabled && !flow.has_affine()) flow.fit_affine();
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),

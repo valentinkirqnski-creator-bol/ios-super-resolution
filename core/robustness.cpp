@@ -918,7 +918,8 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
 
 static Image upscale_warp_stats(const Image& guide_stats,
                                 bool is_ref, const FlowField* flow, int tile_size,
-                                int num_threads, bool bilinear_flow) {
+                                int num_threads, bool bilinear_flow,
+                                bool use_affine = false) {
     const int nc = guide_stats.c;
     // Match Python upscale_warp_stats sizing: 3ch -> 2x, else same size
     const int out_h = (nc == 3) ? guide_stats.h * 2 : guide_stats.h;
@@ -933,7 +934,15 @@ static Image upscale_warp_stats(const Image& guide_stats,
             if (!is_ref && flow && tile_size > 0 && flow->ny > 0 && flow->nx > 0 &&
                 !flow->flow.empty()) {
                 // y, x are RAW here, so sample_bilinear takes them directly.
-                if (bilinear_flow) {
+                if (use_affine && flow->has_affine()) {
+                    // Per-tile affine (Config::affine_flow_enabled): warp the
+                    // comparison statistics with the SAME per-pixel displacement
+                    // the merge fetches (FlowField::sample_affine), so the mask
+                    // scores exactly the merge's correspondence. Without this the
+                    // mask scored the tile-constant vector while the merge used
+                    // the affine one -- a mask/merge parity break under rotation.
+                    flow->sample_affine((f32)y, (f32)x, tile_size, flow_x, flow_y);
+                } else if (bilinear_flow) {
                     flow->sample_bilinear((f32)y, (f32)x, tile_size, flow_x, flow_y);
                 } else {
                     // Python: patch_idy = int(y // tile_size)  (no clamp)
@@ -1550,7 +1559,8 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
-                                        tile_size, cfg.num_threads, false);
+                                        tile_size, cfg.num_threads, false,
+                                        cfg.affine_flow_enabled);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -1917,7 +1927,8 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 // Dodgson upscale + flow warp into the reference frame, the
                 // same transform the analytic raw-res path applies.
                 Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
-                                                 tile_size, cfg.num_threads, false);
+                                                 tile_size, cfg.num_threads, false,
+                                                 cfg.affine_flow_enabled);
                 cm_nn = std::move(hires);
             }
         }
@@ -2545,7 +2556,8 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
         local_stats_3x3(guide, comp_means, comp_vars);
         if (raw_res)
             comp_means = upscale_warp_stats(comp_means, /*is_ref=*/false, &flow,
-                                            tile_size, cfg.num_threads, false);
+                                            tile_size, cfg.num_threads, false,
+                                            cfg.affine_flow_enabled);
     }
     if (comp_means.h <= 0 || comp_means.w <= 0) return false;
 

@@ -1157,6 +1157,204 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
     return flow;
 }
 
+// ---- measured per-tile affine (Config::affine_flow_enabled) -----------------
+//
+// fit_affine INFERS the Jacobian by differentiating the measured per-tile
+// TRANSLATIONS across a neighbour window -- a smoothed finite difference that is
+// fine for slow global rotation but smears across depth discontinuities and
+// inherits every block-match error in the window. This refines each tile's full
+// 6-DOF warp AGAINST THE PIXELS instead (inverse-compositional Gauss-Newton):
+//
+//   W(p) = p + d + J*off(p),  off(p) = p/ts - 0.5 - tile   (centred tile units,
+//                                      FlowField::sample_affine's convention)
+//
+// seeded by the tile's translation d and fit_affine's J, so rotation / zoom /
+// perspective and locally-planar parallax are genuinely measured rather than
+// approximated from neighbours. The six steepest-descent images are
+// [gx, gy, gx*ox, gx*oy, gy*ox, gy*oy] from the REFERENCE gradients. A tile is
+// accepted only if its mean per-pixel SSD against the moving grey IMPROVES over
+// the seed, so no tile can leave this function worse than fit_affine left it.
+//
+// The gradients are the same unnormalised central differences the 2-DOF ICA
+// uses (2x dI/dx), which halves each Gauss-Newton step; the iteration count is
+// doubled to compensate (1-(1/2)^n of the true step is recovered after n).
+void affine_ica_refine(FlowField& flow, const Image& ref_grey,
+                       const Image& moving_grey, const Config& cfg,
+                       int tile_size) {
+    if (!cfg.affine_flow_enabled) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0) return;
+    // Host pixels required on both sides; on the resident GPU path a grey can be
+    // header-only, in which case the inferred fit (pipeline fallback) stands.
+    if (ref_grey.data.size() != (size_t)ref_grey.h * ref_grey.w * ref_grey.c ||
+        moving_grey.data.size() !=
+            (size_t)moving_grey.h * moving_grey.w * moving_grey.c)
+        return;
+
+    flow.fit_affine();            // seed J (and the fallback if a tile reverts)
+    if (!flow.has_affine()) return;
+
+    const Image gx = compute_sobel_gradx(ref_grey);
+    const Image gy = compute_sobel_grady(ref_grey);
+    const int ts = tile_size;
+    const int n_iter = std::max(3, cfg.ica_n_iter * 2);
+    const f32 jmax = 2.f;        // same absolute clamp as fit_affine
+    const f32 dstep_max = 1.f;   // translation update per iteration, grey px
+    const f32 jstep_max = 0.5f;  // Jacobian update per iteration, tile units
+
+    auto sample_bilin = [](const Image& img, f32 y, f32 x) -> f32 {
+        y = std::min(std::max(y, 0.f), (f32)(img.h - 1));
+        x = std::min(std::max(x, 0.f), (f32)(img.w - 1));
+        const int y0 = (int)y, x0 = (int)x;
+        const int y1 = std::min(y0 + 1, img.h - 1);
+        const int x1 = std::min(x0 + 1, img.w - 1);
+        const f32 fy = y - (f32)y0, fx = x - (f32)x0;
+        const f32 top = img.at(y0, x0) + (img.at(y0, x1) - img.at(y0, x0)) * fx;
+        const f32 bot = img.at(y1, x0) + (img.at(y1, x1) - img.at(y1, x0)) * fx;
+        return top + (bot - top) * fy;
+    };
+
+    parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
+        for (int tx = 0; tx < flow.nx; ++tx) {
+            const int oy = ty * ts, ox = tx * ts;
+            if (oy >= ref_grey.h || ox >= ref_grey.w) continue;
+            f32* J = &flow.affine_jac[((size_t)ty * flow.nx + tx) * 4];
+            f32 th[6] = {flow.dx(ty, tx), flow.dy(ty, tx), J[0], J[1], J[2], J[3]};
+            const f32 seed[6] = {th[0], th[1], th[2], th[3], th[4], th[5]};
+
+            // Mean per-pixel SSD of a parameter vector; pixels whose warp leaves
+            // the moving frame are not scored (counted via n_valid).
+            auto tile_cost = [&](const f32 t[6], int& n_valid) -> f32 {
+                f32 ssd = 0.f; n_valid = 0;
+                for (int i = 0; i < ts; ++i) {
+                    const int py = oy + i;
+                    if (py >= ref_grey.h) break;
+                    const f32 offy = (f32)py / (f32)ts - 0.5f - (f32)ty;
+                    for (int j = 0; j < ts; ++j) {
+                        const int px = ox + j;
+                        if (px >= ref_grey.w) break;
+                        const f32 offx = (f32)px / (f32)ts - 0.5f - (f32)tx;
+                        const f32 wx = (f32)px + t[0] + t[2] * offx + t[3] * offy;
+                        const f32 wy = (f32)py + t[1] + t[4] * offx + t[5] * offy;
+                        if (wx < 0.f || wx > (f32)(moving_grey.w - 1) ||
+                            wy < 0.f || wy > (f32)(moving_grey.h - 1))
+                            continue;
+                        const f32 r = sample_bilin(moving_grey, wy, wx) -
+                                      ref_grey.at(py, px);
+                        ssd += r * r;
+                        ++n_valid;
+                    }
+                }
+                return (n_valid > 0) ? ssd / (f32)n_valid
+                                     : std::numeric_limits<f32>::infinity();
+            };
+
+            int n_seed = 0;
+            const f32 cost_seed = tile_cost(th, n_seed);
+            if (n_seed < ts * ts / 4) continue;   // mostly out of frame: keep seed
+
+            for (int it = 0; it < n_iter; ++it) {
+                f32 H[36] = {0.f};
+                f32 B[6] = {0.f};
+                for (int i = 0; i < ts; ++i) {
+                    const int py = oy + i;
+                    if (py >= ref_grey.h) break;
+                    const f32 offy = (f32)py / (f32)ts - 0.5f - (f32)ty;
+                    for (int j = 0; j < ts; ++j) {
+                        const int px = ox + j;
+                        if (px >= ref_grey.w) break;
+                        const f32 offx = (f32)px / (f32)ts - 0.5f - (f32)tx;
+                        const f32 wx = (f32)px + th[0] + th[2] * offx + th[3] * offy;
+                        const f32 wy = (f32)py + th[1] + th[4] * offx + th[5] * offy;
+                        if (wx < 0.f || wx > (f32)(moving_grey.w - 1) ||
+                            wy < 0.f || wy > (f32)(moving_grey.h - 1))
+                            continue;
+                        const f32 gxx = gx.at(py, px), gyy = gy.at(py, px);
+                        const f32 sd[6] = {gxx, gyy, gxx * offx, gxx * offy,
+                                           gyy * offx, gyy * offy};
+                        const f32 gradt =
+                            sample_bilin(moving_grey, wy, wx) - ref_grey.at(py, px);
+                        for (int a = 0; a < 6; ++a) {
+                            B[a] -= sd[a] * gradt;
+                            for (int b = a; b < 6; ++b)
+                                H[a * 6 + b] += sd[a] * sd[b];
+                        }
+                    }
+                }
+                // Symmetrise + Levenberg damping relative to the diagonal, so a
+                // texture-poor direction (aperture) stays at its seed instead of
+                // being flung by a near-singular solve.
+                f32 tr = 0.f;
+                for (int a = 0; a < 6; ++a) tr += H[a * 6 + a];
+                const f32 lm = 1e-4f * tr + 1e-12f;
+                for (int a = 0; a < 6; ++a) {
+                    H[a * 6 + a] += lm;
+                    for (int b = 0; b < a; ++b) H[a * 6 + b] = H[b * 6 + a];
+                }
+                // Gaussian elimination with partial pivoting on [H | B].
+                f32 dlt[6];
+                bool ok = true;
+                {
+                    f32 A[36]; f32 rhs[6];
+                    std::copy(H, H + 36, A);
+                    std::copy(B, B + 6, rhs);
+                    for (int col = 0; col < 6 && ok; ++col) {
+                        int piv = col; f32 pv = std::fabs(A[col * 6 + col]);
+                        for (int r = col + 1; r < 6; ++r)
+                            if (std::fabs(A[r * 6 + col]) > pv) {
+                                pv = std::fabs(A[r * 6 + col]); piv = r;
+                            }
+                        if (pv < 1e-20f) { ok = false; break; }
+                        if (piv != col) {
+                            for (int c2 = 0; c2 < 6; ++c2)
+                                std::swap(A[col * 6 + c2], A[piv * 6 + c2]);
+                            std::swap(rhs[col], rhs[piv]);
+                        }
+                        const f32 inv = 1.f / A[col * 6 + col];
+                        for (int r = col + 1; r < 6; ++r) {
+                            const f32 f = A[r * 6 + col] * inv;
+                            if (f == 0.f) continue;
+                            for (int c2 = col; c2 < 6; ++c2)
+                                A[r * 6 + c2] -= f * A[col * 6 + c2];
+                            rhs[r] -= f * rhs[col];
+                        }
+                    }
+                    if (ok) {
+                        for (int r = 5; r >= 0; --r) {
+                            f32 s = rhs[r];
+                            for (int c2 = r + 1; c2 < 6; ++c2)
+                                s -= A[r * 6 + c2] * dlt[c2];
+                            dlt[r] = s / A[r * 6 + r];
+                        }
+                    }
+                }
+                if (!ok) break;
+                auto clampv = [](f32 v, f32 m) {
+                    return v < -m ? -m : (v > m ? m : v);
+                };
+                th[0] += clampv(dlt[0], dstep_max);
+                th[1] += clampv(dlt[1], dstep_max);
+                for (int a = 2; a < 6; ++a)
+                    th[a] = clampv(th[a] + clampv(dlt[a], jstep_max), jmax);
+                bool fin = true;
+                for (int a = 0; a < 6; ++a) fin = fin && std::isfinite(th[a]);
+                if (!fin) { std::copy(seed, seed + 6, th); break; }
+            }
+
+            // Accept only a measured improvement over the seed (per valid pixel,
+            // and without losing a large part of the tile's coverage).
+            int n_new = 0;
+            const f32 cost_new = tile_cost(th, n_new);
+            if (std::isfinite(cost_new) && n_new * 4 >= n_seed * 3 &&
+                cost_new < cost_seed) {
+                flow.dx(ty, tx) = th[0];
+                flow.dy(ty, tx) = th[1];
+                J[0] = th[2]; J[1] = th[3]; J[2] = th[4]; J[3] = th[5];
+            }
+            // else: keep the block-match translation and fit_affine's J.
+        }
+    });
+}
+
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
@@ -1302,6 +1500,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
                         initial_dx, initial_dy, initial_rotation_rad)) {
             maybe_fb_correct(flow_gpu, ref_grey, moving_grey, cfg, tile_size,
                              initial_dx, initial_dy, initial_rotation_rad);
+            // Measured per-tile affine on the host greys (the GPU align returns a
+            // translation per tile); no-op unless Config::affine_flow_enabled.
+            affine_ica_refine(flow_gpu, ref_grey, moving_grey, cfg,
+                              cfg.grey_tile_size(tile_size));
             mark_aperture_limited_tiles(flow_gpu, nullptr, cfg);
             mark_motion_irregular_tiles(flow_gpu, cfg);
             return flow_gpu;
@@ -1442,6 +1644,10 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
     }
     maybe_fb_correct(flow, ref_grey, moving_grey, cfg, tile_size,
                      initial_dx, initial_dy, initial_rotation_rad);
+    // Measured per-tile affine (CPU twin of the Metal-path call above); no-op
+    // unless Config::affine_flow_enabled.
+    affine_ica_refine(flow, ref_grey, moving_grey, cfg,
+                      cfg.grey_tile_size(tile_size));
     mark_aperture_limited_tiles(flow, mark_hess, cfg);
     mark_motion_irregular_tiles(flow, cfg);
     return flow;
@@ -1495,6 +1701,14 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
         src_irregular = compute_motion_irregular(flow, r_Mt, sx, sy, num_threads);
     const bool carry_motion = src_irregular.size() == (size_t)flow.ny * flow.nx;
     if (carry_motion) out.motion_irregular.assign((size_t)raw_ny * raw_nx, 0u);
+    // Carry the measured per-tile affine Jacobian (affine_ica_refine) onto the
+    // raw grid. J maps a CENTRED TILE-UNIT offset to a displacement; a grey tile
+    // and a raw tile cover the same content span (grey_tile_size = tile_size /
+    // grey_scale), so the offset is grid-invariant and only the displacement
+    // rows rescale: the dx row by sx, the dy row by sy -- exactly like dx/dy.
+    const bool carry_affine =
+        flow.affine_jac.size() == (size_t)flow.ny * (size_t)flow.nx * 4;
+    if (carry_affine) out.affine_jac.assign((size_t)raw_ny * raw_nx * 4, 0.f);
     for (int ty = 0; ty < raw_ny; ++ty) {
         const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
         const int gy = std::max(0, std::min(flow.ny - 1,
@@ -1511,6 +1725,12 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 out.ambiguous(ty, tx) = flow.ambiguous(gy, gx);
             if (carry_motion)
                 out.irregular(ty, tx) = src_irregular[(size_t)gy * flow.nx + gx];
+            if (carry_affine) {
+                const f32* Js = &flow.affine_jac[((size_t)gy * flow.nx + gx) * 4];
+                f32* Jd = &out.affine_jac[((size_t)ty * raw_nx + tx) * 4];
+                Jd[0] = Js[0] * sx; Jd[1] = Js[1] * sx;
+                Jd[2] = Js[2] * sy; Jd[3] = Js[3] * sy;
+            }
         }
     }
     return out;

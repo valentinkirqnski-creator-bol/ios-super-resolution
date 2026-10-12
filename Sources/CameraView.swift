@@ -1138,7 +1138,7 @@ struct CameraView: View {
                 Section(header: Text("Motion Model")) {
                     Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)
                     Text("""
-                         Experimental. Fits a local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. Does not model sharp depth or moving-object edges — robustness still handles those.
+                         Experimental. A full local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. The affine is now MEASURED per tile against the pixels (6-parameter Gauss-Newton refinement seeded by the neighbour fit; a tile is kept only if it provably improves), and the robustness mask scores exactly the same affine correspondence the merge fetches — previously the mask used the plain per-tile vector while the merge warped affinely. Does not model sharp depth or moving-object edges — robustness still handles those.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)

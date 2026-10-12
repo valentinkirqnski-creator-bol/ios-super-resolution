@@ -1684,6 +1684,10 @@ struct RobDogsonParams {
     // and R goes dark. Composed only for the comparison stats (is_ref==0).
     float hmat[9];        // row-major 3x3, lr/raw coords
     uint use_homography;  // 1 = apply hmat (was _pad1)
+    // 1 = sample the per-tile AFFINE flow (Config::affine_flow_enabled) when
+    // warping the comparison statistics, so the mask scores exactly the
+    // correspondence the merge fetches (flow_sample_affine, same as the merge).
+    uint affine_flow;
 };
 
 struct RobMaskParams {
@@ -1937,12 +1941,19 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
                                device const float* stats [[buffer(1)]],
                                device const float* flow [[buffer(2)]],
                                constant RobDogsonParams& p [[buffer(3)]],
+                               device const float* affine_jac [[buffer(4)]],
                                uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.out_w || gid.y >= p.out_h) return;
     int y = int(gid.y), x = int(gid.x);
     float flow_x = 0.f, flow_y = 0.f;
     if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
-        if (p.flow_bilinear != 0u) {
+        if (p.affine_flow != 0u) {
+            // Per-tile affine: identical sampling to the merge kernel, so the
+            // warped comparison statistics sit exactly where the merge fetches.
+            flow_sample_affine(flow, affine_jac, p.flow_ny, p.flow_nx,
+                               float(y), float(x), float(p.tile_size),
+                               flow_x, flow_y);
+        } else if (p.flow_bilinear != 0u) {
             flow_sample_bilinear(flow, p.flow_ny, p.flow_nx, float(y), float(x),
                                  float(p.tile_size), flow_x, flow_y);
         } else {

@@ -44,6 +44,15 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 f32 r_Mt, int num_threads,
                                 int guide_tile_size = 0);
 
+// Measured per-tile affine (Config::affine_flow_enabled): refine each tile's
+// 6-DOF warp W(p)=p+d+J*off(p) by inverse-compositional Gauss-Newton against the
+// pixels, seeded by fit_affine's inferred Jacobian; a tile is accepted only when
+// its per-pixel SSD improves over the seed. tile_size is the GREY tile size the
+// flow grid was built at; no-op when the flag is off or a grey is header-only.
+void affine_ica_refine(FlowField& flow, const Image& ref_grey,
+                       const Image& moving_grey, const Config& cfg,
+                       int tile_size);
+
 // 1 where the flow field is irregular over the 3x3 tile neighbourhood -- the
 // r_Mt test (Wronski et al. Eq. 7/8, literally: raw max-min span, no
 // detrending). sx/sy scale the stored displacements into r_Mt's units.

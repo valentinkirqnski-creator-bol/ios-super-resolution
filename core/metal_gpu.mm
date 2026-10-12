@@ -1628,8 +1628,11 @@ struct RobDogsonParamsCPU {
     // place and R goes dark. Mirrors upscale_warp_stats / RobDogsonParams.
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};
     uint32_t use_homography = 0;   // was _pad1
+    // 1 = per-tile affine flow sampling for the comp-stats warp (mask/merge
+    // correspondence parity under Config::affine_flow_enabled).
+    uint32_t affine_flow = 0;
 };
-static_assert(sizeof(RobDogsonParamsCPU) == 84, "RobDogsonParamsCPU");
+static_assert(sizeof(RobDogsonParamsCPU) == 88, "RobDogsonParamsCPU");
 
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
@@ -1936,7 +1939,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       bool flow_bilinear) {
+                       bool flow_bilinear, bool use_affine = false) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1962,6 +1965,9 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.use_homography = (!is_ref && flow && flow->has_global_h) ? 1u : 0u;
     if (dp.use_homography)
         for (int i = 0; i < 9; ++i) dp.hmat[i] = flow->global_h[i];
+    // Per-tile affine sampling (Config::affine_flow_enabled): only for the
+    // comparison stats, and only when the Jacobian was actually fitted/measured.
+    dp.affine_flow = (!is_ref && use_affine && flow && flow->has_affine()) ? 1u : 0u;
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {
@@ -1972,6 +1978,14 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
         b_flow = buf(kDummyFlow, sizeof(kDummyFlow));
         if (!b_flow) return false;
     }
+    id<MTLBuffer> b_affine = nil;
+    if (dp.affine_flow) {
+        b_affine = buf(flow->affine_jac.data(),
+                       flow->affine_jac.size() * sizeof(float));
+        if (!b_affine) return false;
+    } else {
+        b_affine = b_flow;  // inert placeholder; the kernel never reads it
+    }
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
@@ -1979,6 +1993,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     [enc setBuffer:b_in offset:0 atIndex:1];
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&dp length:sizeof(dp) atIndex:3];
+    [enc setBuffer:b_affine offset:0 atIndex:4];
     dispatch2(enc, c.pipe("rob_upscale_dogson"), dp.out_w, dp.out_h);
     [enc endEncoding];
     return true;
@@ -2226,7 +2241,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    false))
+                    false, /*use_affine=*/cfg.affine_flow_enabled))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
