@@ -566,6 +566,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.guide_curve = tuning[@"guide_curve"].intValue;
     if (tuning[@"robustness_per_channel"])
         cfg.robustness_per_channel = tuning[@"robustness_per_channel"].boolValue;
+    if (tuning[@"robustness_min_upsample_bilinear"])
+        cfg.robustness_min_upsample_bilinear = tuning[@"robustness_min_upsample_bilinear"].boolValue;
     if (tuning[@"hf_artifact_removal_enabled"])
         cfg.hf_artifact_removal_enabled = tuning[@"hf_artifact_removal_enabled"].boolValue;
     if (tuning[@"hf_variance_loss_threshold"])

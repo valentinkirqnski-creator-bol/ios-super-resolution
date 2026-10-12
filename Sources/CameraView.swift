@@ -1197,6 +1197,11 @@ struct CameraView: View {
                          Builds a separate robustness mask for each guide colour channel (R, G, B) with per-channel noise statistics and Wiener shrink, the way ImageStackAlignator does, instead of one scalar mask summed across channels. Lets a coloured edge or a single-channel mismatch be rejected on the channel it actually affects. Needs the 3-channel RGB guide, so turning this on automatically switches the robustness guide off the single-channel full-res grey (it would otherwise have nothing to split) onto the half-res RGB guide ISA uses. Off = the 460-main single cross-channel mask.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Smooth Mask Upsample", isOn: $cam.tuningParams.robustness_min_upsample_bilinear)
+                    Text("""
+                         The robustness mask's 5×5 minimum (Wronski Eq. 9) is computed on the half-resolution guide and brought back to full resolution. Off (default) = nearest, so every 2×2 pixel block gets one value — the mask has hard, square edges. On = bilinear, which ramps between cells for rounder, smoother mask contours. Trade-off: interpolating a minimum raises the values along a rejected↔kept seam, so it softens the rejection boundary and can let back a sliver of what the mask rejected (ghosts on moving/repetitive edges). Cosmetic unless you're chasing blocky mask artifacts; measure the result.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
