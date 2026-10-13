@@ -1364,8 +1364,10 @@ void lk_refine_level_fresh(const Image& ref, const Image& moving,
 
             int n_new = 0;
             const f32 cost_new = tile_cost(dx, dy, n_new);
+            // Same relative margin as the affine refine: a noise-level win must
+            // not move a tile that block matching already placed correctly.
             if (std::isfinite(cost_new) && n_new * 4 >= n_seed * 3 &&
-                cost_new < cost_seed) {
+                cost_new < 0.98f * cost_seed) {
                 flow.dx(ty, tx) = dx;
                 flow.dy(ty, tx) = dy;
             }
@@ -1561,8 +1563,14 @@ void affine_ica_refine(FlowField& flow, const Image& ref_grey,
             // and without losing a large part of the tile's coverage).
             int n_new = 0;
             const f32 cost_new = tile_cost(th, n_new);
+            // Relative margin, not any-improvement: on a near-still burst the
+            // true J is ~0 and a noise-level SSD win would otherwise accept a
+            // spurious Jacobian whose edge pixels then disagree with the
+            // neighbouring tiles -- a thin dark/colored seam along the tile
+            // side. A genuine within-tile correction improves the tile far
+            // beyond 2%.
             if (std::isfinite(cost_new) && n_new * 4 >= n_seed * 3 &&
-                cost_new < cost_seed) {
+                cost_new < 0.98f * cost_seed) {
                 flow.dx(ty, tx) = th[0];
                 flow.dy(ty, tx) = th[1];
                 J[0] = th[2]; J[1] = th[3]; J[2] = th[4]; J[3] = th[5];

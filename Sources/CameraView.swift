@@ -1153,6 +1153,11 @@ struct CameraView: View {
                          Refines every pyramid level's block-match result with 3 Lucas–Kanade iterations against that level's pixels (fresh implementation: damped Gauss–Newton, step clamp, and a per-tile gate so no tile can end worse than its seed). Sub-pixel accuracy at each level stops coarse-level errors being multiplied by the upsample factor on the way to finer levels. The finest-level refinement still runs as always; this adds the between-level polish. Runs on both GPU and CPU aligners; the refined flow feeds the mask and merge as usual.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Reject Ambiguous Shifts", isOn: $cam.tuningParams.align_ambiguous_fallback_enabled)
+                    Text("""
+                         ImageStackAlignator's rule: when a tile's best and second-best block-match costs are nearly tied — a flat patch, repeating texture, or a STEADY handheld burst where there is almost no motion and noise picks the winner — apply NO shift and keep the seed instead of trusting a coin-flip match. Measured to halve the scattered wrong tile shifts on near-still bursts (the usual cause of rare tile-edge-shaped dark/colored lines in an otherwise clean output), at ~4% cost on rotating bursts.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Half-Tile Refinement", isOn: $cam.tuningParams.halftile_refine_enabled)
                     Text("""
                          After registration finishes, every motion tile is split into four half-size children: each child starts from the tile's affine model at its own centre, keeps the parent's reliability statistics (so the rejection mask doesn't over-fire on the finer grid), and is then re-measured against the pixels with a safety gate — a child with too little texture keeps its seed. The mask and merge then use the finer field. Robustness of the full tile search, spatial resolution of the half tile: helps where motion changes INSIDE a tile (subject edges, depth boundaries); smooth camera motion is already handled exactly by Affine Tile Motion. Works with the CPU and GPU pipelines.

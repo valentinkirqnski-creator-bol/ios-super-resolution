@@ -3509,7 +3509,9 @@ kernel void lk_refine_fresh(device float* flow [[buffer(0)]],
     int n_new = 0;
     float cost_new = lk_fresh_cost(ref, mov, p, oy, ox, dx, dy, n_new);
     if (n_new * 4 < n_seed * 3) return;
-    if (!(cost_new < cost_seed)) return;   // never worse than the seed
+    // Relative margin (twin of lk_refine_level_fresh): a noise-level SSD win
+    // must not move a tile that block matching already placed correctly.
+    if (!(cost_new < 0.98f * cost_seed)) return;
     flow[fi + 0u] = dx;
     flow[fi + 1u] = dy;
 }
