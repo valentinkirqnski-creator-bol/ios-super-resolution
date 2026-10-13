@@ -44,6 +44,13 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 f32 r_Mt, int num_threads,
                                 int guide_tile_size = 0);
 
+// Fresh per-level Lucas-Kanade (Config::lk_every_level_enabled): per-tile
+// inverse-compositional GN translation refinement against one pyramid level,
+// Levenberg-damped, step-clamped, with a per-tile SSD accept gate.
+void lk_refine_level_fresh(const Image& ref, const Image& moving,
+                           int tile_size, FlowField& flow, int n_iter,
+                           int num_threads);
+
 // HDR+ sub-pixel block matching (Config::bm_subpixel_enabled): LS-quadratic fit
 // on the 3x3 L2 cost neighbourhood around each tile's integer shift; PD + [-1,1]
 // safeguards, L2 levels only. tile_size is the level's grey tile size.

@@ -558,6 +558,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_upsample_candidates = tuning[@"flow_upsample_candidates"].boolValue;
     if (tuning[@"bm_subpixel_enabled"])
         cfg.bm_subpixel_enabled = tuning[@"bm_subpixel_enabled"].boolValue;
+    if (tuning[@"lk_every_level_enabled"])
+        cfg.lk_every_level_enabled = tuning[@"lk_every_level_enabled"].boolValue;
     if (tuning[@"real_rgb_guide"])
         cfg.real_rgb_guide = tuning[@"real_rgb_guide"].boolValue;
     if (tuning[@"guide_white_balance"])

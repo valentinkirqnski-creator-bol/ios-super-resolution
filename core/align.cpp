@@ -1233,6 +1233,147 @@ void bm_subpixel_refine_level(const Image& ref, const Image& moving,
     });
 }
 
+// ---- fresh per-level Lucas-Kanade (Config::lk_every_level_enabled) ----------
+//
+// Independent implementation (not the 1.4 ica_every_level path): per tile,
+// refine the translation d by inverse-compositional Gauss-Newton against this
+// pyramid level's pixels, minimising sum (moving(p + d) - ref(p))^2.
+//
+//   - Template gradients: NORMALIZED central differences of the reference,
+//     g = (ref(p+1) - ref(p-1)) / 2, so Gauss-Newton steps are full-size.
+//   - The 2x2 Hessian H = sum g g^T comes from the reference alone (the
+//     inverse-compositional property), computed once per tile, with Levenberg
+//     damping lambda = 1e-4 * tr(H) so an aperture-limited tile's weak
+//     direction stays at its seed instead of being flung by a near-singular
+//     solve.
+//   - Each iteration samples the moving image by clamped bilinear at p + d,
+//     accumulates b = -sum g * (mov - ref), steps d += H^-1 b, with the step
+//     clamped to +-1.5 px (the refinement polishes a verified seed; it must
+//     not wander out of the region block matching actually evaluated).
+//   - Accept gate: the tile's mean per-pixel SSD must IMPROVE over the seed
+//     (with >= 3/4 of the seed's coverage), else the tile reverts -- no tile
+//     can leave this function worse than block matching left it.
+//
+// Runs at EVERY level, immediately after the block match and before the
+// upscale multiplies whatever error is left by the upsample factor.
+void lk_refine_level_fresh(const Image& ref, const Image& moving,
+                           int tile_size, FlowField& flow, int n_iter,
+                           int num_threads) {
+    const int ny = flow.ny, nx = flow.nx, ts = tile_size;
+    if (ny <= 0 || nx <= 0 || ts <= 0 || flow.flow.empty()) return;
+    if (ref.data.size() != (size_t)ref.h * ref.w * ref.c ||
+        moving.data.size() != (size_t)moving.h * moving.w * moving.c)
+        return;
+    const int iters = std::max(1, n_iter);
+
+    auto sample_bilin = [](const Image& img, f32 y, f32 x) -> f32 {
+        y = std::min(std::max(y, 0.f), (f32)(img.h - 1));
+        x = std::min(std::max(x, 0.f), (f32)(img.w - 1));
+        const int y0 = (int)y, x0 = (int)x;
+        const int y1 = std::min(y0 + 1, img.h - 1);
+        const int x1 = std::min(x0 + 1, img.w - 1);
+        const f32 fy = y - (f32)y0, fx = x - (f32)x0;
+        const f32 top = img.at(y0, x0) + (img.at(y0, x1) - img.at(y0, x0)) * fx;
+        const f32 bot = img.at(y1, x0) + (img.at(y1, x1) - img.at(y1, x0)) * fx;
+        return top + (bot - top) * fy;
+    };
+    auto grad_at = [&](int y, int x, f32& gx, f32& gy) {
+        const int xl = std::max(0, x - 1), xr = std::min(ref.w - 1, x + 1);
+        const int yu = std::max(0, y - 1), yd = std::min(ref.h - 1, y + 1);
+        gx = 0.5f * (ref.at(y, xr) - ref.at(y, xl));
+        gy = 0.5f * (ref.at(yd, x) - ref.at(yu, x));
+    };
+
+    parallel_rows(ny, num_threads, [&](int ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            const int oy = ty * ts, ox = tx * ts;
+            if (oy >= ref.h || ox >= ref.w) continue;
+            const f32 seed_x = flow.dx(ty, tx), seed_y = flow.dy(ty, tx);
+            f32 dx = seed_x, dy = seed_y;
+
+            // Template Hessian (fixed across iterations).
+            f32 Sxx = 0.f, Sxy = 0.f, Syy = 0.f;
+            for (int v = 0; v < ts; ++v) {
+                const int py = oy + v;
+                if (py >= ref.h) break;
+                for (int u = 0; u < ts; ++u) {
+                    const int px = ox + u;
+                    if (px >= ref.w) break;
+                    f32 gx, gy;
+                    grad_at(py, px, gx, gy);
+                    Sxx += gx * gx; Sxy += gx * gy; Syy += gy * gy;
+                }
+            }
+            const f32 lm = 1e-4f * (Sxx + Syy) + 1e-12f;
+            const f32 h00 = Sxx + lm, h11 = Syy + lm, h01 = Sxy;
+            const f32 det = h00 * h11 - h01 * h01;
+            if (!(det > 0.f)) continue;
+            const f32 idet = 1.f / det;
+
+            // Mean per-pixel SSD of a displacement (out-of-frame samples skipped).
+            auto tile_cost = [&](f32 ddx, f32 ddy, int& n_valid) -> f32 {
+                f32 ssd = 0.f; n_valid = 0;
+                for (int v = 0; v < ts; ++v) {
+                    const int py = oy + v;
+                    if (py >= ref.h) break;
+                    const f32 wy = (f32)py + ddy;
+                    if (wy < 0.f || wy > (f32)(moving.h - 1)) continue;
+                    for (int u = 0; u < ts; ++u) {
+                        const int px = ox + u;
+                        if (px >= ref.w) break;
+                        const f32 wx = (f32)px + ddx;
+                        if (wx < 0.f || wx > (f32)(moving.w - 1)) continue;
+                        const f32 r = sample_bilin(moving, wy, wx) - ref.at(py, px);
+                        ssd += r * r;
+                        ++n_valid;
+                    }
+                }
+                return (n_valid > 0) ? ssd / (f32)n_valid
+                                     : std::numeric_limits<f32>::infinity();
+            };
+            int n_seed = 0;
+            const f32 cost_seed = tile_cost(seed_x, seed_y, n_seed);
+            if (n_seed < ts * ts / 4) continue;
+
+            for (int it = 0; it < iters; ++it) {
+                f32 bx = 0.f, by = 0.f;
+                for (int v = 0; v < ts; ++v) {
+                    const int py = oy + v;
+                    if (py >= ref.h) break;
+                    const f32 wy = (f32)py + dy;
+                    if (wy < 0.f || wy > (f32)(moving.h - 1)) continue;
+                    for (int u = 0; u < ts; ++u) {
+                        const int px = ox + u;
+                        if (px >= ref.w) break;
+                        const f32 wx = (f32)px + dx;
+                        if (wx < 0.f || wx > (f32)(moving.w - 1)) continue;
+                        const f32 r = sample_bilin(moving, wy, wx) - ref.at(py, px);
+                        f32 gx, gy;
+                        grad_at(py, px, gx, gy);
+                        bx -= gx * r;
+                        by -= gy * r;
+                    }
+                }
+                f32 sx = idet * (h11 * bx - h01 * by);
+                f32 sy = idet * (-h01 * bx + h00 * by);
+                if (!std::isfinite(sx) || !std::isfinite(sy)) { dx = seed_x; dy = seed_y; break; }
+                const f32 mag = std::sqrt(sx * sx + sy * sy);
+                if (mag > 1.5f) { sx *= 1.5f / mag; sy *= 1.5f / mag; }
+                dx += sx; dy += sy;
+            }
+
+            int n_new = 0;
+            const f32 cost_new = tile_cost(dx, dy, n_new);
+            if (std::isfinite(cost_new) && n_new * 4 >= n_seed * 3 &&
+                cost_new < cost_seed) {
+                flow.dx(ty, tx) = dx;
+                flow.dy(ty, tx) = dy;
+            }
+            // else: keep the block-match seed.
+        }
+    });
+}
+
 // ---- measured per-tile affine (Config::affine_flow_enabled) -----------------
 //
 // fit_affine INFERS the Jacobian by differentiating the measured per-tile
@@ -1684,6 +1825,11 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         // removed before the upsample factor multiplies it.
         if (cfg.bm_subpixel_enabled && metric != "L1")
             bm_subpixel_refine_level(r, m, ts, flow, cfg.num_threads);
+        // Fresh per-level LK (Config::lk_every_level_enabled): polish this
+        // level's translations to sub-pixel BEFORE the upscale multiplies the
+        // residual by the upsample factor. Independent of ica_every_level().
+        if (cfg.lk_every_level_enabled)
+            lk_refine_level_fresh(r, m, ts, flow, cfg.ica_n_iter, cfg.num_threads);
 
         // alignment.py align_lvl: block matching, then ICA, at this level --
         // before the flow is upscaled and its error multiplied.

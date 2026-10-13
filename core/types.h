@@ -718,6 +718,19 @@ struct Config {
     // math on the CPU and Metal aligners. Off by default.
     bool bm_subpixel_enabled = false;
 
+    // Fresh per-level Lucas-Kanade refinement (independent implementation, not
+    // the 1.4 ica_every_level path): after EVERY pyramid level's block match,
+    // refine each tile's translation by inverse-compositional Gauss-Newton
+    // against that level's pixels -- normalized central-difference template
+    // gradients, Levenberg-damped 2x2 solve, per-iteration step clamp, and a
+    // per-tile SSD accept gate so no tile leaves worse than its seed. The point
+    // is BETWEEN levels: each level's residual error is multiplied by the
+    // upsample factor on the way down, so polishing to sub-pixel before the
+    // upscale keeps every finer search inside its radius and the final ICA
+    // inside its basin. The finest-level production ICA still runs afterwards.
+    // Off by default.
+    bool lk_every_level_enabled = false;
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

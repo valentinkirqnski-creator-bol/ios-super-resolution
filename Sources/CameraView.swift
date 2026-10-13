@@ -1148,6 +1148,11 @@ struct CameraView: View {
                          HDR+'s quadratic sub-pixel refinement: after each pyramid level's integer search, a quadratic is fitted to the 3×3 cost surface around the best shift and the flow moves to its analytic minimum (L2 levels only, with positive-definite and ±1 px safeguards). Removes the ±0.5 px per-level quantisation before it is multiplied by the upsample factor on the way to finer levels. The final Lucas–Kanade refinement already provides sub-pixel at the finest level, so expect the effect between levels, mostly on fine texture and larger motion. Runs on both GPU and CPU aligners.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Per-Level LK Refinement", isOn: $cam.tuningParams.lk_every_level_enabled)
+                    Text("""
+                         Refines every pyramid level's block-match result with 3 Lucas–Kanade iterations against that level's pixels (fresh implementation: damped Gauss–Newton, step clamp, and a per-tile gate so no tile can end worse than its seed). Sub-pixel accuracy at each level stops coarse-level errors being multiplied by the upsample factor on the way to finer levels. The finest-level refinement still runs as always; this adds the between-level polish. Runs on both GPU and CPU aligners; the refined flow feeds the mask and merge as usual.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)
                     Text("""
                          Experimental. A full local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. The affine is now MEASURED per tile against the pixels (6-parameter Gauss-Newton refinement seeded by the neighbour fit; a tile is kept only if it provably improves), and the robustness mask scores exactly the same affine correspondence the merge fetches — previously the mask used the plain per-tile vector while the merge warped affinely. Does not model sharp depth or moving-object edges — robustness still handles those.

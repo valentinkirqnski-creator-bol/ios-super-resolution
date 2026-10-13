@@ -220,6 +220,7 @@ static MetalCtx& ctx() {
             "pyr_conv_y", "pyr_conv_x", "pyr_subsample",
             "align_sobel_x", "align_sobel_y", "align_hessian",
             "align_upscale_flow", "align_upscale_flow_460", "bm_subpixel_refine",
+            "lk_refine_fresh",
             "align_upscale_flow_bilinear",
             "merge_normalize_rgb16",
             nullptr};
@@ -2952,6 +2953,44 @@ static bool l2_bufs(id<MTLBuffer> ref_img, id<MTLBuffer> mov_img, id<MTLBuffer> 
     return wait_slot(0) && wait_slot(1);
 }
 
+// Fresh per-level LK refinement (Config::lk_every_level_enabled): one thread
+// per tile, twin of lk_refine_level_fresh in align.cpp. Non-fatal at the call
+// site -- a failed refine costs precision, not the frame.
+static bool lk_fresh_bufs(id<MTLBuffer> b_ref, id<MTLBuffer> b_mov,
+                          id<MTLBuffer> b_flow, int ref_h, int ref_w,
+                          int mov_h, int mov_w, int ny, int nx, int ts,
+                          int n_iter) {
+    if (ny <= 0 || nx <= 0 || ts <= 0) return true;
+    auto& c = ctx();
+    struct LkFreshParamsCPU {
+        uint32_t ref_h, ref_w, mov_h, mov_w;
+        uint32_t flow_ny, flow_nx, tile_size, n_iter;
+    };
+    static_assert(sizeof(LkFreshParamsCPU) == 32, "LkFreshParamsCPU");
+    LkFreshParamsCPU p{};
+    p.ref_h = (uint32_t)ref_h;
+    p.ref_w = (uint32_t)ref_w;
+    p.mov_h = (uint32_t)mov_h;
+    p.mov_w = (uint32_t)mov_w;
+    p.flow_ny = (uint32_t)ny;
+    p.flow_nx = (uint32_t)nx;
+    p.tile_size = (uint32_t)ts;
+    p.n_iter = (uint32_t)std::max(1, n_iter);
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return false;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_flow offset:0 atIndex:0];
+    [enc setBuffer:b_ref offset:0 atIndex:1];
+    [enc setBuffer:b_mov offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    dispatch2(enc, c.pipe("lk_refine_fresh"), (uint32_t)nx, (uint32_t)ny);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "align:lk-fresh");
+    align_commit(cmd);
+    return true;
+}
+
 // HDR+ sub-pixel block-match refinement (Config::bm_subpixel_enabled): one
 // thread per tile, twin of bm_subpixel_refine_level in align.cpp. Non-fatal by
 // design at the call site -- a failed refine costs precision, not the frame.
@@ -3783,6 +3822,10 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         if (cfg.bm_subpixel_enabled && metric != "L1")
             (void)bm_subpixel_bufs(b_ref, m.img, b_flow, r.h, r.w,
                                    m.h, m.w, ny, nx, ts);
+        // Fresh per-level LK (Config::lk_every_level_enabled); non-fatal.
+        if (cfg.lk_every_level_enabled)
+            (void)lk_fresh_bufs(b_ref, m.img, b_flow, r.h, r.w,
+                                m.h, m.w, ny, nx, ts, cfg.ica_n_iter);
 
         // alignment.py align_lvl: block matching, then ICA, on this level --
         // before upscale_flow multiplies whatever error is left by the

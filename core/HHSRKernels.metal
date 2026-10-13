@@ -3381,6 +3381,139 @@ struct AlignUpscaleParams {
 };
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
+struct LkFreshParams {
+    uint ref_h, ref_w, mov_h, mov_w;
+    uint flow_ny, flow_nx;
+    uint tile_size;
+    uint n_iter;
+};
+
+// Fresh per-level Lucas-Kanade (Config::lk_every_level_enabled). Twin of
+// lk_refine_level_fresh in align.cpp: inverse-compositional GN per tile with
+// normalized central-difference template gradients, Levenberg damping, a
+// 1.5 px per-iteration step clamp, and a per-tile SSD accept gate (a tile can
+// never leave worse than its block-match seed). One thread per tile.
+inline float lk_fresh_bilin(device const float* img, uint w, int h_limit,
+                            int w_limit, float y, float x) {
+    int y0 = int(y), x0 = int(x);
+    int y1 = min(y0 + 1, h_limit - 1), x1 = min(x0 + 1, w_limit - 1);
+    float fy = y - float(y0), fx = x - float(x0);
+    float top = img[uint(y0) * w + uint(x0)] +
+                (img[uint(y0) * w + uint(x1)] - img[uint(y0) * w + uint(x0)]) * fx;
+    float bot = img[uint(y1) * w + uint(x0)] +
+                (img[uint(y1) * w + uint(x1)] - img[uint(y1) * w + uint(x0)]) * fx;
+    return top + (bot - top) * fy;
+}
+
+// Mean per-pixel SSD of displacement (ddx,ddy); OOB samples skipped.
+inline float lk_fresh_cost(device const float* ref, device const float* mov,
+                           constant LkFreshParams& p, int oy, int ox,
+                           float ddx, float ddy, thread int& n_valid) {
+    const int ts = int(p.tile_size);
+    const int rh = int(p.ref_h), rw = int(p.ref_w);
+    const int mh = int(p.mov_h), mw = int(p.mov_w);
+    float ssd = 0.f; n_valid = 0;
+    for (int v = 0; v < ts; ++v) {
+        int py = oy + v;
+        if (py >= rh) break;
+        float wy = float(py) + ddy;
+        if (wy < 0.f || wy > float(mh - 1)) continue;
+        for (int u = 0; u < ts; ++u) {
+            int px = ox + u;
+            if (px >= rw) break;
+            float wx = float(px) + ddx;
+            if (wx < 0.f || wx > float(mw - 1)) continue;
+            float r = lk_fresh_bilin(mov, p.mov_w, mh, mw, wy, wx) -
+                      ref[uint(py) * p.ref_w + uint(px)];
+            ssd += r * r;
+            ++n_valid;
+        }
+    }
+    return (n_valid > 0) ? ssd / float(n_valid) : INFINITY;
+}
+
+kernel void lk_refine_fresh(device float* flow [[buffer(0)]],
+                            device const float* ref [[buffer(1)]],
+                            device const float* mov [[buffer(2)]],
+                            constant LkFreshParams& p [[buffer(3)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.flow_nx || gid.y >= p.flow_ny) return;
+    uint fi = (gid.y * p.flow_nx + gid.x) * 2u;
+    const int ts = int(p.tile_size);
+    const int oy = int(gid.y) * ts, ox = int(gid.x) * ts;
+    const int rh = int(p.ref_h), rw = int(p.ref_w);
+    const int mh = int(p.mov_h), mw = int(p.mov_w);
+    if (oy >= rh || ox >= rw) return;
+    const float seed_x = flow[fi + 0u], seed_y = flow[fi + 1u];
+    float dx = seed_x, dy = seed_y;
+
+    // Template Hessian from normalized central-difference ref gradients.
+    float Sxx = 0.f, Sxy = 0.f, Syy = 0.f;
+    for (int v = 0; v < ts; ++v) {
+        int py = oy + v;
+        if (py >= rh) break;
+        int yu = max(0, py - 1), yd = min(rh - 1, py + 1);
+        for (int u = 0; u < ts; ++u) {
+            int px = ox + u;
+            if (px >= rw) break;
+            int xl = max(0, px - 1), xr = min(rw - 1, px + 1);
+            float gx = 0.5f * (ref[uint(py) * p.ref_w + uint(xr)] -
+                               ref[uint(py) * p.ref_w + uint(xl)]);
+            float gy = 0.5f * (ref[uint(yd) * p.ref_w + uint(px)] -
+                               ref[uint(yu) * p.ref_w + uint(px)]);
+            Sxx += gx * gx; Sxy += gx * gy; Syy += gy * gy;
+        }
+    }
+    float lm = 1e-4f * (Sxx + Syy) + 1e-12f;
+    float h00 = Sxx + lm, h11 = Syy + lm, h01 = Sxy;
+    float det = h00 * h11 - h01 * h01;
+    if (!(det > 0.f)) return;
+    float idet = 1.f / det;
+
+    int n_seed = 0;
+    float cost_seed = lk_fresh_cost(ref, mov, p, oy, ox, seed_x, seed_y, n_seed);
+    if (n_seed < ts * ts / 4) return;
+
+    for (uint it = 0u; it < max(p.n_iter, 1u); ++it) {
+        float bx = 0.f, by = 0.f;
+        for (int v = 0; v < ts; ++v) {
+            int py = oy + v;
+            if (py >= rh) break;
+            float wy = float(py) + dy;
+            if (wy < 0.f || wy > float(mh - 1)) continue;
+            int yu = max(0, py - 1), yd = min(rh - 1, py + 1);
+            for (int u = 0; u < ts; ++u) {
+                int px = ox + u;
+                if (px >= rw) break;
+                float wx = float(px) + dx;
+                if (wx < 0.f || wx > float(mw - 1)) continue;
+                float r = lk_fresh_bilin(mov, p.mov_w, mh, mw, wy, wx) -
+                          ref[uint(py) * p.ref_w + uint(px)];
+                int xl = max(0, px - 1), xr = min(rw - 1, px + 1);
+                float gx = 0.5f * (ref[uint(py) * p.ref_w + uint(xr)] -
+                                   ref[uint(py) * p.ref_w + uint(xl)]);
+                float gy = 0.5f * (ref[uint(yd) * p.ref_w + uint(px)] -
+                                   ref[uint(yu) * p.ref_w + uint(px)]);
+                bx -= gx * r;
+                by -= gy * r;
+            }
+        }
+        float sx = idet * (h11 * bx - h01 * by);
+        float sy = idet * (-h01 * bx + h00 * by);
+        if (!isfinite(sx) || !isfinite(sy)) { dx = seed_x; dy = seed_y; break; }
+        float mag = sqrt(sx * sx + sy * sy);
+        if (mag > 1.5f) { sx *= 1.5f / mag; sy *= 1.5f / mag; }
+        dx += sx; dy += sy;
+    }
+
+    int n_new = 0;
+    float cost_new = lk_fresh_cost(ref, mov, p, oy, ox, dx, dy, n_new);
+    if (n_new * 4 < n_seed * 3) return;
+    if (!(cost_new < cost_seed)) return;   // never worse than the seed
+    flow[fi + 0u] = dx;
+    flow[fi + 1u] = dy;
+}
+
 struct BmSubpixelParams {
     uint ref_h, ref_w, mov_h, mov_w;
     uint flow_ny, flow_nx;
