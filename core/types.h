@@ -706,6 +706,18 @@ struct Config {
     bool flow_upsample_candidates = true;
     bool use_candidate_flow_upsample() const { return flow_upsample_candidates; }
 
+    // Sub-pixel block matching (HDR+, Hasinoff et al. 2016 supplement): after a
+    // level's integer search, fit a least-squares quadratic to the 3x3 L2 cost
+    // neighbourhood around the chosen shift and move to its analytic minimum
+    // (positive-definite Hessian required, offset clamped to +-1, L2 levels only
+    // -- a parabola on a piecewise-linear L1 surface is biased). 460-main removed
+    // this step because final ICA supersedes it at the finest level; the value
+    // here is BETWEEN levels, where each level's +-0.5 px quantisation is
+    // multiplied by the upsample factor before the next level must absorb it.
+    // Runs as a separate refine pass after each level's block match, identical
+    // math on the CPU and Metal aligners. Off by default.
+    bool bm_subpixel_enabled = false;
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

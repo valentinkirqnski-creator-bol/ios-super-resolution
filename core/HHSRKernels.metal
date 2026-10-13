@@ -3381,6 +3381,72 @@ struct AlignUpscaleParams {
 };
 
 // upscale_flow nearest (default.yaml): repeat then scale by upsample_factor; pad 0
+struct BmSubpixelParams {
+    uint ref_h, ref_w, mov_h, mov_w;
+    uint flow_ny, flow_nx;
+    uint tile_size;
+    uint _pad0;
+};
+
+// HDR+ sub-pixel refinement of a level's integer block-match shifts
+// (Config::bm_subpixel_enabled): recompute the 3x3 L2 cost neighbourhood around
+// round(flow), fit the least-squares quadratic over x,y in {-1,0,1} and move to
+// its analytic minimum -- positive-definite Hessian required, offset clamped to
+// [-1,1], any out-of-bounds cost sample keeps the integer shift. Exact twin of
+// bm_subpixel_refine_level in align.cpp. One thread per tile.
+kernel void bm_subpixel_refine(device float* flow [[buffer(0)]],
+                               device const float* ref [[buffer(1)]],
+                               device const float* mov [[buffer(2)]],
+                               constant BmSubpixelParams& p [[buffer(3)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.flow_nx || gid.y >= p.flow_ny) return;
+    uint fi = (gid.y * p.flow_nx + gid.x) * 2u;
+    int ts = int(p.tile_size);
+    int oy = int(gid.y) * ts, ox = int(gid.x) * ts;
+    int bx = lround_away(flow[fi + 0u]);
+    int by = lround_away(flow[fi + 1u]);
+    float D[3][3];
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            float acc = 0.f;
+            for (int v = 0; v < ts; ++v) {
+                int ry = oy + v;
+                int myy = ry + by + i;
+                if (ry >= int(p.ref_h) || myy < 0 || myy >= int(p.mov_h)) return;
+                for (int u = 0; u < ts; ++u) {
+                    int rx = ox + u;
+                    int mxx = rx + bx + j;
+                    if (rx >= int(p.ref_w) || mxx < 0 || mxx >= int(p.mov_w)) return;
+                    float d = ref[uint(ry) * p.ref_w + uint(rx)] -
+                              mov[uint(myy) * p.mov_w + uint(mxx)];
+                    acc += d * d;
+                }
+            }
+            D[i + 1][j + 1] = acc;
+        }
+    float S0 = 0.f, Sx = 0.f, Sy = 0.f, Sxx = 0.f, Syy = 0.f, Sxy = 0.f;
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            float val = D[i + 1][j + 1];
+            S0 += val; Sx += float(j) * val; Sy += float(i) * val;
+            Sxx += float(j * j) * val; Syy += float(i * i) * val;
+            Sxy += float(i * j) * val;
+        }
+    float d1 = Sx / 6.f, e1 = Sy / 6.f, c1 = Sxy / 4.f;
+    float T = (3.f * (Sxx + Syy) - 4.f * S0) / 6.f;
+    float a1 = 0.5f * T + 0.25f * (Sxx - Syy);
+    float b1 = 0.5f * T - 0.25f * (Sxx - Syy);
+    float det = 4.f * a1 * b1 - c1 * c1;
+    if (!(a1 > 0.f) || !(det > 0.f)) return;
+    float mux = -(2.f * b1 * d1 - c1 * e1) / det;
+    float muy = (c1 * d1 - 2.f * a1 * e1) / det;
+    if (!isfinite(mux) || !isfinite(muy)) return;
+    mux = clamp(mux, -1.f, 1.f);
+    muy = clamp(muy, -1.f, 1.f);
+    flow[fi + 0u] = float(bx) + mux;
+    flow[fi + 1u] = float(by) + muy;
+}
+
 kernel void align_upscale_flow(device const float* in_flow [[buffer(0)]],
                                device float* out_flow [[buffer(1)]],
                                constant AlignUpscaleParams& p [[buffer(2)]],

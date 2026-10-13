@@ -44,6 +44,12 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 f32 r_Mt, int num_threads,
                                 int guide_tile_size = 0);
 
+// HDR+ sub-pixel block matching (Config::bm_subpixel_enabled): LS-quadratic fit
+// on the 3x3 L2 cost neighbourhood around each tile's integer shift; PD + [-1,1]
+// safeguards, L2 levels only. tile_size is the level's grey tile size.
+void bm_subpixel_refine_level(const Image& ref, const Image& moving,
+                              int tile_size, FlowField& flow, int num_threads);
+
 // Measured per-tile affine (Config::affine_flow_enabled): refine each tile's
 // 6-DOF warp W(p)=p+d+J*off(p) by inverse-compositional Gauss-Newton against the
 // pixels, seeded by fit_affine's inferred Jacobian; a tile is accepted only when

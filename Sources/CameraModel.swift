@@ -191,6 +191,11 @@ struct TuningParams: Equatable, Codable {
     /// Forced OFF by align_match_14, which is what 1.4 does.
     /// Default true: 460-main uses the three-candidate content-aware upscale.
     var flow_upsample_candidates: Bool = true
+    /// HDR+ sub-pixel block matching: after each pyramid level's integer search,
+    /// fit a quadratic to the 3x3 cost neighbourhood and move to its analytic
+    /// minimum (L2 levels only, PD + range safeguards). Removes the ±0.5 px
+    /// quantisation before the upsample factor multiplies it between levels.
+    var bm_subpixel_enabled: Bool = false
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -413,6 +418,7 @@ struct TuningParams: Equatable, Codable {
         case isa_prealign_enabled, isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
+        case bm_subpixel_enabled
         case robustness_per_channel
         case robustness_min_upsample_bilinear
         case robustness_perceptual_sqrt
@@ -514,6 +520,7 @@ struct TuningParams: Equatable, Codable {
         isa_prealign_rot_range_deg = try c.decodeIfPresent(Float.self, forKey: .isa_prealign_rot_range_deg) ?? isa_prealign_rot_range_deg
         isa_prealign_refine_dim = try c.decodeIfPresent(Int.self, forKey: .isa_prealign_refine_dim) ?? isa_prealign_refine_dim
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
+        bm_subpixel_enabled = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_enabled) ?? bm_subpixel_enabled
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2319,6 +2326,7 @@ final class CameraModel: NSObject, ObservableObject {
             "isa_prealign_rot_range_deg": NSNumber(value: tuningParams.isa_prealign_rot_range_deg),
             "isa_prealign_refine_dim": NSNumber(value: tuningParams.isa_prealign_refine_dim),
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
+            "bm_subpixel_enabled": NSNumber(value: tuningParams.bm_subpixel_enabled),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

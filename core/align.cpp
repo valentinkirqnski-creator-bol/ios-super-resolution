@@ -1157,6 +1157,82 @@ FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor
     return flow;
 }
 
+// ---- sub-pixel block matching (Config::bm_subpixel_enabled) -----------------
+//
+// HDR+'s quadratic sub-pixel refinement (Hasinoff et al. 2016, supplement):
+// recompute the 3x3 L2 cost neighbourhood around each tile's chosen integer
+// shift and fit the least-squares quadratic
+//
+//   f(x,y) = a x^2 + b y^2 + c xy + d x + e y + g      over x,y in {-1,0,1}
+//
+// whose analytic minimum mu = -H^-1 grad (H = [2a c; c 2b], grad = (d,e)) is the
+// sub-pixel offset. Safeguards per HDR+: the fit is used only when every cost in
+// the window is finite/in-bounds and H is positive definite, and mu is clamped
+// to [-1,1]; otherwise the integer shift stands. The refined value replaces any
+// fractional carry in the seed -- it is a MEASURED sub-pixel position around the
+// integer centre the search actually evaluated. 460-main removed this step
+// because final ICA supersedes it at the finest level; its value in this port is
+// between levels, where integer quantisation is amplified by the upsample factor.
+void bm_subpixel_refine_level(const Image& ref, const Image& moving,
+                              int tile_size, FlowField& flow,
+                              int num_threads) {
+    const int ny = flow.ny, nx = flow.nx, ts = tile_size;
+    if (ny <= 0 || nx <= 0 || ts <= 0 || flow.flow.empty()) return;
+    parallel_rows(ny, num_threads, [&](int ty) {
+        for (int tx = 0; tx < nx; ++tx) {
+            const int oy = ty * ts, ox = tx * ts;
+            const int bx = cuda_round_to_int(flow.dx(ty, tx));
+            const int by = cuda_round_to_int(flow.dy(ty, tx));
+            f32 D[3][3];
+            bool ok = true;
+            for (int i = -1; i <= 1 && ok; ++i) {
+                for (int j = -1; j <= 1 && ok; ++j) {
+                    f32 acc = 0.f;
+                    for (int v = 0; v < ts && ok; ++v) {
+                        const int ry = oy + v;
+                        if (ry >= ref.h) { ok = false; break; }
+                        const int myy = ry + by + i;
+                        if (myy < 0 || myy >= moving.h) { ok = false; break; }
+                        for (int u = 0; u < ts; ++u) {
+                            const int rx = ox + u;
+                            if (rx >= ref.w) { ok = false; break; }
+                            const int mxx = rx + bx + j;
+                            if (mxx < 0 || mxx >= moving.w) { ok = false; break; }
+                            const f32 d = ref.at(ry, rx) - moving.at(myy, mxx);
+                            acc += d * d;
+                        }
+                    }
+                    D[i + 1][j + 1] = acc;
+                }
+            }
+            if (!ok) continue;
+            f32 S0 = 0.f, Sx = 0.f, Sy = 0.f, Sxx = 0.f, Syy = 0.f, Sxy = 0.f;
+            for (int i = -1; i <= 1; ++i)
+                for (int j = -1; j <= 1; ++j) {
+                    const f32 val = D[i + 1][j + 1];
+                    S0 += val;
+                    Sx += (f32)j * val;       Sy += (f32)i * val;
+                    Sxx += (f32)(j * j) * val; Syy += (f32)(i * i) * val;
+                    Sxy += (f32)(i * j) * val;
+                }
+            // Closed-form LS solution on the symmetric 3x3 design.
+            const f32 d1 = Sx / 6.f, e1 = Sy / 6.f, c1 = Sxy / 4.f;
+            const f32 T = (3.f * (Sxx + Syy) - 4.f * S0) / 6.f;   // a + b
+            const f32 a1 = 0.5f * T + 0.25f * (Sxx - Syy);
+            const f32 b1 = 0.5f * T - 0.25f * (Sxx - Syy);
+            const f32 det = 4.f * a1 * b1 - c1 * c1;              // det(H)
+            if (!(a1 > 0.f) || !(det > 0.f)) continue;            // not a PD minimum
+            f32 mux = -(2.f * b1 * d1 - c1 * e1) / det;
+            f32 muy = (c1 * d1 - 2.f * a1 * e1) / det;
+            if (!std::isfinite(mux) || !std::isfinite(muy)) continue;
+            mux = std::min(std::max(mux, -1.f), 1.f);             // HDR+ range clamp
+            muy = std::min(std::max(muy, -1.f), 1.f);
+            flow.dx(ty, tx) = (f32)bx + mux;
+            flow.dy(ty, tx) = (f32)by + muy;
+        }
+    });
+}
+
 // ---- measured per-tile affine (Config::affine_flow_enabled) -----------------
 //
 // fit_affine INFERS the Jacobian by differentiating the measured per-tile
@@ -1602,6 +1678,12 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
             block_match_level_L1(r, m, ts, radius, flow, cfg, cfg.num_threads);
         else
             block_match_level_L2(r, m, ts, radius, flow, cfg, cfg.num_threads);
+        // HDR+ sub-pixel refinement of this level's integer shifts (L2 levels
+        // only; a parabola on a piecewise-linear L1 surface is biased). Runs
+        // BEFORE the upscale to the next level, so the +-0.5 px quantisation is
+        // removed before the upsample factor multiplies it.
+        if (cfg.bm_subpixel_enabled && metric != "L1")
+            bm_subpixel_refine_level(r, m, ts, flow, cfg.num_threads);
 
         // alignment.py align_lvl: block matching, then ICA, at this level --
         // before the flow is upscaled and its error multiplied.
