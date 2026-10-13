@@ -44,6 +44,16 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                                 f32 r_Mt, int num_threads,
                                 int guide_tile_size = 0);
 
+// Half-tile final refinement (Config::halftile_refine_enabled): subdivide the
+// finished RAW-GRID flow 2x2 (children affine-seeded at their centres, parent
+// statistics and J/2 carried), then gated-LK polish in grey coordinates.
+// raw_tile_size is the PARENT raw tile; consumers must then index the flow at
+// raw_tile_size/2. comp_grey must be the grey align() actually matched (the
+// warped one under global pre-alignment).
+void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
+                               const Image& comp_grey, const Config& cfg,
+                               int raw_tile_size, int raw_h, int raw_w);
+
 // Fresh per-level Lucas-Kanade (Config::lk_every_level_enabled): per-tile
 // inverse-compositional GN translation refinement against one pyramid level,
 // Levenberg-damped, step-clamped, with a per-tile SSD accept gate.

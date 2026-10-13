@@ -731,6 +731,19 @@ struct Config {
     // Off by default.
     bool lk_every_level_enabled = false;
 
+    // Half-tile final refinement: after registration is finished, subdivide the
+    // raw-grid flow 2x2 (each tile -> four children), seed every child from the
+    // per-tile AFFINE model at the child's own centre (so rotation/zoom carries
+    // over exactly, not a plain parent copy), carry the PARENT-measured flow
+    // statistics (motion prior, match ambiguity, aperture flag) and the halved
+    // Jacobian to the children, then polish each child with the gated LK.
+    // Robustness and the merge then index the flow at half the tile size. The
+    // point is motion DISCONTINUITIES (subject/depth boundaries) that one model
+    // per 16px tile cannot follow; for smooth camera motion the affine model
+    // already carries the field exactly, so children revert to it where 8px of
+    // evidence cannot beat it. Off by default.
+    bool halftile_refine_enabled = false;
+
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and
     // robustness sample the per-pixel affine displacement (FlowField::

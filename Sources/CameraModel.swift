@@ -201,6 +201,12 @@ struct TuningParams: Equatable, Codable {
     /// with a per-tile accept gate (never worse than the seed). Polishes the
     /// seed BEFORE the upsample factor multiplies its error between levels.
     var lk_every_level_enabled: Bool = false
+    /// Half-tile final refinement: subdivide the finished flow 2x2 (children
+    /// seeded from the per-tile affine model, parent flow statistics carried so
+    /// the mask's priors don't inflate), then a gated LK polish per child; the
+    /// mask and merge consume the flow at half the tile size. Targets motion
+    /// DISCONTINUITIES (subject/depth boundaries) one tile model can't follow.
+    var halftile_refine_enabled: Bool = false
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -423,7 +429,7 @@ struct TuningParams: Equatable, Codable {
         case isa_prealign_enabled, isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
-        case bm_subpixel_enabled, lk_every_level_enabled
+        case bm_subpixel_enabled, lk_every_level_enabled, halftile_refine_enabled
         case robustness_per_channel
         case robustness_min_upsample_bilinear
         case robustness_perceptual_sqrt
@@ -527,6 +533,7 @@ struct TuningParams: Equatable, Codable {
         flow_upsample_candidates = try c.decodeIfPresent(Bool.self, forKey: .flow_upsample_candidates) ?? flow_upsample_candidates
         bm_subpixel_enabled = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_enabled) ?? bm_subpixel_enabled
         lk_every_level_enabled = try c.decodeIfPresent(Bool.self, forKey: .lk_every_level_enabled) ?? lk_every_level_enabled
+        halftile_refine_enabled = try c.decodeIfPresent(Bool.self, forKey: .halftile_refine_enabled) ?? halftile_refine_enabled
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2334,6 +2341,7 @@ final class CameraModel: NSObject, ObservableObject {
             "flow_upsample_candidates": NSNumber(value: tuningParams.flow_upsample_candidates),
             "bm_subpixel_enabled": NSNumber(value: tuningParams.bm_subpixel_enabled),
             "lk_every_level_enabled": NSNumber(value: tuningParams.lk_every_level_enabled),
+            "halftile_refine_enabled": NSNumber(value: tuningParams.halftile_refine_enabled),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

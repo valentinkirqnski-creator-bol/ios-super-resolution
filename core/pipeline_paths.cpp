@@ -1236,7 +1236,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.gyro_prealign_enabled ||
                               work.affine_flow_enabled ||
                               work.flow_fb_consistency_enabled ||
-                              work.flow_consensus_enabled);
+                              work.flow_consensus_enabled ||
+                              work.halftile_refine_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1356,6 +1357,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     const int tile_size = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
     // Grid the flow consumers (grey->raw regrid, robustness, merge) index at.
     const int cons_ts = tile_size;
+    // Half-tile final refinement subdivides the finished raw-grid flow 2x2, so
+    // everything that CONSUMES the flow (robustness + merge) indexes it at half
+    // the tile; alignment itself and flow_to_raw_tile_grid stay on the parent.
+    const int merge_ts = work.halftile_refine_enabled
+        ? std::max(1, cons_ts / 2) : cons_ts;
     // Output dimensions are known as soon as the reference is, and the online
     // merge needs its accumulator before the first frame is analyzed.
     const int out_h = (int)std::lround(work.scale * (f32)ref_h);
@@ -1802,6 +1808,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // (Config::affine_flow_enabled); leaves flow.affine_jac empty otherwise
         // so every consumer keeps the plain per-tile vector.
         if (work.affine_flow_enabled && !flow.has_affine()) flow.fit_affine();
+        // Half-tile final refinement (Config::halftile_refine_enabled): children
+        // affine-seeded, parent statistics carried, gated LK polish. From here on
+        // the flow is a 2x grid indexed at merge_ts by robustness and the merge.
+        if (work.halftile_refine_enabled)
+            halftile_subdivide_refine(flow, ref_grey,
+                                      gw.warped ? gw.warped_grey : comp_grey,
+                                      work, cons_ts, comp.h, comp.w);
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
@@ -1836,7 +1849,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // Keep rob ∥ kernels serialized — dual Metal peaks jetsam on 1×.
             const double t_rob = prof_now_ms();
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
-                                                  cons_ts, work,
+                                                  merge_ts, work,
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr,
@@ -1865,7 +1878,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             std::future<CovField> cov_fut =
                 std::async(std::launch::async, [&]() { worker_qos(); return estimate_kernels(comp, work); });
             rob = compute_robustness_and_activity(comp, ref_stats, flow,
-                                                  cons_ts, work,
+                                                  merge_ts, work,
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr,
@@ -1906,7 +1919,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 online_skip_rejected++;
             } else if (comp.h <= 0 || comp.w <= 0) {
                 online_skip_nodata++;
-            } else if (!merge_comp_band(comp, flow, covs, rob, cons_ts,
+            } else if (!merge_comp_band(comp, flow, covs, rob, merge_ts,
                                         num_sink, den_sink, 0, work, k)) {
                 // The GPU refused the frame -- geometry, an allocation, or the
                 // upload. Dropping that silently is how a burst ends up as the
@@ -2335,7 +2348,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             const uint16_t* rows = nullptr;
             const bool got = metal_merge_band_fused(
                 fused_slots.data(), (int)fused_slots.size(), ref_index,
-                y0, bh, Hs, Ws, nch, cons_ts, work,
+                y0, bh, Hs, Ws, nch, merge_ts, work,
                 prev_step, ph, pw, pscale, band_index & 1, &rows);
             if (!got || !rows) { fused_ok = false; break; }
             // Wait for the write two bands back before handing out a new one: the
@@ -2421,12 +2434,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     continue;
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
-                    merge_comp_band(empty, meta.flow, meta.covs, meta.rob, cons_ts,
+                    merge_comp_band(empty, meta.flow, meta.covs, meta.rob, merge_ts,
                                     num_band, den_band, y0, work, meta.index);
                     continue;
                 }
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
-                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, cons_ts,
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
@@ -2437,12 +2450,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     continue;
                 if (metal_merge_has_frame(fc.index)) {
                     Image empty;
-                    merge_comp_band(empty, fc.flow, fc.covs, fc.rob, cons_ts,
+                    merge_comp_band(empty, fc.flow, fc.covs, fc.rob, merge_ts,
                                     num_band, den_band, y0, work, fc.index);
                     continue;
                 }
                 if (fc.comp.h <= 0) continue;
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, cons_ts,
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
                                 num_band, den_band, y0, work, fc.index);
             }
         }
@@ -2529,7 +2542,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                     work.scale, work.bayer_mode))
                     continue;
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
-                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, cons_ts,
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
@@ -2538,7 +2551,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
                                                     work.scale, work.bayer_mode))
                     continue;
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, cons_ts,
+                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
                                 num_band, den_band, y0, work, fc.index);
             }
         }

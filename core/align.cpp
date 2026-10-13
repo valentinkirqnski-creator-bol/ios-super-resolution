@@ -1572,6 +1572,94 @@ void affine_ica_refine(FlowField& flow, const Image& ref_grey,
     });
 }
 
+// ---- half-tile final refinement (Config::halftile_refine_enabled) -----------
+//
+// Subdivide the FINISHED raw-grid flow 2x2 and polish the children:
+//   - each child is seeded by the parent's AFFINE model evaluated at the
+//     child's own centre (sample_affine), so the seed already carries the
+//     measured rotation/zoom -- a plain parent copy would re-centre the model
+//     wrongly inside each child;
+//   - the parent-measured statistics are carried verbatim (motion prior,
+//     match ambiguity, aperture) -- re-measuring them on the finer, noisier
+//     grid is what would inflate the mask's s1 flagging and geometry test;
+//   - the Jacobian is carried as J/2: a child tile unit spans half the parent
+//     tile, so the same per-pixel gradient is half per tile unit;
+//   - each child is then refined by the gated LK (lk_refine_level_fresh) in
+//     grey coordinates, so a child whose 8 px of evidence cannot beat the
+//     affine seed REVERTS to it -- small-tile estimation noise never enters
+//     the field. On the half-res decimate grey a child is only ~4 grey px and
+//     the refinement is skipped (seeding + carry still apply).
+// Downstream, robustness and the merge index the result at half the tile size
+// -- the consumption shape the overlapping-tiles experiment already proved.
+void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
+                               const Image& comp_grey, const Config& cfg,
+                               int raw_tile_size, int raw_h, int raw_w) {
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || raw_tile_size < 2)
+        return;
+    if (!flow.has_affine()) flow.fit_affine();  // seed model (inferred is fine)
+    const int ny2 = flow.ny * 2, nx2 = flow.nx * 2;
+    const int ts2 = raw_tile_size / 2;
+    FlowField out(ny2, nx2);
+    const bool carry_m = flow.has_motion_prior();
+    if (carry_m) out.motion_irregular.assign((size_t)ny2 * nx2, 0u);
+    const bool carry_j = flow.has_affine();
+    if (carry_j) out.affine_jac.assign((size_t)ny2 * (size_t)nx2 * 4, 0.f);
+    const bool carry_ap =
+        flow.aperture_limited.size() == (size_t)flow.ny * flow.nx;
+    const bool carry_am =
+        flow.match_ambiguous.size() == (size_t)flow.ny * flow.nx;
+    for (int cy = 0; cy < ny2; ++cy) {
+        const int pyt = std::min(cy / 2, flow.ny - 1);
+        for (int cx = 0; cx < nx2; ++cx) {
+            const int pxt = std::min(cx / 2, flow.nx - 1);
+            const f32 ccx = ((f32)cx + 0.5f) * (f32)ts2;
+            const f32 ccy = ((f32)cy + 0.5f) * (f32)ts2;
+            f32 dx, dy;
+            flow.sample_affine(ccy, ccx, raw_tile_size, dx, dy);
+            out.dx(cy, cx) = dx;
+            out.dy(cy, cx) = dy;
+            if (carry_ap) out.aperture(cy, cx) = flow.aperture(pyt, pxt);
+            if (carry_am) out.ambiguous(cy, cx) = flow.ambiguous(pyt, pxt);
+            if (carry_m) out.irregular(cy, cx) = flow.irregular(pyt, pxt);
+            if (carry_j) {
+                const f32* Js = &flow.affine_jac[((size_t)pyt * flow.nx + pxt) * 4];
+                f32* Jd = &out.affine_jac[((size_t)cy * nx2 + cx) * 4];
+                for (int k = 0; k < 4; ++k) Jd[k] = Js[k] * 0.5f;
+            }
+        }
+    }
+    for (int i = 0; i < 9; ++i) out.global_h[i] = flow.global_h[i];
+    out.has_global_h = flow.has_global_h;
+
+    // Gated LK polish, in GREY coordinates (the flow is raw-grid; on the FFT
+    // grey they coincide, on the decimate grey positions and displacements both
+    // halve). Host pixels required on both sides; skipped otherwise -- the
+    // affine-seeded subdivision stands on its own.
+    const bool host =
+        ref_grey.h > 0 && raw_w > 0 && raw_h > 0 &&
+        ref_grey.data.size() == (size_t)ref_grey.h * ref_grey.w * ref_grey.c &&
+        comp_grey.data.size() == (size_t)comp_grey.h * comp_grey.w * comp_grey.c;
+    if (host) {
+        const f32 s = (f32)ref_grey.w / (f32)raw_w;
+        const int gts2 = (int)std::lround((f32)ts2 * s);
+        if (gts2 >= 6) {
+            if (ref_grey.w == raw_w && ref_grey.h == raw_h) {
+                lk_refine_level_fresh(ref_grey, comp_grey, gts2, out,
+                                      cfg.ica_n_iter, cfg.num_threads);
+            } else {
+                FlowField g = out;
+                for (size_t i = 0; i < g.flow.size(); ++i) g.flow[i] *= s;
+                lk_refine_level_fresh(ref_grey, comp_grey, gts2, g,
+                                      cfg.ica_n_iter, cfg.num_threads);
+                const f32 inv = (s > 0.f) ? 1.f / s : 1.f;
+                for (size_t i = 0; i < out.flow.size(); ++i)
+                    out.flow[i] = g.flow[i] * inv;
+            }
+        }
+    }
+    flow = std::move(out);
+}
+
 // align() — Python alignment.align
 // ref_grey must already be circular-padded (init_alignment); moving is NOT.
 // ============================================================================
