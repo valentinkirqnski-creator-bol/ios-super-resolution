@@ -1136,6 +1136,13 @@ struct CameraView: View {
                 }
 
                 Section(header: Text("Motion Model")) {
+                    Toggle("Bilinear Flow Upsample", isOn: Binding(
+                        get: { !cam.tuningParams.flow_upsample_candidates },
+                        set: { cam.tuningParams.flow_upsample_candidates = !$0 }))
+                    Text("""
+                         How the motion field is passed from each coarse pyramid level to the next finer one. OFF (default) = 460-main's candidate upsampling: each finer tile tests three candidate vectors (its own and two neighbours) against the actual pixels and keeps the best — robust at motion edges, but it can snap to a neighbour's vector and produce blocky flow. ON = Python 1.4's plain bilinear resize of the flow field — smooth flow that never re-tests against the image, so coarse-level mistakes are interpolated into the fine levels instead of being corrected. A/B on real bursts; affects the aligner on both the GPU and CPU paths.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)
                     Text("""
                          Experimental. A full local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. The affine is now MEASURED per tile against the pixels (6-parameter Gauss-Newton refinement seeded by the neighbour fit; a tile is kept only if it provably improves), and the robustness mask scores exactly the same affine correspondence the merge fetches — previously the mask used the plain per-tile vector while the merge warped affinely. Does not model sharp depth or moving-object edges — robustness still handles those.
