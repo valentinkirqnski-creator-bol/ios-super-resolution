@@ -2287,6 +2287,15 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         uint fd = (uint(ptd) * p.flow_nx + uint(patch_idx)) * 2u, fu = (uint(ptu) * p.flow_nx + uint(patch_idx)) * 2u;
         float gdxdx = (flow[fr + 0u] - flow[fl + 0u]) * i2, gdydx = (flow[fr + 1u] - flow[fl + 1u]) * i2;
         float gdxdy = (flow[fd + 0u] - flow[fu + 0u]) * i2, gdydy = (flow[fd + 1u] - flow[fu + 1u]) * i2;
+        // Affine-aware: the merge compensates the measured per-tile Jacobian
+        // (flow = d + J*off, off in tile units -> per-raw-px gradient J/ts), so
+        // only the RESIDUAL within-tile variation is a real fetch error.
+        if (p.affine_flow != 0u) {
+            uint ji = (uint(patch_idy) * p.flow_nx + uint(patch_idx)) * 4u;
+            float its = 1.0f / float(p.tile_size);
+            gdxdx -= affine_jac[ji + 0u] * its; gdxdy -= affine_jac[ji + 1u] * its;
+            gdydx -= affine_jac[ji + 2u] * its; gdydy -= affine_jac[ji + 3u] * its;
+        }
         float sc = (p.nch == 3u) ? 2.0f : 1.0f;
         float rawx = sc * float(gid.x) + 0.5f * (sc - 1.0f), rawy = sc * float(gid.y) + 0.5f * (sc - 1.0f);
         float u = rawx - (float(patch_idx) + 0.5f) * float(p.tile_size);
@@ -2388,6 +2397,16 @@ struct RobMaskRawParams {
     float edge_misalign_ghost_z;
     float edge_misalign_min_conf;
     uint per_channel;  // 1 = write a separate R per guide channel (ISA per-channel)
+    // Geometry-aware rejection (Config::motion_geom_reject_*) on the RAW-RES
+    // path -- previously guide-res only, leaving the Settings toggle inert on
+    // the shipping mask. Twin of RobMaskParams' geom_* block; affine_flow makes
+    // the test score only the residual beyond the measured per-tile Jacobian.
+    uint geom_reject_enabled;
+    float geom_reject_threshold;
+    uint geom_relative;
+    float geom_noise_floor_mult;
+    float geom_reject_threshold_relative;
+    uint affine_flow;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2507,6 +2526,8 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const uint* motion_magnitude_reject [[buffer(11)]],
                               device const uint* motion_irregular [[buffer(12)]],
                               device const float* ref_hf_loss [[buffer(13)]],
+                              device const float* flow [[buffer(14)]],
+                              device const float* affine_jac [[buffer(15)]],
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2584,7 +2605,51 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
         uint gx = min(gid.x / 2u, p.hf_w - 1u);
         hf_reject = ref_hf_loss[gy * p.hf_w + gx] > p.hf_variance_loss_threshold;
     }
-    bool hard_reject = (hf_reject || motion_magnitude_reject_tile);
+    // Geometry-aware rejection (raw-res twin of rob_make_mask's block; see
+    // compute_robustness_raw_res in robustness.cpp). Raw coordinates, so no
+    // guide-scale conversion; affine-aware: subtract the measured per-tile
+    // Jacobian (J/ts per raw px) so only the residual error can reject.
+    bool geom_reject = false;
+    if (p.geom_reject_enabled != 0u && p.flow_ny >= 3u && p.flow_nx >= 3u) {
+        int ptu = clamp(int(patch_idy) - 1, 0, int(p.flow_ny) - 1);
+        int ptd = clamp(int(patch_idy) + 1, 0, int(p.flow_ny) - 1);
+        int pxl = clamp(int(patch_idx) - 1, 0, int(p.flow_nx) - 1);
+        int pxr = clamp(int(patch_idx) + 1, 0, int(p.flow_nx) - 1);
+        float i2 = 1.0f / (2.0f * float(p.tile_size));
+        uint fr = (patch_idy * p.flow_nx + uint(pxr)) * 2u;
+        uint fl = (patch_idy * p.flow_nx + uint(pxl)) * 2u;
+        uint fd = (uint(ptd) * p.flow_nx + patch_idx) * 2u;
+        uint fu = (uint(ptu) * p.flow_nx + patch_idx) * 2u;
+        float gdxdx = (flow[fr + 0u] - flow[fl + 0u]) * i2;
+        float gdydx = (flow[fr + 1u] - flow[fl + 1u]) * i2;
+        float gdxdy = (flow[fd + 0u] - flow[fu + 0u]) * i2;
+        float gdydy = (flow[fd + 1u] - flow[fu + 1u]) * i2;
+        if (p.affine_flow != 0u) {
+            uint ji = (patch_idy * p.flow_nx + patch_idx) * 4u;
+            float its = 1.0f / float(p.tile_size);
+            gdxdx -= affine_jac[ji + 0u] * its; gdxdy -= affine_jac[ji + 1u] * its;
+            gdydx -= affine_jac[ji + 2u] * its; gdydy -= affine_jac[ji + 3u] * its;
+        }
+        float u = float(gid.x) - (float(patch_idx) + 0.5f) * float(p.tile_size);
+        float v = float(gid.y) - (float(patch_idy) + 0.5f) * float(p.tile_size);
+        float ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v;
+        float Emag = sqrt(ex * ex + ey * ey);
+        int xl = max(0, int(gid.x) - 1), xr = min(int(p.w) - 1, int(gid.x) + 1);
+        int yu = max(0, int(gid.y) - 1), yd = min(int(p.h) - 1, int(gid.y) + 1);
+        float gix = 0.5f * (ref_means[(gid.y * p.w + uint(xr)) * p.nch] -
+                            ref_means[(gid.y * p.w + uint(xl)) * p.nch]);
+        float giy = 0.5f * (ref_means[(uint(yd) * p.w + gid.x) * p.nch] -
+                            ref_means[(uint(yu) * p.w + gid.x) * p.nch]);
+        float gmag = sqrt(gix * gix + giy * giy);
+        geom_reject = (gmag * Emag) > p.geom_reject_threshold;
+        if (!geom_reject && p.geom_relative != 0u) {
+            float bri = rob_brightness(ref_means, p.h, p.w, p.nch, int(gid.y), int(gid.x));
+            float nsig = sqrt(max(p.alpha * bri + p.beta, 0.f));
+            float gmag_dn = max(0.f, gmag - p.geom_noise_floor_mult * nsig);
+            geom_reject = (gmag_dn / (bri + 1e-4f)) * Emag > p.geom_reject_threshold_relative;
+        }
+    }
+    bool hard_reject = (hf_reject || motion_magnitude_reject_tile || geom_reject);
     // Edge-misalignment confidence multiplier (1.0 when disabled/hard-rejected),
     // applied to every channel so the per-channel path stays consistent.
     float emc = 1.f;

@@ -1237,9 +1237,20 @@ struct CameraView: View {
                 Section(header: Text("Geometry Rejection")) {
                     Toggle("Reject Misaligned Motion", isOn: $cam.tuningParams.motion_geom_reject_enabled)
                     Text("""
-                         Drops frames' contribution in tiles where the aligned comparison frame disagrees geometrically with the reference — occlusion, subject motion, or a large residual misalignment the block search could not resolve. On by default; turning it off makes merging follow the plain reference algorithm, which can keep more detail on perfectly still scenes but may leave ghosts where anything moved.
+                         Rejects pixels where the per-tile motion model is provably a poor fit: the within-tile motion variation (predicted from the flow field's gradient), weighted by the reference edge strength |∇I|, exceeds the threshold. Off by default. Affine-aware: with Affine Tile Motion on, only the residual beyond the measured per-tile warp counts, so the two features compose instead of double-rejecting. Runs on the shipping (raw-resolution) mask on both GPU and CPU.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.motion_geom_reject_enabled {
+                        ispRow("Threshold |∇I|·|E|", $cam.tuningParams.motion_geom_reject_threshold, 0.0...0.06, "%.4f")
+                        Text("Lower = rejects more (0.0045 default; ~0.02 rejects ~15%, 0.06 near-inert).")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Exposure-Invariant (relative)", isOn: $cam.tuningParams.motion_geom_relative)
+                        if cam.tuningParams.motion_geom_relative {
+                            ispRow("Relative threshold", $cam.tuningParams.motion_geom_reject_threshold_relative, 0.0...0.2, "%.3f")
+                            Text("Contrast-weighted variant added on top, so the same misalignment is caught at any light level.")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
+                    }
                 }
 
                 Section(header: Text("Edge Misalignment Rejection")) {

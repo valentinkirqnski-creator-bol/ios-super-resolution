@@ -1697,8 +1697,17 @@ struct RobMaskRawParamsCPU {
     float    edge_misalign_ghost_z = 3.0f;
     float    edge_misalign_min_conf = 0.0f;
     uint32_t per_channel = 0;  // 1 = write a separate R per guide channel (ISA)
+    // Geometry-aware rejection on the raw-res path (twin of RobMaskParamsCPU's
+    // geom_* block); affine_flow = score only the residual beyond the measured
+    // per-tile Jacobian. Keep in lockstep with RobMaskRawParams in the .metal.
+    uint32_t geom_reject_enabled = 0;
+    float    geom_reject_threshold = 0.0045f;
+    uint32_t geom_relative = 0;
+    float    geom_noise_floor_mult = 1.5f;
+    float    geom_reject_threshold_relative = 0.04f;
+    uint32_t affine_flow = 0;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 116, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 140, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2362,6 +2371,22 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.edge_misalign_ghost_z = cfg.edge_misalign_ghost_z;
     mp.edge_misalign_min_conf = cfg.edge_misalign_min_conf;
     mp.per_channel = (rob_nch > 1u) ? 1u : 0u;
+    mp.geom_reject_enabled = cfg.motion_geom_reject_enabled ? 1u : 0u;
+    mp.geom_reject_threshold = cfg.motion_geom_reject_threshold;
+    mp.geom_relative = cfg.motion_geom_relative ? 1u : 0u;
+    mp.geom_noise_floor_mult = cfg.motion_geom_noise_floor_mult;
+    mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
+    const bool raw_geom_affine = cfg.affine_flow_enabled && flow.has_affine();
+    mp.affine_flow = raw_geom_affine ? 1u : 0u;
+    // Flow (+ optional Jacobian) for the geometry test. Bound unconditionally
+    // (the kernel declares them); inert single-element dummies when off.
+    id<MTLBuffer> b_geom_flow = !flow.flow.empty()
+        ? buf(flow.flow.data(), flow.flow.size() * sizeof(float))
+        : buf(nullptr, sizeof(float) * 2);
+    id<MTLBuffer> b_geom_affine = raw_geom_affine
+        ? buf(flow.affine_jac.data(), flow.affine_jac.size() * sizeof(float))
+        : b_geom_flow;
+    if (!b_geom_flow || !b_geom_affine) return Image();
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
@@ -2379,6 +2404,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:b_magnitude offset:0 atIndex:11];
     [enc setBuffer:b_motion offset:0 atIndex:12];
     [enc setBuffer:b_ref_hf offset:0 atIndex:13];
+    [enc setBuffer:b_geom_flow offset:0 atIndex:14];
+    [enc setBuffer:b_geom_affine offset:0 atIndex:15];
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 

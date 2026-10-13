@@ -1639,6 +1639,53 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                     continue;
                 }
             }
+            // Geometry-aware rejection (Config::motion_geom_reject_enabled) on the
+            // RAW-RES path -- previously it existed only on the guide-res path, so
+            // the Settings toggle was inert on the shipping (raw-res) mask. Twin
+            // of the guide-res block below, with raw coordinates throughout
+            // (ref_means is the Dodgson-upscaled raw-res stats, so sc == 1).
+            // AFFINE-AWARE: the merge compensates the measured per-tile Jacobian
+            // (flow = d + J*off, off in tile units -> per-raw-px gradient J/ts),
+            // so only the RESIDUAL within-tile variation is a real fetch error;
+            // with affine off J is absent and this reduces to the original test.
+            if (cfg.motion_geom_reject_enabled && flow.ny >= 3 && flow.nx >= 3) {
+                auto clt = [](int a, int hi) { return a < 0 ? 0 : (a >= hi ? hi - 1 : a); };
+                const int ptu = clt(patch_idy - 1, flow.ny), ptd = clt(patch_idy + 1, flow.ny);
+                const int pxl = clt(patch_idx - 1, flow.nx), pxr = clt(patch_idx + 1, flow.nx);
+                const f32 inv2ts = 1.f / (2.f * (f32)tile_size);
+                f32 gdxdx = (flow.dx(patch_idy, pxr) - flow.dx(patch_idy, pxl)) * inv2ts;
+                f32 gdydx = (flow.dy(patch_idy, pxr) - flow.dy(patch_idy, pxl)) * inv2ts;
+                f32 gdxdy = (flow.dx(ptd, patch_idx) - flow.dx(ptu, patch_idx)) * inv2ts;
+                f32 gdydy = (flow.dy(ptd, patch_idx) - flow.dy(ptu, patch_idx)) * inv2ts;
+                if (cfg.affine_flow_enabled && flow.has_affine()) {
+                    const f32* Jm = &flow.affine_jac[pidx * 4];
+                    const f32 its = 1.f / (f32)tile_size;
+                    gdxdx -= Jm[0] * its; gdxdy -= Jm[1] * its;
+                    gdydx -= Jm[2] * its; gdydy -= Jm[3] * its;
+                }
+                const f32 u = (f32)x - ((f32)patch_idx + 0.5f) * (f32)tile_size;
+                const f32 v = (f32)y - ((f32)patch_idy + 0.5f) * (f32)tile_size;
+                const f32 ex = gdxdx * u + gdxdy * v, ey = gdydx * u + gdydy * v;
+                const f32 Emag = std::sqrt(ex * ex + ey * ey);
+                const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
+                const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
+                const f32 gix = 0.5f * (ref_means.at(y, xr, 0) - ref_means.at(y, xl, 0));
+                const f32 giy = 0.5f * (ref_means.at(yd, x, 0) - ref_means.at(yu, x, 0));
+                const f32 gmag = std::sqrt(gix * gix + giy * giy);
+                bool geom_reject = (gmag * Emag) > cfg.motion_geom_reject_threshold;
+                if (!geom_reject && cfg.motion_geom_relative) {
+                    const f32 bri = guide_brightness(ref_means, y, x);
+                    const f32 nsig = std::sqrt(guide_noise_var(cfg, ref_means.c, 0, bri));
+                    const f32 gmag_dn = std::max(0.f, gmag - cfg.motion_geom_noise_floor_mult * nsig);
+                    geom_reject = (gmag_dn / (bri + 1e-4f)) * Emag >
+                                  cfg.motion_geom_reject_threshold_relative;
+                }
+                if (geom_reject) {
+                    for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = 0.f;
+                    if (s_select_out) s_select_out->at(y, x) = 0.f;
+                    continue;
+                }
+            }
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
             // design ("infinite will imply R = 0"), which makes d^2 +inf and the
             // Wiener shrink inf/inf = NaN; a non-finite r_val is forced to 0.
@@ -2153,10 +2200,18 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 const int ptu = clt(patch_idy - 1, flow.ny), ptd = clt(patch_idy + 1, flow.ny);
                 const int pxl = clt(patch_idx - 1, flow.nx), pxr = clt(patch_idx + 1, flow.nx);
                 const f32 inv2ts = 1.f / (2.f * (f32)tile_size);
-                const f32 gdxdx = (flow.dx(patch_idy, pxr) - flow.dx(patch_idy, pxl)) * inv2ts;
-                const f32 gdydx = (flow.dy(patch_idy, pxr) - flow.dy(patch_idy, pxl)) * inv2ts;
-                const f32 gdxdy = (flow.dx(ptd, patch_idx) - flow.dx(ptu, patch_idx)) * inv2ts;
-                const f32 gdydy = (flow.dy(ptd, patch_idx) - flow.dy(ptu, patch_idx)) * inv2ts;
+                f32 gdxdx = (flow.dx(patch_idy, pxr) - flow.dx(patch_idy, pxl)) * inv2ts;
+                f32 gdydx = (flow.dy(patch_idy, pxr) - flow.dy(patch_idy, pxl)) * inv2ts;
+                f32 gdxdy = (flow.dx(ptd, patch_idx) - flow.dx(ptu, patch_idx)) * inv2ts;
+                f32 gdydy = (flow.dy(ptd, patch_idx) - flow.dy(ptu, patch_idx)) * inv2ts;
+                // Affine-aware: the merge compensates the measured Jacobian
+                // (per-raw-px gradient J/ts), so test only the residual.
+                if (cfg.affine_flow_enabled && flow.has_affine()) {
+                    const f32* Jm = &flow.affine_jac[pidx * 4];
+                    const f32 its = 1.f / (f32)tile_size;
+                    gdxdx -= Jm[0] * its; gdxdy -= Jm[1] * its;
+                    gdydx -= Jm[2] * its; gdydy -= Jm[3] * its;
+                }
                 const f32 sc = (ref_stats.means.c == 3) ? 2.f : 1.f;
                 const f32 rawx = sc * (f32)x + 0.5f * (sc - 1.f);
                 const f32 rawy = sc * (f32)y + 0.5f * (sc - 1.f);
