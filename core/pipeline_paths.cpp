@@ -1824,11 +1824,26 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // merge/robustness then sample flow.dense per pixel. Must precede the
         // comp_grey free below.
         if (work.dense_flow_enabled) {
-            const int seed_ts = work.halftile_refine_enabled
-                                ? std::max(1, cons_ts / 2) : cons_ts;
-            dense_lk_refine(flow, ref_grey,
-                            gw.warped ? gw.warped_grey : comp_grey,
-                            work, seed_ts, comp.h, comp.w);
+            // Dense LK is a full-resolution host pass (its working planes plus
+            // the fp16 per-frame buffer the merge then holds). On a jetsam-
+            // sensitive device that transient peak, stacked on the analysis
+            // working set, can push a mid-burst frame over the memory kill
+            // threshold. Skip it when free memory is tight: the frame then
+            // keeps its tile/affine/half-tile flow (the merge and mask fall
+            // back consistently), which is correct, just not per-pixel. 0 means
+            // the query is unavailable (e.g. harness) -> proceed as before.
+            const uint64_t avail = prof_available_bytes();
+            const size_t need = (size_t)ref_grey.h * ref_grey.w * sizeof(float);
+            const uint64_t kDenseHeadroom = (uint64_t)need * 16ull + 300ull * 1024 * 1024;
+            if (avail != 0 && avail < kDenseHeadroom) {
+                prof_add_cpu("dense#skipped-lowmem", 1.0);
+            } else {
+                const int seed_ts = work.halftile_refine_enabled
+                                    ? std::max(1, cons_ts / 2) : cons_ts;
+                dense_lk_refine(flow, ref_grey,
+                                gw.warped ? gw.warped_grey : comp_grey,
+                                work, seed_ts, comp.h, comp.w);
+            }
         }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");

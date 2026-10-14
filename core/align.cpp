@@ -1690,15 +1690,20 @@ void dense_lk_refine(FlowField& flow, const Image& ref_grey,
 
     const Image gx = compute_sobel_gradx(ref_grey);
     const Image gy = compute_sobel_grady(ref_grey);
-    std::vector<f32> gx2(N), gy2(N), gxy(N);
-    for (size_t i = 0; i < N; ++i) {
-        const f32 a = gx.data[i], b = gy.data[i];
-        gx2[i] = a * a; gy2[i] = b * b; gxy[i] = a * b;
-    }
+    // Structure tensor via ONE scratch plane boxed three times, rather than
+    // three full gx2/gy2/gxy planes held at once -- at full-res grey each plane
+    // is tens of MB and the device is jetsam-sensitive, so the transient peak
+    // of this host pass matters.
     std::vector<f32> Axx, Ayy, Axy;
-    box_sum_sep(gx2, h, w, r, Axx, nt);
-    box_sum_sep(gy2, h, w, r, Ayy, nt);
-    box_sum_sep(gxy, h, w, r, Axy, nt);
+    {
+        std::vector<f32> scratch(N);
+        for (size_t i = 0; i < N; ++i) scratch[i] = gx.data[i] * gx.data[i];
+        box_sum_sep(scratch, h, w, r, Axx, nt);
+        for (size_t i = 0; i < N; ++i) scratch[i] = gy.data[i] * gy.data[i];
+        box_sum_sep(scratch, h, w, r, Ayy, nt);
+        for (size_t i = 0; i < N; ++i) scratch[i] = gx.data[i] * gy.data[i];
+        box_sum_sep(scratch, h, w, r, Axy, nt);
+    }
 
     // Noise-scaled eigenvalue floor: grey noise sigma from the median |second
     // difference| (robust to structure), squared-gradient noise ~2 sigma^2 per
