@@ -1782,8 +1782,13 @@ static void maybe_fb_correct(FlowField& flow, const Image& ref_grey,
     if (ref_grey.data.empty() || moving_grey.data.empty()) return;
 
     const int gts = cfg.grey_tile_size(tile_size);
-    Image comp_padded = pad_image_circular(moving_grey, gts);
-    Pyramid comp_pyr = build_pyramid(comp_padded, cfg.bm_factors);
+    Pyramid comp_pyr;
+    {
+        // Scope the padded copy so its ~full-frame float plane is freed before
+        // the backward align adds its own peak (build_pyramid copies level 0).
+        Image comp_padded = pad_image_circular(moving_grey, gts);
+        comp_pyr = build_pyramid(comp_padded, cfg.bm_factors);
+    }
 #ifdef __APPLE__
     // Forward align pinned the comp grey as sticky_grey; the backward moving is the
     // REFERENCE grey, which has the same dimensions, so align_metal would otherwise
@@ -1796,6 +1801,18 @@ static void maybe_fb_correct(FlowField& flow, const Image& ref_grey,
     g_fb_backward_active = false;
 #ifdef __APPLE__
     metal_invalidate_sticky_grey();  // leave nothing stale for the next frame's grey
+    // The backward align_metal keyed GPU cache entries (ref_level_buffer,
+    // prep_level_ica_gpu) on THIS frame's temporary pyramid/grey host pointers.
+    // Those caches were designed for the burst's one stable reference pyramid
+    // ("upload once per burst", 8 slots = two 4-level pyramids): the backward
+    // pass fills half the ring with dead keys every frame, and the next frame's
+    // temporaries routinely reallocate at the SAME heap addresses, so a stale
+    // "hit" silently aligns against the PREVIOUS frame's pixels. Dropping both
+    // caches here also releases the ~200MB of GPU buffers those dead entries
+    // would otherwise keep squatting between frames (jetsam pressure). Cost:
+    // the real reference levels re-upload next frame -- milliseconds, and FB
+    // is opt-in.
+    metal_clear_ref_ica_cache();
 #endif
     apply_fb_consistency(flow, bwd, gts, cfg);
 }
