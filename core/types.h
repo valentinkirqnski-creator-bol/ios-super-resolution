@@ -818,8 +818,10 @@ struct Config {
     // representation: it follows motion that varies continuously within a tile
     // down to the pixel, where the per-tile and even half-tile models cannot.
     // Eigenvalue-gated per pixel so flat/aperture regions keep the seed rather
-    // than drifting on noise. OFF by default; CPU merge/robustness consume it
-    // today (the Metal merge/robustness dense twin is a separate build).
+    // than drifting on noise. OFF by default. Consumed by BOTH the CPU and the
+    // Metal (on-device) merge + robustness: the per-pixel field is uploaded
+    // fp16 per frame (build 106), with a resident-memory cap that falls back to
+    // the tile flow for any frame that would exceed it.
     bool  dense_flow_enabled = false;
     int   dense_flow_iters = 5;        // Lucas-Kanade iterations
     int   dense_flow_radius = 2;       // window half-size (5x5 structure tensor)

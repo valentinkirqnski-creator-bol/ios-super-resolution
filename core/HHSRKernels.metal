@@ -893,6 +893,15 @@ struct MergeCompParams {
     float hmat[9];
     uint use_homography;
     uint rob_nch;   // channels in the robustness buffer (ISA per-channel: 3, else 1)
+    // Dense per-pixel flow (Config::dense_flow_enabled). When dense_flow, the
+    // comp sample position comes from the fp16 dense buffer (flow_sample_dense)
+    // instead of the tile/affine path; dense_w/h are the grey-pixel dims and
+    // dense_sx/sy the raw/grey scale.
+    uint dense_flow;
+    uint dense_w;
+    uint dense_h;
+    float dense_sx;
+    float dense_sy;
 };
 
 struct MergeRefParams {
@@ -1080,6 +1089,32 @@ inline void flow_sample_affine(device const float* flow, device const float* jac
     ody = flow[fi + 1u] + jac[ji + 2u] * offx + jac[ji + 3u] * offy;
 }
 
+// Dense per-pixel flow (Config::dense_flow_enabled). Mirror of
+// FlowField::sample_dense in types.h: raw (lr) coord -> grey via the raw/grey
+// scale (grey g at raw (s-1)/2 + s*g), bilinear on the fp16 grey-pixel
+// displacement, scaled back to raw. The buffer is half pairs [dx,dy] per grey
+// pixel, row-major dw wide. fp16: a per-pixel field for every burst frame is
+// held resident through the merge, so half storage keeps it affordable; the
+// sub-pixel precision near 1 px is ~0.001, well under the merge's needs.
+inline void flow_sample_dense(device const half* dense, uint dw, uint dh,
+                              float sx, float sy, float raw_y, float raw_x,
+                              thread float& odx, thread float& ody) {
+    float gy = (raw_y - 0.5f * (sy - 1.f)) / sy;
+    float gx = (raw_x - 0.5f * (sx - 1.f)) / sx;
+    int y0 = int(floor(gy)), x0 = int(floor(gx));
+    float ay = gy - float(y0), ax = gx - float(x0);
+    int iy0 = clamp(y0, 0, int(dh) - 1), iy1 = clamp(y0 + 1, 0, int(dh) - 1);
+    int ix0 = clamp(x0, 0, int(dw) - 1), ix1 = clamp(x0 + 1, 0, int(dw) - 1);
+    uint i00 = (uint(iy0) * dw + uint(ix0)) * 2u, i01 = (uint(iy0) * dw + uint(ix1)) * 2u;
+    uint i10 = (uint(iy1) * dw + uint(ix0)) * 2u, i11 = (uint(iy1) * dw + uint(ix1)) * 2u;
+    float tx = float(dense[i00 + 0u]) + (float(dense[i01 + 0u]) - float(dense[i00 + 0u])) * ax;
+    float bx = float(dense[i10 + 0u]) + (float(dense[i11 + 0u]) - float(dense[i10 + 0u])) * ax;
+    float ty = float(dense[i00 + 1u]) + (float(dense[i01 + 1u]) - float(dense[i00 + 1u])) * ax;
+    float by = float(dense[i10 + 1u]) + (float(dense[i11 + 1u]) - float(dense[i10 + 1u])) * ax;
+    odx = (tx + (bx - tx) * ay) * sx;
+    ody = (ty + (by - ty) * ay) * sy;
+}
+
 inline float sample_robustness_bilinear(device const float* robustness,
                                         uint h, uint w,
                                         float y, float x,
@@ -1116,6 +1151,7 @@ inline float sample_robustness_bilinear(device const float* robustness,
 static inline void merge_comp_contrib(device const float* img,
                                       device const float* flow,
                                       device const float* affine_jac,
+                                      device const half* dense,
                                       device const float* covs,
                                       device const float* robustness,
                                       constant MergeCompParams& p,
@@ -1130,7 +1166,12 @@ static inline void merge_comp_contrib(device const float* img,
     int px = int(lr_x / float(p.tile_size));
     int py = int(lr_y / float(p.tile_size));
     float flowx, flowy;
-    if (p.affine_flow != 0u) {
+    if (p.dense_flow != 0u) {
+        // Dense per-pixel flow takes precedence (the mask warp below samples
+        // it the same way, so parity holds).
+        flow_sample_dense(dense, p.dense_w, p.dense_h, p.dense_sx, p.dense_sy,
+                          lr_y, lr_x, flowx, flowy);
+    } else if (p.affine_flow != 0u) {
         flow_sample_affine(flow, affine_jac, p.flow_ny, p.flow_nx, lr_y, lr_x,
                            float(p.tile_size), flowx, flowy);
     } else if (p.flow_bilinear != 0u) {
@@ -1260,13 +1301,14 @@ kernel void merge_accumulate_comp(device float* num [[buffer(0)]],
                                   device const float* robustness [[buffer(5)]],
                                   constant MergeCompParams& p [[buffer(6)]],
                                   device const float* affine_jac [[buffer(7)]],
+                                  device const half* dense [[buffer(8)]],
                                   uint2 gid [[thread_position_in_grid]]) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
     if (hr_j >= p.Ws || local_i >= p.band_h) return;
 
     float v0 = 0.f, v1 = 0.f, v2 = 0.f, a0 = 0.f, a1 = 0.f, a2 = 0.f;
-    merge_comp_contrib(img, flow, affine_jac, covs, robustness, p, hr_j, local_i, v0, v1, v2, a0, a1, a2);
+    merge_comp_contrib(img, flow, affine_jac, dense, covs, robustness, p, hr_j, local_i, v0, v1, v2, a0, a1, a2);
 
     uint base = (local_i * p.Ws + hr_j) * p.nch;
     if (p.nch >= 1) { num[base + 0] += v0; den[base + 0] += a0; }
@@ -1309,6 +1351,10 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
                                      device const float* aff1 [[buffer(21)]],
                                      device const float* aff2 [[buffer(22)]],
                                      device const float* aff3 [[buffer(23)]],
+                                     device const half* dns0 [[buffer(24)]],
+                                     device const half* dns1 [[buffer(25)]],
+                                     device const half* dns2 [[buffer(26)]],
+                                     device const half* dns3 [[buffer(27)]],
                                      uint2 gid [[thread_position_in_grid]]) {
     uint hr_j = gid.x;
     uint local_i = gid.y;
@@ -1319,6 +1365,7 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     device const float* covss[4] = {cov0, cov1, cov2, cov3};
     device const float* robs[4] = {rob0, rob1, rob2, rob3};
     device const float* affs[4] = {aff0, aff1, aff2, aff3};
+    device const half* dnss[4] = {dns0, dns1, dns2, dns3};
 
     const uint nch = ps[0].nch;
     uint base = (local_i * ps[0].Ws + hr_j) * nch;
@@ -1329,7 +1376,7 @@ kernel void merge_accumulate_comp_x4(device float* num [[buffer(0)]],
     if (nch >= 3) { n2 = num[base + 2]; e2 = den[base + 2]; }
 
     for (uint g = 0; g < nframes && g < 4u; ++g) {
-        merge_comp_contrib(imgs[g], flows[g], affs[g], covss[g], robs[g], ps[g],
+        merge_comp_contrib(imgs[g], flows[g], affs[g], dnss[g], covss[g], robs[g], ps[g],
                            hr_j, local_i, n0, n1, n2, e0, e1, e2);
     }
 
@@ -1688,6 +1735,11 @@ struct RobDogsonParams {
     // warping the comparison statistics, so the mask scores exactly the
     // correspondence the merge fetches (flow_sample_affine, same as the merge).
     uint affine_flow;
+    // Dense per-pixel flow (Config::dense_flow_enabled): warp the comparison
+    // statistics by the dense field, the same correspondence the merge fetches.
+    uint dense_flow;
+    uint dense_w, dense_h;
+    float dense_sx, dense_sy;
 };
 
 struct RobMaskParams {
@@ -1942,11 +1994,16 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
                                device const float* flow [[buffer(2)]],
                                constant RobDogsonParams& p [[buffer(3)]],
                                device const float* affine_jac [[buffer(4)]],
+                               device const half* dense [[buffer(5)]],
                                uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.out_w || gid.y >= p.out_h) return;
     int y = int(gid.y), x = int(gid.x);
     float flow_x = 0.f, flow_y = 0.f;
-    if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
+    if (p.is_ref == 0u && p.dense_flow != 0u) {
+        // Dense per-pixel: y, x are RAW here, matching the merge's lr coords.
+        flow_sample_dense(dense, p.dense_w, p.dense_h, p.dense_sx, p.dense_sy,
+                          float(y), float(x), flow_x, flow_y);
+    } else if (p.is_ref == 0u && p.tile_size > 0u && p.flow_ny > 0u && p.flow_nx > 0u) {
         if (p.affine_flow != 0u) {
             // Per-tile affine: identical sampling to the merge kernel, so the
             // warped comparison statistics sit exactly where the merge fetches.
@@ -3896,6 +3953,7 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
                              device atomic_uint* diag      [[buffer(12)]],
                              device float* prev            [[buffer(13)]],
                              device const float* affines   [[buffer(14)]],
+                             device const half* denses     [[buffer(15)]],
                              uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= np.Ws || gid.y >= np.bh) return;
     const uint hr_j = gid.x;
@@ -3908,6 +3966,7 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
         merge_comp_contrib(imgs + ps[g].img_off,
                            flows + ps[g].flow_off,
                            affines + ps[g].affine_off,
+                           denses,                 // placeholder; this path sets dense_flow=0
                            covs + ps[g].cov_off,
                            robs + ps[g].rob_off,
                            ps[g], hr_j, local_i,

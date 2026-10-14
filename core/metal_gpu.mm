@@ -1632,8 +1632,16 @@ struct RobDogsonParamsCPU {
     // 1 = per-tile affine flow sampling for the comp-stats warp (mask/merge
     // correspondence parity under Config::affine_flow_enabled).
     uint32_t affine_flow = 0;
+    // Dense per-pixel flow (Config::dense_flow_enabled): warp the comp stats by
+    // the dense field so the mask grades the per-pixel correspondence the merge
+    // fetches. dense_w/h grey-pixel dims, dense_sx/sy raw/grey scale.
+    uint32_t dense_flow = 0;
+    uint32_t dense_w = 0;
+    uint32_t dense_h = 0;
+    float    dense_sx = 1.f;
+    float    dense_sy = 1.f;
 };
-static_assert(sizeof(RobDogsonParamsCPU) == 88, "RobDogsonParamsCPU");
+static_assert(sizeof(RobDogsonParamsCPU) == 108, "RobDogsonParamsCPU");
 
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
@@ -1949,7 +1957,8 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        int in_h, int in_w, int nch, bool is_ref,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
-                       bool flow_bilinear, bool use_affine = false) {
+                       bool flow_bilinear, bool use_affine = false,
+                       bool use_dense = false) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -1978,6 +1987,17 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     // Per-tile affine sampling (Config::affine_flow_enabled): only for the
     // comparison stats, and only when the Jacobian was actually fitted/measured.
     dp.affine_flow = (!is_ref && use_affine && flow && flow->has_affine()) ? 1u : 0u;
+    // Dense per-pixel flow for the comp-stats warp (mask/merge parity under
+    // Config::dense_flow_enabled). Takes precedence over tile/affine in the
+    // kernel; dims/scale from the flow.
+    const bool dense_on = (!is_ref && use_dense && flow && flow->has_dense());
+    dp.dense_flow = dense_on ? 1u : 0u;
+    if (dense_on) {
+        dp.dense_w = (uint32_t)flow->dense_w;
+        dp.dense_h = (uint32_t)flow->dense_h;
+        dp.dense_sx = flow->dense_sx;
+        dp.dense_sy = flow->dense_sy;
+    }
 
     id<MTLBuffer> b_flow = nil;
     if (!is_ref && flow && !flow->flow.empty()) {
@@ -1996,6 +2016,16 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     } else {
         b_affine = b_flow;  // inert placeholder; the kernel never reads it
     }
+    // fp16 dense buffer (inline conversion; build_dense_fp16 is defined later in
+    // the merge section). Placeholder = b_flow when off (never read as half).
+    id<MTLBuffer> b_dense = b_flow;
+    if (dense_on) {
+        const size_t n = flow->dense.size();
+        std::vector<__fp16> tmp(n);
+        for (size_t i = 0; i < n; ++i) tmp[i] = (__fp16)flow->dense[i];
+        id<MTLBuffer> bd = buf(tmp.data(), n * sizeof(__fp16));
+        if (!bd) { dp.dense_flow = 0u; } else { b_dense = bd; }
+    }
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
@@ -2004,6 +2034,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     [enc setBuffer:b_flow offset:0 atIndex:2];
     [enc setBytes:&dp length:sizeof(dp) atIndex:3];
     [enc setBuffer:b_affine offset:0 atIndex:4];
+    [enc setBuffer:b_dense offset:0 atIndex:5];
     dispatch2(enc, c.pipe("rob_upscale_dogson"), dp.out_w, dp.out_h);
     [enc endEncoding];
     return true;
@@ -2251,7 +2282,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
-                    false, /*use_affine=*/cfg.affine_flow_enabled))
+                    false, /*use_affine=*/cfg.affine_flow_enabled,
+                    /*use_dense=*/cfg.dense_flow_enabled))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
@@ -4030,11 +4062,18 @@ struct MergeCompParamsCPU {
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
     uint32_t use_homography = 0;
     // Channels in the robustness buffer: 3 for ISA per-channel R (Config::
-    // robustness_per_channel with a Bayer guide), else 1. Keep last to match
-    // MergeCompParams in HHSRKernels.metal.
+    // robustness_per_channel with a Bayer guide), else 1.
     uint32_t rob_nch = 1;
+    // Dense per-pixel flow (Config::dense_flow_enabled). Keep last to match
+    // MergeCompParams in HHSRKernels.metal. dense_w/h are grey-pixel dims,
+    // dense_sx/sy the raw/grey scale.
+    uint32_t dense_flow = 0;
+    uint32_t dense_w = 0;
+    uint32_t dense_h = 0;
+    float    dense_sx = 1.f;
+    float    dense_sy = 1.f;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 164, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 184, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -4096,6 +4135,12 @@ struct MergeFrameGpu {
     id<MTLBuffer> b_rob = nil;
     id<MTLBuffer> b_affine = nil;
     size_t img_b = 0, flow_b = 0, cov_b = 0, rob_b = 0, affine_b = 0;
+    // Dense per-pixel flow (Config::dense_flow_enabled), fp16, captured at
+    // upload like b_affine. dims/scale travel with it so the deferred merge can
+    // fill the params from the cache entry on the prefetch path.
+    id<MTLBuffer> b_dense = nil;
+    int dense_w = 0, dense_h = 0;
+    float dense_sx = 1.f, dense_sy = 1.f;
 };
 
 struct MergeRefGpu {
@@ -4144,6 +4189,7 @@ static void merge_enc_close() {
 static constexpr uint32_t kMergeFuseMax = 4u;
 struct PendingMergeComp {
     id<MTLBuffer> img = nil, flow = nil, cov = nil, rob = nil, affine = nil;
+    id<MTLBuffer> dense = nil;   // fp16 per-pixel flow (Config::dense_flow_enabled)
     MergeCompParamsCPU p{};
 };
 static std::vector<PendingMergeComp> g_merge_pending;
@@ -4218,6 +4264,11 @@ static bool merge_flush_pending() {
         // itself. The flow buffer stands in as a non-null placeholder when the
         // frame has no affine model (ps[].affine_flow == 0, kernel never reads).
         [enc setBuffer:(e.affine ? e.affine : e.flow) offset:0 atIndex:20u + i];
+        // Dense per-pixel flow (buffers 24-27). The flow buffer stands in as a
+        // non-null placeholder when the frame has no dense field (ps[].dense_flow
+        // == 0, kernel never reads it as half). Bound to a half* arg, which
+        // Metal accepts as a raw byte reinterpretation that is never read.
+        [enc setBuffer:(e.dense ? e.dense : e.flow) offset:0 atIndex:24u + i];
     }
     dispatch2(enc, c.pipe("merge_accumulate_comp_x4"), ps[0].Ws, ps[0].band_h);
     g_merge_pending.clear();
@@ -4245,6 +4296,27 @@ static bool copy_into(id<MTLBuffer> slot, const f32* data, size_t nbytes) {
     return true;
 }
 
+// Dense per-pixel flow (Config::dense_flow_enabled) is fp16 and one buffer per
+// frame, held in the frame cache through the whole merge, so a long burst could
+// OOM/jetsam. Cap the total resident: over budget a frame simply gets no dense
+// buffer and the merge falls back to its tile/affine flow for that frame --
+// correct, just not per-pixel there. Reset per burst in metal_merge_begin_burst.
+static size_t g_dense_resident_bytes = 0;
+static constexpr size_t kDenseResidentBudget = 900ull * 1024ull * 1024ull;
+
+// fp16 (dx,dy) buffer from a float dense field; nil if absent or over budget.
+static id<MTLBuffer> build_dense_fp16(const FlowField& flow) {
+    if (!flow.has_dense()) return nil;
+    const size_t n = flow.dense.size();                 // dh*dw*2
+    const size_t bytes = n * sizeof(__fp16);
+    if (g_dense_resident_bytes + bytes > kDenseResidentBudget) return nil;
+    std::vector<__fp16> tmp(n);
+    for (size_t i = 0; i < n; ++i) tmp[i] = (__fp16)flow.dense[i];
+    id<MTLBuffer> b = buf(tmp.data(), bytes);
+    if (b) g_dense_resident_bytes += bytes;
+    return b;
+}
+
 // Resolve comparison-frame GPU buffers. Prefer frame_key (>=0) so streamed
 // scratch Images (same CPU pointer, new pixels) still hit across bands.
 // Cache hit does not require CPU img/flow/rob pointers (skip disk reload).
@@ -4252,7 +4324,8 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
                               const CovField& covs, const Image& rob, int frame_key,
                               __strong id<MTLBuffer>& b_img, __strong id<MTLBuffer>& b_flow,
                               __strong id<MTLBuffer>& b_cov, __strong id<MTLBuffer>& b_rob,
-                              __strong id<MTLBuffer>& b_affine) {
+                              __strong id<MTLBuffer>& b_affine,
+                              __strong id<MTLBuffer>& b_dense) {
     const f32* ip = img.data.empty() ? nullptr : img.data.data();
     const f32* fp = flow.flow.empty() ? nullptr : flow.flow.data();
     const f32* cp = covs.cov.empty() ? nullptr : covs.cov.data();
@@ -4270,6 +4343,7 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         b_cov = e.b_cov;
         b_rob = e.b_rob;
         b_affine = e.b_affine;   // nil when the burst has no affine model
+        b_dense = e.b_dense;     // nil when the frame has no dense field / over budget
         if (!b_cov) {
             static float kDummyCov[4] = {1.f, 0.f, 0.f, 1.f};
             b_cov = buf(kDummyCov, sizeof(kDummyCov));
@@ -4315,6 +4389,11 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
             e.b_cov = cov_b ? buf(cp, cov_b) : nil;
             e.b_rob = buf(rp, rob_b);
             e.b_affine = affine_b ? buf(ap, affine_b) : nil;
+            e.b_dense = build_dense_fp16(flow);  // nil = absent/over budget -> tile fallback
+            e.dense_w = flow.has_dense() ? flow.dense_w : 0;
+            e.dense_h = flow.has_dense() ? flow.dense_h : 0;
+            e.dense_sx = flow.dense_sx;
+            e.dense_sy = flow.dense_sy;
             if (!e.b_img || !e.b_flow || !e.b_rob) return false;
             if (affine_b && !e.b_affine) return false;
             if (!e.b_cov) {
@@ -4347,6 +4426,11 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
         e.b_cov = cov_b ? buf(cp, cov_b) : nil;
         e.b_rob = buf(rp, rob_b);
         e.b_affine = affine_b ? buf(ap, affine_b) : nil;
+        e.b_dense = build_dense_fp16(flow);
+        e.dense_w = flow.has_dense() ? flow.dense_w : 0;
+        e.dense_h = flow.has_dense() ? flow.dense_h : 0;
+        e.dense_sx = flow.dense_sx;
+        e.dense_sy = flow.dense_sy;
         e.rob_h = rob.h;
         e.rob_w = rob.w;
         e.rob_nch = std::max(1, rob.c);
@@ -4399,6 +4483,11 @@ static bool acquire_frame_gpu(const Image& img, const FlowField& flow,
     e.b_cov = cov_b ? buf(cp, cov_b) : nil;
     e.b_rob = buf(rp, rob_b);
     e.b_affine = affine_b ? buf(ap, affine_b) : nil;
+    e.b_dense = build_dense_fp16(flow);
+    e.dense_w = flow.has_dense() ? flow.dense_w : 0;
+    e.dense_h = flow.has_dense() ? flow.dense_h : 0;
+    e.dense_sx = flow.dense_sx;
+    e.dense_sy = flow.dense_sy;
     if (!e.b_img || !e.b_flow || !e.b_rob) return false;
     if (affine_b && !e.b_affine) return false;
     if (!e.b_cov) {
@@ -4918,6 +5007,11 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     [enc setBuffer:g_fused_diag offset:0 atIndex:12];
     [enc setBuffer:b_prev offset:0 atIndex:13];
     [enc setBuffer:g_bf.affines offset:0 atIndex:14];
+    // Dense per-pixel flow (buffer 15): the resident fused path does not support
+    // dense (a per-pixel field for every frame as a burst-wide slice is
+    // infeasible), and residency is off whenever dense is on (force-host), so
+    // ps[].dense_flow stays 0 here and this buffer is a never-read placeholder.
+    [enc setBuffer:g_bf.affines offset:0 atIndex:15];
     dispatch2(enc, pipe, (NSUInteger)Ws, (NSUInteger)bh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "merge:band-fused");
@@ -5001,6 +5095,7 @@ void metal_merge_begin_burst(bool trim_analyze_scratch) {
     g_merge_online_zeroed = false;
     g_online_h = g_online_w = g_online_nch = 0;
     g_merge_frames.clear();
+    g_dense_resident_bytes = 0;   // dense buffers went with the frame cache
     g_merge_ref = {};
     // First band XORs to slot 0 when double-buffered.
     g_merge_write_slot = g_merge_single_slot ? 0 : 1;
@@ -5024,9 +5119,9 @@ bool metal_merge_prefetch_frame(const Image& comp_raw, const FlowField& flow,
     if (!metal_gpu_init() || frame_id < 0) return false;
     if (comp_raw.h <= 0 || comp_raw.w <= 0) return false;
     id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil,
-                  b_affine = nil;
+                  b_affine = nil, b_dense = nil;
     return acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
-                             b_img, b_flow, b_cov, b_rob, b_affine);
+                             b_img, b_flow, b_cov, b_rob, b_affine, b_dense);
 }
 
 bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
@@ -5048,9 +5143,9 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     if (!ensure_acc_buffers((size_t)acc_h * acc_w * acc_c, start_band)) return false;
 
     id<MTLBuffer> b_img = nil, b_flow = nil, b_cov = nil, b_rob = nil,
-                  b_affine = nil;
+                  b_affine = nil, b_dense = nil;
     if (!acquire_frame_gpu(comp_raw, flow, covs, robustness, frame_id,
-                           b_img, b_flow, b_cov, b_rob, b_affine))
+                           b_img, b_flow, b_cov, b_rob, b_affine, b_dense))
         return false;
 
     MergeCompParamsCPU p{};
@@ -5134,6 +5229,24 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // buffer per frame, unlike the resident fused path's slice offsets.
     p.affine_flow = (cfg.affine_flow_enabled && b_affine != nil) ? 1u : 0u;
     p.affine_off = 0u;
+    // Dense per-pixel flow: b_dense came from acquire_frame_gpu (live or cache,
+    // the same way b_affine does); the dims/scale come from the live flow, or
+    // the cache entry on the prefetch path (like hmat). nil b_dense -> flag 0 ->
+    // the kernel uses the tile/affine path for this frame.
+    p.dense_flow = (cfg.dense_flow_enabled && b_dense != nil) ? 1u : 0u;
+    if (p.dense_flow) {
+        if (flow.has_dense()) {
+            p.dense_w = (uint32_t)flow.dense_w; p.dense_h = (uint32_t)flow.dense_h;
+            p.dense_sx = flow.dense_sx; p.dense_sy = flow.dense_sy;
+        } else if (frame_id >= 0) {
+            for (const MergeFrameGpu& e : g_merge_frames)
+                if (e.key == frame_id) {
+                    p.dense_w = (uint32_t)e.dense_w; p.dense_h = (uint32_t)e.dense_h;
+                    p.dense_sx = e.dense_sx; p.dense_sy = e.dense_sy; break;
+                }
+        }
+        if (p.dense_w == 0u || p.dense_h == 0u) p.dense_flow = 0u;  // no dims -> fall back
+    }
 
     MergeAccSlot& slot = g_merge_acc[g_merge_write_slot];
     if (!merge_enc_ensure()) {
@@ -5144,6 +5257,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     PendingMergeComp pend;
     pend.img = b_img; pend.flow = b_flow; pend.cov = b_cov; pend.rob = b_rob;
     pend.affine = b_affine;
+    pend.dense = b_dense;
     pend.p = p;
     g_merge_pending.push_back(pend);
     if (g_merge_pending.size() >= (size_t)kMergeFuseMax && !merge_flush_pending())
