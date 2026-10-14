@@ -142,6 +142,16 @@ struct FlowField {
     // and sample_affine. Deliberately NOT allocated by the constructor.
     std::vector<f32> affine_jac;
 
+    // Dense per-pixel optical flow (Config::dense_flow_enabled), the finest
+    // motion representation: one (dx,dy) per GREY pixel, refined by windowed
+    // Lucas-Kanade from the tile/affine flow (dense_lk_refine). Stored at grey
+    // resolution in GREY-pixel displacements; dense_sx/sy are the raw/grey
+    // scale so a consumer working in raw (lr) coords samples via sample_dense.
+    // Empty = not computed; every consumer then falls back to the tile path.
+    std::vector<f32> dense;
+    int dense_h = 0, dense_w = 0;
+    f32 dense_sx = 1.f, dense_sy = 1.f;   // raw = grey * s
+
     // Global homography warp-then-refine (Config::global_homography_enabled).
     // H maps a reference/output pixel to the ORIGINAL comparison-raw position
     // (lr coords): the comparison grey was warped by H into the reference frame
@@ -221,6 +231,36 @@ struct FlowField {
 
     inline bool has_affine() const {
         return affine_jac.size() == (size_t)ny * (size_t)nx * 4 && ny > 0 && nx > 0;
+    }
+
+    inline bool has_dense() const {
+        return dense_h > 0 && dense_w > 0 &&
+               dense.size() == (size_t)dense_h * (size_t)dense_w * 2;
+    }
+
+    // Per-pixel displacement from the dense field, sampled at RAW (lr) coords.
+    // Maps raw -> grey with the stored scale (grey cell g sits at raw
+    // (s-1)/2 + s*g, matching merge.py's 2g+0.5 for s=2; exact identity for the
+    // full-res FFT grey where s=1), bilinearly interpolates the grey-pixel
+    // displacement, and scales it back to raw. Consumers must use this wherever
+    // they would otherwise sample the tile flow, so the robustness mask grades
+    // exactly the correspondence the merge fetches.
+    inline void sample_dense(f32 raw_y, f32 raw_x, f32& out_dx, f32& out_dy) const {
+        const f32 gy = (raw_y - 0.5f * (dense_sy - 1.f)) / dense_sy;
+        const f32 gx = (raw_x - 0.5f * (dense_sx - 1.f)) / dense_sx;
+        const int y0 = (int)std::floor(gy), x0 = (int)std::floor(gx);
+        const f32 ay = gy - (f32)y0, ax = gx - (f32)x0;
+        auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+        const int iy0 = cl(y0, dense_h), iy1 = cl(y0 + 1, dense_h);
+        const int ix0 = cl(x0, dense_w), ix1 = cl(x0 + 1, dense_w);
+        auto ddx = [&](int iy, int ix) { return dense[((size_t)iy * dense_w + ix) * 2 + 0]; };
+        auto ddy = [&](int iy, int ix) { return dense[((size_t)iy * dense_w + ix) * 2 + 1]; };
+        const f32 tx0 = ddx(iy0, ix0) + (ddx(iy0, ix1) - ddx(iy0, ix0)) * ax;
+        const f32 bx0 = ddx(iy1, ix0) + (ddx(iy1, ix1) - ddx(iy1, ix0)) * ax;
+        const f32 ty0 = ddy(iy0, ix0) + (ddy(iy0, ix1) - ddy(iy0, ix0)) * ax;
+        const f32 by0 = ddy(iy1, ix0) + (ddy(iy1, ix1) - ddy(iy1, ix0)) * ax;
+        out_dx = (tx0 + (bx0 - tx0) * ay) * dense_sx;
+        out_dy = (ty0 + (by0 - ty0) * ay) * dense_sy;
     }
 
     // Per-pixel displacement from the per-tile affine model (Config::
@@ -770,6 +810,23 @@ struct Config {
     // (occlusion, moving-object edges) still fall to the robustness mask. OFF by
     // default: not part of the 460-main algorithm, purely additive.
     bool affine_flow_enabled = false;
+
+    // Dense per-pixel optical flow (dense_lk_refine). When on, the finalized
+    // tile/affine flow seeds a windowed inverse-compositional Lucas-Kanade that
+    // produces one displacement per grey pixel, and the merge/robustness sample
+    // it (FlowField::sample_dense) instead of the tile vector. The finest motion
+    // representation: it follows motion that varies continuously within a tile
+    // down to the pixel, where the per-tile and even half-tile models cannot.
+    // Eigenvalue-gated per pixel so flat/aperture regions keep the seed rather
+    // than drifting on noise. OFF by default; CPU merge/robustness consume it
+    // today (the Metal merge/robustness dense twin is a separate build).
+    bool  dense_flow_enabled = false;
+    int   dense_flow_iters = 5;        // Lucas-Kanade iterations
+    int   dense_flow_radius = 2;       // window half-size (5x5 structure tensor)
+    float dense_flow_step_max = 1.0f;  // per-iteration displacement clamp, grey px
+    float dense_flow_eig_floor = 4.0f; // min structure-tensor eigenvalue (noise units) to update a direction
+    float dense_flow_max_dev = 2.0f;   // max |dense - seed| per axis, grey px (local-refinement bound)
+    bool  dense_flow_median = true;    // 3x3 median regularization between iterations
 
     // Global homography warp-then-refine for large camera roll / global
     // perspective. Estimates one homography between the reference and each

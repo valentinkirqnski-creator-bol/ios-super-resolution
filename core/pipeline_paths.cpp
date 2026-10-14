@@ -1237,7 +1237,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.affine_flow_enabled ||
                               work.flow_fb_consistency_enabled ||
                               work.flow_consensus_enabled ||
-                              work.halftile_refine_enabled);
+                              work.halftile_refine_enabled ||
+                              work.dense_flow_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1815,6 +1816,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             halftile_subdivide_refine(flow, ref_grey,
                                       gw.warped ? gw.warped_grey : comp_grey,
                                       work, cons_ts, comp.h, comp.w);
+        // Dense per-pixel optical flow (Config::dense_flow_enabled): refine the
+        // finalized tile/affine/half-tile flow to one vector per grey pixel
+        // (windowed Lucas-Kanade, eigenvalue-gated, accept-gated vs the seed).
+        // The seed grid tile size is cons_ts, halved when half-tile ran. Runs on
+        // the same (possibly globally-warped) grey the other refiners used; the
+        // merge/robustness then sample flow.dense per pixel. Must precede the
+        // comp_grey free below.
+        if (work.dense_flow_enabled) {
+            const int seed_ts = work.halftile_refine_enabled
+                                ? std::max(1, cons_ts / 2) : cons_ts;
+            dense_lk_refine(flow, ref_grey,
+                            gw.warped ? gw.warped_grey : comp_grey,
+                            work, seed_ts, comp.h, comp.w);
+        }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),

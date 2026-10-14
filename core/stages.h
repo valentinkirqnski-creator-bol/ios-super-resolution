@@ -54,6 +54,17 @@ void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
                                const Image& comp_grey, const Config& cfg,
                                int raw_tile_size, int raw_h, int raw_w);
 
+// Dense per-pixel optical flow (Config::dense_flow_enabled): windowed
+// inverse-compositional Lucas-Kanade producing one displacement per grey pixel,
+// seeded from the finalized tile/affine flow and eigenvalue-gated per pixel so
+// flat/aperture regions keep the seed. Stored grey-resolution on the flow
+// (FlowField::dense + sample_dense); raw_tile_size is the tile size of the seed
+// grid, raw_h/raw_w the raw frame dims (for the raw/grey scale). No-op when the
+// flag is off or a grey is header-only.
+void dense_lk_refine(FlowField& flow, const Image& ref_grey,
+                     const Image& comp_grey, const Config& cfg,
+                     int raw_tile_size, int raw_h, int raw_w);
+
 // Fresh per-level Lucas-Kanade (Config::lk_every_level_enabled): per-tile
 // inverse-compositional GN translation refinement against one pyramid level,
 // Levenberg-damped, step-clamped, with a per-tile SSD accept gate.

@@ -934,7 +934,11 @@ static Image upscale_warp_stats(const Image& guide_stats,
             if (!is_ref && flow && tile_size > 0 && flow->ny > 0 && flow->nx > 0 &&
                 !flow->flow.empty()) {
                 // y, x are RAW here, so sample_bilinear takes them directly.
-                if (use_affine && flow->has_affine()) {
+                if (flow->has_dense()) {
+                    // Dense per-pixel flow: grade exactly the correspondence the
+                    // merge fetches (FlowField::sample_dense), per pixel.
+                    flow->sample_dense((f32)y, (f32)x, flow_x, flow_y);
+                } else if (use_affine && flow->has_affine()) {
                     // Per-tile affine (Config::affine_flow_enabled): warp the
                     // comparison statistics with the SAME per-pixel displacement
                     // the merge fetches (FlowField::sample_affine), so the mask

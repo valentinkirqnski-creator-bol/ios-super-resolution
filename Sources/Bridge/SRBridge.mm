@@ -562,6 +562,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.lk_every_level_enabled = tuning[@"lk_every_level_enabled"].boolValue;
     if (tuning[@"halftile_refine_enabled"])
         cfg.halftile_refine_enabled = tuning[@"halftile_refine_enabled"].boolValue;
+    if (tuning[@"dense_flow_enabled"])
+        cfg.dense_flow_enabled = tuning[@"dense_flow_enabled"].boolValue;
     if (tuning[@"real_rgb_guide"])
         cfg.real_rgb_guide = tuning[@"real_rgb_guide"].boolValue;
     if (tuning[@"guide_white_balance"])

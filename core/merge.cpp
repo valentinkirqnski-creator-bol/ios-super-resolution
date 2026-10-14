@@ -137,7 +137,12 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // mask samples the SAME way, so it still grades the fetch that
             // actually happens. See FlowField::sample_bilinear.
             f32 flowx, flowy;
-            if (cfg.affine_flow_enabled && flow.has_affine()) {
+            if (flow.has_dense()) {
+                // Dense per-pixel flow (Config::dense_flow_enabled): the finest
+                // correspondence, one vector per pixel. Takes precedence over the
+                // tile/affine path; the mask samples it the same way below.
+                flow.sample_dense(lr_y, lr_x, flowx, flowy);
+            } else if (cfg.affine_flow_enabled && flow.has_affine()) {
                 // Per-tile affine: displacement varies across the tile so
                 // rotation/yaw/pitch warp correctly. At a tile centre this
                 // equals flow.dx/dy(py,px), so flag-off behaviour is unchanged.

@@ -1597,6 +1597,272 @@ void affine_ica_refine(FlowField& flow, const Image& ref_grey,
     });
 }
 
+// ---- dense per-pixel optical flow (Config::dense_flow_enabled) ---------------
+
+// Separable windowed box sum with replicate (edge-clamp) borders, so the
+// support is a constant (2r+1)^2 at every pixel -- the structure tensor and the
+// gradient-weighted RHS then share the same support exactly.
+static void box_sum_sep(const std::vector<f32>& in, int h, int w, int r,
+                        std::vector<f32>& out, int num_threads) {
+    std::vector<f32> tmp((size_t)h * w);
+    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+    parallel_rows(h, num_threads, [&](int y) {
+        const f32* row = &in[(size_t)y * w];
+        f32* to = &tmp[(size_t)y * w];
+        double s = 0.0;
+        for (int k = -r; k <= r; ++k) s += row[cl(k, w)];
+        to[0] = (f32)s;
+        for (int x = 1; x < w; ++x) {
+            s += row[cl(x + r, w)] - row[cl(x - r - 1, w)];
+            to[x] = (f32)s;
+        }
+    });
+    out.assign((size_t)h * w, 0.f);
+    parallel_rows(w, num_threads, [&](int x) {
+        double s = 0.0;
+        for (int k = -r; k <= r; ++k) s += tmp[(size_t)cl(k, h) * w + x];
+        out[(size_t)0 * w + x] = (f32)s;
+        for (int y = 1; y < h; ++y) {
+            s += tmp[(size_t)cl(y + r, h) * w + x] - tmp[(size_t)cl(y - r - 1, h) * w + x];
+            out[(size_t)y * w + x] = (f32)s;
+        }
+    });
+}
+
+// 3x3 component-wise median of a packed (dx,dy) field, replicate borders.
+static void median3x3_flow(std::vector<f32>& d, int h, int w, int num_threads) {
+    std::vector<f32> src = d;
+    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v >= hi ? hi - 1 : v); };
+    parallel_rows(h, num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            f32 vx[9], vy[9]; int n = 0;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const size_t s = (size_t)cl(y + dy, h) * w + cl(x + dx, w);
+                    vx[n] = src[s * 2 + 0]; vy[n] = src[s * 2 + 1]; ++n;
+                }
+            std::nth_element(vx, vx + 4, vx + 9);
+            std::nth_element(vy, vy + 4, vy + 9);
+            d[((size_t)y * w + x) * 2 + 0] = vx[4];
+            d[((size_t)y * w + x) * 2 + 1] = vy[4];
+        }
+    });
+}
+
+// Windowed inverse-compositional Lucas-Kanade producing ONE displacement per
+// grey pixel, seeded from the finalized tile/affine flow so it starts in the
+// correct pyramidal basin (no large-motion failure) and only resolves the
+// within-tile variation the per-tile / affine / half-tile models cannot carry.
+//
+// Per grey pixel p the flow d minimises  sum_{q in W(p)} [M(q+d) - R(q)]^2 over
+// a (2r+1)^2 window, using the REFERENCE gradients as the steepest-descent
+// images (the Lucas-Kanade gradient approximation). The structure tensor
+// A = sum_W [gx^2 gxgy; gxgy gy^2] is built ONCE; each iteration warps M by the
+// current per-pixel flow, forms the windowed b = sum_W grad*(M(q+d)-R(q)) and
+// steps d += -A^-1 b.
+//
+// APERTURE HANDLING is explicit: A is eigendecomposed per pixel and the step is
+// taken ONLY along eigen-directions whose eigenvalue clears a noise-scaled
+// floor. On a straight edge the tangential eigenvalue is ~0, so that component
+// keeps its seed (no sliding along the edge); in a flat region both are below
+// the floor and the pixel keeps the seed entirely -- the field never drifts
+// where the image cannot constrain it. A 3x3 median between iterations removes
+// isolated outliers (standard for dense LK). Runs on the GREY image; the result
+// is stored grey-resolution with the raw/grey scale so the merge/robustness
+// sample it in raw coords (FlowField::sample_dense).
+void dense_lk_refine(FlowField& flow, const Image& ref_grey,
+                     const Image& comp_grey, const Config& cfg,
+                     int raw_tile_size, int raw_h, int raw_w) {
+    if (!cfg.dense_flow_enabled) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || raw_tile_size <= 0) return;
+    if (ref_grey.data.size() != (size_t)ref_grey.h * ref_grey.w * ref_grey.c ||
+        comp_grey.data.size() != (size_t)comp_grey.h * comp_grey.w * comp_grey.c)
+        return;
+    const int h = ref_grey.h, w = ref_grey.w;
+    if (h < 3 || w < 3 || comp_grey.h != h || comp_grey.w != w) return;
+    const int r = std::max(1, cfg.dense_flow_radius);
+    const int iters = std::max(1, cfg.dense_flow_iters);
+    const f32 step_max = std::max(0.01f, cfg.dense_flow_step_max);
+    const f32 sx = (w > 0) ? (f32)raw_w / (f32)w : 1.f;
+    const f32 sy = (h > 0) ? (f32)raw_h / (f32)h : 1.f;
+    const int nt = cfg.num_threads;
+    const size_t N = (size_t)h * w;
+
+    const Image gx = compute_sobel_gradx(ref_grey);
+    const Image gy = compute_sobel_grady(ref_grey);
+    std::vector<f32> gx2(N), gy2(N), gxy(N);
+    for (size_t i = 0; i < N; ++i) {
+        const f32 a = gx.data[i], b = gy.data[i];
+        gx2[i] = a * a; gy2[i] = b * b; gxy[i] = a * b;
+    }
+    std::vector<f32> Axx, Ayy, Axy;
+    box_sum_sep(gx2, h, w, r, Axx, nt);
+    box_sum_sep(gy2, h, w, r, Ayy, nt);
+    box_sum_sep(gxy, h, w, r, Axy, nt);
+
+    // Noise-scaled eigenvalue floor: grey noise sigma from the median |second
+    // difference| (robust to structure), squared-gradient noise ~2 sigma^2 per
+    // axis, so a pure-noise eigenvalue over the window is ~n_win*2*sigma^2.
+    f32 sigma2 = 0.f;
+    {
+        std::vector<f32> sd;
+        for (int y = 0; y < h; y += 3)
+            for (int x = 1; x + 1 < w; x += 3)
+                sd.push_back(std::fabs(ref_grey.at(y, x - 1) - 2.f * ref_grey.at(y, x) +
+                                       ref_grey.at(y, x + 1)));
+        if (!sd.empty()) {
+            std::nth_element(sd.begin(), sd.begin() + sd.size() / 2, sd.end());
+            const f32 s = 1.4826f * sd[sd.size() / 2] / 2.4494897f;  // /sqrt(6)
+            sigma2 = s * s;
+        }
+    }
+    const int n_win = (2 * r + 1) * (2 * r + 1);
+    const f32 eig_tau =
+        std::max(1e-12f, cfg.dense_flow_eig_floor * (f32)n_win * 2.f * sigma2);
+
+    // Seed one displacement per grey pixel from the tile/affine flow. d0 keeps
+    // the seed so the refinement can be bounded to it (below): dense LK is a
+    // LOCAL correction of an already-trusted field, so a pixel may not wander
+    // more than dense_flow_max_dev from its seed -- that both carries the within
+    // tile variation (sub-pixel) and forbids a periodic-texture lock onto a
+    // neighbouring image period, which unbounded LK is prone to.
+    std::vector<f32> d(N * 2), d0(N * 2);
+    parallel_rows(h, nt, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            const f32 raw_y = 0.5f * (sy - 1.f) + sy * (f32)y;
+            const f32 raw_x = 0.5f * (sx - 1.f) + sx * (f32)x;
+            f32 drx, dry;
+            flow.sample_affine(raw_y, raw_x, raw_tile_size, drx, dry);
+            const size_t i = (size_t)y * w + x;
+            d[i * 2 + 0] = d0[i * 2 + 0] = drx / sx;   // grey-px displacement
+            d[i * 2 + 1] = d0[i * 2 + 1] = dry / sy;
+        }
+    });
+    const f32 max_dev = std::max(0.25f, cfg.dense_flow_max_dev);
+
+    auto sample_bilin = [](const Image& img, f32 yy, f32 xx) -> f32 {
+        yy = std::min(std::max(yy, 0.f), (f32)(img.h - 1));
+        xx = std::min(std::max(xx, 0.f), (f32)(img.w - 1));
+        const int y0 = (int)yy, x0 = (int)xx;
+        const int y1 = std::min(y0 + 1, img.h - 1), x1 = std::min(x0 + 1, img.w - 1);
+        const f32 fy = yy - (f32)y0, fx = xx - (f32)x0;
+        const f32 t = img.at(y0, x0) + (img.at(y0, x1) - img.at(y0, x0)) * fx;
+        const f32 b = img.at(y1, x0) + (img.at(y1, x1) - img.at(y1, x0)) * fx;
+        return t + (b - t) * fy;
+    };
+
+    std::vector<f32> ge_x(N), ge_y(N), Bx, By;
+    for (int it = 0; it < iters; ++it) {
+        parallel_rows(h, nt, [&](int y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (size_t)y * w + x;
+                const f32 wy = (f32)y + d[i * 2 + 1], wx = (f32)x + d[i * 2 + 0];
+                const f32 err = sample_bilin(comp_grey, wy, wx) - ref_grey.at(y, x);
+                ge_x[i] = gx.data[i] * err;
+                ge_y[i] = gy.data[i] * err;
+            }
+        });
+        box_sum_sep(ge_x, h, w, r, Bx, nt);
+        box_sum_sep(ge_y, h, w, r, By, nt);
+        parallel_rows(h, nt, [&](int y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (size_t)y * w + x;
+                const f32 axx = Axx[i], ayy = Ayy[i], axy = Axy[i];
+                const f32 bx = -Bx[i], by = -By[i];       // rhs = -b  (Δ = A^-1(-b))
+                const f32 tr = axx + ayy;
+                const f32 disc =
+                    std::sqrt(std::max(0.f, (axx - ayy) * (axx - ayy) + 4.f * axy * axy));
+                const f32 l1 = 0.5f * (tr + disc), l2 = 0.5f * (tr - disc);
+                f32 v1x, v1y;                              // eigenvector of l1
+                if (std::fabs(axy) > 1e-20f) { v1x = axy; v1y = l1 - axx; }
+                else if (axx >= ayy) { v1x = 1.f; v1y = 0.f; }
+                else { v1x = 0.f; v1y = 1.f; }
+                const f32 n1 = std::sqrt(v1x * v1x + v1y * v1y);
+                if (n1 > 1e-20f) { v1x /= n1; v1y /= n1; }
+                const f32 v2x = -v1y, v2y = v1x;           // orthogonal (l2)
+                const f32 p1 = bx * v1x + by * v1y, p2 = bx * v2x + by * v2y;
+                // A direction updates only if its eigenvalue clears BOTH the
+                // noise floor (absolute) AND a condition ratio of the dominant
+                // eigenvalue (scale-free). The ratio catches an ill-conditioned
+                // structure tensor even with no noise -- without it a nearly
+                // singular direction divides a tiny projection by a tiny
+                // eigenvalue and flings the pixel; with it such a pixel keeps
+                // its seed in that direction. 0.02 ~ aspect ratio 50:1.
+                const f32 cond = 0.02f * l1;
+                const f32 lo = std::max(eig_tau, cond);
+                const f32 c1 = (l1 > lo) ? p1 / (l1 + 1e-6f) : 0.f;
+                const f32 c2 = (l2 > lo) ? p2 / (l2 + 1e-6f) : 0.f;
+                f32 dxs = c1 * v1x + c2 * v2x, dys = c1 * v1y + c2 * v2y;
+                dxs = std::min(std::max(dxs, -step_max), step_max);
+                dys = std::min(std::max(dys, -step_max), step_max);
+                if (std::isfinite(dxs)) d[i * 2 + 0] += dxs;
+                if (std::isfinite(dys)) d[i * 2 + 1] += dys;
+                // Bound the refinement to a neighbourhood of the seed.
+                const f32 ox = d0[i * 2 + 0], oy = d0[i * 2 + 1];
+                d[i * 2 + 0] = std::min(std::max(d[i * 2 + 0], ox - max_dev), ox + max_dev);
+                d[i * 2 + 1] = std::min(std::max(d[i * 2 + 1], oy - max_dev), oy + max_dev);
+            }
+        });
+        if (cfg.dense_flow_median && it + 1 < iters) median3x3_flow(d, h, w, nt);
+    }
+
+    // Per-pixel accept gate, the same "never worse than the seed" discipline the
+    // affine / fresh-LK / half-tile refiners use. The comparison is POINTWISE
+    // (a tiny 3x3 smoothing to tame single-sample noise, not the LK window):
+    // windowed LK assumes the flow is constant over its window, so in a
+    // steep-flow-gradient region (a rotation's periphery, a motion boundary) its
+    // fixed point minimises the WINDOW residual at a flow that is geometrically
+    // off-centre -- a windowed gate would bless exactly those pixels. The merge
+    // fetches each pixel pointwise and super-resolution needs the sample placed
+    // at the right sub-pixel location, so a pixel is kept only where it improves
+    // the match AT that pixel. Reverts the steep-gradient over-reach and any
+    // periodic-texture mislead the eigen/condition/deviation guards let through.
+    {
+        std::vector<f32> rs(N), rf(N), Ss, Sf;
+        parallel_rows(h, nt, [&](int y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (size_t)y * w + x;
+                const f32 rv = ref_grey.at(y, x);
+                const f32 es = sample_bilin(comp_grey, (f32)y + d0[i * 2 + 1],
+                                            (f32)x + d0[i * 2 + 0]) - rv;
+                const f32 ef = sample_bilin(comp_grey, (f32)y + d[i * 2 + 1],
+                                            (f32)x + d[i * 2 + 0]) - rv;
+                rs[i] = es * es; rf[i] = ef * ef;
+            }
+        });
+        // Gate on the SAME (2r+1)^2 window the LK solve used, with a relative
+        // margin. Window size matters: fitting the 2 translation DOF to pure
+        // noise lowers the window residual by ~(2 / n_win) by chance (~8% for a
+        // 5x5 window, ~22% for 3x3), so the margin must EXCEED that fraction or
+        // dense overfits noise on pixels the seed already matched. 15% on a 5x5
+        // window clears the ~8% noise-overfit with headroom; a smaller window
+        // would need a larger margin. (An absolute sigma^2 floor was tried and
+        // rejected: the median-2nd-difference noise estimate conflates texture
+        // curvature with noise and over-suppressed real gains on busy content.)
+        box_sum_sep(rs, h, w, r, Ss, nt);
+        box_sum_sep(rf, h, w, r, Sf, nt);
+        // The gate must clear the noise-overfit fraction's mean AND spread: for
+        // a 2-DOF fit to n_win samples the chance residual drop has mean ~2/n
+        // and a comparable std, so a few-sigma margin ~ 4*2/n (~0.32 at 5x5)
+        // keeps noise from passing while genuine within-tile gains (far larger)
+        // clear it easily.
+        const f32 margin = 1.f - std::min(0.5f, 4.f * 2.f / (f32)n_win);  // ~0.68 at 5x5
+        parallel_rows(h, nt, [&](int y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t i = (size_t)y * w + x;
+                if (!(Sf[i] < margin * Ss[i])) {      // not clearly better (or NaN): revert
+                    d[i * 2 + 0] = d0[i * 2 + 0];
+                    d[i * 2 + 1] = d0[i * 2 + 1];
+                }
+            }
+        });
+    }
+
+    flow.dense = std::move(d);
+    flow.dense_h = h; flow.dense_w = w;
+    flow.dense_sx = sx; flow.dense_sy = sy;
+}
+
 // ---- half-tile final refinement (Config::halftile_refine_enabled) -----------
 //
 // Subdivide the FINISHED raw-grid flow 2x2 and polish the children:
