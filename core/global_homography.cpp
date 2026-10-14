@@ -366,7 +366,12 @@ namespace {  // reopened: the remaining helpers below stay internal
 // identity.
 void coarse_seed(const Image& ref, const Image& comp, f32 H[9]) {
     const f32 cx = 0.5f * (f32)(ref.w - 1), cy = 0.5f * (f32)(ref.h - 1);
-    const f32 range_deg = 12.f, step_deg = 1.f;
+    // +/-33 deg covers deliberate roll (portrait-grip tilt), not just tremor.
+    // The cost lives at the tiny search level so the wider sweep is cheap; the
+    // downstream stages already tolerate it (rigid_lk_level's sanity bound is
+    // 0.7 rad ~ 40 deg, and warp_error's 50% validity floor handles the
+    // overlap a 33-deg candidate loses at the frame corners).
+    const f32 range_deg = 33.f, step_deg = 1.f;
     const int shift_max = 6, shift_step = 2;
     auto make_H = [&](f32 deg, f32 sx, f32 sy, f32 Hc[9]) {
         const f32 th = deg * 3.14159265358979323846f / 180.f;
