@@ -182,6 +182,32 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
     const f32 cx = 0.5f * (f32)(R.w - 1), cy = 0.5f * (f32)(R.h - 1);
     const int y0 = R.h / 8, y1 = R.h - R.h / 8, x0 = R.w / 8, x1 = R.w - R.w / 8;
     f32 pa = 1.f, pb = 0.f;  // lag-1 photometric gain/bias (for the GN residual)
+    // Metric-only scoring pass (no normal equations): the profiled photometric
+    // score of a candidate (tx, ty, theta) over the same region and validity
+    // policy as the main loop. Used to validate the FINAL applied step, which
+    // the in-loop lag check never sees.
+    auto metric_at = [&](f32 ttx, f32 tty, f32 tth) -> f32 {
+        double spr = 0.0, spc = 0.0, sprr = 0.0, sprc = 0.0, spcc = 0.0; long pcnt = 0;
+        const f32 cs = std::cos(tth), sn = std::sin(tth);
+        for (int y = y0; y < y1; y += 2)
+            for (int x = x0; x < x1; x += 2) {
+                const f32 X = (f32)x - cx, Y = (f32)y - cy;
+                const f32 wx = cs * X - sn * Y + cx + ttx;
+                const f32 wy = sn * X + cs * Y + cy + tty;
+                if (!(wx >= 1.f && wx < R.w - 1 && wy >= 1.f && wy < R.h - 1)) continue;
+                const f32 cv = sample_clamp(C, wx, wy), rv = R.at(y, x);
+                if (!(std::isfinite(cv) && std::isfinite(rv))) continue;
+                spr += rv; spc += cv; sprr += (double)rv * rv; sprc += (double)rv * cv;
+                spcc += (double)cv * cv; ++pcnt;
+            }
+        if (pcnt < 16) return 1e30f;
+        const double n = (double)pcnt;
+        const double var_r = sprr / n - (spr / n) * (spr / n);
+        const double var_c = spcc / n - (spc / n) * (spc / n);
+        const double cov   = sprc / n - (spr / n) * (spc / n);
+        const f32 m = (f32)(var_c - (var_r > 1e-12 ? cov * cov / var_r : 0.0));
+        return std::isfinite(m) ? m : 1e30f;
+    };
     // Step acceptance: the sums accumulated in iteration k measure the
     // parameters AFTER step k-1, at zero extra cost. The acceptance metric is
     // the residual VARIANCE WITH GAIN/BIAS PROFILED OUT in closed form,
@@ -190,8 +216,12 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
     // warp), so successive iterations compare like-for-like -- comparing raw
     // residuals under the drifting lag-1 (pa, pb) would conflate a photometric
     // re-fit with a geometric regression. If the metric worsened, the last
-    // step is reverted and the refine stops.
-    f32 prev_metric = 1e30f, last_dtx = 0.f, last_dty = 0.f, last_dth = 0.f;
+    // step is reverted and the refine stops. `pending` tracks whether the
+    // current parameters contain a step that has not been scored yet; EVERY
+    // exit path resolves it (in-loop on the next iteration, otherwise by the
+    // metric_at tail below), so no step is ever committed unevaluated.
+    f32 best_metric = 1e30f, last_dtx = 0.f, last_dty = 0.f, last_dth = 0.f;
+    bool pending = false;
     for (int it = 0; it < iters; ++it) {
         double Hm[3][3] = {{0,0,0},{0,0,0},{0,0,0}}, b[3] = {0,0,0};
         double spr = 0.0, spc = 0.0, sprr = 0.0, sprc = 0.0, spcc = 0.0; long pcnt = 0;
@@ -214,17 +244,23 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
                 for (int a = 0; a < 3; ++a) { b[a] -= J[a] * r;
                     for (int c2 = 0; c2 < 3; ++c2) Hm[a][c2] += J[a] * J[c2]; }
             }
-        if (pcnt < 16) break;  // warped off the frame: nothing to fit on
+        if (pcnt < 16) {  // warped off the frame: nothing to fit on
+            if (pending) { ltx -= last_dtx; lty -= last_dty; th -= last_dth; }
+            pending = false;
+            break;
+        }
         const double n = (double)pcnt;
         const double var_r = sprr / n - (spr / n) * (spr / n);
         const double var_c = spcc / n - (spc / n) * (spc / n);
         const double cov   = sprc / n - (spr / n) * (spc / n);
         const f32 metric = (f32)(var_c - (var_r > 1e-12 ? cov * cov / var_r : 0.0));
-        if (!(metric <= prev_metric)) {           // worse (or NaN): revert last step
+        if (!(metric <= best_metric)) {           // worse (or NaN): revert last step
             ltx -= last_dtx; lty -= last_dty; th -= last_dth;
+            pending = false;
             break;
         }
-        prev_metric = metric;
+        best_metric = metric;
+        pending = false;
         // Photometric fit for the NEXT iteration (lag-1, like the IRLS scales).
         if (var_r > 1e-12) {
             pa = std::min(std::max((f32)(cov / var_r), 0.5f), 2.f);
@@ -255,7 +291,15 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
             break;
         }
         last_dtx = d_tx; last_dty = d_ty; last_dth = d_th;
+        pending = true;
         if (std::fabs(d_tx) + std::fabs(d_ty) < 1e-3f && std::fabs(d_th) < 1e-6f) break;
+    }
+    // Validate the FINAL applied step (convergence break or iteration budget
+    // exhausted both leave `pending` true): score it with the same profiled
+    // metric and revert if it did not improve on the best evaluated state.
+    if (pending) {
+        const f32 m = metric_at(ltx, lty, th);
+        if (!(m <= best_metric)) { ltx -= last_dtx; lty -= last_dty; th -= last_dth; }
     }
 }
 
@@ -300,7 +344,12 @@ void refine_global_rigid_seed(const Image& ref_grey, const Image& comp_grey,
     rigid_to_H(fine_r, dx * scf, dy * scf, rot, Hseed);
     const f32 e_ref = warp_error(fine_r, fine_c, Href);
     const f32 e_seed = warp_error(fine_r, fine_c, Hseed);
-    if (!std::isfinite(e_ref) || !(e_ref <= e_seed)) return;  // keep the FFT seed
+    // Sentinel-aware STRICT improvement: with the old `e_ref <= e_seed`, BOTH
+    // scores being the 1e30 invalid sentinel satisfied the gate and accepted an
+    // unvalidated refine. The refine must now itself be a valid score and
+    // strictly better; a valid refine still rescues an invalid seed, since any
+    // real score is strictly below the sentinel.
+    if (!std::isfinite(e_ref) || e_ref >= 1e29f || !(e_ref < e_seed)) return;
 
     dx = tx; dy = ty; rot = th;
 }
@@ -408,6 +457,15 @@ bool solve8(f32 A[8][8], f32 b[8], f32 x[8]) {
 // Levenberg damping; reverts an iteration that increases the error.
 void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                int num_threads) {
+    // Normalize to the H[8] = 1 parameterization this optimizer assumes. A
+    // level_map conjugation leaves H[8] = 1 + (h6+h7)*d/s != 1 exactly, and
+    // the additive update forces Hn[8] = 1 WITHOUT rescaling the other eight
+    // entries -- an uncompensated jump in the first step. Rescaling the whole
+    // matrix first is the same projective transform in the right chart.
+    if (std::isfinite(H[8]) && std::fabs(H[8]) > 1e-3f && H[8] != 1.f) {
+        const f32 inv8 = 1.f / H[8];
+        for (int i = 0; i < 9; ++i) H[i] *= inv8;
+    }
     f32 cur_err = warp_error(ref, comp, H);
     const int y_lo = 1, y_hi = ref.h - 1;
     const int rows = std::max(0, y_hi - y_lo);
@@ -485,6 +543,9 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                     const f32 gx = 0.5f * (sample_clamp(comp, u + 1.f, v) - sample_clamp(comp, u - 1.f, v));
                     const f32 gy = 0.5f * (sample_clamp(comp, u, v + 1.f) - sample_clamp(comp, u, v - 1.f));
                     const f32 g2 = gx * gx + gy * gy;
+                    // The gradient samples different pixels than err, so the
+                    // err check alone does not keep NaN out of the Jacobian.
+                    if (!(g2 >= 0.f && g2 < 1e30f)) continue;
                     const f32 wsig = (g2floor > 0.f) ? g2 / (g2 + g2floor) : 1.f;
                     const f32 w = wsig / (1.f + err * err * cinv2);  // signal x Cauchy
                     f32 J[8];
@@ -501,9 +562,13 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                     const f32 ae = std::fabs(err);
                     sr += (double)ae; sg2 += (double)g2; ++cn;
                     if (hist_scale > 0.f) {
-                        int bi = (int)(ae * hist_scale);
-                        if (bi >= kHistBins) bi = kHistBins - 1;
-                        ++hist[bi];
+                        // Clamp in FLOAT before the int conversion: casting a
+                        // float beyond int range is UB, so the old post-cast
+                        // clamp did not protect against a huge residual.
+                        const f32 scaled = ae * hist_scale;
+                        if (!(scaled < (f32)(kHistBins - 1))) ++hist[kHistBins - 1];
+                        else if (scaled > 0.f)                ++hist[(int)scaled];
+                        else                                  ++hist[0];
                     }
                     ph[0] += (double)rv; ph[1] += (double)cv;
                     ph[2] += (double)rv * rv; ph[3] += (double)rv * cv;
@@ -690,12 +755,14 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
             seed_move = std::max(seed_move, std::hypot(sx - cxs[i], sy - cys[i]));
         }
         // When the seed is ~identity (still burst), allow at most a small
-        // absolute disagreement; otherwise scale with the seed's own motion.
-        // The absolute floor is RESOLUTION-RELATIVE (0.25% of the long side,
-        // ~10 px on a 4000 px grey), matching the live path's 1-lk-px floor
-        // instead of a fixed pixel count that changes meaning with grey size.
-        const f32 allowed = std::max(
-            0.0025f * (f32)std::max(ref_grey.w, ref_grey.h), 0.5f * seed_move);
+        // absolute disagreement; otherwise scale with the seed's own motion,
+        // hard-capped so large seed motion does not authorise unboundedly
+        // large projective deviation. Both bounds are RESOLUTION-RELATIVE
+        // (0.25% / 1% of the long side, ~10 / ~40 px on a 4000 px grey),
+        // matching the live path's 1 / 4 lk-px policy.
+        const f32 longside = (f32)std::max(ref_grey.w, ref_grey.h);
+        const f32 allowed = std::min(0.01f * longside,
+                                     std::max(0.0025f * longside, 0.5f * seed_move));
         if (extra > allowed) return;  // keep the rigid seed
     }
 
@@ -830,7 +897,11 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
             extra  = std::max(extra,  std::hypot(hx - bx, hy - by));
             b_move = std::max(b_move, std::hypot(bx - cxs[i], by - cys[i]));
         }
-        const f32 allowed = std::max(1.0f, 0.5f * b_move);
+        // Floor for still bursts, relative growth for moderate motion, and a
+        // hard CAP so large rigid motion does not authorise unboundedly large
+        // projective deviation (genuine handheld perspective adds a few lk px
+        // at most on top of the rigid component).
+        const f32 allowed = std::min(4.0f, std::max(1.0f, 0.5f * b_move));
         if (extra > allowed) take_h = false;     // fall back to the base model
     }
     const f32* Hsel = take_h ? H : Hbase;
