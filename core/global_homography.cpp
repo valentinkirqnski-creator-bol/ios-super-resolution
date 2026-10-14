@@ -50,6 +50,27 @@ Image downsample_to(const Image& in, int max_dim, f32& scale_out) {
     return cur;
 }
 
+// Exact pixel-centre map between a box-downsampled level and its source image:
+// the 2x box average sits BETWEEN the pixel pair it averages, so after any
+// number of halvings  x_level = s*x_src - (1-s)/2,  not pure scaling. M maps
+// SRC -> LEVEL, Minv the reverse. Conjugating a homography with the pure-scale
+// matrix instead makes a lifted rotation pivot (1/s-1)/2 px off the true
+// centre, injecting an (I-R)*offset translation at full resolution -- ~0.4 px
+// for a 5-deg roll at the device's lk scale (s ~ 1/16), which is the same
+// order as the rigid refine's whole accuracy budget. (The RIGID path is exempt:
+// rotation about the level centre plus t/s is exactly the true lift, because
+// the level centre lands exactly on the source centre under this map.)
+inline void level_map(f32 s, f32 M[9], f32 Minv[9]) {
+    const f32 d = 0.5f * (1.f - s);
+    M[0] = s;   M[1] = 0.f; M[2] = -d;
+    M[3] = 0.f; M[4] = s;   M[5] = -d;
+    M[6] = 0.f; M[7] = 0.f; M[8] = 1.f;
+    const f32 is = 1.f / s;
+    Minv[0] = is;  Minv[1] = 0.f; Minv[2] = d * is;
+    Minv[3] = 0.f; Minv[4] = is;  Minv[5] = d * is;
+    Minv[6] = 0.f; Minv[7] = 0.f; Minv[8] = 1.f;
+}
+
 inline void mat3_mul(const f32 A[9], const f32 B[9], f32 C[9]) {
     f32 t[9];
     for (int r = 0; r < 3; ++r)
@@ -160,16 +181,20 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
     if (R.h <= 8 || R.w <= 8) return;
     const f32 cx = 0.5f * (f32)(R.w - 1), cy = 0.5f * (f32)(R.h - 1);
     const int y0 = R.h / 8, y1 = R.h - R.h / 8, x0 = R.w / 8, x1 = R.w - R.w / 8;
-    f32 pa = 1.f, pb = 0.f;  // lag-1 photometric gain/bias
-    // Step acceptance: the residual accumulated in iteration k measures the
-    // parameters AFTER step k-1, at zero extra cost. If it got worse, the last
-    // step is reverted and the refine stops -- Gauss-Newton may not silently
-    // walk away from the optimum (previously nothing checked improvement until
-    // the caller's final gate, which only protects the OUTPUT, not the path).
-    f32 prev_mean = 1e30f, last_dtx = 0.f, last_dty = 0.f, last_dth = 0.f;
+    f32 pa = 1.f, pb = 0.f;  // lag-1 photometric gain/bias (for the GN residual)
+    // Step acceptance: the sums accumulated in iteration k measure the
+    // parameters AFTER step k-1, at zero extra cost. The acceptance metric is
+    // the residual VARIANCE WITH GAIN/BIAS PROFILED OUT in closed form,
+    // var(comp) - cov(ref,comp)^2 / var(ref): a pure function of the GEOMETRY
+    // (the photometric nuisance is optimally removed for each iteration's own
+    // warp), so successive iterations compare like-for-like -- comparing raw
+    // residuals under the drifting lag-1 (pa, pb) would conflate a photometric
+    // re-fit with a geometric regression. If the metric worsened, the last
+    // step is reverted and the refine stops.
+    f32 prev_metric = 1e30f, last_dtx = 0.f, last_dty = 0.f, last_dth = 0.f;
     for (int it = 0; it < iters; ++it) {
         double Hm[3][3] = {{0,0,0},{0,0,0},{0,0,0}}, b[3] = {0,0,0};
-        double spr = 0.0, spc = 0.0, sprr = 0.0, sprc = 0.0, sabs = 0.0; long pcnt = 0;
+        double spr = 0.0, spc = 0.0, sprr = 0.0, sprc = 0.0, spcc = 0.0; long pcnt = 0;
         const f32 cs = std::cos(th), sn = std::sin(th);
         for (int y = y0; y < y1; y += 2)
             for (int x = x0; x < x1; x += 2) {
@@ -178,32 +203,32 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
                 const f32 wy = sn * X + cs * Y + cy + lty;
                 if (!(wx >= 1.f && wx < R.w - 1 && wy >= 1.f && wy < R.h - 1)) continue;
                 const f32 cv = sample_clamp(C, wx, wy), rv = R.at(y, x);
+                if (!(std::isfinite(cv) && std::isfinite(rv))) continue;  // bad data
                 const f32 gx = 0.5f * (sample_clamp(C, wx + 1, wy) - sample_clamp(C, wx - 1, wy));
                 const f32 gy = 0.5f * (sample_clamp(C, wx, wy + 1) - sample_clamp(C, wx, wy - 1));
                 const f32 dwx = -sn * X - cs * Y, dwy = cs * X - sn * Y;  // d(wx,wy)/dtheta
                 const f32 J[3] = { gx, gy, gx * dwx + gy * dwy };
                 const f32 r = cv - (pa * rv + pb);
-                spr += rv; spc += cv; sprr += (double)rv * rv; sprc += (double)rv * cv; ++pcnt;
-                sabs += std::fabs((double)r);
+                spr += rv; spc += cv; sprr += (double)rv * rv; sprc += (double)rv * cv;
+                spcc += (double)cv * cv; ++pcnt;
                 for (int a = 0; a < 3; ++a) { b[a] -= J[a] * r;
                     for (int c2 = 0; c2 < 3; ++c2) Hm[a][c2] += J[a] * J[c2]; }
             }
         if (pcnt < 16) break;  // warped off the frame: nothing to fit on
-        const f32 mean_abs = (f32)(sabs / (double)pcnt);
-        if (!(mean_abs <= prev_mean)) {           // worse (or NaN): revert last step
+        const double n = (double)pcnt;
+        const double var_r = sprr / n - (spr / n) * (spr / n);
+        const double var_c = spcc / n - (spc / n) * (spc / n);
+        const double cov   = sprc / n - (spr / n) * (spc / n);
+        const f32 metric = (f32)(var_c - (var_r > 1e-12 ? cov * cov / var_r : 0.0));
+        if (!(metric <= prev_metric)) {           // worse (or NaN): revert last step
             ltx -= last_dtx; lty -= last_dty; th -= last_dth;
             break;
         }
-        prev_mean = mean_abs;
+        prev_metric = metric;
         // Photometric fit for the NEXT iteration (lag-1, like the IRLS scales).
-        {
-            const double n = (double)pcnt;
-            const double var_r = sprr / n - (spr / n) * (spr / n);
-            if (var_r > 1e-12) {
-                const f32 a = (f32)((sprc / n - (spr / n) * (spc / n)) / var_r);
-                pa = std::min(std::max(a, 0.5f), 2.f);
-                pb = (f32)(spc / n - (double)pa * (spr / n));
-            }
+        if (var_r > 1e-12) {
+            pa = std::min(std::max((f32)(cov / var_r), 0.5f), 2.f);
+            pb = (f32)(spc / n - (double)pa * (spr / n));
         }
         for (int a = 0; a < 3; ++a) Hm[a][a] += 1e-3 * Hm[a][a] + 1e-9;  // Levenberg
         double A[3][4];
@@ -307,6 +332,21 @@ void coarse_seed(const Image& ref, const Image& comp, f32 H[9]) {
     auto consider = [&](f32 deg, f32 sx, f32 sy) {
         f32 Hc[9]; make_H(deg, sx, sy, Hc);
         const f32 e = warp_error(ref, comp, Hc);
+        // Same-basin suppression: a candidate within 1.5 deg / 2.5 px of an
+        // already-kept one refines THAT slot instead of occupying another, so
+        // the three slots hold genuinely different motion hypotheses (adjacent
+        // grid cells of one minimum would otherwise fill all three).
+        for (int i = 0; i < 3; ++i) {
+            if (top[i].err < 1e29f &&
+                std::fabs(deg - top[i].deg) <= 1.5f &&
+                std::fabs(sx - top[i].sx) <= 2.5f && std::fabs(sy - top[i].sy) <= 2.5f) {
+                if (e < top[i].err) {
+                    top[i] = {e, deg, sx, sy};
+                    while (i > 0 && top[i].err < top[i - 1].err) { std::swap(top[i], top[i - 1]); --i; }
+                }
+                return;
+            }
+        }
         if (e < top[0].err)      { top[2] = top[1]; top[1] = top[0]; top[0] = {e, deg, sx, sy}; }
         else if (e < top[1].err) { top[2] = top[1]; top[1] = {e, deg, sx, sy}; }
         else if (e < top[2].err) { top[2] = {e, deg, sx, sy}; }
@@ -439,6 +479,9 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                         continue;
                     const f32 cv = sample_clamp(comp, u, v), rv = ref.at(y, x);
                     const f32 err = cv - (pa * rv + pb);
+                    // Bad image data must not reach the histogram index
+                    // conversion or poison the normal equations.
+                    if (!std::isfinite(err)) continue;
                     const f32 gx = 0.5f * (sample_clamp(comp, u + 1.f, v) - sample_clamp(comp, u - 1.f, v));
                     const f32 gy = 0.5f * (sample_clamp(comp, u, v + 1.f) - sample_clamp(comp, u, v - 1.f));
                     const f32 g2 = gx * gx + gy * gy;
@@ -592,9 +635,7 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
     f32 H[9]; for (int i = 0; i < 9; ++i) H[i] = H_inout[i];
     for (const Lvl& L : levels) {
         if (L.r->h <= 8 || L.r->w <= 8) continue;
-        const f32 sc = L.scale;
-        const f32 S[9]    = { sc, 0, 0,  0, sc, 0,  0, 0, 1 };
-        const f32 Sinv[9] = { 1.f / sc, 0, 0,  0, 1.f / sc, 0,  0, 0, 1 };
+        f32 S[9], Sinv[9]; level_map(L.scale, S, Sinv);  // exact pixel-centre map
         f32 Hl[9]; { f32 t[9]; mat3_mul(H, Sinv, t); mat3_mul(S, t, Hl); }
         lk_refine(*L.r, *L.c, Hl, /*iters=*/15, cfg.num_threads);
         f32 t[9]; mat3_mul(Hl, S, t); mat3_mul(Sinv, t, H);
@@ -602,16 +643,18 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
 
     // Accept only if the refined homography beats the seed at the finest level
     // and is non-degenerate; otherwise leave H_inout as the (robust) rigid seed.
-    const f32 Sf[9]  = { scf, 0, 0,  0, scf, 0,  0, 0, 1 };
-    const f32 Sfi[9] = { 1.f / scf, 0, 0,  0, 1.f / scf, 0,  0, 0, 1 };
+    f32 Sf[9], Sfi[9]; level_map(scf, Sf, Sfi);
     f32 Href[9], Hseed[9];
     { f32 t[9]; mat3_mul(H, Sfi, t); mat3_mul(Sf, t, Href); }
     { f32 t[9]; mat3_mul(H_inout, Sfi, t); mat3_mul(Sf, t, Hseed); }
     const f32 e_ref = warp_error(fine_r, fine_c, Href);
     const f32 e_seed = warp_error(fine_r, fine_c, Hseed);
     const f32 det2 = H[0] * H[4] - H[1] * H[3];
-    const bool degenerate = !(std::fabs(det2) > 0.25f && std::fabs(det2) < 4.f) ||
-                            !std::isfinite(e_ref);
+    bool h_finite = true;
+    for (int i = 0; i < 9; ++i) h_finite = h_finite && std::isfinite(H[i]);
+    const bool degenerate = !h_finite ||
+                            !(std::fabs(det2) > 0.25f && std::fabs(det2) < 4.f) ||
+                            !std::isfinite(e_ref) || !std::isfinite(e_seed);
     // Require a MARGIN, not just any improvement. On a near-still burst the true
     // motion is dominated by sensor noise, and the 8-DOF refine will fit that
     // noise into spurious shear/perspective that lowers the average grey error
@@ -647,9 +690,12 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
             seed_move = std::max(seed_move, std::hypot(sx - cxs[i], sy - cys[i]));
         }
         // When the seed is ~identity (still burst), allow at most a small
-        // absolute disagreement; otherwise scale with the seed's own motion
-        // (matches the live path's max(1 lk px, 0.5*base) at full grey res).
-        const f32 allowed = std::max(10.0f, 0.5f * seed_move);
+        // absolute disagreement; otherwise scale with the seed's own motion.
+        // The absolute floor is RESOLUTION-RELATIVE (0.25% of the long side,
+        // ~10 px on a 4000 px grey), matching the live path's 1-lk-px floor
+        // instead of a fixed pixel count that changes meaning with grey size.
+        const f32 allowed = std::max(
+            0.0025f * (f32)std::max(ref_grey.w, ref_grey.h), 0.5f * seed_move);
         if (extra > allowed) return;  // keep the rigid seed
     }
 
@@ -681,11 +727,10 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     // Coarse rotation+shift seed at the smallest level, in lk-level pixels.
     f32 Hc[9];
     coarse_seed(s_ref, s_comp, Hc);
-    // Lift the seed from search-level pixels to lk-level pixels: D maps lk->search.
+    // Lift the seed from search-level pixels to lk-level pixels with the exact
+    // pixel-centre map (see level_map): D maps lk->search.
     {
-        const f32 f = search_scale;
-        const f32 D[9]   = { f, 0, 0,  0, f, 0,  0, 0, 1 };
-        const f32 Dinv[9]= { 1.f/f, 0, 0,  0, 1.f/f, 0,  0, 0, 1 };
+        f32 D[9], Dinv[9]; level_map(search_scale, D, Dinv);
         f32 tmp[9]; mat3_mul(Hc, D, tmp); mat3_mul(Dinv, tmp, Hc);
     }
 
@@ -750,7 +795,10 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     // must never make alignment worse.
     const f32 e_h  = warp_error(lk_ref, lk_comp, H);
     const f32 det2 = H[0] * H[4] - H[1] * H[3];
-    bool take_h = (std::fabs(det2) > 0.25f && std::fabs(det2) < 4.f) &&
+    bool h_finite = true;
+    for (int i = 0; i < 9; ++i) h_finite = h_finite && std::isfinite(H[i]);
+    bool take_h = h_finite &&
+                  (std::fabs(det2) > 0.25f && std::fabs(det2) < 4.f) &&
                   std::isfinite(e_h) && (e_h < 0.98f * e_base) &&
                   (e_h < e_id - margin);
     if (take_h) {
@@ -788,10 +836,9 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     const f32* Hsel = take_h ? H : Hbase;
     if (!take_h && !(e_base < e_id)) return;     // identity: H_out already set
 
-    // Scale from lk-level pixels to full grey pixels: D maps full->lk.
-    const f32 f = lk_scale;
-    const f32 D[9]    = { f, 0, 0,  0, f, 0,  0, 0, 1 };
-    const f32 Dinv[9] = { 1.f/f, 0, 0,  0, 1.f/f, 0,  0, 0, 1 };
+    // Scale from lk-level pixels to full grey pixels with the exact
+    // pixel-centre map: D maps full->lk.
+    f32 D[9], Dinv[9]; level_map(lk_scale, D, Dinv);
     f32 tmp[9]; mat3_mul(Hsel, D, tmp); mat3_mul(Dinv, tmp, H_out);
 }
 
