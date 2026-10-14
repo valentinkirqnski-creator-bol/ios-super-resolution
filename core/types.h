@@ -121,6 +121,17 @@ struct FlowField {
     // deriving it, which is what the full-resolution FFT path relies on.
     std::vector<uint32_t> motion_irregular;
 
+    // 1 = this tile's vector was REPLACED by the forward-backward consistency
+    // check (neighbour-median of round-trip-consistent tiles). The replacement
+    // deliberately overrides pixel evidence: on the ambiguous/flat/repetitive
+    // tiles FB corrects, the WRONG correspondence has lower photometric cost
+    // (that is why block matching fell for it), so any later pixel-driven
+    // refinement (affine_ica_refine's IC-GN, halftile's child LK) would walk
+    // straight back into the wrong basin and its accept gate would approve it.
+    // Consumers skip pixel re-optimisation for marked tiles. Empty = no FB pass
+    // ran (same convention as motion_irregular: not allocated by default).
+    std::vector<uint32_t> fb_corrected;
+
     // Per-tile local affine motion model (Config::affine_flow_enabled). Four
     // floats per tile -- the 2x2 Jacobian [Jxx, Jxy, Jyx, Jyy] of the flow field,
     // fitted by least squares over a window of neighbour tile vectors. The tile's
@@ -149,6 +160,13 @@ struct FlowField {
     // True when motion_irregular carries a measurement for this grid.
     inline bool has_motion_prior() const {
         return motion_irregular.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
+    }
+    // True when fb_corrected carries marks for this grid.
+    inline bool has_fb_marks() const {
+        return fb_corrected.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
+    }
+    inline uint32_t fb_mark(int ty, int tx) const {
+        return fb_corrected[(size_t)ty * nx + tx];
     }
     inline uint32_t& irregular(int ty, int tx) { return motion_irregular[(size_t)ty * nx + tx]; }
     inline uint32_t irregular(int ty, int tx) const { return motion_irregular[(size_t)ty * nx + tx]; }

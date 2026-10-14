@@ -94,6 +94,13 @@ Image pad_image_circular(const Image& img, int tile_size);
 int pad_image_circular_amount(const Image& img, int tile_size);
 
 // ---- align.cpp ----------------------------------------------------------
+// Forward-backward consistency core (Config::flow_fb_consistency_enabled):
+// flags round-trip-inconsistent tiles in fwd, replaces them with the median of
+// consistent neighbours (escalating window up to 4x the fill radius for
+// blunder clusters) and marks them in fwd.fb_corrected so later pixel-driven
+// refiners do not undo the correction. Exposed for the CPU harness.
+void apply_fb_consistency(FlowField& fwd, const FlowField& bwd,
+                          int gts, const Config& cfg);
 FlowField make_global_initial_flow(int ny, int nx, int tile_size, int abs_factor,
                                    int finest_h, int finest_w,
                                    f32 initial_dx, f32 initial_dy,

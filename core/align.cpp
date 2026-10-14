@@ -1284,8 +1284,16 @@ void lk_refine_level_fresh(const Image& ref, const Image& moving,
         gy = 0.5f * (ref.at(yd, x) - ref.at(yu, x));
     };
 
+    const bool fb_marks = flow.has_fb_marks();
     parallel_rows(ny, num_threads, [&](int ty) {
         for (int tx = 0; tx < nx; ++tx) {
+            // FB-corrected tiles keep their consensus vector: pixel evidence is
+            // exactly what the FB replacement overruled (the wrong minimum
+            // scores BETTER photometrically on these tiles), so a fresh LK
+            // polish would pull them back and its gate would approve it. Marks
+            // only exist on a post-FB field, so the per-level use of this
+            // function (which runs before FB) is unaffected.
+            if (fb_marks && flow.fb_mark(ty, tx)) continue;
             const int oy = ty * ts, ox = tx * ts;
             if (oy >= ref.h || ox >= ref.w) continue;
             const f32 seed_x = flow.dx(ty, tx), seed_y = flow.dy(ty, tx);
@@ -1432,10 +1440,19 @@ void affine_ica_refine(FlowField& flow, const Image& ref_grey,
         return top + (bot - top) * fy;
     };
 
+    const bool fb_marks = flow.has_fb_marks();
     parallel_rows(flow.ny, cfg.num_threads, [&](int ty) {
         for (int tx = 0; tx < flow.nx; ++tx) {
             const int oy = ty * ts, ox = tx * ts;
             if (oy >= ref_grey.h || ox >= ref_grey.w) continue;
+            // FB-corrected tiles keep their consensus vector: the replacement
+            // deliberately overrides pixel evidence (the wrong correspondence
+            // scores BETTER photometrically on these ambiguous tiles -- that is
+            // how block matching lost them), so running IC-GN here would walk
+            // back into the wrong minimum and the 2% gate would approve it.
+            // Their J stays the fit_affine neighbour-inferred one, which is
+            // consensus-consistent by construction.
+            if (fb_marks && flow.fb_mark(ty, tx)) continue;
             f32* J = &flow.affine_jac[((size_t)ty * flow.nx + tx) * 4];
             f32 th[6] = {flow.dx(ty, tx), flow.dy(ty, tx), J[0], J[1], J[2], J[3]};
             const f32 seed[6] = {th[0], th[1], th[2], th[3], th[4], th[5]};
@@ -1616,6 +1633,8 @@ void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
         flow.aperture_limited.size() == (size_t)flow.ny * flow.nx;
     const bool carry_am =
         flow.match_ambiguous.size() == (size_t)flow.ny * flow.nx;
+    const bool carry_fb = flow.has_fb_marks();
+    if (carry_fb) out.fb_corrected.assign((size_t)ny2 * nx2, 0u);
     for (int cy = 0; cy < ny2; ++cy) {
         const int pyt = std::min(cy / 2, flow.ny - 1);
         for (int cx = 0; cx < nx2; ++cx) {
@@ -1629,6 +1648,8 @@ void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
             if (carry_ap) out.aperture(cy, cx) = flow.aperture(pyt, pxt);
             if (carry_am) out.ambiguous(cy, cx) = flow.ambiguous(pyt, pxt);
             if (carry_m) out.irregular(cy, cx) = flow.irregular(pyt, pxt);
+            if (carry_fb)
+                out.fb_corrected[(size_t)cy * nx2 + cx] = flow.fb_mark(pyt, pxt);
             if (carry_j) {
                 const f32* Js = &flow.affine_jac[((size_t)pyt * flow.nx + pxt) * 4];
                 f32* Jd = &out.affine_jac[((size_t)cy * nx2 + cx) * 4];
@@ -1697,8 +1718,10 @@ static void fb_sample_flow(const FlowField& f, f32 tcy, f32 tcx,
 // Flag blunder tiles by round-trip error and replace them with the component-wise
 // median of the consistent tiles in a window. fwd/bwd share the (ny,nx) tile grid;
 // gts is the grey-pixel tile size the flow was measured at. In place on fwd.
-static void apply_fb_consistency(FlowField& fwd, const FlowField& bwd,
-                                 int gts, const Config& cfg) {
+// Non-static (declared in stages.h) so the CPU harness can unit-test the
+// flag/escalating-fill/mark mechanics directly on synthetic flow fields.
+void apply_fb_consistency(FlowField& fwd, const FlowField& bwd,
+                          int gts, const Config& cfg) {
     if (fwd.ny <= 0 || fwd.nx <= 0 || gts <= 0) return;
     if (bwd.ny != fwd.ny || bwd.nx != fwd.nx) return;  // grids must match
     const int ny = fwd.ny, nx = fwd.nx;
@@ -1736,34 +1759,53 @@ static void apply_fb_consistency(FlowField& fwd, const FlowField& bwd,
     // the ORIGINAL field (snapshot) so one correction never seeds another.
     const std::vector<f32> src = fwd.flow;
     const int r = std::max(1, cfg.flow_fb_fill_radius);
+    fwd.fb_corrected.assign((size_t)ny * nx, 0u);
+    size_t n_corrected = 0, n_unanchored = 0;
     std::vector<f32> mx, my;
-    mx.reserve((size_t)(2 * r + 1) * (2 * r + 1));
-    my.reserve((size_t)(2 * r + 1) * (2 * r + 1));
+    mx.reserve((size_t)(8 * r + 1) * (8 * r + 1));
+    my.reserve((size_t)(8 * r + 1) * (8 * r + 1));
     for (int iy = 0; iy < ny; ++iy) {
         for (int ix = 0; ix < nx; ++ix) {
             const size_t t = (size_t)iy * nx + ix;
             if (!flagged[t]) continue;
+            // Escalating window: blunders arrive in CLUSTERS (a flat low-light
+            // region fails block matching as a patch, not as lone tiles), so
+            // the base radius often holds no consistent anchor at all -- the
+            // old code then kept the known-bad vector. Doubling the radius
+            // twice reaches past a cluster up to ~4r tiles across.
             mx.clear(); my.clear();
-            for (int dy = -r; dy <= r; ++dy) {
-                int ny0 = iy + dy;
-                if (ny0 < 0 || ny0 >= ny) continue;
-                for (int dx = -r; dx <= r; ++dx) {
-                    int nx0 = ix + dx;
-                    if (nx0 < 0 || nx0 >= nx) continue;
-                    const size_t s = (size_t)ny0 * nx + nx0;
-                    if (flagged[s]) continue;             // consistent neighbours only
-                    mx.push_back(src[s * 2 + 0]);
-                    my.push_back(src[s * 2 + 1]);
+            for (int rr = r; rr <= 4 * r; rr *= 2) {
+                for (int dy = -rr; dy <= rr; ++dy) {
+                    int ny0 = iy + dy;
+                    if (ny0 < 0 || ny0 >= ny) continue;
+                    for (int dx = -rr; dx <= rr; ++dx) {
+                        int nx0 = ix + dx;
+                        if (nx0 < 0 || nx0 >= nx) continue;
+                        if (rr > r && std::abs(dy) <= rr / 2 && std::abs(dx) <= rr / 2)
+                            continue;                     // inner ring already scanned
+                        const size_t s = (size_t)ny0 * nx + nx0;
+                        if (flagged[s]) continue;         // consistent neighbours only
+                        mx.push_back(src[s * 2 + 0]);
+                        my.push_back(src[s * 2 + 1]);
+                    }
                 }
+                if (!mx.empty()) break;
             }
-            if (mx.empty()) continue;                     // no anchor -> keep forward
+            if (mx.empty()) { ++n_unanchored; continue; }  // nothing within 4r: keep
             const size_t mid = mx.size() / 2;
             std::nth_element(mx.begin(), mx.begin() + mid, mx.end());
             std::nth_element(my.begin(), my.begin() + mid, my.end());
             fwd.flow[t * 2 + 0] = mx[mid];
             fwd.flow[t * 2 + 1] = my[mid];
+            // Mark the replacement: it deliberately OVERRIDES pixel evidence,
+            // and the later pixel-driven refiners (affine IC-GN, halftile LK)
+            // must not re-optimise it back into the wrong photometric minimum.
+            fwd.fb_corrected[t] = 1u;
+            ++n_corrected;
         }
     }
+    prof_add_cpu("fb#corrected", (double)n_corrected);
+    prof_add_cpu("fb#unanchored", (double)n_unanchored);
 }
 
 // Guards the recursive backward align() so it does not itself spawn a backward
@@ -2050,6 +2092,10 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
     const bool carry_affine =
         flow.affine_jac.size() == (size_t)flow.ny * (size_t)flow.nx * 4;
     if (carry_affine) out.affine_jac.assign((size_t)raw_ny * raw_nx * 4, 0.f);
+    // FB-corrected marks ride along so halftile_subdivide_refine (raw grid)
+    // knows not to pixel-re-optimise a consensus-replaced tile.
+    const bool carry_fb = flow.has_fb_marks();
+    if (carry_fb) out.fb_corrected.assign((size_t)raw_ny * raw_nx, 0u);
     for (int ty = 0; ty < raw_ny; ++ty) {
         const f32 raw_cy = ((f32)ty + 0.5f) * (f32)tile_size;
         const int gy = std::max(0, std::min(flow.ny - 1,
@@ -2072,6 +2118,8 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
                 Jd[0] = Js[0] * sx; Jd[1] = Js[1] * sx;
                 Jd[2] = Js[2] * sy; Jd[3] = Js[3] * sy;
             }
+            if (carry_fb)
+                out.fb_corrected[(size_t)ty * raw_nx + tx] = flow.fb_mark(gy, gx);
         }
     }
     return out;
