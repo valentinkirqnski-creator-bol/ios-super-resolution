@@ -181,6 +181,12 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
     if (R.h <= 8 || R.w <= 8) return;
     const f32 cx = 0.5f * (f32)(R.w - 1), cy = 0.5f * (f32)(R.h - 1);
     const int y0 = R.h / 8, y1 = R.h - R.h / 8, x0 = R.w / 8, x1 = R.w - R.w / 8;
+    // Minimum coverage for any scored state: at least a quarter of the inner
+    // region's sample grid must be valid, so candidates are never compared on
+    // tiny, disjoint pixel subsets (16 samples used to be enough to "win").
+    const long region_total =
+        (long)((y1 - y0 + 1) / 2) * (long)((x1 - x0 + 1) / 2);
+    const long min_cover = std::max<long>(16, region_total / 4);
     f32 pa = 1.f, pb = 0.f;  // lag-1 photometric gain/bias (for the GN residual)
     // Metric-only scoring pass (no normal equations): the profiled photometric
     // score of a candidate (tx, ty, theta) over the same region and validity
@@ -200,7 +206,7 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
                 spr += rv; spc += cv; sprr += (double)rv * rv; sprc += (double)rv * cv;
                 spcc += (double)cv * cv; ++pcnt;
             }
-        if (pcnt < 16) return 1e30f;
+        if (pcnt < min_cover) return 1e30f;
         const double n = (double)pcnt;
         const double var_r = sprr / n - (spr / n) * (spr / n);
         const double var_c = spcc / n - (spc / n) * (spc / n);
@@ -244,7 +250,7 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
                 for (int a = 0; a < 3; ++a) { b[a] -= J[a] * r;
                     for (int c2 = 0; c2 < 3; ++c2) Hm[a][c2] += J[a] * J[c2]; }
             }
-        if (pcnt < 16) {  // warped off the frame: nothing to fit on
+        if (pcnt < min_cover) {  // warped off the frame / too little evidence
             if (pending) { ltx -= last_dtx; lty -= last_dty; th -= last_dth; }
             pending = false;
             break;
@@ -646,13 +652,27 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
         if (!solve8(An, bn, y)) break;
         f32 d[8];
         for (int i = 0; i < 8; ++i) d[i] = y[i] / s[i];
-        f32 Hn[9];
-        for (int i = 0; i < 8; ++i) Hn[i] = H[i] + d[i];
-        Hn[8] = 1.f;
-        f32 e = warp_error(ref, comp, Hn);
-        if (!(e < cur_err)) break;     // no improvement (or NaN) -> stop
-        for (int i = 0; i < 9; ++i) H[i] = Hn[i];
-        cur_err = e;
+        // Backtracking line search: a too-aggressive Gauss-Newton step must not
+        // end refinement outright when a fraction of it would improve. The
+        // robust weighted objective the normal equations minimise and the
+        // gain/bias-corrected MAE the acceptance uses agree near the optimum
+        // but can disagree on step SIZE under outliers or poor conditioning;
+        // halving twice bridges them. If no tested fraction improves, stop.
+        bool accepted = false;
+        f32 step = 1.f;
+        for (int t = 0; t < 3; ++t, step *= 0.5f) {
+            f32 Hn[9];
+            for (int i = 0; i < 8; ++i) Hn[i] = H[i] + step * d[i];
+            Hn[8] = 1.f;
+            const f32 e = warp_error(ref, comp, Hn);
+            if (e < cur_err) {         // strict; false for NaN
+                for (int i = 0; i < 9; ++i) H[i] = Hn[i];
+                cur_err = e;
+                accepted = true;
+                break;
+            }
+        }
+        if (!accepted) break;
     }
 }
 
@@ -915,7 +935,57 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     // Scale from lk-level pixels to full grey pixels with the exact
     // pixel-centre map: D maps full->lk.
     f32 D[9], Dinv[9]; level_map(lk_scale, D, Dinv);
-    f32 tmp[9]; mat3_mul(Hsel, D, tmp); mat3_mul(Dinv, tmp, H_out);
+    f32 Hfull[9];
+    { f32 tmp[9]; mat3_mul(Hsel, D, tmp); mat3_mul(Dinv, tmp, Hfull); }
+
+    // HIGH-RESOLUTION FINAL POLISH. The ladder estimates at <= 384 px, where
+    // 0.1 px of residual is ~1 FULL-RES px on a 4000 px grey -- too coarse a
+    // finish for super-resolution, whose signal is sub-pixel offsets. Re-refine
+    // the selected model against >= 1024 px levels; every polish is gated by
+    // its own warp error, so it can only improve on the ladder's answer.
+    Config fine_cfg = cfg;
+    fine_cfg.isa_prealign_refine_dim = std::max(1024, cfg.isa_prealign_refine_dim);
+    if (!take_h) {
+        // Rigid winner: decompose in full-grey coords (exact -- the pixel-centre
+        // lift of a centred rigid transform is again rigid about the full
+        // centre) and hand it to the existing coarse-to-fine sub-pixel rigid
+        // refine, which gates against its own fine-level warp error.
+        const f32 fcx = 0.5f * (f32)(ref_grey.w - 1), fcy = 0.5f * (f32)(ref_grey.h - 1);
+        f32 th = std::atan2(Hfull[3], Hfull[0]);
+        const f32 cs = std::cos(th), sn = std::sin(th);
+        f32 dx = Hfull[2] - fcx + cs * fcx - sn * fcy;
+        f32 dy = Hfull[5] - fcy + sn * fcx + cs * fcy;
+        refine_global_rigid_seed(ref_grey, comp_grey, fine_cfg, dx, dy, th);
+        rigid_to_H(ref_grey, dx, dy, th, Hfull);
+    } else {
+        // Homography winner: estimate the residual RIGID correction at the
+        // refine resolution on the H-warped comp -- translation-first precision
+        // without re-opening the 8 projective DOF at high resolution, where
+        // they could drift on noise again. Compose it BEHIND H (total sample
+        // position = H * (R * p)) and keep it only if the fine-level warp
+        // error strictly improves.
+        f32 scf = 1.f;
+        const Image fine_r = downsample_to(ref_grey, fine_cfg.isa_prealign_refine_dim, scf);
+        const Image fine_c = downsample_to(comp_grey, fine_cfg.isa_prealign_refine_dim, scf);
+        if (fine_r.h > 8 && fine_r.w > 8 &&
+            fine_c.h == fine_r.h && fine_c.w == fine_r.w) {
+            f32 Mf[9], Mfi[9]; level_map(scf, Mf, Mfi);
+            f32 Hf[9]; { f32 t2[9]; mat3_mul(Hfull, Mfi, t2); mat3_mul(Mf, t2, Hf); }
+            const Image warped = warp_grey_by_homography(fine_c, Hf);
+            f32 rtx = 0.f, rty = 0.f, rth = 0.f;
+            rigid_lk_level(fine_r, warped, rtx, rty, rth, /*iters=*/15);
+            if (std::isfinite(rtx) && std::isfinite(rty) && std::isfinite(rth)) {
+                f32 Rm[9]; rigid_to_H(fine_r, rtx, rty, rth, Rm);
+                f32 Hcand[9]; mat3_mul(Hf, Rm, Hcand);
+                const f32 e_new = warp_error(fine_r, fine_c, Hcand);
+                const f32 e_old = warp_error(fine_r, fine_c, Hf);
+                if (std::isfinite(e_new) && e_new < 1e29f && e_new < e_old) {
+                    f32 t2[9]; mat3_mul(Hcand, Mf, t2); mat3_mul(Mfi, t2, Hfull);
+                }
+            }
+        }
+    }
+    for (int i = 0; i < 9; ++i) H_out[i] = Hfull[i];
 }
 
 f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey,
