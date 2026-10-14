@@ -50,6 +50,10 @@ Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]);
 // essentially no overlap returns -1. Used as a frame-level gate to reject
 // unfittable frames before merge. Returns 1 when it cannot be assessed (dims
 // mismatch / empty), so the caller does not reject on a non-measurement.
-f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey);
+// Pass H (the warp that produced warped_comp_grey) whenever available: validity
+// is then explicit (H*p in bounds) instead of the value==0 heuristic, which
+// cannot tell a genuinely black pixel from border fill on dark scenes.
+f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey,
+                     const f32* H = nullptr);
 
 } // namespace hhsr

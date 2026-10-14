@@ -63,29 +63,36 @@ inline void mat3_mul(const f32 A[9], const f32 B[9], f32 C[9]) {
 // Alignment error of comp warped by H against ref: mean absolute residual
 // after removing a global photometric gain/bias (comp ~= a*ref + b, least
 // squares) so exposure/gain drift between burst frames does not read as
-// misalignment. CONSISTENT SCORING across candidates: each candidate used to
-// be averaged over its OWN in-bounds pixel set with a ~12.5%-overlap floor, so
-// a warp could win by pushing the difficult pixels out of frame; now the mean
-// is divided by the valid-overlap fraction (losing coverage must be paid for
-// by a proportional per-pixel win) and under 50% overlap the candidate is not
-// comparable at all and scores 1e30.
+// misalignment. Candidates are scored on a COMMON central region (each side
+// inset by 1/6) so that, for the motion range the pre-align searches, every
+// candidate evaluates (and fits its photometric model on) essentially the
+// same pixel population -- a candidate can no longer look better by cropping
+// the difficult periphery out of its own score. Residual out-of-bounds pixels
+// (rare within the inset) are still skipped and charged for: the mean is
+// divided by the valid fraction, and under 50% validity the candidate is not
+// comparable at all and scores 1e30. Bounds tests use the require-form
+// (!(x >= lo && x <= hi)) so a non-finite coordinate from a diverged iterate
+// is REJECTED rather than reaching floor()/int conversion in the sampler.
 f32 warp_error(const Image& ref, const Image& comp, const f32 H[9]) {
-    // Pass 1: valid-overlap count + sums for the photometric fit.
+    const int y0 = ref.h / 6, y1 = ref.h - ref.h / 6;
+    const int x0 = ref.w / 6, x1 = ref.w - ref.w / 6;
+    // Pass 1: valid count + sums for the photometric fit.
     double sr = 0.0, sc = 0.0, srr = 0.0, src = 0.0;
     long cnt = 0, tot = 0;
-    for (int y = 0; y < ref.h; y += 2) {
-        for (int x = 0; x < ref.w; x += 2) {
+    for (int y = y0; y < y1; y += 2) {
+        for (int x = x0; x < x1; x += 2) {
             ++tot;
             f32 ox, oy;
             apply_homography(H, (f32)x, (f32)y, ox, oy);
-            if (ox < 0.f || ox > (f32)(comp.w - 1) || oy < 0.f || oy > (f32)(comp.h - 1))
+            if (!(ox >= 0.f && ox <= (f32)(comp.w - 1) &&
+                  oy >= 0.f && oy <= (f32)(comp.h - 1)))
                 continue;
             const double cv = sample_clamp(comp, ox, oy), rv = ref.at(y, x);
             sr += rv; sc += cv; srr += rv * rv; src += rv * cv;
             ++cnt;
         }
     }
-    if (tot <= 0 || cnt * 2 < tot) return 1e30f;  // <50% overlap
+    if (tot <= 0 || cnt * 2 < tot) return 1e30f;  // <50% valid
     const double n = (double)cnt;
     const double var_r = srr / n - (sr / n) * (sr / n);
     f32 pa = 1.f, pb = 0.f;
@@ -96,11 +103,12 @@ f32 warp_error(const Image& ref, const Image& comp, const f32 H[9]) {
     }
     // Pass 2: mean |comp(Hp) - (a*ref(p) + b)| over the same valid set.
     double acc = 0.0;
-    for (int y = 0; y < ref.h; y += 2) {
-        for (int x = 0; x < ref.w; x += 2) {
+    for (int y = y0; y < y1; y += 2) {
+        for (int x = x0; x < x1; x += 2) {
             f32 ox, oy;
             apply_homography(H, (f32)x, (f32)y, ox, oy);
-            if (ox < 0.f || ox > (f32)(comp.w - 1) || oy < 0.f || oy > (f32)(comp.h - 1))
+            if (!(ox >= 0.f && ox <= (f32)(comp.w - 1) &&
+                  oy >= 0.f && oy <= (f32)(comp.h - 1)))
                 continue;
             acc += std::fabs(sample_clamp(comp, ox, oy) - (pa * ref.at(y, x) + pb));
         }
@@ -153,9 +161,15 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
     const f32 cx = 0.5f * (f32)(R.w - 1), cy = 0.5f * (f32)(R.h - 1);
     const int y0 = R.h / 8, y1 = R.h - R.h / 8, x0 = R.w / 8, x1 = R.w - R.w / 8;
     f32 pa = 1.f, pb = 0.f;  // lag-1 photometric gain/bias
+    // Step acceptance: the residual accumulated in iteration k measures the
+    // parameters AFTER step k-1, at zero extra cost. If it got worse, the last
+    // step is reverted and the refine stops -- Gauss-Newton may not silently
+    // walk away from the optimum (previously nothing checked improvement until
+    // the caller's final gate, which only protects the OUTPUT, not the path).
+    f32 prev_mean = 1e30f, last_dtx = 0.f, last_dty = 0.f, last_dth = 0.f;
     for (int it = 0; it < iters; ++it) {
         double Hm[3][3] = {{0,0,0},{0,0,0},{0,0,0}}, b[3] = {0,0,0};
-        double spr = 0.0, spc = 0.0, sprr = 0.0, sprc = 0.0; long pcnt = 0;
+        double spr = 0.0, spc = 0.0, sprr = 0.0, sprc = 0.0, sabs = 0.0; long pcnt = 0;
         const f32 cs = std::cos(th), sn = std::sin(th);
         for (int y = y0; y < y1; y += 2)
             for (int x = x0; x < x1; x += 2) {
@@ -170,11 +184,19 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
                 const f32 J[3] = { gx, gy, gx * dwx + gy * dwy };
                 const f32 r = cv - (pa * rv + pb);
                 spr += rv; spc += cv; sprr += (double)rv * rv; sprc += (double)rv * cv; ++pcnt;
+                sabs += std::fabs((double)r);
                 for (int a = 0; a < 3; ++a) { b[a] -= J[a] * r;
                     for (int c2 = 0; c2 < 3; ++c2) Hm[a][c2] += J[a] * J[c2]; }
             }
+        if (pcnt < 16) break;  // warped off the frame: nothing to fit on
+        const f32 mean_abs = (f32)(sabs / (double)pcnt);
+        if (!(mean_abs <= prev_mean)) {           // worse (or NaN): revert last step
+            ltx -= last_dtx; lty -= last_dty; th -= last_dth;
+            break;
+        }
+        prev_mean = mean_abs;
         // Photometric fit for the NEXT iteration (lag-1, like the IRLS scales).
-        if (pcnt > 16) {
+        {
             const double n = (double)pcnt;
             const double var_r = sprr / n - (spr / n) * (spr / n);
             if (var_r > 1e-12) {
@@ -200,6 +222,14 @@ void rigid_lk_level(const Image& R, const Image& C, f32& ltx, f32& lty, f32& th,
         const f32 d_tx = (f32)A[0][3], d_ty = (f32)A[1][3], d_th = (f32)A[2][3];
         if (!(std::isfinite(d_tx) && std::isfinite(d_ty) && std::isfinite(d_th))) break;
         ltx += d_tx; lty += d_ty; th += d_th;
+        // Parameter sanity: a rigid pre-align never legitimately leaves this
+        // range; stepping outside it means divergence, so undo and stop.
+        if (!(std::fabs(ltx) < (f32)R.w && std::fabs(lty) < (f32)R.h &&
+              std::fabs(th) < 0.7f)) {
+            ltx -= d_tx; lty -= d_ty; th -= d_th;
+            break;
+        }
+        last_dtx = d_tx; last_dty = d_ty; last_dth = d_th;
         if (std::fabs(d_tx) + std::fabs(d_ty) < 1e-3f && std::fabs(d_th) < 1e-6f) break;
     }
 }
@@ -397,11 +427,15 @@ void lk_refine(const Image& ref, const Image& comp, f32 H[9], int iters,
                 for (int x = 1; x < ref.w - 1; ++x) {
                     const f32 fx = (f32)x, fy = (f32)y;
                     const f32 D = H[6] * fx + H[7] * fy + H[8];
-                    if (std::fabs(D) < 1e-6f) continue;
+                    // Require-form tests reject NaN/inf (comparisons with NaN
+                    // are false), so a diverged iterate cannot reach the
+                    // sampler's floor()/int conversion.
+                    if (!(std::fabs(D) > 1e-6f)) continue;
                     const f32 iD = 1.f / D;
                     const f32 u = (H[0] * fx + H[1] * fy + H[2]) * iD;
                     const f32 v = (H[3] * fx + H[4] * fy + H[5]) * iD;
-                    if (u < 1.f || u > (f32)(comp.w - 2) || v < 1.f || v > (f32)(comp.h - 2))
+                    if (!(u >= 1.f && u <= (f32)(comp.w - 2) &&
+                          v >= 1.f && v <= (f32)(comp.h - 2)))
                         continue;
                     const f32 cv = sample_clamp(comp, u, v), rv = ref.at(y, x);
                     const f32 err = cv - (pa * rv + pb);
@@ -517,8 +551,9 @@ Image warp_grey_by_homography(const Image& comp_grey, const f32 H[9]) {
         for (int x = 0; x < out.w; ++x) {
             f32 ox, oy;
             apply_homography(H, (f32)x, (f32)y, ox, oy);
-            if (ox < 0.f || ox > (f32)(comp_grey.w - 1) ||
-                oy < 0.f || oy > (f32)(comp_grey.h - 1)) {
+            // Require-form bounds reject NaN/inf coordinates too (-> 0 fill).
+            if (!(ox >= 0.f && ox <= (f32)(comp_grey.w - 1) &&
+                  oy >= 0.f && oy <= (f32)(comp_grey.h - 1))) {
                 out.at(y, x) = 0.f;
             } else {
                 out.at(y, x) = sample_clamp(comp_grey, ox, oy);
@@ -586,27 +621,36 @@ void refine_global_homography_seed(const Image& ref_grey, const Image& comp_grey
     // seed is the safe fallback; only take the homography when it earns it.
     if (degenerate || !(e_ref < 0.98f * e_seed)) return;
 
-    // Second gate: even with a real average-error win, reject a refine that
-    // moves the corners far more than the seed does (relative to identity) --
-    // the signature of noise-driven perspective. A genuine global perspective
-    // change lowers the error roughly in proportion to how far it moves pixels;
-    // noise lowers it marginally while moving corners a lot. Cap the ratio.
+    // Second gate: even with a real average-error win, reject a refine whose
+    // corner predictions DISAGREE with the seed's by more than the seed's own
+    // motion supports -- the signature of noise-driven perspective. Evaluated
+    // with H and H_inout directly, which are BOTH in full grey pixels, at the
+    // full grey corners (the previous version applied the fine-level-scaled
+    // Href/Hseed to full-res corners, a mixed-coordinate comparison whose
+    // numbers were meaningless), and the guarded quantity is max||H*p -
+    // Hseed*p||, not each model's distance from identity (two models moving a
+    // corner equally far in OPPOSITE directions must not pass).
     {
         const f32 cxs[4] = {0.f, (f32)(ref_grey.w - 1), 0.f, (f32)(ref_grey.w - 1)};
         const f32 cys[4] = {0.f, 0.f, (f32)(ref_grey.h - 1), (f32)(ref_grey.h - 1)};
-        f32 ref_move = 0.f, seed_move = 0.f;
+        f32 extra = 0.f, seed_move = 0.f;
         for (int i = 0; i < 4; ++i) {
+            // Projective validity at the corners (linear in x,y, so corner-
+            // positivity covers the whole frame).
+            const f32 den = H[6] * cxs[i] + H[7] * cys[i] + H[8];
+            if (!(den > 0.05f && den < 20.f)) return;  // keep the rigid seed
             f32 rx, ry, sx, sy;
-            apply_homography(Href,  cxs[i], cys[i], rx, ry);
-            apply_homography(Hseed, cxs[i], cys[i], sx, sy);
-            ref_move  = std::max(ref_move,  std::hypot(rx - cxs[i], ry - cys[i]));
+            apply_homography(H,       cxs[i], cys[i], rx, ry);
+            apply_homography(H_inout, cxs[i], cys[i], sx, sy);
+            if (!(std::isfinite(rx) && std::isfinite(ry))) return;
+            extra     = std::max(extra,     std::hypot(rx - sx, ry - sy));
             seed_move = std::max(seed_move, std::hypot(sx - cxs[i], sy - cys[i]));
         }
-        // When the seed is ~identity (still burst), allow the refine at most a
-        // small absolute corner excursion; otherwise allow it to scale with the
-        // seed's own motion. Reject wild perspective on low-motion input.
-        const f32 allowed = std::max(2.0f, 1.5f * seed_move);
-        if (ref_move > allowed) return;  // keep the rigid seed
+        // When the seed is ~identity (still burst), allow at most a small
+        // absolute disagreement; otherwise scale with the seed's own motion
+        // (matches the live path's max(1 lk px, 0.5*base) at full grey res).
+        const f32 allowed = std::max(10.0f, 0.5f * seed_move);
+        if (extra > allowed) return;  // keep the rigid seed
     }
 
     for (int i = 0; i < 9; ++i) H_inout[i] = H[i];
@@ -687,10 +731,13 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     // only if it beats identity by the noise margin; identity otherwise.
     f32 Hbase[9]; for (int i = 0; i < 9; ++i) Hbase[i] = identity[i];
     f32 e_base = e_id;
-    const f32 e_low = std::min(std::isfinite(e_c) ? e_c : 1e30f,
-                               std::isfinite(e_r) ? e_r : 1e30f);
+    // Sanitise BEFORE choosing the winner: comparing raw values would let a
+    // NaN score select the invalid candidate (NaN comparisons are false).
+    const f32 e_c_s = std::isfinite(e_c) ? e_c : 1e30f;
+    const f32 e_r_s = std::isfinite(e_r) ? e_r : 1e30f;
+    const f32 e_low = std::min(e_c_s, e_r_s);
     if (e_low < e_id - margin) {
-        const f32* Hw = (e_r <= e_c) ? Hr : Hc;
+        const f32* Hw = (e_r_s <= e_c_s) ? Hr : Hc;
         for (int i = 0; i < 9; ++i) Hbase[i] = Hw[i];
         e_base = e_low;
     }
@@ -707,25 +754,36 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
                   std::isfinite(e_h) && (e_h < 0.98f * e_base) &&
                   (e_h < e_id - margin);
     if (take_h) {
-        // Corner-motion guard (the same idea refine_global_homography_seed
-        // uses, previously MISSING here -- and this is the live path): a
-        // genuine global perspective lowers the error roughly in proportion to
-        // how far it moves pixels; noise lowers it marginally while moving the
-        // corners a lot. Cap the homography's corner excursion relative to the
-        // base model's. 1 lk-level px (level <= 384 wide) is ~10 full-res grey
-        // px of corner motion -- plenty for real handheld perspective.
+        // Projective validity: the denominator h6*x + h7*y + 1 must be finite,
+        // well away from zero and POSITIVE at all four corners. It is linear
+        // in (x, y), so corner-positivity implies positivity over the whole
+        // frame -- no pixel maps through (or near) the plane at infinity. The
+        // 2x2 determinant alone cannot guarantee this.
+        //
+        // Corner-motion guard (previously only in the uncalled
+        // refine_global_homography_seed; this is the live path). The guarded
+        // quantity is the DISAGREEMENT between the homography and the base
+        // model at the corners, max ||H*p - Hbase*p|| -- not each one's
+        // distance from identity, which would pass two models that move a
+        // corner the same distance in opposite directions. A genuine global
+        // perspective only ADDS a modest corner excursion on top of the rigid
+        // base; noise-perspective buys a sliver of error with a large
+        // excursion. 1 lk-level px (level <= 384 wide) is ~10 full-res grey px.
         const f32 cxs[4] = {0.f, (f32)(lk_ref.w - 1), 0.f, (f32)(lk_ref.w - 1)};
         const f32 cys[4] = {0.f, 0.f, (f32)(lk_ref.h - 1), (f32)(lk_ref.h - 1)};
-        f32 h_move = 0.f, b_move = 0.f;
+        f32 extra = 0.f, b_move = 0.f;
         for (int i = 0; i < 4; ++i) {
+            const f32 den = H[6] * cxs[i] + H[7] * cys[i] + H[8];
+            if (!(den > 0.05f && den < 20.f)) { take_h = false; break; }
             f32 hx, hy, bx, by;
             apply_homography(H,     cxs[i], cys[i], hx, hy);
             apply_homography(Hbase, cxs[i], cys[i], bx, by);
-            h_move = std::max(h_move, std::hypot(hx - cxs[i], hy - cys[i]));
+            if (!(std::isfinite(hx) && std::isfinite(hy))) { take_h = false; break; }
+            extra  = std::max(extra,  std::hypot(hx - bx, hy - by));
             b_move = std::max(b_move, std::hypot(bx - cxs[i], by - cys[i]));
         }
-        const f32 allowed = std::max(1.0f, 1.5f * b_move);
-        if (h_move > allowed) take_h = false;    // fall back to the base model
+        const f32 allowed = std::max(1.0f, 0.5f * b_move);
+        if (extra > allowed) take_h = false;     // fall back to the base model
     }
     const f32* Hsel = take_h ? H : Hbase;
     if (!take_h && !(e_base < e_id)) return;     // identity: H_out already set
@@ -737,7 +795,8 @@ void estimate_global_homography(const Image& ref_grey, const Image& comp_grey,
     f32 tmp[9]; mat3_mul(Hsel, D, tmp); mat3_mul(Dinv, tmp, H_out);
 }
 
-f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey) {
+f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey,
+                     const f32* H) {
     const Image& a = ref_grey;
     const Image& b = warped_comp_grey;
     if (a.h <= 0 || a.w <= 0 || b.h != a.h || b.w != a.w) return 1.f; // can't assess
@@ -745,17 +804,29 @@ f32 prealign_fit_ncc(const Image& ref_grey, const Image& warped_comp_grey) {
         b.data.size() != (size_t)b.h * b.w * b.c) return 1.f;
     // Pearson correlation over the inner 80% (the warp zeroes a border strip for
     // any real shift; sampling the centre avoids counting that border as
-    // mismatch), subsampled for speed.
+    // mismatch), subsampled for speed. With H (the warp that produced
+    // warped_comp_grey) validity is EXPLICIT: a pixel counts iff H*p landed in
+    // bounds. Without H the old value==0 heuristic remains, which cannot tell a
+    // genuinely black pixel from border fill and so under-samples (or falsely
+    // non-fits) dark scenes -- pass H whenever it is available.
     const int stride = 4;
     const int y0 = a.h / 10, y1 = a.h - a.h / 10;
     const int x0 = a.w / 10, x1 = a.w - a.w / 10;
+    const f32 bw = (f32)(b.w - 1), bh = (f32)(b.h - 1);
     double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
     long nn = 0, tot = 0;
     for (int y = y0; y < y1; y += stride)
         for (int x = x0; x < x1; x += stride) {
             ++tot;
             const float vb = b.at(y, x);
-            if (vb == 0.f) continue;              // warp out-of-bounds -> exactly 0
+            if (H) {
+                f32 ox, oy;
+                apply_homography(H, (f32)x, (f32)y, ox, oy);
+                if (!(ox >= 0.f && ox <= bw && oy >= 0.f && oy <= bh))
+                    continue;                     // warp out-of-bounds: not data
+            } else if (vb == 0.f) {
+                continue;                         // heuristic: border fill is 0
+            }
             const float va = a.at(y, x);
             sa += va; sb += vb; saa += (double)va * va; sbb += (double)vb * vb;
             sab += (double)va * vb; ++nn;
