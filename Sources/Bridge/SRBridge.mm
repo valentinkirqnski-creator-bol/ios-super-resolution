@@ -635,6 +635,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_refine_max_reduction = tuning[@"robustness_refine_max_reduction"].floatValue;
     if (tuning[@"robustness_refine_deadzone"])
         cfg.robustness_refine_deadzone = tuning[@"robustness_refine_deadzone"].floatValue;
+    if (tuning[@"robustness_refine_gate_px"])
+        cfg.robustness_refine_gate_px = tuning[@"robustness_refine_gate_px"].floatValue;
+    if (tuning[@"robustness_refine_regional_gate_px"])
+        cfg.robustness_refine_regional_gate_px = tuning[@"robustness_refine_regional_gate_px"].floatValue;
 }
 
 static std::string NSStringToStd(id value) {

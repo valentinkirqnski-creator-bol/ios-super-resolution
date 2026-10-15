@@ -1244,6 +1244,21 @@ struct CameraView: View {
                          Diagnostic: zeroes the Poisson–Gaussian sensor-noise model as read by the robustness mask ONLY. R is then scored from the raw measured local variance and the raw (un-shrunk) pixel difference, with no noise floor subtracted — so a tile's colour difference is taken at face value instead of being forgiven as "within noise". Isolates whether a mismatch reads small because the noise model excused it or because the content genuinely is that flat. Alignment, kernels and SNR auto-tune are untouched. Leave OFF for normal use.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("NN Mask Refine", isOn: $cam.tuningParams.robustness_refine_nn_enabled)
+                    Text("""
+                         A small neural network that REFINES the analytic robustness mask — darken-only, so it can only reject more, never trust more (R=0 stays 0). Per pixel it reads ~47 features the analytic mask can't combine — the local affine flow model's disagreement with the tile vector, a pooled Lucas-Kanade shift estimate, structure-tensor coherence and multi-scale edge analysis — and attenuates R where a tile's single vector misrepresents the real motion (rotation/yaw/parallax within a tile, a mis-estimated tile) while sparing clean sub-pixel detail. Runs on both CPU and GPU (one Metal kernel). Gated so it leaves most of the frame bit-identical and acts only where the geometry says the merge would ghost. Off by default; A/B it on bursts that still ghost at tile edges.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.robustness_refine_nn_enabled {
+                        ispRow("Max Reduction", $cam.tuningParams.robustness_refine_max_reduction, 0.0...1.0, "%.2f")
+                        ispRow("Dead Zone", $cam.tuningParams.robustness_refine_deadzone, 0.0...0.5, "%.2f")
+                        ispRow("Gate (px)", $cam.tuningParams.robustness_refine_gate_px, 0.0...3.0, "%.2f")
+                        ispRow("Regional Gate (px)", $cam.tuningParams.robustness_refine_regional_gate_px, 0.0...3.0, "%.2f")
+                        Text("""
+                             Max Reduction caps how far R can be pulled down (1.0 = may reach 0; lower = gentler). Dead Zone ignores tiny attenuations (keeps R bit-identical below it). The two Gates make the net act only where local flow disagreement exceeds the threshold in raw pixels — Gate is per-pixel, Regional is over the neighbourhood; 0 disables a gate. Sub-1px flow error is SR signal, so the gates keep the net off it.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
