@@ -38,26 +38,42 @@
 
 #include "rob_mask_nn_weights.h"   // ROB_NN_FEAT, ROB_NN_FMU/FSD, W0/B0/W1/B1/W2/B2
 
+// Hidden widths -- must match tools/nn_mask_refine/train.py Net.
+#define RMN_H0 24
+#define RMN_H1 16
+
 // q in [0,1]: how much of R to KEEP. Darken-only -- the caller multiplies.
 inline float rob_mask_nn_gate(const RMN_THREAD float* feat) {
     float x[9];
     for (int c = 0; c < ROB_NN_FEAT; ++c)
         x[c] = (feat[c] - ROB_NN_FMU[c]) / ROB_NN_FSD[c];
-    float h0[10];
-    for (int o = 0; o < 10; ++o) {
+    float h0[RMN_H0];
+    for (int o = 0; o < RMN_H0; ++o) {
         float s = ROB_NN_B0[o];
         for (int c = 0; c < ROB_NN_FEAT; ++c) s += ROB_NN_W0[o * ROB_NN_FEAT + c] * x[c];
         h0[o] = s > 0.f ? s : 0.f;
     }
-    float h1[8];
-    for (int o = 0; o < 8; ++o) {
+    float h1[RMN_H1];
+    for (int o = 0; o < RMN_H1; ++o) {
         float s = ROB_NN_B1[o];
-        for (int c = 0; c < 10; ++c) s += ROB_NN_W1[o * 10 + c] * h0[c];
+        for (int c = 0; c < RMN_H0; ++c) s += ROB_NN_W1[o * RMN_H0 + c] * h0[c];
         h1[o] = s > 0.f ? s : 0.f;
     }
     float s = ROB_NN_B2[0];
-    for (int c = 0; c < 8; ++c) s += ROB_NN_W2[c] * h1[c];
+    for (int c = 0; c < RMN_H1; ++c) s += ROB_NN_W2[c] * h1[c];
     return 1.f / (1.f + exp(-s));
+}
+
+// HARD GATE: the sigmoid asymptotes to 0/1 but never reaches them, so a
+// confidently-bad pixel keeps a few percent of weight (an incomplete
+// rejection) and a clean pixel is nudged below 1 (needless denoise loss).
+// Snap the two ends: below `lo` reject OUTRIGHT (g = 0, the off switch the
+// soft gate lacked), above `hi` keep bit-identical (g = 1). The ambiguous
+// middle stays soft. Monotone, so it only sharpens what the net already says.
+inline float rob_mask_nn_hard_gate(float g, float lo, float hi) {
+    if (g < lo) return 0.f;
+    if (g > hi) return 1.f;
+    return g;
 }
 
 // Assemble the 9 features (f7 is derived here so the caller cannot forget it)

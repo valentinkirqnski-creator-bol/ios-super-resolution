@@ -2822,6 +2822,13 @@ void rob_mask_nn_refine(Image& R, const Image& ref_grey,
             Rg = Rg < 0.f ? 0.f : (Rg > 1.f ? 1.f : Rg);
             f32 g = rob_mask_nn_gate_from(Rg, d_over_sig, gref, gradv,
                                           divv, curl, dist, cons_dev);
+            // Hard gate: snap the confident ends so a bad pixel is rejected
+            // OUTRIGHT (g=0, not the sigmoid's residual few percent) and a clean
+            // pixel is kept bit-identical (g=1). lo/hi leave the ambiguous
+            // middle soft. This is the "off switch" the plain sigmoid lacked --
+            // it completes the rejection of the far-from-centre rotated pixels
+            // the net already marks low.
+            g = rob_mask_nn_hard_gate(g, 0.55f, 0.90f);
             if (!(g >= 0.f && g <= 1.f)) g = 1.f;   // never brighten / never NaN
             for (int ch = 0; ch < c; ++ch) R.at(y, x, ch) *= g;
         }
