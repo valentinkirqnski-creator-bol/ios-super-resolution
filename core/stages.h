@@ -155,7 +155,7 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // nearest-upsample back to raw. Shared by the CPU path and the Metal host
 // (which runs the mask kernel on GPU and this stage on CPU so both paths
 // stay bit-identical without a new shader).
-Image robustness_local_min_on_guide(const Image& R, bool bilinear_upsample = false);
+Image robustness_local_min_on_guide(const Image& R);
 
 // Bayer quad -> guide-resolution RGB (or the raw plane itself outside Bayer
 // mode). Exposed so callers besides robustness.cpp (neural_flow's caller)

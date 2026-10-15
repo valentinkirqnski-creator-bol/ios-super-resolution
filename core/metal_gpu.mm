@@ -2455,7 +2455,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, (int)rob_nch);
     memcpy(R_pre.data.data(), [b_R contents], mask_b_r);
-    Image r = robustness_local_min_on_guide(R_pre, cfg.robustness_min_upsample_bilinear);   // channel-aware 5x5 min
+    Image r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);

@@ -1456,7 +1456,7 @@ static Image local_min_5x5(const Image& R) {
 // preserved (one rejected raw pixel still darkens its guide cell). Net:
 // R is evaluated per raw pixel (the toggle's point), but the spatial
 // safety margin is Wronski's own, on Wronski's own grid.
-static Image local_min_5x5_on_guide(const Image& R, bool bilinear_upsample);
+static Image local_min_5x5_on_guide(const Image& R);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
@@ -1711,17 +1711,16 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         }
     }
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
-    // there (= the paper's 10x10-raw footprint), upsample back (nearest by
-    // default; bilinear when robustness_min_upsample_bilinear). See
+    // there (= the paper's 10x10-raw footprint), nearest-upsample back. See
     // local_min_5x5_on_guide.
-    return local_min_5x5_on_guide(R, cfg.robustness_min_upsample_bilinear);
+    return local_min_5x5_on_guide(R);
 }
 
-Image robustness_local_min_on_guide(const Image& R, bool bilinear_upsample) {
-    return local_min_5x5_on_guide(R, bilinear_upsample);
+Image robustness_local_min_on_guide(const Image& R) {
+    return local_min_5x5_on_guide(R);
 }
 
-static Image local_min_5x5_on_guide(const Image& R, bool bilinear_upsample) {
+static Image local_min_5x5_on_guide(const Image& R) {
     const int nc = R.c;
     const int gh = R.h / 2, gw = R.w / 2;
     if (gh <= 0 || gw <= 0) return local_min_5x5(R);
@@ -1739,43 +1738,13 @@ static Image local_min_5x5_on_guide(const Image& R, bool bilinear_upsample) {
     }
     Image M = local_min_5x5(G);
     Image out(R.h, R.w, nc);
-    if (!bilinear_upsample) {
-        // Nearest: each 2x2 raw block takes its parent guide cell's min
-        // (piecewise-constant -> square mask pixels).
-        for (int y = 0; y < R.h; ++y) {
-            const int gy = std::min(gh - 1, y / 2);
-            for (int x = 0; x < R.w; ++x)
-                for (int ch = 0; ch < nc; ++ch)
-                    out.at(y, x, ch) = M.at(gy, std::min(gw - 1, x / 2), ch);
-        }
-        return out;
-    }
-    // Bilinear: ramp between guide cells (align_corners=False), rounding the
-    // mask contours. Softens the rejection boundary -- a kept cell next to a
-    // rejected one now has intermediate values at the seam instead of a hard
-    // zero edge, so this re-admits a sliver of what the min rejected. Opt-in.
-    const f32 syc = (f32)gh / (f32)R.h;   // out -> guide coordinate scale
-    const f32 sxc = (f32)gw / (f32)R.w;
+    // Nearest: each 2x2 raw block takes its parent guide cell's min
+    // (piecewise-constant -> square mask pixels).
     for (int y = 0; y < R.h; ++y) {
-        f32 fy = ((f32)y + 0.5f) * syc - 0.5f;
-        if (fy < 0.f) fy = 0.f; else if (fy > (f32)(gh - 1)) fy = (f32)(gh - 1);
-        const int y0 = (int)std::floor(fy);
-        const int y1 = std::min(gh - 1, y0 + 1);
-        const f32 wy = fy - (f32)y0;
-        for (int x = 0; x < R.w; ++x) {
-            f32 fx = ((f32)x + 0.5f) * sxc - 0.5f;
-            if (fx < 0.f) fx = 0.f; else if (fx > (f32)(gw - 1)) fx = (f32)(gw - 1);
-            const int x0 = (int)std::floor(fx);
-            const int x1 = std::min(gw - 1, x0 + 1);
-            const f32 wx = fx - (f32)x0;
-            for (int ch = 0; ch < nc; ++ch) {
-                const f32 m00 = M.at(y0, x0, ch), m01 = M.at(y0, x1, ch);
-                const f32 m10 = M.at(y1, x0, ch), m11 = M.at(y1, x1, ch);
-                const f32 top = m00 + (m01 - m00) * wx;
-                const f32 bot = m10 + (m11 - m10) * wx;
-                out.at(y, x, ch) = top + (bot - top) * wy;
-            }
-        }
+        const int gy = std::min(gh - 1, y / 2);
+        for (int x = 0; x < R.w; ++x)
+            for (int ch = 0; ch < nc; ++ch)
+                out.at(y, x, ch) = M.at(gy, std::min(gw - 1, x / 2), ch);
     }
     return out;
 }

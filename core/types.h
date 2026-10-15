@@ -1001,18 +1001,6 @@ struct Config {
     // robustness/merge path does not yet (see rob_make_mask / the merge kernel).
     bool  robustness_per_channel = false;
 
-    // Eq. 9 upsample: how the 5x5-min result on the half-res guide lattice is
-    // brought back to raw resolution (local_min_5x5_on_guide). false (default) =
-    // NEAREST, so each 2x2 raw block takes one guide value -> the mask is
-    // piecewise-constant over 2x2 blocks (square pixels). true = BILINEAR, which
-    // ramps between guide cells -> rounder mask contours. NOTE: interpolating a
-    // MIN mask raises values between a rejected (low) cell and a kept (high) one,
-    // so it SOFTENS the rejection boundary -- the same softening that re-admitted
-    // ghosts when the merge-side fetch was made bilinear (see the build 75->76
-    // revert). Measure before trusting it. Shared by the CPU and Metal raw-res
-    // paths (both call local_min_5x5_on_guide after R is built).
-    bool  robustness_min_upsample_bilinear = false;
-
     // Perceptual-space robustness (reworked mask). The sensor is Poisson-Gaussian
     // (var = alpha*x + beta), and the human eye is near-logarithmic, so a fixed
     // colour difference in LINEAR space is neither a fixed amount of noise nor a
