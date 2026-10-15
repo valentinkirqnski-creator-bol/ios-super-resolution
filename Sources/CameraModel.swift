@@ -363,11 +363,6 @@ struct TuningParams: Equatable, Codable {
     /// correction. 0.2 is measured: it moves 3% of the frame and captures 77%
     /// of the available merge-error improvement (see types.h for the sweep).
     var robustness_refine_deadzone: Float = 0.05
-    /// Per-pixel / regional flow-disagreement gates (raw px): the refiner acts
-    /// only where local flow error exceeds these; 0 disables a gate. Match the
-    /// core defaults (Config::robustness_refine_gate_px / _regional_gate_px).
-    var robustness_refine_gate_px: Float = 0.80
-    var robustness_refine_regional_gate_px: Float = 1.00
     /// FALSE. It is now a Settings toggle, so its stored value is what the user
     /// sees; defaulting it to true while the gate also demands the decimate grey
     /// made it read "on" while being inert, which is worse than off.
@@ -460,7 +455,6 @@ struct TuningParams: Equatable, Codable {
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
-        case robustness_refine_gate_px, robustness_refine_regional_gate_px
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -583,8 +577,6 @@ struct TuningParams: Equatable, Codable {
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
-        robustness_refine_gate_px = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_gate_px) ?? robustness_refine_gate_px
-        robustness_refine_regional_gate_px = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_regional_gate_px) ?? robustness_refine_regional_gate_px
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
         hdr_vibrance = try c.decodeIfPresent(Float.self, forKey: .hdr_vibrance) ?? hdr_vibrance
     }
@@ -2394,8 +2386,6 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
-            "robustness_refine_gate_px": NSNumber(value: tuningParams.robustness_refine_gate_px),
-            "robustness_refine_regional_gate_px": NSNumber(value: tuningParams.robustness_refine_regional_gate_px),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),
             "hdr_vibrance": NSNumber(value: tuningParams.hdr_vibrance),
         ]
