@@ -1347,7 +1347,13 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // consumes the reference covariances from a HOST CovField. Residency hands
     // those back dimensions-only, so the two cannot be combined -- an explicit
     // online run keeps the whole pre-residency path.
-    frames_resident = (work.merge_arch != 2) &&
+    // The NN mask refiner (Config::rob_mask_nn_enabled) refines the mask HOST-
+    // side (the verified rob_mask_nn_refine), which needs the mask materialised
+    // on the host, not left in a GPU slice. Residency is off by default anyway;
+    // this makes it explicit so the refined host mask is what the banded merge
+    // uploads -- the whole net path then runs host-side with no Metal kernel and
+    // the device result is bit-identical to the CPU path.
+    frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -1709,7 +1715,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // this same consensus -- lands next. Decodes + aligns every frame again, so
     // it is strictly opt-in. An empty result disables the refine downstream.
     Image mask_nn_consensus;
-#if !defined(__APPLE__)
     if (work.rob_mask_nn_enabled) {
         const double t_cons = prof_now_ms();
         mask_nn_consensus = compute_mask_nn_consensus(loader, comp_indices, ref_grey,
@@ -1718,7 +1723,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_add_cpu("mask_nn:consensus-ms", prof_now_ms() - t_cons);
         prof_add_cpu("mask_nn:consensus-ok", mask_nn_consensus.h > 0 ? 1.0 : 0.0);
     }
-#endif
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
