@@ -368,6 +368,13 @@ struct TuningParams: Equatable, Codable {
     /// device with no Metal kernel. Blind to errors all frames share. OFF.
     var robustness_consensus_reject_enabled: Bool = false
     var consensus_reject_sigma: Float = 2.0
+    /// Convolutional ghost detector (build 117): a tiny 5-layer CNN whose
+    /// spatial receptive field sees the ghost signature (doubled edge, displaced
+    /// blob) that wrong per-tile flow leaves (rotation, parallax, blunders).
+    /// Darken-only: R' = R*(1 - ghost_strength*g). Runs host-side at reduced res
+    /// and uploads to the device merge (no Metal kernel). OFF by default.
+    var ghost_detector_enabled: Bool = false
+    var ghost_strength: Float = 1.0
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -469,6 +476,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_refine_deadzone
         case rob_mask_nn_enabled
         case robustness_consensus_reject_enabled, consensus_reject_sigma
+        case ghost_detector_enabled, ghost_strength
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -592,6 +600,8 @@ struct TuningParams: Equatable, Codable {
         rob_mask_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .rob_mask_nn_enabled) ?? rob_mask_nn_enabled
         robustness_consensus_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_consensus_reject_enabled) ?? robustness_consensus_reject_enabled
         consensus_reject_sigma = try c.decodeIfPresent(Float.self, forKey: .consensus_reject_sigma) ?? consensus_reject_sigma
+        ghost_detector_enabled = try c.decodeIfPresent(Bool.self, forKey: .ghost_detector_enabled) ?? ghost_detector_enabled
+        ghost_strength = try c.decodeIfPresent(Float.self, forKey: .ghost_strength) ?? ghost_strength
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
@@ -2404,6 +2414,8 @@ final class CameraModel: NSObject, ObservableObject {
             "rob_mask_nn_enabled": NSNumber(value: tuningParams.rob_mask_nn_enabled),
             "robustness_consensus_reject_enabled": NSNumber(value: tuningParams.robustness_consensus_reject_enabled),
             "consensus_reject_sigma": NSNumber(value: tuningParams.consensus_reject_sigma),
+            "ghost_detector_enabled": NSNumber(value: tuningParams.ghost_detector_enabled),
+            "ghost_strength": NSNumber(value: tuningParams.ghost_strength),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),

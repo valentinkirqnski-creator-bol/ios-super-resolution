@@ -82,6 +82,20 @@ void rob_consensus_reject(Image& R, const Image& ref_grey,
                           const Image& comp_aligned_grey,
                           const Image& consensus_grey, const Config& cfg);
 
+// Convolutional GHOST DETECTOR (Config::ghost_detector_enabled, build 117).
+// A tiny 5-layer CNN (tools/ghost_nn) that sees a PATCH of
+// [ref, comp_aligned, residual/sigma, analytic_R] and outputs a per-pixel ghost
+// probability g. Unlike the per-pixel masks, its convolutional receptive field
+// sees the SPATIAL signature of a ghost (doubled edge, displaced blob) that
+// wrong per-tile flow leaves -- rotation, parallax, block-match blunders --
+// which per-pixel features are blind to. Darken-only: R' = R*(1 - strength*g).
+// Runs host-side at 1/GHOST_DS of the grey resolution (ghosts are large; this
+// bounds memory) and the refined host mask is uploaded to the device merge, so
+// no Metal kernel -- same mechanism as rob_mask_nn_refine. comp_aligned_grey is
+// this frame's comparison grey warped to the reference (the merge's fetch).
+void ghost_detect_refine(Image& R, const Image& ref_grey,
+                         const Image& comp_aligned_grey, const Config& cfg);
+
 // Dense per-pixel optical flow (Config::dense_flow_enabled): windowed
 // inverse-compositional Lucas-Kanade producing one displacement per grey pixel,
 // seeded from the finalized tile/affine flow and eigenvalue-gated per pixel so

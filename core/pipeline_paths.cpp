@@ -1321,7 +1321,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.halftile_refine_enabled ||
                               work.dense_flow_enabled ||
                               work.rob_mask_nn_enabled ||
-                              work.robustness_consensus_reject_enabled);
+                              work.robustness_consensus_reject_enabled ||
+                              work.ghost_detector_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1356,6 +1357,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // the device result is bit-identical to the CPU path.
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled &&
                       !work.robustness_consensus_reject_enabled &&
+                      !work.ghost_detector_enabled &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -1962,8 +1964,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // consensus below. Empty consensus (pre-pass skipped/failed, incl. the
         // device path) leaves it empty and the refine no-ops.
         Image mask_nn_aligned_grey;
-        if ((work.rob_mask_nn_enabled || work.robustness_consensus_reject_enabled) &&
-            mask_nn_consensus.h > 0 && !comp_grey.data.empty())
+        const bool want_aligned_grey =
+            (((work.rob_mask_nn_enabled || work.robustness_consensus_reject_enabled) &&
+              mask_nn_consensus.h > 0) || work.ghost_detector_enabled);
+        if (want_aligned_grey && !comp_grey.data.empty())
             mask_nn_aligned_grey = warp_comp_grey_to_ref(comp_grey, flow, merge_ts,
                                                          work.num_threads);
         const double t_freeg = prof_now_ms();
@@ -2050,6 +2054,14 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
             rob.h == ref_grey.h && rob.w == ref_grey.w)
             rob_consensus_reject(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus, work);
+        // Convolutional ghost detector (Config::ghost_detector_enabled): detect
+        // the spatial ghost signature wrong per-tile flow leaves (rotation,
+        // parallax, blunders) and darken R where it fires. Host-side CNN; the
+        // refined host mask uploads to the device merge (no Metal kernel).
+        if (work.ghost_detector_enabled &&
+            mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
+            rob.h == ref_grey.h && rob.w == ref_grey.w)
+            ghost_detect_refine(rob, ref_grey, mask_nn_aligned_grey, work);
         // Folded in here rather than beside absorb_robustness_sum, because that
         // call is made in only two of the three stash branches -- the cached
         // banded path defers to build_robustness_sum after the loop, and would

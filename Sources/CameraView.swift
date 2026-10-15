@@ -1262,6 +1262,19 @@ struct CameraView: View {
                          How far (in noise sigmas) a frame may deviate from the consensus before that pixel is rejected. Lower = stricter (rejects more, including some borderline-good samples); higher = more permissive. 2.0 is the measured default. Only used when Consensus Reject is on.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Ghost Detector (CNN, new)", isOn: $cam.tuningParams.ghost_detector_enabled)
+                    Text("""
+                         A small CONVOLUTIONAL neural net that detects ghosting from wrong per-tile flow — the rotation, parallax and block-match blunders the per-pixel masks miss. Because it's convolutional it sees the SPATIAL signature of a ghost (a doubled edge, a displaced blob), not just one pixel's value, which is why it localises parallax and tile ghosts where the analytic mask and the per-pixel nets can't. It outputs a per-pixel ghost probability and darkens the robustness mask there: R' = R·(1 − strength·g). Measured on synthetic bursts: cleanly fires on parallax (0.80) and tile (0.68) ghosts and ~0 on clean pixels; rotation-rim detection is weaker. Runs host-side at reduced resolution (ghosts are large) and the refined mask is handed to the GPU merge — no separate Metal kernel, but it adds decode+compute time. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    HStack {
+                        Text("Ghost strength: \(cam.tuningParams.ghost_strength, specifier: "%.2f")")
+                        Slider(value: $cam.tuningParams.ghost_strength, in: 0.25...1.0, step: 0.05)
+                    }
+                    Text("""
+                         How hard a detected ghost is rejected. 1.0 fully removes a pixel the net is certain is a ghost; lower values attenuate more gently (keep some of the sample). Only used when Ghost Detector is on.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {
