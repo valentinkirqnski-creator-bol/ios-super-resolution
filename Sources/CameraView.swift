@@ -1163,10 +1163,14 @@ struct CameraView: View {
                          After registration finishes, every motion tile is split into four half-size children: each child starts from the tile's affine model at its own centre, keeps the parent's reliability statistics (so the rejection mask doesn't over-fire on the finer grid), and is then re-measured against the pixels with a safety gate — a child with too little texture keeps its seed. The mask and merge then use the finer field. Robustness of the full tile search, spatial resolution of the half tile: helps where motion changes INSIDE a tile (subject edges, depth boundaries); smooth camera motion is already handled exactly by Affine Tile Motion. Works with the CPU and GPU pipelines.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
-                    Stepper("Refine to ts=\(16 >> max(1, cam.tuningParams.halftile_refine_levels)) (\(cam.tuningParams.halftile_refine_levels) level\(cam.tuningParams.halftile_refine_levels == 1 ? "" : "s"))",
-                            value: $cam.tuningParams.halftile_refine_levels, in: 1...2)
+                    Picker("Refine to", selection: $cam.tuningParams.halftile_refine_target_ts) {
+                        Text("Half (ts/2)").tag(0)
+                        Text("ts=8").tag(8)
+                        Text("ts=4").tag(4)
+                    }
+                    .pickerStyle(.segmented)
                     Text("""
-                         How many times to subdivide (each level halves the tile). 1 = ts=8 (one split). 2 = ts=4: the flow is refined to a ts=4 grid at FULL resolution — a finer tile lattice that follows within-tile rotation at 4px, WITHOUT the interpolated waviness of Dense Per-Pixel Flow. The pixel-accurate Lucas-Kanade polish runs while the child tile stays ≥6px, so the ts=8 level is re-measured against pixels and the ts=4 level carries that refined motion plus the affine gradient (4px is too small to solve reliably on its own, so it isn't re-measured — which is what avoids the waviness). Only used when Half-Tile Refinement is on.
+                         The target tile size the flow is refined to. "Half" = one split (the original, ts/2). "ts=8"/"ts=4" are absolute targets: the subdivision is chained from your actual Alignment Tile Size down to that size — so ts=4 is ts=4 whether the tile is 16 (2 splits), 32 (3) or 64 (4), and it works with Auto. It's a finer tile LATTICE at full resolution that follows within-tile rotation at the target size, WITHOUT the interpolated waviness of Dense Per-Pixel Flow. The pixel-accurate Lucas-Kanade polish runs while the child tile stays ≥6px, so levels ≥8px are re-measured against pixels and a 4px level carries that refined motion plus the affine gradient (4px is too small to solve reliably on its own, which is what avoids the waviness). Capped at 4 splits. Only used when Half-Tile Refinement is on.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Dense Per-Pixel Flow", isOn: $cam.tuningParams.dense_flow_enabled)

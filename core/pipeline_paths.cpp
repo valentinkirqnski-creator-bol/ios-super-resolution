@@ -1469,8 +1469,21 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // Half-tile final refinement subdivides the finished raw-grid flow 2x2, so
     // everything that CONSUMES the flow (robustness + merge) indexes it at half
     // the tile; alignment itself and flow_to_raw_tile_grid stay on the parent.
-    const int halftile_levels = work.halftile_refine_enabled
-        ? std::max(1, work.halftile_refine_levels) : 0;
+    // Half-tile subdivision depth, derived from the TARGET tile size against the
+    // ACTUAL alignment tile (cons_ts), so "refine to ts=4" is ts=4 at any tile
+    // size (16->2, 32->3, 64->4 levels) and with Auto. target<=0 => one level
+    // (ts/2, legacy). Capped at 4; at least one level when enabled.
+    int halftile_levels = 0;
+    if (work.halftile_refine_enabled) {
+        const int target = work.halftile_refine_target_ts;
+        if (target <= 0) {
+            halftile_levels = 1;
+        } else {
+            int t = cons_ts;
+            while (t > target && halftile_levels < 4) { t >>= 1; ++halftile_levels; }
+            if (halftile_levels < 1) halftile_levels = 1;
+        }
+    }
     const int merge_ts = std::max(1, cons_ts >> halftile_levels);
     // Output dimensions are known as soon as the reference is, and the online
     // merge needs its accumulator before the first frame is analyzed.
@@ -1937,7 +1950,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         if (work.affine_flow_enabled && !flow.has_affine()) flow.fit_affine();
         // Half-tile final refinement (Config::halftile_refine_enabled): children
         // affine-seeded, parent statistics carried, gated LK polish. Each level
-        // halves the tile (halftile_refine_levels): 1 -> ts/2, 2 -> ts/4. The
+        // halves the tile; halftile_levels is derived from the target tile size
+        // above (0 -> 1 level = ts/2; ts=4 -> as many halvings as needed). The
         // chained call re-subdivides the already-finer grid; each level's LK
         // polish runs while the child tile stays >= 6 grey px (so ts=8 is pixel-
         // refined, ts=4 carries that motion + affine, LK skipped there). From

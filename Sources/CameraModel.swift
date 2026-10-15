@@ -207,9 +207,11 @@ struct TuningParams: Equatable, Codable {
     /// mask and merge consume the flow at half the tile size. Targets motion
     /// DISCONTINUITIES (subject/depth boundaries) one tile model can't follow.
     var halftile_refine_enabled: Bool = false
-    /// Subdivision levels: 1 = refine to ts/2 (ts=8), 2 = refine to ts/4 (ts=4).
-    /// A finer tile lattice at full resolution, without dense per-pixel waviness.
-    var halftile_refine_levels: Int = 1
+    /// Target tile size for the refined flow: 0 = ts/2 (one level, the original),
+    /// 8 or 4 = absolute target (the core derives the levels from the actual
+    /// alignment tile size, so ts=4 is ts=4 at any tile size incl. Auto). A finer
+    /// tile lattice at full resolution, without dense per-pixel waviness.
+    var halftile_refine_target_ts: Int = 0
     /// Dense per-pixel optical flow: refine the finalized tile/affine/half-tile
     /// flow to one vector per grey pixel (windowed Lucas-Kanade, eigenvalue- and
     /// accept-gated vs the seed). The finest motion representation; resolves
@@ -439,7 +441,7 @@ struct TuningParams: Equatable, Codable {
         case isa_prealign_enabled, isa_prealign_rot_range_deg, isa_prealign_refine_dim
         case guide_white_balance, guide_color_matrix, guide_curve
         case real_rgb_guide, flow_upsample_candidates
-        case bm_subpixel_enabled, lk_every_level_enabled, halftile_refine_enabled, halftile_refine_levels
+        case bm_subpixel_enabled, lk_every_level_enabled, halftile_refine_enabled, halftile_refine_target_ts
         case dense_flow_enabled
         case robustness_per_channel
         case robustness_perceptual_sqrt
@@ -545,7 +547,7 @@ struct TuningParams: Equatable, Codable {
         bm_subpixel_enabled = try c.decodeIfPresent(Bool.self, forKey: .bm_subpixel_enabled) ?? bm_subpixel_enabled
         lk_every_level_enabled = try c.decodeIfPresent(Bool.self, forKey: .lk_every_level_enabled) ?? lk_every_level_enabled
         halftile_refine_enabled = try c.decodeIfPresent(Bool.self, forKey: .halftile_refine_enabled) ?? halftile_refine_enabled
-        halftile_refine_levels = try c.decodeIfPresent(Int.self, forKey: .halftile_refine_levels) ?? halftile_refine_levels
+        halftile_refine_target_ts = try c.decodeIfPresent(Int.self, forKey: .halftile_refine_target_ts) ?? halftile_refine_target_ts
         dense_flow_enabled = try c.decodeIfPresent(Bool.self, forKey: .dense_flow_enabled) ?? dense_flow_enabled
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
@@ -2355,7 +2357,7 @@ final class CameraModel: NSObject, ObservableObject {
             "bm_subpixel_enabled": NSNumber(value: tuningParams.bm_subpixel_enabled),
             "lk_every_level_enabled": NSNumber(value: tuningParams.lk_every_level_enabled),
             "halftile_refine_enabled": NSNumber(value: tuningParams.halftile_refine_enabled),
-            "halftile_refine_levels": NSNumber(value: tuningParams.halftile_refine_levels),
+            "halftile_refine_target_ts": NSNumber(value: tuningParams.halftile_refine_target_ts),
             "dense_flow_enabled": NSNumber(value: tuningParams.dense_flow_enabled),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
