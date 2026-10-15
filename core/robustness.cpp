@@ -2767,6 +2767,9 @@ void rob_mask_nn_refine(Image& R, const Image& ref_grey,
     if (!cfg.rob_mask_nn_enabled) return;
     const int h = R.h, w = R.w, c = std::max(1, R.c);
     if (h <= 0 || w <= 0) return;
+    // GPU-resident mask (header only, no host pixels): nothing to refine here --
+    // the device applies the gate in a Metal kernel instead. Safe no-op.
+    if (R.data.size() != (size_t)h * w * c) return;
     if (ref_grey.h != h || ref_grey.w != w ||
         comp_aligned_grey.h != h || comp_aligned_grey.w != w ||
         consensus_grey.h != h || consensus_grey.w != w) return;

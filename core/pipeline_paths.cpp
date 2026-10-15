@@ -1044,6 +1044,87 @@ static GlobalWarp estimate_global_warp(const Image& ref_grey, const Image& comp_
     return g;
 }
 
+// ---- build-105 NN mask refiner: multi-frame consensus pre-pass -------------
+//
+// The net's key feature is each comparison frame's deviation from the mean of
+// ALL aligned comparison greys -- a signal that does not exist until every
+// frame is aligned, hence a 2-pass. This standalone pass decodes + greys +
+// aligns each comparison frame exactly as the main loop does (same
+// estimate_global_warp + align + flow_to_raw_tile_grid), warps its grey into
+// the reference frame, and accumulates the per-pixel mean. It touches none of
+// the merge/residency state (align() is a self-contained call), so it is a
+// pure addition gated on Config::rob_mask_nn_enabled. Returns an empty Image on
+// any failure -> the refine then no-ops. CPU/harness only in this build (see
+// the call site); the device Metal twin consumes the same consensus next.
+static f32 sample_bilinear_clamp_1ch(const Image& im, f32 y, f32 x) {
+    if (im.h <= 0 || im.w <= 0) return 0.f;
+    y = std::min(std::max(y, 0.f), (f32)(im.h - 1));
+    x = std::min(std::max(x, 0.f), (f32)(im.w - 1));
+    const int y0 = (int)y, x0 = (int)x;
+    const int y1 = std::min(y0 + 1, im.h - 1), x1 = std::min(x0 + 1, im.w - 1);
+    const f32 fy = y - (f32)y0, fx = x - (f32)x0;
+    const f32 t = im.at(y0, x0) + (im.at(y0, x1) - im.at(y0, x0)) * fx;
+    const f32 b = im.at(y1, x0) + (im.at(y1, x1) - im.at(y1, x0)) * fx;
+    return t + (b - t) * fy;
+}
+
+// aligned(p) = comp_grey sampled at the merge's comp position H*(p + flow(p)),
+// in grey coords (FFT path: grey == raw). Nearest tile flow, bilinear sample.
+static Image warp_comp_grey_to_ref(const Image& comp_grey, const FlowField& flow,
+                                   int tile_size, int num_threads) {
+    Image out(comp_grey.h, comp_grey.w, 1);
+    const int ny = flow.ny, nx = flow.nx;
+    parallel_rows(comp_grey.h, num_threads, [&](int y) {
+        const int ty = (ny > 0 && tile_size > 0) ? std::min(y / tile_size, ny - 1) : 0;
+        for (int x = 0; x < comp_grey.w; ++x) {
+            f32 fx = 0.f, fy = 0.f;
+            if (ny > 0 && nx > 0 && tile_size > 0) {
+                const int tx = std::min(x / tile_size, nx - 1);
+                fx = flow.dx(ty, tx); fy = flow.dy(ty, tx);
+            }
+            f32 cx = (f32)x + fx, cy = (f32)y + fy;
+            if (flow.has_global_h) {
+                f32 hx, hy; apply_homography(flow.global_h, cx, cy, hx, hy);
+                cx = hx; cy = hy;
+            }
+            out.at(y, x) = sample_bilinear_clamp_1ch(comp_grey, cy, cx);
+        }
+    });
+    return out;
+}
+
+static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
+                                       const std::vector<int>& comp_indices,
+                                       const Image& ref_grey, const Pyramid& ref_pyr,
+                                       int tile_size, int cons_ts,
+                                       int ref_h, int ref_w, Config& work) {
+    if (ref_grey.h <= 0 || ref_grey.w <= 0) return Image();
+    std::vector<double> sum((size_t)ref_grey.h * ref_grey.w, 0.0);
+    int cnt = 0;
+    for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
+        const int k = comp_indices[(size_t)pos];
+        Image comp = loader(k, work, false, ref_h, ref_w);
+        if (comp.h <= 0 || comp.w <= 0) continue;
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        GlobalWarp gw = estimate_global_warp(ref_grey, comp_grey, comp.h, comp.w, k, work);
+        const Image* align_comp = gw.warped ? &gw.warped_grey : &comp_grey;
+        FlowField flow = align(ref_pyr, ref_grey, *align_comp, work, tile_size, 0.f, 0.f, 0.f);
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w,
+                                     cons_ts, work.r_Mt, work.num_threads,
+                                     work.grey_tile_size(cons_ts));
+        if (gw.warped) { for (int i = 0; i < 9; ++i) flow.global_h[i] = gw.H[i]; flow.has_global_h = true; }
+        Image aligned = warp_comp_grey_to_ref(comp_grey, flow, cons_ts, work.num_threads);
+        if (aligned.h != ref_grey.h || aligned.w != ref_grey.w) continue;
+        for (size_t i = 0; i < sum.size(); ++i) sum[i] += (double)aligned.data[i];
+        ++cnt;
+    }
+    if (cnt <= 0) return Image();
+    Image con(ref_grey.h, ref_grey.w, 1);
+    const double inv = 1.0 / (double)cnt;
+    for (size_t i = 0; i < sum.size(); ++i) con.data[i] = (f32)(sum[i] * inv);
+    return con;
+}
+
 } // namespace
 
 Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
@@ -1238,7 +1319,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.flow_fb_consistency_enabled ||
                               work.flow_consensus_enabled ||
                               work.halftile_refine_enabled ||
-                              work.dense_flow_enabled);
+                              work.dense_flow_enabled ||
+                              work.rob_mask_nn_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1618,6 +1700,25 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
         spill_pending = false;
     };
+
+    // ---- build-105 NN mask refiner: consensus pre-pass (Config::
+    // rob_mask_nn_enabled). Builds the multi-frame consensus grey the refiner's
+    // key feature needs (see compute_mask_nn_consensus). CPU/harness only in
+    // this build: on device the robustness mask is a GPU slice, so the host
+    // refine is a no-op there and the Metal apply twin -- which will consume
+    // this same consensus -- lands next. Decodes + aligns every frame again, so
+    // it is strictly opt-in. An empty result disables the refine downstream.
+    Image mask_nn_consensus;
+#if !defined(__APPLE__)
+    if (work.rob_mask_nn_enabled) {
+        const double t_cons = prof_now_ms();
+        mask_nn_consensus = compute_mask_nn_consensus(loader, comp_indices, ref_grey,
+                                                      ref_pyr, tile_size, cons_ts,
+                                                      ref_h, ref_w, work);
+        prof_add_cpu("mask_nn:consensus-ms", prof_now_ms() - t_cons);
+        prof_add_cpu("mask_nn:consensus-ok", mask_nn_consensus.h > 0 ? 1.0 : 0.0);
+    }
+#endif
     for (int pos = 0; pos < (int)comp_indices.size(); ++pos) {
         const double t_frame_total = prof_now_ms();
         const int k = comp_indices[(size_t)pos];
@@ -1849,6 +1950,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         prof_mark_memory("analyze:after-align");
         debug_dump_bin("cpp_flow_" + std::to_string(pos),
                        flow.flow.data(), flow.flow.size());
+        // NN mask refiner (Config::rob_mask_nn_enabled): capture this frame's
+        // comp grey warped to the reference frame (the correspondence the merge
+        // fetches) BEFORE comp_grey is freed; the refine consumes it against the
+        // consensus below. Empty consensus (pre-pass skipped/failed, incl. the
+        // device path) leaves it empty and the refine no-ops.
+        Image mask_nn_aligned_grey;
+        if (work.rob_mask_nn_enabled && mask_nn_consensus.h > 0 && !comp_grey.data.empty())
+            mask_nn_aligned_grey = warp_comp_grey_to_ref(comp_grey, flow, merge_ts,
+                                                         work.num_threads);
         const double t_freeg = prof_now_ms();
         comp_grey = Image(); // free before robustness/kernels peak
         prof_add_cpu("comp:free-grey", prof_now_ms() - t_freeg);
@@ -1915,6 +2025,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   frames_resident ? k : -1);
             covs = cov_fut.get();
         }
+        // NN mask refiner: darken the mask per the net (Config::rob_mask_nn_
+        // enabled). No-op unless the mask is host-resident AND the consensus +
+        // this frame's aligned grey were built (CPU/harness path); on device the
+        // mask is a GPU slice and this returns immediately (the Metal apply twin
+        // handles it). rob_mask_nn_refine re-checks every precondition.
+        if (work.rob_mask_nn_enabled && mask_nn_consensus.h > 0 &&
+            mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
+            rob.h == ref_grey.h && rob.w == ref_grey.w)
+            rob_mask_nn_refine(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus,
+                               flow, merge_ts, work);
         // Folded in here rather than beside absorb_robustness_sum, because that
         // call is made in only two of the three stash branches -- the cached
         // banded path defers to build_robustness_sum after the loop, and would

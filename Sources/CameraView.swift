@@ -1244,6 +1244,11 @@ struct CameraView: View {
                          Diagnostic: zeroes the Poisson–Gaussian sensor-noise model as read by the robustness mask ONLY. R is then scored from the raw measured local variance and the raw (un-shrunk) pixel difference, with no noise floor subtracted — so a tile's colour difference is taken at face value instead of being forgiven as "within noise". Isolates whether a mismatch reads small because the noise model excused it or because the content genuinely is that flat. Alignment, kernels and SNR auto-tune are untouched. Leave OFF for normal use.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("NN Mask Refine (new)", isOn: $cam.tuningParams.rob_mask_nn_enabled)
+                    Text("""
+                         The freshly-trained darken-only mask net: a tiny 9-feature model that only attenuates the analytic mask (R·g, g in [0,1] — never trusts more), trained on synthetic bursts with deliberately corrupted alignment vectors and measured +6.4% merged-MSE on held-out synthetic data. Its decisive input is a MULTI-FRAME CONSENSUS — each frame vs the mean of all aligned frames — so enabling it runs a second alignment pass over the burst to build that consensus (opt-in, extra time). It reads its features from the full-res grey in the net's own training domain, so no retraining. NOTE: this build applies it on the CPU pipeline (and the harness); the on-device Metal merge keeps the analytic mask until the Metal apply kernel ships next. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {

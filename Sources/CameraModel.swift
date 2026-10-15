@@ -356,6 +356,11 @@ struct TuningParams: Equatable, Codable {
     /// rather than less. Off by default; falls back to leaving R untouched if
     /// the model is missing. See tools/rob_refine.
     var robustness_refine_nn_enabled: Bool = false
+    /// Build-105 "new" darken-only NN mask refiner (tools/nn_mask_refine): a
+    /// tiny 9-feature net trained on synthetic bursts with corrupted alignment
+    /// vectors; +6.4% merged-MSE on held-out synthetic. Needs the multi-frame
+    /// consensus pre-pass. CPU/harness path today; device Metal apply pending.
+    var rob_mask_nn_enabled: Bool = false
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -455,6 +460,7 @@ struct TuningParams: Equatable, Codable {
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
+        case rob_mask_nn_enabled
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -575,6 +581,7 @@ struct TuningParams: Equatable, Codable {
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
+        rob_mask_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .rob_mask_nn_enabled) ?? rob_mask_nn_enabled
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
@@ -2384,6 +2391,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
+            "rob_mask_nn_enabled": NSNumber(value: tuningParams.rob_mask_nn_enabled),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),

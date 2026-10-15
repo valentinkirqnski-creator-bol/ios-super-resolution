@@ -631,6 +631,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.use_neural_robustness = tuning[@"use_neural_robustness"].boolValue;
     if (tuning[@"robustness_refine_nn_enabled"])
         cfg.robustness_refine_nn_enabled = tuning[@"robustness_refine_nn_enabled"].boolValue;
+    if (tuning[@"rob_mask_nn_enabled"])
+        cfg.rob_mask_nn_enabled = tuning[@"rob_mask_nn_enabled"].boolValue;
     if (tuning[@"robustness_refine_max_reduction"])
         cfg.robustness_refine_max_reduction = tuning[@"robustness_refine_max_reduction"].floatValue;
     if (tuning[@"robustness_refine_deadzone"])
