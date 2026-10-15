@@ -1320,8 +1320,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.flow_consensus_enabled ||
                               work.halftile_refine_enabled ||
                               work.dense_flow_enabled ||
-                              work.rob_mask_nn_enabled ||
-                              work.robustness_consensus_reject_enabled);
+                              work.rob_mask_nn_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
@@ -1355,7 +1354,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // uploads -- the whole net path then runs host-side with no Metal kernel and
     // the device result is bit-identical to the CPU path.
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled &&
-                      !work.robustness_consensus_reject_enabled &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -1717,7 +1715,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // this same consensus -- lands next. Decodes + aligns every frame again, so
     // it is strictly opt-in. An empty result disables the refine downstream.
     Image mask_nn_consensus;
-    if (work.rob_mask_nn_enabled || work.robustness_consensus_reject_enabled) {
+    if (work.rob_mask_nn_enabled) {
         const double t_cons = prof_now_ms();
         mask_nn_consensus = compute_mask_nn_consensus(loader, comp_indices, ref_grey,
                                                       ref_pyr, tile_size, cons_ts,
@@ -1962,8 +1960,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // consensus below. Empty consensus (pre-pass skipped/failed, incl. the
         // device path) leaves it empty and the refine no-ops.
         Image mask_nn_aligned_grey;
-        if ((work.rob_mask_nn_enabled || work.robustness_consensus_reject_enabled) &&
-            mask_nn_consensus.h > 0 && !comp_grey.data.empty())
+        if (work.rob_mask_nn_enabled && mask_nn_consensus.h > 0 && !comp_grey.data.empty())
             mask_nn_aligned_grey = warp_comp_grey_to_ref(comp_grey, flow, merge_ts,
                                                          work.num_threads);
         const double t_freeg = prof_now_ms();
@@ -2042,14 +2039,6 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             rob.h == ref_grey.h && rob.w == ref_grey.w)
             rob_mask_nn_refine(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus,
                                flow, merge_ts, work);
-        // Consensus rejection (Config::robustness_consensus_reject_enabled):
-        // hard-reject this frame's pixels that disagree with the multi-frame
-        // consensus. Same preconditions + host-mask mechanism as the NN refine
-        // above, so it reaches the device banded merge with no Metal kernel.
-        if (work.robustness_consensus_reject_enabled && mask_nn_consensus.h > 0 &&
-            mask_nn_aligned_grey.h == ref_grey.h && mask_nn_aligned_grey.w == ref_grey.w &&
-            rob.h == ref_grey.h && rob.w == ref_grey.w)
-            rob_consensus_reject(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus, work);
         // Folded in here rather than beside absorb_robustness_sum, because that
         // call is made in only two of the three stash branches -- the cached
         // banded path defers to build_robustness_sum after the loop, and would
