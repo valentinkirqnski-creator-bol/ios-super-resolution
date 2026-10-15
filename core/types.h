@@ -1584,6 +1584,16 @@ struct Config {
     // falls back to leaving R untouched whenever the model is missing or
     // fails to load, so enabling it can never leave the pipeline maskless.
     bool  robustness_refine_nn_enabled = false;
+    // The build-105 "new" darken-only mask refiner (tools/nn_mask_refine, core/
+    // rob_mask_nn.h). A tiny 9-feature net trained on synthetic bursts with
+    // deliberately corrupted alignment vectors; measured +6.4% merged-MSE on
+    // held-out synthetic data. Computes its features from the full-res FFT grey
+    // in the net's own grayscale training domain (so no retrain), and its key
+    // input is a multi-frame CONSENSUS (mean of all aligned comparison greys)
+    // -- the outlier signal the analytic mask lacks -- so it needs the
+    // consensus pre-pass. Darken-only: R' = R * g, g in [0,1]. OFF by default;
+    // distinct from robustness_refine_nn_enabled (the older 47-feature net).
+    bool  rob_mask_nn_enabled = false;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency
