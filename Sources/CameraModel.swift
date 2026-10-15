@@ -361,6 +361,13 @@ struct TuningParams: Equatable, Codable {
     /// vectors; +6.4% merged-MSE on held-out synthetic. Needs the multi-frame
     /// consensus pre-pass. CPU/harness path today; device Metal apply pending.
     var rob_mask_nn_enabled: Bool = false
+    /// Consensus rejection (build 116): hard-reject a frame's pixels that
+    /// disagree with the multi-frame consensus by > consensus_reject_sigma noise
+    /// sigmas. The one signal measured to separate a real misalignment ghost
+    /// from noise. Reuses the consensus pre-pass + host-mask path, so it runs on
+    /// device with no Metal kernel. Blind to errors all frames share. OFF.
+    var robustness_consensus_reject_enabled: Bool = false
+    var consensus_reject_sigma: Float = 2.0
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -461,6 +468,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robustness_refine_deadzone
         case rob_mask_nn_enabled
+        case robustness_consensus_reject_enabled, consensus_reject_sigma
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight
@@ -582,6 +590,8 @@ struct TuningParams: Equatable, Codable {
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         rob_mask_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .rob_mask_nn_enabled) ?? rob_mask_nn_enabled
+        robustness_consensus_reject_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_consensus_reject_enabled) ?? robustness_consensus_reject_enabled
+        consensus_reject_sigma = try c.decodeIfPresent(Float.self, forKey: .consensus_reject_sigma) ?? consensus_reject_sigma
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
@@ -2392,6 +2402,8 @@ final class CameraModel: NSObject, ObservableObject {
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "rob_mask_nn_enabled": NSNumber(value: tuningParams.rob_mask_nn_enabled),
+            "robustness_consensus_reject_enabled": NSNumber(value: tuningParams.robustness_consensus_reject_enabled),
+            "consensus_reject_sigma": NSNumber(value: tuningParams.consensus_reject_sigma),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),

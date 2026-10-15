@@ -1249,6 +1249,19 @@ struct CameraView: View {
                          The freshly-trained darken-only mask net: a tiny 9-feature model that only attenuates the analytic mask (R·g, g in [0,1] — never trusts more), so the merge stays robust to misaligned tiles and only well-aligned samples contribute to super-resolution. Trained on synthetic bursts with deliberately corrupted alignment vectors; measured +6.4% merged-MSE on held-out synthetic data. Its decisive input is a MULTI-FRAME CONSENSUS — each frame vs the mean of all aligned frames — so enabling it runs a second alignment pass over the burst to build that consensus (opt-in, extra decode+align time). Features come from the full-res grey in the net's own training domain, so no retraining. Runs on device: the mask is refined on the host and handed to the GPU merge (no separate Metal kernel). Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Consensus Reject (new)", isOn: $cam.tuningParams.robustness_consensus_reject_enabled)
+                    Text("""
+                         Rejects misaligned pixels by MULTI-FRAME CONSENSUS — the one signal measured to actually separate a real misalignment ghost from sensor noise. Each comparison frame's aligned pixel is compared to the consensus (mean) of all the aligned frames; where it disagrees by more than the threshold below, that pixel is rejected outright (R→0), so a ghosting rotated-tile rim or a wrong block-match shift stops leaking into the merge. A single frame-vs-reference residual can't do this (noise raises the difference on clean pixels too); averaging the others beats the noise down so the true outlier stands out. Reuses the same consensus pre-pass and host-mask path as NN Mask Refine, so it runs on device with no separate Metal kernel (extra decode+align time). BLIND to errors every frame shares (a subject that moves the same way in all frames, a systematic warp) — those keep the normal mask. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    HStack {
+                        Text("Reject σ: \(cam.tuningParams.consensus_reject_sigma, specifier: "%.1f")")
+                        Slider(value: $cam.tuningParams.consensus_reject_sigma, in: 1.0...4.0, step: 0.25)
+                    }
+                    Text("""
+                         How far (in noise sigmas) a frame may deviate from the consensus before that pixel is rejected. Lower = stricter (rejects more, including some borderline-good samples); higher = more permissive. 2.0 is the measured default. Only used when Consensus Reject is on.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {

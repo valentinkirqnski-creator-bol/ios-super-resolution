@@ -1594,6 +1594,16 @@ struct Config {
     // consensus pre-pass. Darken-only: R' = R * g, g in [0,1]. OFF by default;
     // distinct from robustness_refine_nn_enabled (the older 47-feature net).
     bool  rob_mask_nn_enabled = false;
+    // Consensus rejection (build 116): hard-reject a comparison frame's pixels
+    // where its aligned grey disagrees with the multi-frame consensus by more
+    // than consensus_reject_sigma noise sigmas. MEASURED to be the only signal
+    // that cleanly separates a real misalignment ghost from noise (the analytic
+    // mask, a sharper R, and geometry features all cannot -- they are noise-
+    // limited or structure-blind). Reuses the rob_mask_nn consensus pre-pass +
+    // host-mask mechanism, so it reaches the device merge with no Metal kernel.
+    // Blind to errors ALL frames share. OFF by default. See stages.h.
+    bool  robustness_consensus_reject_enabled = false;
+    float consensus_reject_sigma = 2.0f;   // threshold in noise sigmas
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency

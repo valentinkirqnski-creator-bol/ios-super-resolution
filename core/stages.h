@@ -65,6 +65,23 @@ void rob_mask_nn_refine(Image& R, const Image& ref_grey,
                         const Image& consensus_grey, const FlowField& flow,
                         int tile_size, const Config& cfg);
 
+// Consensus rejection (Config::robustness_consensus_reject_enabled, build 116).
+// Hard-rejects (R=0) every pixel of this comparison frame whose aligned grey
+// disagrees with the multi-frame consensus by more than consensus_reject_sigma
+// noise sigmas. This is the one signal MEASURED to separate a real misalignment
+// ghost from noise: a single frame-vs-reference residual cannot (noise raises
+// |ref-cmp| on clean pixels too), but a frame-vs-what-the-others-agree-on
+// deviation can, because averaging beats the noise down. consensus_grey is the
+// per-pixel mean of all aligned comparison greys (compute_mask_nn_consensus);
+// a soft shoulder of one sigma below the threshold tapers the gate so a pixel
+// exactly at the boundary is not a hard cliff. Darken-only. Same host-mask
+// mechanism as rob_mask_nn_refine, so it reaches the device banded merge with
+// no Metal kernel. BLIND to errors ALL frames share (a subject that moves the
+// same way in every frame, a systematic warp) -- those keep the analytic R.
+void rob_consensus_reject(Image& R, const Image& ref_grey,
+                          const Image& comp_aligned_grey,
+                          const Image& consensus_grey, const Config& cfg);
+
 // Dense per-pixel optical flow (Config::dense_flow_enabled): windowed
 // inverse-compositional Lucas-Kanade producing one displacement per grey pixel,
 // seeded from the finalized tile/affine flow and eigenvalue-gated per pixel so

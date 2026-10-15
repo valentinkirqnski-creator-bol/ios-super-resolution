@@ -2835,4 +2835,38 @@ void rob_mask_nn_refine(Image& R, const Image& ref_grey,
     });
 }
 
+void rob_consensus_reject(Image& R, const Image& ref_grey,
+                          const Image& comp_aligned_grey,
+                          const Image& consensus_grey, const Config& cfg) {
+    if (!cfg.robustness_consensus_reject_enabled) return;
+    const int h = R.h, w = R.w, c = std::max(1, R.c);
+    if (h <= 0 || w <= 0) return;
+    // GPU-resident mask (header only): no host pixels to gate -- safe no-op.
+    // (Not reached on device: the flag forces the host mask, like rob_mask_nn.)
+    if (R.data.size() != (size_t)h * w * c) return;
+    if (ref_grey.h != h || ref_grey.w != w ||
+        comp_aligned_grey.h != h || comp_aligned_grey.w != w ||
+        consensus_grey.h != h || consensus_grey.w != w) return;
+    // Device noise model (matches the merge's own sigma from the ref brightness).
+    const f32 A = 2.0e-3f, B = 1.0e-3f;
+    const f32 tau = cfg.consensus_reject_sigma > 0.f ? cfg.consensus_reject_sigma : 2.0f;
+    const f32 lo = tau - 1.0f;   // one-sigma soft shoulder below the threshold
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            const f32 ref = ref_grey.at(y, x);
+            const f32 cmp = comp_aligned_grey.at(y, x);
+            const f32 con = consensus_grey.at(y, x);
+            const f32 sig = std::sqrt(std::max(A * std::max(ref, 0.f) + B, 1e-12f));
+            const f32 dev = std::fabs(cmp - con) / std::max(sig, 1e-4f);
+            // g = 1 below the shoulder, ramps to 0 at the threshold. Darken-only.
+            f32 g;
+            if (dev <= lo) g = 1.f;
+            else if (dev >= tau) g = 0.f;
+            else g = (tau - dev) / std::max(tau - lo, 1e-4f);
+            if (!(g >= 0.f && g <= 1.f)) g = 1.f;   // never brighten / never NaN
+            for (int ch = 0; ch < c; ++ch) R.at(y, x, ch) *= g;
+        }
+    });
+}
+
 } // namespace hhsr
