@@ -1958,9 +1958,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // here on the flow is a (2^levels) grid indexed at merge_ts.
         for (int lvl = 0; lvl < halftile_levels; ++lvl) {
             const int level_ts = std::max(2, cons_ts >> lvl);  // 16, 8, ...
+            // Drop the per-tile affine Jacobian on the FINAL level when the tile
+            // is small (<=4px): the tile vectors already carry the rotation
+            // there, so the Jacobian is redundant (~4 floats/tile of RAM saved).
+            // Intermediate levels keep it -- the next subdivision seeds from it.
+            const bool last = (lvl == halftile_levels - 1);
+            const bool emit_affine = !(last && merge_ts <= 4);
             halftile_subdivide_refine(flow, ref_grey,
                                       gw.warped ? gw.warped_grey : comp_grey,
-                                      work, level_ts, comp.h, comp.w);
+                                      work, level_ts, comp.h, comp.w, emit_affine);
         }
         // Dense per-pixel optical flow (Config::dense_flow_enabled): refine the
         // finalized tile/affine/half-tile flow to one vector per grey pixel

@@ -50,9 +50,16 @@ FlowField flow_to_raw_tile_grid(const FlowField& flow, int raw_h, int raw_w,
 // raw_tile_size is the PARENT raw tile; consumers must then index the flow at
 // raw_tile_size/2. comp_grey must be the grey align() actually matched (the
 // warped one under global pre-alignment).
+// emit_affine=false drops the per-tile affine Jacobian from the OUTPUT grid (the
+// children are still affine-SEEDED from the parent; they just don't carry their
+// own J). Used on the FINAL subdivision level when the tile is small (<=4px): at
+// that granularity the tile vectors already carry the rotation, so the Jacobian
+// is redundant and skipping it saves ~4 floats/tile of RAM. Intermediate levels
+// must keep it (the next level's subdivision seeds from it).
 void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
                                const Image& comp_grey, const Config& cfg,
-                               int raw_tile_size, int raw_h, int raw_w);
+                               int raw_tile_size, int raw_h, int raw_w,
+                               bool emit_affine = true);
 
 // Build-105 "new" NN mask refiner (Config::rob_mask_nn_enabled): darken-only
 // refine of the robustness mask R (R *= g, g in [0,1]) from the tiny net in

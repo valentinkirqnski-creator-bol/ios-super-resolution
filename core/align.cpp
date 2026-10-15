@@ -1889,7 +1889,8 @@ void dense_lk_refine(FlowField& flow, const Image& ref_grey,
 // -- the consumption shape the overlapping-tiles experiment already proved.
 void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
                                const Image& comp_grey, const Config& cfg,
-                               int raw_tile_size, int raw_h, int raw_w) {
+                               int raw_tile_size, int raw_h, int raw_w,
+                               bool emit_affine) {
     if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || raw_tile_size < 2)
         return;
     if (!flow.has_affine()) flow.fit_affine();  // seed model (inferred is fine)
@@ -1898,7 +1899,9 @@ void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
     FlowField out(ny2, nx2);
     const bool carry_m = flow.has_motion_prior();
     if (carry_m) out.motion_irregular.assign((size_t)ny2 * nx2, 0u);
-    const bool carry_j = flow.has_affine();
+    // Children are always SEEDED from the parent affine (sample_affine below);
+    // carry_j only controls whether the OUTPUT keeps its own Jacobian.
+    const bool carry_j = flow.has_affine() && emit_affine;
     if (carry_j) out.affine_jac.assign((size_t)ny2 * (size_t)nx2 * 4, 0.f);
     const bool carry_ap =
         flow.aperture_limited.size() == (size_t)flow.ny * flow.nx;
