@@ -1604,15 +1604,6 @@ struct Config {
     // Blind to errors ALL frames share. OFF by default. See stages.h.
     bool  robustness_consensus_reject_enabled = false;
     float consensus_reject_sigma = 2.0f;   // threshold in noise sigmas
-    // Convolutional ghost detector (build 117): a tiny 5-layer CNN whose
-    // SPATIAL receptive field sees the ghost signature (doubled edge, displaced
-    // blob) that wrong per-tile flow leaves (rotation, parallax, block-match
-    // blunders) and that the per-pixel masks are blind to. Darken-only:
-    // R' = R*(1 - ghost_strength*g). Runs host-side at 1/GHOST_DS of the grey
-    // resolution; the refined host mask uploads to the device merge (no Metal
-    // kernel). OFF by default. See core/ghost_detect.cpp, tools/ghost_nn.
-    bool  ghost_detector_enabled = false;
-    float ghost_strength = 1.0f;           // 0..1 darkening applied per ghost prob
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency

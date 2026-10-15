@@ -637,10 +637,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_consensus_reject_enabled = tuning[@"robustness_consensus_reject_enabled"].boolValue;
     if (tuning[@"consensus_reject_sigma"])
         cfg.consensus_reject_sigma = tuning[@"consensus_reject_sigma"].floatValue;
-    if (tuning[@"ghost_detector_enabled"])
-        cfg.ghost_detector_enabled = tuning[@"ghost_detector_enabled"].boolValue;
-    if (tuning[@"ghost_strength"])
-        cfg.ghost_strength = tuning[@"ghost_strength"].floatValue;
     if (tuning[@"robustness_refine_max_reduction"])
         cfg.robustness_refine_max_reduction = tuning[@"robustness_refine_max_reduction"].floatValue;
     if (tuning[@"robustness_refine_deadzone"])
