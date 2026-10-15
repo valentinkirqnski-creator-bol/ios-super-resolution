@@ -824,7 +824,11 @@ struct Config {
     // the tile flow for any frame that would exceed it.
     bool  dense_flow_enabled = false;
     int   dense_flow_iters = 5;        // Lucas-Kanade iterations
-    int   dense_flow_radius = 2;       // window half-size (5x5 structure tensor)
+    // Analysis-window half-size. 7 => a 15x15 (~16px, "ts16") window -- enough
+    // texture for a reliable per-pixel solve. The window is nearly free: the
+    // structure tensor and RHS are separable running box sums, so a 16px window
+    // costs the same as a 5px one. (Was 2 = 5px, too aperture-limited.)
+    int   dense_flow_radius = 7;
     float dense_flow_step_max = 1.0f;  // per-iteration displacement clamp, grey px
     float dense_flow_eig_floor = 4.0f; // min structure-tensor eigenvalue (noise units) to update a direction
     float dense_flow_max_dev = 2.0f;   // max |dense - seed| per axis, grey px (local-refinement bound)
