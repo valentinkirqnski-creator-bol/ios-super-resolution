@@ -1,6 +1,7 @@
 #include "stages.h"
 #include "robustness_nn.h"
 #include "robustness_refine_shared.h"
+#include "rob_mask_nn.h"
 #include "parallel.h"
 #include "pixel4a_noise_curves.h"
 #include "prof.h"
@@ -2737,6 +2738,91 @@ Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
     if (!refined_on_gpu && R.h > 0 && R.w > 0)
         apply_robustness_refinement(R, comp_raw, ref_stats, flow, tile_size, cfg);
     return R;
+}
+
+// ---- build-105 "new" NN mask refiner (Config::rob_mask_nn_enabled) ----------
+//
+// Darken-only refine of the robustness mask using tools/nn_mask_refine's tiny
+// net (core/rob_mask_nn.h). Features are computed from the full-res FFT greys
+// in the net's own grayscale training domain -- the same quantities common.py
+// built -- so the trained weights apply with no retraining:
+//   0 R           the mask value being refined (per pixel, luma-reduced)
+//   1 d/sigma     |ref - comp_aligned| / sqrt(alpha*ref + beta)
+//   2 |grad ref|
+//   3-5 gradv/div/curl   per-tile flow-field derivatives (the flow is already
+//                        one vector per tile, so no averaging -- see common.py)
+//   6 dist        within-tile distance from the tile centre
+//   7 gradv*dist
+//   8 cons_dev    |comp_aligned - consensus| / sigma, the multi-frame outlier
+//                 signal; consensus is the mean of all aligned comparison greys
+//
+// R is multiplied in place by g in [0,1]. ref_grey / comp_aligned_grey /
+// consensus_grey are single-channel, same resolution as R here (the full-res
+// FFT path); flow is the raw/grey tile flow. Matches tools/nn_mask_refine
+// exactly (CPU parity harness: 9e-7 vs the Python net).
+void rob_mask_nn_refine(Image& R, const Image& ref_grey,
+                        const Image& comp_aligned_grey,
+                        const Image& consensus_grey, const FlowField& flow,
+                        int tile_size, const Config& cfg) {
+    if (!cfg.rob_mask_nn_enabled) return;
+    const int h = R.h, w = R.w, c = std::max(1, R.c);
+    if (h <= 0 || w <= 0) return;
+    if (ref_grey.h != h || ref_grey.w != w ||
+        comp_aligned_grey.h != h || comp_aligned_grey.w != w ||
+        consensus_grey.h != h || consensus_grey.w != w) return;
+    if (flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return;
+    // Net's grayscale training constants (tools/nn_mask_refine/common.py).
+    const f32 A = 2.0e-3f, B = 1.0e-3f;
+    const int TS = tile_size;
+    auto tile_dx = [&](int ty, int tx) {
+        ty = ty < 0 ? 0 : (ty >= flow.ny ? flow.ny - 1 : ty);
+        tx = tx < 0 ? 0 : (tx >= flow.nx ? flow.nx - 1 : tx);
+        return flow.dx(ty, tx);
+    };
+    auto tile_dy = [&](int ty, int tx) {
+        ty = ty < 0 ? 0 : (ty >= flow.ny ? flow.ny - 1 : ty);
+        tx = tx < 0 ? 0 : (tx >= flow.nx ? flow.nx - 1 : tx);
+        return flow.dy(ty, tx);
+    };
+    parallel_rows(h, cfg.num_threads, [&](int y) {
+        const int ty = std::min(y / TS, flow.ny - 1);
+        for (int x = 0; x < w; ++x) {
+            const int tx = std::min(x / TS, flow.nx - 1);
+            const f32 ref = ref_grey.at(y, x);
+            const f32 cmp = comp_aligned_grey.at(y, x);
+            const f32 con = consensus_grey.at(y, x);
+            const f32 sig = std::sqrt(std::max(A * std::max(ref, 0.f) + B, 1e-12f));
+            const f32 d_over_sig = std::fabs(ref - cmp) / std::max(sig, 1e-4f);
+            // |grad ref|, 0.5*central difference (common.grad_mag).
+            const f32 gx = 0.5f * (ref_grey.at(y, std::min(x + 1, w - 1)) -
+                                   ref_grey.at(y, std::max(x - 1, 0)));
+            const f32 gy = 0.5f * (ref_grey.at(std::min(y + 1, h - 1), x) -
+                                   ref_grey.at(std::max(y - 1, 0), x));
+            const f32 gref = std::sqrt(gx * gx + gy * gy);
+            // Per-tile flow derivatives (central difference over neighbour tiles).
+            const f32 gdx = 0.5f * (tile_dx(ty, tx + 1) - tile_dx(ty, tx - 1));
+            const f32 gdy = 0.5f * (tile_dx(ty + 1, tx) - tile_dx(ty - 1, tx));
+            const f32 gdxv = 0.5f * (tile_dy(ty, tx + 1) - tile_dy(ty, tx - 1));
+            const f32 gdyv = 0.5f * (tile_dy(ty + 1, tx) - tile_dy(ty - 1, tx));
+            const f32 gradv = std::sqrt(gdx * gdx + gdy * gdy + gdxv * gdxv + gdyv * gdyv);
+            const f32 divv = gdx + gdyv;
+            const f32 curl = gdxv - gdy;
+            const f32 offx = ((f32)(x % TS) - TS / 2 + 0.5f) / (f32)TS;
+            const f32 offy = ((f32)(y % TS) - TS / 2 + 0.5f) / (f32)TS;
+            const f32 dist = std::sqrt(offx * offx + offy * offy);
+            const f32 cons_dev = std::fabs(cmp - con) / std::max(sig, 1e-4f);
+            // Feature 0 is the net's OWN grayscale analytic R (common.analytic_R,
+            // r_t=0.12), computed from the greys so the net sees its training
+            // domain; the gate g is then applied to the device mask R below.
+            const f32 sig2 = std::max(A * std::max(ref, 0.f) + B, 1e-6f);
+            f32 Rg = std::exp(-(ref - cmp) * (ref - cmp) / sig2) - 0.12f;
+            Rg = Rg < 0.f ? 0.f : (Rg > 1.f ? 1.f : Rg);
+            f32 g = rob_mask_nn_gate_from(Rg, d_over_sig, gref, gradv,
+                                          divv, curl, dist, cons_dev);
+            if (!(g >= 0.f && g <= 1.f)) g = 1.f;   // never brighten / never NaN
+            for (int ch = 0; ch < c; ++ch) R.at(y, x, ch) *= g;
+        }
+    });
 }
 
 } // namespace hhsr

@@ -54,6 +54,17 @@ void halftile_subdivide_refine(FlowField& flow, const Image& ref_grey,
                                const Image& comp_grey, const Config& cfg,
                                int raw_tile_size, int raw_h, int raw_w);
 
+// Build-105 "new" NN mask refiner (Config::rob_mask_nn_enabled): darken-only
+// refine of the robustness mask R (R *= g, g in [0,1]) from the tiny net in
+// core/rob_mask_nn.h. Features are computed from the full-res grayscale greys
+// in the net's training domain; consensus_grey is the per-pixel mean of all
+// aligned comparison greys (the multi-frame outlier signal). ref_grey /
+// comp_aligned_grey / consensus_grey are single channel, same resolution as R.
+void rob_mask_nn_refine(Image& R, const Image& ref_grey,
+                        const Image& comp_aligned_grey,
+                        const Image& consensus_grey, const FlowField& flow,
+                        int tile_size, const Config& cfg);
+
 // Dense per-pixel optical flow (Config::dense_flow_enabled): windowed
 // inverse-compositional Lucas-Kanade producing one displacement per grey pixel,
 // seeded from the finalized tile/affine flow and eigenvalue-gated per pixel so
