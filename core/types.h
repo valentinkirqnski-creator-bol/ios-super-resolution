@@ -801,6 +801,16 @@ struct Config {
     // already carries the field exactly, so children revert to it where 8px of
     // evidence cannot beat it. Off by default.
     bool halftile_refine_enabled = false;
+    // How many times to subdivide (each level halves the tile). 1 => ts/2 (ts=8
+    // from a 16 grid, the original behaviour). 2 => ts/4 (ts=4): the flow at the
+    // end of registration is refined to a ts=4 grid at FULL resolution -- a
+    // finer tile lattice than per-tile that still follows within-tile rotation,
+    // WITHOUT the interpolated waviness of a dense per-pixel field. The LK polish
+    // runs at each level while the child tile stays >= 6 grey px (so the ts=8
+    // level is pixel-refined; the ts=4 level carries that refined motion + the
+    // affine gradient, LK skipped there since 4px is too aperture-limited to
+    // solve reliably). The merge and mask index the flow at cons_ts >> levels.
+    int  halftile_refine_levels = 1;
 
     // Per-tile local affine motion model. When on, the finalized flow field is
     // fitted to a per-tile affine (FlowField::fit_affine) and the merge and

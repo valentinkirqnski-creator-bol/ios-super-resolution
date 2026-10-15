@@ -1469,8 +1469,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // Half-tile final refinement subdivides the finished raw-grid flow 2x2, so
     // everything that CONSUMES the flow (robustness + merge) indexes it at half
     // the tile; alignment itself and flow_to_raw_tile_grid stay on the parent.
-    const int merge_ts = work.halftile_refine_enabled
-        ? std::max(1, cons_ts / 2) : cons_ts;
+    const int halftile_levels = work.halftile_refine_enabled
+        ? std::max(1, work.halftile_refine_levels) : 0;
+    const int merge_ts = std::max(1, cons_ts >> halftile_levels);
     // Output dimensions are known as soon as the reference is, and the online
     // merge needs its accumulator before the first frame is analyzed.
     const int out_h = (int)std::lround(work.scale * (f32)ref_h);
@@ -1935,12 +1936,18 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // so every consumer keeps the plain per-tile vector.
         if (work.affine_flow_enabled && !flow.has_affine()) flow.fit_affine();
         // Half-tile final refinement (Config::halftile_refine_enabled): children
-        // affine-seeded, parent statistics carried, gated LK polish. From here on
-        // the flow is a 2x grid indexed at merge_ts by robustness and the merge.
-        if (work.halftile_refine_enabled)
+        // affine-seeded, parent statistics carried, gated LK polish. Each level
+        // halves the tile (halftile_refine_levels): 1 -> ts/2, 2 -> ts/4. The
+        // chained call re-subdivides the already-finer grid; each level's LK
+        // polish runs while the child tile stays >= 6 grey px (so ts=8 is pixel-
+        // refined, ts=4 carries that motion + affine, LK skipped there). From
+        // here on the flow is a (2^levels) grid indexed at merge_ts.
+        for (int lvl = 0; lvl < halftile_levels; ++lvl) {
+            const int level_ts = std::max(2, cons_ts >> lvl);  // 16, 8, ...
             halftile_subdivide_refine(flow, ref_grey,
                                       gw.warped ? gw.warped_grey : comp_grey,
-                                      work, cons_ts, comp.h, comp.w);
+                                      work, level_ts, comp.h, comp.w);
+        }
         // Dense per-pixel optical flow (Config::dense_flow_enabled): refine the
         // finalized tile/affine/half-tile flow to one vector per grey pixel
         // (windowed Lucas-Kanade, eigenvalue-gated, accept-gated vs the seed).
@@ -1970,8 +1977,9 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (avail != 0 && avail < kDenseHeadroom) {
                 prof_add_cpu("dense#skipped-lowmem", 1.0);
             } else {
-                const int seed_ts = work.halftile_refine_enabled
-                                    ? std::max(1, cons_ts / 2) : cons_ts;
+                // The flow grid is now at merge_ts (cons_ts >> halftile levels),
+                // so the dense seed samples the affine model at that tile size.
+                const int seed_ts = merge_ts;
                 const Image& cg = gw.warped ? gw.warped_grey : comp_grey;
                 if (Dd > 1) {
                     // dense_lk_refine derives the raw/grey scale from the grey
