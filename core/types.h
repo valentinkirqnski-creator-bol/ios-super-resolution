@@ -824,11 +824,23 @@ struct Config {
     // the tile flow for any frame that would exceed it.
     bool  dense_flow_enabled = false;
     int   dense_flow_iters = 5;        // Lucas-Kanade iterations
-    // Analysis-window half-size. 7 => a 15x15 (~16px, "ts16") window -- enough
-    // texture for a reliable per-pixel solve. The window is nearly free: the
-    // structure tensor and RHS are separable running box sums, so a 16px window
-    // costs the same as a 5px one. (Was 2 = 5px, too aperture-limited.)
-    int   dense_flow_radius = 7;
+    // The dense solve runs on a grey DOWNSAMPLED by this factor (not the full
+    // FFT grey). At full res the per-pixel solve's ~15 working planes are ~16x
+    // the grey (~780MB at 12MP), so the memory guard in pipeline_paths skips it
+    // on device and the merge silently falls back to the tile flow -- "dense on"
+    // then does nothing. 2 cuts the working set ~4x (~200MB) so it actually
+    // runs, and the field is stored at that resolution (one vector per 2x2 grey
+    // block -- the "ts2" density). The full-res FFT grey still drives block
+    // match / affine / mask / merge; only the dense solve is coarsened. No Metal
+    // change: dense_sx/sy carry the scale, so sample_dense (host + shader)
+    // interpolates it. 1 = full-res (heavy; likely skipped on device).
+    int   dense_flow_downsample = 2;
+    // Analysis-window half-size, in DOWNSAMPLED grey pixels. 4 => a 9x9 window
+    // on the 1/2 grey = ~18 raw px -- enough texture for a reliable solve
+    // (a 5px full-res window was too aperture-limited; it locked onto the wrong
+    // period in repetitive texture). Nearly free: separable running box sums.
+    // Effective raw window ~= (2*radius+1) * dense_flow_downsample.
+    int   dense_flow_radius = 4;
     float dense_flow_step_max = 1.0f;  // per-iteration displacement clamp, grey px
     float dense_flow_eig_floor = 4.0f; // min structure-tensor eigenvalue (noise units) to update a direction
     float dense_flow_max_dev = 2.0f;   // max |dense - seed| per axis, grey px (local-refinement bound)

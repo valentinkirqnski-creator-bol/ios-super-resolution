@@ -1093,6 +1093,26 @@ static Image warp_comp_grey_to_ref(const Image& comp_grey, const FlowField& flow
     return out;
 }
 
+// Box-average a single-channel grey by an integer factor D (decimate-style),
+// for the dense-flow solve (keeps its working set ~1/D^2 of the full FFT grey
+// so it fits device memory). Returns the grey unchanged for D<=1.
+static Image downsample_box_grey(const Image& g, int D) {
+    if (D <= 1 || g.h < D || g.w < D) return g;
+    const int gh = g.h / D, gw = g.w / D;
+    Image out(gh, gw, 1);
+    const f32 inv = 1.f / (f32)(D * D);
+    parallel_rows(gh, 0, [&](int y) {
+        for (int x = 0; x < gw; ++x) {
+            f32 s = 0.f;
+            for (int dy = 0; dy < D; ++dy)
+                for (int dx = 0; dx < D; ++dx)
+                    s += g.at(y * D + dy, x * D + dx);
+            out.at(y, x) = s * inv;
+        }
+    });
+    return out;
+}
+
 static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
                                        const std::vector<int>& comp_indices,
                                        const Image& ref_grey, const Pyramid& ref_pyr,
@@ -1929,25 +1949,40 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // merge/robustness then sample flow.dense per pixel. Must precede the
         // comp_grey free below.
         if (work.dense_flow_enabled) {
-            // Dense LK is a full-resolution host pass (its working planes plus
-            // the fp16 per-frame buffer the merge then holds). On a jetsam-
-            // sensitive device that transient peak, stacked on the analysis
-            // working set, can push a mid-burst frame over the memory kill
-            // threshold. Skip it when free memory is tight: the frame then
-            // keeps its tile/affine/half-tile flow (the merge and mask fall
-            // back consistently), which is correct, just not per-pixel. 0 means
-            // the query is unavailable (e.g. harness) -> proceed as before.
+            // The dense LK solves on a grey DOWNSAMPLED by dense_flow_downsample
+            // (not the full FFT grey): the per-pixel solve allocates ~15 working
+            // planes, so at full res that is ~16x the grey (~780MB at 12MP) and
+            // the guard below used to skip it on every device frame -- "dense on"
+            // did nothing. At 1/2 the working set is ~1/4, so it fits and runs.
+            // The field is stored at the downsampled resolution (dense_sx/sy
+            // carry the scale); the full-res merge/mask sample it via
+            // sample_dense with no Metal change. Block match / affine / mask /
+            // merge still use the full-res FFT grey -- only this solve is coarse.
+            const int Dd = std::max(1, work.dense_flow_downsample);
+            // Memory guard sized to the DOWNSAMPLED working set. On a jetsam-
+            // sensitive device a transient peak over the kill threshold aborts
+            // the burst, so a frame that would exceed it keeps its tile/affine/
+            // half-tile flow (merge and mask fall back consistently). 0 = query
+            // unavailable (e.g. harness) -> proceed.
             const uint64_t avail = prof_available_bytes();
-            const size_t need = (size_t)ref_grey.h * ref_grey.w * sizeof(float);
+            const size_t need = (size_t)(ref_grey.h / Dd) * (ref_grey.w / Dd) * sizeof(float);
             const uint64_t kDenseHeadroom = (uint64_t)need * 16ull + 300ull * 1024 * 1024;
             if (avail != 0 && avail < kDenseHeadroom) {
                 prof_add_cpu("dense#skipped-lowmem", 1.0);
             } else {
                 const int seed_ts = work.halftile_refine_enabled
                                     ? std::max(1, cons_ts / 2) : cons_ts;
-                dense_lk_refine(flow, ref_grey,
-                                gw.warped ? gw.warped_grey : comp_grey,
-                                work, seed_ts, comp.h, comp.w);
+                const Image& cg = gw.warped ? gw.warped_grey : comp_grey;
+                if (Dd > 1) {
+                    // dense_lk_refine derives the raw/grey scale from the grey
+                    // dims vs raw_h/raw_w, so handing it the 1/Dd greys makes it
+                    // solve + store at that resolution automatically.
+                    Image ref_ds = downsample_box_grey(ref_grey, Dd);
+                    Image comp_ds = downsample_box_grey(cg, Dd);
+                    dense_lk_refine(flow, ref_ds, comp_ds, work, seed_ts, comp.h, comp.w);
+                } else {
+                    dense_lk_refine(flow, ref_grey, cg, work, seed_ts, comp.h, comp.w);
+                }
             }
         }
         prof_add_cpu("comp:align", prof_now_ms() - t_align);
