@@ -1383,6 +1383,17 @@ struct Config {
 
     bool  align_ambiguous_fallback_enabled = false;
 
+    // Frame discard: drop a comparison frame that cannot be aligned. The
+    // per-frame alignment confidence = the fraction of robustness-mask samples
+    // confidently accepted (R > 0.25); below frame_discard_min_fraction the
+    // frame is dropped from the merge (motion blur, a hand over the lens, a
+    // scene change, motion beyond the search range). It reuses the mask pass
+    // that already runs (one scalar, no buffer) and routes the drop through the
+    // existing no-contribution path, so it REMOVES merge work -- never adds RAM
+    // or GPU. OFF by default. See pipeline_paths.cpp.
+    bool  frame_discard_enabled = false;
+    float frame_discard_min_fraction = 0.25f;
+
     // Forward-backward consistency check IN alignment (not robustness): after the
     // forward flow (ref->comp) is produced, align comp->ref independently and, for
     // each tile, sample the backward flow at the forward-predicted destination. The

@@ -100,23 +100,45 @@ static bool load_cached_comp_raw(const fs::path& cache, int k, Image& comp) {
     return load_image(cache / ("f" + std::to_string(k) + ".raw"), comp) && comp.h > 0;
 }
 
-static bool robustness_row_activity(const Image& rob, std::vector<uint8_t>& rows) {
+// accept_frac (out): fraction of mask samples that are CONFIDENTLY accepted
+// (R > kFrameAcceptTau) -- a per-frame alignment-confidence used by the optional
+// frame-discard gate. Only computed when want_accept_frac, because it needs the
+// full per-pixel pass (the row-activity test early-outs at the first non-zero);
+// otherwise it is left at 1.0 (never discard). No allocation -- a scalar folded
+// into the pass that already runs over the finished mask.
+static constexpr f32 kFrameAcceptTau = 0.25f;
+static bool robustness_row_activity(const Image& rob, std::vector<uint8_t>& rows,
+                                    double* accept_frac = nullptr,
+                                    bool want_accept_frac = false) {
+    if (accept_frac) *accept_frac = 1.0;
     rows.assign((size_t)std::max(0, rob.h), 0u);
     if (rob.h <= 0 || rob.w <= 0 || rob.c <= 0 || rob.data.empty())
         return false;
     bool any = false;
+    const int nc = std::max(1, rob.c);
+    size_t accepted = 0;
     for (int y = 0; y < rob.h; ++y) {
         bool row_any = false;
-        const size_t base = (size_t)y * (size_t)rob.w * (size_t)std::max(1, rob.c);
-        const size_t count = (size_t)rob.w * (size_t)std::max(1, rob.c);
-        for (size_t i = 0; i < count; ++i) {
-            if (rob.data[base + i] != 0.f) {
-                row_any = true;
-                break;
+        const size_t base = (size_t)y * (size_t)rob.w * (size_t)nc;
+        const size_t count = (size_t)rob.w * (size_t)nc;
+        if (want_accept_frac) {
+            // Full pass: count confidently-accepted samples AND flag the row.
+            for (size_t i = 0; i < count; ++i) {
+                const f32 r = rob.data[base + i];
+                if (r != 0.f) row_any = true;
+                if (r > kFrameAcceptTau) ++accepted;
+            }
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                if (rob.data[base + i] != 0.f) { row_any = true; break; }
             }
         }
         rows[(size_t)y] = row_any ? 1u : 0u;
         any = any || row_any;
+    }
+    if (accept_frac && want_accept_frac) {
+        const double total = (double)rob.h * (double)rob.w * (double)nc;
+        *accept_frac = (total > 0.0) ? (double)accepted / total : 1.0;
     }
     return any;
 }
@@ -129,13 +151,24 @@ static Image compute_robustness_and_activity(const Image& comp,
                                              std::vector<uint8_t>& rows,
                                              bool& has_nonzero,
                                              Image* s_select_out = nullptr,
-                                             int gpu_slot = -1) {
+                                             int gpu_slot = -1,
+                                             double* accept_frac = nullptr) {
+    if (accept_frac) *accept_frac = 1.0;
     Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work, s_select_out);
 #if defined(__APPLE__)
     // The mask stayed in its slice, so read the per-row activity from there --
     // a few KB, against pulling the whole 12MB plane back to test for non-zeros.
     if (gpu_slot >= 0 && rob.h > 0 && rob.data.empty()) {
-        if (metal_frame_rob_rows(gpu_slot, rows, has_nonzero)) return rob;
+        if (metal_frame_rob_rows(gpu_slot, rows, has_nonzero)) {
+            // Resident mask: no host pixels, so don't pull the plane back (that
+            // would add GPU/transfer). Use the already-read row flags as a free
+            // COARSE confidence -- fraction of rows with any accepted sample.
+            if (accept_frac && work.frame_discard_enabled && !rows.empty()) {
+                size_t nz = 0; for (uint8_t r : rows) nz += (r != 0u);
+                *accept_frac = (double)nz / (double)rows.size();
+            }
+            return rob;
+        }
         // Could not read the flags. Assume the frame contributes rather than
         // silently dropping it: robustness_row_activity on a mask with no host
         // storage would report "all zero", which is a different burst.
@@ -146,7 +179,8 @@ static Image compute_robustness_and_activity(const Image& comp,
 #else
     (void)gpu_slot;
 #endif
-    has_nonzero = robustness_row_activity(rob, rows);
+    has_nonzero = robustness_row_activity(rob, rows, accept_frac,
+                                          work.frame_discard_enabled);
     return rob;
 }
 
@@ -2048,6 +2082,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         CovField covs;
         std::vector<uint8_t> rob_rows_nonzero;
         bool rob_has_nonzero = true;
+        double rob_accept_frac = 1.0;   // per-frame alignment confidence (frame discard)
         // Per-frame, freed at the end of this iteration once folded into the
         // running split. Only allocated when the debug masks are requested.
         Image rob_s_select;
@@ -2060,7 +2095,8 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr,
-                                                  frames_resident ? k : -1);
+                                                  frames_resident ? k : -1,
+                                                  &rob_accept_frac);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -2089,8 +2125,22 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   rob_rows_nonzero,
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr,
-                                                  frames_resident ? k : -1);
+                                                  frames_resident ? k : -1,
+                                                  &rob_accept_frac);
             covs = cov_fut.get();
+        }
+        // Frame discard (Config::frame_discard_enabled): a comparison frame whose
+        // alignment confidence -- the fraction of mask samples confidently
+        // accepted -- is below the threshold cannot be aligned (motion blur, a
+        // hand over the lens, a scene change, motion beyond the search range), so
+        // drop it entirely. Routed through rob_has_nonzero=false, the existing
+        // no-contribution path: the merge is SKIPPED and the frame's flow/covs
+        // are not cached -- this REMOVES work, never adds RAM or GPU. The
+        // reference and the kept frames still merge.
+        if (work.frame_discard_enabled && rob_has_nonzero &&
+            rob_accept_frac < (double)work.frame_discard_min_fraction) {
+            rob_has_nonzero = false;
+            prof_add_cpu("frame#discarded-unalignable", 1.0);
         }
         // NN mask refiner: darken the mask per the net (Config::rob_mask_nn_
         // enabled). No-op unless the mask is host-resident AND the consensus +

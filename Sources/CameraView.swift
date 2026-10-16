@@ -1158,6 +1158,19 @@ struct CameraView: View {
                          ImageStackAlignator's rule: when a tile's best and second-best block-match costs are nearly tied — a flat patch, repeating texture, or a STEADY handheld burst where there is almost no motion and noise picks the winner — apply NO shift and keep the seed instead of trusting a coin-flip match. Measured to halve the scattered wrong tile shifts on near-still bursts (the usual cause of rare tile-edge-shaped dark/colored lines in an otherwise clean output), at ~4% cost on rotating bursts.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Discard Unalignable Frames", isOn: $cam.tuningParams.frame_discard_enabled)
+                    Text("""
+                         Drops a whole comparison frame from the merge when too little of it aligned — the fraction of the robustness mask that's confidently accepted is below the threshold below. Catches a frame ruined by motion blur, a finger over the lens, a scene change, or motion beyond the search range, whose few "accepted" pixels are usually spurious. It reuses the mask pass that already runs (just a count) and routes the drop through the path that already skips a zero-mask frame, so it REMOVES merge work — it adds no RAM and no GPU. The reference and the aligned frames merge as normal. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    HStack {
+                        Text("Keep if aligned ≥ \(Int(cam.tuningParams.frame_discard_min_fraction * 100))%")
+                        Slider(value: $cam.tuningParams.frame_discard_min_fraction, in: 0.05...0.6, step: 0.05)
+                    }
+                    Text("""
+                         A frame is kept only if at least this fraction of it is confidently aligned. Lower = more permissive (drops only badly broken frames); higher = stricter. 25% is a sensible default. Only used when Discard Unalignable Frames is on.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Half-Tile Refinement", isOn: $cam.tuningParams.halftile_refine_enabled)
                     Text("""
                          After registration finishes, every motion tile is split into four half-size children: each child starts from the tile's affine model at its own centre, keeps the parent's reliability statistics (so the rejection mask doesn't over-fire on the finer grid), and is then re-measured against the pixels with a safety gate — a child with too little texture keeps its seed. The mask and merge then use the finer field. Robustness of the full tile search, spatial resolution of the half tile: helps where motion changes INSIDE a tile (subject edges, depth boundaries); smooth camera motion is already handled exactly by Affine Tile Motion. Works with the CPU and GPU pipelines.

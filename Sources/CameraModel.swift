@@ -319,6 +319,11 @@ struct TuningParams: Equatable, Codable {
     /// itself, unlike the s1 demotion, which is inert under rotation where
     /// every tile is on s1 already. Off by default -- A/B before adopting.
     var align_ambiguous_fallback_enabled: Bool = false
+    /// Drop a comparison frame that can't be aligned (confidence = fraction of
+    /// mask confidently accepted; below the threshold the frame is skipped).
+    /// Reuses the existing mask pass; removes merge work, no added RAM/GPU.
+    var frame_discard_enabled: Bool = false
+    var frame_discard_min_fraction: Float = 0.25
     /// Debug: zero the noise model as read by the robustness mask ONLY.
     /// R is then scored from the raw measured local variance and the raw
     /// (unshrunk) pixel difference. SNR auto-tune, the alignment tile size
@@ -454,6 +459,7 @@ struct TuningParams: Equatable, Codable {
         case edge_misalign_enabled, edge_misalign_edge_snr, edge_misalign_radius
         case edge_misalign_shift_z, edge_misalign_ghost_z, edge_misalign_min_conf
         case align_ambiguous_fallback_enabled
+        case frame_discard_enabled, frame_discard_min_fraction
         case debug_noise_model_disabled, robustness_raw_resolution_enabled
         case kernel_selection_linear
         case use_neural_robustness
@@ -575,6 +581,8 @@ struct TuningParams: Equatable, Codable {
         edge_misalign_ghost_z = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_ghost_z) ?? edge_misalign_ghost_z
         edge_misalign_min_conf = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_min_conf) ?? edge_misalign_min_conf
         align_ambiguous_fallback_enabled = try c.decodeIfPresent(Bool.self, forKey: .align_ambiguous_fallback_enabled) ?? align_ambiguous_fallback_enabled
+        frame_discard_enabled = try c.decodeIfPresent(Bool.self, forKey: .frame_discard_enabled) ?? frame_discard_enabled
+        frame_discard_min_fraction = try c.decodeIfPresent(Float.self, forKey: .frame_discard_min_fraction) ?? frame_discard_min_fraction
         debug_noise_model_disabled = try c.decodeIfPresent(Bool.self, forKey: .debug_noise_model_disabled) ?? debug_noise_model_disabled
         kernel_selection_linear = try c.decodeIfPresent(Bool.self, forKey: .kernel_selection_linear) ?? kernel_selection_linear
         robustness_raw_resolution_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_raw_resolution_enabled) ?? robustness_raw_resolution_enabled
@@ -2385,6 +2393,8 @@ final class CameraModel: NSObject, ObservableObject {
             "edge_misalign_ghost_z": NSNumber(value: tuningParams.edge_misalign_ghost_z),
             "edge_misalign_min_conf": NSNumber(value: tuningParams.edge_misalign_min_conf),
             "align_ambiguous_fallback_enabled": NSNumber(value: tuningParams.align_ambiguous_fallback_enabled),
+            "frame_discard_enabled": NSNumber(value: tuningParams.frame_discard_enabled),
+            "frame_discard_min_fraction": NSNumber(value: tuningParams.frame_discard_min_fraction),
             "debug_noise_model_disabled": NSNumber(value: tuningParams.debug_noise_model_disabled),
             "kernel_selection_linear": NSNumber(value: tuningParams.kernel_selection_linear),
             "robustness_raw_resolution_enabled": NSNumber(value: tuningParams.robustness_raw_resolution_enabled),
