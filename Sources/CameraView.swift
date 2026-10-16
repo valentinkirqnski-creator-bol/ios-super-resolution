@@ -1267,6 +1267,11 @@ struct CameraView: View {
                          The freshly-trained darken-only mask net: a tiny 9-feature model that only attenuates the analytic mask (R·g, g in [0,1] — never trusts more), so the merge stays robust to misaligned tiles and only well-aligned samples contribute to super-resolution. Trained on synthetic bursts with deliberately corrupted alignment vectors; measured +6.4% merged-MSE on held-out synthetic data. Its decisive input is a MULTI-FRAME CONSENSUS — each frame vs the mean of all aligned frames — so enabling it runs a second alignment pass over the burst to build that consensus (opt-in, extra decode+align time). Features come from the full-res grey in the net's own training domain, so no retraining. Runs on device: the mask is refined on the host and handed to the GPU merge (no separate Metal kernel). Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Robust NN v2 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)
+                    Text("""
+                         Learned refinement of the robustness mask (tools/robust_nn, v2): R = sigmoid(logit(R0) + δ), a ~2.3k-parameter net that starts from the analytic mask and moves it either way — down where the correspondence is wrong (rotation/parallax tile errors, moving subjects, repetitive-texture mismatches), up where the analytic mask rejected correctly aligned but differently-sampled (aliased) detail. Trained on synthetic RAW bursts with exact ground-truth alignment; on held-out synthetic bursts +0.45 dB merged PSNR over the analytic mask (+2.1 dB repetitive texture, +0.5 dB rotation), with a known tendency to under-trust good samples (slightly worse in shadows on parallax/moving scenes). Not yet validated on real bursts. One fused GPU kernel, ~36 MB extra on a 12 MP burst. Bayer, linear guide only. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("High-Frequency Rejection")) {

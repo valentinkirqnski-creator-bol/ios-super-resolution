@@ -1,0 +1,6 @@
+data/
+runs/*/*
+!runs/*/model.pt
+!runs/*/metrics.json
+__pycache__/
+*.log

@@ -1622,6 +1622,15 @@ struct Config {
     // consensus pre-pass. Darken-only: R' = R * g, g in [0,1]. OFF by default;
     // distinct from robustness_refine_nn_enabled (the older 47-feature net).
     bool  rob_mask_nn_enabled = false;
+    // tools/robust_nn: learned refinement R = sigmoid(logit(R0) + delta) of the
+    // finished analytic mask, ~2.3k params (core/robust_nn_shared.h + _weights.h).
+    // Trained on synthetic RAW bursts with exact ground-truth correspondence,
+    // against geometric-reliability and merge-utility labels; ships v2 (+0.45 dB
+    // merged PSNR over the analytic mask on held-out synthetic). One fused Metal
+    // kernel at guide resolution, features in threadgroup memory; ~36 MB extra
+    // on a 12 MP burst. Bayer + linear guide only; declines (mask unchanged)
+    // otherwise. OFF by default.
+    bool  robust_nn_enabled = false;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency

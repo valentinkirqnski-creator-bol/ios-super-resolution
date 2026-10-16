@@ -9,6 +9,8 @@ using namespace metal;
 // The refinement network's arithmetic, shared verbatim with robustness.cpp so
 // the CPU mask and the GPU mask cannot drift. See rob_refine_mask below.
 #include "robustness_refine_shared.h"
+// tools/robust_nn: learned refinement of the robustness mask (rnn_refine_mask).
+#include "robust_nn_shared.h"
 
 constant float PI = 3.14159265358979323846f;
 
@@ -4000,5 +4002,153 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
             prev[po + 1u] = cn1;
             prev[po + 2u] = cn2;
         }
+    }
+}
+
+
+// ===========================================================================
+// robust_nn (Config::robust_nn_enabled): learned refinement of the analytic
+// robustness mask, tools/robust_nn. R = sigmoid(logit(R0) + delta(features)),
+// ~2.3k parameters, features and net in core/robust_nn_shared.h (shared with
+// the parity-tested CPU reference). Runs at GUIDE resolution (one pixel per
+// RGGB quad), the grid the net was trained on.
+//
+// Memory: one fused kernel. Each 16x16 threadgroup builds its warped-grey tile
+// (26x26) and its 18x18 feature halo in threadgroup memory (~21 KB) and runs
+// the net from there -- no feature planes in device memory. The only device
+// buffers are the pinned reference grey (per burst), R0 in and R out.
+// ===========================================================================
+
+// Mirrors RnnAppParamsCPU in metal_gpu.mm (static_assert'ed there: 96 bytes).
+struct RnnAppParams {
+    int width, height, flow_step;
+    float noise_a, noise_b, clip_level;
+    uint flow_ny, flow_nx;
+    float tile_size;
+    uint affine, homog, _pad0;
+    float hmat[9];
+    float _pad1, _pad2, _pad3;
+};
+
+// Grey of the Bayer guide (R, mean G, B): the RGGB quad mean the net was trained on.
+struct RnnGuideGrey {
+    device const float* g;
+    int w;
+    float operator()(int x, int y) const {
+        uint o = uint(y * w + x) * 3u;
+        return 0.25f * g[o] + 0.5f * g[o + 1u] + 0.25f * g[o + 2u];
+    }
+};
+
+// The correspondence rob_make_mask scores for a guide pixel (nch == 3 branch):
+// nearest tile or affine flow at the quad's raw centre, halved to guide px,
+// then the optional global homography. Returned as a displacement in guide px.
+struct RnnAppFlow {
+    device const float* flow;
+    device const float* jac;
+    constant RnnAppParams* p;
+    void operator()(int x, int y, thread float& dx, thread float& dy) const {
+        float ry = 2.f * float(y) + 0.5f, rx = 2.f * float(x) + 0.5f;
+        float fx, fy;
+        if (p->affine != 0u) {
+            float rdx, rdy;
+            flow_sample_affine(flow, jac, p->flow_ny, p->flow_nx, ry, rx, p->tile_size, rdx, rdy);
+            fx = 0.5f * rdx;
+            fy = 0.5f * rdy;
+        } else {
+            int py = min(int(ry / p->tile_size), int(p->flow_ny) - 1);
+            int px = min(int(rx / p->tile_size), int(p->flow_nx) - 1);
+            uint fi = (uint(py) * p->flow_nx + uint(px)) * 2u;
+            fx = 0.5f * flow[fi + 0u];
+            fy = 0.5f * flow[fi + 1u];
+        }
+        float sx = float(x) + fx, sy = float(y) + fy;
+        if (p->homog != 0u) {
+            float px2 = 2.f * sx, py2 = 2.f * sy;
+            float wq = p->hmat[6] * px2 + p->hmat[7] * py2 + p->hmat[8];
+            float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
+            sx = 0.5f * (p->hmat[0] * px2 + p->hmat[1] * py2 + p->hmat[2]) * iwq;
+            sy = 0.5f * (p->hmat[3] * px2 + p->hmat[4] * py2 + p->hmat[5]) * iwq;
+        }
+        dx = sx - float(x);
+        dy = sy - float(y);
+    }
+};
+
+#define RNN_TS 16                          // output tile per threadgroup
+#define RNN_JR 5                           // warped-grey apron: 1 (conv) + 4 (widest window)
+#define RNN_JN (RNN_TS + 2 * RNN_JR)       // 26
+#define RNN_HN (RNN_TS + 2)                // 18: feature halo for the 3x3 conv
+
+struct RnnTgImg {
+    threadgroup const float* s;
+    int ox, oy;
+    float operator()(int x, int y) const { return s[(y - oy) * RNN_JN + (x - ox)]; }
+};
+struct RnnTgFeat {
+    threadgroup const float* s;
+    int ox, oy;
+    float operator()(int c, int x, int y) const { return s[(c * RNN_HN + (y - oy)) * RNN_HN + (x - ox)]; }
+};
+
+kernel void rnn_grey_from_guide(device float* grey [[buffer(0)]],
+                                device const float* guide [[buffer(1)]],
+                                constant uint2& dims [[buffer(2)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dims.x || gid.y >= dims.y) return;
+    uint i = gid.y * dims.x + gid.x;
+    grey[i] = 0.25f * guide[3u * i] + 0.5f * guide[3u * i + 1u] + 0.25f * guide[3u * i + 2u];
+}
+
+// Dispatch as threadgroups of any size over ceil(W/16) x ceil(H/16); every
+// phase strides by the threadgroup's thread count, so the kernel is correct
+// whatever maxTotalThreadsPerThreadgroup the compiler allows.
+kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
+                            device const float* comp_guide [[buffer(1)]],
+                            device const float* r0 [[buffer(2)]],
+                            device float* r_out [[buffer(3)]],
+                            device const float* flow [[buffer(4)]],
+                            device const float* jac [[buffer(5)]],
+                            constant RnnAppParams& p [[buffer(6)]],
+                            uint2 tgid [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint2 tpt [[threads_per_threadgroup]]) {
+    threadgroup float sJ[RNN_JN * RNN_JN];
+    threadgroup float sF[RNN_NF * RNN_HN * RNN_HN];
+    const int W = p.width, H = p.height;
+    const int nt = int(tpt.x * tpt.y);
+    const int x0 = int(tgid.x) * RNN_TS, y0 = int(tgid.y) * RNN_TS;
+    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RnnAppFlow fl = {flow, jac, &p};
+
+    // 1) warped comparison grey J over the tile + apron (clamped coords)
+    RnnGuideGrey cg = {comp_guide, W};
+    for (int i = int(tid); i < RNN_JN * RNN_JN; i += nt) {
+        int gx = clamp(x0 - RNN_JR + i % RNN_JN, 0, W - 1);
+        int gy = clamp(y0 - RNN_JR + i / RNN_JN, 0, H - 1);
+        sJ[i] = rnn_warp_at(cg, fl, W, H, gx, gy);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2) features over the 18x18 halo. Entries whose position lies outside the
+    // image hold the clamped pixel's features and are never read (every read
+    // below goes through clamped coordinates).
+    RNNImg rf = {ref_grey, W};
+    RnnTgImg tj = {sJ, x0 - RNN_JR, y0 - RNN_JR};
+    for (int i = int(tid); i < RNN_HN * RNN_HN; i += nt) {
+        int gx = clamp(x0 - 1 + i % RNN_HN, 0, W - 1);
+        int gy = clamp(y0 - 1 + i / RNN_HN, 0, H - 1);
+        float f[RNN_NF];
+        rnn_features_at(rf, tj, fl, r0[gy * W + gx], P, gx, gy, f);
+        for (int c = 0; c < RNN_NF; ++c) sF[c * RNN_HN * RNN_HN + i] = f[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3) the net
+    RnnTgFeat tf = {sF, x0 - 1, y0 - 1};
+    for (int i = int(tid); i < RNN_TS * RNN_TS; i += nt) {
+        int x = x0 + i % RNN_TS, y = y0 + i / RNN_TS;
+        if (x >= W || y >= H) continue;
+        r_out[y * W + x] = rnn_net_at(tf, r0[y * W + x], W, H, x, y);
     }
 }

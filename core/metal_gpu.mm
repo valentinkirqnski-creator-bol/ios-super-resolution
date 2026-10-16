@@ -2055,6 +2055,15 @@ static size_t g_rob_ref_bytes = 0;
 static id<MTLBuffer> g_rob_ref_m_hires = nil;
 static id<MTLBuffer> g_rob_ref_v_hires = nil;
 static int g_rob_ref_hires_h = 0, g_rob_ref_hires_w = 0;
+// robust_nn (Config::robust_nn_enabled): the reference grey at guide
+// resolution, pinned once per burst (the net reads raw pixels, not the 3x3
+// means the analytic mask keeps), plus the per-frame R0-in / R-out planes,
+// reused across the burst's frames. ~3 x 12 MB on a 12 MP burst; nothing is
+// allocated while the toggle is off.
+static id<MTLBuffer> g_rnn_ref_grey = nil;
+static int g_rnn_h = 0, g_rnn_w = 0;
+static id<MTLBuffer> g_rnn_r0 = nil;
+static id<MTLBuffer> g_rnn_out = nil;
 // std/diff curve buffers hold up to 3 CONCATENATED per-channel curves
 // (each g_rob_curve_n entries; channel ch's curve starts at ch*g_rob_curve_n)
 // rather than one curve shared by every guide channel -- see
@@ -2110,6 +2119,128 @@ static void clear_rob_ref_gpu() {
     g_rob_curve_pixel4a = false;
     g_rob_curve_pixel4a_iso = 0;
     g_rob_curve_perceptual = false;
+    g_rnn_ref_grey = nil;
+    g_rnn_h = g_rnn_w = 0;
+    g_rnn_r0 = nil;
+    g_rnn_out = nil;
+}
+
+// ---- robust_nn: learned refinement of the robustness mask ------------------
+// (Config::robust_nn_enabled, tools/robust_nn, kernel rnn_refine_mask).
+
+// Mirrors RnnAppParams in HHSRKernels.metal.
+struct RnnAppParamsCPU {
+    int32_t width, height, flow_step;
+    float noise_a, noise_b, clip_level;
+    uint32_t flow_ny, flow_nx;
+    float tile_size;
+    uint32_t affine, homog, _pad0;
+    float hmat[9];
+    float _pad1, _pad2, _pad3;
+};
+static_assert(sizeof(RnnAppParamsCPU) == 96, "RnnAppParamsCPU must mirror RnnAppParams");
+
+// The net's input domain: the plain linear Bayer guide (3 channels, camera-
+// native, white = 1). Anything else (grey bursts, the sqrt guide) is outside it.
+static bool rnn_domain_ok(const Config& cfg, int nch) {
+    return cfg.robust_nn_enabled && nch == 3 && !cfg.robustness_perceptual_sqrt;
+}
+
+// Encodes rnn_grey_from_guide for the reference into cmd. Called from
+// init_robustness_metal_impl while the reference guide is still alive.
+static void rnn_pin_ref_grey(id<MTLBuffer> b_guide, int gh, int gw, int nch, const Config& cfg,
+                             id<MTLCommandBuffer> cmd) {
+    if (!rnn_domain_ok(cfg, nch)) return;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pso = c.pipe("rnn_grey_from_guide");
+    if (!pso || !b_guide) return;
+    id<MTLBuffer> grey = buf(nullptr, (size_t)gh * (size_t)gw * sizeof(float));
+    id<MTLComputeCommandEncoder> enc = grey ? [cmd computeCommandEncoder] : nil;
+    if (!enc) return;
+    uint32_t dims[2] = {(uint32_t)gw, (uint32_t)gh};
+    [enc setBuffer:grey offset:0 atIndex:0];
+    [enc setBuffer:b_guide offset:0 atIndex:1];
+    [enc setBytes:dims length:sizeof(dims) atIndex:2];
+    dispatch2(enc, pso, (NSUInteger)gw, (NSUInteger)gh);
+    [enc endEncoding];
+    g_rnn_ref_grey = grey;
+    g_rnn_h = gh;
+    g_rnn_w = gw;
+}
+
+// Refines the final raw-resolution analytic mask R in place. That mask is
+// constant on each RGGB quad (Eq. 9 runs on the guide lattice and is nearest-
+// upsampled), so it IS a guide-resolution mask: the net runs on the guide grid
+// it was trained on and its output is written back quad by quad. Returns false
+// (R untouched) whenever any precondition fails.
+static bool rnn_refine_raw_res(Image& R, id<MTLBuffer> b_comp_guide, int gh, int gw, int nch,
+                               const FlowField& flow, int tile_size, const Config& cfg,
+                               id<MTLBuffer> b_flow, id<MTLBuffer> b_jac, bool use_affine) {
+    if (!rnn_domain_ok(cfg, nch) || cfg.dense_flow_enabled) return false;
+    if (!g_rnn_ref_grey || g_rnn_h != gh || g_rnn_w != gw || !b_comp_guide) return false;
+    if (R.c != 1 || R.h < 1 || R.w < 1 || R.data.empty()) return false;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0 || !b_flow || !b_jac)
+        return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pso = c.pipe("rnn_refine_mask");
+    if (!pso) return false;
+    const size_t n = (size_t)gh * (size_t)gw, bytes = n * sizeof(float);
+    if (!g_rnn_r0 || [g_rnn_r0 length] < bytes) g_rnn_r0 = buf(nullptr, bytes);
+    if (!g_rnn_out || [g_rnn_out length] < bytes) g_rnn_out = buf(nullptr, bytes);
+    if (!g_rnn_r0 || !g_rnn_out) return false;
+
+    float* r0 = (float*)[g_rnn_r0 contents];
+    for (int y = 0; y < gh; ++y) {
+        const int ry = std::min(2 * y, R.h - 1);
+        for (int x = 0; x < gw; ++x)
+            r0[(size_t)y * gw + x] = R.data[(size_t)ry * R.w + std::min(2 * x, R.w - 1)];
+    }
+
+    RnnAppParamsCPU p{};
+    p.width = gw;
+    p.height = gh;
+    p.flow_step = std::max(1, tile_size / 2);          // tile stride in guide px
+    // Per-sample DNG noise of the camera-native guide -> variance of the quad
+    // mean (R + 2 G + B) / 4 = (aR + 2 aG + aB) / 16, same for beta.
+    p.noise_a = (cfg.alpha_dng[0] + 2.f * cfg.alpha_dng[1] + cfg.alpha_dng[2]) / 16.f;
+    p.noise_b = (cfg.beta_dng[0] + 2.f * cfg.beta_dng[1] + cfg.beta_dng[2]) / 16.f;
+    p.clip_level = 0.9f;                                // the value it was trained with
+    p.flow_ny = (uint32_t)flow.ny;
+    p.flow_nx = (uint32_t)flow.nx;
+    p.tile_size = (float)tile_size;
+    p.affine = use_affine ? 1u : 0u;
+    p.homog = flow.has_global_h ? 1u : 0u;
+    for (int i = 0; i < 9; ++i) p.hmat[i] = flow.global_h[i];
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = cmd ? [cmd computeCommandEncoder] : nil;
+    if (!enc) return false;
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
+    [enc setBuffer:b_comp_guide offset:0 atIndex:1];
+    [enc setBuffer:g_rnn_r0 offset:0 atIndex:2];
+    [enc setBuffer:g_rnn_out offset:0 atIndex:3];
+    [enc setBuffer:b_flow offset:0 atIndex:4];
+    [enc setBuffer:b_jac offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    // The kernel strides over its 16x16 tile, so any group size is correct.
+    const NSUInteger total = std::min<NSUInteger>(256, pso.maxTotalThreadsPerThreadgroup);
+    const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)gw + 15) / 16, ((NSUInteger)gh + 15) / 16, 1)
+        threadsPerThreadgroup:tg];
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:nn");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    const float* out = (const float*)[g_rnn_out contents];
+    for (int y = 0; y < R.h; ++y) {
+        const float* row = out + (size_t)std::min(y / 2, gh - 1) * gw;
+        float* dst = R.data.data() + (size_t)y * R.w;
+        for (int x = 0; x < R.w; ++x) dst[x] = row[std::min(x / 2, gw - 1)];
+    }
+    return true;
 }
 
 static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& cfg) {
@@ -2132,6 +2263,10 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.hf_artifact_removal_enabled &&
         !rob_run_hf_loss(b_guide, b_means, b_vars, b_ref_hf_loss, gh, gw, nch, cfg, cmd))
         return RefStats();
+
+    // robust_nn reads the reference grey itself, and this guide is gone after
+    // this function. No-op unless Config::robust_nn_enabled.
+    rnn_pin_ref_grey(b_guide, gh, gw, nch, cfg, cmd);
 
     // Dodgson-upscale the reference's own local stats to raw resolution once
     // per burst here, same reasoning as CPU init_robustness's means_hires/
@@ -2456,6 +2591,11 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     Image R_pre(ch_h, ch_w, (int)rob_nch);
     memcpy(R_pre.data.data(), [b_R contents], mask_b_r);
     Image r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
+    // Learned refinement of the finished mask (Config::robust_nn_enabled). The
+    // comparison guide is still in b_guide; R stays analytic if it declines.
+    if (rob_nch == 1u)
+        rnn_refine_raw_res(r, b_guide, gh, gw, nch, flow, tile_size, cfg, b_geom_flow, b_geom_affine,
+                           raw_geom_affine);
     if (want_s_select) {
         *s_select_out = Image(ch_h, ch_w, 1);
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
