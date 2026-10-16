@@ -4,6 +4,7 @@
 //   app_kernel_emu in.bin out.bin    (same in.bin format as robust_nn_cli; the
 //   dense flow must be nearest-tile with tile = flow_step grey px)
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -25,6 +26,7 @@ enum class mem_flags { mem_threadgroup };
 inline void threadgroup_barrier(mem_flags) {}
 using std::min;
 inline int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+inline float clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline float floor_(float v) { return std::floor(v); }
 // copied verbatim (minus address spaces) from HHSRKernels.metal
 inline void flow_sample_affine(device const float* flow, device const float* jac,
@@ -69,6 +71,8 @@ int main(int argc, char** argv) {
     p.width = W; p.height = H; p.flow_step = fs;
     p.noise_a = prm[0]; p.noise_b = prm[1]; p.clip_level = prm[2];
     p.flow_ny = ny; p.flow_nx = nx; p.tile_size = 2.f * fs; p.affine = 0; p.homog = 0;
+    p.sharp_lo = argc > 4 ? std::atof(argv[3]) : 0.f;   // optional: lo hi
+    p.sharp_hi = argc > 4 ? std::atof(argv[4]) : 0.f;
     for (uint ty = 0; ty < (uint)((H + 15) / 16); ++ty)
         for (uint tx = 0; tx < (uint)((W + 15) / 16); ++tx)
             rnn_refine_mask(ref.data(), guide.data(), r0.data(), out.data(), tflow.data(), jac.data(), p,

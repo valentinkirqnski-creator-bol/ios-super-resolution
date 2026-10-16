@@ -4027,7 +4027,8 @@ struct RnnAppParams {
     float tile_size;
     uint affine, homog, _pad0;
     float hmat[9];
-    float _pad1, _pad2, _pad3;
+    float sharp_lo, sharp_hi;   // output sharpening, identity when hi <= lo
+    float _pad3;
 };
 
 // Grey of the Bayer guide (R, mean G, B): the RGGB quad mean the net was trained on.
@@ -4149,6 +4150,12 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
     for (int i = int(tid); i < RNN_TS * RNN_TS; i += nt) {
         int x = x0 + i % RNN_TS, y = y0 + i / RNN_TS;
         if (x >= W || y >= H) continue;
-        r_out[y * W + x] = rnn_net_at(tf, r0[y * W + x], W, H, x, y);
+        float R = rnn_net_at(tf, r0[y * W + x], W, H, x, y);
+        // Decisiveness (Config::robust_nn_reject_below / _accept_above): the net
+        // outputs a calibrated probability and hedges at ~0.3 on ghosts, which
+        // the merge's normalisation still lets through. Below lo -> 0, above hi -> 1.
+        if (p.sharp_hi > p.sharp_lo)
+            R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
+        r_out[y * W + x] = R;
     }
 }

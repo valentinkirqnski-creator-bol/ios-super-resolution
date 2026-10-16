@@ -639,6 +639,10 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.rob_mask_nn_enabled = tuning[@"rob_mask_nn_enabled"].boolValue;
     if (tuning[@"robust_nn_enabled"])
         cfg.robust_nn_enabled = tuning[@"robust_nn_enabled"].boolValue;
+    if (tuning[@"robust_nn_reject_below"])
+        cfg.robust_nn_reject_below = tuning[@"robust_nn_reject_below"].floatValue;
+    if (tuning[@"robust_nn_accept_above"])
+        cfg.robust_nn_accept_above = tuning[@"robust_nn_accept_above"].floatValue;
     if (tuning[@"robustness_refine_max_reduction"])
         cfg.robustness_refine_max_reduction = tuning[@"robustness_refine_max_reduction"].floatValue;
     if (tuning[@"robustness_refine_deadzone"])

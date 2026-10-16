@@ -234,6 +234,19 @@ Other measurements:
   flow-geometry features removes most of the gain, so the net uses the flow
   field's rotation evidence.
 
+**Output sharpening (shipped default).** `R' = clamp((R − 0.30)/0.40)`,
+via `Config::robust_nn_reject_below` / `_accept_above` (Settings sliders).
+Measured on 27 held-out bursts (`sharpen_sweep.py`, v2):
+
+| v2 mask | dPSNR vs r0 | d√-PSNR | leak | keep | worst scenario |
+|---|---|---|---|---|---|
+| raw | +0.43 | +0.21 | 0.29 | 0.72 | parallax −0.32 |
+| **[0.30, 0.70]** | **+0.99** | **+0.87** | 0.22 | 0.88 | low_light −0.08 |
+| oracle labels | +0.80 | +0.75 | 0.02 | 0.98 | low_light −0.77 |
+
+The remaining 0.22 leak is outright misjudgement (raw R > 0.5 on harmful
+pixels), not hedging. That part needs the asymmetric-loss retrain.
+
 Known weakness: the NN under-trusts correct samples. Keep weight is 0.70–0.76
 vs 0.85 for r0, which costs ~0.2 dB in the sqrt domain on parallax and moving
 scenes. v2 (`--util_sharp 3`) reduced this relative to v1. `train_merge.py`

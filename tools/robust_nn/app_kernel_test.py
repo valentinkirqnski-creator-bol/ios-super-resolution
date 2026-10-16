@@ -14,6 +14,8 @@ from rnn.model import RobustNet
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.path.join(HERE, "runs", "v1", "model.pt"))
+ap.add_argument("--lo", type=float, default=0.0)
+ap.add_argument("--hi", type=float, default=0.0)
 a = ap.parse_args()
 core = os.path.join(HERE, "..", "..", "core")
 MARK = "// robust_nn (Config::robust_nn_enabled)"
@@ -47,7 +49,9 @@ with tempfile.TemporaryDirectory() as d:
             np.array([W, H, fs], np.int32).tofile(fh); np.array([na, nb, clip], np.float32).tofile(fh)
             for t in (Ir, Ic, fl[0].permute(1, 2, 0), r0):
                 t.numpy().astype(np.float32).tofile(fh)
-        subprocess.run([exe, inp, out], check=True)
+        subprocess.run([exe, inp, out, str(a.lo), str(a.hi)], check=True)
+        if a.hi > a.lo:
+            R = ((R - a.lo) / (a.hi - a.lo)).clamp(0, 1)
         Re = np.fromfile(out, np.float32).reshape(H, W)
         dmax = float(np.abs(Re - R[0].numpy()).max())
         worst = max(worst, dmax)

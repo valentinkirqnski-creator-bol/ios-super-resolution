@@ -1631,6 +1631,13 @@ struct Config {
     // on a 12 MP burst. Bayer + linear guide only; declines (mask unchanged)
     // otherwise. OFF by default.
     bool  robust_nn_enabled = false;
+    // Decisiveness of robust_nn: R' = clamp((R - below) / (above - below), 0, 1).
+    // The net hedges (~0.3 on ghosts, ~0.7 on good samples) and the merge's
+    // normalisation turns a 0.3 leak across several frames into most of the
+    // pixel, so its output is sharpened to hard reject / full trust.
+    // above <= below disables it (raw network output).
+    float robust_nn_reject_below = 0.30f;
+    float robust_nn_accept_above = 0.70f;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency

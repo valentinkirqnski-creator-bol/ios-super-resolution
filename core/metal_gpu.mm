@@ -2136,7 +2136,8 @@ struct RnnAppParamsCPU {
     float tile_size;
     uint32_t affine, homog, _pad0;
     float hmat[9];
-    float _pad1, _pad2, _pad3;
+    float sharp_lo, sharp_hi;
+    float _pad3;
 };
 static_assert(sizeof(RnnAppParamsCPU) == 96, "RnnAppParamsCPU must mirror RnnAppParams");
 
@@ -2211,6 +2212,8 @@ static bool rnn_refine_raw_res(Image& R, id<MTLBuffer> b_comp_guide, int gh, int
     p.affine = use_affine ? 1u : 0u;
     p.homog = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) p.hmat[i] = flow.global_h[i];
+    p.sharp_lo = std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f);
+    p.sharp_hi = std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f);   // hi <= lo: raw output
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = cmd ? [cmd computeCommandEncoder] : nil;
