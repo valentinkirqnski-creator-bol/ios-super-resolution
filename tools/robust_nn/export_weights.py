@@ -27,7 +27,7 @@ def write_header(net, path, note=""):
          f"// {n_params} parameters. Features: {', '.join(NAMES)}",
          "#pragma once",
          f"#define RNN_NF {NF}",
-         f"#define RNN_HID {HID}",
+         f"#define RNN_HID {net.c1.weight.shape[0]}",
          "// W1 layout [hid][feature][ky][kx]; standardisation already folded in.",
          arr("RNN_W1", w1), arr("RNN_B1", b1),
          arr("RNN_W2", net.c2.weight), arr("RNN_B2", net.c2.bias),
@@ -41,9 +41,12 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "core",
                                                   "robust_nn_weights.h"))
     a = ap.parse_args()
-    net = RobustNet()
     if a.model != "identity":
-        net.load_state_dict(torch.load(a.model, map_location="cpu"))
+        sd = torch.load(a.model, map_location="cpu")
+        net = RobustNet(nf=sd["c1.weight"].shape[1], hid=sd["c1.weight"].shape[0])
+        net.load_state_dict(sd)
+    else:
+        net = RobustNet()
     write_header(net, a.out, f"source: {a.model}")
     print("wrote", a.out)
 

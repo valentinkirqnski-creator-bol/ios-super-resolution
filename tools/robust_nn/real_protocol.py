@@ -37,7 +37,28 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from rnn import scenarios                                         # noqa: E402
 from rnn.burst import Burst                                       # noqa: E402
-from rnn.features import compute_features                         # noqa: E402
+from rnn.features import compute_features, consensus_features, full_consensus_features, NF, NF_CONS   # noqa: E402
+from rnn.common import warp_by_flow                                # noqa: E402
+CONSENSUS = os.environ.get("RNN_CONSENSUS", "0") == "1"
+FULLCONS = os.environ.get("RNN_FULLCONS", "0") == "1"       # v9: full-resolution consensus inputs
+HR_TARGET = os.environ.get("RNN_HR_TARGET", "0") == "1"     # v9: true high-res scene as the target
+GEO = os.environ.get("RNN_GEO", "0") == "1"                 # v12: geometric misalignment target (0..1)
+
+
+def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02):
+    """Continuous target R* in [0,1] per guide pixel and comparison frame. The ghost a flow error paints is
+    measured on the NOISE-FREE comparison frame: content at the used flow vs content at the true flow (both from
+    the same frame, so aliasing cancels and aligned-but-aliased areas get 1). Compared with the noise sigma plus a
+    small visibility floor; occluded / out-of-frame points get 0."""
+    K = flow_used.shape[0]
+    Ck = clean[1:]
+    Ce = warp_by_flow(Ck, flow_used)
+    Cg = warp_by_flow(Ck, gt_flow)
+    from rnn.common import win_mean as _wm
+    D2 = _wm((Ce - Cg) ** 2, 1)
+    mu = _wm(clean[0:1], 1).clamp_min(0).expand(K, -1, -1)
+    s2 = (alpha * mu + beta) / 4.0 + (floor * mu) ** 2 + 1e-10
+    return vis * torch.exp(-0.5 * D2 / (k * k * s2))
 from rnn.model import RobustNet                                   # noqa: E402
 from target_protocol import combine, err_map, r_index, region_psnr, SCALE, CLIP   # noqa: E402
 
@@ -86,13 +107,34 @@ def _gen_one(args):
         sc.update(tremor=float(rng.uniform(3.0, 8.0)))
     if name == "rotation":
         sc.update(rot_deg=float(rng.uniform(0.2, 2.0)))
+    # rotated tile content: 0..7 patches whose content rotates 0..33 deg in some comparison frames
+    rlo, rhi, elo, ehi = (int(x) for x in os.environ.get("RNN_ROT_PATCHES", "0,7,0,4").split(","))
+    sc.update(n_rot_patches=int(rng.integers(rlo, rhi + 1)), rot_max_deg=33.0,
+              n_rot_patches_edge=int(rng.integers(elo, ehi + 1)))      # PLUS patches centred on edges/detail
     if rng.random() < 0.3:
         sc.update(persp=float(np.exp(rng.uniform(np.log(1e-6), np.log(1e-5)))))
     k = float(np.exp(rng.uniform(0, np.log(30))))            # ISO multiplier on the DNG's own profile
     sc.update(noise_a=alpha0 * k, noise_b=beta0 * k * k)
     b = Burst(sc, rng, Hr=SIZE, Wr=SIZE, bg_rgb=sc_rgb, cfa=cfa, prewhite=wb)
     d = b.render(out_scale=1, seed=int(rng.integers(1 << 31)))
+    # true high-resolution scene at the app's 2x output grid, same domain as the merge output:
+    # native = min(scene * E, 1) (sensor clip), then the loader's pre-white-balance gain per colour
+    Ho = int(SIZE * SCALE)
+    yy, xx = torch.meshgrid(torch.arange(Ho, dtype=torch.float64) / SCALE, torch.arange(Ho, dtype=torch.float64) / SCALE,
+                            indexing="ij")
+    rgb = b.render_rgb(0, torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)).view(3, Ho, Ho)
+    gt_hr = ((rgb * b.E[0]).clamp(0, 1) * torch.from_numpy(wb)[:, None, None]).permute(1, 2, 0)
+    # noise-free camera-native grey per frame (undo the pre-white-balance per CFA site, quad mean): the content
+    # each frame really shows, used to measure the ghost a flow error paints (geometric misalignment target)
+    rc = d["raw_clean"].numpy()
+    g = np.empty_like(rc)
+    for i in range(2):
+        for j in range(2):
+            g[:, i::2, j::2] = rc[:, i::2, j::2] / wb[cfa[i][j]]
+    clean_grey = 0.25 * (g[:, 0::2, 0::2] + g[:, 0::2, 1::2] + g[:, 1::2, 0::2] + g[:, 1::2, 1::2])
     np.savez(path, raw=d["raw"].numpy().astype(np.float32), gt_flow=d["gt_flow"].numpy().astype(np.float32),
+             gt_hr=gt_hr.numpy().astype(np.float16), clean_grey=clean_grey.astype(np.float32),
+             vis=d["vis"].numpy().astype(np.float16),
              alpha=np.float32(alpha0 * k), beta=np.float32(beta0 * k * k), scenario=name,
              cfa=np.array(cfa, np.int32), wb=wb)
 
@@ -159,24 +201,46 @@ class RP(Dataset):
         raw, gt = z["raw"], z["gt_flow"]
         N, H, W = raw.shape
         rng = np.random.default_rng(None if self.train else 99 + idx)
-        corrupt = bool(rng.random() < 0.5) if self.train else bool(idx >= len(self.files))
+        corrupt = (bool(rng.random() < float(os.environ.get("RNN_CORRUPT_P", "0.5"))) if self.train
+                   else bool(idx >= len(self.files)))
         seed = int(rng.integers(1, 1 << 30)) + attempt
         d = run_tp_real(raw, gt, float(z["alpha"]), float(z["beta"]), seed, corrupt, z["cfa"], z["wb"])
         Hg, Wg = H // 2, W // 2
         gy, gx = r_index(H, W, Hg, Wg)
-        T = combine(d["Aref"], d["Bref"], d["Ag"], d["Bg"], torch.ones(N - 1, Hg, Wg), gy, gx)
+        # ground-truth merge: only samples that truly exist (visible, not at a motion discontinuity, where the
+        # merge's flow interpolation would mix two motions). Older data without 'vis' falls back to all samples.
+        Rgt = torch.ones(N - 1, Hg, Wg)
+        if "vis" in z.files:
+            gtf = torch.from_numpy(gt[1:])
+            jump = torch.zeros(N - 1, Hg, Wg)
+            for sh in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+                jump = torch.maximum(jump, (gtf - torch.roll(gtf, sh, (2, 3))).norm(dim=1))
+            Rgt = torch.from_numpy(z["vis"][1:].astype(np.float32)) * (jump < 0.25).float()
+        T = combine(d["Aref"], d["Bref"], d["Ag"], d["Bg"], Rgt, gy, gx)
         a_g, b_g = float(z["alpha"]) / 4.0, float(z["beta"]) / 4.0           # quad-mean grey noise
         Ir = d["ref_grey"][None].expand(N - 1, -1, -1).contiguous()
         fs = max(1, d["tile"] // 2)
         with torch.no_grad():
-            feats, _ = compute_features(Ir, d["grey"], d["flow"], d["r0"], a_g, b_g, CLIP, fs)
+            feats, J = compute_features(Ir, d["grey"], d["flow"], d["r0"], a_g, b_g, CLIP, fs)
+            if CONSENSUS:
+                feats = torch.cat([feats, consensus_features(d["ref_grey"], J, d["r0"], a_g, b_g)], 1)
+            if FULLCONS:
+                feats = torch.cat([feats, full_consensus_features(torch.from_numpy(raw), d["flow"], d["r0"],
+                                                                  float(z["alpha"]), float(z["beta"]))], 1)
+        if HR_TARGET:
+            T = torch.from_numpy(z["gt_hr"].astype(np.float32))
+        geo = None
+        if GEO:
+            geo = geo_target(torch.from_numpy(z["clean_grey"]), d["flow"], torch.from_numpy(gt[1:]),
+                             torch.from_numpy(z["vis"][1:].astype(np.float32)), float(z["alpha"]), float(z["beta"]))
         ferr = (d["flow"] - torch.from_numpy(gt[1:])).norm(dim=1)             # used vs exact, grey px
         badg = ((ferr > 0.1) | (d["corr"] > 0.5)).float().amax(0)
         badg = F.max_pool2d(badg[None, None], 3, 1, 1)[0, 0]
         bad = badg[gy][:, gx] > 0
         h = lambda t: t.half()   # halve inter-process transfer; maths stays fp32 (loss_of upcasts)
         return dict(feats=feats, r0=d["r0"], A=h(d["Au"]), B=h(d["Bu"]), Aref=h(d["Aref"]), Bref=h(d["Bref"]), T=h(T),
-                    corr=bad, gy=gy, gx=gx, ferr=ferr, scen=str(z["scenario"]), corrupt=corrupt)
+                    corr=bad, gy=gy, gx=gx, ferr=ferr, scen=str(z["scenario"]), corrupt=corrupt, flowg=d["flow"],
+                    geo=geo if geo is not None else torch.zeros(0))
 
 
 def _first(x):
@@ -200,6 +264,57 @@ def loss_of(d, R, w_corr=1.0):
     lc = E[clean].mean() / e_ref[clean].mean().clamp_min(1e-6) if clean.any() else torch.zeros(())
     lr_ = E[corr].mean() / e_one[corr].mean().clamp_min(1e-6) if corr.any() else torch.zeros(())
     return lc + w_corr * lr_, float(lc.detach()), float(lr_.detach())
+
+
+def load_net(path):
+    """Loads a RobustNet of whatever input width the checkpoint has."""
+    sd = torch.load(path, map_location="cpu")
+    net = RobustNet(nf=sd["c1.weight"].shape[1], hid=sd["c1.weight"].shape[0])
+    net.load_state_dict(sd)
+    net.eval()
+    return net
+
+
+def widen(path, extra, dl):
+    """old net -> wider input (new channels inferred from the data), new input weights zero: starts as exactly
+    the old net."""
+    old = load_net(path)
+    extra = next(iter(dl))["feats"].shape[1] - old.c1.weight.shape[1]
+    net = RobustNet(nf=old.c1.weight.shape[1] + extra)
+    with torch.no_grad():
+        net.c1.weight.zero_()
+        net.c1.weight[:, :old.c1.weight.shape[1]] = old.c1.weight
+        net.c1.bias.copy_(old.c1.bias)
+        for n in ("c2", "c3"):
+            getattr(net, n).load_state_dict(getattr(old, n).state_dict())
+        net.mu[:old.mu.numel()] = old.mu
+        net.sd[:old.sd.numel()] = old.sd
+        fs = []
+        for i, d in enumerate(dl):          # standardisation of the new channels from data
+            fs.append(d["feats"][:, -extra:].permute(1, 0, 2, 3).reshape(extra, -1))
+            if i >= 5:
+                break
+        fs = torch.cat(fs, 1)
+        net.mu[-extra:] = fs.mean(1)
+        net.sd[-extra:] = fs.std(1).clamp_min(1e-3)
+    return net
+
+
+def widen_hidden(net, hid):
+    """16 -> hid hidden channels; new channels feed nothing at start, so the function is unchanged."""
+    old = net
+    new = RobustNet(nf=old.c1.weight.shape[1], hid=hid)
+    h0 = old.c1.weight.shape[0]
+    with torch.no_grad():
+        new.mu.copy_(old.mu); new.sd.copy_(old.sd)
+        new.c1.weight.normal_(0, 0.02); new.c1.bias.zero_()
+        new.c1.weight[:h0] = old.c1.weight; new.c1.bias[:h0] = old.c1.bias
+        new.c2.weight.zero_(); new.c2.bias.zero_()
+        new.c2.weight[:h0, :h0] = old.c2.weight; new.c2.bias[:h0] = old.c2.bias
+        new.c2.weight[h0:, :].normal_(0, 0.02)
+        new.c3.weight.zero_(); new.c3.bias.copy_(old.c3.bias)
+        new.c3.weight[:, :h0] = old.c3.weight
+    return new
 
 
 def cmd_eval(a):
@@ -242,12 +357,33 @@ def cmd_eval(a):
                   f"{np.mean(r['lr']):7.4f} | {np.nanmean(r['w_bad']):8.3f} {np.mean(r['w_good']):9.3f}")
 
 
+def geo_loss(R, t, w_bad=9.0):
+    """Weighted BCE toward the geometric target: keeping a misaligned sample (t ~ 0) costs up to 1+w_bad times
+    more than dropping a good one. No term rewards merging more."""
+    Rc = R.clamp(1e-5, 1 - 1e-5)
+    w = 1.0 + w_bad * (1.0 - t)
+    return (w * -(t * torch.log(Rc) + (1 - t) * torch.log(1 - Rc))).mean()
+
+
+def stretch(R, lo=0.05, hi=0.95):
+    """Continuous R with exact 0 and 1 (the kernel's sharpening)."""
+    return ((R - lo) / (hi - lo)).clamp(0, 1)
+
+
 def cmd_train(a):
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(0)
     torch.set_num_threads(2)
-    net = RobustNet()
-    net.load_state_dict(torch.load(a.init, map_location="cpu"))
+    if a.widen:
+        dl0 = DataLoader(RP(a.train, True), 1, shuffle=True, num_workers=a.workers, collate_fn=_first,
+                         worker_init_fn=_wi, prefetch_factor=1, timeout=900)
+        net = widen(a.init, NF_CONS, dl0)
+        del dl0
+    else:
+        net = load_net(a.init)
+        if a.hid and a.hid > net.c1.weight.shape[0]:
+            net = widen_hidden(net, a.hid)
+        net.train()
     if a.zero_head:   # keep the learned feature layers, start exactly at the app's analytic mask
         torch.nn.init.zeros_(net.c3.weight)
         torch.nn.init.zeros_(net.c3.bias)
@@ -262,9 +398,23 @@ def cmd_train(a):
     def val():
         c, r = [], []
         for d in dv:
-            _, lc, lr_ = loss_of(d, net(d["feats"], d["r0"])[0])
-            c.append(lc)
-            r.append(lr_)
+            R = net(d["feats"], d["r0"])[0]
+            if GEO:        # accuracy vs the ground-truth mask on clear pixels + similarity on all pixels
+                t, Rs = d["geo"], stretch(R)
+                dec = (t < 0.2) | (t > 0.8)
+                ok = ((t < 0.2) & (Rs < 0.5)) | ((t > 0.8) & (Rs > 0.5))
+                c.append((float(ok.sum()), float(dec.sum()), float((Rs - t).abs().sum()), float(t.numel()),
+                          float(Rs[t < 0.2].sum()), float((t < 0.2).sum()), float(Rs[t > 0.8].sum()), float((t > 0.8).sum())))
+            else:
+                _, lc, lr_ = loss_of(d, R)
+                c.append(lc)
+                r.append(lr_)
+        if GEO:
+            a_ = np.array(c).sum(0)
+            acc_, sim_ = a_[0] / a_[1], 1 - a_[2] / a_[3]
+            print(f"   accuracy vs GT mask {acc_:.4f}  similarity {sim_:.4f}  leak {a_[4] / a_[5]:.3f}  keep {a_[6] / a_[7]:.3f}",
+                  flush=True)
+            return 1 - acc_, 1 - sim_
         return float(np.mean(c)), float(np.mean(r))
 
     vc, vr = val()
@@ -276,7 +426,12 @@ def cmd_train(a):
     opt.zero_grad()
     while step < a.steps:
         for d in dl:
-            loss, lc, lr_ = loss_of(d, net(d["feats"], d["r0"])[0], a.w_corr)
+            R = net(d["feats"], d["r0"])[0]
+            if GEO:
+                loss = geo_loss(R, d["geo"])
+                lc, lr_ = float(loss.detach()), 0.0
+            else:
+                loss, lc, lr_ = loss_of(d, R, a.w_corr)
             (loss / a.accum).backward()
             run = (lc, lr_) if run is None else (0.98 * run[0] + 0.02 * lc, 0.98 * run[1] + 0.02 * lr_)
             acc += 1
@@ -328,6 +483,8 @@ def main():
     t.add_argument("--eval_every", type=int, default=200)
     t.add_argument("--zero_head", action="store_true")
     t.add_argument("--w_corr", type=float, default=1.0)
+    t.add_argument("--widen", action="store_true", help="add the consensus input channels (set RNN_CONSENSUS=1)")
+    t.add_argument("--hid", type=int, default=0, help="widen the hidden layer to this many channels")
     a = ap.parse_args()
     {"gen": cmd_gen, "eval": cmd_eval, "train": cmd_train}[a.cmd](a)
 

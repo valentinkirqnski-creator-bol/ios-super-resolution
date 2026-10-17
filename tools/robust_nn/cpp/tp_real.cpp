@@ -34,6 +34,15 @@ static void guide_flow(const FlowField& fl, int tile, int x, int y, float& dx, f
     dy = 0.5f * fl.dy(py, px);
 }
 
+// Corruption magnitude in RAW px: half tiny (0.02..0.1, below/at the aligner's own precision),
+// half 0.1..12 log-uniform. Tiny errors are priced by the merge like any other: harmful on sharp
+// detail, harmless on flat areas.
+static float tiny_or_large(std::mt19937& rng) {
+    std::uniform_real_distribution<float> U(0.f, 1.f);
+    if (U(rng) < 0.5f) return 0.02f + 0.08f * U(rng);
+    return 0.1f * std::exp(U(rng) * std::log(120.f));
+}
+
 static void put(FILE* o, const std::vector<float>& v) { std::fwrite(v.data(), 4, v.size(), o); }
 
 int main(int argc, char** argv) {
@@ -104,7 +113,29 @@ int main(int argc, char** argv) {
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile, work.r_Mt,
                                      work.num_threads, work.grey_tile_size(tile));
         std::vector<float> tcorr((size_t)flow.ny * flow.nx, 0.f);
-        if (corrupt && U(rng) > 0.25f) {   // deliberate corruption on top of the aligner's own errors
+        // Per-tile edge strength of the reference (mean squared grey gradient) as a rank in [0,1),
+        // used for the EXTRA edge-targeted corruption below (the random corruption is unchanged).
+        std::vector<float> erank((size_t)flow.ny * flow.nx, 0.5f);
+        {
+            std::vector<double> esum(erank.size(), 0.0), ecnt(erank.size(), 0.0);
+            for (int gy = 1; gy + 1 < ref_grey.h; ++gy)
+                for (int gx = 1; gx + 1 < ref_grey.w; ++gx) {
+                    const float dx = ref_grey.at(gy, gx + 1) - ref_grey.at(gy, gx - 1);
+                    const float dy = ref_grey.at(gy + 1, gx) - ref_grey.at(gy - 1, gx);
+                    const int ty = std::min((int)((2.f * gy + 0.5f) / tile), flow.ny - 1);
+                    const int tx = std::min((int)((2.f * gx + 0.5f) / tile), flow.nx - 1);
+                    esum[(size_t)ty * flow.nx + tx] += dx * dx + dy * dy;
+                    ecnt[(size_t)ty * flow.nx + tx] += 1.0;
+                }
+            std::vector<size_t> idx(erank.size());
+            for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                return esum[a] / std::max(1.0, ecnt[a]) < esum[b] / std::max(1.0, ecnt[b]);
+            });
+            for (size_t r = 0; r < idx.size(); ++r) erank[idx[r]] = (float)r / (float)idx.size();
+        }
+        const bool frame_corrupted = corrupt && U(rng) > 0.25f;
+        if (frame_corrupted) {   // deliberate corruption on top of the aligner's own errors (as before)
             const bool block = U(rng) < 0.3f;
             const float frac = 0.05f + 0.35f * U(rng);
             int by0 = 0, bx0 = 0, bh = 0, bw = 0;
@@ -114,7 +145,7 @@ int main(int argc, char** argv) {
                 bw = 1 + (int)(U(rng) * std::max(1, flow.nx / 2));
                 by0 = (int)(U(rng) * std::max(1, flow.ny - bh + 1));
                 bx0 = (int)(U(rng) * std::max(1, flow.nx - bw + 1));
-                bmag = 0.3f * std::exp(U(rng) * std::log(40.f));   // 0.3..12 raw px
+                bmag = tiny_or_large(rng);
                 bang = 6.2831853f * U(rng);
             }
             for (int ty = 0; ty < flow.ny; ++ty)
@@ -127,7 +158,7 @@ int main(int argc, char** argv) {
                         ang = bang;
                     } else {
                         hit = U(rng) < frac;
-                        mag = 0.3f * std::exp(U(rng) * std::log(40.f));
+                        mag = tiny_or_large(rng);
                         ang = 6.2831853f * U(rng);
                     }
                     if (!hit) continue;
@@ -135,6 +166,18 @@ int main(int argc, char** argv) {
                     flow.flow[i] += mag * std::cos(ang);
                     flow.flow[i + 1] += mag * std::sin(ang);
                     tcorr[(size_t)ty * flow.nx + tx] = 1.f;
+                }
+        }
+        if (frame_corrupted && U(rng) < 0.7f) {   // PLUS extra corrupted tiles on the strongest edges
+            const float efrac = 0.05f + 0.20f * U(rng);
+            for (int ty = 0; ty < flow.ny; ++ty)
+                for (int tx = 0; tx < flow.nx; ++tx) {
+                    const size_t t = (size_t)ty * flow.nx + tx;
+                    if (erank[t] < 0.7f || U(rng) >= efrac) continue;
+                    const float mag = tiny_or_large(rng), ang = 6.2831853f * U(rng);
+                    flow.flow[2 * t] += mag * std::cos(ang);
+                    flow.flow[2 * t + 1] += mag * std::sin(ang);
+                    tcorr[t] = 1.f;
                 }
         }
         Image rob = compute_robustness(comp, ref_stats, flow, tile, work);

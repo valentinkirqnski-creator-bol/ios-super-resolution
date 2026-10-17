@@ -6,21 +6,21 @@ import numpy as np, torch
 import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from torch.utils.data import DataLoader
-from real_protocol import RP, _first, _wi
+from real_protocol import RP, _first, _wi, load_net
 from target_protocol import combine
 from rnn.model import RobustNet
 
 
 def main():
     torch.set_num_threads(3)
-    net = RobustNet(); net.load_state_dict(torch.load(sys.argv[1], map_location='cpu')); net.eval()
+    net = load_net(sys.argv[1])
     dl = DataLoader(RP('data/rp_val', False), 1, num_workers=3, collate_fn=_first, worker_init_fn=_wi, prefetch_factor=1)
     acc = {}
     for d in dl:
         for k in ('A', 'B', 'Aref', 'Bref', 'T'):
             d[k] = d[k].float()
         with torch.no_grad():
-            Rn = net(d['feats'], d['r0'])[0]
+            Rn = net(d['feats'][:, :net.c1.in_channels], d['r0'])[0]
         r0 = d['r0']
         K = r0.shape[0]
         for k in range(K):

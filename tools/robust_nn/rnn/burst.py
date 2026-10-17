@@ -113,7 +113,7 @@ class Burst:
     """Holds a sampled world + motion and renders anything about it."""
 
     def __init__(self, sc, rng, Hr=256, Wr=256, tex_scale=2.0, scene_dir=None, bg_rgb=None,
-                 cfa=((0, 1), (1, 2)), prewhite=None):
+                 cfa=((0, 1), (1, 2)), prewhite=None, allow_flip=True):
         """bg_rgb: optional camera-native linear RGB scene [h,w,3] (e.g. from a real DNG) used as the
         background instead of a procedural one; it is already sensor-space, so no extra WB is applied.
         cfa: 2x2 colour index per site (0=R,1=G,2=B). prewhite: per-colour gains applied to the noisy
@@ -134,9 +134,10 @@ class Burst:
             bh, bw = bg_rgb.shape[:2]
             y0, x0 = int(rng.integers(0, bh - Ht + 1)), int(rng.integers(0, bw - Wt + 1))
             bg = np.ascontiguousarray(bg_rgb[y0:y0 + Ht, x0:x0 + Wt])
-            if rng.random() < 0.5:
+            fx_, fy_ = rng.random() < 0.5, rng.random() < 0.5
+            if allow_flip and fx_:
                 bg = bg[:, ::-1]
-            if rng.random() < 0.5:
+            if allow_flip and fy_:
                 bg = bg[::-1]
             bg = np.ascontiguousarray(bg, dtype=np.float32)
         else:
@@ -144,6 +145,48 @@ class Burst:
         if sc["highlights"]:
             bg = scene.add_highlights(rng, bg)
         self.layers = [Layer(np.concatenate([bg, np.ones_like(bg[..., :1])], 2), fc, 1.0, tex_scale, "reflection")]
+        # Rotated tile content: square patches cut from the background itself (so the reference is
+        # seamless) whose content rotates about the patch centre by a random angle in some comparison
+        # frames. A one-vector-per-tile aligner cannot represent this: a true local-rotation misalignment.
+        self.rot_patch_layers = []
+        n_rand = int(sc.get("n_rot_patches", 0))
+        n_edge = int(sc.get("n_rot_patches_edge", 0))
+        if n_edge:   # edge/detail map of the background, sampled at candidate patch centres
+            from scipy.ndimage import gaussian_filter
+            gyy, gxx = np.gradient(bg.mean(-1))
+            emap = gaussian_filter(gyy * gyy + gxx * gxx, 3.0 * tex_scale)
+        for pi in range(n_rand + n_edge):
+            if pi >= n_rand:                    # the EXTRA patches go on edges; the first n_rand stay random
+                size = float(sc.get("rot_patch_tile", 32)) if rng.random() < 0.5 else float(rng.uniform(16, 64))
+                cand = np.stack([rng.uniform(size / 2, Wr - size / 2, 64), rng.uniform(size / 2, Hr - size / 2, 64)], 1)
+                tx_ = ((Wt - 1) / 2.0 + tex_scale * (cand[:, 0] - fc[0])).astype(int).clip(0, Wt - 1)
+                ty_ = ((Ht - 1) / 2.0 + tex_scale * (cand[:, 1] - fc[1])).astype(int).clip(0, Ht - 1)
+                w = emap[ty_, tx_] + 1e-12
+                cx, cy = cand[rng.choice(64, p=w / w.sum())]
+            elif rng.random() < 0.5:
+                size = float(sc.get("rot_patch_tile", 32))                     # exactly one app tile
+                cx = (int(rng.integers(0, Wr // int(size))) + 0.5) * size
+                cy = (int(rng.integers(0, Hr // int(size))) + 0.5) * size
+            else:
+                size = float(rng.uniform(16, 64))
+                cx, cy = rng.uniform(size / 2, Wr - size / 2), rng.uniform(size / 2, Hr - size / 2)
+            half_tex = int(tex_scale * size * 0.75) + 2                        # room for the rotated square
+            tcx = (Wt - 1) / 2.0 + tex_scale * (cx - fc[0])
+            tcy = (Ht - 1) / 2.0 + tex_scale * (cy - fc[1])
+            x0, y0 = int(round(tcx)) - half_tex, int(round(tcy)) - half_tex
+            if x0 < 0 or y0 < 0 or x0 + 2 * half_tex + 1 > Wt or y0 + 2 * half_tex + 1 > Ht:
+                continue
+            crop = bg[y0:y0 + 2 * half_tex + 1, x0:x0 + 2 * half_tex + 1]
+            yy, xx = np.mgrid[0:crop.shape[0], 0:crop.shape[1]].astype(np.float32)
+            hs = tex_scale * size / 2.0
+            ox, oy = (tcx - x0), (tcy - y0)
+            a = (np.clip(hs + 0.5 - np.abs(xx - ox), 0, 1) * np.clip(hs + 0.5 - np.abs(yy - oy), 0, 1))
+            # texture centre must be the patch centre: shift by the sub-texel rounding
+            origin = np.array([cx + (x0 + half_tex - tcx) / tex_scale, cy + (y0 + half_tex - tcy) / tex_scale])
+            lay = Layer(np.concatenate([crop, a[..., None]], 2).astype(np.float32), origin, 1.0, tex_scale, "zeros")
+            lay.rot_deg = [0.0] + [float(rng.choice([-1, 1]) * rng.uniform(0, sc.get("rot_max_deg", 33.0)))
+                                   if rng.random() < 0.6 else 0.0 for _ in range(N - 1)]
+            self.rot_patch_layers.append(lay)
         for _ in range(sc["n_objects"]):
             sz = rng.uniform(0.2, 0.6) * min(Wr, Hr)
             h = int(tex_scale * sz * rng.uniform(0.6, 1.4))
@@ -154,8 +197,9 @@ class Burst:
             origin = np.array([rng.uniform(0.1, 0.9) * Wr, rng.uniform(0.1, 0.9) * Hr])
             par = rng.uniform(*sc["obj_parallax"])
             self.layers.append(Layer(rgba, origin, par, tex_scale, "zeros"))
-        # nearer layers last (painter's order); background stays first
+        # nearer layers last (painter's order); background stays first; rotated patches sit on the background
         self.layers[1:] = sorted(self.layers[1:], key=lambda l: l.parallax)
+        self.layers[1:1] = self.rot_patch_layers
         so = sc["optics_sigma"] * tex_scale
         for l in self.layers:
             l.blur(so)
@@ -166,7 +210,10 @@ class Burst:
         drift = drift / (np.linalg.norm(drift) + 1e-9) * sc["cam_drift"]
         rot_drift = sc["rot_drift"]          # radians per frame
         vel = []
-        for _ in self.layers[1:]:
+        for l in self.layers[1:]:
+            if hasattr(l, "rot_deg"):
+                vel.append(None)
+                continue
             a = rng.uniform(0, 2 * np.pi)
             v = sc["obj_speed"] * rng.uniform(0.3, 1.0)
             vel.append(dict(mx=v * math.cos(a), my=v * math.sin(a),
@@ -183,7 +230,10 @@ class Burst:
                            dz=sc["zoom_rate"] * k + rng.normal(0, sc["zoom_rate"] * 0.1),
                            p1=rng.normal(0, sc["persp"]), p2=rng.normal(0, sc["persp"]))
                 objs = [dict(ZERO_OBJ)]
-                for v in vel:
+                for li, v in enumerate(vel):
+                    if v is None:                                   # rotated-content patch
+                        objs.append(dict(mx=0.0, my=0.0, phi=math.radians(self.layers[1 + li].rot_deg[k]), sc=1.0))
+                        continue
                     j = sc["obj_jitter"]
                     objs.append(dict(mx=v["mx"] * k + rng.normal(0, j), my=v["my"] * k + rng.normal(0, j),
                                      phi=v["phi"] * k, sc=1.0 + v["sc"] * k))
@@ -196,7 +246,8 @@ class Burst:
                                       th=math.radians(rng.normal(0, 0.05)) if blurred else 0.0))
             # moving objects smear along their velocity by the exposure fraction
             ef = sc["exposure_frac"]
-            self.blur_obj.append([dict()] + [dict(mx=v["mx"] * ef, my=v["my"] * ef) for v in vel])
+            self.blur_obj.append([dict()] + [dict() if v is None else dict(mx=v["mx"] * ef, my=v["my"] * ef)
+                                             for v in vel])
 
         # ---- photometry ---------------------------------------------------------------------
         self.wb = (np.ones(3, np.float32) if bg_rgb is not None else

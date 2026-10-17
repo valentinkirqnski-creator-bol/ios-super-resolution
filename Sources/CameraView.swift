@@ -1267,9 +1267,9 @@ struct CameraView: View {
                          The freshly-trained darken-only mask net: a tiny 9-feature model that only attenuates the analytic mask (R·g, g in [0,1] — never trusts more), so the merge stays robust to misaligned tiles and only well-aligned samples contribute to super-resolution. Trained on synthetic bursts with deliberately corrupted alignment vectors; measured +6.4% merged-MSE on held-out synthetic data. Its decisive input is a MULTI-FRAME CONSENSUS — each frame vs the mean of all aligned frames — so enabling it runs a second alignment pass over the burst to build that consensus (opt-in, extra decode+align time). Features come from the full-res grey in the net's own training domain, so no retraining. Runs on device: the mask is refined on the host and handed to the GPU merge (no separate Metal kernel). Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
-                    Toggle("Robust NN v6 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)
+                    Toggle("Robust NN v13 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)
                     Text("""
-                         Learned refinement of the robustness mask (tools/robust_nn, v6): R = sigmoid(logit(R0) + δ), a ~2.3k-parameter net that starts from this app's own analytic mask and learns where to override it. Trained on bursts built from real DNG scenes with exactly known motion, run through this app's own aligner, analytic mask and merge, scored against the perfect-alignment merge. Measured on held-out data: harmful (misaligned) samples get 0.44 weight vs 0.65 from the analytic mask, and fine detail stays visibly sharper on an unseen burst. Known trade-off: it also drops some good samples, so flat areas (sky, walls) can be noisier. One fused GPU kernel, ~36 MB extra on a 12 MP burst. Bayer, linear guide only. Off by default.
+                         Learned robustness mask (tools/robust_nn, v13): a per-pixel weight from 0 to 1 per frame that rejects samples whose misalignment would paint a visible ghost or doubled edge, and keeps correctly aligned samples — including aliased ones, which carry the super-resolution detail. Trained on bursts built from real DNG scenes with exactly known motion, deliberate tile shifts and 0–33° rotated tile content, through this app's own aligner and merge; on held-out bursts it agrees with the ground-truth mask on 93% of clear pixels (analytic mask: ~87–92%). Prefers rejecting a misalignment over keeping noise down, so flat areas can be a little noisier. Same GPU kernel and memory as before. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robust_nn_enabled {
@@ -1286,7 +1286,7 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.robust_nn_accept_above, in: 0.0...1.0, step: 0.05)
                         Text("""
-                             Optional sharpening of the NN mask: output below "Reject Below" becomes 0 (sample dropped), above "Trust Above" becomes 1, linear in between. Off by default (both 0) — v6 makes its own decisions. Try Reject Below ~0.3 if ghosts remain; Trust Above ~0.7 if flat areas look noisy. Trust Above ≤ Reject Below = off.
+                             Optional sharpening of the NN mask: output below "Reject Below" becomes 0 (sample dropped), above "Trust Above" becomes 1, linear in between. Defaults 0.05 / 0.95 give an exact 0-to-1 mask. Raise Reject Below (e.g. 0.3) to reject borderline misalignments more firmly; lower Trust Above (e.g. 0.7) to keep more samples in flat areas. Trust Above ≤ Reject Below = raw network output.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }

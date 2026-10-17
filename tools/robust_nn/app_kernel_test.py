@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as d:
     subprocess.run(["g++", "-O2", "-std=c++17", "-ffp-contract=off", "-static", "-I", core,
                     f'-DRNN_APP_BLOCK="{a.block}"', os.path.join(HERE, "cpp", "app_kernel_emu.cpp"), "-o", exe],
                    check=True)
-    for f in sorted(glob.glob(os.path.join(HERE, "data", "val", "*.npz")))[:4]:
+    for f in sorted(glob.glob(os.path.join(HERE, "data", os.environ.get("PARITY_DATA", "val_parity"), "*.npz")))[:4]:
         z = np.load(f)
         k, fs = 1, int(z["tile"])
         Ir = torch.from_numpy(z["grey"][0].astype(np.float32))[None]

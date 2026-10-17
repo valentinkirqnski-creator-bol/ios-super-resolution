@@ -23,6 +23,7 @@ model (rotation / zoom / parallax / outliers) is suspect even where the images
 happen to agree.
 """
 import torch
+import torch.nn.functional as F
 
 from .common import pad_rep, win_mean, win_mean_offsets, warp_by_flow
 
@@ -140,3 +141,89 @@ def compute_features(Ir, Ic, flow, R0, a, b, clip, fs):
     r9 = win_mean_offsets(r * r, [-4, -2, 0, 2, 4])
     f13 = torch.log(1.0 + r9 / s2)
     return torch.stack([f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13], 1), J
+
+
+# ---- burst consistency (prototype, v8) ---------------------------------------------------------------
+NF_CONS = 4
+NAMES_CONS = ["cons_dis3", "cons_dis5", "cons_vs_ref3", "cons_explained"]
+
+
+def consensus_features(Ir, J, r0, a, b):
+    """Ir [H,W] reference grey; J [K,H,W] warped comparison greys (each by its own flow); r0 [K,H,W] analytic
+    mask. For frame k the consensus is leave-one-out: (Ir + sum_{j!=k} r0_j J_j) / (1 + sum_{j!=k} r0_j),
+    so a sample that disagrees with what the OTHER frames (and the reference) show stands out, while
+    aliasing -- which differs between correctly aligned frames -- is averaged by the consensus."""
+    K = J.shape[0]
+    num = Ir[None] + (r0 * J).sum(0, keepdim=True)
+    den = 1.0 + r0.sum(0, keepdim=True)
+    C = (num - r0 * J) / (den - r0)                          # leave-one-out
+    mu = win_mean(Ir[None], 1).expand(K, -1, -1)
+    s2 = (a * mu.clamp_min(0.0) + b).clamp_min(1e-10)
+    dJC = J - C
+    dCR = C - Ir[None]
+    dJR = J - Ir[None]
+    c0 = torch.log(1.0 + win_mean(dJC * dJC, 1) / s2)
+    c1 = torch.log(1.0 + win_mean(dJC * dJC, 2) / s2)
+    c2 = torch.log(1.0 + win_mean(dCR * dCR, 1) / s2)
+    c3 = win_mean(dJC * dJC, 2) / (win_mean(dJR * dJR, 2) + win_mean(dJC * dJC, 2) + s2)
+    return torch.stack([c0, c1, c2, c3], 1)
+
+
+# ---- full-resolution burst consistency (v9) ----------------------------------------------------------
+NF_FULL = 5
+NAMES_FULL = ["full_dis2", "full_dis4", "full_peak", "full_ls_shift", "full_ls_explained"]
+
+
+def gather_raw(raw, flow_raw, sigma=0.6):
+    """raw [H,W] pre-WB'd Bayer of one frame; flow_raw [2,H,W] raw-px ref->frame displacement per ref pixel.
+    Returns a full-resolution luminance-like estimate of that frame at every reference pixel: Gaussian-weighted
+    3x3 gather of its raw samples around p + flow (pre-white-balance makes the sites roughly comparable)."""
+    H, W = raw.shape
+    yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij")
+    px, py = xx + flow_raw[0], yy + flow_raw[1]
+    bx, by = torch.floor(px + 0.5).long(), torch.floor(py + 0.5).long()
+    num = torch.zeros(H, W)
+    den = torch.zeros(H, W)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            nx, ny = bx + dx, by + dy
+            ok = ((nx >= 0) & (nx < W) & (ny >= 0) & (ny < H)).float()
+            w = torch.exp(-((nx.float() - px) ** 2 + (ny.float() - py) ** 2) / (2 * sigma * sigma)) * ok
+            num += w * raw[ny.clamp(0, H - 1), nx.clamp(0, W - 1)]
+            den += w
+    return num / den.clamp_min(1e-8)
+
+
+def full_consensus_features(raws, flows_guide, r0, alpha, beta):
+    """raws [N,H,W] pre-WB'd Bayer (frame 0 = reference); flows_guide [K,2,H/2,W/2] the per-pixel flow the mask
+    scores (grey px); r0 [K,H/2,W/2]. Leave-one-out consensus at SENSOR resolution, features pooled to the
+    guide grid. Device cost: one fp16 plane at sensor res + one guide-res weight plane (~36 MB at 12 MP)."""
+    N, H, W = raws.shape
+    K = N - 1
+    up = lambda t: t.repeat_interleave(2, -2).repeat_interleave(2, -1)[..., :H, :W]
+    L0 = gather_raw(raws[0], torch.zeros(2, H, W))
+    Ls = torch.stack([gather_raw(raws[k + 1], up(2.0 * flows_guide[k])) for k in range(K)])
+    w = up(r0)
+    num = L0 + (w * Ls).sum(0)
+    den = 1.0 + w.sum(0)
+    C = (num[None] - w * Ls) / (den[None] - w)               # leave-one-out, per frame
+    s2 = (alpha * C.clamp_min(0) + beta).clamp_min(1e-10)
+    e = Ls - C
+    e2 = e * e / s2
+    pool2 = lambda t: F.avg_pool2d(t[:, None], 2)[:, 0]
+    g0 = torch.log(1.0 + pool2(e2))
+    g1 = torch.log(1.0 + F.avg_pool2d(F.pad(e2[:, None], (1, 1, 1, 1), mode="replicate"), 4, 2, 0)[:, 0][:, :H // 2, :W // 2])
+    g2 = torch.log(1.0 + F.max_pool2d((e.abs() / s2.sqrt())[:, None], 2)[:, 0])
+    # least-squares fit of the residual to a shift of the consensus, over a 6x6 raw window per quad
+    gxC = 0.5 * (F.pad(C, (1, 1, 0, 0), mode="replicate")[..., 2:] - F.pad(C, (1, 1, 0, 0), mode="replicate")[..., :-2])
+    gyC = 0.5 * (F.pad(C[:, None], (0, 0, 1, 1), mode="replicate")[:, 0, 2:] - F.pad(C[:, None], (0, 0, 1, 1), mode="replicate")[:, 0, :-2])
+    box = lambda t: F.avg_pool2d(F.pad(t[:, None], (2, 2, 2, 2), mode="replicate"), 6, 2, 0)[:, 0][:, :H // 2, :W // 2]
+    Sxx, Syy, Sxy = box(gxC * gxC), box(gyC * gyC), box(gxC * gyC)
+    bx, by, ee = box(gxC * e), box(gyC * e), box(e * e)
+    lam = 0.5 * box(s2)
+    det = (Sxx + lam) * (Syy + lam) - Sxy * Sxy
+    u = ((Syy + lam) * bx - Sxy * by) / det
+    v = ((Sxx + lam) * by - Sxy * bx) / det
+    g3 = torch.sqrt(u * u + v * v).clamp(max=4.0)
+    g4 = ((bx * u + by * v) / (ee + 1e-3 * lam)).clamp(0.0, 1.0)
+    return torch.stack([g0, g1, g2, g3, g4], 1)

@@ -1625,9 +1625,11 @@ struct Config {
     // tools/robust_nn: learned refinement R = sigmoid(logit(R0) + delta) of the
     // finished analytic mask, ~2.3k params (core/robust_nn_shared.h + _weights.h).
     // Trained on synthetic RAW bursts with exact ground-truth correspondence,
-    // against geometric-reliability and merge-utility labels. Ships v6: fine-tuned
-    // on bursts built from real DNG scenes, through the app's own aligner,
-    // analytic mask and merge, against the perfect-alignment merge. One fused Metal
+    // Ships v13 (round 1): trained on bursts built from real DNG scenes through
+    // the app's own aligner / analytic mask / merge, against a GEOMETRIC ground-
+    // truth mask (reject any sample whose misalignment paints a visible ghost, keep
+    // every correctly aligned sample incl. aliased ones), misalignment-averse loss.
+    // 93.4% agreement with that mask on clear pixels of held-out bursts. One fused Metal
     // kernel at guide resolution, features in threadgroup memory; ~36 MB extra
     // on a 12 MP burst. Bayer + linear guide only; declines (mask unchanged)
     // otherwise. OFF by default.
@@ -1637,9 +1639,9 @@ struct Config {
     // normalisation turns a 0.3 leak across several frames into most of the
     // pixel, so its output is sharpened to hard reject / full trust.
     // above <= below disables it (raw network output).
-    // v6 is trained to decide on its own: off (0/0) by default.
-    float robust_nn_reject_below = 0.0f;
-    float robust_nn_accept_above = 0.0f;
+    // v13 is evaluated with exact 0/1 output: below 0.05 -> 0, above 0.95 -> 1.
+    float robust_nn_reject_below = 0.05f;
+    float robust_nn_accept_above = 0.95f;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency
