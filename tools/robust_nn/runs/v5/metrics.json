@@ -1,0 +1,32 @@
+{
+ "args": {
+  "cmd": "train",
+  "init": "runs/v4/model.pt",
+  "train": "C:\\Users\\valen\\Downloads\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\tools\\robust_nn\\data\\rp_train",
+  "val": "C:\\Users\\valen\\Downloads\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\tools\\robust_nn\\data\\rp_val",
+  "out": "runs/v5",
+  "steps": 110,
+  "accum": 4,
+  "lr": 0.001,
+  "workers": 3,
+  "eval_every": 55,
+  "zero_head": true
+ },
+ "hist": [
+  {
+   "step": 0,
+   "clean": 0.09368757822861275,
+   "bad": 0.8603945295015971
+  },
+  {
+   "step": 55,
+   "clean": 0.09397843508049845,
+   "bad": 0.8493954320748647
+  },
+  {
+   "step": 110,
+   "clean": 0.09407978417972723,
+   "bad": 0.8471816673874855
+  }
+ ]
+}

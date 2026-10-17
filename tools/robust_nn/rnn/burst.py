@@ -112,7 +112,14 @@ def _interp(p, d, u):
 class Burst:
     """Holds a sampled world + motion and renders anything about it."""
 
-    def __init__(self, sc, rng, Hr=256, Wr=256, tex_scale=2.0, scene_dir=None):
+    def __init__(self, sc, rng, Hr=256, Wr=256, tex_scale=2.0, scene_dir=None, bg_rgb=None,
+                 cfa=((0, 1), (1, 2)), prewhite=None):
+        """bg_rgb: optional camera-native linear RGB scene [h,w,3] (e.g. from a real DNG) used as the
+        background instead of a procedural one; it is already sensor-space, so no extra WB is applied.
+        cfa: 2x2 colour index per site (0=R,1=G,2=B). prewhite: per-colour gains applied to the noisy
+        raw (how the app's loader delivers a pre-white-balanced DNG)."""
+        self.cfa = cfa
+        self.prewhite = None if prewhite is None else np.asarray(prewhite, np.float32)
         self.sc, self.rng, self.Hr, self.Wr, self.S = sc, rng, Hr, Wr, tex_scale
         N = sc["n_frames"]
         self.N = N
@@ -123,7 +130,17 @@ class Burst:
         # ---- layers -------------------------------------------------------------------------
         M = 96
         Wt, Ht = int(tex_scale * (Wr + 2 * M)), int(tex_scale * (Hr + 2 * M))
-        bg = scene.background(rng, Ht, Wt, sc["texture_mode"], scene_dir)
+        if bg_rgb is not None:
+            bh, bw = bg_rgb.shape[:2]
+            y0, x0 = int(rng.integers(0, bh - Ht + 1)), int(rng.integers(0, bw - Wt + 1))
+            bg = np.ascontiguousarray(bg_rgb[y0:y0 + Ht, x0:x0 + Wt])
+            if rng.random() < 0.5:
+                bg = bg[:, ::-1]
+            if rng.random() < 0.5:
+                bg = bg[::-1]
+            bg = np.ascontiguousarray(bg, dtype=np.float32)
+        else:
+            bg = scene.background(rng, Ht, Wt, sc["texture_mode"], scene_dir)
         if sc["highlights"]:
             bg = scene.add_highlights(rng, bg)
         self.layers = [Layer(np.concatenate([bg, np.ones_like(bg[..., :1])], 2), fc, 1.0, tex_scale, "reflection")]
@@ -182,7 +199,8 @@ class Burst:
             self.blur_obj.append([dict()] + [dict(mx=v["mx"] * ef, my=v["my"] * ef) for v in vel])
 
         # ---- photometry ---------------------------------------------------------------------
-        self.wb = np.array([1 / rng.uniform(1.5, 2.5), 1.0, 1 / rng.uniform(1.3, 2.2)], np.float32)
+        self.wb = (np.ones(3, np.float32) if bg_rgb is not None else
+                   np.array([1 / rng.uniform(1.5, 2.5), 1.0, 1 / rng.uniform(1.3, 2.2)], np.float32))
         self.E = [sc["exposure"] * (1 + (rng.uniform(-1, 1) * sc["exposure_jitter"] if k else 0.0))
                   for k in range(N)]
         self.a, self.b = sc["noise_a"], sc["noise_b"]
@@ -227,11 +245,19 @@ class Burst:
         Hr, Wr = self.Hr, self.Wr
         x = rgb.view(3, Hr, Wr) * torch.from_numpy(self.wb)[:, None, None] * self.E[k]
         raw = torch.empty(Hr, Wr)
-        raw[0::2, 0::2] = x[0, 0::2, 0::2]
-        raw[0::2, 1::2] = x[1, 0::2, 1::2]
-        raw[1::2, 0::2] = x[1, 1::2, 0::2]
-        raw[1::2, 1::2] = x[2, 1::2, 1::2]
+        for i in range(2):
+            for j in range(2):
+                raw[i::2, j::2] = x[self.cfa[i][j], i::2, j::2]
         return raw
+
+    def _prewhiten(self, raw):
+        if self.prewhite is None:
+            return raw
+        g = torch.empty_like(raw)
+        for i in range(2):
+            for j in range(2):
+                g[i::2, j::2] = float(self.prewhite[self.cfa[i][j]])
+        return raw * g
 
     def render(self, out_scale=1, seed=0):
         Hr, Wr, N = self.Hr, self.Wr, self.N
@@ -245,8 +271,8 @@ class Burst:
             var = (self.a * clean + self.b).clamp_min(0)
             noisy = (raw + var.sqrt() * torch.randn(raw.shape, generator=gen)).clamp(0, 1)
             noisy = torch.floor(noisy * q + 0.5) / q
-            raws.append(noisy)
-            cleans.append(clean)
+            raws.append(self._prewhiten(noisy))
+            cleans.append(self._prewhiten(clean))
         raws = torch.stack(raws)
         cleans = torch.stack(cleans)
 

@@ -143,7 +143,32 @@ Retraining needs no device code changes, as long as the features are unchanged:
 `cpp/robust_nn_weights.h`. `python parity_test.py --model ...` must print
 `PARITY OK`.
 
-## In the app (Settings → Robustness → "Robust NN v1 (GPU)")
+## Shipped: v6 (Settings → Robustness → "Robust NN v6 (GPU)")
+
+v6 is trained with the **real-scene target protocol** (`real_protocol.py`):
+
+* **Scenes:** bursts built from real DNG scenes with exactly known camera motion
+  (APC_1186 and the HDR+ payload for training; APC_1211 for validation;
+  burst2 never used).
+* **Format:** rendered in the device's raw format (BGGR, pre-white-balanced,
+  the DNG's noise profile × ISO).
+* **The app's own stages:** run through `build/pipe/tp_real.exe`: the aligner
+  (its real errors), optional tile corruption, the analytic `compute_robustness`,
+  and the merge.
+* **Target:** the app's merge with the exact flow and R = 1.
+
+Held-out results:
+
+* **Validation scene:** error in misaligned regions is 3.8% below the
+  analytic mask.
+* **Per-pixel check** (`harm_check.py`): harmful samples get weight 0.44
+  (analytic 0.65), helpful ones 0.76 (0.91).
+* **Unseen burst2:** visibly sharper fine detail than the analytic mask.
+* **Known cost:** flat areas (sky) can be ~25% noisier.
+
+Sharpening defaults to off for v6.
+
+## In the app (implementation)
 
 `Config::robust_nn_enabled`, default off. The toggle is wired through
 `CameraModel.TuningParams` → `SRBridge` → `Config`.

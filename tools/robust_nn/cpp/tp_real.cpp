@@ -1,0 +1,177 @@
+// tp_real — one training/eval sample for the robust_nn target protocol, built
+// from the APP's own stages on a synthetic burst whose exact flow is known.
+//
+//   tp_real in.bin out.bin
+// in : int32 N, H, W, seed, corrupt, cfa00, cfa01, cfa10, cfa11
+//      float32 scale, alpha, beta, wb0, wb1, wb2, prewhitened
+//      raw[N][H][W]                (as the app's loader delivers it: CFA as given, pre-WB'd if prewhitened)
+//      gt[N][H/2][W/2][2]          (exact ref->cmp flow, GREY px; frame 0 ignored)
+// Per comparison frame the app's aligner runs on the noisy frames (its real
+// errors), optionally followed by deliberate tile corruption (seeded); the
+// app's analytic mask (compute_robustness) scores that flow; the app's merge
+// gives each frame's contribution with the USED flow and with the EXACT flow.
+// out: A_ref,B_ref [Ho][Wo][3]
+//      for n=1..N-1: A_used,B_used,A_gt,B_gt [Ho][Wo][3]
+//      ref_grey [gh][gw]; for n=1..N-1: grey, r0, flow_x, flow_y, corrupt [gh][gw]
+//      int32 tile
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <random>
+#include <vector>
+
+#include "snr_tuning.h"
+#include "stages.h"
+#include "types.h"
+
+using namespace hhsr;
+
+static void guide_flow(const FlowField& fl, int tile, int x, int y, float& dx, float& dy) {
+    const float ry = 2.f * y + 0.5f, rx = 2.f * x + 0.5f;
+    int py = std::min((int)(ry / tile), fl.ny - 1), px = std::min((int)(rx / tile), fl.nx - 1);
+    dx = 0.5f * fl.dx(py, px);
+    dy = 0.5f * fl.dy(py, px);
+}
+
+static void put(FILE* o, const std::vector<float>& v) { std::fwrite(v.data(), 4, v.size(), o); }
+
+int main(int argc, char** argv) {
+    if (argc < 3) return 1;
+    FILE* f = std::fopen(argv[1], "rb");
+    int32_t hi[9];
+    float hf[7];
+    if (std::fread(hi, 4, 9, f) != 9 || std::fread(hf, 4, 7, f) != 7) return 3;
+    const int N = hi[0], H = hi[1], W = hi[2], seed = hi[3], corrupt = hi[4];
+    const int Hg = H / 2, Wg = W / 2;
+    std::vector<Image> raw(N, Image(H, W, 1));
+    for (auto& r : raw)
+        if (std::fread(r.data.data(), 4, r.data.size(), f) != r.data.size()) return 4;
+    std::vector<float> gt((size_t)N * Hg * Wg * 2);
+    if (std::fread(gt.data(), 4, gt.size(), f) != gt.size()) return 5;
+    std::fclose(f);
+
+    Config cfg;
+    cfg.bayer_mode = true;
+    cfg.cfa.p[0][0] = (uint8_t)hi[5];
+    cfg.cfa.p[0][1] = (uint8_t)hi[6];
+    cfg.cfa.p[1][0] = (uint8_t)hi[7];
+    cfg.cfa.p[1][1] = (uint8_t)hi[8];
+    cfg.scale = hf[0];
+    for (int c = 0; c < 3; ++c) {
+        cfg.alpha_dng[c] = hf[1];
+        cfg.beta_dng[c] = hf[2];
+        cfg.white_balance[c] = hf[3 + c];
+    }
+    cfg.has_noise_profile = true;
+    cfg.raw_prewhitened = hf[6] != 0.f;
+    Config work = cfg;
+    work.burst_frame_count = N;
+    tune_config_snr(raw[0], work);
+    const int tile = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+
+    const Image& ref = raw[0];
+    Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
+    Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, work.grey_tile_size(tile)), work.bm_factors);
+    RefStats ref_stats = init_robustness(ref, work);
+    CovField ref_covs = estimate_kernels(ref, work);
+    const int Ho = (int)std::lround(work.scale * H), Wo = (int)std::lround(work.scale * W);
+
+    FILE* o = std::fopen(argv[2], "wb");
+    {
+        Image num(Ho, Wo, 3), den(Ho, Wo, 3);
+        merge_ref(ref, ref_covs, num, den, work, nullptr);
+        put(o, num.data);
+        put(o, den.data);
+    }
+    auto guide_grey = [&](const Image& r) {
+        Image g = compute_guide(r, work);
+        std::vector<float> v((size_t)Hg * Wg);
+        for (int y = 0; y < Hg; ++y)
+            for (int x = 0; x < Wg; ++x)
+                v[(size_t)y * Wg + x] = 0.25f * g.at(y, x, 0) + 0.5f * g.at(y, x, 1) + 0.25f * g.at(y, x, 2);
+        return v;
+    };
+    std::mt19937 rng((uint32_t)seed);
+    std::uniform_real_distribution<float> U(0.f, 1.f);
+    Image ones(H, W, 1);
+    for (auto& x : ones.data) x = 1.f;
+    std::vector<std::vector<float>> per;   // grey, r0, fx, fy, corr per frame
+    for (int n = 1; n < N; ++n) {
+        const Image& comp = raw[n];
+        Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile);
+        flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile, work.r_Mt,
+                                     work.num_threads, work.grey_tile_size(tile));
+        std::vector<float> tcorr((size_t)flow.ny * flow.nx, 0.f);
+        if (corrupt && U(rng) > 0.25f) {   // deliberate corruption on top of the aligner's own errors
+            const bool block = U(rng) < 0.3f;
+            const float frac = 0.05f + 0.35f * U(rng);
+            int by0 = 0, bx0 = 0, bh = 0, bw = 0;
+            float bmag = 0, bang = 0;
+            if (block) {
+                bh = 1 + (int)(U(rng) * std::max(1, flow.ny / 2));
+                bw = 1 + (int)(U(rng) * std::max(1, flow.nx / 2));
+                by0 = (int)(U(rng) * std::max(1, flow.ny - bh + 1));
+                bx0 = (int)(U(rng) * std::max(1, flow.nx - bw + 1));
+                bmag = 0.3f * std::exp(U(rng) * std::log(40.f));   // 0.3..12 raw px
+                bang = 6.2831853f * U(rng);
+            }
+            for (int ty = 0; ty < flow.ny; ++ty)
+                for (int tx = 0; tx < flow.nx; ++tx) {
+                    bool hit;
+                    float mag, ang;
+                    if (block) {
+                        hit = ty >= by0 && ty < by0 + bh && tx >= bx0 && tx < bx0 + bw;
+                        mag = bmag;
+                        ang = bang;
+                    } else {
+                        hit = U(rng) < frac;
+                        mag = 0.3f * std::exp(U(rng) * std::log(40.f));
+                        ang = 6.2831853f * U(rng);
+                    }
+                    if (!hit) continue;
+                    const size_t i = ((size_t)ty * flow.nx + tx) * 2;
+                    flow.flow[i] += mag * std::cos(ang);
+                    flow.flow[i + 1] += mag * std::sin(ang);
+                    tcorr[(size_t)ty * flow.nx + tx] = 1.f;
+                }
+        }
+        Image rob = compute_robustness(comp, ref_stats, flow, tile, work);
+        CovField covs = estimate_kernels(comp, work);
+        Image nu(Ho, Wo, 3), du(Ho, Wo, 3), ng(Ho, Wo, 3), dg(Ho, Wo, 3);
+        merge_comp(comp, flow, covs, ones, tile, nu, du, work);
+        FlowField gfl;
+        gfl.dense_h = Hg;
+        gfl.dense_w = Wg;
+        gfl.dense_sx = gfl.dense_sy = 2.f;
+        const float* src = gt.data() + (size_t)n * Hg * Wg * 2;
+        gfl.dense.assign(src, src + (size_t)Hg * Wg * 2);
+        merge_comp(comp, gfl, covs, ones, tile, ng, dg, work);
+        put(o, nu.data);
+        put(o, du.data);
+        put(o, ng.data);
+        put(o, dg.data);
+        std::vector<float> r0((size_t)Hg * Wg), fx(r0.size()), fy(r0.size()), cm(r0.size());
+        for (int y = 0; y < Hg; ++y)
+            for (int x = 0; x < Wg; ++x) {
+                const size_t i = (size_t)y * Wg + x;
+                r0[i] = rob.at(std::min(2 * y, rob.h - 1), std::min(2 * x, rob.w - 1));
+                guide_flow(flow, tile, x, y, fx[i], fy[i]);
+                const int py = std::min((int)((2.f * y + 0.5f) / tile), flow.ny - 1);
+                const int px = std::min((int)((2.f * x + 0.5f) / tile), flow.nx - 1);
+                cm[i] = tcorr[(size_t)py * flow.nx + px];
+            }
+        per.push_back(guide_grey(comp));
+        per.push_back(r0);
+        per.push_back(fx);
+        per.push_back(fy);
+        per.push_back(cm);
+    }
+    put(o, guide_grey(ref));
+    for (auto& v : per) put(o, v);
+    int32_t t = tile;
+    std::fwrite(&t, 4, 1, o);
+    std::fclose(o);
+    return 0;
+}

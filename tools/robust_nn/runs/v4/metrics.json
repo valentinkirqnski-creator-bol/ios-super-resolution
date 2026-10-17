@@ -1,0 +1,52 @@
+{
+ "args": {
+  "cmd": "train",
+  "init": "runs/v3/model.pt",
+  "train": "C:\\Users\\valen\\Downloads\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\tools\\robust_nn\\data\\tp_train",
+  "val": "C:\\Users\\valen\\Downloads\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\tools\\robust_nn\\data\\tp_val",
+  "out": "runs/v4",
+  "steps": 1500,
+  "accum": 4,
+  "lr": 0.001,
+  "w_corr": 1.0,
+  "workers": 10,
+  "eval_every": 250
+ },
+ "hist": [
+  {
+   "step": 0,
+   "clean": 0.06790629299357534,
+   "corr": 0.5927103434999784
+  },
+  {
+   "step": 250,
+   "clean": 0.020508197830834737,
+   "corr": 0.5189930212994417
+  },
+  {
+   "step": 500,
+   "clean": 0.01690498011691185,
+   "corr": 0.5132957155505816
+  },
+  {
+   "step": 750,
+   "clean": 0.01606288580223918,
+   "corr": 0.51005816111962
+  },
+  {
+   "step": 1000,
+   "clean": 0.014646075621324901,
+   "corr": 0.5101198670764764
+  },
+  {
+   "step": 1250,
+   "clean": 0.014680784170438225,
+   "corr": 0.5092244433859984
+  },
+  {
+   "step": 1500,
+   "clean": 0.014460067288018763,
+   "corr": 0.5092408003906409
+  }
+ ]
+}
