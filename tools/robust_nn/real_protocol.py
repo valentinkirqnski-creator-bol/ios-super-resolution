@@ -43,13 +43,21 @@ CONSENSUS = os.environ.get("RNN_CONSENSUS", "0") == "1"
 FULLCONS = os.environ.get("RNN_FULLCONS", "0") == "1"       # v9: full-resolution consensus inputs
 HR_TARGET = os.environ.get("RNN_HR_TARGET", "0") == "1"     # v9: true high-res scene as the target
 GEO = os.environ.get("RNN_GEO", "0") == "1"                 # v12: geometric misalignment target (0..1)
+OCC_LOOK = os.environ.get("RNN_OCC_LOOK", "0") == "1"       # v14: occluded points judged by visible difference
+HARD = os.environ.get("RNN_HARD", "0") == "1"               # v14: edge / rotation / flat flags for loss + val
+W_EDGE = float(os.environ.get("RNN_W_EDGE", "2"))           # extra cost of keeping a small-shift (< 1 px) misalignment
+W_ROT = float(os.environ.get("RNN_W_ROT", "3"))             # ... a misaligned rotated-content pixel
+W_FLAT = float(os.environ.get("RNN_W_FLAT", "1"))           # extra cost of dropping a good flat-area pixel
+SELECT_SAFE = os.environ.get("RNN_SELECT", "") == "safe"    # v14: best = fewest errors with leak not above start
 
 
-def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02):
+def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, occ_look=False):
     """Continuous target R* in [0,1] per guide pixel and comparison frame. The ghost a flow error paints is
     measured on the NOISE-FREE comparison frame: content at the used flow vs content at the true flow (both from
     the same frame, so aliasing cancels and aligned-but-aliased areas get 1). Compared with the noise sigma plus a
-    small visibility floor; occluded / out-of-frame points get 0."""
+    small visibility floor; out-of-frame points get 0. Occluded points get 0 too, unless occ_look: then they are
+    judged by what merging would show (reference vs comparison content at the used flow), so an occluded wall
+    that looks like the wall in front of it is not a misalignment."""
     K = flow_used.shape[0]
     Ck = clean[1:]
     Ce = warp_by_flow(Ck, flow_used)
@@ -58,11 +66,40 @@ def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02):
     D2 = _wm((Ce - Cg) ** 2, 1)
     mu = _wm(clean[0:1], 1).clamp_min(0).expand(K, -1, -1)
     s2 = (alpha * mu + beta) / 4.0 + (floor * mu) ** 2 + 1e-10
-    return vis * torch.exp(-0.5 * D2 / (k * k * s2))
+    t = vis * torch.exp(-0.5 * D2 / (k * k * s2))
+    if occ_look:
+        H, W = Ck.shape[-2:]
+        xs = torch.arange(W, dtype=torch.float32).view(1, 1, W) + gt_flow[:, 0]
+        ys = torch.arange(H, dtype=torch.float32).view(1, H, 1) + gt_flow[:, 1]
+        inside = (xs >= 0) & (xs <= W - 1) & (ys >= 0) & (ys <= H - 1)
+        t_look = torch.exp(-0.5 * _wm((Ce - clean[0:1]) ** 2, 1) / (k * k * s2))
+        t = torch.where((vis < 0.5) & inside, t_look, t)
+    return t
+
+
+def hard_maps(clean, gt_flow, flow_used, alpha, beta):
+    """Flags for the targeted failure modes, per guide pixel: edge = reference |grad| in noise sigmas (3x3 max;
+    < 0.5 flat); rot = content whose TRUE motion rotates > ~3 deg relative to the frame (curl of
+    the exact flow, motion discontinuities excluded); ferr = used-vs-true flow error in raw px."""
+    c0 = clean[0]
+    gx, gy = torch.zeros_like(c0), torch.zeros_like(c0)
+    gx[:, 1:-1] = 0.5 * (c0[:, 2:] - c0[:, :-2])
+    gy[1:-1] = 0.5 * (c0[2:] - c0[:-2])
+    sig = ((alpha * c0.clamp_min(0) + beta) / 4.0).sqrt() + 1e-6
+    edge = F.max_pool2d(((gx * gx + gy * gy).sqrt() / sig)[None, None], 3, 1, 1)[0, 0]
+    fx, fy = gt_flow[:, 0], gt_flow[:, 1]
+    curl = torch.zeros_like(fx)
+    curl[:, 1:-1, 1:-1] = 0.5 * (fy[:, 1:-1, 2:] - fy[:, 1:-1, :-2]) - 0.5 * (fx[:, 2:, 1:-1] - fx[:, :-2, 1:-1])
+    jump = torch.zeros_like(fx)
+    for sh in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+        jump = torch.maximum(jump, (gt_flow - torch.roll(gt_flow, sh, (2, 3))).norm(dim=1))
+    curl = (curl - curl.flatten(1).median(1).values.view(-1, 1, 1)) * (jump < 0.25)
+    rot = F.avg_pool2d(curl.abs()[:, None], 5, 1, 2)[:, 0] > 0.1
+    return dict(edge=edge, rot=rot, ferr=2.0 * (flow_used - gt_flow).norm(dim=1))
 from rnn.model import RobustNet                                   # noqa: E402
 from target_protocol import combine, err_map, r_index, region_psnr, SCALE, CLIP   # noqa: E402
 
-TP_REAL = os.path.join(HERE, "build", "pipe", "tp_real.exe")
+TP_REAL = os.environ.get("RNN_TP_REAL", os.path.join(HERE, "build", "pipe", "tp_real.exe"))
 REAL = os.path.join(HERE, "data", "real")
 TRAIN_SCENES = ["APC_1186"]                             # --scenes overrides; val scene: a different capture
 VAL_SCENE = "APC_1211"
@@ -149,22 +186,51 @@ def cmd_gen(a):
                 print(f"{i}/{a.n} {time.time() - t0:.0f}s", flush=True)
 
 
-def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb):
+NOMERGE = os.environ.get("RNN_NOMERGE", "0") == "1"   # mask-only training: the harness skips all merges
+USE_SERVER = os.environ.get("RNN_TP_SERVER", "0") == "1"   # one persistent harness process per worker
+_SERVER = None
+
+
+def _server_job(pi, po):
+    """Runs one job on this process's persistent harness (started on first use)."""
+    global _SERVER
+    if _SERVER is None or _SERVER.poll() is not None:
+        _SERVER = subprocess.Popen([TP_REAL, "--server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                   bufsize=1)
+    _SERVER.stdin.write(f"{pi} {po}\n")
+    _SERVER.stdin.flush()
+    line = _SERVER.stdout.readline()
+    if not line.startswith("OK 0"):
+        _SERVER.kill()
+        _SERVER = None
+        raise RuntimeError(f"harness failed: {line!r}")
+
+
+def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb, nomerge=False):
     N, H, W = raw.shape
     Hg, Wg = H // 2, W // 2
     Ho, Wo = int(H * SCALE), int(W * SCALE)
     with tempfile.TemporaryDirectory() as d:
         pi, po = os.path.join(d, "in.bin"), os.path.join(d, "out.bin")
         with open(pi, "wb") as fh:
-            np.array([N, H, W, seed, int(corrupt), cfa[0][0], cfa[0][1], cfa[1][0], cfa[1][1]], np.int32).tofile(fh)
+            np.array([N, H, W, seed, int(corrupt) | (2 if nomerge else 0), cfa[0][0], cfa[0][1], cfa[1][0], cfa[1][1]],
+                     np.int32).tofile(fh)
             np.array([SCALE, alpha, beta, wb[0], wb[1], wb[2], 1.0], np.float32).tofile(fh)
             raw.astype(np.float32).tofile(fh)
             gt.transpose(0, 2, 3, 1).astype(np.float32).tofile(fh)
-        subprocess.run([TP_REAL, pi, po], check=True)
+        if USE_SERVER:
+            _server_job(pi, po)
+        else:
+            subprocess.run([TP_REAL, pi, po], check=True)
         o = np.fromfile(po, np.float32)
     tile = int(o[-1:].view(np.int32)[0])
     o = torch.from_numpy(o[:-1].copy())
     P, G = Ho * Wo * 3, Hg * Wg
+    if nomerge:
+        g = o
+        ref_grey = g[:G].view(Hg, Wg)
+        per = g[G:].view(N - 1, 5, Hg, Wg)
+        return dict(ref_grey=ref_grey, grey=per[:, 0], r0=per[:, 1], flow=per[:, 2:4], corr=per[:, 4], tile=tile)
     Aref, Bref = o[:P].view(Ho, Wo, 3), o[P:2 * P].view(Ho, Wo, 3)
     m = o[2 * P:2 * P + 4 * (N - 1) * P].view(N - 1, 4, Ho, Wo, 3)
     g = o[2 * P + 4 * (N - 1) * P:]
@@ -204,8 +270,21 @@ class RP(Dataset):
         corrupt = (bool(rng.random() < float(os.environ.get("RNN_CORRUPT_P", "0.5"))) if self.train
                    else bool(idx >= len(self.files)))
         seed = int(rng.integers(1, 1 << 30)) + attempt
-        d = run_tp_real(raw, gt, float(z["alpha"]), float(z["beta"]), seed, corrupt, z["cfa"], z["wb"])
+        d = run_tp_real(raw, gt, float(z["alpha"]), float(z["beta"]), seed, corrupt, z["cfa"], z["wb"],
+                        nomerge=NOMERGE and GEO)
         Hg, Wg = H // 2, W // 2
+        if NOMERGE and GEO:            # mask-only path: features, analytic mask, geometric target
+            a_g, b_g = float(z["alpha"]) / 4.0, float(z["beta"]) / 4.0
+            Ir = d["ref_grey"][None].expand(N - 1, -1, -1).contiguous()
+            with torch.no_grad():
+                feats, _ = compute_features(Ir, d["grey"], d["flow"], d["r0"], a_g, b_g, CLIP, max(1, d["tile"] // 2))
+            clean, gtf = torch.from_numpy(z["clean_grey"]), torch.from_numpy(gt[1:])
+            geo = geo_target(clean, d["flow"], gtf, torch.from_numpy(z["vis"][1:].astype(np.float32)),
+                             float(z["alpha"]), float(z["beta"]), occ_look=OCC_LOOK)
+            out = dict(feats=feats, r0=d["r0"], geo=geo, corrupt=corrupt, scen=str(z["scenario"]))
+            if HARD:
+                out.update(hard_maps(clean, gtf, d["flow"], float(z["alpha"]), float(z["beta"])))
+            return out
         gy, gx = r_index(H, W, Hg, Wg)
         # ground-truth merge: only samples that truly exist (visible, not at a motion discontinuity, where the
         # merge's flow interpolation would mix two motions). Older data without 'vis' falls back to all samples.
@@ -357,11 +436,17 @@ def cmd_eval(a):
                   f"{np.mean(r['lr']):7.4f} | {np.nanmean(r['w_bad']):8.3f} {np.mean(r['w_good']):9.3f}")
 
 
-def geo_loss(R, t, w_bad=9.0):
+def geo_loss(R, t, w_bad=9.0, d=None):
     """Weighted BCE toward the geometric target: keeping a misaligned sample (t ~ 0) costs up to 1+w_bad times
-    more than dropping a good one. No term rewards merging more."""
+    more than dropping a good one. No term rewards merging more. With the hard-case flags (d from RNN_HARD),
+    keeping a small-shift misalignment (true error < 1 raw px, visible only because of an edge) or a misaligned
+    rotated-content pixel costs more still, and dropping a good flat pixel costs a little more."""
     Rc = R.clamp(1e-5, 1 - 1e-5)
-    w = 1.0 + w_bad * (1.0 - t)
+    if d is not None and "edge" in d:
+        h = 1.0 + W_EDGE * (d["ferr"] < 1).float() + W_ROT * d["rot"].float()
+        w = 1.0 + w_bad * (1.0 - t) * h + W_FLAT * t * (d["edge"][None] < 0.5).float()
+    else:
+        w = 1.0 + w_bad * (1.0 - t)
     return (w * -(t * torch.log(Rc) + (1 - t) * torch.log(1 - Rc))).mean()
 
 
@@ -394,9 +479,11 @@ def cmd_train(a):
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * min(1.0, s / a.steps))))
 
+    safe = {}          # SELECT_SAFE: errors + leak of the last val, and the starting leak (the ceiling)
+
     @torch.no_grad()
     def val():
-        c, r = [], []
+        c, r, x = [], [], []
         for d in dv:
             R = net(d["feats"], d["r0"])[0]
             if GEO:        # accuracy vs the ground-truth mask on clear pixels + similarity on all pixels
@@ -405,6 +492,11 @@ def cmd_train(a):
                 ok = ((t < 0.2) & (Rs < 0.5)) | ((t > 0.8) & (Rs > 0.5))
                 c.append((float(ok.sum()), float(dec.sum()), float((Rs - t).abs().sum()), float(t.numel()),
                           float(Rs[t < 0.2].sum()), float((t < 0.2).sum()), float(Rs[t > 0.8].sum()), float((t > 0.8).sum())))
+                if "edge" in d:   # the three targeted failure modes
+                    bad, good, e = t < 0.2, t > 0.8, d["edge"][None].expand_as(t)
+                    miss, over = bad & (Rs >= 0.5), good & (Rs <= 0.5)
+                    se, ro, fl = bad & (d["ferr"] < 1), bad & d["rot"], good & (e < 0.5)
+                    x.append([float(v.sum()) for v in (miss, bad, over, good, miss & se, se, miss & ro, ro, over & fl, fl)])
             else:
                 _, lc, lr_ = loss_of(d, R)
                 c.append(lc)
@@ -414,12 +506,25 @@ def cmd_train(a):
             acc_, sim_ = a_[0] / a_[1], 1 - a_[2] / a_[3]
             print(f"   accuracy vs GT mask {acc_:.4f}  similarity {sim_:.4f}  leak {a_[4] / a_[5]:.3f}  keep {a_[6] / a_[7]:.3f}",
                   flush=True)
+            if x:
+                b_ = np.array(x).sum(0)
+                q = lambda i: b_[i] / max(1.0, b_[i + 1])
+                safe.update(err=q(0) + q(2), leak=a_[4] / a_[5])
+                print(f"   balanced {100 * (1 - 0.5 * (q(0) + q(2))):.2f}%  missed {100 * q(0):.2f}%  over-rejected "
+                      f"{100 * q(2):.2f}%  | small-shift missed {100 * q(4):.2f}%  rotation missed {100 * q(6):.2f}%  "
+                      f"flat over-rejected {100 * q(8):.2f}%", flush=True)
             return 1 - acc_, 1 - sim_
         return float(np.mean(c)), float(np.mean(r))
 
+    def score(vc, vr):
+        if SELECT_SAFE and "err" in safe:   # fewest errors, but never leakier than where we started
+            return safe["err"] if safe["leak"] <= safe["leak0"] + 0.002 else float("inf")
+        return vc + vr
+
     vc, vr = val()
     print(f"init val: clean {vc:.4f} bad {vr:.4f}", flush=True)
-    best = vc + vr
+    safe["leak0"] = safe.get("leak", 1.0)
+    best = score(vc, vr)
     torch.save(net.state_dict(), os.path.join(a.out, "model.pt"))
     hist = [dict(step=0, clean=vc, bad=vr)]
     step, acc, t0, run = 0, 0, time.time(), None
@@ -428,7 +533,7 @@ def cmd_train(a):
         for d in dl:
             R = net(d["feats"], d["r0"])[0]
             if GEO:
-                loss = geo_loss(R, d["geo"])
+                loss = geo_loss(R, d["geo"], d=d)
                 lc, lr_ = float(loss.detach()), 0.0
             else:
                 loss, lc, lr_ = loss_of(d, R, a.w_corr)
@@ -448,8 +553,9 @@ def cmd_train(a):
                 hist.append(dict(step=step, clean=vc, bad=vr))
                 print(f"[val step {step}] clean {vc:.4f} bad {vr:.4f}", flush=True)
                 torch.save(net.state_dict(), os.path.join(a.out, f"model_s{step}.pt"))
-                if vc + vr < best:
-                    best = vc + vr
+                if score(vc, vr) < best:
+                    best = score(vc, vr)
+                    print(f"   -> new best (step {step})", flush=True)
                     torch.save(net.state_dict(), os.path.join(a.out, "model.pt"))
                 json.dump(dict(args=vars(a), hist=hist), open(os.path.join(a.out, "metrics.json"), "w"), indent=1)
             if step >= a.steps:

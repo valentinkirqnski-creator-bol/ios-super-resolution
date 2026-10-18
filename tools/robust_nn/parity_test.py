@@ -38,10 +38,13 @@ def main():
     ap.add_argument("--n", type=int, default=3)
     a = ap.parse_args()
     torch.manual_seed(1)
-    net = RobustNet()
-    if a.model:
-        net.load_state_dict(torch.load(a.model, map_location="cpu"))
-    else:   # random weights everywhere, incl. the zero-initialised head and the standardisation
+    if a.model:   # width (inputs, hidden) from the checkpoint
+        sd = torch.load(a.model, map_location="cpu")
+        net = RobustNet(nf=sd["c1.weight"].shape[1], hid=sd["c1.weight"].shape[0])
+        net.load_state_dict(sd)
+    else:
+        net = RobustNet()
+    if not a.model:   # random weights everywhere, incl. the zero-initialised head and the standardisation
         for p in net.parameters():
             torch.nn.init.normal_(p, 0, 0.3)
         net.mu.normal_(0, 0.5)

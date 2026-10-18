@@ -366,14 +366,14 @@ struct TuningParams: Equatable, Codable {
     /// vectors; +6.4% merged-MSE on held-out synthetic. Needs the multi-frame
     /// consensus pre-pass. CPU/harness path today; device Metal apply pending.
     var rob_mask_nn_enabled: Bool = false
-    /// tools/robust_nn (v13 weights): learned refinement of the analytic robustness
+    /// tools/robust_nn (v14 weights): learned refinement of the analytic robustness
     /// mask (R = sigmoid(logit(R0) + delta)), one fused Metal kernel. Off by default.
     var robust_nn_enabled: Bool = false
-    /// robust_nn output: R below this -> exactly 0 (rejected). v13 default 0.05.
-    /// Stored under new keys (…_v13) so a value saved by an earlier build cannot override the new default.
-    var robust_nn_reject_below: Float = 0.05
-    /// robust_nn output: R above this -> exactly 1 (fully trusted). v13 default 0.95.
-    var robust_nn_accept_above: Float = 0.95
+    /// robust_nn output: R below this -> exactly 0 (rejected). v14 default 0.20.
+    /// Stored under new keys (…_v14) so a value saved by an earlier build cannot override the new default.
+    var robust_nn_reject_below: Float = 0.20
+    /// robust_nn output: R above this -> exactly 1 (fully trusted). v14 default 0.90.
+    var robust_nn_accept_above: Float = 0.90
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -475,8 +475,8 @@ struct TuningParams: Equatable, Codable {
         case robustness_refine_deadzone
         case rob_mask_nn_enabled
         case robust_nn_enabled
-        case robust_nn_reject_below = "robust_nn_reject_below_v13"
-        case robust_nn_accept_above = "robust_nn_accept_above_v13"
+        case robust_nn_reject_below = "robust_nn_reject_below_v14"
+        case robust_nn_accept_above = "robust_nn_accept_above_v14"
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
         case isp_enabled, isp_exposure_ev, isp_local_strength, isp_highlight

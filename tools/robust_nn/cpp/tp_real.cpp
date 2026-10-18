@@ -18,8 +18,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
+#include <string>
+#include <chrono>
+static double tnow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+#define TPT(name) do { if (std::getenv("TP_TIMING")) std::fprintf(stderr, "%-22s %.3fs\n", name, tnow() - _t0); _t0 = tnow(); } while (0)
 
 #include "snr_tuning.h"
 #include "stages.h"
@@ -45,13 +50,34 @@ static float tiny_or_large(std::mt19937& rng) {
 
 static void put(FILE* o, const std::vector<float>& v) { std::fwrite(v.data(), 4, v.size(), o); }
 
+static int process(const char* in_path, const char* out_path);
+
+// Persistent mode (--server): reads "in out" path pairs from stdin, one per line, answers "OK <rc>" per job.
+// One-time costs (noise-curve Monte-Carlo per noise level, FFT/thread setup) are then paid once per worker.
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--server") {
+        char a[4096], b[4096];
+        while (std::scanf("%4095s %4095s", a, b) == 2) {
+            const int rc = process(a, b);
+            std::printf("OK %d\n", rc);
+            std::fflush(stdout);
+        }
+        return 0;
+    }
     if (argc < 3) return 1;
-    FILE* f = std::fopen(argv[1], "rb");
+    return process(argv[1], argv[2]);
+}
+
+static int process(const char* in_path, const char* out_path) {
+    clear_align_ref_ica_cache();   // keyed on the pyramid's ADDRESS: must not leak between jobs
+    FILE* f = std::fopen(in_path, "rb");
+    if (!f) return 2;
     int32_t hi[9];
     float hf[7];
     if (std::fread(hi, 4, 9, f) != 9 || std::fread(hf, 4, 7, f) != 7) return 3;
-    const int N = hi[0], H = hi[1], W = hi[2], seed = hi[3], corrupt = hi[4];
+    const int N = hi[0], H = hi[1], W = hi[2], seed = hi[3];
+    const int corrupt = hi[4] & 1;
+    const bool nomerge = (hi[4] & 2) != 0;   // mask-only training: skip all merges (the slow part)
     const int Hg = H / 2, Wg = W / 2;
     std::vector<Image> raw(N, Image(H, W, 1));
     for (auto& r : raw)
@@ -60,6 +86,8 @@ int main(int argc, char** argv) {
     if (std::fread(gt.data(), 4, gt.size(), f) != gt.size()) return 5;
     std::fclose(f);
 
+    double _t0 = tnow();
+    TPT("read input");
     Config cfg;
     cfg.bayer_mode = true;
     cfg.cfa.p[0][0] = (uint8_t)hi[5];
@@ -76,18 +104,35 @@ int main(int argc, char** argv) {
     cfg.raw_prewhitened = hf[6] != 0.f;
     Config work = cfg;
     work.burst_frame_count = N;
-    tune_config_snr(raw[0], work);
+    // The SNR auto-tune builds a Monte-Carlo noise curve (~4 s) and its result is the same every time a burst is
+    // reused, so the caller may pass the cached result: TP_TUNE="Ts k_detail k_denoise D_th D_tr".
+    if (const char* tc = std::getenv("TP_TUNE")) {
+        int Ts = 16;
+        std::sscanf(tc, "%d %f %f %f %f", &Ts, &work.k_detail, &work.k_denoise, &work.D_th, &work.D_tr);
+        work.snr_auto_tune = false;
+        work.alignment_tile_size = Ts;
+        tune_config_snr(raw[0], work);          // applies the manual tile size only
+    } else {
+        tune_config_snr(raw[0], work);
+    }
+    if (std::getenv("TP_PRINT_TUNE"))
+        std::fprintf(stderr, "TUNE %d %.9g %.9g %.9g %.9g\n", work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0],
+                     work.k_detail, work.k_denoise, work.D_th, work.D_tr);
     const int tile = work.bm_tile_sizes.empty() ? 16 : work.bm_tile_sizes[0];
+    TPT("tune_config_snr");
 
     const Image& ref = raw[0];
     Image ref_grey = compute_grey(ref, work.bayer_mode, work.grey_method);
     Pyramid ref_pyr = build_pyramid(pad_image_circular(ref_grey, work.grey_tile_size(tile)), work.bm_factors);
+    TPT("ref grey+pyramid");
     RefStats ref_stats = init_robustness(ref, work);
-    CovField ref_covs = estimate_kernels(ref, work);
+    TPT("init_robustness");
+    CovField ref_covs;
+    if (!nomerge) ref_covs = estimate_kernels(ref, work);
     const int Ho = (int)std::lround(work.scale * H), Wo = (int)std::lround(work.scale * W);
 
-    FILE* o = std::fopen(argv[2], "wb");
-    {
+    FILE* o = std::fopen(out_path, "wb");
+    if (!nomerge) {
         Image num(Ho, Wo, 3), den(Ho, Wo, 3);
         merge_ref(ref, ref_covs, num, den, work, nullptr);
         put(o, num.data);
@@ -109,7 +154,9 @@ int main(int argc, char** argv) {
     for (int n = 1; n < N; ++n) {
         const Image& comp = raw[n];
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
+        TPT("comp grey");
         FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile);
+        TPT("align");
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile, work.r_Mt,
                                      work.num_threads, work.grey_tile_size(tile));
         std::vector<float> tcorr((size_t)flow.ny * flow.nx, 0.f);
@@ -180,7 +227,10 @@ int main(int argc, char** argv) {
                     tcorr[t] = 1.f;
                 }
         }
+        TPT("flow grid+corrupt");
         Image rob = compute_robustness(comp, ref_stats, flow, tile, work);
+        TPT("compute_robustness");
+        if (!nomerge) {
         CovField covs = estimate_kernels(comp, work);
         Image nu(Ho, Wo, 3), du(Ho, Wo, 3), ng(Ho, Wo, 3), dg(Ho, Wo, 3);
         merge_comp(comp, flow, covs, ones, tile, nu, du, work);
@@ -195,6 +245,7 @@ int main(int argc, char** argv) {
         put(o, du.data);
         put(o, ng.data);
         put(o, dg.data);
+        }
         std::vector<float> r0((size_t)Hg * Wg), fx(r0.size()), fy(r0.size()), cm(r0.size());
         for (int y = 0; y < Hg; ++y)
             for (int x = 0; x < Wg; ++x) {
@@ -211,6 +262,7 @@ int main(int argc, char** argv) {
         per.push_back(fy);
         per.push_back(cm);
     }
+    TPT("per-frame rest");
     put(o, guide_grey(ref));
     for (auto& v : per) put(o, v);
     int32_t t = tile;

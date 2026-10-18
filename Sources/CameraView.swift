@@ -1267,9 +1267,9 @@ struct CameraView: View {
                          The freshly-trained darken-only mask net: a tiny 9-feature model that only attenuates the analytic mask (R·g, g in [0,1] — never trusts more), so the merge stays robust to misaligned tiles and only well-aligned samples contribute to super-resolution. Trained on synthetic bursts with deliberately corrupted alignment vectors; measured +6.4% merged-MSE on held-out synthetic data. Its decisive input is a MULTI-FRAME CONSENSUS — each frame vs the mean of all aligned frames — so enabling it runs a second alignment pass over the burst to build that consensus (opt-in, extra decode+align time). Features come from the full-res grey in the net's own training domain, so no retraining. Runs on device: the mask is refined on the host and handed to the GPU merge (no separate Metal kernel). Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
-                    Toggle("Robust NN v13 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)
+                    Toggle("Robust NN v14 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)
                     Text("""
-                         Learned robustness mask (tools/robust_nn, v13): a per-pixel weight from 0 to 1 per frame that rejects samples whose misalignment would paint a visible ghost or doubled edge, and keeps correctly aligned samples — including aliased ones, which carry the super-resolution detail. Trained on bursts built from real DNG scenes with exactly known motion, deliberate tile shifts and 0–33° rotated tile content, through this app's own aligner and merge; on held-out bursts it agrees with the ground-truth mask on 93% of clear pixels (analytic mask: ~87–92%). Prefers rejecting a misalignment over keeping noise down, so flat areas can be a little noisier. Same GPU kernel and memory as before. Off by default.
+                         Learned robustness mask (tools/robust_nn, v14): a per-pixel weight from 0 to 1 per frame that rejects samples whose misalignment would paint a visible ghost or doubled edge, and keeps correctly aligned samples — including aliased ones, which carry the super-resolution detail. Trained on bursts built from real DNG scenes with exactly known motion, deliberate tile shifts and 0–33° rotated tile content, through this app's own aligner and merge. On held-out bursts (balanced accuracy vs the ground-truth mask: v14 94.5%, v13 94.0%, analytic 89.7%) v14 misses fewer small edge shifts (8.5% vs 10.7%) and rotated-content misalignments (1.7% vs 2.8%) than v13 and over-rejects less (6.0% vs 6.3% of good pixels). Prefers rejecting a misalignment over keeping noise down. Same GPU kernel and memory as before. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robust_nn_enabled {
@@ -1286,7 +1286,7 @@ struct CameraView: View {
                         }
                         Slider(value: $cam.tuningParams.robust_nn_accept_above, in: 0.0...1.0, step: 0.05)
                         Text("""
-                             Optional sharpening of the NN mask: output below "Reject Below" becomes 0 (sample dropped), above "Trust Above" becomes 1, linear in between. Defaults 0.05 / 0.95 give an exact 0-to-1 mask. Raise Reject Below (e.g. 0.3) to reject borderline misalignments more firmly; lower Trust Above (e.g. 0.7) to keep more samples in flat areas. Trust Above ≤ Reject Below = raw network output.
+                             Optional sharpening of the NN mask: output below "Reject Below" becomes 0 (sample dropped), above "Trust Above" becomes 1, linear in between. Defaults 0.20 / 0.90 give an exact 0-to-1 mask (v14 is tuned for them). Raise Reject Below (e.g. 0.3) to reject borderline misalignments more firmly; lower Trust Above (e.g. 0.7) to keep more samples in flat areas. Trust Above ≤ Reject Below = raw network output.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }

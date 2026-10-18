@@ -19,7 +19,8 @@ ap.add_argument("--hi", type=float, default=0.0)
 a = ap.parse_args()
 core = os.path.join(HERE, "..", "..", "core")
 MARK = "// robust_nn (Config::robust_nn_enabled)"
-net = RobustNet(); net.load_state_dict(torch.load(a.model, map_location="cpu")); net.eval()
+_sd = torch.load(a.model, map_location="cpu")
+net = RobustNet(nf=_sd["c1.weight"].shape[1], hid=_sd["c1.weight"].shape[0]); net.load_state_dict(_sd); net.eval()
 worst = 0.0
 with tempfile.TemporaryDirectory() as d:
     exe = os.path.join(d, "emu.exe")
