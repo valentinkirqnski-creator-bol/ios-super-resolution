@@ -51,13 +51,20 @@ W_FLAT = float(os.environ.get("RNN_W_FLAT", "1"))           # extra cost of drop
 SELECT_SAFE = os.environ.get("RNN_SELECT", "") == "safe"    # v14: best = fewest errors with leak not above start
 
 
-def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, occ_look=False):
+GT_NMERGE = float(os.environ.get("RNN_GT_NMERGE", "1"))   # v17: judge visibility at the MERGED image's noise
+
+
+def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, occ_look=False, n_merge=None):
     """Continuous target R* in [0,1] per guide pixel and comparison frame. The ghost a flow error paints is
     measured on the NOISE-FREE comparison frame: content at the used flow vs content at the true flow (both from
     the same frame, so aliasing cancels and aligned-but-aliased areas get 1). Compared with the noise sigma plus a
     small visibility floor; out-of-frame points get 0. Occluded points get 0 too, unless occ_look: then they are
     judged by what merging would show (reference vs comparison content at the used flow), so an occluded wall
-    that looks like the wall in front of it is not a misalignment."""
+    that looks like the wall in front of it is not a misalignment. n_merge > 1 (v17): a ghost counts as visible
+    against the noise of the MERGED image (single-frame variance / n_merge), because after merging ~8 frames the
+    noise drops ~3x and small per-tile errors that hid in one frame's noise show (low-light tile seams, zipper
+    edges)."""
+    n_merge = GT_NMERGE if n_merge is None else n_merge
     K = flow_used.shape[0]
     Ck = clean[1:]
     Ce = warp_by_flow(Ck, flow_used)
@@ -65,7 +72,7 @@ def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, o
     from rnn.common import win_mean as _wm
     D2 = _wm((Ce - Cg) ** 2, 1)
     mu = _wm(clean[0:1], 1).clamp_min(0).expand(K, -1, -1)
-    s2 = (alpha * mu + beta) / 4.0 + (floor * mu) ** 2 + 1e-10
+    s2 = (alpha * mu + beta) / 4.0 / n_merge + (floor * mu) ** 2 + 1e-10
     t = vis * torch.exp(-0.5 * D2 / (k * k * s2))
     if occ_look:
         H, W = Ck.shape[-2:]
@@ -131,7 +138,7 @@ def _gen_one(args):
     if os.path.exists(path):
         return
     torch.set_num_threads(1)
-    name_s = VAL_SCENE if val else scenes[seed % len(scenes)]
+    name_s = scenes[seed % len(scenes)] if (not val or os.environ.get("RNN_VAL_FROM_SCENES") == "1") else VAL_SCENE
     if name_s not in _SCENE:
         _SCENE[name_s] = load_scene(name_s)
     sc_rgb, cfa, wb, alpha0, beta0 = _SCENE[name_s]
@@ -169,8 +176,13 @@ def _gen_one(args):
         for j in range(2):
             g[:, i::2, j::2] = rc[:, i::2, j::2] / wb[cfa[i][j]]
     clean_grey = 0.25 * (g[:, 0::2, 0::2] + g[:, 0::2, 1::2] + g[:, 1::2, 0::2] + g[:, 1::2, 1::2])
+    clean_rgb = np.zeros((g.shape[0], 3) + clean_grey.shape[1:], np.float32)   # camera-native colour per quad
+    for i in range(2):
+        for j in range(2):
+            clean_rgb[:, cfa[i][j]] += g[:, i::2, j::2] * (0.5 if cfa[i][j] == 1 else 1.0)
     np.savez(path, raw=d["raw"].numpy().astype(np.float32), gt_flow=d["gt_flow"].numpy().astype(np.float32),
              gt_hr=gt_hr.numpy().astype(np.float16), clean_grey=clean_grey.astype(np.float32),
+             clean_rgb=clean_rgb.astype(np.float16),
              vis=d["vis"].numpy().astype(np.float16),
              alpha=np.float32(alpha0 * k), beta=np.float32(beta0 * k * k), scenario=name,
              cfa=np.array(cfa, np.int32), wb=wb)

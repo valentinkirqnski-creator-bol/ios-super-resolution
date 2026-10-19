@@ -1,0 +1,223 @@
+"""Train v15 (PixNet: pixel-seeing correction over the frozen shipped v14) on the cached app-stage outputs.
+
+    python train_pix.py --base runs/v14/model.pt --out runs/v15 --steps 30000
+Scored against the corrected ground-truth mask on the 60 held-out samples, always next to v14 as shipped
+(cutoffs 0.20/0.90): similarity (1 - mean|R - t|, all pixels), boundary error (mean|R - t| where the GT changes
+from reject to keep within 5x5 - how FINE the mask is), balanced accuracy, misses, over-rejection, small-shift /
+rotation misses, flat over-rejection, partial ghost weight. v15 is also shown at a few logit shifts (weights-only).
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import numpy as np                                          # noqa: E402
+import torch                                                # noqa: E402
+import torch.nn.functional as F                             # noqa: E402
+from torch.utils.data import DataLoader, Dataset            # noqa: E402
+from real_protocol import load_net, stretch, geo_loss, geo_target, CLIP   # noqa: E402
+from rnn.features import compute_features                  # noqa: E402
+from rnn.common import warp_by_flow                        # noqa: E402
+from rnn.pixnet import PixNet, pixel_inputs, consensus_inputs, expand_inputs, NPIX, NCONS   # noqa: E402
+
+LO, HI = 0.20, 0.90                                         # the shipped exact-0/1 cutoffs
+
+
+CLEAN = os.environ.get("PIX_CLEAN", "0") == "1"   # ceiling test: pixel inputs from the NOISE-FREE frames
+CONS = os.environ.get("PIX_CONS", "0") == "1"     # v16: + multi-frame consensus pixel channels
+
+
+SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], "c17_val": ["rp17_val"],
+       "c17_train": ["rp17_train"]}
+REGT = os.environ.get("RNN_GT_NMERGE") is not None   # v17: recompute the target (merged-noise visibility)
+
+
+def _source(cache_file):
+    """The synthetic burst a cache sample was made from (for its noise-free frames)."""
+    stem = os.path.basename(cache_file)[:-4]
+    roots = SRC[os.path.basename(os.path.dirname(cache_file))]
+    if stem.startswith("val"):
+        src = sorted(glob.glob(os.path.join(HERE, "data", roots[0], "*.npz")))
+        return src[int(stem[3:]) % len(src)]
+    name = stem.rsplit("_v", 1)[0] + ".npz"
+    for r in roots:
+        if os.path.exists(os.path.join(HERE, "data", r, name)):
+            return os.path.join(HERE, "data", r, name)
+    raise FileNotFoundError(name)
+
+
+class Cache(Dataset):
+    def __init__(self, root, crop=None, aug=False):
+        self.files = sorted(f for f in glob.glob(os.path.join(HERE, root, "*.npz")) if ".tmp." not in f)
+        self.crop, self.aug = crop, aug
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        z = np.load(self.files[i])
+        Ir, G = torch.from_numpy(z["ref"]), torch.from_numpy(z["grey"])
+        fl, r0 = torch.from_numpy(z["flow"]), torch.from_numpy(z["r0"].astype(np.float32))
+        K, (H, W) = G.shape[0], G.shape[1:]
+        a, b = float(z["a"]), float(z["b"])
+        Ik = Ir[None].expand(K, -1, -1).contiguous()
+        with torch.no_grad():
+            feats, J = compute_features(Ik, G, fl, r0, a, b, CLIP, max(1, int(z["tile"]) // 2))
+            pix = pixel_inputs(Ik, J, a, b)
+            if CONS:
+                pix = torch.cat([pix, consensus_inputs(Ir, J, a, b)], 1)
+            if CLEAN:
+                cl = torch.from_numpy(np.load(_source(self.files[i]))["clean_grey"])
+                pix = pixel_inputs(cl[0][None].expand(K, -1, -1).contiguous(), warp_by_flow(cl[1:], fl), a, b)
+        geo = torch.from_numpy(z["geo"].astype(np.float32))
+        if REGT:   # target recomputed from the burst's noise-free frames with the current visibility rule
+            sz = np.load(_source(self.files[i]))
+            geo = geo_target(torch.from_numpy(sz["clean_grey"]), fl, torch.from_numpy(sz["gt_flow"][1:]),
+                             torch.from_numpy(sz["vis"][1:].astype(np.float32)), 4 * a, 4 * b, occ_look=True)
+        d = dict(feats=feats, pix=pix, r0=r0, geo=geo,
+                 edge=torch.from_numpy(z["edge"].astype(np.float32))[None].expand(K, -1, -1),
+                 rot=torch.from_numpy(z["rot"]), ferr=torch.from_numpy(z["ferr"].astype(np.float32)))
+        rng = np.random.default_rng()
+        if self.crop:
+            y, x = int(rng.integers(0, H - self.crop + 1)), int(rng.integers(0, W - self.crop + 1))
+            d = {k: v[..., y:y + self.crop, x:x + self.crop] for k, v in d.items()}
+        if self.aug:   # every input is a rotation-invariant scalar field, so flips / 90-degree turns are exact
+            k90, fl_ = int(rng.integers(0, 4)), bool(rng.integers(0, 2))
+            d = {k: torch.rot90(v, k90, (-2, -1)) for k, v in d.items()}
+            if fl_:
+                d = {k: torch.flip(v, (-1,)) for k, v in d.items()}
+        return {k: v.contiguous() for k, v in d.items()}
+
+
+def cat(batch):
+    return {k: torch.cat([b[k] for b in batch], 0) for k in batch[0]}
+
+
+def _wi(_):
+    torch.set_num_threads(1)
+
+
+def counts(R, d, lo=LO, hi=HI):
+    t, Rs = d["geo"], stretch(R, lo, hi)
+    bad, good = t < 0.2, t > 0.8
+    miss, over = bad & (Rs >= 0.5), good & (Rs <= 0.5)
+    se, ro, fl = bad & (d["ferr"] < 1), bad & d["rot"], good & (d["edge"] < 0.5)
+    band = (F.max_pool2d(t[:, None], 5, 1, 2) + F.max_pool2d(-t[:, None], 5, 1, 2))[:, 0] > 0.5
+    err = (Rs - t).abs()
+    return np.array([float(v) for v in (miss.sum(), bad.sum(), over.sum(), good.sum(), (miss & se).sum(), se.sum(),
+                                        (miss & ro).sum(), ro.sum(), (over & fl).sum(), fl.sum(), Rs[bad].sum(),
+                                        Rs[t < 0.05].sum(), (t < 0.05).sum(), err.sum(), t.numel(), err[band].sum(),
+                                        band.sum())])
+
+
+def summary(c):
+    q = lambda j: 100 * c[j] / max(1.0, c[j + 1])
+    return dict(sim=1 - c[13] / c[14], bnd=c[15] / max(1.0, c[16]), bal=100 - 0.5 * (q(0) + q(2)), missed=q(0),
+                over=q(2), small=q(4), rot=q(6), flat=q(8), leak=c[10] / max(1.0, c[1]), leak05=c[11] / max(1.0, c[12]))
+
+
+def fmt(name, s):
+    return (f"{name:16s} sim {s['sim']:.4f}  boundary err {s['bnd']:.3f}  bal {s['bal']:.2f}  missed {s['missed']:.2f}  "
+            f"over {s['over']:.2f}  small {s['small']:.2f}  rot {s['rot']:.2f}  flat {s['flat']:.2f}  "
+            f"leak {s['leak']:.3f}  leak<.05 {s['leak05']:.3f}")
+
+
+SHIFTS = [-1.5, -1.25, -1.125, -1.0, -0.875, -0.75, -0.5, 0.0]
+
+
+@torch.no_grad()
+def evaluate(net, dv, base_too=False):
+    C = {}
+    for d in dv:
+        if base_too:
+            C["v14"] = C.get("v14", 0) + counts(net.base(d["feats"], d["r0"])[0], d)
+        npix = getattr(net, "npix", None) or net.p1.in_channels - net.base.c1.weight.shape[1] - 1
+        R = net(d["feats"], d["r0"], d["pix"][:, :npix])[0].clamp(1e-6, 1 - 1e-6)
+        lg = torch.log(R) - torch.log1p(-R)
+        for s in SHIFTS:
+            C[s] = C.get(s, 0) + counts(torch.sigmoid(lg + s), d)
+    return {k: summary(v) for k, v in C.items()}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", default="runs/v14/model.pt")
+    ap.add_argument("--train", default="data/c15_train")
+    ap.add_argument("--val", default="data/c15_val")
+    ap.add_argument("--out", default="runs/v15")
+    ap.add_argument("--steps", type=int, default=30000)
+    ap.add_argument("--eval_every", type=int, default=2500)
+    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--ch", type=int, default=16)
+    ap.add_argument("--crop", type=int, default=96)
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--init", default=None)
+    a = ap.parse_args()
+    os.makedirs(os.path.join(HERE, a.out), exist_ok=True)
+    torch.manual_seed(0)
+    torch.set_num_threads(4)
+    npix = NPIX + (NCONS if CONS else 0)
+    net = PixNet(load_net(os.path.join(HERE, a.base)), ch=a.ch, npix=npix)
+    if a.init:
+        sd = torch.load(os.path.join(HERE, a.init), map_location="cpu")
+        nf = net.base.c1.weight.shape[1]
+        old = sd["p1.weight"].shape[1] - nf - 1
+        if old != npix:   # start exactly at the smaller net (new input channels zero)
+            sd = expand_inputs(sd, nf, old, npix)
+        net.load_state_dict(sd)
+    mp = dict(persistent_workers=True, prefetch_factor=2) if a.workers else {}
+    dl = DataLoader(Cache(a.train, a.crop, True), a.batch, shuffle=True, num_workers=a.workers, collate_fn=cat,
+                    worker_init_fn=_wi, drop_last=True, **mp)
+    dv = DataLoader(Cache(a.val), 1, shuffle=False, num_workers=a.workers, collate_fn=cat, worker_init_fn=_wi)
+    params = [p for p in net.parameters() if p.requires_grad]
+    print(f"trainable params {sum(p.numel() for p in params)}; train {len(dl.dataset)} val {len(dv.dataset)}", flush=True)
+    opt = torch.optim.Adam(params, lr=a.lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * min(1.0, s / a.steps))))
+    net.eval()
+    ev = evaluate(net, dv, base_too=True)
+    print(fmt("v14 (shipped)", ev["v14"]), flush=True)
+    print(fmt("v15 step 0", ev[0.0]), flush=True)
+    ref = ev["v14"]
+    hist = [dict(step=0, ev={str(k): v for k, v in ev.items()})]
+    step, t0, run = 0, time.time(), None
+    net.train()
+    net.base.eval()
+    while step < a.steps:
+        for d in dl:
+            R, _ = net(d["feats"], d["r0"], d["pix"])
+            loss = geo_loss(R, d["geo"], d=d)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            sched.step()
+            step += 1
+            run = float(loss) if run is None else 0.99 * run + 0.01 * float(loss)
+            if step % 250 == 0:
+                print(f"step {step} loss {run:.4f} {time.time() - t0:.0f}s", flush=True)
+            if step % a.eval_every == 0 or step == a.steps:
+                net.eval()
+                ev = evaluate(net, dv)
+                net.train()
+                net.base.eval()
+                for s in SHIFTS:
+                    print(fmt(f"v15 s{step} {s:+.2f}", ev[s]), flush=True)
+                ok = [s for s in SHIFTS if ev[s]["missed"] <= ref["missed"] and ev[s]["leak05"] <= ref["leak05"]]
+                if ok:   # at v14's miss rate and partial-ghost weight or better: how close to the GT, how fine
+                    s = max(ok, key=lambda k: ev[k]["sim"])
+                    print(">> MATCHED " + fmt(f"v15 s{step} {s:+.2f}", ev[s]), flush=True)
+                torch.save(net.state_dict(), os.path.join(HERE, a.out, f"pix_s{step}.pt"))
+                hist.append(dict(step=step, ev={str(k): v for k, v in ev.items()}))
+                json.dump(dict(args=vars(a), hist=hist), open(os.path.join(HERE, a.out, "metrics.json"), "w"), indent=1)
+            if step >= a.steps:
+                break
+    print("done", flush=True)
+
+
+if __name__ == "__main__":
+    main()

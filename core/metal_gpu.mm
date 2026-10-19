@@ -12,6 +12,7 @@
 // the layout the kernel reads, and the compiled-in weights themselves.
 #include "robustness_refine_shared.h"
 #include "robustness_refine_weights.h"
+#include "robust_nn_shared.h"   // RNN_NF / RNN15_* sizes for the v15 band buffers
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -2064,6 +2065,9 @@ static id<MTLBuffer> g_rnn_ref_grey = nil;
 static int g_rnn_h = 0, g_rnn_w = 0;
 static id<MTLBuffer> g_rnn_r0 = nil;
 static id<MTLBuffer> g_rnn_out = nil;
+// robust_nn v15 band buffers (Config::robust_nn_v15_enabled): reused across bands
+// and frames, ~25 MB on a 12 MP burst, released with the burst's reference.
+static id<MTLBuffer> g_r15_j = nil, g_r15_f = nil, g_r15_x = nil, g_r15_a = nil, g_r15_b = nil;
 // std/diff curve buffers hold up to 3 CONCATENATED per-channel curves
 // (each g_rob_curve_n entries; channel ch's curve starts at ch*g_rob_curve_n)
 // rather than one curve shared by every guide channel -- see
@@ -2123,6 +2127,7 @@ static void clear_rob_ref_gpu() {
     g_rnn_h = g_rnn_w = 0;
     g_rnn_r0 = nil;
     g_rnn_out = nil;
+    g_r15_j = g_r15_f = g_r15_x = g_r15_a = g_r15_b = nil;
 }
 
 // ---- robust_nn: learned refinement of the robustness mask ------------------
@@ -2242,6 +2247,152 @@ static bool rnn_refine_raw_res(Image& R, id<MTLBuffer> b_comp_guide, int gh, int
         const float* row = out + (size_t)std::min(y / 2, gh - 1) * gw;
         float* dst = R.data.data() + (size_t)y * R.w;
         for (int x = 0; x < R.w; ++x) dst[x] = row[std::min(x / 2, gw - 1)];
+    }
+    return true;
+}
+
+// ---- robust_nn v15: pixel-seeing refinement, banded (kernels rnn15_*) -------
+// Mirrors Rnn15Band in HHSRKernels.metal.
+struct Rnn15BandCPU {
+    int32_t lo, hi, jb, jn, fb, fn, xb, xn, ib, in_, ob, on, layer, dil, _pad0, _pad1;
+};
+static_assert(sizeof(Rnn15BandCPU) == 64, "Rnn15BandCPU must mirror Rnn15Band");
+
+// Output rows per band. Rows each stage computes beyond the band, per side: warped
+// grey 13, features 9, inputs 8 (conv dilations 1+2+4+1), conv layers 7 / 5 / 1 / 0.
+static const int kRnn15Band = 32;
+static const int kRnn15HaloL[4] = {7, 5, 1, 0};
+
+// Same contract as rnn_refine_raw_res (same inputs, output written back quad by
+// quad); runs the v15 network. Returns false (R untouched) whenever it cannot run.
+static bool rnn15_refine_raw_res(Image& R, id<MTLBuffer> b_comp_guide, int gh, int gw, int nch,
+                                 const FlowField& flow, int tile_size, const Config& cfg,
+                                 id<MTLBuffer> b_flow, id<MTLBuffer> b_jac, bool use_affine) {
+    if (!cfg.robust_nn_v15_enabled || !rnn_domain_ok(cfg, nch) || cfg.dense_flow_enabled) return false;
+    if (!g_rnn_ref_grey || g_rnn_h != gh || g_rnn_w != gw || !b_comp_guide) return false;
+    if (R.c != 1 || R.h < 1 || R.w < 1 || R.data.empty()) return false;
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty() || tile_size <= 0 || !b_flow || !b_jac)
+        return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pw = c.pipe("rnn15_warp"), pf = c.pipe("rnn15_feat"), pi = c.pipe("rnn15_inputs"),
+                                pc = c.pipe("rnn15_conv"), po = c.pipe("rnn15_out");
+    if (!pw || !pf || !pi || !pc || !po) return false;
+    const size_t n = (size_t)gh * (size_t)gw, bytes = n * sizeof(float);
+    if (!g_rnn_r0 || [g_rnn_r0 length] < bytes) g_rnn_r0 = buf(nullptr, bytes);
+    if (!g_rnn_out || [g_rnn_out length] < bytes) g_rnn_out = buf(nullptr, bytes);
+    const int B = kRnn15Band;
+    const size_t row = (size_t)gw * sizeof(float);
+    const size_t need_j = (size_t)(B + 26) * row, need_f = (size_t)RNN_NF * (B + 18) * row,
+                 need_x = (size_t)RNN15_CIN * (B + 16) * row, need_a = (size_t)RNN15_CH * (B + 14) * row,
+                 need_b = (size_t)RNN15_CH * (B + 10) * row;
+    if (!g_r15_j || [g_r15_j length] < need_j) g_r15_j = buf(nullptr, need_j);
+    if (!g_r15_f || [g_r15_f length] < need_f) g_r15_f = buf(nullptr, need_f);
+    if (!g_r15_x || [g_r15_x length] < need_x) g_r15_x = buf(nullptr, need_x);
+    if (!g_r15_a || [g_r15_a length] < need_a) g_r15_a = buf(nullptr, need_a);
+    if (!g_r15_b || [g_r15_b length] < need_b) g_r15_b = buf(nullptr, need_b);
+    if (!g_rnn_r0 || !g_rnn_out || !g_r15_j || !g_r15_f || !g_r15_x || !g_r15_a || !g_r15_b) return false;
+
+    float* r0 = (float*)[g_rnn_r0 contents];
+    for (int y = 0; y < gh; ++y) {
+        const int ry = std::min(2 * y, R.h - 1);
+        for (int x = 0; x < gw; ++x)
+            r0[(size_t)y * gw + x] = R.data[(size_t)ry * R.w + std::min(2 * x, R.w - 1)];
+    }
+    RnnAppParamsCPU p{};
+    p.width = gw;
+    p.height = gh;
+    p.flow_step = std::max(1, tile_size / 2);
+    p.noise_a = (cfg.alpha_dng[0] + 2.f * cfg.alpha_dng[1] + cfg.alpha_dng[2]) / 16.f;
+    p.noise_b = (cfg.beta_dng[0] + 2.f * cfg.beta_dng[1] + cfg.beta_dng[2]) / 16.f;
+    p.clip_level = 0.9f;
+    p.flow_ny = (uint32_t)flow.ny;
+    p.flow_nx = (uint32_t)flow.nx;
+    p.tile_size = (float)tile_size;
+    p.affine = use_affine ? 1u : 0u;
+    p.homog = flow.has_global_h ? 1u : 0u;
+    for (int i = 0; i < 9; ++i) p.hmat[i] = flow.global_h[i];
+    p.sharp_lo = std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f);
+    p.sharp_hi = std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f);
+
+    // One compute encoder (serial dispatch: each dispatch completes before the next),
+    // so the band buffers can be reused band after band.
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = cmd ? [cmd computeCommandEncoder] : nil;
+    if (!enc) return false;
+    auto rows = [&](int a, int b) { return std::max(0, std::min(gh, b) - std::max(0, a)); };
+    for (int y0 = 0; y0 < gh; y0 += B) {
+        const int y1 = std::min(gh, y0 + B);
+        Rnn15BandCPU bd{};
+        bd.jb = std::max(0, y0 - 13); bd.jn = rows(y0 - 13, y1 + 13);
+        bd.fb = std::max(0, y0 - 9);  bd.fn = rows(y0 - 9, y1 + 9);
+        bd.xb = std::max(0, y0 - 8);  bd.xn = rows(y0 - 8, y1 + 8);
+        const int ab = std::max(0, y0 - 7), an = rows(y0 - 7, y1 + 7);   // conv layers 1 and 3 write A
+        const int bb = std::max(0, y0 - 5), bn = rows(y0 - 5, y1 + 5);   // conv layers 2 and 4 write B
+        auto stage = [&](id<MTLComputePipelineState> ps, int band_index, int lo, int hi) {
+            bd.lo = std::max(0, lo);
+            bd.hi = std::min(gh, hi);
+            [enc setBytes:&bd length:sizeof(bd) atIndex:band_index];
+            dispatch2(enc, ps, (NSUInteger)gw, (NSUInteger)(bd.hi - bd.lo));
+        };
+        // 1) warped comparison grey
+        [enc setBuffer:b_comp_guide offset:0 atIndex:0];
+        [enc setBuffer:g_r15_j offset:0 atIndex:1];
+        [enc setBuffer:b_flow offset:0 atIndex:2];
+        [enc setBuffer:b_jac offset:0 atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        stage(pw, 5, y0 - 13, y1 + 13);
+        // 2) the 14 features
+        [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
+        [enc setBuffer:g_r15_j offset:0 atIndex:1];
+        [enc setBuffer:g_rnn_r0 offset:0 atIndex:2];
+        [enc setBuffer:g_r15_f offset:0 atIndex:3];
+        [enc setBuffer:b_flow offset:0 atIndex:4];
+        [enc setBuffer:b_jac offset:0 atIndex:5];
+        [enc setBytes:&p length:sizeof(p) atIndex:6];
+        stage(pf, 7, y0 - 9, y1 + 9);
+        // 3) the 19 inputs (standardised features, pixel channels, base logit)
+        [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
+        [enc setBuffer:g_r15_j offset:0 atIndex:1];
+        [enc setBuffer:g_r15_f offset:0 atIndex:2];
+        [enc setBuffer:g_rnn_r0 offset:0 atIndex:3];
+        [enc setBuffer:g_r15_x offset:0 atIndex:4];
+        [enc setBytes:&p length:sizeof(p) atIndex:5];
+        stage(pi, 6, y0 - 8, y1 + 8);
+        // 4) four dilated convs: X -> A -> B -> A -> B
+        const int dil[4] = {1, 2, 4, 1};
+        for (int l = 0; l < 4; ++l) {
+            const bool from_x = (l == 0), to_a = (l % 2 == 0);
+            bd.layer = l + 1;
+            bd.dil = dil[l];
+            bd.ib = from_x ? bd.xb : (to_a ? bb : ab);
+            bd.in_ = from_x ? bd.xn : (to_a ? bn : an);
+            bd.ob = to_a ? ab : bb;
+            bd.on = to_a ? an : bn;
+            [enc setBuffer:(from_x ? g_r15_x : (to_a ? g_r15_b : g_r15_a)) offset:0 atIndex:0];
+            [enc setBuffer:(to_a ? g_r15_a : g_r15_b) offset:0 atIndex:1];
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            stage(pc, 3, y0 - kRnn15HaloL[l], y1 + kRnn15HaloL[l]);
+        }
+        // 5) head: base logit + delta, sharpening, into the output plane
+        bd.ib = bb;
+        bd.in_ = bn;
+        [enc setBuffer:g_r15_b offset:0 atIndex:0];
+        [enc setBuffer:g_r15_x offset:0 atIndex:1];
+        [enc setBuffer:g_rnn_out offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        stage(po, 4, y0, y1);
+    }
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:nn15");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return false;
+
+    const float* out = (const float*)[g_rnn_out contents];
+    for (int y = 0; y < R.h; ++y) {
+        const float* orow = out + (size_t)std::min(y / 2, gh - 1) * gw;
+        float* dst = R.data.data() + (size_t)y * R.w;
+        for (int x = 0; x < R.w; ++x) dst[x] = orow[std::min(x / 2, gw - 1)];
     }
     return true;
 }
@@ -2596,7 +2747,10 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     Image r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     // Learned refinement of the finished mask (Config::robust_nn_enabled). The
     // comparison guide is still in b_guide; R stays analytic if it declines.
-    if (rob_nch == 1u)
+    // v15 (Config::robust_nn_v15_enabled) when it can run, else v14.
+    if (rob_nch == 1u &&
+        !rnn15_refine_raw_res(r, b_guide, gh, gw, nch, flow, tile_size, cfg, b_geom_flow, b_geom_affine,
+                              raw_geom_affine))
         rnn_refine_raw_res(r, b_guide, gh, gw, nch, flow, tile_size, cfg, b_geom_flow, b_geom_affine,
                            raw_geom_affine);
     if (want_s_select) {

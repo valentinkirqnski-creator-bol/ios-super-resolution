@@ -4159,3 +4159,124 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
         r_out[y * W + x] = R;
     }
 }
+
+// ===========================================================================
+// robust_nn v15 (Config::robust_nn_v15_enabled): pixel-seeing refinement over
+// its own v14 base (core/robust_nn15_weights.h, ~15k parameters). Besides the
+// 14 features it sees the noise-normalised pixels of the reference and the
+// aligned comparison through four dilated 3x3 convs (a 17x17 view), so its mask
+// follows where inside a tile a ghost actually shows.
+//
+// Memory: the image is processed in bands of RNN15_BAND output rows. Each band
+// stage writes a small band buffer (warped grey, 14 features, 19 inputs, two
+// 16-channel activation planes) holding only the rows it needs plus the halo
+// the next stage reads (13 / 9 / 8 / 7 / 5 rows), so the extra memory is
+// ~25 MB at 12 MP and does not grow with the burst. Per-pixel kernels, no
+// threadgroup memory; the host encodes all stages of all bands in one serial
+// compute encoder (each dispatch completes before the next).
+// ===========================================================================
+
+// Mirrors Rnn15BandCPU in metal_gpu.mm (static_assert'ed there: 64 bytes).
+struct Rnn15Band {
+    int lo, hi;                 // absolute rows this dispatch computes
+    int jb, jn, fb, fn, xb, xn; // band buffers (warped grey, features, inputs): first row, row count
+    int ib, in_, ob, on;        // conv / head: input and output plane buffers: first row, row count
+    int layer, dil;             // conv layer 1..4 and its dilation
+    int _pad0, _pad1;
+};
+
+struct Rnn15Rows {                 // one plane, rows [base, base + n)
+    device const float* p;
+    int w, base;
+    float operator()(int x, int y) const { return p[(y - base) * w + x]; }
+};
+struct Rnn15Planes {               // [c][rows][w], rows [base, base + rows)
+    device const float* p;
+    int w, base, rows;
+    float operator()(int c, int x, int y) const { return p[(c * rows + (y - base)) * w + x]; }
+};
+
+kernel void rnn15_warp(device const float* comp_guide [[buffer(0)]],
+                       device float* jband [[buffer(1)]],
+                       device const float* flow [[buffer(2)]],
+                       device const float* jac [[buffer(3)]],
+                       constant RnnAppParams& p [[buffer(4)]],
+                       constant Rnn15Band& b [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    const int x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= p.width || y >= b.hi) return;
+    RnnGuideGrey cg = {comp_guide, p.width};
+    RnnAppFlow fl = {flow, jac, &p};
+    jband[(y - b.jb) * p.width + x] = rnn_warp_at(cg, fl, p.width, p.height, x, y);
+}
+
+kernel void rnn15_feat(device const float* ref_grey [[buffer(0)]],
+                       device const float* jband [[buffer(1)]],
+                       device const float* r0 [[buffer(2)]],
+                       device float* fband [[buffer(3)]],
+                       device const float* flow [[buffer(4)]],
+                       device const float* jac [[buffer(5)]],
+                       constant RnnAppParams& p [[buffer(6)]],
+                       constant Rnn15Band& b [[buffer(7)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    RNNParams P = {W, p.height, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RnnAppFlow fl = {flow, jac, &p};
+    RNNImg rf = {ref_grey, W};
+    Rnn15Rows tj = {jband, W, b.jb};
+    float f[RNN_NF];
+    rnn_features_at(rf, tj, fl, r0[y * W + x], P, x, y, f);
+    for (int c = 0; c < RNN_NF; ++c) fband[(c * b.fn + (y - b.fb)) * W + x] = f[c];
+}
+
+kernel void rnn15_inputs(device const float* ref_grey [[buffer(0)]],
+                         device const float* jband [[buffer(1)]],
+                         device const float* fband [[buffer(2)]],
+                         device const float* r0 [[buffer(3)]],
+                         device float* xband [[buffer(4)]],
+                         constant RnnAppParams& p [[buffer(5)]],
+                         constant Rnn15Band& b [[buffer(6)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    RNNParams P = {W, p.height, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RNNImg rf = {ref_grey, W};
+    Rnn15Rows tj = {jband, W, b.jb};
+    Rnn15Planes tf = {fband, W, b.fb, b.fn};
+    float xin[RNN15_CIN];
+    rnn15_inputs_at(rf, tj, tf, r0[y * W + x], P, x, y, xin);
+    for (int c = 0; c < RNN15_CIN; ++c) xband[(c * b.xn + (y - b.xb)) * W + x] = xin[c];
+}
+
+kernel void rnn15_conv(device const float* in [[buffer(0)]],
+                       device float* out [[buffer(1)]],
+                       constant RnnAppParams& p [[buffer(2)]],
+                       constant Rnn15Band& b [[buffer(3)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    Rnn15Planes ti = {in, W, b.ib, b.in_};
+    const int cin = (b.layer == 1) ? RNN15_CIN : RNN15_CH;
+    RNN_CPTR float* w = (b.layer == 1) ? RNN15_W1 : ((b.layer == 2) ? RNN15_W2 : ((b.layer == 3) ? RNN15_W3 : RNN15_W4));
+    RNN_CPTR float* bias = (b.layer == 1) ? RNN15_B1 : ((b.layer == 2) ? RNN15_B2 : ((b.layer == 3) ? RNN15_B3 : RNN15_B4));
+    float o[RNN15_CH];
+    rnn15_conv_at(ti, cin, w, bias, b.dil, W, p.height, x, y, o);
+    for (int c = 0; c < RNN15_CH; ++c) out[(c * b.on + (y - b.ob)) * W + x] = o[c];
+}
+
+kernel void rnn15_out(device const float* hband [[buffer(0)]],
+                      device const float* xband [[buffer(1)]],
+                      device float* r_out [[buffer(2)]],
+                      constant RnnAppParams& p [[buffer(3)]],
+                      constant Rnn15Band& b [[buffer(4)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    Rnn15Planes th = {hband, W, b.ib, b.in_};
+    const float zb = 4.0f * xband[((RNN15_CIN - 1) * b.xn + (y - b.xb)) * W + x];
+    float R = rnn15_out_at(th, zb, x, y);
+    if (p.sharp_hi > p.sharp_lo)
+        R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
+    r_out[y * W + x] = R;
+}

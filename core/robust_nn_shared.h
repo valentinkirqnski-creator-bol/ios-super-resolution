@@ -260,3 +260,97 @@ inline float rnn_net_at(FTA feat, float r0v, int W, int H, int x, int y) {
     float z = RNN_LOG(Rc / (1.0f - Rc)) + d;
     return 1.0f / (1.0f + RNN_EXP(-z));
 }
+
+// ---- v15: pixel-seeing refinement (Config::robust_nn_v15_enabled) -----------------------
+// Mirrors tools/robust_nn/rnn/pixnet.py (PixNet.forward, pixel_inputs) op for op over its OWN
+// v14 base (RNN15B_*, so a later change of the main weights cannot change v15's base). The app
+// runs it as banded kernels (HHSRKernels.metal, rnn15_*); tools/robust_nn/app_kernel_test15.py
+// checks those kernels, band edges included, against PyTorch.
+#ifdef RNN15_WEIGHTS_HEADER
+#include RNN15_WEIGHTS_HEADER
+#else
+#include "robust_nn15_weights.h"
+#endif
+
+#ifdef __METAL_VERSION__
+#define RNN_CPTR constant
+#else
+#define RNN_CPTR const
+#endif
+
+// Base (v14) logit at (x,y) with PixNet's clamp of the base probability to [1e-4, 1 - 1e-4].
+template <typename FTA>
+inline float rnn15_base_logit_at(FTA feat, float r0v, int W, int H, int x, int y) {
+    float h1[RNN15B_HID];
+    for (int h = 0; h < RNN15B_HID; ++h) h1[h] = RNN15B_B1[h];
+    for (int ky = 0; ky < 3; ++ky) {
+        int yy = rnn_clampi(y + ky - 1, 0, H - 1);
+        for (int kx = 0; kx < 3; ++kx) {
+            int xx = rnn_clampi(x + kx - 1, 0, W - 1);
+            for (int c = 0; c < RNN15_NF; ++c) {
+                float v = feat(c, xx, yy);
+                for (int h = 0; h < RNN15B_HID; ++h) h1[h] += RNN15B_W1[((h * RNN15_NF + c) * 3 + ky) * 3 + kx] * v;
+            }
+        }
+    }
+    for (int h = 0; h < RNN15B_HID; ++h) h1[h] = rnn_maxf(h1[h], 0.0f);
+    float d = RNN15B_B3[0];
+    for (int o = 0; o < RNN15B_HID; ++o) {
+        float a = RNN15B_B2[o];
+        for (int i = 0; i < RNN15B_HID; ++i) a += RNN15B_W2[o * RNN15B_HID + i] * h1[i];
+        d += RNN15B_W3[o] * rnn_maxf(a, 0.0f);
+    }
+    float Rc = rnn_clampf(r0v, 1e-3f, 1.0f - 1e-3f);
+    float z = RNN_LOG(Rc / (1.0f - Rc)) + d;
+    float R = rnn_clampf(1.0f / (1.0f + RNN_EXP(-z)), 1e-4f, 1.0f - 1e-4f);
+    return RNN_LOG(R) - RNN_LOG(1.0f - R);
+}
+
+// The RNN15_CIN PixNet inputs at (x,y): standardised raw features (feat holds UNstandardised
+// features), 4 noise-normalised pixel channels, base logit / 4.
+template <typename RA, typename JA, typename FTA>
+inline void rnn15_inputs_at(RA ref, JA J, FTA feat, float r0v, RNNParams P, int x, int y, RNN_THREAD float* xin) {
+    const int W = P.width, H = P.height;
+    for (int c = 0; c < RNN15_NF; ++c) xin[c] = (feat(c, x, y) - RNN15_MU[c]) / RNN15_SD[c];
+    float smr = 0.0f, smj = 0.0f;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            int qx = rnn_clampi(x + dx, 0, W - 1), qy = rnn_clampi(y + dy, 0, H - 1);
+            smr = smr + ref(qx, qy);
+            smj = smj + J(qx, qy);
+        }
+    float mr = smr / 9.0f, mj = smj / 9.0f;
+    float sig = RNN_SQRT(rnn_maxf(P.noise_a * rnn_maxf(mr, 0.0f) + P.noise_b, 1e-10f));
+    float ir = ref(x, y), jv = J(x, y);
+    xin[RNN15_NF + 0] = rnn_clampf((jv - ir) / sig, -10.0f, 10.0f);
+    xin[RNN15_NF + 1] = rnn_clampf((ir - mr) / sig, -10.0f, 10.0f);
+    xin[RNN15_NF + 2] = rnn_clampf((jv - mj) / sig, -10.0f, 10.0f);
+    xin[RNN15_NF + 3] = rnn_clampf((mj - mr) / sig, -10.0f, 10.0f);
+    xin[RNN15_NF + 4] = rnn15_base_logit_at(feat, r0v, W, H, x, y) / 4.0f;
+}
+
+// One dilated 3x3 conv + ReLU at (x,y), clamp-to-edge (== replicate padding).
+template <typename XA>
+inline void rnn15_conv_at(XA in, int cin, RNN_CPTR float* w, RNN_CPTR float* b, int dil, int W, int H, int x, int y,
+                          RNN_THREAD float* out) {
+    for (int o = 0; o < RNN15_CH; ++o) out[o] = b[o];
+    for (int ky = 0; ky < 3; ++ky) {
+        int yy = rnn_clampi(y + (ky - 1) * dil, 0, H - 1);
+        for (int kx = 0; kx < 3; ++kx) {
+            int xx = rnn_clampi(x + (kx - 1) * dil, 0, W - 1);
+            for (int c = 0; c < cin; ++c) {
+                float v = in(c, xx, yy);
+                for (int o = 0; o < RNN15_CH; ++o) out[o] += w[((o * cin + c) * 3 + ky) * 3 + kx] * v;
+            }
+        }
+    }
+    for (int o = 0; o < RNN15_CH; ++o) out[o] = rnn_maxf(out[o], 0.0f);
+}
+
+// Head: R = sigmoid(base logit + delta).
+template <typename HA>
+inline float rnn15_out_at(HA h, float zb, int x, int y) {
+    float d = RNN15_B5[0];
+    for (int c = 0; c < RNN15_CH; ++c) d += RNN15_W5[c] * h(c, x, y);
+    return 1.0f / (1.0f + RNN_EXP(-(zb + d)));
+}

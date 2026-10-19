@@ -1634,6 +1634,10 @@ struct Config {
     // on a 12 MP burst. Bayer + linear guide only; declines (mask unchanged)
     // otherwise. OFF by default.
     bool  robust_nn_enabled = false;
+    // v15 (tools/robust_nn, opt-in, needs robust_nn_enabled): pixel-seeing refinement over
+    // its own v14 base, banded kernels rnn15_*. ~3x v14's mask-step GPU work and ~25 MB of
+    // band buffers on a 12 MP burst; falls back to v14 whenever it cannot run.
+    bool  robust_nn_v15_enabled = false;
     // Decisiveness of robust_nn: R' = clamp((R - below) / (above - below), 0, 1).
     // The net hedges (~0.3 on ghosts, ~0.7 on good samples) and the merge's
     // normalisation turns a 0.3 leak across several frames into most of the

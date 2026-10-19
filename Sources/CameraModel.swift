@@ -369,6 +369,9 @@ struct TuningParams: Equatable, Codable {
     /// tools/robust_nn (v14 weights): learned refinement of the analytic robustness
     /// mask (R = sigmoid(logit(R0) + delta)), one fused Metal kernel. Off by default.
     var robust_nn_enabled: Bool = false
+    /// robust_nn v15 (opt-in, on top of robust_nn_enabled): pixel-seeing mask net. More GPU (~3x the
+    /// mask step) and ~25 MB of band buffers on a 12 MP burst; falls back to v14 if it cannot run.
+    var robust_nn_v15_enabled: Bool = false
     /// robust_nn output: R below this -> exactly 0 (rejected). v14 default 0.20.
     /// Stored under new keys (…_v14) so a value saved by an earlier build cannot override the new default.
     var robust_nn_reject_below: Float = 0.20
@@ -475,6 +478,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_refine_deadzone
         case rob_mask_nn_enabled
         case robust_nn_enabled
+        case robust_nn_v15_enabled
         case robust_nn_reject_below = "robust_nn_reject_below_v14"
         case robust_nn_accept_above = "robust_nn_accept_above_v14"
         case hdr_black_percentile, hdr_vibrance
@@ -601,6 +605,7 @@ struct TuningParams: Equatable, Codable {
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         rob_mask_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .rob_mask_nn_enabled) ?? rob_mask_nn_enabled
         robust_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_enabled) ?? robust_nn_enabled
+        robust_nn_v15_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_v15_enabled) ?? robust_nn_v15_enabled
         robust_nn_reject_below = try c.decodeIfPresent(Float.self, forKey: .robust_nn_reject_below) ?? robust_nn_reject_below
         robust_nn_accept_above = try c.decodeIfPresent(Float.self, forKey: .robust_nn_accept_above) ?? robust_nn_accept_above
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
@@ -2416,6 +2421,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "rob_mask_nn_enabled": NSNumber(value: tuningParams.rob_mask_nn_enabled),
             "robust_nn_enabled": NSNumber(value: tuningParams.robust_nn_enabled),
+            "robust_nn_v15_enabled": NSNumber(value: tuningParams.robust_nn_v15_enabled),
             "robust_nn_reject_below": NSNumber(value: tuningParams.robust_nn_reject_below),
             "robust_nn_accept_above": NSNumber(value: tuningParams.robust_nn_accept_above),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),

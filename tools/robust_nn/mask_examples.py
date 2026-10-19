@@ -21,6 +21,7 @@ import numpy as np                            # noqa: E402
 import torch                                  # noqa: E402
 from PIL import Image, ImageDraw              # noqa: E402
 from real_protocol import run_tp_real, geo_target, compute_features, load_net, stretch, CLIP   # noqa: E402
+from rnn.pixnet import PixNet, pixel_inputs, consensus_inputs                               # noqa: E402
 
 PICK = [30, 31, 32, 33, 36, 41, 44, 47, 2, 3]       # val sample ids (>= 30: with deliberate corruption)
 
@@ -49,8 +50,22 @@ def main():
     def spec(sp):
         path, *c = sp.split(":") if not sp[1:3] == ":/" else [sp]
         lo, hi = (float(c[0]), float(c[1])) if c else (0.05, 0.95)
+        shift = float(c[2]) if len(c) > 2 else 0.0
         nm = path.replace("\\", "/").split("runs/")[1].replace("/model.pt", "").replace(".pt", "").replace("/", " ")
-        return load_net(path), lo, hi, nm
+        if "pix_" in path:   # v15 PixNet over the shipped v14
+            sd = torch.load(path, map_location="cpu")
+            npix = sd["p1.weight"].shape[1] - 14 - 1                          # 7 = with multi-frame consensus
+            pn = PixNet(load_net(os.path.join(HERE, "runs", "v14", "model.pt")), ch=sd["p1.weight"].shape[0], npix=npix)
+            pn.load_state_dict(sd)
+            pn.eval()
+            fn = lambda f, r0, pix, n=npix: pn(f, r0, pix[:, :n])[0]
+        else:
+            m = load_net(path)
+            fn = lambda f, r0, pix, m=m: m(f[:, :m.c1.in_channels], r0)[0]
+        def run(f, r0, pix, fn=fn):
+            R = fn(f, r0, pix).clamp(1e-6, 1 - 1e-6)
+            return stretch(torch.sigmoid(torch.log(R) - torch.log1p(-R) + shift), lo, hi).numpy()
+        return run, lo, hi, nm + (f" {shift:+.2f}" if shift else "")
     net, lo, hi, name = spec(sys.argv[1])
     out = sys.argv[2]
     other = spec(sys.argv[sys.argv.index("--vs") + 1]) if "--vs" in sys.argv else None
@@ -67,11 +82,12 @@ def main():
         d = run_tp_real(raw, gt, float(z["alpha"]), float(z["beta"]), seed, corrupt, z["cfa"], z["wb"], nomerge=True)
         Ir = d["ref_grey"][None].expand(N - 1, -1, -1).contiguous()
         with torch.no_grad():
-            feats, _ = compute_features(Ir, d["grey"], d["flow"], d["r0"], float(z["alpha"]) / 4, float(z["beta"]) / 4,
+            feats, J = compute_features(Ir, d["grey"], d["flow"], d["r0"], float(z["alpha"]) / 4, float(z["beta"]) / 4,
                                         CLIP, max(1, d["tile"] // 2))
-            R = stretch(net(feats[:, :net.c1.in_channels], d["r0"])[0], lo, hi).numpy()
-            A = (stretch(other[0](feats[:, :other[0].c1.in_channels], d["r0"])[0], other[1], other[2]).numpy()
-                 if other else d["r0"].numpy())
+            pix = pixel_inputs(Ir, J, float(z["alpha"]) / 4, float(z["beta"]) / 4)
+            pix = torch.cat([pix, consensus_inputs(Ir, J, float(z["alpha"]) / 4, float(z["beta"]) / 4)], 1)
+            R = net(feats, d["r0"], pix)
+            A = other[0](feats, d["r0"], pix) if other else d["r0"].numpy()
         t = geo_target(torch.from_numpy(z["clean_grey"]), d["flow"], torch.from_numpy(gt[1:]),
                        torch.from_numpy(z["vis"][1:].astype(np.float32)), float(z["alpha"]), float(z["beta"]),
                        occ_look=occ).numpy()
