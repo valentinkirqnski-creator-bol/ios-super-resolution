@@ -366,16 +366,16 @@ struct TuningParams: Equatable, Codable {
     /// vectors; +6.4% merged-MSE on held-out synthetic. Needs the multi-frame
     /// consensus pre-pass. CPU/harness path today; device Metal apply pending.
     var rob_mask_nn_enabled: Bool = false
-    /// tools/robust_nn (v14 weights): learned refinement of the analytic robustness
+    /// tools/robust_nn (v17 weights): learned refinement of the analytic robustness
     /// mask (R = sigmoid(logit(R0) + delta)), one fused Metal kernel. Off by default.
     var robust_nn_enabled: Bool = false
     /// robust_nn v15 (opt-in, on top of robust_nn_enabled): pixel-seeing mask net. More GPU (~3x the
     /// mask step) and ~25 MB of band buffers on a 12 MP burst; falls back to v14 if it cannot run.
     var robust_nn_v15_enabled: Bool = false
-    /// robust_nn output: R below this -> exactly 0 (rejected). v14 default 0.20.
+    /// robust_nn output: R below this -> exactly 0 (rejected). v14/v17 default 0.20.
     /// Stored under new keys (…_v14) so a value saved by an earlier build cannot override the new default.
     var robust_nn_reject_below: Float = 0.20
-    /// robust_nn output: R above this -> exactly 1 (fully trusted). v14 default 0.90.
+    /// robust_nn output: R above this -> exactly 1 (fully trusted). v14/v17 default 0.90.
     var robust_nn_accept_above: Float = 0.90
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0

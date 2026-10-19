@@ -1643,7 +1643,8 @@ struct Config {
     // normalisation turns a 0.3 leak across several frames into most of the
     // pixel, so its output is sharpened to hard reject / full trust.
     // above <= below disables it (raw network output).
-    // v14 is tuned with exact 0/1 output: below 0.20 -> 0, above 0.90 -> 1 (the setting at which it beats
+    // v17 (same network size as v14) is tuned for the same cutoffs; v14 was tuned with exact 0/1 output:
+    // below 0.20 -> 0, above 0.90 -> 1 (the setting at which it beat
     // v13 on missed misalignments, partial ghost weight, small shifts, rotations and over-rejection at once).
     float robust_nn_reject_below = 0.20f;
     float robust_nn_accept_above = 0.90f;

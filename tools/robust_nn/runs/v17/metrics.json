@@ -1,0 +1,62 @@
+{
+ "source": "runs/v17/model_s12500.pt + logit shift +0.25 folded into c3.bias",
+ "ground_truth": "8-frame merged-noise visibility (RNN_GT_NMERGE=8), occluded points judged by look",
+ "cutoffs": [
+  0.2,
+  0.9
+ ],
+ "held_out_8frame": {
+  "old_scene_c15_val": {
+   "v14": {
+    "missed": 13.13,
+    "over": 3.73,
+    "small": 28.31,
+    "rot": 18.55,
+    "flat": 5.07,
+    "bal": 91.57
+   },
+   "v15": {
+    "missed": 10.0,
+    "over": 3.63,
+    "small": 18.73,
+    "rot": 13.96,
+    "flat": 5.38,
+    "bal": 93.19
+   },
+   "v17": {
+    "missed": 8.83,
+    "over": 2.15,
+    "small": 15.98,
+    "rot": 8.73,
+    "flat": 1.52,
+    "bal": 94.51
+   }
+  },
+  "user_scenes_c17_val": {
+   "v14": {
+    "missed": 11.25,
+    "over": 6.13,
+    "small": 19.95,
+    "rot": 13.56,
+    "flat": 5.2,
+    "bal": 91.31
+   },
+   "v15": {
+    "missed": 9.72,
+    "over": 4.68,
+    "small": 15.01,
+    "rot": 10.46,
+    "flat": 5.63,
+    "bal": 92.8
+   },
+   "v17": {
+    "missed": 7.71,
+    "over": 5.25,
+    "small": 10.33,
+    "rot": 5.64,
+    "flat": 1.74,
+    "bal": 93.52
+   }
+  }
+ }
+}
