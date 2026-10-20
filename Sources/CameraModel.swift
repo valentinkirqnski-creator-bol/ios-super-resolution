@@ -369,8 +369,8 @@ struct TuningParams: Equatable, Codable {
     /// tools/robust_nn (v17 weights): learned refinement of the analytic robustness
     /// mask (R = sigmoid(logit(R0) + delta)), one fused Metal kernel. Off by default.
     var robust_nn_enabled: Bool = false
-    /// Match every frame's brightness to the reference before alignment / masking / merging (auto-exposure
-    /// drifts inside ZSL bursts; without this the masks darken well-aligned scenes). On by default.
+    /// Match every frame's brightness to the reference before alignment / masking / merging, from each frame's
+    /// exposure metadata (shutter x ISO); locked bursts are untouched. On by default.
     var exposure_match_enabled: Bool = true
     /// robust_nn v15 (opt-in, on top of robust_nn_enabled): pixel-seeing mask net. More GPU (~3x the
     /// mask step) and ~25 MB of band buffers on a 12 MP burst; falls back to v14 if it cannot run.

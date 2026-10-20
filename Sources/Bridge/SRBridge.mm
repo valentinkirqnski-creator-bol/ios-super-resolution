@@ -921,6 +921,13 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
 
     if (is_reference)
         FillReferenceMetadataFromRawFrame(frame, cfg);
+    // This frame's exposure (shutter seconds x ISO) for brightness matching within the burst; 0 = unknown.
+    NSDictionary *frame_exif = EXIFMetadata(DictValue(frame, @"metadata"));
+    const float frame_shutter = FirstNumber(FirstValueForKeys(frame_exif, @[
+        (__bridge NSString *)kCGImagePropertyExifExposureTime, @"ExposureTime"]), 0.f);
+    const float frame_iso = FirstNumber(FirstValueForKeys(frame_exif, @[
+        (__bridge NSString *)kCGImagePropertyExifISOSpeedRatings, @"ISOSpeedRatings"]), 0.f);
+    const float frame_exposure = (frame_shutter > 0.f && frame_iso > 0.f) ? frame_shutter * frame_iso : 0.f;
 
     float maxv = cfg.has_black_levels ? cfg.white_level : 65535.f;
     float site_black[2][2];
@@ -1008,7 +1015,10 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
     // The Metal path cropped inside the kernel, so `img` is already the final
     // extent (or dimensions-only). Only the CPU fallback, which decodes the whole
     // plane, still needs these.
-    if (img.h == out_h && img.w == out_w) return img;
+    if (img.h == out_h && img.w == out_w) {
+        img.exposure = frame_exposure;
+        return img;
+    }
 
     if (cfg.input_crop_zoom > 1.f) {
         const float z = cfg.input_crop_zoom;
@@ -1038,6 +1048,7 @@ static Image DecodeRawFrameDictionary(NSDictionary *frame, Config& cfg,
                 c.at(y, x) = img.at(y, x);
         img = std::move(c);
     }
+    img.exposure = frame_exposure;
     return img;
 }
 

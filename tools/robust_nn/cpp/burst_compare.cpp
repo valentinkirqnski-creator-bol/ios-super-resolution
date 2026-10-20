@@ -77,12 +77,17 @@ int main(int argc, char** argv) {
 
     Config cfg;
     std::vector<Image> burst = load_raw_burst(paths, cfg);
-    // BC_GAIN_NORM=1: match every frame's brightness to the reference, one gain per CFA site (median of the
-    // inner frame, robust to the burst's small motion) - tests whether exposure drift causes the over-rejection.
-    if (std::getenv("BC_GAIN_NORM") && burst.size() > 1) {   // the app's own brightness matching (core/raw_io)
+    // BC_GAIN_NORM=1: match every frame's brightness to the reference like the app does (one gain from the
+    // frames' shutter x ISO metadata) - tests whether exposure drift causes the over-rejection.
+    if (std::getenv("BC_GAIN_NORM") && burst.size() > 1 && burst[0].exposure > 0.f) {   // the app's matching
         float med[4], mx[4];
         raw_site_stats(burst[0], med, mx);
-        for (size_t k = 1; k < burst.size(); ++k) match_raw_exposure(burst[k], med, mx);
+        for (size_t k = 1; k < burst.size(); ++k)
+            if (burst[k].exposure > 0.f) {
+                const float g = std::min(1.5f, std::max(0.67f, burst[0].exposure / burst[k].exposure));
+                std::fprintf(stderr, "frame %zu exposure gain %.4f\n", k, g);
+                if (std::fabs(g - 1.f) > 0.002f) apply_raw_gain(burst[k], g, mx);
+            }
     }
     if (cx < 0) cx = (burst[0].w - cw) / 2;
     if (cy < 0) cy = (burst[0].h - ch) / 2;
@@ -107,8 +112,14 @@ int main(int argc, char** argv) {
     CovField ref_covs = estimate_kernels(ref, work);
 
     const int Hs = (int)std::lround(work.scale * ref.h), Ws = (int)std::lround(work.scale * ref.w);
-    Image num[3] = {Image(Hs, Ws, 3), Image(Hs, Ws, 3), Image(Hs, Ws, 3)};
-    Image den[3] = {Image(Hs, Ws, 3), Image(Hs, Ws, 3), Image(Hs, Ws, 3)};
+    // BC_MERGES (e.g. "nn" or "r0,nn"): only these merges, to fit full frames in memory. Default: all three.
+    const char* bm = std::getenv("BC_MERGES");
+    const std::string sel = bm ? bm : "ones,r0,nn";
+    const bool want[3] = {sel.find("ones") != std::string::npos, sel.find("r0") != std::string::npos,
+                          sel.find("nn") != std::string::npos};
+    Image num[3], den[3];
+    for (int v = 0; v < 3; ++v)
+        if (want[v]) { num[v] = Image(Hs, Ws, 3); den[v] = Image(Hs, Ws, 3); }
 
     const std::vector<float> rgrey = guide_grey(ref, work);
     const int gw = ref.w / 2, gh = ref.h / 2;
@@ -153,9 +164,9 @@ int main(int argc, char** argv) {
                 ones.at(y, x) = 1.f;
             }
         CovField covs = estimate_kernels(comp, work);
-        merge_comp(comp, flow, covs, ones, tile, num[0], den[0], work);
-        merge_comp(comp, flow, covs, rob, tile, num[1], den[1], work);
-        merge_comp(comp, flow, covs, rnn, tile, num[2], den[2], work);
+        if (want[0]) merge_comp(comp, flow, covs, ones, tile, num[0], den[0], work);
+        if (want[1]) merge_comp(comp, flow, covs, rob, tile, num[1], den[1], work);
+        if (want[2]) merge_comp(comp, flow, covs, rnn, tile, num[2], den[2], work);
         double m0 = 0, m1 = 0;
         for (size_t i = 0; i < r0g.size(); ++i) m0 += r0g[i], m1 += rn[i];
         std::fprintf(stderr, "frame %d: mean R analytic %.3f  nn %.3f\n", k, m0 / r0g.size(), m1 / rn.size());
@@ -163,6 +174,7 @@ int main(int argc, char** argv) {
     std::fclose(fm);
     const char* names[3] = {"ones", "r0", "nn"};
     for (int v = 0; v < 3; ++v) {
+        if (!want[v]) continue;
         merge_ref(ref, ref_covs, num[v], den[v], work, nullptr);
         std::vector<float> o(num[v].data.size());
         for (size_t i = 0; i < o.size(); ++i) o[i] = den[v].data[i] > 0.f ? num[v].data[i] / den[v].data[i] : 0.f;

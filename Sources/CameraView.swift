@@ -1269,7 +1269,7 @@ struct CameraView: View {
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Match Frame Brightness", isOn: $cam.tuningParams.exposure_match_enabled)
                     Text("""
-                         Scales every frame to the reference's brightness before aligning, masking and merging. Auto-exposure keeps adjusting during the frame ring, so one burst often mixes frames 5-10% apart (e.g. 1/2000 s and 1/2200 s); without this the robustness masks treat that difference as misalignment and darken well-aligned areas, and the merge can show brightness steps at tile borders. On by default.
+                         Scales every frame to the reference's brightness before aligning, masking and merging, using each frame's own exposure metadata (shutter x ISO). Bursts whose exposure changes mid-burst (auto-exposure on the ZSL ring, imported bursts from other apps, e.g. 1/2000 s and 1/2200 s) otherwise look misaligned everywhere to the robustness masks. Bursts with locked exposure are left untouched. On by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Robust NN v17 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)

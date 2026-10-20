@@ -75,6 +75,9 @@ struct Image {
     int w = 0;
     int c = 1;
     std::vector<f32> data;
+    // Raw frames only: exposure from the frame's own metadata, shutter seconds x ISO (0 = unknown). Used to
+    // match brightness within a burst (Config::exposure_match_enabled).
+    f32 exposure = 0.f;
 
     Image() = default;
     Image(int h_, int w_, int c_ = 1) : h(h_), w(w_), c(c_), data((size_t)h_ * w_ * c_, 0.f) {}
@@ -1633,11 +1636,13 @@ struct Config {
     // kernel at guide resolution, features in threadgroup memory; ~36 MB extra
     // on a 12 MP burst. Bayer + linear guide only; declines (mask unchanged)
     // otherwise. OFF by default.
-    // Match every comparison frame's brightness to the reference before alignment, robustness and merge:
-    // one gain per 2x2 CFA site from robust inner-frame medians. Auto-exposure keeps adjusting the ZSL ring,
-    // so frames of one burst routinely differ by 5-10% (MEASURED: 1/2000 s -> 1/2200 s inside a burst); the
-    // masks read that as misalignment everywhere and darken well-aligned scenes, and the merge shows
-    // brightness steps at tile borders. Also corrects lighting flicker.
+    // Match every comparison frame's brightness to the reference before alignment, robustness and merge,
+    // from the frames' own exposure metadata: gain = (shutter x ISO of the reference) / (shutter x ISO of the
+    // frame), one gain for all channels. Bursts whose exposure changes mid-burst (auto-exposure on the ZSL
+    // ring, other camera apps: MEASURED 1/2000 s -> 1/2200 s inside one burst) otherwise read as misaligned
+    // everywhere. Locked bursts have equal metadata -> gain exactly 1 -> untouched; no metadata -> untouched.
+    // (A first version estimated per-site gains from image medians; camera motion biased them by several %
+    // per channel and created the very mismatch it was meant to remove.)
     bool  exposure_match_enabled = true;
     bool  robust_nn_enabled = false;
     // v15 (tools/robust_nn, opt-in, needs robust_nn_enabled): pixel-seeing refinement over

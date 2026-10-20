@@ -1186,18 +1186,21 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                   const ProgressFn& progress, int maxPreviewDim) {
     if (frame_count < 2 || !loader_in) return Image();
     // Every frame of the burst comes through this loader (reference, prealign thumbnails, analysis and merge
-    // passes), so brightness matching here covers the DNG and ZSL paths alike. The reference statistics are
-    // those of the most recent reference load (frame 0 first, then the selected reference).
+    // passes), so brightness matching here covers the DNG and ZSL paths alike. The gain is the ratio of the
+    // frames' own exposure metadata (shutter x ISO), one gain for all channels; nothing happens when either
+    // frame lacks it or the exposures are equal (locked bursts). The reference is the most recent reference
+    // load (frame 0 first, then the selected reference).
     float exp_ref_med[4] = {0.f, 0.f, 0.f, 0.f}, exp_ref_max[4] = {0.f, 0.f, 0.f, 0.f};
-    bool exp_have_ref = false;
+    f32 exp_ref = 0.f;
     const RawFrameLoaderFn loader = [&](int index, Config& c, bool is_reference, int crop_h, int crop_w) {
         Image im = loader_in(index, c, is_reference, crop_h, crop_w);
         if (!cfg.exposure_match_enabled || im.h <= 0) return im;
         if (is_reference) {
-            raw_site_stats(im, exp_ref_med, exp_ref_max);
-            exp_have_ref = true;
-        } else if (exp_have_ref) {
-            match_raw_exposure(im, exp_ref_med, exp_ref_max);
+            exp_ref = im.exposure;
+            if (exp_ref > 0.f) raw_site_stats(im, exp_ref_med, exp_ref_max);
+        } else if (exp_ref > 0.f && im.exposure > 0.f) {
+            const float g = std::min(1.5f, std::max(0.67f, exp_ref / im.exposure));
+            if (std::fabs(g - 1.f) > 0.002f) apply_raw_gain(im, g, exp_ref_max);
         }
         return im;
     };

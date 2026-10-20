@@ -455,6 +455,9 @@ Image load_raw_frame(const std::string& path, Config& cfg, bool is_reference,
     if (raw->open_file(path.c_str()) != LIBRAW_SUCCESS) return Image();
     if (raw->unpack() != LIBRAW_SUCCESS) { raw->recycle(); return Image(); }
     Image img = decode_raw_file(*raw, cfg, is_reference, crop_h, crop_w, path);
+    // exposure metadata for brightness matching within a burst (0 = unknown)
+    const double shutter = raw->imgdata.other.shutter, iso = raw->imgdata.other.iso_speed;
+    if (shutter > 0.0 && iso > 0.0) img.exposure = (f32)(shutter * iso);
     raw->recycle();
     return img;
 #else
@@ -527,25 +530,19 @@ void raw_site_stats(const Image& raw, float med[4], float mx[4]) {
     }
 }
 
-// Scales a comparison raw frame so its per-site medians match the reference's (Config::exposure_match_enabled).
-// Gains are clamped to [0.67, 1.5]; sites too dark to measure are left alone. A brightened pixel is capped at
-// the reference's maximum for that site unless it was already above it, so saturated highlights stay at the
-// reference's saturation level instead of overshooting it.
-void match_raw_exposure(Image& raw, const float ref_med[4], const float ref_max[4]) {
-    if (raw.c != 1 || raw.h < 16 || raw.w < 16) return;
-    float med[4], mx[4];
-    raw_site_stats(raw, med, mx);
+// Scales a comparison raw frame by one exposure gain g (Config::exposure_match_enabled). A brightened pixel is
+// capped at the reference's maximum for its CFA site unless it was already above it, so saturated highlights stay
+// at the reference's saturation level (raw values are pre-white-balanced, so R/B saturate above 1).
+void apply_raw_gain(Image& raw, float g, const float ref_max[4]) {
+    if (raw.c != 1 || !(g > 0.f) || std::fabs(g - 1.f) < 1e-6f) return;
     for (int s = 0; s < 4; ++s) {
-        if (ref_med[s] < 2e-3f || med[s] < 2e-3f) continue;
-        const float g = std::min(1.5f, std::max(0.67f, ref_med[s] / med[s]));
-        if (std::fabs(g - 1.f) < 0.002f) continue;
         const int i = s / 2, j = s % 2;
         const float cap = ref_max[s];
         for (int y = i; y < raw.h; y += 2)
             for (int x = j; x < raw.w; x += 2) {
                 float& p = raw.at(y, x, 0);
                 const float q = p * g;
-                p = (g > 1.f && q > cap) ? std::max(p, cap) : q;
+                p = (g > 1.f && cap > 0.f && q > cap) ? std::max(p, cap) : q;
             }
     }
 }
