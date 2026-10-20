@@ -77,7 +77,13 @@ int main(int argc, char** argv) {
 
     Config cfg;
     std::vector<Image> burst = load_raw_burst(paths, cfg);
-    if (burst.size() < 2) return 2;
+    // BC_GAIN_NORM=1: match every frame's brightness to the reference, one gain per CFA site (median of the
+    // inner frame, robust to the burst's small motion) - tests whether exposure drift causes the over-rejection.
+    if (std::getenv("BC_GAIN_NORM") && burst.size() > 1) {   // the app's own brightness matching (core/raw_io)
+        float med[4], mx[4];
+        raw_site_stats(burst[0], med, mx);
+        for (size_t k = 1; k < burst.size(); ++k) match_raw_exposure(burst[k], med, mx);
+    }
     if (cx < 0) cx = (burst[0].w - cw) / 2;
     if (cy < 0) cy = (burst[0].h - ch) / 2;
     cx &= ~1;

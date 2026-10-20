@@ -25,6 +25,11 @@ std::vector<Image> load_raw_burst(const std::vector<std::string>& paths, Config&
 Image load_raw_frame(const std::string& path, Config& cfg, bool is_reference,
                      int crop_h = 0, int crop_w = 0);
 
+// Brightness matching within a burst (Config::exposure_match_enabled): per-2x2-CFA-site median and maximum of
+// a raw frame's inner 3/4, and in-place scaling of a comparison frame so its site medians match the reference's.
+void raw_site_stats(const Image& raw, float med[4], float mx[4]);
+void match_raw_exposure(Image& raw, const float ref_med[4], const float ref_max[4]);
+
 // Convert a normalized RGB float image [H,W,3] (0..1) to packed 8-bit RGBA
 // (for handing back to Android Bitmap). Applies sRGB gamma.
 std::vector<uint8_t> to_rgba8(const Image& rgb);

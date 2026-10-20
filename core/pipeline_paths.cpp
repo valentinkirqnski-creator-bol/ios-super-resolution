@@ -1181,10 +1181,26 @@ static Image compute_mask_nn_consensus(const RawFrameLoaderFn& loader,
 
 } // namespace
 
-Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader,
+Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loader_in,
                                   const Config& cfg, const std::string& dng_path,
                                   const ProgressFn& progress, int maxPreviewDim) {
-    if (frame_count < 2 || !loader) return Image();
+    if (frame_count < 2 || !loader_in) return Image();
+    // Every frame of the burst comes through this loader (reference, prealign thumbnails, analysis and merge
+    // passes), so brightness matching here covers the DNG and ZSL paths alike. The reference statistics are
+    // those of the most recent reference load (frame 0 first, then the selected reference).
+    float exp_ref_med[4] = {0.f, 0.f, 0.f, 0.f}, exp_ref_max[4] = {0.f, 0.f, 0.f, 0.f};
+    bool exp_have_ref = false;
+    const RawFrameLoaderFn loader = [&](int index, Config& c, bool is_reference, int crop_h, int crop_w) {
+        Image im = loader_in(index, c, is_reference, crop_h, crop_w);
+        if (!cfg.exposure_match_enabled || im.h <= 0) return im;
+        if (is_reference) {
+            raw_site_stats(im, exp_ref_med, exp_ref_max);
+            exp_have_ref = true;
+        } else if (exp_have_ref) {
+            match_raw_exposure(im, exp_ref_med, exp_ref_max);
+        }
+        return im;
+    };
 
     prof_reset();
     prof_mark_memory("burst:begin");

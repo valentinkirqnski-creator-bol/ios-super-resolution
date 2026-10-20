@@ -504,4 +504,50 @@ std::vector<uint8_t> to_rgba8(const Image& rgb) {
     return out;
 }
 
+
+// Robust brightness of a raw frame: the median of each 2x2 CFA site over the inner 3/4 of the frame
+// (the burst's small motion barely moves that distribution), sampled every 4th quad for speed, plus each
+// site's maximum (a saturation estimate; raw values are pre-white-balanced, so R/B can exceed 1).
+void raw_site_stats(const Image& raw, float med[4], float mx[4]) {
+    for (int s = 0; s < 4; ++s) {
+        const int i = s / 2, j = s % 2;
+        std::vector<float> v;
+        v.reserve((size_t)(raw.h / 8 + 1) * (size_t)(raw.w / 8 + 1));
+        float m = 0.f;
+        for (int y = raw.h / 8 + i; y < raw.h - raw.h / 8; y += 8)
+            for (int x = raw.w / 8 + j; x < raw.w - raw.w / 8; x += 8) {
+                const float p = raw.at(y, x, 0);
+                v.push_back(p);
+                m = std::max(m, p);
+            }
+        mx[s] = m;
+        if (v.empty()) { med[s] = 0.f; continue; }
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        med[s] = v[v.size() / 2];
+    }
+}
+
+// Scales a comparison raw frame so its per-site medians match the reference's (Config::exposure_match_enabled).
+// Gains are clamped to [0.67, 1.5]; sites too dark to measure are left alone. A brightened pixel is capped at
+// the reference's maximum for that site unless it was already above it, so saturated highlights stay at the
+// reference's saturation level instead of overshooting it.
+void match_raw_exposure(Image& raw, const float ref_med[4], const float ref_max[4]) {
+    if (raw.c != 1 || raw.h < 16 || raw.w < 16) return;
+    float med[4], mx[4];
+    raw_site_stats(raw, med, mx);
+    for (int s = 0; s < 4; ++s) {
+        if (ref_med[s] < 2e-3f || med[s] < 2e-3f) continue;
+        const float g = std::min(1.5f, std::max(0.67f, ref_med[s] / med[s]));
+        if (std::fabs(g - 1.f) < 0.002f) continue;
+        const int i = s / 2, j = s % 2;
+        const float cap = ref_max[s];
+        for (int y = i; y < raw.h; y += 2)
+            for (int x = j; x < raw.w; x += 2) {
+                float& p = raw.at(y, x, 0);
+                const float q = p * g;
+                p = (g > 1.f && q > cap) ? std::max(p, cap) : q;
+            }
+    }
+}
+
 } // namespace hhsr

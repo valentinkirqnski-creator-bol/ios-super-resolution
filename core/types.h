@@ -1633,6 +1633,12 @@ struct Config {
     // kernel at guide resolution, features in threadgroup memory; ~36 MB extra
     // on a 12 MP burst. Bayer + linear guide only; declines (mask unchanged)
     // otherwise. OFF by default.
+    // Match every comparison frame's brightness to the reference before alignment, robustness and merge:
+    // one gain per 2x2 CFA site from robust inner-frame medians. Auto-exposure keeps adjusting the ZSL ring,
+    // so frames of one burst routinely differ by 5-10% (MEASURED: 1/2000 s -> 1/2200 s inside a burst); the
+    // masks read that as misalignment everywhere and darken well-aligned scenes, and the merge shows
+    // brightness steps at tile borders. Also corrects lighting flicker.
+    bool  exposure_match_enabled = true;
     bool  robust_nn_enabled = false;
     // v15 (tools/robust_nn, opt-in, needs robust_nn_enabled): pixel-seeing refinement over
     // its own v14 base, banded kernels rnn15_*. ~3x v14's mask-step GPU work and ~25 MB of

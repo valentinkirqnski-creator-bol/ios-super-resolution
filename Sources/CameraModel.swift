@@ -369,6 +369,9 @@ struct TuningParams: Equatable, Codable {
     /// tools/robust_nn (v17 weights): learned refinement of the analytic robustness
     /// mask (R = sigmoid(logit(R0) + delta)), one fused Metal kernel. Off by default.
     var robust_nn_enabled: Bool = false
+    /// Match every frame's brightness to the reference before alignment / masking / merging (auto-exposure
+    /// drifts inside ZSL bursts; without this the masks darken well-aligned scenes). On by default.
+    var exposure_match_enabled: Bool = true
     /// robust_nn v15 (opt-in, on top of robust_nn_enabled): pixel-seeing mask net. More GPU (~3x the
     /// mask step) and ~25 MB of band buffers on a 12 MP burst; falls back to v14 if it cannot run.
     var robust_nn_v15_enabled: Bool = false
@@ -478,6 +481,7 @@ struct TuningParams: Equatable, Codable {
         case robustness_refine_deadzone
         case rob_mask_nn_enabled
         case robust_nn_enabled
+        case exposure_match_enabled
         case robust_nn_v15_enabled
         case robust_nn_reject_below = "robust_nn_reject_below_v14"
         case robust_nn_accept_above = "robust_nn_accept_above_v14"
@@ -605,6 +609,7 @@ struct TuningParams: Equatable, Codable {
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
         rob_mask_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .rob_mask_nn_enabled) ?? rob_mask_nn_enabled
         robust_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_enabled) ?? robust_nn_enabled
+        exposure_match_enabled = try c.decodeIfPresent(Bool.self, forKey: .exposure_match_enabled) ?? exposure_match_enabled
         robust_nn_v15_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_v15_enabled) ?? robust_nn_v15_enabled
         robust_nn_reject_below = try c.decodeIfPresent(Float.self, forKey: .robust_nn_reject_below) ?? robust_nn_reject_below
         robust_nn_accept_above = try c.decodeIfPresent(Float.self, forKey: .robust_nn_accept_above) ?? robust_nn_accept_above
@@ -2421,6 +2426,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
             "rob_mask_nn_enabled": NSNumber(value: tuningParams.rob_mask_nn_enabled),
             "robust_nn_enabled": NSNumber(value: tuningParams.robust_nn_enabled),
+            "exposure_match_enabled": NSNumber(value: tuningParams.exposure_match_enabled),
             "robust_nn_v15_enabled": NSNumber(value: tuningParams.robust_nn_v15_enabled),
             "robust_nn_reject_below": NSNumber(value: tuningParams.robust_nn_reject_below),
             "robust_nn_accept_above": NSNumber(value: tuningParams.robust_nn_accept_above),
