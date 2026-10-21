@@ -4044,10 +4044,16 @@ struct RnnGuideGrey {
 // The correspondence rob_make_mask scores for a guide pixel (nch == 3 branch):
 // nearest tile or affine flow at the quad's raw centre, halved to guide px,
 // then the optional global homography. Returned as a displacement in guide px.
+// use_h = 0 leaves the homography out: the flow-consistency features read that
+// residual, because a large global rotation turns the composed displacement
+// into a steep smooth gradient (~1 px between neighbouring tiles at 7 deg) that
+// the net was trained to read as rotated, misaligned tiles. The warp (use_h = 1)
+// still samples the comparison through the homography.
 struct RnnAppFlow {
     device const float* flow;
     device const float* jac;
     constant RnnAppParams* p;
+    uint use_h;
     void operator()(int x, int y, thread float& dx, thread float& dy) const {
         float ry = 2.f * float(y) + 0.5f, rx = 2.f * float(x) + 0.5f;
         float fx, fy;
@@ -4064,7 +4070,7 @@ struct RnnAppFlow {
             fy = 0.5f * flow[fi + 1u];
         }
         float sx = float(x) + fx, sy = float(y) + fy;
-        if (p->homog != 0u) {
+        if (use_h != 0u && p->homog != 0u) {
             float px2 = 2.f * sx, py2 = 2.f * sy;
             float wq = p->hmat[6] * px2 + p->hmat[7] * py2 + p->hmat[8];
             float iwq = (wq != 0.f) ? 1.f / wq : 0.f;
@@ -4120,7 +4126,8 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
     const int nt = int(tpt.x * tpt.y);
     const int x0 = int(tgid.x) * RNN_TS, y0 = int(tgid.y) * RNN_TS;
     RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
-    RnnAppFlow fl = {flow, jac, &p};
+    RnnAppFlow fl = {flow, jac, &p, 1u};    // warp: full correspondence
+    RnnAppFlow fr = {flow, jac, &p, 0u};    // flow features: residual after the homography
 
     // 1) warped comparison grey J over the tile + apron (clamped coords)
     RnnGuideGrey cg = {comp_guide, W};
@@ -4140,7 +4147,7 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
         int gx = clamp(x0 - 1 + i % RNN_HN, 0, W - 1);
         int gy = clamp(y0 - 1 + i / RNN_HN, 0, H - 1);
         float f[RNN_NF];
-        rnn_features_at(rf, tj, fl, r0[gy * W + gx], P, gx, gy, f);
+        rnn_features_at(rf, tj, fr, r0[gy * W + gx], P, gx, gy, f);
         for (int c = 0; c < RNN_NF; ++c) sF[c * RNN_HN * RNN_HN + i] = f[c];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4206,7 +4213,7 @@ kernel void rnn15_warp(device const float* comp_guide [[buffer(0)]],
     const int x = int(gid.x), y = b.lo + int(gid.y);
     if (x >= p.width || y >= b.hi) return;
     RnnGuideGrey cg = {comp_guide, p.width};
-    RnnAppFlow fl = {flow, jac, &p};
+    RnnAppFlow fl = {flow, jac, &p, 1u};    // warp: full correspondence
     jband[(y - b.jb) * p.width + x] = rnn_warp_at(cg, fl, p.width, p.height, x, y);
 }
 
@@ -4222,7 +4229,7 @@ kernel void rnn15_feat(device const float* ref_grey [[buffer(0)]],
     const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
     if (x >= W || y >= b.hi) return;
     RNNParams P = {W, p.height, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
-    RnnAppFlow fl = {flow, jac, &p};
+    RnnAppFlow fl = {flow, jac, &p, 0u};    // flow features: residual after the homography
     RNNImg rf = {ref_grey, W};
     Rnn15Rows tj = {jband, W, b.jb};
     float f[RNN_NF];
