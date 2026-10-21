@@ -14,19 +14,20 @@ import torch                                            # noqa: E402
 import train_pix as tp                                  # noqa: E402
 from real_protocol import load_net                      # noqa: E402
 
-SHIFTS = [float(x) for x in os.environ.get("SHIFTS", "-0.25,0,0.125,0.25,0.375,0.5,0.75").split(",")]
+SHIFTS = [float(x) for x in os.environ.get("SHIFTS", "-0.25,0,0.125,0.25,0.375,0.5,0.75,1.0").split(",")]
 CUTS = [tuple(float(y) for y in x.split(":")) for x in
         os.environ.get("CUTS", "0.05:0.95,0.1:0.95,0.15:0.95,0.2:0.9,0.25:0.9,0.3:0.9").split(",")]
 KEYS = ["missed", "over", "small", "rot", "flat", "leak05"]       # lower is better
 
 
 def main():
-    assert os.environ.get("RNN_GT_NMERGE") == "8", "run with RNN_GT_NMERGE=8"
+    assert os.environ.get("RNN_GT_NMERGE") == "8" or os.environ.get("RNN_GT_HR") == "1", (
+        "run with RNN_GT_NMERGE=8 (guide-res target) or RNN_GT_HR=1 (full-res target)")
     torch.set_num_threads(4)
-    v14 = load_net(os.path.join(HERE, "runs", "v14", "model.pt"))
+    v14 = load_net(os.path.join(HERE, os.environ.get("BASE", "runs/v14/model.pt")))   # the shipped model to beat
     nets = {os.path.basename(ck)[:-3]: load_net(os.path.join(HERE, ck)) for ck in sys.argv[1:]}
     S = {}
-    for vs in ("c15_val", "c17_val"):
+    for vs in os.environ.get("VALS", "c15_val,c17_val").split(","):
         ds = tp.Cache(f"data/{vs}")
         C = {}
         with torch.no_grad():

@@ -23,9 +23,14 @@ import real_protocol as rp                                                # noqa
 OUT = None
 
 
-def _init(out):
-    global OUT
-    OUT = out
+EDGE_STEP = False
+HOMOG = False
+ORACLE = False
+
+
+def _init(out, edge_step=False, homog=False, oracle=False):
+    global OUT, EDGE_STEP, HOMOG, ORACLE
+    OUT, EDGE_STEP, HOMOG, ORACLE = out, edge_step, homog, oracle
     torch.set_num_threads(1)
 
 
@@ -40,7 +45,8 @@ def _job(job):
     al, be = float(z["alpha"]), float(z["beta"])
     for attempt in range(3):
         try:
-            d = rp.run_tp_real(raw, gt, al, be, seed + attempt, corrupt, z["cfa"], z["wb"], nomerge=True)
+            d = rp.run_tp_real(raw, gt, al, be, seed + attempt, corrupt, z["cfa"], z["wb"], nomerge=True,
+                               edge_step=EDGE_STEP, homog=HOMOG, oracle=ORACLE)
             break
         except Exception:   # noqa: BLE001 - transient harness failure: retry with the next seed
             time.sleep(1.0)
@@ -51,7 +57,8 @@ def _job(job):
     geo = rp.geo_target(clean, d["flow"], gtf, vis, al, be, occ_look=True)
     hm = rp.hard_maps(clean, gtf, d["flow"], al, be)
     tmp = path[:-4] + ".tmp.npz"
-    np.savez(tmp, ref=d["ref_grey"].numpy().astype(np.float32), grey=d["grey"].numpy().astype(np.float32),
+    extra = dict(rflow=d["rflow"].numpy().astype(np.float32)) if "rflow" in d else {}
+    np.savez(tmp, **extra, ref=d["ref_grey"].numpy().astype(np.float32), grey=d["grey"].numpy().astype(np.float32),
              flow=d["flow"].numpy().astype(np.float32), r0=d["r0"].numpy().astype(np.float16),
              geo=geo.numpy().astype(np.float16), edge=hm["edge"].numpy().astype(np.float16),
              rot=hm["rot"].numpy(), ferr=hm["ferr"].numpy().astype(np.float16),
@@ -69,13 +76,19 @@ def main():
     ap.add_argument("--val", action="store_true")
     ap.add_argument("--corrupt_p", type=float, default=0.8)
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--edge_step", action="store_true", help="v19: straight-edge step corruption (tp_real flag 8)")
+    ap.add_argument("--homog", action="store_true", help="v20: the app's global homography path (tp_real flag 16)")
+    ap.add_argument("--oracle", action="store_true", help="v21: perfect alignment (tp_real flag 32)")
+    ap.add_argument("--val_corrupt_only", action="store_true", help="v21: --val keeps only the corrupted half")
+    ap.add_argument("--no_corrupt", action="store_true",
+                    help="v20: never corrupt (perfect-alignment sets); --val then keeps only the aligner-only half")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for r in a.src.split(",") for f in glob.glob(os.path.join(HERE, r, "*.npz")))
     jobs = []
     if a.val:   # identical to RP(val)[idx]: idx < n aligner only, idx >= n corrupted; seed from default_rng(99 + idx)
         n = len(files)
-        for idx in range(2 * n):
+        for idx in (range(n, 2 * n) if a.val_corrupt_only else range(n if a.no_corrupt else 2 * n)):
             seed = int(np.random.default_rng(99 + idx).integers(1, 1 << 30))
             jobs.append((files[idx % n], f"val{idx:03d}", idx >= n, seed))
     else:
@@ -83,9 +96,10 @@ def main():
         for f in files:
             stem = os.path.splitext(os.path.basename(f))[0]
             for v in range(a.variants):
-                jobs.append((f, f"{stem}_v{v}", bool(rng.random() < a.corrupt_p), int(rng.integers(1, 1 << 30))))
+                cor = bool(rng.random() < a.corrupt_p)
+                jobs.append((f, f"{stem}_v{v}", cor and not a.no_corrupt, int(rng.integers(1, 1 << 30))))
     t0, bad = time.time(), 0
-    with Pool(a.workers, initializer=_init, initargs=(a.out,)) as p:
+    with Pool(a.workers, initializer=_init, initargs=(a.out, a.edge_step, a.homog, a.oracle)) as p:
         for k, dt in enumerate(p.imap_unordered(_job, jobs, chunksize=2)):
             bad += dt < 0
             if k % 50 == 0:

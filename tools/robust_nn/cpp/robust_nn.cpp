@@ -5,7 +5,7 @@
 namespace robust_nn {
 
 void refine(const float* ref, const float* cmp, const float* flow_xy, const float* r0, const RNNParams& P,
-            float* r_out, Scratch* scratch, float* feat_out) {
+            float* r_out, Scratch* scratch, float* feat_out, const float* feat_flow_xy) {
     Scratch local;
     Scratch& s = scratch ? *scratch : local;
     const int W = P.width, H = P.height;
@@ -22,7 +22,8 @@ void refine(const float* ref, const float* cmp, const float* flow_xy, const floa
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
             float f[RNN_NF];
-            rnn_features_at(RNNImg{ref, W}, RNNImg{s.J.data(), W}, RNNFlowInterleaved{flow_xy, W},
+            rnn_features_at(RNNImg{ref, W}, RNNImg{s.J.data(), W},
+                            RNNFlowInterleaved{feat_flow_xy ? feat_flow_xy : flow_xy, W},
                             r0[(size_t)y * W + x], P, x, y, f);
             for (int c = 0; c < RNN_NF; ++c) s.feat[c * plane + (size_t)y * W + x] = f[c];
         }

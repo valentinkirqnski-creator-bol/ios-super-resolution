@@ -13,6 +13,7 @@
 // out: A_ref,B_ref [Ho][Wo][3]
 //      for n=1..N-1: A_used,B_used,A_gt,B_gt [Ho][Wo][3]
 //      ref_grey [gh][gw]; for n=1..N-1: grey, r0, flow_x, flow_y, corrupt [gh][gw]
+//      (+ residual_flow_x, residual_flow_y [gh][gw] per frame with the homography flag 16)
 //      int32 tile
 #include <algorithm>
 #include <cmath>
@@ -26,17 +27,26 @@
 static double tnow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 #define TPT(name) do { if (std::getenv("TP_TIMING")) std::fprintf(stderr, "%-22s %.3fs\n", name, tnow() - _t0); _t0 = tnow(); } while (0)
 
+#include "global_homography.h"
 #include "snr_tuning.h"
 #include "stages.h"
 #include "types.h"
 
 using namespace hhsr;
 
-static void guide_flow(const FlowField& fl, int tile, int x, int y, float& dx, float& dy) {
+// The guide-pixel correspondence the app's mask kernels use (RnnAppFlow): nearest tile flow halved to guide px,
+// then the global homography when one was estimated. use_h = false: the residual tile flow alone.
+static void guide_flow(const FlowField& fl, int tile, int x, int y, float& dx, float& dy, bool use_h = true) {
     const float ry = 2.f * y + 0.5f, rx = 2.f * x + 0.5f;
     int py = std::min((int)(ry / tile), fl.ny - 1), px = std::min((int)(rx / tile), fl.nx - 1);
     dx = 0.5f * fl.dx(py, px);
     dy = 0.5f * fl.dy(py, px);
+    if (use_h && fl.has_global_h) {
+        float hx, hy;
+        apply_homography(fl.global_h, 2.f * (x + dx), 2.f * (y + dy), hx, hy);
+        dx = 0.5f * hx - x;
+        dy = 0.5f * hy - y;
+    }
 }
 
 // Corruption magnitude in RAW px: half tiny (0.02..0.1, below/at the aligner's own precision),
@@ -78,6 +88,18 @@ static int process(const char* in_path, const char* out_path) {
     const int N = hi[0], H = hi[1], W = hi[2], seed = hi[3];
     const int corrupt = hi[4] & 1;
     const bool nomerge = (hi[4] & 2) != 0;   // mask-only training: skip all merges (the slow part)
+    // v19: straight-edge steps. In corrupted frames, tiles crossed by a dominant straight edge are shifted a
+    // fraction of a pixel ACROSS that edge, each by its own amount, so a long straight edge comes out as
+    // offset segments at tile borders (the "shifted straight" edges seen at 48 MP).
+    const bool edge_step = (hi[4] & 8) != 0;
+    // v20: the app's global homography (Config::global_homography_enabled): each comparison grey is warped onto
+    // the reference by estimate_global_homography before align(), and the flow carries H. Per frame the output
+    // then also holds the residual tile flow (without H), which the net's flow features read.
+    const bool homog = (hi[4] & 16) != 0;
+    // v21: perfect alignment. Every tile's vector is set to the exact flow at the tile centre (exact for the
+    // translation-only bursts this is used with), before any deliberate corruption: any rejection of an
+    // uncorrupted frame is then the mask's own error.
+    const bool oracle = (hi[4] & 32) != 0;
     const int Hg = H / 2, Wg = W / 2;
     std::vector<Image> raw(N, Image(H, W, 1));
     for (auto& r : raw)
@@ -155,14 +177,44 @@ static int process(const char* in_path, const char* out_path) {
         const Image& comp = raw[n];
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
         TPT("comp grey");
-        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile);
+        const bool warp_h = homog && comp_grey.h == comp.h && comp_grey.w == comp.w &&
+                            ref_grey.h == ref.h && ref_grey.w == ref.w;   // full-resolution grey only, as in the app
+        f32 Hm[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+        FlowField flow;
+        if (warp_h) {
+            estimate_global_homography(ref_grey, comp_grey, work, Hm);
+            flow = align(ref_pyr, ref_grey, warp_grey_by_homography(comp_grey, Hm), work, tile);
+        } else {
+            flow = align(ref_pyr, ref_grey, comp_grey, work, tile);
+        }
         TPT("align");
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile, work.r_Mt,
                                      work.num_threads, work.grey_tile_size(tile));
+        if (warp_h) {
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = Hm[i];
+            flow.has_global_h = true;
+        }
+        if (oracle) {
+            const float* g = gt.data() + (size_t)n * Hg * Wg * 2;
+            for (int ty = 0; ty < flow.ny; ++ty)
+                for (int tx = 0; tx < flow.nx; ++tx) {
+                    const int gy = std::min((int)((ty + 0.5f) * tile * 0.5f), Hg - 1);
+                    const int gx = std::min((int)((tx + 0.5f) * tile * 0.5f), Wg - 1);
+                    const size_t i = ((size_t)ty * flow.nx + tx) * 2, s = ((size_t)gy * Wg + gx) * 2;
+                    flow.flow[i] = 2.f * g[s];            // grey px -> raw px
+                    flow.flow[i + 1] = 2.f * g[s + 1];
+                }
+            flow.global_h[0] = flow.global_h[4] = flow.global_h[8] = 1.f;
+            flow.global_h[1] = flow.global_h[2] = flow.global_h[3] = flow.global_h[5] = 0.f;
+            flow.global_h[6] = flow.global_h[7] = 0.f;
+            flow.has_global_h = false;
+        }
         std::vector<float> tcorr((size_t)flow.ny * flow.nx, 0.f);
         // Per-tile edge strength of the reference (mean squared grey gradient) as a rank in [0,1),
         // used for the EXTRA edge-targeted corruption below (the random corruption is unchanged).
         std::vector<float> erank((size_t)flow.ny * flow.nx, 0.5f);
+        // per-tile structure tensor of the reference grey (edge_step only): dominant edge normal + coherence
+        std::vector<double> sxx(erank.size(), 0.0), syy(erank.size(), 0.0), sxy(erank.size(), 0.0);
         {
             std::vector<double> esum(erank.size(), 0.0), ecnt(erank.size(), 0.0);
             for (int gy = 1; gy + 1 < ref_grey.h; ++gy)
@@ -173,6 +225,9 @@ static int process(const char* in_path, const char* out_path) {
                     const int tx = std::min((int)((2.f * gx + 0.5f) / tile), flow.nx - 1);
                     esum[(size_t)ty * flow.nx + tx] += dx * dx + dy * dy;
                     ecnt[(size_t)ty * flow.nx + tx] += 1.0;
+                    sxx[(size_t)ty * flow.nx + tx] += dx * dx;
+                    syy[(size_t)ty * flow.nx + tx] += dy * dy;
+                    sxy[(size_t)ty * flow.nx + tx] += dx * dy;
                 }
             std::vector<size_t> idx(erank.size());
             for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
@@ -227,6 +282,28 @@ static int process(const char* in_path, const char* out_path) {
                     tcorr[t] = 1.f;
                 }
         }
+        if (frame_corrupted && edge_step) {   // straight-edge steps (see edge_step above)
+            const float pfrac = 0.3f + 0.5f * U(rng);
+            for (int ty = 0; ty < flow.ny; ++ty)
+                for (int tx = 0; tx < flow.nx; ++tx) {
+                    const size_t t = (size_t)ty * flow.nx + tx;
+                    const double a = sxx[t], b = syy[t], c = sxy[t];
+                    const double tr = a + b, dd = std::sqrt((a - b) * (a - b) + 4.0 * c * c);
+                    const double l1 = 0.5 * (tr + dd), l2 = 0.5 * (tr - dd);
+                    const double coh = tr > 1e-12 ? ((l1 - l2) / (l1 + l2)) * ((l1 - l2) / (l1 + l2)) : 0.0;
+                    if (erank[t] < 0.6f || coh < 0.5 || U(rng) >= pfrac) continue;
+                    // edge normal = eigenvector of l1 (the gradient direction)
+                    float nx = (float)(l1 - b), ny = (float)c;
+                    if (std::fabs(nx) + std::fabs(ny) < 1e-12f) { nx = (float)c; ny = (float)(l1 - a); }
+                    const float nn = std::sqrt(nx * nx + ny * ny) + 1e-12f;
+                    nx /= nn; ny /= nn;
+                    const float mag = 0.08f * std::exp(U(rng) * std::log(7.5f)) * (U(rng) < 0.5f ? -1.f : 1.f);
+                    const float tang = 0.2f * mag * (2.f * U(rng) - 1.f);
+                    flow.flow[2 * t] += mag * nx - tang * ny;
+                    flow.flow[2 * t + 1] += mag * ny + tang * nx;
+                    tcorr[t] = 1.f;
+                }
+        }
         TPT("flow grid+corrupt");
         Image rob = compute_robustness(comp, ref_stats, flow, tile, work);
         TPT("compute_robustness");
@@ -246,12 +323,14 @@ static int process(const char* in_path, const char* out_path) {
         put(o, ng.data);
         put(o, dg.data);
         }
-        std::vector<float> r0((size_t)Hg * Wg), fx(r0.size()), fy(r0.size()), cm(r0.size());
+        std::vector<float> r0((size_t)Hg * Wg), fx(r0.size()), fy(r0.size()), cm(r0.size()),
+            rfx(homog ? r0.size() : 0), rfy(homog ? r0.size() : 0);
         for (int y = 0; y < Hg; ++y)
             for (int x = 0; x < Wg; ++x) {
                 const size_t i = (size_t)y * Wg + x;
                 r0[i] = rob.at(std::min(2 * y, rob.h - 1), std::min(2 * x, rob.w - 1));
                 guide_flow(flow, tile, x, y, fx[i], fy[i]);
+                if (homog) guide_flow(flow, tile, x, y, rfx[i], rfy[i], false);
                 const int py = std::min((int)((2.f * y + 0.5f) / tile), flow.ny - 1);
                 const int px = std::min((int)((2.f * x + 0.5f) / tile), flow.nx - 1);
                 cm[i] = tcorr[(size_t)py * flow.nx + px];
@@ -261,6 +340,10 @@ static int process(const char* in_path, const char* out_path) {
         per.push_back(fx);
         per.push_back(fy);
         per.push_back(cm);
+        if (homog) {
+            per.push_back(rfx);
+            per.push_back(rfy);
+        }
     }
     TPT("per-frame rest");
     put(o, guide_grey(ref));

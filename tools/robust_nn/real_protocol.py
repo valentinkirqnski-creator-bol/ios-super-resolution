@@ -48,6 +48,8 @@ HARD = os.environ.get("RNN_HARD", "0") == "1"               # v14: edge / rotati
 W_EDGE = float(os.environ.get("RNN_W_EDGE", "2"))           # extra cost of keeping a small-shift (< 1 px) misalignment
 W_ROT = float(os.environ.get("RNN_W_ROT", "3"))             # ... a misaligned rotated-content pixel
 W_FLAT = float(os.environ.get("RNN_W_FLAT", "1"))           # extra cost of dropping a good flat-area pixel
+W_TEX = float(os.environ.get("RNN_W_TEX", "0"))             # v18b: ... a good TEXTURED pixel (edge >= 0.5 sigma)
+W_CLEAR = float(os.environ.get("RNN_W_CLEAR", "0"))         # v18b: extra cost of any weight on a clearly misaligned pixel
 SELECT_SAFE = os.environ.get("RNN_SELECT", "") == "safe"    # v14: best = fewest errors with leak not above start
 
 
@@ -131,13 +133,12 @@ def load_scene(name):
 _SCENE = {}
 
 
-def _gen_one(args):
-    seed, out, val, scenes = args
+def build_burst(seed, val, scenes):
+    """The synthetic burst of a seed, exactly as _gen_one builds it (same rng draws): returns the Burst (whose
+    render_rgb gives any frame's noise-free scene at exact raw positions), the rng positioned just after
+    construction, and the scene's cfa / wb / noise. Generation env (RNN_ROT_PATCHES, RNN_VAL_FROM_SCENES) must match
+    the env the burst was generated with."""
     global _SCENE
-    path = os.path.join(out, f"rp{seed:08d}.npz")
-    if os.path.exists(path):
-        return
-    torch.set_num_threads(1)
     name_s = scenes[seed % len(scenes)] if (not val or os.environ.get("RNN_VAL_FROM_SCENES") == "1") else VAL_SCENE
     if name_s not in _SCENE:
         _SCENE[name_s] = load_scene(name_s)
@@ -155,11 +156,60 @@ def _gen_one(args):
     rlo, rhi, elo, ehi = (int(x) for x in os.environ.get("RNN_ROT_PATCHES", "0,7,0,4").split(","))
     sc.update(n_rot_patches=int(rng.integers(rlo, rhi + 1)), rot_max_deg=33.0,
               n_rot_patches_edge=int(rng.integers(elo, ehi + 1)))      # PLUS patches centred on edges/detail
+    if os.environ.get("RNN_ROT_SMALL"):    # v19: small tilt + shift patches on straight edges (see rnn/burst.py)
+        slo, shi = (int(x) for x in os.environ["RNN_ROT_SMALL"].split(","))
+        sc.update(n_rot_patches_small=int(rng.integers(slo, shi + 1)))
     if rng.random() < 0.3:
         sc.update(persp=float(np.exp(rng.uniform(np.log(1e-6), np.log(1e-5)))))
     k = float(np.exp(rng.uniform(0, np.log(30))))            # ISO multiplier on the DNG's own profile
     sc.update(noise_a=alpha0 * k, noise_b=beta0 * k * k)
-    b = Burst(sc, rng, Hr=SIZE, Wr=SIZE, bg_rgb=sc_rgb, cfa=cfa, prewhite=wb)
+    # v20 (each draws no rng unless set, so older bursts rebuild unchanged):
+    # RNN_BIGROT="sigma_max,drift_max,centre_max": the whole camera turns, per-frame angle spread up to sigma_max deg
+    # plus a steady drift of up to drift_max deg per frame (frames end up to ~30 deg from the reference, the range
+    # the app's homography seed searches), about a centre up to centre_max px off the crop centre.
+    if os.environ.get("RNN_BIGROT"):
+        smax, dmax, cmax = (float(x) for x in os.environ["RNN_BIGROT"].split(","))
+        sc.update(rot_deg=float(rng.uniform(0.3, smax)),
+                  rot_drift=float(np.radians(rng.choice([-1, 1]) * rng.uniform(0.5, dmax))),
+                  center_dist=float(rng.uniform(0, cmax)))
+    # RNN_PERFECT=1: perfectly alignable bursts - camera motion only, no rotated-content patches (no objects
+    # anyway). RNN_PERFECT=still: also no rotation, zoom or perspective, i.e. hand-shake translation the per-tile
+    # aligner represents exactly without a homography.
+    if os.environ.get("RNN_PERFECT"):
+        sc.update(n_rot_patches=0, n_rot_patches_edge=0, n_rot_patches_small=0)
+        if os.environ["RNN_PERFECT"] == "still":
+            sc.update(rot_deg=0.0, rot_drift=0.0, zoom_rate=0.0, persp=0.0)
+    # scene texels (one per RGGB quad of the DNG) per synthetic raw pixel: 2 (default) shrinks the photo 4x, so
+    # edges are sharper / structures smaller per pixel than in a real 12 MP frame; 1 = 2x, 0.5 = the camera's own
+    # scale (v19, RNN_TEX_SCALE). Draws no rng.
+    # v21 (RNN_TEXT=1): aliased fine-text scenes, perfectly alignable - 8 frames of pure sub-pixel hand-shake
+    # translation, a light lens blur (0.3-0.55 raw px) so the sensor aliases, low-to-moderate ISO. The scene is a
+    # synthetic text image (rnn/text_scene.py) at 4 texels per raw pixel instead of the DNG photo; the DNG still
+    # supplies the CFA, white balance and noise profile. Draws no rng unless set.
+    text_bg = None
+    if os.environ.get("RNN_TEXT") == "1":
+        from rnn.text_scene import text_scene
+        sc.update(n_frames=8, optics_sigma=float(rng.uniform(0.3, 0.55)), tremor=float(rng.uniform(0.5, 3.0)),
+                  rot_deg=0.0, rot_drift=0.0, zoom_rate=0.0, persp=0.0, n_rot_patches=0, n_rot_patches_edge=0,
+                  n_rot_patches_small=0, exposure=float(rng.uniform(0.35, 0.8)), highlights=False)
+        k = float(np.exp(rng.uniform(0, np.log(8))))
+        sc.update(noise_a=alpha0 * k, noise_b=beta0 * k * k)
+        tt = float(os.environ.get("RNN_TEX_SCALE", "4"))
+        n_tex = int(tt * (SIZE + 2 * 96)) + 64
+        text_bg = text_scene(rng, n_tex, n_tex, tt, wb)
+    tex = float(os.environ.get("RNN_TEX_SCALE", "2" if text_bg is None else "4"))
+    b = Burst(sc, rng, Hr=SIZE, Wr=SIZE, bg_rgb=sc_rgb if text_bg is None else text_bg, cfa=cfa, prewhite=wb,
+              tex_scale=tex, allow_flip=text_bg is None)
+    return b, rng, name, cfa, wb, alpha0 * k, beta0 * k * k
+
+
+def _gen_one(args):
+    seed, out, val, scenes = args
+    path = os.path.join(out, f"rp{seed:08d}.npz")
+    if os.path.exists(path):
+        return
+    torch.set_num_threads(1)
+    b, rng, name, cfa, wb, alpha, beta = build_burst(seed, val, scenes)
     d = b.render(out_scale=1, seed=int(rng.integers(1 << 31)))
     # true high-resolution scene at the app's 2x output grid, same domain as the merge output:
     # native = min(scene * E, 1) (sensor clip), then the loader's pre-white-balance gain per colour
@@ -184,7 +234,7 @@ def _gen_one(args):
              gt_hr=gt_hr.numpy().astype(np.float16), clean_grey=clean_grey.astype(np.float32),
              clean_rgb=clean_rgb.astype(np.float16),
              vis=d["vis"].numpy().astype(np.float16),
-             alpha=np.float32(alpha0 * k), beta=np.float32(beta0 * k * k), scenario=name,
+             alpha=np.float32(alpha), beta=np.float32(beta), scenario=name,
              cfa=np.array(cfa, np.int32), wb=wb)
 
 
@@ -218,14 +268,21 @@ def _server_job(pi, po):
         raise RuntimeError(f"harness failed: {line!r}")
 
 
-def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb, nomerge=False):
+def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb, nomerge=False, edge_step=False, homog=False,
+                oracle=False):
+    """homog (v20): the app's global homography path; flow is then the full correspondence (homography composed)
+    and rflow the residual tile flow the net's flow features read. oracle (v21): every tile vector is the exact
+    flow (perfect alignment for translation-only bursts), before any deliberate corruption."""
     N, H, W = raw.shape
     Hg, Wg = H // 2, W // 2
     Ho, Wo = int(H * SCALE), int(W * SCALE)
     with tempfile.TemporaryDirectory() as d:
         pi, po = os.path.join(d, "in.bin"), os.path.join(d, "out.bin")
         with open(pi, "wb") as fh:
-            np.array([N, H, W, seed, int(corrupt) | (2 if nomerge else 0), cfa[0][0], cfa[0][1], cfa[1][0], cfa[1][1]],
+            np.array([N, H, W, seed,
+                      int(corrupt) | (2 if nomerge else 0) | (8 if edge_step else 0) | (16 if homog else 0)
+                      | (32 if oracle else 0),
+                      cfa[0][0], cfa[0][1], cfa[1][0], cfa[1][1]],
                      np.int32).tofile(fh)
             np.array([SCALE, alpha, beta, wb[0], wb[1], wb[2], 1.0], np.float32).tofile(fh)
             raw.astype(np.float32).tofile(fh)
@@ -238,18 +295,25 @@ def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb, nomerge=False):
     tile = int(o[-1:].view(np.int32)[0])
     o = torch.from_numpy(o[:-1].copy())
     P, G = Ho * Wo * 3, Hg * Wg
+    npl = 7 if homog else 5
     if nomerge:
         g = o
         ref_grey = g[:G].view(Hg, Wg)
-        per = g[G:].view(N - 1, 5, Hg, Wg)
-        return dict(ref_grey=ref_grey, grey=per[:, 0], r0=per[:, 1], flow=per[:, 2:4], corr=per[:, 4], tile=tile)
+        per = g[G:].view(N - 1, npl, Hg, Wg)
+        out = dict(ref_grey=ref_grey, grey=per[:, 0], r0=per[:, 1], flow=per[:, 2:4], corr=per[:, 4], tile=tile)
+        if homog:
+            out["rflow"] = per[:, 5:7]
+        return out
     Aref, Bref = o[:P].view(Ho, Wo, 3), o[P:2 * P].view(Ho, Wo, 3)
     m = o[2 * P:2 * P + 4 * (N - 1) * P].view(N - 1, 4, Ho, Wo, 3)
     g = o[2 * P + 4 * (N - 1) * P:]
     ref_grey = g[:G].view(Hg, Wg)
-    per = g[G:].view(N - 1, 5, Hg, Wg)
-    return dict(Aref=Aref, Bref=Bref, Au=m[:, 0], Bu=m[:, 1], Ag=m[:, 2], Bg=m[:, 3], ref_grey=ref_grey,
-                grey=per[:, 0], r0=per[:, 1], flow=per[:, 2:4], corr=per[:, 4], tile=tile)
+    per = g[G:].view(N - 1, npl, Hg, Wg)
+    out = dict(Aref=Aref, Bref=Bref, Au=m[:, 0], Bu=m[:, 1], Ag=m[:, 2], Bg=m[:, 3], ref_grey=ref_grey,
+               grey=per[:, 0], r0=per[:, 1], flow=per[:, 2:4], corr=per[:, 4], tile=tile)
+    if homog:
+        out["rflow"] = per[:, 5:7]
+    return out
 
 
 class RP(Dataset):
@@ -456,7 +520,9 @@ def geo_loss(R, t, w_bad=9.0, d=None):
     Rc = R.clamp(1e-5, 1 - 1e-5)
     if d is not None and "edge" in d:
         h = 1.0 + W_EDGE * (d["ferr"] < 1).float() + W_ROT * d["rot"].float()
-        w = 1.0 + w_bad * (1.0 - t) * h + W_FLAT * t * (d["edge"][None] < 0.5).float()
+        e = d["edge"][None]
+        w = (1.0 + w_bad * (1.0 - t) * h + W_FLAT * t * (e < 0.5).float() + W_TEX * t * (e >= 0.5).float()
+             + W_CLEAR * w_bad * (t < 0.05).float())
     else:
         w = 1.0 + w_bad * (1.0 - t)
     return (w * -(t * torch.log(Rc) + (1 - t) * torch.log(1 - Rc))).mean()

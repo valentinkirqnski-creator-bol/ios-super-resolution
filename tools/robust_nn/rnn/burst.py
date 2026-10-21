@@ -187,6 +187,57 @@ class Burst:
             lay.rot_deg = [0.0] + [float(rng.choice([-1, 1]) * rng.uniform(0, sc.get("rot_max_deg", 33.0)))
                                    if rng.random() < 0.6 else 0.0 for _ in range(N - 1)]
             self.rot_patch_layers.append(lay)
+        # v19: tile-sized patches centred on STRAIGHT edges (structure-tensor coherence x strength) whose content
+        # tilts 0.3-4 deg AND shifts 0.05-0.6 px across the edge in some comparison frames: the one-vector-per-tile
+        # aligner cannot follow, so a straight edge comes out tilted / offset inside one tile ("straight, then
+        # shifted straight" at tile borders). No rng is drawn unless n_rot_patches_small > 0, so older bursts
+        # rebuild bit-exactly.
+        n_small = int(sc.get("n_rot_patches_small", 0))
+        if n_small:
+            from scipy.ndimage import gaussian_filter
+            gyy, gxx = np.gradient(bg.mean(-1))
+            jxx, jyy, jxy = (gaussian_filter(v, 2.0 * tex_scale) for v in (gxx * gxx, gyy * gyy, gxx * gyy))
+            tr_, dd_ = jxx + jyy, np.sqrt((jxx - jyy) ** 2 + 4 * jxy ** 2)
+            l1_, l2_ = 0.5 * (tr_ + dd_), 0.5 * (tr_ - dd_)
+            smap = ((l1_ - l2_) / (l1_ + l2_ + 1e-12)) ** 2 * l1_
+        for _ in range(n_small):
+            size = float(sc.get("rot_patch_tile", 32)) if rng.random() < 0.5 else float(rng.uniform(16, 48))
+            cand = np.stack([rng.uniform(size / 2, Wr - size / 2, 128), rng.uniform(size / 2, Hr - size / 2, 128)], 1)
+            tx_ = ((Wt - 1) / 2.0 + tex_scale * (cand[:, 0] - fc[0])).astype(int).clip(0, Wt - 1)
+            ty_ = ((Ht - 1) / 2.0 + tex_scale * (cand[:, 1] - fc[1])).astype(int).clip(0, Ht - 1)
+            w = smap[ty_, tx_] ** 2 + 1e-30
+            ci = int(rng.choice(128, p=w / w.sum()))
+            cx, cy = cand[ci]
+            a_, b_, c_ = jxx[ty_[ci], tx_[ci]], jyy[ty_[ci], tx_[ci]], jxy[ty_[ci], tx_[ci]]
+            l1c = 0.5 * (a_ + b_ + np.sqrt((a_ - b_) ** 2 + 4 * c_ * c_))
+            nx_, ny_ = (l1c - b_, c_) if abs(l1c - b_) + abs(c_) > 1e-18 else (c_, l1c - a_)
+            nn_ = math.hypot(nx_, ny_) + 1e-18
+            nx_, ny_ = nx_ / nn_, ny_ / nn_                                     # edge normal (gradient direction)
+            half_tex = int(tex_scale * size * 0.75) + 2
+            tcx = (Wt - 1) / 2.0 + tex_scale * (cx - fc[0])
+            tcy = (Ht - 1) / 2.0 + tex_scale * (cy - fc[1])
+            x0, y0 = int(round(tcx)) - half_tex, int(round(tcy)) - half_tex
+            if x0 < 0 or y0 < 0 or x0 + 2 * half_tex + 1 > Wt or y0 + 2 * half_tex + 1 > Ht:
+                continue
+            crop = bg[y0:y0 + 2 * half_tex + 1, x0:x0 + 2 * half_tex + 1]
+            yy, xx = np.mgrid[0:crop.shape[0], 0:crop.shape[1]].astype(np.float32)
+            hs = tex_scale * size / 2.0
+            ox, oy = (tcx - x0), (tcy - y0)
+            a = (np.clip(hs + 0.5 - np.abs(xx - ox), 0, 1) * np.clip(hs + 0.5 - np.abs(yy - oy), 0, 1))
+            origin = np.array([cx + (x0 + half_tex - tcx) / tex_scale, cy + (y0 + half_tex - tcy) / tex_scale])
+            lay = Layer(np.concatenate([crop, a[..., None]], 2).astype(np.float32), origin, 1.0, tex_scale, "zeros")
+            rot, sh = [0.0], [(0.0, 0.0)]
+            for _ in range(N - 1):
+                if rng.random() < 0.7:
+                    rot.append(float(rng.choice([-1, 1]) * rng.uniform(0.3, 4.0)))
+                    m = float(np.exp(rng.uniform(np.log(0.05), np.log(0.6)))) * float(rng.choice([-1, 1]))
+                    tg = float(rng.normal(0, 0.2)) * m
+                    sh.append((m * nx_ - tg * ny_, m * ny_ + tg * nx_))
+                else:
+                    rot.append(0.0)
+                    sh.append((0.0, 0.0))
+            lay.rot_deg, lay.shift = rot, sh
+            self.rot_patch_layers.append(lay)
         for _ in range(sc["n_objects"]):
             sz = rng.uniform(0.2, 0.6) * min(Wr, Hr)
             h = int(tex_scale * sz * rng.uniform(0.6, 1.4))
@@ -232,7 +283,9 @@ class Burst:
                 objs = [dict(ZERO_OBJ)]
                 for li, v in enumerate(vel):
                     if v is None:                                   # rotated-content patch
-                        objs.append(dict(mx=0.0, my=0.0, phi=math.radians(self.layers[1 + li].rot_deg[k]), sc=1.0))
+                        lay_ = self.layers[1 + li]
+                        mx_, my_ = lay_.shift[k] if hasattr(lay_, "shift") else (0.0, 0.0)
+                        objs.append(dict(mx=mx_, my=my_, phi=math.radians(lay_.rot_deg[k]), sc=1.0))
                         continue
                     j = sc["obj_jitter"]
                     objs.append(dict(mx=v["mx"] * k + rng.normal(0, j), my=v["my"] * k + rng.normal(0, j),

@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "global_homography.h"
 #include "raw_io.h"
 #include "snr_tuning.h"
 #include "robust_nn.h"
@@ -32,8 +33,10 @@ static Image crop(const Image& im, int x0, int y0, int w, int h) {
     return o;
 }
 
-// The guide-pixel correspondence rob_make_mask / rnn_refine_mask use.
-static void guide_flow(const FlowField& fl, int tile, const Config& cfg, int x, int y, float& dx, float& dy) {
+// The guide-pixel correspondence rob_make_mask / rnn_refine_mask use. use_h = false: the tile/affine flow
+// alone, without the global homography (the residual after the global warp).
+static void guide_flow(const FlowField& fl, int tile, const Config& cfg, int x, int y, float& dx, float& dy,
+                       bool use_h = true) {
     const float ry = 2.f * y + 0.5f, rx = 2.f * x + 0.5f;
     float fx, fy;
     if (cfg.affine_flow_enabled && fl.has_affine()) {
@@ -44,7 +47,7 @@ static void guide_flow(const FlowField& fl, int tile, const Config& cfg, int x, 
         fy = fl.dy(py, px);
     }
     float sx = x + 0.5f * fx, sy = y + 0.5f * fy;
-    if (fl.has_global_h) {
+    if (use_h && fl.has_global_h) {
         float hx, hy;
         apply_homography(fl.global_h, 2.f * sx, 2.f * sy, hx, hy);
         sx = 0.5f * hx;
@@ -136,23 +139,49 @@ int main(int argc, char** argv) {
     for (int k = 1; k < n; ++k) {
         const Image& comp = burst[k];
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
-        FlowField flow = align(ref_pyr, ref_grey, comp_grey, work, tile);
+        // BC_HOMOG=1: the app's global homography (Config::global_homography_enabled, estimate_global_warp in
+        // core/pipeline_paths.cpp): warp the comparison grey onto the reference, align the residual, carry H on
+        // the flow so the masks and the merge sample comp at H * (p + flow). Full-resolution grey only, as in the app.
+        const bool homog = std::getenv("BC_HOMOG") && comp_grey.h == comp.h && comp_grey.w == comp.w &&
+                           ref_grey.h == ref.h && ref_grey.w == ref.w;
+        f32 Hg[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+        FlowField flow;
+        if (homog) {
+            estimate_global_homography(ref_grey, comp_grey, work, Hg);
+            flow = align(ref_pyr, ref_grey, warp_grey_by_homography(comp_grey, Hg), work, tile);
+            std::fprintf(stderr, "frame %d homography %.5f %.5f %.2f / %.5f %.5f %.2f / %.2e %.2e\n", k, Hg[0],
+                         Hg[1], Hg[2], Hg[3], Hg[4], Hg[5], Hg[6], Hg[7]);
+        } else {
+            if (std::getenv("BC_HOMOG")) std::fprintf(stderr, "frame %d: grey not full resolution, no homography\n", k);
+            flow = align(ref_pyr, ref_grey, comp_grey, work, tile);
+        }
         flow = flow_to_raw_tile_grid(flow, comp.h, comp.w, comp_grey.h, comp_grey.w, tile, work.r_Mt,
                                      work.num_threads, work.grey_tile_size(tile));
+        if (homog) {
+            for (int i = 0; i < 9; ++i) flow.global_h[i] = Hg[i];
+            flow.has_global_h = true;
+        }
         Image rob = compute_robustness(comp, ref_stats, flow, tile, work);   // the app's analytic mask
         if (rob.c != 1 || rob.h != comp.h || rob.w != comp.w) {
             std::fprintf(stderr, "unexpected mask %dx%dx%d\n", rob.h, rob.w, rob.c);
             return 3;
         }
         // robust_nn on the guide grid (the analytic mask is constant per RGGB quad)
+        // BC_RESID_FEAT=1: the flow-consistency features read the residual flow (no global homography); the warp
+        // still samples through the homography.
+        const bool resid = std::getenv("BC_RESID_FEAT") && flow.has_global_h;
         std::vector<float> cgrey = guide_grey(comp, work), fxy((size_t)gw * gh * 2), r0g((size_t)gw * gh),
-            rn((size_t)gw * gh);
+            rn((size_t)gw * gh), fres(resid ? (size_t)gw * gh * 2 : 0);
         for (int y = 0; y < gh; ++y)
             for (int x = 0; x < gw; ++x) {
                 guide_flow(flow, tile, work, x, y, fxy[2 * ((size_t)y * gw + x)], fxy[2 * ((size_t)y * gw + x) + 1]);
+                if (resid)
+                    guide_flow(flow, tile, work, x, y, fres[2 * ((size_t)y * gw + x)],
+                               fres[2 * ((size_t)y * gw + x) + 1], false);
                 r0g[(size_t)y * gw + x] = rob.at(2 * y, 2 * x);
             }
-        robust_nn::refine(rgrey.data(), cgrey.data(), fxy.data(), r0g.data(), P, rn.data(), &scratch);
+        robust_nn::refine(rgrey.data(), cgrey.data(), fxy.data(), r0g.data(), P, rn.data(), &scratch, nullptr,
+                          resid ? fres.data() : nullptr);
         if (hi > lo)
             for (auto& v : rn) v = std::min(std::max((v - lo) / (hi - lo), 0.f), 1.f);
         std::fwrite(r0g.data(), 4, r0g.size(), fm);

@@ -33,8 +33,18 @@ CONS = os.environ.get("PIX_CONS", "0") == "1"     # v16: + multi-frame consensus
 
 
 SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], "c17_val": ["rp17_val"],
-       "c17_train": ["rp17_train"]}
+       "c17_train": ["rp17_train"], "c19_val": ["rp19_val"], "c19_train": ["rp19_train"],
+       "c19s1_val": ["rp19s1_val"], "c19s1_train": ["rp19s1_train"], "c19s05_val": ["rp19s05_val"],
+       "c19s05_train": ["rp19s05_train"],
+       # v20: whole-camera rotation + homography, normal bursts + homography, perfectly alignable bursts
+       "c20rot_train": ["rp20rot_train"], "c20rot_val": ["rp20rot_val"], "c20h_train": ["rp20h_train"],
+       "c20h_val": ["rp20h_val"], "c20pH_train": ["rp20pH_train"], "c20pH_val": ["rp20pH_val"],
+       "c20p_train": ["rp20p_train"], "c20p_val": ["rp20p_val"],
+       # v21: aliased fine-text bursts, perfectly aligned (p) and with deliberate misalignment on the same text (m)
+       "c21txp_train": ["rp21tx_train"], "c21txm_train": ["rp21tx_train"], "c21txp_val": ["rp21tx_val"],
+       "c21txm_val": ["rp21tx_val"]}
 REGT = os.environ.get("RNN_GT_NMERGE") is not None   # v17: recompute the target (merged-noise visibility)
+GT_HR = os.environ.get("RNN_GT_HR", "0") == "1"       # v18: full-raw-resolution target from <cache>_hr/
 
 
 def _source(cache_file):
@@ -66,8 +76,9 @@ class Cache(Dataset):
         K, (H, W) = G.shape[0], G.shape[1:]
         a, b = float(z["a"]), float(z["b"])
         Ik = Ir[None].expand(K, -1, -1).contiguous()
+        ffl = torch.from_numpy(z["rflow"]) if "rflow" in z.files else None   # v20: residual after the homography
         with torch.no_grad():
-            feats, J = compute_features(Ik, G, fl, r0, a, b, CLIP, max(1, int(z["tile"]) // 2))
+            feats, J = compute_features(Ik, G, fl, r0, a, b, CLIP, max(1, int(z["tile"]) // 2), ffl)
             pix = pixel_inputs(Ik, J, a, b)
             if CONS:
                 pix = torch.cat([pix, consensus_inputs(Ir, J, a, b)], 1)
@@ -75,7 +86,10 @@ class Cache(Dataset):
                 cl = torch.from_numpy(np.load(_source(self.files[i]))["clean_grey"])
                 pix = pixel_inputs(cl[0][None].expand(K, -1, -1).contiguous(), warp_by_flow(cl[1:], fl), a, b)
         geo = torch.from_numpy(z["geo"].astype(np.float32))
-        if REGT:   # target recomputed from the burst's noise-free frames with the current visibility rule
+        if GT_HR:   # v18: full-raw-resolution target (precompute_hr.py)
+            hp = os.path.join(os.path.dirname(self.files[i]) + "_hr", os.path.basename(self.files[i]))
+            geo = torch.from_numpy(np.load(hp)["geo_hr"].astype(np.float32))
+        elif REGT:   # target recomputed from the burst's noise-free frames with the current visibility rule
             sz = np.load(_source(self.files[i]))
             geo = geo_target(torch.from_numpy(sz["clean_grey"]), fl, torch.from_numpy(sz["gt_flow"][1:]),
                              torch.from_numpy(sz["vis"][1:].astype(np.float32)), 4 * a, 4 * b, occ_look=True)
@@ -112,19 +126,20 @@ def counts(R, d, lo=LO, hi=HI):
     return np.array([float(v) for v in (miss.sum(), bad.sum(), over.sum(), good.sum(), (miss & se).sum(), se.sum(),
                                         (miss & ro).sum(), ro.sum(), (over & fl).sum(), fl.sum(), Rs[bad].sum(),
                                         Rs[t < 0.05].sum(), (t < 0.05).sum(), err.sum(), t.numel(), err[band].sum(),
-                                        band.sum())])
+                                        band.sum(), (1 - Rs)[good].sum(), good.sum())])
 
 
 def summary(c):
     q = lambda j: 100 * c[j] / max(1.0, c[j + 1])
     return dict(sim=1 - c[13] / c[14], bnd=c[15] / max(1.0, c[16]), bal=100 - 0.5 * (q(0) + q(2)), missed=q(0),
-                over=q(2), small=q(4), rot=q(6), flat=q(8), leak=c[10] / max(1.0, c[1]), leak05=c[11] / max(1.0, c[12]))
+                over=q(2), small=q(4), rot=q(6), flat=q(8), leak=c[10] / max(1.0, c[1]), leak05=c[11] / max(1.0, c[12]),
+                lost=100 * c[17] / max(1.0, c[18]) if len(c) > 18 else float("nan"))
 
 
 def fmt(name, s):
     return (f"{name:16s} sim {s['sim']:.4f}  boundary err {s['bnd']:.3f}  bal {s['bal']:.2f}  missed {s['missed']:.2f}  "
             f"over {s['over']:.2f}  small {s['small']:.2f}  rot {s['rot']:.2f}  flat {s['flat']:.2f}  "
-            f"leak {s['leak']:.3f}  leak<.05 {s['leak05']:.3f}")
+            f"leak {s['leak']:.3f}  leak<.05 {s['leak05']:.3f}  good-weight lost {s['lost']:.2f}%")
 
 
 SHIFTS = [-1.5, -1.25, -1.125, -1.0, -0.875, -0.75, -0.5, 0.0]

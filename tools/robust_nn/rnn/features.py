@@ -95,8 +95,9 @@ def _flow_features(flow, fs):
     return center, rms, grad, md
 
 
-def compute_features(Ir, Ic, flow, R0, a, b, clip, fs):
-    """Returns features [B,NF,H,W] and the warped comparison J [B,H,W]."""
+def compute_features(Ir, Ic, flow, R0, a, b, clip, fs, fflow=None):
+    """Returns features [B,NF,H,W] and the warped comparison J [B,H,W]. fflow (v20): the flow the flow-consistency
+    features read instead of flow (the residual tile flow after the app's global homography); the warp uses flow."""
     J = warp_by_flow(Ic, flow)
     mu_r = win_mean(Ir, 1)
     mu_j = win_mean(J, 1)
@@ -133,7 +134,7 @@ def compute_features(Ir, Ic, flow, R0, a, b, clip, fs):
     f7 = 0.25 * torch.log(mu_r.clamp_min(1e-4))
     ci = (torch.maximum(Ir, J) > clip).float()
     f8 = win_mean(ci, 1)
-    center, rms, grad, md = _flow_features(flow, fs)
+    center, rms, grad, md = _flow_features(flow if fflow is None else fflow, fs)
     f9 = torch.log(1.0 + center)
     f10 = torch.log(1.0 + rms)
     f11 = torch.log(1.0 + grad)

@@ -31,11 +31,11 @@ class Wrap(nn.Module):
         return self.net(f, r0)
 
 
-def report(tag, base, net, loaders):
+def report(tag, base, net, loaders, base_name="v14"):
     for name, dv in loaders.items():
         ev = tp.evaluate(net, dv)
         evb = tp.evaluate(base, dv)
-        print(tp.fmt(f"[{name}] v14", evb[0.0]), flush=True)
+        print(tp.fmt(f"[{name}] {base_name}", evb[0.0]), flush=True)
         for s in tp.SHIFTS:
             print(tp.fmt(f"[{name}] {tag} {s:+.3f}", ev[s]), flush=True)
         ref = evb[0.0]
@@ -44,7 +44,7 @@ def report(tag, base, net, loaders):
             s = min(ok, key=lambda k: ev[k]["over"])
             print(f">> MATCHED [{name}] " + tp.fmt(f"{tag} {s:+.3f}", ev[s]), flush=True)
         else:
-            print(f">> [{name}] no shift reaches v14's misses and partial-ghost weight", flush=True)
+            print(f">> [{name}] no shift reaches {base_name}'s misses and partial-ghost weight", flush=True)
 
 
 def main():
@@ -56,22 +56,28 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--new_weight", type=int, default=2, help="repeat the new-scene cache this many times")
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--base", default="runs/v14/model.pt", help="shipped model to compare against (cutoffs 0.20/0.90)")
+    ap.add_argument("--tag", default="v17")
     a = ap.parse_args()
     os.makedirs(os.path.join(HERE, a.out), exist_ok=True)
     torch.manual_seed(0)
     torch.set_num_threads(4)
-    base = Wrap(load_net(os.path.join(HERE, "runs", "v14", "model.pt"))).eval()
+    base = Wrap(load_net(os.path.join(HERE, a.base))).eval()
+    bname = os.path.basename(os.path.dirname(a.base))
     net = Wrap(load_net(os.path.join(HERE, a.init)))
-    tr = ConcatDataset([tp.Cache("data/c15_train", 96, True)] + [tp.Cache("data/c17_train", 96, True)] * a.new_weight)
+    extra = [x for x in os.environ.get("EXTRA_TRAIN", "").split(",") if x]   # v19: e.g. "c19_train:2"
+    tr = ConcatDataset([tp.Cache("data/c15_train", 96, True)] + [tp.Cache("data/c17_train", 96, True)] * a.new_weight
+                       + [tp.Cache(f"data/{x.split(':')[0]}", 96, True) for x in extra
+                          for _ in range(int(x.split(":")[1]) if ":" in x else 1)])
     dl = DataLoader(tr, 2, shuffle=True, num_workers=a.workers, collate_fn=tp.cat, worker_init_fn=tp._wi,
                     drop_last=True, persistent_workers=True, prefetch_factor=2)
     vals = {k: DataLoader(tp.Cache(f"data/{k}"), 1, num_workers=2, collate_fn=tp.cat, worker_init_fn=tp._wi)
-            for k in ("c15_val", "c17_val")}
+            for k in ["c15_val", "c17_val"] + [x for x in os.environ.get("EXTRA_VAL", "").split(",") if x]}
     tp.SHIFTS = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25]
     print(f"train samples {len(tr)} (new scenes x{a.new_weight}); GT n_merge {os.environ.get('RNN_GT_NMERGE')}",
           flush=True)
     net.eval()
-    report("v17 s0", base, net, vals)
+    report(f"{a.tag} s0", base, net, vals, bname)
     opt = torch.optim.Adam(net.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * min(1.0, s / a.steps))))
     step, t0, run, hist = 0, time.time(), None, []
@@ -90,7 +96,7 @@ def main():
                 print(f"step {step} loss {run:.4f} {time.time() - t0:.0f}s", flush=True)
             if step % a.eval_every == 0 or step == a.steps:
                 net.eval()
-                report(f"v17 s{step}", base, net, vals)
+                report(f"{a.tag} s{step}", base, net, vals, bname)
                 net.train()
                 torch.save(net.net.state_dict(), os.path.join(HERE, a.out, f"model_s{step}.pt"))
             if step >= a.steps:
