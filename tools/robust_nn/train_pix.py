@@ -20,7 +20,7 @@ import numpy as np                                          # noqa: E402
 import torch                                                # noqa: E402
 import torch.nn.functional as F                             # noqa: E402
 from torch.utils.data import DataLoader, Dataset            # noqa: E402
-from real_protocol import load_net, stretch, geo_loss, geo_target, CLIP   # noqa: E402
+from real_protocol import load_net, stretch, geo_loss, geo_target, gt_edge_mask, CLIP   # noqa: E402
 from rnn.features import compute_features                  # noqa: E402
 from rnn.common import warp_by_flow                        # noqa: E402
 from rnn.pixnet import PixNet, pixel_inputs, consensus_inputs, expand_inputs, NPIX, NCONS   # noqa: E402
@@ -42,7 +42,12 @@ SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], 
        "c20p_train": ["rp20p_train"], "c20p_val": ["rp20p_val"],
        # v21: aliased fine-text bursts, perfectly aligned (p) and with deliberate misalignment on the same text (m)
        "c21txp_train": ["rp21tx_train"], "c21txm_train": ["rp21tx_train"], "c21txp_val": ["rp21tx_val"],
-       "c21txm_val": ["rp21tx_val"]}
+       "c21txm_val": ["rp21tx_val"],
+       # v22: text 1.8-9 px perfectly aligned (p) / tiny edge slips (m); text + tiny tilt/shift patches (r);
+       # real scenes, translation-only camera + tiny tilt/shift patches (s)
+       "c22txp_train": ["rp22tx_train"], "c22txm_train": ["rp22tx_train"], "c22txp_val": ["rp22tx_val"],
+       "c22txm_val": ["rp22tx_val"], "c22txr_train": ["rp22txr_train"], "c22txr_val": ["rp22txr_val"],
+       "c22scr_train": ["rp22scr_train"], "c22scr_val": ["rp22scr_val"]}
 REGT = os.environ.get("RNN_GT_NMERGE") is not None   # v17: recompute the target (merged-noise visibility)
 GT_HR = os.environ.get("RNN_GT_HR", "0") == "1"       # v18: full-raw-resolution target from <cache>_hr/
 
@@ -91,9 +96,14 @@ class Cache(Dataset):
             geo = torch.from_numpy(np.load(hp)["geo_hr"].astype(np.float32))
         elif REGT:   # target recomputed from the burst's noise-free frames with the current visibility rule
             sz = np.load(_source(self.files[i]))
+            vis_px = torch.from_numpy(sz["vis"][1:].astype(np.float32))      # v22: lets counts skip out-of-view pixels
+            gtedge = (gt_edge_mask(torch.from_numpy(sz["clean_grey"])).float()[None].expand(K, -1, -1)
+                      if os.environ.get("RNN_GT_EDGE") else None)
             geo = geo_target(torch.from_numpy(sz["clean_grey"]), fl, torch.from_numpy(sz["gt_flow"][1:]),
                              torch.from_numpy(sz["vis"][1:].astype(np.float32)), 4 * a, 4 * b, occ_look=True)
         d = dict(feats=feats, pix=pix, r0=r0, geo=geo,
+                 **({"vis": vis_px} if REGT and not GT_HR else {}),
+                 **({"gtedge": gtedge} if REGT and not GT_HR and gtedge is not None else {}),
                  edge=torch.from_numpy(z["edge"].astype(np.float32))[None].expand(K, -1, -1),
                  rot=torch.from_numpy(z["rot"]), ferr=torch.from_numpy(z["ferr"].astype(np.float32)))
         rng = np.random.default_rng()
@@ -119,6 +129,8 @@ def _wi(_):
 def counts(R, d, lo=LO, hi=HI):
     t, Rs = d["geo"], stretch(R, lo, hi)
     bad, good = t < 0.2, t > 0.8
+    if os.environ.get("RNN_MISS_VISIBLE") == "1" and "vis" in d:   # v22: misses only where the frame has content
+        bad = bad & (d["vis"] > 0.5)
     miss, over = bad & (Rs >= 0.5), good & (Rs <= 0.5)
     se, ro, fl = bad & (d["ferr"] < 1), bad & d["rot"], good & (d["edge"] < 0.5)
     band = (F.max_pool2d(t[:, None], 5, 1, 2) + F.max_pool2d(-t[:, None], 5, 1, 2))[:, 0] > 0.5

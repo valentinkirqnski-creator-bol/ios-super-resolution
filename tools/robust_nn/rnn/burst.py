@@ -227,7 +227,24 @@ class Burst:
             origin = np.array([cx + (x0 + half_tex - tcx) / tex_scale, cy + (y0 + half_tex - tcy) / tex_scale])
             lay = Layer(np.concatenate([crop, a[..., None]], 2).astype(np.float32), origin, 1.0, tex_scale, "zeros")
             rot, sh = [0.0], [(0.0, 0.0)]
+            # v22 (sc["small_mode"] = (tilt_lo, tilt_hi, shift_lo, shift_hi)): each affected frame gets ONE of
+            # translation only / rotation only / both, at very small log-uniform magnitudes - the tiny slips that
+            # thicken or double an edge. Unset: the v19 draws exactly as before.
+            smode = sc.get("small_mode")
             for _ in range(N - 1):
+                if smode is not None:
+                    if rng.random() < 0.7:
+                        kind = int(rng.integers(0, 3))          # 0 translate, 1 rotate, 2 both
+                        tl, th, sl, sh_hi = smode
+                        r_ = float(rng.choice([-1, 1]) * np.exp(rng.uniform(np.log(tl), np.log(th))))
+                        m = float(np.exp(rng.uniform(np.log(sl), np.log(sh_hi)))) * float(rng.choice([-1, 1]))
+                        tg = float(rng.normal(0, 0.3)) * m
+                        rot.append(r_ if kind >= 1 else 0.0)
+                        sh.append((m * nx_ - tg * ny_, m * ny_ + tg * nx_) if kind != 1 else (0.0, 0.0))
+                    else:
+                        rot.append(0.0)
+                        sh.append((0.0, 0.0))
+                    continue
                 if rng.random() < 0.7:
                     rot.append(float(rng.choice([-1, 1]) * rng.uniform(0.3, 4.0)))
                     m = float(np.exp(rng.uniform(np.log(0.05), np.log(0.6)))) * float(rng.choice([-1, 1]))

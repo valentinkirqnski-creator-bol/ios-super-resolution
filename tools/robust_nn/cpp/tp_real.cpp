@@ -100,6 +100,9 @@ static int process(const char* in_path, const char* out_path) {
     // translation-only bursts this is used with), before any deliberate corruption: any rejection of an
     // uncorrupted frame is then the mask's own error.
     const bool oracle = (hi[4] & 32) != 0;
+    // v22: only TINY misalignments in corrupted frames - tiles on edges shifted 0.05-0.5 raw px (log-uniform, any
+    // direction), plus the straight-edge steps when flag 8 is set; none of the large / block shifts.
+    const bool small_only = (hi[4] & 64) != 0;
     const int Hg = H / 2, Wg = W / 2;
     std::vector<Image> raw(N, Image(H, W, 1));
     for (auto& r : raw)
@@ -237,7 +240,19 @@ static int process(const char* in_path, const char* out_path) {
             for (size_t r = 0; r < idx.size(); ++r) erank[idx[r]] = (float)r / (float)idx.size();
         }
         const bool frame_corrupted = corrupt && U(rng) > 0.25f;
-        if (frame_corrupted) {   // deliberate corruption on top of the aligner's own errors (as before)
+        if (frame_corrupted && small_only) {
+            const float pfrac = 0.1f + 0.3f * U(rng);
+            for (int ty = 0; ty < flow.ny; ++ty)
+                for (int tx = 0; tx < flow.nx; ++tx) {
+                    const size_t t = (size_t)ty * flow.nx + tx;
+                    if (erank[t] < 0.5f || U(rng) >= pfrac) continue;
+                    const float mag = 0.05f * std::exp(U(rng) * std::log(10.f)), ang = 6.2831853f * U(rng);
+                    flow.flow[2 * t] += mag * std::cos(ang);
+                    flow.flow[2 * t + 1] += mag * std::sin(ang);
+                    tcorr[t] = 1.f;
+                }
+        }
+        if (frame_corrupted && !small_only) {   // deliberate corruption on top of the aligner's own errors
             const bool block = U(rng) < 0.3f;
             const float frac = 0.05f + 0.35f * U(rng);
             int by0 = 0, bx0 = 0, bh = 0, bw = 0;
@@ -270,7 +285,7 @@ static int process(const char* in_path, const char* out_path) {
                     tcorr[(size_t)ty * flow.nx + tx] = 1.f;
                 }
         }
-        if (frame_corrupted && U(rng) < 0.7f) {   // PLUS extra corrupted tiles on the strongest edges
+        if (frame_corrupted && !small_only && U(rng) < 0.7f) {   // PLUS extra corrupted tiles on the strongest edges
             const float efrac = 0.05f + 0.20f * U(rng);
             for (int ty = 0; ty < flow.ny; ++ty)
                 for (int tx = 0; tx < flow.nx; ++tx) {

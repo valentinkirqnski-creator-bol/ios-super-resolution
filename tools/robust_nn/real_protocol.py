@@ -50,13 +50,14 @@ W_ROT = float(os.environ.get("RNN_W_ROT", "3"))             # ... a misaligned r
 W_FLAT = float(os.environ.get("RNN_W_FLAT", "1"))           # extra cost of dropping a good flat-area pixel
 W_TEX = float(os.environ.get("RNN_W_TEX", "0"))             # v18b: ... a good TEXTURED pixel (edge >= 0.5 sigma)
 W_CLEAR = float(os.environ.get("RNN_W_CLEAR", "0"))         # v18b: extra cost of any weight on a clearly misaligned pixel
+W_NONEDGE = float(os.environ.get("RNN_W_NONEDGE", "0"))     # v22c: extra cost of dropping a good pixel OFF the edge mask
 SELECT_SAFE = os.environ.get("RNN_SELECT", "") == "safe"    # v14: best = fewest errors with leak not above start
 
 
 GT_NMERGE = float(os.environ.get("RNN_GT_NMERGE", "1"))   # v17: judge visibility at the MERGED image's noise
 
 
-def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, occ_look=False, n_merge=None):
+def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=None, floor=None, occ_look=False, n_merge=None):
     """Continuous target R* in [0,1] per guide pixel and comparison frame. The ghost a flow error paints is
     measured on the NOISE-FREE comparison frame: content at the used flow vs content at the true flow (both from
     the same frame, so aliasing cancels and aligned-but-aliased areas get 1). Compared with the noise sigma plus a
@@ -67,6 +68,9 @@ def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, o
     noise drops ~3x and small per-tile errors that hid in one frame's noise show (low-light tile seams, zipper
     edges)."""
     n_merge = GT_NMERGE if n_merge is None else n_merge
+    # v22: RNN_GT_K / RNN_GT_FLOOR tighten what counts as visible (defaults 1.5 sigma of the merged noise, 2% floor)
+    k = float(os.environ.get("RNN_GT_K", "1.5")) if k is None else k
+    floor = float(os.environ.get("RNN_GT_FLOOR", "0.02")) if floor is None else floor
     K = flow_used.shape[0]
     Ck = clean[1:]
     Ce = warp_by_flow(Ck, flow_used)
@@ -74,6 +78,14 @@ def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, o
     from rnn.common import win_mean as _wm
     D2 = _wm((Ce - Cg) ** 2, 1)
     mu = _wm(clean[0:1], 1).clamp_min(0).expand(K, -1, -1)
+    edge_rule = os.environ.get("RNN_GT_EDGE")
+    if edge_rule:
+        # v22b: the stricter rule only on EDGES (see gt_edge_mask), where even a small slip visibly thickens or
+        # shifts the edge. Everywhere else the default rule.
+        ke, fe = (float(x) for x in edge_rule.split(",")[:2])
+        strong = gt_edge_mask(clean, edge_rule)
+        k = torch.where(strong, torch.tensor(ke), torch.tensor(float(k)))[None].expand(K, -1, -1)
+        floor = torch.where(strong, torch.tensor(fe), torch.tensor(float(floor)))[None].expand(K, -1, -1)
     s2 = (alpha * mu + beta) / 4.0 / n_merge + (floor * mu) ** 2 + 1e-10
     t = vis * torch.exp(-0.5 * D2 / (k * k * s2))
     if occ_look:
@@ -84,6 +96,27 @@ def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=1.5, floor=0.02, o
         t_look = torch.exp(-0.5 * _wm((Ce - clean[0:1]) ** 2, 1) / (k * k * s2))
         t = torch.where((vis < 0.5) & inside, t_look, t)
     return t
+
+
+def gt_edge_mask(clean, edge_rule=None):
+    """v22b: where the stricter target applies - a strong, single-direction contrast step in the noise-free
+    reference (an outline, roofline, window frame, text stroke; not foliage or texture): local gradient at least
+    rel_th of the local brightness per guide px AND structure-tensor coherence at least coh_th, widened 1 px so both
+    sides of the edge count. edge_rule = "k,floor,rel_th,coh_th" (RNN_GT_EDGE). Returns a bool [H,W] map."""
+    from rnn.common import win_mean as _wm
+    edge_rule = edge_rule or os.environ.get("RNN_GT_EDGE", "1.0,0.01,0.08,0.5")
+    rel_th, coh_th = (float(x) for x in edge_rule.split(",")[2:4])
+    c0 = clean[0]
+    mu0 = _wm(clean[0:1], 1).clamp_min(0)[0]
+    gx, gy = torch.zeros_like(c0), torch.zeros_like(c0)
+    gx[:, 1:-1] = 0.5 * (c0[:, 2:] - c0[:, :-2])
+    gy[1:-1] = 0.5 * (c0[2:] - c0[:-2])
+    jxx, jyy, jxy = (_wm(v[None], 2)[0] for v in (gx * gx, gy * gy, gx * gy))
+    tr, dd = jxx + jyy, ((jxx - jyy) ** 2 + 4 * jxy ** 2).sqrt()
+    coh = (dd / (tr + 1e-12)) ** 2
+    rel = (gx * gx + gy * gy).sqrt() / mu0.clamp_min(1e-3)
+    strong = ((rel >= rel_th) & (coh >= coh_th)).float()
+    return F.max_pool2d(strong[None, None], 3, 1, 1)[0, 0] > 0.5
 
 
 def hard_maps(clean, gt_flow, flow_used, alpha, beta):
@@ -159,6 +192,8 @@ def build_burst(seed, val, scenes):
     if os.environ.get("RNN_ROT_SMALL"):    # v19: small tilt + shift patches on straight edges (see rnn/burst.py)
         slo, shi = (int(x) for x in os.environ["RNN_ROT_SMALL"].split(","))
         sc.update(n_rot_patches_small=int(rng.integers(slo, shi + 1)))
+    if os.environ.get("RNN_SMALL_MODE"):   # v22: tilt_lo,tilt_hi (deg),shift_lo,shift_hi (px): translate / rotate / both
+        sc.update(small_mode=tuple(float(x) for x in os.environ["RNN_SMALL_MODE"].split(",")))
     if rng.random() < 0.3:
         sc.update(persp=float(np.exp(rng.uniform(np.log(1e-6), np.log(1e-5)))))
     k = float(np.exp(rng.uniform(0, np.log(30))))            # ISO multiplier on the DNG's own profile
@@ -175,8 +210,11 @@ def build_burst(seed, val, scenes):
     # RNN_PERFECT=1: perfectly alignable bursts - camera motion only, no rotated-content patches (no objects
     # anyway). RNN_PERFECT=still: also no rotation, zoom or perspective, i.e. hand-shake translation the per-tile
     # aligner represents exactly without a homography.
+    # With RNN_ROT_SMALL the small tilt/shift patches stay (v22: perfectly aligned except those tiny slips).
     if os.environ.get("RNN_PERFECT"):
-        sc.update(n_rot_patches=0, n_rot_patches_edge=0, n_rot_patches_small=0)
+        sc.update(n_rot_patches=0, n_rot_patches_edge=0)
+        if not os.environ.get("RNN_ROT_SMALL"):
+            sc.update(n_rot_patches_small=0)
         if os.environ["RNN_PERFECT"] == "still":
             sc.update(rot_deg=0.0, rot_drift=0.0, zoom_rate=0.0, persp=0.0)
     # scene texels (one per RGGB quad of the DNG) per synthetic raw pixel: 2 (default) shrinks the photo 4x, so
@@ -191,12 +229,15 @@ def build_burst(seed, val, scenes):
         from rnn.text_scene import text_scene
         sc.update(n_frames=8, optics_sigma=float(rng.uniform(0.3, 0.55)), tremor=float(rng.uniform(0.5, 3.0)),
                   rot_deg=0.0, rot_drift=0.0, zoom_rate=0.0, persp=0.0, n_rot_patches=0, n_rot_patches_edge=0,
-                  n_rot_patches_small=0, exposure=float(rng.uniform(0.35, 0.8)), highlights=False)
+                  exposure=float(rng.uniform(0.35, 0.8)), highlights=False)
+        if not os.environ.get("RNN_ROT_SMALL"):    # v22 keeps the tiny tilt/shift patches when asked for
+            sc.update(n_rot_patches_small=0)
         k = float(np.exp(rng.uniform(0, np.log(8))))
         sc.update(noise_a=alpha0 * k, noise_b=beta0 * k * k)
         tt = float(os.environ.get("RNN_TEX_SCALE", "4"))
         n_tex = int(tt * (SIZE + 2 * 96)) + 64
-        text_bg = text_scene(rng, n_tex, n_tex, tt, wb)
+        cap = tuple(float(x) for x in os.environ.get("RNN_TEXT_CAP", "2.5,7").split(","))   # v22: 1.8,9
+        text_bg = text_scene(rng, n_tex, n_tex, tt, wb, cap_raw=cap)
     tex = float(os.environ.get("RNN_TEX_SCALE", "2" if text_bg is None else "4"))
     b = Burst(sc, rng, Hr=SIZE, Wr=SIZE, bg_rgb=sc_rgb if text_bg is None else text_bg, cfa=cfa, prewhite=wb,
               tex_scale=tex, allow_flip=text_bg is None)
@@ -269,7 +310,7 @@ def _server_job(pi, po):
 
 
 def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb, nomerge=False, edge_step=False, homog=False,
-                oracle=False):
+                oracle=False, small_only=False):
     """homog (v20): the app's global homography path; flow is then the full correspondence (homography composed)
     and rflow the residual tile flow the net's flow features read. oracle (v21): every tile vector is the exact
     flow (perfect alignment for translation-only bursts), before any deliberate corruption."""
@@ -281,7 +322,7 @@ def run_tp_real(raw, gt, alpha, beta, seed, corrupt, cfa, wb, nomerge=False, edg
         with open(pi, "wb") as fh:
             np.array([N, H, W, seed,
                       int(corrupt) | (2 if nomerge else 0) | (8 if edge_step else 0) | (16 if homog else 0)
-                      | (32 if oracle else 0),
+                      | (32 if oracle else 0) | (64 if small_only else 0),
                       cfa[0][0], cfa[0][1], cfa[1][0], cfa[1][1]],
                      np.int32).tofile(fh)
             np.array([SCALE, alpha, beta, wb[0], wb[1], wb[2], 1.0], np.float32).tofile(fh)
@@ -523,6 +564,8 @@ def geo_loss(R, t, w_bad=9.0, d=None):
         e = d["edge"][None]
         w = (1.0 + w_bad * (1.0 - t) * h + W_FLAT * t * (e < 0.5).float() + W_TEX * t * (e >= 0.5).float()
              + W_CLEAR * w_bad * (t < 0.05).float())
+        if W_NONEDGE > 0 and "gtedge" in d:     # v22c: strict only where an edge slip can show
+            w = w + W_NONEDGE * t * (1.0 - d["gtedge"].float())
     else:
         w = 1.0 + w_bad * (1.0 - t)
     return (w * -(t * torch.log(Rc) + (1 - t) * torch.log(1 - Rc))).mean()

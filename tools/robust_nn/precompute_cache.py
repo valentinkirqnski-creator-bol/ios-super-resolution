@@ -26,11 +26,12 @@ OUT = None
 EDGE_STEP = False
 HOMOG = False
 ORACLE = False
+SMALL = False
 
 
-def _init(out, edge_step=False, homog=False, oracle=False):
-    global OUT, EDGE_STEP, HOMOG, ORACLE
-    OUT, EDGE_STEP, HOMOG, ORACLE = out, edge_step, homog, oracle
+def _init(out, edge_step=False, homog=False, oracle=False, small=False):
+    global OUT, EDGE_STEP, HOMOG, ORACLE, SMALL
+    OUT, EDGE_STEP, HOMOG, ORACLE, SMALL = out, edge_step, homog, oracle, small
     torch.set_num_threads(1)
 
 
@@ -46,7 +47,8 @@ def _job(job):
     for attempt in range(3):
         try:
             d = rp.run_tp_real(raw, gt, al, be, seed + attempt, corrupt, z["cfa"], z["wb"], nomerge=True,
-                               edge_step=EDGE_STEP, homog=HOMOG, oracle=ORACLE)
+                               edge_step=EDGE_STEP, homog=HOMOG, oracle=ORACLE,
+                               small_only=SMALL)
             break
         except Exception:   # noqa: BLE001 - transient harness failure: retry with the next seed
             time.sleep(1.0)
@@ -79,6 +81,7 @@ def main():
     ap.add_argument("--edge_step", action="store_true", help="v19: straight-edge step corruption (tp_real flag 8)")
     ap.add_argument("--homog", action="store_true", help="v20: the app's global homography path (tp_real flag 16)")
     ap.add_argument("--oracle", action="store_true", help="v21: perfect alignment (tp_real flag 32)")
+    ap.add_argument("--small", action="store_true", help="v22: only tiny misalignments when corrupting (flag 64)")
     ap.add_argument("--val_corrupt_only", action="store_true", help="v21: --val keeps only the corrupted half")
     ap.add_argument("--no_corrupt", action="store_true",
                     help="v20: never corrupt (perfect-alignment sets); --val then keeps only the aligner-only half")
@@ -99,7 +102,7 @@ def main():
                 cor = bool(rng.random() < a.corrupt_p)
                 jobs.append((f, f"{stem}_v{v}", cor and not a.no_corrupt, int(rng.integers(1, 1 << 30))))
     t0, bad = time.time(), 0
-    with Pool(a.workers, initializer=_init, initargs=(a.out, a.edge_step, a.homog, a.oracle)) as p:
+    with Pool(a.workers, initializer=_init, initargs=(a.out, a.edge_step, a.homog, a.oracle, a.small)) as p:
         for k, dt in enumerate(p.imap_unordered(_job, jobs, chunksize=2)):
             bad += dt < 0
             if k % 50 == 0:

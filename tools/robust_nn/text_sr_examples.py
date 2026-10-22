@@ -54,13 +54,15 @@ def main():
     ap.add_argument("out")
     ap.add_argument("models", nargs="+", help="path:logit_shift:label")
     ap.add_argument("--n", type=int, default=6)
+    ap.add_argument("--src", default="rp21tx_val", help="v22: held-out source set (e.g. rp22scr_val, rp22tx_val)")
+    ap.add_argument("--aligned_only", action="store_true", help="v22: skip the tile-corrupted twin")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     nets = {}
     for m in a.models:
         p, s, lab = m.split(":")
         nets[lab + " mask"] = (load_net(os.path.join(HERE, p)), float(s))
-    files = sorted(glob.glob(os.path.join(HERE, "data", "rp21tx_val", "*.npz")))[:a.n]
+    files = sorted(glob.glob(os.path.join(HERE, "data", a.src, "*.npz")))[:a.n]
     for f in files:
         z = np.load(f)
         stem = os.path.basename(f)[:-4]
@@ -69,9 +71,9 @@ def main():
         gy, gx = r_index(H, W, H // 2, W // 2)
         truth = z["gt_hr"].astype(np.float32)
         s = float(np.percentile(truth, 99.5)) + 1e-9
-        for twin, corrupt in (("aligned", False), ("misaligned", True)):
+        for twin, corrupt in (("aligned", False),) + (() if a.aligned_only else (("misaligned", True),)):
             d = rp.run_tp_real(raw, gt, float(z["alpha"]), float(z["beta"]), 11, corrupt, z["cfa"], z["wb"],
-                               oracle=True, edge_step=corrupt)
+                               oracle=True, edge_step=corrupt, small_only=a.src.startswith("rp22"))
             M = masks_for(nets, d, z)
             ones = torch.ones_like(M["analytic mask"])
             panels = [("one low-res frame (reference only)", (d["Aref"] / d["Bref"].clamp_min(1e-12)).numpy()),
