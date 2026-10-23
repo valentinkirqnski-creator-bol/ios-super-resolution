@@ -228,3 +228,94 @@ def full_consensus_features(raws, flows_guide, r0, alpha, beta):
     g3 = torch.sqrt(u * u + v * v).clamp(max=4.0)
     g4 = ((bx * u + by * v) / (ee + 1e-3 * lam)).clamp(0.0, 1.0)
     return torch.stack([g0, g1, g2, g3, g4], 1)
+
+
+# ---- v26: edge-line shift (what the eye sees on a straight edge) -------------------------------------------------
+NF_EDGE = 3
+NAMES_EDGE = ["edge_line_shift", "edge_line_signif", "edge_line_step"]
+
+
+def edge_line_features(Ir, J, a, b, L=None, band=None):
+    """Ir [K,H,W] reference grey (per comparison frame), J [K,H,W] warped comparison grey. At every pixel: the edge
+    normal n from the 5x5 structure tensor of the reference, then 2L+1 samples ALONG the edge (p + s t, t = n rotated
+    90 deg, bilinear) of the residual r = J - Ir and of the reference gradient across the edge g = grad Ir . n. A shift
+    of this frame's edge across itself is delta = sum(g r) / (sum(g^2) + lambda); averaging along the edge length is
+    what lets a 0.2-0.3 px shift of a straight edge stand out of one frame's noise (the eye integrates the same way).
+    Returns [K,3,H,W]: |delta| (guide px, clamped 2), its significance log(1 + z^2) with z^2 = (sum g r)^2 /
+    (s2r sum g^2), and the significance of the difference between the left (s <= 0) and right (s >= 0) halves - a step
+    along the edge, i.e. a zipper at a tile border."""
+    import os as _os
+    L = int(_os.environ.get("EDGEF_L", "8")) if L is None else L            # half length along the edge
+    band = int(_os.environ.get("EDGEF_BAND", "1")) if band is None else band  # half width across it
+    K, H, W = J.shape
+    Ip = pad_rep(Ir, 1)
+    gx = 0.5 * (Ip[:, 1:-1, 2:] - Ip[:, 1:-1, :-2])
+    gy = 0.5 * (Ip[:, 2:, 1:-1] - Ip[:, :-2, 1:-1])
+    Sxx, Syy, Sxy = win_mean(gx * gx, 2), win_mean(gy * gy, 2), win_mean(gx * gy, 2)
+    th = 0.5 * torch.atan2(2.0 * Sxy, Sxx - Syy)
+    nx, ny = torch.cos(th), torch.sin(th)
+    tx, ty = -ny, nx
+    mu = win_mean(Ir, 1).clamp_min(0.0)
+    s2 = (a * mu + b).clamp_min(1e-10)
+    s2r = 2.0 * s2                                            # variance of a residual of two noisy frames
+    lam = 0.5 * s2
+    src = torch.stack([gx, gy, J - Ir], 1)                    # [K,3,H,W]
+    yy, xx = torch.meshgrid(torch.arange(H, dtype=Ir.dtype), torch.arange(W, dtype=Ir.dtype), indexing="ij")
+    A_l = torch.zeros_like(Ir); B_l = torch.zeros_like(Ir); A_r = torch.zeros_like(Ir); B_r = torch.zeros_like(Ir)
+    A = torch.zeros_like(Ir); B = torch.zeros_like(Ir)
+    for s in range(-L, L + 1):
+        for w in range(-band, band + 1):               # a band 2*band+1 wide across the edge
+            px = (xx[None] + s * tx + w * nx) / max(W - 1, 1) * 2 - 1
+            py = (yy[None] + s * ty + w * ny) / max(H - 1, 1) * 2 - 1
+            smp = F.grid_sample(src, torch.stack([px, py], -1), mode="bilinear", padding_mode="border",
+                                align_corners=True)
+            g = smp[:, 0] * nx + smp[:, 1] * ny
+            gr, gg = g * smp[:, 2], g * g
+            A, B = A + gg, B + gr
+            if s < 0:
+                A_l, B_l = A_l + gg, B_l + gr
+            elif s > 0:
+                A_r, B_r = A_r + gg, B_r + gr
+    delta = B / (A + lam)
+    f0 = delta.abs().clamp(max=2.0)
+    f1 = torch.log(1.0 + B * B / (s2r * A.clamp_min(1e-12)))
+    dl, dr = B_l / (A_l + lam), B_r / (A_r + lam)
+    var_d = s2r * (1.0 / A_l.clamp_min(1e-12) + 1.0 / A_r.clamp_min(1e-12))
+    f2 = torch.log(1.0 + (dl - dr) ** 2 / var_d)
+    return torch.stack([f0, f1, f2], 1)
+
+
+def tile_pool_features(Ir, J, a, b, ts):
+    """Ir/J [K,H,W] reference and warped comparison grey, ts = the flow's tile size in these pixels. A wrong tile
+    vector moves the WHOLE tile, so the evidence for it is pooled over the tile (ts*ts pixels, not a 5x5 window): a
+    noise-weighted least-squares fit of the residual r = J - Ir to grad(Ir) . d (translation, 2 params) and to
+    grad(Ir) . (d + M x) (affine, 6 params - tile content slightly rotated). Returns [K,4,H,W], constant per tile:
+    |d| (px, clamped 2), log(1 + z2_trans), log(1 + z2_aff - z2_trans) (what the rotation adds), and the fraction of
+    the tile's residual energy the affine fit explains. z2 = b^T A^-1 b is chi-square (2 / 6 dof) under pure noise."""
+    K, H, W = J.shape
+    Ip = pad_rep(Ir, 1)
+    gx = 0.5 * (Ip[:, 1:-1, 2:] - Ip[:, 1:-1, :-2])
+    gy = 0.5 * (Ip[:, 2:, 1:-1] - Ip[:, :-2, 1:-1])
+    w = 1.0 / (2.0 * (a * win_mean(Ir, 1).clamp_min(0.0) + b)).clamp_min(1e-10)   # 1 / var of a two-frame residual
+    r = J - Ir
+    yy, xx = torch.meshgrid(torch.arange(H, dtype=Ir.dtype), torch.arange(W, dtype=Ir.dtype), indexing="ij")
+    xc = ((xx % ts) - 0.5 * (ts - 1)) / ts                    # position inside the tile, [-0.5, 0.5]
+    yc = ((yy % ts) - 0.5 * (ts - 1)) / ts
+    phi = torch.stack([gx, gy, gx * xc, gx * yc, gy * xc, gy * yc], 1)            # [K,6,H,W]
+    Ht, Wt = -(-H // ts), -(-W // ts)
+    pool = lambda v: F.avg_pool2d(v, ts, ts, ceil_mode=True) * (ts * ts)          # per-tile sums (approx at edges)
+    A = pool((phi[:, :, None] * phi[:, None] * w[:, None, None]).reshape(K, 36, H, W)).reshape(K, 6, 6, Ht, Wt)
+    bb = pool(phi * (r * w)[:, None])                                             # [K,6,Ht,Wt]
+    e = pool((r * r * w)[:, None])[:, 0]
+    A = A.permute(0, 3, 4, 1, 2)
+    bb = bb.permute(0, 2, 3, 1)
+    lam = 0.25 * ts * ts * torch.eye(6, dtype=Ir.dtype) * 1e-2
+    At = A[..., :2, :2] + lam[:2, :2]
+    dt = torch.linalg.solve(At, bb[..., :2, None])[..., 0]
+    z2t = (bb[..., :2] * dt).sum(-1)
+    da = torch.linalg.solve(A + lam, bb[..., None])[..., 0]
+    z2a = (bb * da).sum(-1)
+    feats_t = torch.stack([dt.norm(dim=-1).clamp(max=2.0), torch.log1p(z2t.clamp_min(0.0)),
+                           torch.log1p((z2a - z2t).clamp_min(0.0)), (z2a / e.clamp_min(1e-6)).clamp(0.0, 1.0)], 1)
+    up = feats_t.repeat_interleave(ts, 2).repeat_interleave(ts, 3)
+    return up[..., :H, :W]

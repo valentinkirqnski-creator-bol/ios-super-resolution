@@ -10,7 +10,7 @@ from rnn.align import densify
 from rnn.analytic import analytic_r0, NOMINAL
 from rnn.common import warp_by_flow
 from rnn.features import compute_features
-from rnn.model import RobustNet
+from rnn.model import RobustNet, RobustNetTile
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.path.join(HERE, "runs", "v1", "model.pt"))
@@ -20,7 +20,11 @@ a = ap.parse_args()
 core = os.path.join(HERE, "..", "..", "core")
 MARK = "// robust_nn (Config::robust_nn_enabled)"
 _sd = torch.load(a.model, map_location="cpu")
-net = RobustNet(nf=_sd["c1.weight"].shape[1], hid=_sd["c1.weight"].shape[0]); net.load_state_dict(_sd); net.eval()
+if "tile_model" in _sd:   # v31: tile-aligned wide view, pooled over the flow tile (fs guide px)
+    net = RobustNetTile(nf=_sd["c1.weight"].shape[1], hid=_sd["c1.weight"].shape[0], ctx=_sd["k1.weight"].shape[0])
+else:
+    net = RobustNet(nf=_sd["c1.weight"].shape[1], hid=_sd["c1.weight"].shape[0])
+net.load_state_dict(_sd); net.eval()
 worst = 0.0
 with tempfile.TemporaryDirectory() as d:
     exe = os.path.join(d, "emu.exe")
@@ -44,7 +48,8 @@ with tempfile.TemporaryDirectory() as d:
         na, nb, clip = float(z["noise_a"]), float(z["noise_b"]), 0.9
         r0 = analytic_r0(Ir, warp_by_flow(Ic, fl), na, nb, NOMINAL)
         with torch.no_grad():
-            R, _ = net(compute_features(Ir, Ic, fl, r0, na, nb, clip, fs)[0], r0)
+            feats = compute_features(Ir, Ic, fl, r0, na, nb, clip, fs)[0]
+            R, _ = net(feats, r0, min(fs, 32)) if isinstance(net, RobustNetTile) else net(feats, r0)
         inp, out = os.path.join(d, "in.bin"), os.path.join(d, "out.bin")
         with open(inp, "wb") as fh:
             np.array([W, H, fs], np.int32).tofile(fh); np.array([na, nb, clip], np.float32).tofile(fh)

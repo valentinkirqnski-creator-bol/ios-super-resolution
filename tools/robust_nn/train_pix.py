@@ -21,7 +21,7 @@ import torch                                                # noqa: E402
 import torch.nn.functional as F                             # noqa: E402
 from torch.utils.data import DataLoader, Dataset            # noqa: E402
 from real_protocol import load_net, stretch, geo_loss, geo_target, gt_edge_mask, CLIP   # noqa: E402
-from rnn.features import compute_features                  # noqa: E402
+from rnn.features import compute_features, consensus_features, edge_line_features   # noqa: E402
 from rnn.common import warp_by_flow                        # noqa: E402
 from rnn.pixnet import PixNet, pixel_inputs, consensus_inputs, expand_inputs, NPIX, NCONS   # noqa: E402
 
@@ -47,7 +47,24 @@ SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], 
        # real scenes, translation-only camera + tiny tilt/shift patches (s)
        "c22txp_train": ["rp22tx_train"], "c22txm_train": ["rp22tx_train"], "c22txp_val": ["rp22tx_val"],
        "c22txm_val": ["rp22tx_val"], "c22txr_train": ["rp22txr_train"], "c22txr_val": ["rp22txr_val"],
-       "c22scr_train": ["rp22scr_train"], "c22scr_val": ["rp22scr_val"]}
+       "c22scr_train": ["rp22scr_train"], "c22scr_val": ["rp22scr_val"],
+       # v23: edge segments slightly rotated the same way in most frames (the "same edge slightly rotated" artifact)
+       "c23er_train": ["rp23er_train"], "c23er_val": ["rp23er_val"], "c23ert_train": ["rp23ert_train"],
+       "c23ert_val": ["rp23ert_val"],
+       # v24: 768 px bursts at camera pixel scale - perfectly aligned (p), ghosted / thicker edges from small vector
+       # noise on edge tiles (g), zippery edges from a slight camera roll under one translation per tile (z)
+       "c24p_train": ["rp24ph_train", "rp24tx_train"], "c24g_train": ["rp24ph_train", "rp24tx_train"],
+       "c24z_train": ["rp24z_train"], "c24p_val": ["rp24ph_val"], "c24pt_val": ["rp24tx_val"],
+       "c24g_val": ["rp24ph_val"], "c24gt_val": ["rp24tx_val"], "c24z_val": ["rp24z_val"],
+       # v26: 3 MP (1728 px) bursts, real photos at camera scale - ghosted / thicker (g), zippery (z), perfect (p)
+       "c26g_train": ["rp26ph_train"], "c26p_train": ["rp26ph_train"], "c26z_train": ["rp26z_train"],
+       "c26g_val": ["rp26ph_val"], "c26p_val": ["rp26ph_val"], "c26z_val": ["rp26z_val"],
+       **{f"cchart{i}_val": [f"rpchart{i}"] for i in range(4)}, "c8mp_val": ["rp8mp"],
+       # v27: edge-chart training bursts (thin lines .. big blocks) - slipped edge tiles (T) and the same perfect (P)
+       **{f"cchartT{i}_train": [f"rpchartT{i}"] for i in range(4)}, **{f"cchartP{i}_train": [f"rpchartT{i}"] for i in range(4)},
+       # v28: uniform 0.2-2 px slips (tile vectors anywhere + translated / rotated content patches), photos / text / charts
+       **{f"c28{k}_{s}": [f"rp28{k}_{s}"] for k in ("p", "t", "c") for s in ("train", "val")}}
+PRE_M = 24   # v24: guide px of context kept around a training crop before features / target are computed
 REGT = os.environ.get("RNN_GT_NMERGE") is not None   # v17: recompute the target (merged-noise visibility)
 GT_HR = os.environ.get("RNN_GT_HR", "0") == "1"       # v18: full-raw-resolution target from <cache>_hr/
 
@@ -76,45 +93,71 @@ class Cache(Dataset):
 
     def __getitem__(self, i):
         z = np.load(self.files[i])
-        Ir, G = torch.from_numpy(z["ref"]), torch.from_numpy(z["grey"])
-        fl, r0 = torch.from_numpy(z["flow"]), torch.from_numpy(z["r0"].astype(np.float32))
+        rng = np.random.default_rng()
+        # v24: for big samples, cut the training crop (plus PRE_M context) out first, so features and target are only
+        # computed where they are used. Small samples keep the old full-image path.
+        Hf, Wf = z["ref"].shape
+        win = None
+        if self.crop and min(Hf, Wf) > self.crop + 2 * PRE_M:
+            y0, x0 = int(rng.integers(0, Hf - self.crop + 1)), int(rng.integers(0, Wf - self.crop + 1))
+            if os.environ.get("RNN_TILE_CROP") == "1":   # v30: crops on the tile grid (tile-aligned model)
+                tg = max(1, int(z["tile"]) // 2); y0, x0 = y0 // tg * tg, x0 // tg * tg
+            ya, xa = max(0, y0 - PRE_M), max(0, x0 - PRE_M)
+            win = (ya, min(Hf, y0 + self.crop + PRE_M), xa, min(Wf, x0 + self.crop + PRE_M), y0 - ya, x0 - xa)
+        S = (lambda v: np.ascontiguousarray(v[..., win[0]:win[1], win[2]:win[3]])) if win else (lambda v: v)
+        Ir, G = torch.from_numpy(S(z["ref"])), torch.from_numpy(S(z["grey"]))
+        fl, r0 = torch.from_numpy(S(z["flow"])), torch.from_numpy(S(z["r0"]).astype(np.float32))
         K, (H, W) = G.shape[0], G.shape[1:]
         a, b = float(z["a"]), float(z["b"])
         Ik = Ir[None].expand(K, -1, -1).contiguous()
-        ffl = torch.from_numpy(z["rflow"]) if "rflow" in z.files else None   # v20: residual after the homography
+        ffl = torch.from_numpy(S(z["rflow"])) if "rflow" in z.files else None   # v20: residual after the homography
         with torch.no_grad():
             feats, J = compute_features(Ik, G, fl, r0, a, b, CLIP, max(1, int(z["tile"]) // 2), ffl)
             pix = pixel_inputs(Ik, J, a, b)
+            if os.environ.get("EDGEF") == "1":   # v26: edge-line shift of this frame's edges (no extra buffers)
+                feats = torch.cat([feats, edge_line_features(Ik, J, a, b)], 1)
+            if os.environ.get("CONSF") == "1" and K > 1:   # v25: burst consistency - each frame vs the leave-one-out
+                feats = torch.cat([feats, consensus_features(Ir, J, r0, a, b)], 1)   # consensus of the others
             if CONS:
                 pix = torch.cat([pix, consensus_inputs(Ir, J, a, b)], 1)
             if CLEAN:
                 cl = torch.from_numpy(np.load(_source(self.files[i]))["clean_grey"])
                 pix = pixel_inputs(cl[0][None].expand(K, -1, -1).contiguous(), warp_by_flow(cl[1:], fl), a, b)
-        geo = torch.from_numpy(z["geo"].astype(np.float32))
+        geo = torch.from_numpy(S(z["geo"]).astype(np.float32))
         if GT_HR:   # v18: full-raw-resolution target (precompute_hr.py)
             hp = os.path.join(os.path.dirname(self.files[i]) + "_hr", os.path.basename(self.files[i]))
             geo = torch.from_numpy(np.load(hp)["geo_hr"].astype(np.float32))
         elif REGT:   # target recomputed from the burst's noise-free frames with the current visibility rule
             sz = np.load(_source(self.files[i]))
-            vis_px = torch.from_numpy(sz["vis"][1:].astype(np.float32))      # v22: lets counts skip out-of-view pixels
-            gtedge = (gt_edge_mask(torch.from_numpy(sz["clean_grey"])).float()[None].expand(K, -1, -1)
-                      if os.environ.get("RNN_GT_EDGE") else None)
-            geo = geo_target(torch.from_numpy(sz["clean_grey"]), fl, torch.from_numpy(sz["gt_flow"][1:]),
-                             torch.from_numpy(sz["vis"][1:].astype(np.float32)), 4 * a, 4 * b, occ_look=True)
-        d = dict(feats=feats, pix=pix, r0=r0, geo=geo,
+            cg_ = torch.from_numpy(S(sz["clean_grey"]))
+            vis_px = torch.from_numpy(S(sz["vis"][1:]).astype(np.float32))   # v22: lets counts skip out-of-view pixels
+            gtedge = (gt_edge_mask(cg_).float()[None].expand(K, -1, -1) if os.environ.get("RNN_GT_EDGE") else None)
+            # v24: the geometry rule on outlines only for the sets named in RNN_GT_GEO_SETS (prefixes)
+            gsets = [x for x in os.environ.get("RNN_GT_GEO_SETS", "").split(",") if x]
+            gtau = None
+            if gsets:
+                setname = os.path.basename(os.path.dirname(self.files[i]))
+                gtau = os.environ.get("RNN_GT_GEO_TAU", "0.15") if any(setname.startswith(p) for p in gsets) else "0"
+            geo = geo_target(cg_, fl, torch.from_numpy(S(sz["gt_flow"][1:])), vis_px, 4 * a, 4 * b, occ_look=True,
+                             geo_tau=gtau)
+        d = dict(feats=feats, pix=pix, r0=r0, geo=geo, ts=torch.full((K,), max(1, int(z["tile"]) // 2)),
                  **({"vis": vis_px} if REGT and not GT_HR else {}),
                  **({"gtedge": gtedge} if REGT and not GT_HR and gtedge is not None else {}),
-                 edge=torch.from_numpy(z["edge"].astype(np.float32))[None].expand(K, -1, -1),
-                 rot=torch.from_numpy(z["rot"]), ferr=torch.from_numpy(z["ferr"].astype(np.float32)))
-        rng = np.random.default_rng()
-        if self.crop:
+                 edge=torch.from_numpy(S(z["edge"]).astype(np.float32))[None].expand(K, -1, -1),
+                 rot=torch.from_numpy(S(z["rot"])), ferr=torch.from_numpy(S(z["ferr"]).astype(np.float32)))
+        if win:
+            oy, ox = win[4], win[5]
+            d = {k: (v[..., oy:oy + self.crop, ox:ox + self.crop] if k != "ts" else v) for k, v in d.items()}
+        elif self.crop:
             y, x = int(rng.integers(0, H - self.crop + 1)), int(rng.integers(0, W - self.crop + 1))
+            if os.environ.get("RNN_TILE_CROP") == "1":
+                tg = max(1, int(z["tile"]) // 2); y, x = y // tg * tg, x // tg * tg
             d = {k: v[..., y:y + self.crop, x:x + self.crop] for k, v in d.items()}
         if self.aug:   # every input is a rotation-invariant scalar field, so flips / 90-degree turns are exact
             k90, fl_ = int(rng.integers(0, 4)), bool(rng.integers(0, 2))
-            d = {k: torch.rot90(v, k90, (-2, -1)) for k, v in d.items()}
+            d = {k: (torch.rot90(v, k90, (-2, -1)) if v.dim() >= 2 else v) for k, v in d.items()}
             if fl_:
-                d = {k: torch.flip(v, (-1,)) for k, v in d.items()}
+                d = {k: (torch.flip(v, (-1,)) if v.dim() >= 2 else v) for k, v in d.items()}
         return {k: v.contiguous() for k, v in d.items()}
 
 
@@ -164,6 +207,8 @@ def evaluate(net, dv, base_too=False):
         if base_too:
             C["v14"] = C.get("v14", 0) + counts(net.base(d["feats"], d["r0"])[0], d)
         npix = getattr(net, "npix", None) or net.p1.in_channels - net.base.c1.weight.shape[1] - 1
+        if hasattr(net, "set_ts"):
+            net.set_ts(d.get("ts"))
         R = net(d["feats"], d["r0"], d["pix"][:, :npix])[0].clamp(1e-6, 1 - 1e-6)
         lg = torch.log(R) - torch.log1p(-R)
         for s in SHIFTS:

@@ -24,7 +24,7 @@ def main():
     torch.set_num_threads(10)
     vs.SHIFTS = [float(x) for x in os.environ.get("SHIFTS", "0,0.25,0.5,0.75,1.0,1.25,1.5").split(",")]
     vs.CUTS = [tuple(float(y) for y in x.split(":")) for x in os.environ.get("CUTS", "0.2:0.9").split(",")]
-    nets = {"v17": load_net(os.path.join(HERE, "runs/v21/model.pt"))}       # "v17" = the baseline slot: shipped v21
+    nets = {"v17": load_net(os.path.join(HERE, os.environ.get("BASE", "runs/v21/model.pt")))}   # baseline slot
     nets.update({os.path.basename(os.path.dirname(c)) + "/" + os.path.basename(c)[:-3]: load_net(os.path.join(HERE, c))
                  for c in sys.argv[1:]})
     sets = list(dict.fromkeys(KEEP + OLD + SLIP))

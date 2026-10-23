@@ -201,11 +201,16 @@ class Burst:
             l1_, l2_ = 0.5 * (tr_ + dd_), 0.5 * (tr_ - dd_)
             smap = ((l1_ - l2_) / (l1_ + l2_ + 1e-12)) ** 2 * l1_
         for _ in range(n_small):
-            size = float(sc.get("rot_patch_tile", 32)) if rng.random() < 0.5 else float(rng.uniform(16, 48))
+            if sc.get("small_size"):     # v23: longer edge segments (draws no extra rng when unset)
+                size = float(rng.uniform(*sc["small_size"]))
+            else:
+                size = float(sc.get("rot_patch_tile", 32)) if rng.random() < 0.5 else float(rng.uniform(16, 48))
             cand = np.stack([rng.uniform(size / 2, Wr - size / 2, 128), rng.uniform(size / 2, Hr - size / 2, 128)], 1)
             tx_ = ((Wt - 1) / 2.0 + tex_scale * (cand[:, 0] - fc[0])).astype(int).clip(0, Wt - 1)
             ty_ = ((Ht - 1) / 2.0 + tex_scale * (cand[:, 1] - fc[1])).astype(int).clip(0, Ht - 1)
             w = smap[ty_, tx_] ** 2 + 1e-30
+            if sc.get("small_anywhere") and rng.random() < sc["small_anywhere"]:   # v28: some patches anywhere
+                w = np.ones_like(w)
             ci = int(rng.choice(128, p=w / w.sum()))
             cx, cy = cand[ci]
             a_, b_, c_ = jxx[ty_[ci], tx_[ci]], jyy[ty_[ci], tx_[ci]], jxy[ty_[ci], tx_[ci]]
@@ -231,7 +236,60 @@ class Burst:
             # translation only / rotation only / both, at very small log-uniform magnitudes - the tiny slips that
             # thicken or double an edge. Unset: the v19 draws exactly as before.
             smode = sc.get("small_mode")
+            # sc["small_consistent"]: ONE slip per patch, applied (with +-15% jitter) in ~90% of the frames - the
+            # same region misaligned the same way across the burst, which the merge cannot average away.
+            consistent = smode is not None and sc.get("small_consistent", False)
+            if consistent:
+                kind0 = int(rng.integers(0, 3)) if not sc.get("small_kinds") else int(rng.choice(sc["small_kinds"]))
+                p_frame = float(rng.uniform(*sc["small_frac"])) if sc.get("small_frac") else 0.9
+                tl, th, sl, sh_hi = smode
+                r00 = float(rng.choice([-1, 1]) * np.exp(rng.uniform(np.log(tl), np.log(th))))
+                m00 = float(np.exp(rng.uniform(np.log(sl), np.log(sh_hi)))) * float(rng.choice([-1, 1]))
+                tg00 = float(rng.normal(0, 0.3)) * m00
+            dcons = None
+            if sc.get("small_disp") and rng.random() < 0.5:   # v28: half the patches slip the SAME way in most frames
+                dlo, dhi = sc["small_disp"]
+                dcons = (int(rng.integers(0, 3)), float(rng.uniform(dlo, dhi)) * float(rng.choice([-1, 1])),
+                         float(rng.choice([-1, 1]) * np.degrees(rng.uniform(dlo, dhi) / (size / 2.0))),
+                         float(rng.normal(0, 0.5)), float(rng.uniform(0.4, 0.95)))
             for _ in range(N - 1):
+                if dcons is not None:
+                    kind, m, r_, tgf, pf = dcons
+                    if rng.random() < pf:
+                        jt = float(np.clip(1.0 + 0.15 * rng.normal(), 0.5, 1.5))
+                        rot.append(r_ * jt if kind >= 1 else 0.0)
+                        sh.append(((m * nx_ - tgf * m * ny_) * jt, (m * ny_ + tgf * m * nx_) * jt) if kind != 1
+                                  else (0.0, 0.0))
+                    else:
+                        rot.append(0.0)
+                        sh.append((0.0, 0.0))
+                    continue
+                if consistent:
+                    if rng.random() < p_frame:
+                        jt = float(np.clip(1.0 + 0.15 * rng.normal(), 0.5, 1.5))
+                        rot.append(r00 * jt if kind0 >= 1 else 0.0)
+                        sh.append(((m00 * nx_ - tg00 * ny_) * jt, (m00 * ny_ + tg00 * nx_) * jt) if kind0 != 1
+                                  else (0.0, 0.0))
+                    else:
+                        rot.append(0.0)
+                        sh.append((0.0, 0.0))
+                    continue
+                if sc.get("small_disp"):
+                    # v28 (sc["small_disp"] = (lo, hi) raw px): each affected frame gets a translation, a rotation or
+                    # both whose DISPLACEMENT is uniform in [lo, hi] - a rotation turns the patch so its border moves
+                    # by that much (angle = disp / half size) - i.e. ghosts / blur / zipper edges of a known size
+                    if rng.random() < sc.get("small_pframe", 0.7):
+                        kind = int(rng.integers(0, 3))
+                        dlo, dhi = sc["small_disp"]
+                        m = float(rng.uniform(dlo, dhi)) * float(rng.choice([-1, 1]))
+                        r_ = float(rng.choice([-1, 1]) * np.degrees(rng.uniform(dlo, dhi) / (size / 2.0)))
+                        tg = float(rng.normal(0, 0.5)) * m
+                        rot.append(r_ if kind >= 1 else 0.0)
+                        sh.append((m * nx_ - tg * ny_, m * ny_ + tg * nx_) if kind != 1 else (0.0, 0.0))
+                    else:
+                        rot.append(0.0)
+                        sh.append((0.0, 0.0))
+                    continue
                 if smode is not None:
                     if rng.random() < 0.7:
                         kind = int(rng.integers(0, 3))          # 0 translate, 1 rotate, 2 both

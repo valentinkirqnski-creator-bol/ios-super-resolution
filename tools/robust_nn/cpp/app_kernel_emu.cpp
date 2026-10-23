@@ -27,6 +27,7 @@ inline void threadgroup_barrier(mem_flags) {}
 using std::min;
 inline int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline float clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+using std::max;
 inline float floor_(float v) { return std::floor(v); }
 // copied verbatim (minus address spaces) from HHSRKernels.metal
 inline void flow_sample_affine(device const float* flow, device const float* jac,
@@ -73,10 +74,25 @@ int main(int argc, char** argv) {
     p.flow_ny = ny; p.flow_nx = nx; p.tile_size = 2.f * fs; p.affine = 0; p.homog = 0;
     p.sharp_lo = argc > 4 ? std::atof(argv[3]) : 0.f;   // optional: lo hi
     p.sharp_hi = argc > 4 ? std::atof(argv[4]) : 0.f;
+    std::vector<float> tileB(1, 0.f);
+#if RNN_CTX > 0
+    {   // v31 tile passes, exactly as the host encodes them (one group per flow tile, then one thread per tile)
+        const int fsg = std::min(fs, RNN_TMAX);
+        const int nxg = (W + fsg - 1) / fsg, nyg = (H + fsg - 1) / fsg;
+        std::vector<float> tileA((size_t)nxg * nyg * RNN_CTX, 0.f);
+        tileB.assign((size_t)nxg * nyg * RNN_CTX, 0.f);
+        for (uint ty = 0; ty < (uint)nyg; ++ty)
+            for (uint tx = 0; tx < (uint)nxg; ++tx)
+                rnn_tile_pool(ref.data(), guide.data(), r0.data(), tileA.data(), tflow.data(), jac.data(), p,
+                              uint2{tx, ty}, 0u, uint2{1u, 1u});
+        for (uint ty = 0; ty < (uint)nyg; ++ty)
+            for (uint tx = 0; tx < (uint)nxg; ++tx) rnn_tile_conv(tileA.data(), tileB.data(), p, uint2{tx, ty});
+    }
+#endif
     for (uint ty = 0; ty < (uint)((H + 15) / 16); ++ty)
         for (uint tx = 0; tx < (uint)((W + 15) / 16); ++tx)
             rnn_refine_mask(ref.data(), guide.data(), r0.data(), out.data(), tflow.data(), jac.data(), p,
-                            uint2{tx, ty}, 0u, uint2{1u, 1u});
+                            tileB.data(), uint2{tx, ty}, 0u, uint2{1u, 1u});
     FILE* o = std::fopen(argv[2], "wb");
     std::fwrite(out.data(), 4, n, o);
     std::fclose(o);

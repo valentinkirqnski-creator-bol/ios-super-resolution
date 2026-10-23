@@ -81,13 +81,15 @@ def main():
     ap.add_argument("--edge_step", action="store_true", help="v19: straight-edge step corruption (tp_real flag 8)")
     ap.add_argument("--homog", action="store_true", help="v20: the app's global homography path (tp_real flag 16)")
     ap.add_argument("--oracle", action="store_true", help="v21: perfect alignment (tp_real flag 32)")
+    ap.add_argument("--limit", type=int, default=0, help="v24: use only the first N bursts of each source dir")
     ap.add_argument("--small", action="store_true", help="v22: only tiny misalignments when corrupting (flag 64)")
     ap.add_argument("--val_corrupt_only", action="store_true", help="v21: --val keeps only the corrupted half")
     ap.add_argument("--no_corrupt", action="store_true",
                     help="v20: never corrupt (perfect-alignment sets); --val then keeps only the aligner-only half")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    files = sorted(f for r in a.src.split(",") for f in glob.glob(os.path.join(HERE, r, "*.npz")))
+    files = sorted(f for r in a.src.split(",")
+                   for f in sorted(glob.glob(os.path.join(HERE, r, "*.npz")))[:a.limit or None])
     jobs = []
     if a.val:   # identical to RP(val)[idx]: idx < n aligner only, idx >= n corrupted; seed from default_rng(99 + idx)
         n = len(files)

@@ -176,6 +176,13 @@ static int process(const char* in_path, const char* out_path) {
     Image ones(H, W, 1);
     for (auto& x : ones.data) x = 1.f;
     std::vector<std::vector<float>> per;   // grey, r0, fx, fy, corr per frame
+    // v28: TP_SMALL_CONSISTENT=1 - some slipped tiles get ONE slip for the whole burst, applied (+-15%) in 40-95% of
+    // the frames, so the merge shows a clear double / shifted / zippery edge instead of a blur. Own rng: the main
+    // draws are unchanged.
+    const bool small_cons = std::getenv("TP_SMALL_CONSISTENT") != nullptr;
+    std::mt19937 crng((uint32_t)seed ^ 0x9e3779b9u);
+    std::normal_distribution<float> Nc(0.f, 1.f);
+    std::vector<float> cs_dx, cs_dy, cs_pf;
     for (int n = 1; n < N; ++n) {
         const Image& comp = raw[n];
         Image comp_grey = compute_grey(comp, work.bayer_mode, work.grey_method);
@@ -241,16 +248,48 @@ static int process(const char* in_path, const char* out_path) {
         }
         const bool frame_corrupted = corrupt && U(rng) > 0.25f;
         if (frame_corrupted && small_only) {
-            const float pfrac = 0.1f + 0.3f * U(rng);
+            // TP_SMALL_RANGE="lo,hi" (raw px, v24) overrides the 0.05-0.5 px log-uniform slip range
+            float slo = 0.05f, shi = 0.5f;
+            if (const char* sr = std::getenv("TP_SMALL_RANGE")) std::sscanf(sr, "%f,%f", &slo, &shi);
+            // v28: TP_SMALL_ANY=1 corrupts tiles anywhere (not only the stronger-edge half), TP_SMALL_UNIFORM=1 draws
+            // the slip uniformly in [lo, hi] instead of log-uniformly
+            const bool any_tile = std::getenv("TP_SMALL_ANY") != nullptr;
+            const bool uni = std::getenv("TP_SMALL_UNIFORM") != nullptr;
+            const float pfrac = (0.1f + 0.3f * U(rng)) * (small_cons ? 0.5f : 1.f);
             for (int ty = 0; ty < flow.ny; ++ty)
                 for (int tx = 0; tx < flow.nx; ++tx) {
                     const size_t t = (size_t)ty * flow.nx + tx;
-                    if (erank[t] < 0.5f || U(rng) >= pfrac) continue;
-                    const float mag = 0.05f * std::exp(U(rng) * std::log(10.f)), ang = 6.2831853f * U(rng);
+                    if ((!any_tile && erank[t] < 0.5f) || U(rng) >= pfrac) continue;
+                    const float u0 = U(rng);
+                    const float mag = uni ? slo + (shi - slo) * u0 : slo * std::exp(u0 * std::log(shi / slo));
+                    const float ang = 6.2831853f * U(rng);
                     flow.flow[2 * t] += mag * std::cos(ang);
                     flow.flow[2 * t + 1] += mag * std::sin(ang);
                     tcorr[t] = 1.f;
                 }
+        }
+        if (corrupt && small_only && small_cons) {
+            float slo = 0.05f, shi = 0.5f;
+            if (const char* sr = std::getenv("TP_SMALL_RANGE")) std::sscanf(sr, "%f,%f", &slo, &shi);
+            const bool any_tile = std::getenv("TP_SMALL_ANY") != nullptr;
+            const size_t nt = (size_t)flow.nx * flow.ny;
+            if (cs_pf.size() != nt) {   // drawn once per burst
+                cs_dx.assign(nt, 0.f); cs_dy.assign(nt, 0.f); cs_pf.assign(nt, 0.f);
+                const float cfrac = 0.05f + 0.15f * U(crng);
+                for (size_t t = 0; t < nt; ++t) {
+                    if ((!any_tile && erank[t] < 0.5f) || U(crng) >= cfrac) continue;
+                    const float mag = slo + (shi - slo) * U(crng), ang = 6.2831853f * U(crng);
+                    cs_dx[t] = mag * std::cos(ang); cs_dy[t] = mag * std::sin(ang);
+                    cs_pf[t] = 0.4f + 0.55f * U(crng);
+                }
+            }
+            for (size_t t = 0; t < nt; ++t) {
+                if (cs_pf[t] <= 0.f || U(crng) >= cs_pf[t]) continue;
+                const float j = std::min(1.5f, std::max(0.5f, 1.f + 0.15f * Nc(crng)));
+                flow.flow[2 * t] += cs_dx[t] * j;
+                flow.flow[2 * t + 1] += cs_dy[t] * j;
+                tcorr[t] = 1.f;
+            }
         }
         if (frame_corrupted && !small_only) {   // deliberate corruption on top of the aligner's own errors
             const bool block = U(rng) < 0.3f;
