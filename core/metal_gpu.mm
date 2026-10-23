@@ -2065,6 +2065,10 @@ static id<MTLBuffer> g_rnn_ref_grey = nil;
 static int g_rnn_h = 0, g_rnn_w = 0;
 static id<MTLBuffer> g_rnn_r0 = nil;
 static id<MTLBuffer> g_rnn_out = nil;
+static id<MTLBuffer> g_rnn_tileA = nil;   // v31 tile branch: K1 per flow tile, K2 per flow tile
+static id<MTLBuffer> g_rnn_tileB = nil;
+static const int kRnnTileMax = 32;         // == RNN_TMAX in HHSRKernels.metal (largest flow tile, guide px)
+static const int kRnnTilePoolThreads = 64; // == RNN_TPT (rnn_tile_pool threads per group, at most)
 // robust_nn v15 band buffers (Config::robust_nn_v15_enabled): reused across bands
 // and frames, ~25 MB on a 12 MP burst, released with the burst's reference.
 static id<MTLBuffer> g_r15_j = nil, g_r15_f = nil, g_r15_x = nil, g_r15_a = nil, g_r15_b = nil;
@@ -2127,6 +2131,8 @@ static void clear_rob_ref_gpu() {
     g_rnn_h = g_rnn_w = 0;
     g_rnn_r0 = nil;
     g_rnn_out = nil;
+    g_rnn_tileA = nil;
+    g_rnn_tileB = nil;
     g_r15_j = g_r15_f = g_r15_x = g_r15_a = g_r15_b = nil;
 }
 
@@ -2220,9 +2226,41 @@ static bool rnn_refine_raw_res(Image& R, id<MTLBuffer> b_comp_guide, int gh, int
     p.sharp_lo = std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f);
     p.sharp_hi = std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f);   // hi <= lo: raw output
 
+#if RNN_CTX > 0
+    // v31 tile branch (core/robust_nn_shared.h): K1 per flow tile, then K2 over
+    // the tile grid, encoded before the fused kernel in the same serial encoder.
+    const int fs = p.flow_step;
+    if (fs > kRnnTileMax) return false;               // the pool kernel's threadgroup tile cannot hold it
+    const int nxg = (gw + fs - 1) / fs, nyg = (gh + fs - 1) / fs;
+    const size_t tbytes = (size_t)nxg * (size_t)nyg * RNN_CTX * sizeof(float);
+    if (!g_rnn_tileA || [g_rnn_tileA length] < tbytes) g_rnn_tileA = buf(nullptr, tbytes);
+    if (!g_rnn_tileB || [g_rnn_tileB length] < tbytes) g_rnn_tileB = buf(nullptr, tbytes);
+    id<MTLComputePipelineState> ppool = c.pipe("rnn_tile_pool"), pconv = c.pipe("rnn_tile_conv");
+    if (!g_rnn_tileA || !g_rnn_tileB || !ppool || !pconv) return false;
+#endif
+
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = cmd ? [cmd computeCommandEncoder] : nil;
     if (!enc) return false;
+#if RNN_CTX > 0
+    [enc setComputePipelineState:ppool];
+    [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
+    [enc setBuffer:b_comp_guide offset:0 atIndex:1];
+    [enc setBuffer:g_rnn_r0 offset:0 atIndex:2];
+    [enc setBuffer:g_rnn_tileA offset:0 atIndex:3];
+    [enc setBuffer:b_flow offset:0 atIndex:4];
+    [enc setBuffer:b_jac offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    {
+        // One group per flow tile; the kernel strides its tile by the group's thread count (<= RNN_TPT).
+        const NSUInteger tp = std::min<NSUInteger>((NSUInteger)kRnnTilePoolThreads, ppool.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nxg, (NSUInteger)nyg, 1) threadsPerThreadgroup:MTLSizeMake(tp, 1, 1)];
+    }
+    [enc setBuffer:g_rnn_tileA offset:0 atIndex:0];
+    [enc setBuffer:g_rnn_tileB offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    dispatch2(enc, pconv, (NSUInteger)nxg, (NSUInteger)nyg);
+#endif
     [enc setComputePipelineState:pso];
     [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
     [enc setBuffer:b_comp_guide offset:0 atIndex:1];
@@ -2231,6 +2269,11 @@ static bool rnn_refine_raw_res(Image& R, id<MTLBuffer> b_comp_guide, int gh, int
     [enc setBuffer:b_flow offset:0 atIndex:4];
     [enc setBuffer:b_jac offset:0 atIndex:5];
     [enc setBytes:&p length:sizeof(p) atIndex:6];
+#if RNN_CTX > 0
+    [enc setBuffer:g_rnn_tileB offset:0 atIndex:7];
+#else
+    [enc setBuffer:g_rnn_r0 offset:0 atIndex:7];      // declared by the kernel, never read
+#endif
     // The kernel strides over its 16x16 tile, so any group size is correct.
     const NSUInteger total = std::min<NSUInteger>(256, pso.maxTotalThreadsPerThreadgroup);
     const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);

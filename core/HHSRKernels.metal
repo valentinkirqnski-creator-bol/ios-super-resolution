@@ -4017,6 +4017,14 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
 // (26x26) and its 18x18 feature halo in threadgroup memory (~21 KB) and runs
 // the net from there -- no feature planes in device memory. The only device
 // buffers are the pinned reference grey (per burst), R0 in and R out.
+//
+// v31 (RNN_CTX > 0, core/robust_nn_shared.h "tile branch"): the net also sees
+// its own flow tile. Two small passes before the fused kernel: rnn_tile_pool
+// (one threadgroup per flow tile: warped grey + the tile's 14 features, their
+// mean and max -> K1, RNN_CTX floats per tile) and rnn_tile_conv (3x3 over the
+// tile grid -> K2), ~RNN_CTX x 4 bytes per tile of device memory (~0.4 MB at
+// 12 MP). The fused kernel adds K3 of its tile's value to layer 2. The
+// features are computed twice (pool pass + fused kernel): ~2x the mask step.
 // ===========================================================================
 
 // Mirrors RnnAppParamsCPU in metal_gpu.mm (static_assert'ed there: 96 bytes).
@@ -4098,6 +4106,103 @@ struct RnnTgFeat {
     float operator()(int c, int x, int y) const { return s[(c * RNN_HN + (y - oy)) * RNN_HN + (x - ox)]; }
 };
 
+#if RNN_CTX > 0
+#define RNN_TMAX 32                        // largest flow tile (guide px) the tile branch runs at
+#define RNN_TPT 64                         // rnn_tile_pool threads per group (host dispatches at most this)
+#define RNN_TJN (RNN_TMAX + 8)             // warped-grey tile + 4 px apron (widest feature window)
+
+struct RnnTgImgN {                         // threadgroup tile with a runtime row stride
+    threadgroup const float* s;
+    int ox, oy, n;
+    float operator()(int x, int y) const { return s[(y - oy) * n + (x - ox)]; }
+};
+
+// v31 pass A: one threadgroup per flow tile (p.flow_step guide px, grid origin
+// 0, ceil(W/fs) x ceil(H/fs) groups of at most RNN_TPT threads): the tile's
+// features, their mean and max over the in-image pixels -> K1 summary.
+kernel void rnn_tile_pool(device const float* ref_grey [[buffer(0)]],
+                          device const float* comp_guide [[buffer(1)]],
+                          device const float* r0 [[buffer(2)]],
+                          device float* tileA [[buffer(3)]],
+                          device const float* flow [[buffer(4)]],
+                          device const float* jac [[buffer(5)]],
+                          constant RnnAppParams& p [[buffer(6)]],
+                          uint2 tgid [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 tpt [[threads_per_threadgroup]]) {
+    threadgroup float sJ[RNN_TJN * RNN_TJN];
+    threadgroup float sA[RNN_TPT * RNN_NF];
+    threadgroup float sM[RNN_TPT * RNN_NF];
+    threadgroup int sC[RNN_TPT];
+    const int W = p.width, H = p.height, fs = min(p.flow_step, RNN_TMAX);
+    const int nt = min(int(tpt.x * tpt.y), RNN_TPT);
+    const bool active = int(tid) < nt;      // threads beyond RNN_TPT only keep the barriers uniform
+    const int x0 = int(tgid.x) * fs, y0 = int(tgid.y) * fs;
+    const int jn = fs + 8;
+    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RnnAppFlow fl = {flow, jac, &p, 1u};
+    RnnAppFlow fr = {flow, jac, &p, 0u};
+    RnnGuideGrey cg = {comp_guide, W};
+    for (int i = int(tid); active && i < jn * jn; i += nt) {
+        int gx = clamp(x0 - 4 + i % jn, 0, W - 1);
+        int gy = clamp(y0 - 4 + i / jn, 0, H - 1);
+        sJ[i] = rnn_warp_at(cg, fl, W, H, gx, gy);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    RNNImg rf = {ref_grey, W};
+    RnnTgImgN tj = {sJ, x0 - 4, y0 - 4, jn};
+    float acc[RNN_NF], mx[RNN_NF];
+    for (int c = 0; c < RNN_NF; ++c) { acc[c] = 0.f; mx[c] = -1e30f; }
+    int cnt = 0;
+    for (int i = int(tid); active && i < fs * fs; i += nt) {
+        int x = x0 + i % fs, y = y0 + i / fs;
+        if (x >= W || y >= H) continue;
+        float f[RNN_NF];
+        rnn_features_at(rf, tj, fr, r0[y * W + x], P, x, y, f);
+        for (int c = 0; c < RNN_NF; ++c) { acc[c] += f[c]; mx[c] = max(mx[c], f[c]); }
+        ++cnt;
+    }
+    if (active) {
+        for (int c = 0; c < RNN_NF; ++c) { sA[tid * RNN_NF + c] = acc[c]; sM[tid * RNN_NF + c] = mx[c]; }
+        sC[tid] = cnt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0u) return;
+    float avg[RNN_NF], m[RNN_NF];
+    int n = 0;
+    for (int c = 0; c < RNN_NF; ++c) { avg[c] = 0.f; m[c] = -1e30f; }
+    for (int t = 0; t < nt; ++t) {
+        n += sC[t];
+        for (int c = 0; c < RNN_NF; ++c) { avg[c] += sA[t * RNN_NF + c]; m[c] = max(m[c], sM[t * RNN_NF + c]); }
+    }
+    float cs[RNN_CTX];
+    if (n > 0) {
+        for (int c = 0; c < RNN_NF; ++c) avg[c] = avg[c] / float(n);
+        rnn_tile_summary(avg, m, cs);
+    } else {
+        for (int o = 0; o < RNN_CTX; ++o) cs[o] = 0.f;
+    }
+    const uint nxg = uint((W + fs - 1) / fs);
+    const uint ti = tgid.y * nxg + tgid.x;
+    for (int o = 0; o < RNN_CTX; ++o) tileA[ti * uint(RNN_CTX) + uint(o)] = cs[o];
+}
+
+// v31 pass B: 3x3 over the tile grid (one thread per tile).
+kernel void rnn_tile_conv(device const float* tileA [[buffer(0)]],
+                          device float* tileB [[buffer(1)]],
+                          constant RnnAppParams& p [[buffer(2)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    const int fs = min(p.flow_step, RNN_TMAX);
+    const int nxg = (p.width + fs - 1) / fs, nyg = (p.height + fs - 1) / fs;
+    if (int(gid.x) >= nxg || int(gid.y) >= nyg) return;
+    RNNTileA ta = {tileA, nxg};
+    float o[RNN_CTX];
+    rnn_tile_conv_at(ta, nxg, nyg, int(gid.x), int(gid.y), o);
+    const uint ti = gid.y * uint(nxg) + gid.x;
+    for (int c = 0; c < RNN_CTX; ++c) tileB[ti * uint(RNN_CTX) + uint(c)] = o[c];
+}
+#endif
+
 kernel void rnn_grey_from_guide(device float* grey [[buffer(0)]],
                                 device const float* guide [[buffer(1)]],
                                 constant uint2& dims [[buffer(2)]],
@@ -4117,6 +4222,7 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
                             device const float* flow [[buffer(4)]],
                             device const float* jac [[buffer(5)]],
                             constant RnnAppParams& p [[buffer(6)]],
+                            device const float* tileB [[buffer(7)]],   // v31: K2 per flow tile (unused if RNN_CTX == 0)
                             uint2 tgid [[threadgroup_position_in_grid]],
                             uint tid [[thread_index_in_threadgroup]],
                             uint2 tpt [[threads_per_threadgroup]]) {
@@ -4157,7 +4263,15 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
     for (int i = int(tid); i < RNN_TS * RNN_TS; i += nt) {
         int x = x0 + i % RNN_TS, y = y0 + i / RNN_TS;
         if (x >= W || y >= H) continue;
+#if RNN_CTX > 0
+        const int fs = min(p.flow_step, RNN_TMAX);
+        const uint ti = uint(y / fs) * uint((W + fs - 1) / fs) + uint(x / fs);
+        float tb[RNN_CTX];
+        for (int c = 0; c < RNN_CTX; ++c) tb[c] = tileB[ti * uint(RNN_CTX) + uint(c)];
+        float R = rnn_net_tile_at(tf, tb, r0[y * W + x], W, H, x, y);
+#else
         float R = rnn_net_at(tf, r0[y * W + x], W, H, x, y);
+#endif
         // Decisiveness (Config::robust_nn_reject_below / _accept_above): the net
         // outputs a calibrated probability and hedges at ~0.3 on ghosts, which
         // the merge's normalisation still lets through. Below lo -> 0, above hi -> 1.

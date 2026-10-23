@@ -261,6 +261,82 @@ inline float rnn_net_at(FTA feat, float r0v, int W, int H, int x, int y) {
     return 1.0f / (1.0f + RNN_EXP(-z));
 }
 
+#ifndef RNN_CTX
+#define RNN_CTX 0
+#endif
+#if RNN_CTX > 0
+// ---- v31 tile branch (RNN_CTX > 0; mirrors rnn/model.py RobustNetTile) ------------------------
+// A wrong tile vector moves the WHOLE flow tile, and a zipper is the border between a right and a
+// wrong tile, so the net also sees its own tile: the mean and max of the 14 standardised features
+// over the pixel's flow tile (flow_step guide px, grid origin 0) -> K1 (1x1) -> ReLU -> K2 (3x3 over
+// the tile grid, clamp-to-edge: the 8 neighbour tiles) -> ReLU -> K3 (1x1) added to layer 2 before
+// its ReLU. Nothing crosses a tile border except the 3x3 tile step.
+
+// Per-tile summary from the tile's mean / max of the RAW features (standardised here).
+inline void rnn_tile_summary(RNN_THREAD const float* avg, RNN_THREAD const float* mx, RNN_THREAD float* c) {
+    for (int o = 0; o < RNN_CTX; ++o) {
+        float a = RNN_BK1[o];
+        for (int i = 0; i < RNN_NF; ++i) {
+            float xa = (avg[i] - RNN_MU[i]) / RNN_SD[i];
+            float xm = (mx[i] - RNN_MU[i]) / RNN_SD[i];
+            a += RNN_K1[o * 2 * RNN_NF + i] * xa + RNN_K1[o * 2 * RNN_NF + RNN_NF + i] * xm;
+        }
+        c[o] = rnn_maxf(a, 0.0f);
+    }
+}
+
+struct RNNTileA {                    // [tile][RNN_CTX], tiles row-major over a nxg-wide grid
+    const RNN_DEVICE float* p;
+    int nxg;
+    float operator()(int c, int tx, int ty) const { return p[(ty * nxg + tx) * RNN_CTX + c]; }
+};
+
+// 3x3 over the tile grid + ReLU, clamp-to-edge (== replicate padding).
+template <typename TA>
+inline void rnn_tile_conv_at(TA tileA, int nxg, int nyg, int tx, int ty, RNN_THREAD float* out) {
+    for (int o = 0; o < RNN_CTX; ++o) out[o] = RNN_BK2[o];
+    for (int ky = 0; ky < 3; ++ky) {
+        int yy = rnn_clampi(ty + ky - 1, 0, nyg - 1);
+        for (int kx = 0; kx < 3; ++kx) {
+            int xx = rnn_clampi(tx + kx - 1, 0, nxg - 1);
+            for (int c = 0; c < RNN_CTX; ++c) {
+                float v = tileA(c, xx, yy);
+                for (int o = 0; o < RNN_CTX; ++o) out[o] += RNN_K2[((o * RNN_CTX + c) * 3 + ky) * 3 + kx] * v;
+            }
+        }
+    }
+    for (int o = 0; o < RNN_CTX; ++o) out[o] = rnn_maxf(out[o], 0.0f);
+}
+
+// The network at (x,y) with the pixel's tile term tb[RNN_CTX] (K2's output for its tile).
+template <typename FTA>
+inline float rnn_net_tile_at(FTA feat, RNN_THREAD const float* tb, float r0v, int W, int H, int x, int y) {
+    float h1[RNN_HID];
+    for (int h = 0; h < RNN_HID; ++h) h1[h] = RNN_B1[h];
+    for (int ky = 0; ky < 3; ++ky) {
+        int yy = rnn_clampi(y + ky - 1, 0, H - 1);
+        for (int kx = 0; kx < 3; ++kx) {
+            int xx = rnn_clampi(x + kx - 1, 0, W - 1);
+            for (int c = 0; c < RNN_NF; ++c) {
+                float v = feat(c, xx, yy);
+                for (int h = 0; h < RNN_HID; ++h) h1[h] += RNN_W1[((h * RNN_NF + c) * 3 + ky) * 3 + kx] * v;
+            }
+        }
+    }
+    for (int h = 0; h < RNN_HID; ++h) h1[h] = rnn_maxf(h1[h], 0.0f);
+    float d = RNN_B3[0];
+    for (int o = 0; o < RNN_HID; ++o) {
+        float a = RNN_B2[o];
+        for (int i = 0; i < RNN_HID; ++i) a += RNN_W2[o * RNN_HID + i] * h1[i];
+        for (int c = 0; c < RNN_CTX; ++c) a += RNN_K3[o * RNN_CTX + c] * tb[c];
+        d += RNN_W3[o] * rnn_maxf(a, 0.0f);
+    }
+    float Rc = rnn_clampf(r0v, 1e-3f, 1.0f - 1e-3f);
+    float z = RNN_LOG(Rc / (1.0f - Rc)) + d;
+    return 1.0f / (1.0f + RNN_EXP(-z));
+}
+#endif
+
 // ---- v15: pixel-seeing refinement (Config::robust_nn_v15_enabled) -----------------------
 // Mirrors tools/robust_nn/rnn/pixnet.py (PixNet.forward, pixel_inputs) op for op over its OWN
 // v14 base (RNN15B_*, so a later change of the main weights cannot change v15's base). The app
