@@ -10,6 +10,7 @@
 //   burst_compare out_dir crop_x crop_y crop_w crop_h scale lo hi dng...
 // writes out_dir/{ones,r0,nn}.f32 (Hs x Ws x 3), out_dir/masks.f32
 // (per comp frame: r0 then nn, guide res), out_dir/meta.txt
+#include <cmath>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -160,6 +161,14 @@ int main(int argc, char** argv) {
         if (homog) {
             for (int i = 0; i < 9; ++i) flow.global_h[i] = Hg[i];
             flow.has_global_h = true;
+            // what the homography takes out: rotation (deg), scale, and the translation at the frame centre
+            const double rot = std::atan2((double)Hg[3], (double)Hg[0]) * 180.0 / 3.14159265358979;
+            const double scl = std::sqrt((double)Hg[0] * Hg[0] + (double)Hg[3] * Hg[3]);
+            const double cx = 0.5 * comp.w, cy = 0.5 * comp.h;
+            const double wq = Hg[6] * cx + Hg[7] * cy + Hg[8];
+            const double hx = (Hg[0] * cx + Hg[1] * cy + Hg[2]) / wq, hy = (Hg[3] * cx + Hg[4] * cy + Hg[5]) / wq;
+            std::fprintf(stderr, "frame %d: homography rotation %.3f deg, scale %.4f, centre shift (%.1f, %.1f) raw px\n",
+                         k, rot, scl, hx - cx, hy - cy);
         }
         Image rob = compute_robustness(comp, ref_stats, flow, tile, work);   // the app's analytic mask
         if (rob.c != 1 || rob.h != comp.h || rob.w != comp.w) {

@@ -60,6 +60,8 @@ SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], 
        "c26g_train": ["rp26ph_train"], "c26p_train": ["rp26ph_train"], "c26z_train": ["rp26z_train"],
        "c26g_val": ["rp26ph_val"], "c26p_val": ["rp26ph_val"], "c26z_val": ["rp26z_val"],
        **{f"cchart{i}_val": [f"rpchart{i}"] for i in range(4)}, "c8mp_val": ["rp8mp"],
+       # v32: pairs (P perfect by the app's aligner + homography / C corrupted) of rotated bursts at camera scale
+       **{f"c32{k}{v}_{sp}": [f"rp32{k}_{sp}"] for k in ("rot", "roll") for v in ("P", "C") for sp in ("train", "val")},
        # v27: edge-chart training bursts (thin lines .. big blocks) - slipped edge tiles (T) and the same perfect (P)
        **{f"cchartT{i}_train": [f"rpchartT{i}"] for i in range(4)}, **{f"cchartP{i}_train": [f"rpchartT{i}"] for i in range(4)},
        # v28: uniform 0.2-2 px slips (tile vectors anywhere + translated / rotated content patches), photos / text / charts
@@ -141,18 +143,19 @@ class Cache(Dataset):
             geo = geo_target(cg_, fl, torch.from_numpy(S(sz["gt_flow"][1:])), vis_px, 4 * a, 4 * b, occ_look=True,
                              geo_tau=gtau)
         d = dict(feats=feats, pix=pix, r0=r0, geo=geo, ts=torch.full((K,), max(1, int(z["tile"]) // 2)),
+                 perfect=torch.full((K,), 0.0 if bool(z["corrupt"]) else 1.0),   # v32: no deliberate slip in this sample
                  **({"vis": vis_px} if REGT and not GT_HR else {}),
                  **({"gtedge": gtedge} if REGT and not GT_HR and gtedge is not None else {}),
                  edge=torch.from_numpy(S(z["edge"]).astype(np.float32))[None].expand(K, -1, -1),
                  rot=torch.from_numpy(S(z["rot"])), ferr=torch.from_numpy(S(z["ferr"]).astype(np.float32)))
         if win:
             oy, ox = win[4], win[5]
-            d = {k: (v[..., oy:oy + self.crop, ox:ox + self.crop] if k != "ts" else v) for k, v in d.items()}
+            d = {k: (v[..., oy:oy + self.crop, ox:ox + self.crop] if v.dim() >= 2 else v) for k, v in d.items()}
         elif self.crop:
             y, x = int(rng.integers(0, H - self.crop + 1)), int(rng.integers(0, W - self.crop + 1))
             if os.environ.get("RNN_TILE_CROP") == "1":
                 tg = max(1, int(z["tile"]) // 2); y, x = y // tg * tg, x // tg * tg
-            d = {k: v[..., y:y + self.crop, x:x + self.crop] for k, v in d.items()}
+            d = {k: (v[..., y:y + self.crop, x:x + self.crop] if v.dim() >= 2 else v) for k, v in d.items()}
         if self.aug:   # every input is a rotation-invariant scalar field, so flips / 90-degree turns are exact
             k90, fl_ = int(rng.integers(0, 4)), bool(rng.integers(0, 2))
             d = {k: (torch.rot90(v, k90, (-2, -1)) if v.dim() >= 2 else v) for k, v in d.items()}

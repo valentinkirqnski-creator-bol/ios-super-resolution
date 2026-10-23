@@ -55,6 +55,7 @@ EDGE_HARD = float(os.environ.get("RNN_EDGE_HARD", "0"))     # v27: visible slips
 EDGE_KEEP = float(os.environ.get("RNN_EDGE_KEEP", "0"))     # v27: extra cost of dropping a well-aligned OUTLINE pixel
 W_NEAR = float(os.environ.get("RNN_W_NEAR", "0"))           # v31: extra cost of dropping a good pixel NEXT TO a slip
 NEAR_R = int(os.environ.get("RNN_NEAR_R", "8"))             # v31: ... within this many guide px of one
+W_PERFECT = float(os.environ.get("RNN_W_PERFECT", "0"))     # v32: extra cost of dropping a good pixel of an UNcorrupted sample
 SELECT_SAFE = os.environ.get("RNN_SELECT", "") == "safe"    # v14: best = fewest errors with leak not above start
 
 
@@ -123,7 +124,11 @@ def geo_target(clean, flow_used, gt_flow, vis, alpha, beta, k=None, floor=None, 
             e2 = e_n ** 2 + ((1.0 - coh) * e_t) ** 2
             sig_grad = ((alpha * mu[0] + beta) / 8.0 / n_merge).clamp_min(1e-12).sqrt()   # merged-noise gradient sigma
             struct = ((l1.sqrt() > 3.0 * sig_grad)[None].expand(K, -1, -1)) & (vis > 0.5)
-            t = torch.where(struct, torch.minimum(t, torch.exp(-0.5 * e2 / tau ** 2)), t)
+            # v32 (RNN_GT_GEO_TAU_TEX): a looser scale on low-coherence texture (foliage, gravel), where a slip of
+            # a few tenths of a pixel blurs slightly rather than drawing a visible double edge
+            tau_tex = float(os.environ.get("RNN_GT_GEO_TAU_TEX", tau))
+            tau_eff = (tau + (tau_tex - tau) * (1.0 - coh))[None]
+            t = torch.where(struct, torch.minimum(t, torch.exp(-0.5 * e2 / tau_eff ** 2)), t)
         else:
             outline = gt_edge_mask(clean)[None].expand(K, -1, -1) & (vis > 0.5)
             t = torch.where(outline, torch.minimum(t, torch.exp(-0.5 * (e_n / tau) ** 2)), t)
@@ -668,6 +673,8 @@ def geo_loss(R, t, w_bad=9.0, d=None):
             bad = (d["ferr"] > 0.2).float()[:, None]
             near = (torch.nn.functional.max_pool2d(bad, 2 * NEAR_R + 1, 1, NEAR_R)[:, 0] > 0.5) & (d["ferr"] <= 0.2)
             w = w + W_NEAR * t * near.float()
+        if W_PERFECT > 0 and "perfect" in d:   # v32: the perfectly aligned twin of every scene must be kept
+            w = w + W_PERFECT * t * d["perfect"].float()[:, None, None]
     else:
         w = 1.0 + w_bad * (1.0 - t)
     return (w * -(t * torch.log(Rc) + (1 - t) * torch.log(1 - Rc))).mean()
