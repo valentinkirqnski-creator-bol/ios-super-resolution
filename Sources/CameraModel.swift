@@ -366,7 +366,7 @@ struct TuningParams: Equatable, Codable {
     /// vectors; +6.4% merged-MSE on held-out synthetic. Needs the multi-frame
     /// consensus pre-pass. CPU/harness path today; device Metal apply pending.
     var rob_mask_nn_enabled: Bool = false
-    /// tools/robust_nn (v31 weights): learned refinement of the analytic robustness
+    /// tools/robust_nn (v32 weights): learned refinement of the analytic robustness
     /// mask (R = sigmoid(logit(R0) + delta)), two small per-tile passes + one fused Metal kernel. Off by default.
     var robust_nn_enabled: Bool = false
     /// Match every frame's brightness to the reference before alignment / masking / merging, from each frame's
