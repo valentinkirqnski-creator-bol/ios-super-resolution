@@ -46,6 +46,7 @@ targets:
           - "merge.cpp"
           - "pipeline.cpp"
           - "pipeline_paths.cpp"
+          - "feat_metric.cpp"
           - "global_homography.cpp"
           - "flow_consensus.cpp"
           - "isa_prealign.cpp"

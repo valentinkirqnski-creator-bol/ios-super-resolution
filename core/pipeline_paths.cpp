@@ -1393,6 +1393,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                               work.flow_consensus_enabled ||
                               work.halftile_refine_enabled ||
                               work.dense_flow_enabled ||
+                              work.feat_metric_refine_enabled ||
                               work.rob_mask_nn_enabled);
 #endif
     // 460-main block matching circular-pads the reference before pyramid construction.
@@ -2063,6 +2064,34 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     dense_lk_refine(flow, ref_ds, comp_ds, work, seed_ts, comp.h, comp.w);
                 } else {
                     dense_lk_refine(flow, ref_grey, cg, work, seed_ts, comp.h, comp.w);
+                }
+            }
+        }
+        // Feature-metric refinement (Config::feat_metric_refine_enabled): a tiny
+        // learned CNN maps the greys to feature planes and a per-tile affine LK
+        // refines the flow on those features (feat_metric.cpp). Alternative dense
+        // source to dense_lk_refine; runs AFTER it so it wins when both are on.
+        // Host-side like dense: memory-guarded + downsampled (the feature planes
+        // and the warped-feature working set are a few FM_NF-channel planes, so
+        // at full 12MP res the transient would threaten jetsam -- 1/2 grey keeps
+        // it to ~150-250MB and, being nearer the grey scale the net trained on,
+        // is also the more faithful feature scale).
+        if (work.feat_metric_refine_enabled) {
+            const int Dd = std::max(1, work.feat_metric_downsample);
+            const uint64_t avail = prof_available_bytes();
+            const size_t need = (size_t)(ref_grey.h / Dd) * (ref_grey.w / Dd) * sizeof(float);
+            const uint64_t kFeatHeadroom = (uint64_t)need * 20ull + 300ull * 1024 * 1024;
+            if (avail != 0 && avail < kFeatHeadroom) {
+                prof_add_cpu("featmetric#skipped-lowmem", 1.0);
+            } else {
+                const int seed_ts = merge_ts;
+                const Image& cg = gw.warped ? gw.warped_grey : comp_grey;
+                if (Dd > 1) {
+                    Image ref_ds = downsample_box_grey(ref_grey, Dd);
+                    Image comp_ds = downsample_box_grey(cg, Dd);
+                    feat_metric_refine(flow, ref_ds, comp_ds, work, seed_ts, comp.h, comp.w);
+                } else {
+                    feat_metric_refine(flow, ref_grey, cg, work, seed_ts, comp.h, comp.w);
                 }
             }
         }

@@ -219,6 +219,13 @@ struct TuningParams: Equatable, Codable {
     /// merge/robustness consume it (the Metal merge/robustness dense twin is a
     /// later build), off by default.
     var dense_flow_enabled: Bool = false
+    /// Feature-metric alignment refinement: a tiny learned CNN maps the greys to
+    /// feature planes and a per-tile affine Lucas-Kanade refines the flow on those
+    /// features (core/feat_metric.cpp). Scene-aware; measured +16–37% alignment
+    /// accuracy over classical on held-out real bursts, rotation-safe. Produces
+    /// the same dense field as dense_flow (wins when both on). Host-side like
+    /// dense, off by default.
+    var feat_metric_refine_enabled: Bool = false
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -463,6 +470,7 @@ struct TuningParams: Equatable, Codable {
         case real_rgb_guide, flow_upsample_candidates
         case bm_subpixel_enabled, lk_every_level_enabled, halftile_refine_enabled, halftile_refine_target_ts
         case dense_flow_enabled
+        case feat_metric_refine_enabled
         case robustness_per_channel
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -575,6 +583,7 @@ struct TuningParams: Equatable, Codable {
         halftile_refine_enabled = try c.decodeIfPresent(Bool.self, forKey: .halftile_refine_enabled) ?? halftile_refine_enabled
         halftile_refine_target_ts = try c.decodeIfPresent(Int.self, forKey: .halftile_refine_target_ts) ?? halftile_refine_target_ts
         dense_flow_enabled = try c.decodeIfPresent(Bool.self, forKey: .dense_flow_enabled) ?? dense_flow_enabled
+        feat_metric_refine_enabled = try c.decodeIfPresent(Bool.self, forKey: .feat_metric_refine_enabled) ?? feat_metric_refine_enabled
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
@@ -2392,6 +2401,7 @@ final class CameraModel: NSObject, ObservableObject {
             "halftile_refine_enabled": NSNumber(value: tuningParams.halftile_refine_enabled),
             "halftile_refine_target_ts": NSNumber(value: tuningParams.halftile_refine_target_ts),
             "dense_flow_enabled": NSNumber(value: tuningParams.dense_flow_enabled),
+            "feat_metric_refine_enabled": NSNumber(value: tuningParams.feat_metric_refine_enabled),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),

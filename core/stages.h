@@ -83,6 +83,18 @@ void dense_lk_refine(FlowField& flow, const Image& ref_grey,
                      const Image& comp_grey, const Config& cfg,
                      int raw_tile_size, int raw_h, int raw_w);
 
+// Feature-metric alignment refinement (Config::feat_metric_refine_enabled): a
+// tiny learned CNN (core/feat_metric_shared.h + feat_metric_weights.h) maps the
+// greys to FM_NF feature planes; a per-tile affine Lucas-Kanade refines the flow
+// on those features, seeded from the finalized tile/affine flow, and writes a
+// per-pixel dense field (FlowField::dense + sample_dense), same contract as
+// dense_lk_refine. raw_tile_size is the seed grid's tile size, raw_h/raw_w the
+// raw frame dims (grey->raw scale). Host-side, memory-guarded at the call site.
+// No-op when the flag is off or a grey is header-only.
+void feat_metric_refine(FlowField& flow, const Image& ref_grey,
+                        const Image& comp_grey, const Config& cfg,
+                        int raw_tile_size, int raw_h, int raw_w);
+
 // Fresh per-level Lucas-Kanade (Config::lk_every_level_enabled): per-tile
 // inverse-compositional GN translation refinement against one pyramid level,
 // Levenberg-damped, step-clamped, with a per-tile SSD accept gate.

@@ -862,6 +862,22 @@ struct Config {
     float dense_flow_max_dev = 2.0f;   // max |dense - seed| per axis, grey px (local-refinement bound)
     bool  dense_flow_median = true;    // 3x3 median regularization between iterations
 
+    // Feature-metric alignment refinement (feat_metric.cpp). A tiny learned CNN
+    // (core/feat_metric_weights.h, 956 params) maps the reference/comparison grey
+    // to FM_NF feature planes; a per-tile AFFINE Lucas-Kanade then refines the
+    // flow ON THOSE FEATURES, seeded from the finalized tile/affine flow, and
+    // writes a per-pixel dense field (FlowField::dense, like dense_lk_refine).
+    // Scene-aware features cut alignment error on handheld/parallax/repetitive
+    // content where intensity LK cannot (measured +16..37% endpoint over
+    // classical on held-out real bursts); the affine model keeps rotation from
+    // regressing. Runs on the HOST (memory-guarded + downsample-aware at the call
+    // site like dense). Off by default; an alternative dense-flow source (if both
+    // dense_flow_enabled and this are on, whichever runs last wins -- this does).
+    bool  feat_metric_refine_enabled = false;
+    int   feat_metric_iters = 6;        // per-tile LK iterations (training used 6)
+    int   feat_metric_downsample = 2;   // run on 1/N grey (memory, like dense_flow_downsample)
+    bool  feat_metric_accept_gate = true; // per-tile SSD accept vs seed (false only for parity tests)
+
     // Global homography warp-then-refine for large camera roll / global
     // perspective. Estimates one homography between the reference and each
     // comparison grey, warps the comparison into the reference frame before
