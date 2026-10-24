@@ -62,6 +62,8 @@ SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], 
        **{f"cchart{i}_val": [f"rpchart{i}"] for i in range(4)}, "c8mp_val": ["rp8mp"],
        # v32: pairs (P perfect by the app's aligner + homography / C corrupted) of rotated bursts at camera scale
        **{f"c32{k}{v}_{sp}": [f"rp32{k}_{sp}"] for k in ("rot", "roll") for v in ("P", "C") for sp in ("train", "val")},
+       # v33: burst12-like slow roll + zoom, app aligner WITHOUT the homography (A: stepped edges) / WITH it (H: clean)
+       **{f"c33{v}_{sp}": [f"rp33_{sp}"] for v in ("A", "H", "O") for sp in ("train", "val")},
        # v27: edge-chart training bursts (thin lines .. big blocks) - slipped edge tiles (T) and the same perfect (P)
        **{f"cchartT{i}_train": [f"rpchartT{i}"] for i in range(4)}, **{f"cchartP{i}_train": [f"rpchartT{i}"] for i in range(4)},
        # v28: uniform 0.2-2 px slips (tile vectors anywhere + translated / rotated content patches), photos / text / charts

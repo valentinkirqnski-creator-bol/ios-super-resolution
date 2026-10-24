@@ -323,6 +323,14 @@ def build_burst(seed, val, scenes):
         rlo_, rhi_ = (float(x) for x in os.environ["RNN_ROLL"].split(","))
         sc.update(rot_deg=float(rng.uniform(rlo_, rhi_)), rot_drift=0.0, zoom_rate=0.0, persp=0.0,
                   center_dist=float(rng.uniform(0, 100)))
+    # v33 (RNN_B12="spread,drift_lo,drift_hi,zoom_lo,zoom_hi"): the burst12 hand motion - a slow camera roll that
+    # grows along the burst (drift deg/frame, random sign) with a small per-frame spread, a slow zoom (rate/frame,
+    # 0.0035 = 2.5% by frame 7) and the usual tremor; no perspective. Aligned WITHOUT the homography by the app's own
+    # aligner, one translation per tile cannot follow the roll inside a tile: long edges step at tile borders.
+    if os.environ.get("RNN_B12"):
+        sp_, dlo_, dhi_, zlo_, zhi_ = (float(x) for x in os.environ["RNN_B12"].split(","))
+        sc.update(rot_deg=sp_, rot_drift=float(np.radians(rng.choice([-1, 1]) * rng.uniform(dlo_, dhi_))),
+                  zoom_rate=float(rng.uniform(zlo_, zhi_)), persp=0.0, center_dist=float(rng.uniform(0, 150)))
     tex = float(os.environ.get("RNN_TEX_SCALE", "2" if text_bg is None else "4"))
     b = Burst(sc, rng, Hr=SIZE, Wr=SIZE, bg_rgb=sc_rgb if text_bg is None else text_bg, cfa=cfa, prewhite=wb,
               tex_scale=tex, allow_flip=text_bg is None)

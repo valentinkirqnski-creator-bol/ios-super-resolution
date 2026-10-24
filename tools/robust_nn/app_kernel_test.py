@@ -48,7 +48,7 @@ with tempfile.TemporaryDirectory() as d:
         na, nb, clip = float(z["noise_a"]), float(z["noise_b"]), 0.9
         r0 = analytic_r0(Ir, warp_by_flow(Ic, fl), na, nb, NOMINAL)
         with torch.no_grad():
-            feats = compute_features(Ir, Ic, fl, r0, na, nb, clip, fs)[0]
+            feats = compute_features(Ir, Ic, fl, r0, na, nb, clip, fs)[0][:, :net.c1.weight.shape[1]]   # a 14-input net
             R, _ = net(feats, r0, min(fs, 32)) if isinstance(net, RobustNetTile) else net(feats, r0)
         inp, out = os.path.join(d, "in.bin"), os.path.join(d, "out.bin")
         with open(inp, "wb") as fh:

@@ -27,10 +27,10 @@ import torch.nn.functional as F
 
 from .common import pad_rep, win_mean, win_mean_offsets, warp_by_flow
 
-NF = 14
+NF = 15
 NAMES = ["r0_logit", "mean_diff", "resid_e5", "edge_e5", "ls_shift", "ls_explained", "anisotropy",
          "log_bright", "clip_frac", "flow_affine_center", "flow_affine_rms", "flow_affine_grad",
-         "flow_max_nbr_dev", "resid_e9"]
+         "flow_max_nbr_dev", "resid_e9", "tile_pred_resid"]
 
 
 def _flow_features(flow, fs):
@@ -92,7 +92,7 @@ def _flow_features(flow, fs):
         ex = flow[:, 0] - tx
         ey = flow[:, 1] - ty
         md = torch.maximum(md, torch.sqrt(ex * ex + ey * ey))
-    return center, rms, grad, md
+    return center, rms, grad, md, (ax1, ax2, ay1, ay2)
 
 
 def compute_features(Ir, Ic, flow, R0, a, b, clip, fs, fflow=None):
@@ -134,14 +134,25 @@ def compute_features(Ir, Ic, flow, R0, a, b, clip, fs, fflow=None):
     f7 = 0.25 * torch.log(mu_r.clamp_min(1e-4))
     ci = (torch.maximum(Ir, J) > clip).float()
     f8 = win_mean(ci, 1)
-    center, rms, grad, md = _flow_features(flow if fflow is None else fflow, fs)
+    center, rms, grad, md, (ax1, ax2, ay1, ay2) = _flow_features(flow if fflow is None else fflow, fs)
     f9 = torch.log(1.0 + center)
     f10 = torch.log(1.0 + rms)
     f11 = torch.log(1.0 + grad)
     f12 = torch.log(1.0 + md)
     r9 = win_mean_offsets(r * r, [-4, -2, 0, 2, 4])
     f13 = torch.log(1.0 + r9 / s2)
-    return torch.stack([f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13], 1), J
+    # v34: predicted in-tile residual of the one-translation-per-tile model (mirrors robust_nn_shared.h f[14]):
+    # the affine fit's change of the tile flow per tile step, times the pixel's offset from its own tile centre
+    # (tile grid origin 0, fs px) -> how far this pixel's true motion differs from its tile's vector (a roll: the
+    # stepped edge at tile borders). Flow only, noise-free.
+    H, W = Ir.shape[-2:]
+    ys, xs = torch.meshgrid(torch.arange(H, dtype=Ir.dtype), torch.arange(W, dtype=Ir.dtype), indexing="ij")
+    ox = (xs - torch.div(xs, fs, rounding_mode="floor") * fs) - 0.5 * (fs - 1)
+    oy = (ys - torch.div(ys, fs, rounding_mode="floor") * fs) - 0.5 * (fs - 1)
+    rx = (ax1 * ox + ax2 * oy) / float(fs)
+    ry = (ay1 * ox + ay2 * oy) / float(fs)
+    f14 = torch.log(1.0 + torch.sqrt(rx * rx + ry * ry))
+    return torch.stack([f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14], 1), J
 
 
 # ---- burst consistency (prototype, v8) ---------------------------------------------------------------
