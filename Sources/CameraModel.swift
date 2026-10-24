@@ -372,8 +372,9 @@ struct TuningParams: Equatable, Codable {
     /// Match every frame's brightness to the reference before alignment / masking / merging, from each frame's
     /// exposure metadata (shutter x ISO); locked bursts are untouched. On by default.
     var exposure_match_enabled: Bool = true
-    /// robust_nn v15 (opt-in, on top of robust_nn_enabled): pixel-seeing mask net. More GPU (~3x the
-    /// mask step) and ~25 MB of band buffers on a 12 MP burst; falls back to v14 if it cannot run.
+    /// Content-aware pixel net v39 (opt-in, on top of robust_nn_enabled; the v15 kernels over a frozen v21 base):
+    /// sees the pixels, ~3x the mask step's GPU time and ~25 MB of band buffers on a 12 MP burst; falls back to v21
+    /// if it cannot run.
     var robust_nn_v15_enabled: Bool = false
     /// robust_nn output: R below this -> exactly 0 (rejected). v14/v17/v21/v22 default 0.20.
     /// Stored under new keys (…_v14) so a value saved by an earlier build cannot override the new default.

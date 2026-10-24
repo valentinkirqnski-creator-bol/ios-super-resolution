@@ -1278,9 +1278,9 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robust_nn_enabled {
-                        Toggle("Use v15 pixel net (experimental)", isOn: $cam.tuningParams.robust_nn_v15_enabled)
+                        Toggle("Content-aware pixel net (v39)", isOn: $cam.tuningParams.robust_nn_v15_enabled)
                         Text("""
-                             v15 also looks at the actual pixels of the reference and the aligned frame (a 17x17 neighbourhood), so its mask follows where inside a tile a ghost really shows: finer rejection boundaries and fewer missed small shifts and rotated tile content than v14 at the same ghost rate. Costs about 3x v14's mask-step GPU time and ~25 MB extra memory on a 12 MP burst. Uses the same Reject Below / Trust Above sliders.
+                             On top of v21, a small network that also sees the actual pixels of the reference and the aligned frame over a 17x17 neighbourhood, so a doubled, stepped or smeared edge is recognised as a shape rather than from per-pixel statistics. Trained on full 12 MP bursts of the same scene perfectly aligned and with small misalignments (a hand roll of 1-3 degrees that one translation per tile cannot follow, tile slips of 0.1-3 px, slipped small text) with the perfectly aligned twin protected. On held-out bursts vs v21: misaligned pixels kept 53% -> 23% on the roll residual, 35% -> 12% on tile slips, 13% -> 10% on slipped text; perfectly aligned 12 MP frames and aliased text given up 0.1% and 1.8% (v21 0.3% and 6.4%). On the real burst9 it keeps the same weight as v21 on texture and flat areas and rejects more at the misaligned car. Operating point +0.25 folded in; evaluated at Reject Below 0.20 / Trust Above 0.90. About 3x the mask step's GPU time and ~25 MB more memory on a 12 MP burst.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                         HStack {
