@@ -531,8 +531,10 @@ void raw_site_stats(const Image& raw, float med[4], float mx[4]) {
 }
 
 // Scales a comparison raw frame by one exposure gain g (Config::exposure_match_enabled). A brightened pixel is
-// capped at the reference's maximum for its CFA site unless it was already above it, so saturated highlights stay
-// at the reference's saturation level (raw values are pre-white-balanced, so R/B saturate above 1).
+// capped at cap[site] unless it was already above it. The caller passes each CFA site's SATURATION level
+// (raw values are pre-white-balanced: white = wb[c] / wb[G] per site), so saturated highlights stay saturated and
+// bright areas keep their channel ratios. Do not pass the reference's observed per-site maximum: that is scene
+// content, differs per site, and tints highlights.
 void apply_raw_gain(Image& raw, float g, const float ref_max[4]) {
     if (raw.c != 1 || !(g > 0.f) || std::fabs(g - 1.f) < 1e-6f) return;
     for (int s = 0; s < 4; ++s) {

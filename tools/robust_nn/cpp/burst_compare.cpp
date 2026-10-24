@@ -90,7 +90,16 @@ int main(int argc, char** argv) {
             if (burst[k].exposure > 0.f) {
                 const float g = std::min(1.5f, std::max(0.67f, burst[0].exposure / burst[k].exposure));
                 std::fprintf(stderr, "frame %zu exposure gain %.4f\n", k, g);
-                if (std::fabs(g - 1.f) > 0.002f) apply_raw_gain(burst[k], g, mx);
+                if (std::fabs(g - 1.f) > 0.002f) {
+                    float sat[4];   // per-site saturation, as the app (pipeline_paths.cpp) caps now
+                    for (int s = 0; s < 4; ++s) {
+                        int col = (int)cfg.cfa.p[s / 2][s % 2];
+                        if (col < 0) col = 0;
+                        if (col > 2) col = 1;
+                        sat[s] = cfg.white_balance[1] > 0.f ? cfg.white_balance[col] / cfg.white_balance[1] : mx[s];
+                    }
+                    apply_raw_gain(burst[k], g, sat);
+                }
             }
     }
     if (cx < 0) cx = (burst[0].w - cw) / 2;

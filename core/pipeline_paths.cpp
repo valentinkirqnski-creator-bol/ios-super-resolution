@@ -1200,7 +1200,23 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             if (exp_ref > 0.f) raw_site_stats(im, exp_ref_med, exp_ref_max);
         } else if (exp_ref > 0.f && im.exposure > 0.f) {
             const float g = std::min(1.5f, std::max(0.67f, exp_ref / im.exposure));
-            if (std::fabs(g - 1.f) > 0.002f) apply_raw_gain(im, g, exp_ref_max);
+            if (std::fabs(g - 1.f) > 0.002f) {
+                // Brightened pixels are capped at each CFA site's SATURATION: the loader delivers
+                // (v - black) / (white - black) * wb[c] / wb[G], so a saturated site sits at wb[c] / wb[G].
+                // (Capping at the reference's observed per-site maximum instead - scene content, sampled
+                // on a sparse grid, different for every site - clipped bright areas of the brightened frames
+                // at four unrelated levels and tinted highlights cyan / purple in the merged DNG.)
+                float sat[4];
+                const bool wb_ok = std::isfinite(c.white_balance[1]) && c.white_balance[1] > 0.f;
+                for (int s = 0; s < 4; ++s) {
+                    int col = (int)c.cfa.p[s / 2][s % 2];
+                    if (col < 0) col = 0;
+                    if (col > 2) col = 1;
+                    const bool ok = wb_ok && std::isfinite(c.white_balance[col]) && c.white_balance[col] > 0.f;
+                    sat[s] = ok ? c.white_balance[col] / c.white_balance[1] : exp_ref_max[s];
+                }
+                apply_raw_gain(im, g, sat);
+            }
         }
         return im;
     };
