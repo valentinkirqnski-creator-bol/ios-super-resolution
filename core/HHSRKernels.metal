@@ -4139,7 +4139,7 @@ kernel void rnn_tile_pool(device const float* ref_grey [[buffer(0)]],
     const bool active = int(tid) < nt;      // threads beyond RNN_TPT only keep the barriers uniform
     const int x0 = int(tgid.x) * fs, y0 = int(tgid.y) * fs;
     const int jn = fs + 8;
-    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, int(p.affine), 0};
     RnnAppFlow fl = {flow, jac, &p, 1u};
     RnnAppFlow fr = {flow, jac, &p, 0u};
     RnnGuideGrey cg = {comp_guide, W};
@@ -4231,7 +4231,7 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
     const int W = p.width, H = p.height;
     const int nt = int(tpt.x * tpt.y);
     const int x0 = int(tgid.x) * RNN_TS, y0 = int(tgid.y) * RNN_TS;
-    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, int(p.affine), 0};   // pad0: affine mode (v34 feature)
     RnnAppFlow fl = {flow, jac, &p, 1u};    // warp: full correspondence
     RnnAppFlow fr = {flow, jac, &p, 0u};    // flow features: residual after the homography
 

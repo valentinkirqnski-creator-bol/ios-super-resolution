@@ -232,6 +232,19 @@ inline void rnn_features_at(RA ref, JA J, FA flow, float r0v, RNNParams P, int x
             r9 = r9 + r * r;
         }
     f[13] = RNN_LOG(1.0f + (r9 / 25.0f) / s2);
+#if RNN_NF > 14
+    // v34: predicted in-tile residual of the one-translation-per-tile model. The affine fit above gives the change
+    // of the tile flow per tile step (a global roll / zoom makes neighbouring tiles' vectors differ); times the
+    // pixel's offset from its own tile centre (tile grid origin 0, fs px) it is how far this pixel's true motion
+    // differs from the vector its tile uses: the stepped edge at tile borders. Exact for a roll, noise-free (flow
+    // only). P.pad0 != 0: the app's per-tile affine mode already models the in-tile motion -> 0.
+    {
+        float ox = (float)(x - (x / fs) * fs) - 0.5f * (float)(fs - 1);
+        float oy = (float)(y - (y / fs) * fs) - 0.5f * (float)(fs - 1);
+        float rx = (ax1 * ox + ax2 * oy) / (float)fs, ry = (ay1 * ox + ay2 * oy) / (float)fs;
+        f[14] = (P.pad0 != 0) ? 0.0f : RNN_LOG(1.0f + RNN_SQRT(rx * rx + ry * ry));
+    }
+#endif
 }
 
 // Pass 3: the network at (x,y). feat(c, x, y) over clamped coords. Returns refined R.
