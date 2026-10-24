@@ -202,6 +202,7 @@ REAL = os.path.join(HERE, "data", "real")
 TRAIN_SCENES = ["APC_1186"]                             # --scenes overrides; val scene: a different capture
 VAL_SCENE = "APC_1211"
 SIZE = int(os.environ.get("RNN_SIZE", "384"))         # raw crop per burst (v24: 768 at camera pixel scale)
+SIZE_W = int(os.environ.get("RNN_SIZE_W", str(SIZE)))  # v38: width when not square (full 12 MP: 4032 x 3024)
 
 
 def load_scene(name):
@@ -247,7 +248,8 @@ def build_burst(seed, val, scenes):
               n_rot_patches_edge=int(rng.integers(elo, ehi + 1)))      # PLUS patches centred on edges/detail
     if os.environ.get("RNN_ROT_SMALL"):    # v19: small tilt + shift patches on straight edges (see rnn/burst.py)
         slo, shi = (int(x) for x in os.environ["RNN_ROT_SMALL"].split(","))
-        sc.update(n_rot_patches_small=int(rng.integers(slo, shi + 1)))
+        # v38: drawn from a DERIVED rng so a twin burst without patches shares every other draw (crop, motion)
+        sc.update(n_rot_patches_small=int(np.random.default_rng(seed + 7777).integers(slo, shi + 1)))
     if os.environ.get("RNN_SMALL_MODE"):   # v22: tilt_lo,tilt_hi (deg),shift_lo,shift_hi (px): translate / rotate / both
         sc.update(small_mode=tuple(float(x) for x in os.environ["RNN_SMALL_MODE"].split(",")))
         if os.environ.get("RNN_SMALL_CONSISTENT") == "1":   # v23: the same slip in ~90% of frames (see rnn/burst.py)
@@ -331,8 +333,16 @@ def build_burst(seed, val, scenes):
         sp_, dlo_, dhi_, zlo_, zhi_ = (float(x) for x in os.environ["RNN_B12"].split(","))
         sc.update(rot_deg=sp_, rot_drift=float(np.radians(rng.choice([-1, 1]) * rng.uniform(dlo_, dhi_))),
                   zoom_rate=float(rng.uniform(zlo_, zhi_)), persp=0.0, center_dist=float(rng.uniform(0, 150)))
+    # v37 (RNN_MOTION=file): replay a measured burst's global camera motion (one row per comparison frame:
+    # rotation deg, shift x, shift y in raw px, zoom), with a per-burst gain of 0.7-1.3 and a random sign of the
+    # rotation for variety. The motion is about the crop centre; the aligner sees the same in-tile residuals.
+    if os.environ.get("RNN_MOTION"):
+        tab = [[float(v) for v in ln.split()] for ln in open(os.environ["RNN_MOTION"]) if ln.strip() and not ln.startswith("#")]
+        sgn = float(rng.choice([-1, 1]))
+        sc.update(motion_table=[[r[0] * sgn, r[1], r[2], r[3]] for r in tab], motion_gain=float(rng.uniform(0.7, 1.3)),
+                  persp=0.0, n_rot_patches=0, n_rot_patches_edge=0)   # the small edge patches (RNN_ROT_SMALL) stay
     tex = float(os.environ.get("RNN_TEX_SCALE", "2" if text_bg is None else "4"))
-    b = Burst(sc, rng, Hr=SIZE, Wr=SIZE, bg_rgb=sc_rgb if text_bg is None else text_bg, cfa=cfa, prewhite=wb,
+    b = Burst(sc, rng, Hr=SIZE, Wr=SIZE_W, bg_rgb=sc_rgb if text_bg is None else text_bg, cfa=cfa, prewhite=wb,
               tex_scale=tex, allow_flip=text_bg is None)
     return b, rng, name, cfa, wb, alpha0 * k, beta0 * k * k
 
@@ -347,11 +357,13 @@ def _gen_one(args):
     d = b.render(out_scale=1, seed=int(rng.integers(1 << 31)))
     # true high-resolution scene at the app's 2x output grid, same domain as the merge output:
     # native = min(scene * E, 1) (sensor clip), then the loader's pre-white-balance gain per colour
-    Ho = int(SIZE * SCALE)
-    yy, xx = torch.meshgrid(torch.arange(Ho, dtype=torch.float64) / SCALE, torch.arange(Ho, dtype=torch.float64) / SCALE,
-                            indexing="ij")
-    rgb = b.render_rgb(0, torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)).view(3, Ho, Ho)
-    gt_hr = ((rgb * b.E[0]).clamp(0, 1) * torch.from_numpy(wb)[:, None, None]).permute(1, 2, 0)
+    lean = os.environ.get("RNN_LEAN") == "1"   # v38: mask-only bursts - no 2x truth image, no colour planes
+    if not lean:
+        Ho, Wo = int(SIZE * SCALE), int(SIZE_W * SCALE)
+        yy, xx = torch.meshgrid(torch.arange(Ho, dtype=torch.float64) / SCALE, torch.arange(Wo, dtype=torch.float64) / SCALE,
+                                indexing="ij")
+        rgb = b.render_rgb(0, torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)).view(3, Ho, Wo)
+        gt_hr = ((rgb * b.E[0]).clamp(0, 1) * torch.from_numpy(wb)[:, None, None]).permute(1, 2, 0)
     # noise-free camera-native grey per frame (undo the pre-white-balance per CFA site, quad mean): the content
     # each frame really shows, used to measure the ghost a flow error paints (geometric misalignment target)
     rc = d["raw_clean"].numpy()
@@ -360,6 +372,11 @@ def _gen_one(args):
         for j in range(2):
             g[:, i::2, j::2] = rc[:, i::2, j::2] / wb[cfa[i][j]]
     clean_grey = 0.25 * (g[:, 0::2, 0::2] + g[:, 0::2, 1::2] + g[:, 1::2, 0::2] + g[:, 1::2, 1::2])
+    if lean:
+        np.savez(path, raw=d["raw"].numpy().astype(np.float32), gt_flow=d["gt_flow"].numpy().astype(np.float32),
+                 clean_grey=clean_grey.astype(np.float32), vis=d["vis"].numpy().astype(np.float16),
+                 alpha=np.float32(alpha), beta=np.float32(beta), scenario=name, cfa=np.array(cfa, np.int32), wb=wb)
+        return
     clean_rgb = np.zeros((g.shape[0], 3) + clean_grey.shape[1:], np.float32)   # camera-native colour per quad
     for i in range(2):
         for j in range(2):

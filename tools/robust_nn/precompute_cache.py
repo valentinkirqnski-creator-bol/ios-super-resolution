@@ -24,14 +24,17 @@ OUT = None
 
 
 EDGE_STEP = False
+TILE_OUT = 0
 HOMOG = False
 ORACLE = False
 SMALL = False
 
 
-def _init(out, edge_step=False, homog=False, oracle=False, small=False):
+def _init(out, edge_step=False, homog=False, oracle=False, small=False, tile_out=0):
     global OUT, EDGE_STEP, HOMOG, ORACLE, SMALL
     OUT, EDGE_STEP, HOMOG, ORACLE, SMALL = out, edge_step, homog, oracle, small
+    global TILE_OUT
+    TILE_OUT = tile_out
     torch.set_num_threads(1)
 
 
@@ -58,14 +61,39 @@ def _job(job):
     vis = torch.from_numpy(z["vis"][1:].astype(np.float32))
     geo = rp.geo_target(clean, d["flow"], gtf, vis, al, be, occ_look=True)
     hm = rp.hard_maps(clean, gtf, d["flow"], al, be)
-    tmp = path[:-4] + ".tmp.npz"
     extra = dict(rflow=d["rflow"].numpy().astype(np.float32)) if "rflow" in d else {}
-    np.savez(tmp, **extra, ref=d["ref_grey"].numpy().astype(np.float32), grey=d["grey"].numpy().astype(np.float32),
-             flow=d["flow"].numpy().astype(np.float32), r0=d["r0"].numpy().astype(np.float16),
-             geo=geo.numpy().astype(np.float16), edge=hm["edge"].numpy().astype(np.float16),
-             rot=hm["rot"].numpy(), ferr=hm["ferr"].numpy().astype(np.float16),
-             a=np.float32(al / 4.0), b=np.float32(be / 4.0), tile=np.int32(d["tile"]), corrupt=np.bool_(corrupt),
-             scen=str(z["scenario"]))
+    arrs = dict(**extra, ref=d["ref_grey"].numpy().astype(np.float32), grey=d["grey"].numpy().astype(np.float32),
+                flow=d["flow"].numpy().astype(np.float32), r0=d["r0"].numpy().astype(np.float16),
+                geo=geo.numpy().astype(np.float16), edge=hm["edge"].numpy().astype(np.float16),
+                rot=hm["rot"].numpy(), ferr=hm["ferr"].numpy().astype(np.float16))
+    scal = dict(a=np.float32(al / 4.0), b=np.float32(be / 4.0), tile=np.int32(d["tile"]), corrupt=np.bool_(corrupt),
+                scen=str(z["scenario"]))
+    if TILE_OUT:
+        # v38: a big burst (full 12 MP frame) is stored as TILE_OUT x TILE_OUT guide-px tiles, each with its own
+        # source tile (noise-free frames, true flow, visibility at guide res) next to it in OUT_tiles_src, so the
+        # training loader's target recomputation (REGT) works tile by tile. Partial edge tiles are dropped.
+        T = TILE_OUT
+        gh, gw = arrs["ref"].shape[-2:]
+        base = name.rsplit("_v", 1)[0]
+        vtag = ("_v" + name.rsplit("_v", 1)[1]) if "_v" in name else ""
+        sdir = OUT + "_tiles_src"
+        os.makedirs(sdir, exist_ok=True)
+        cg, gtf_np, vis_np = z["clean_grey"], gt, z["vis"]
+        for ty in range(gh // T):
+            for tx in range(gw // T):
+                sl = (slice(ty * T, (ty + 1) * T), slice(tx * T, (tx + 1) * T))
+                tn = f"{base}_t{ty:02d}{tx:02d}"
+                tp_ = os.path.join(OUT, tn + vtag + ".npz")
+                np.savez(tp_[:-4] + ".tmp.npz", **{k: np.ascontiguousarray(v[..., sl[0], sl[1]]) for k, v in arrs.items()}, **scal)
+                os.replace(tp_[:-4] + ".tmp.npz", tp_)
+                sp = os.path.join(sdir, tn + ".npz")
+                if not os.path.exists(sp):
+                    np.savez(sp[:-4] + ".tmp.npz", clean_grey=np.ascontiguousarray(cg[..., sl[0], sl[1]]),
+                             gt_flow=np.ascontiguousarray(gtf_np[..., sl[0], sl[1]]), vis=np.ascontiguousarray(vis_np[..., sl[0], sl[1]]))
+                    os.replace(sp[:-4] + ".tmp.npz", sp)
+        return time.time() - t0
+    tmp = path[:-4] + ".tmp.npz"
+    np.savez(tmp, **arrs, **scal)
     os.replace(tmp, path)
     return time.time() - t0
 
@@ -84,6 +112,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="v24: use only the first N bursts of each source dir")
     ap.add_argument("--small", action="store_true", help="v22: only tiny misalignments when corrupting (flag 64)")
     ap.add_argument("--val_corrupt_only", action="store_true", help="v21: --val keeps only the corrupted half")
+    ap.add_argument("--tile_out", type=int, default=0, help="v38: store each burst as T x T guide-px tiles (+ source tiles)")
     ap.add_argument("--no_corrupt", action="store_true",
                     help="v20: never corrupt (perfect-alignment sets); --val then keeps only the aligner-only half")
     a = ap.parse_args()
@@ -104,7 +133,7 @@ def main():
                 cor = bool(rng.random() < a.corrupt_p)
                 jobs.append((f, f"{stem}_v{v}", cor and not a.no_corrupt, int(rng.integers(1, 1 << 30))))
     t0, bad = time.time(), 0
-    with Pool(a.workers, initializer=_init, initargs=(a.out, a.edge_step, a.homog, a.oracle, a.small)) as p:
+    with Pool(a.workers, initializer=_init, initargs=(a.out, a.edge_step, a.homog, a.oracle, a.small, a.tile_out)) as p:
         for k, dt in enumerate(p.imap_unordered(_job, jobs, chunksize=2)):
             bad += dt < 0
             if k % 50 == 0:

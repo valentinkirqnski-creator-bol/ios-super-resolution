@@ -64,6 +64,10 @@ SRC = {"c15_val": ["rp13_val"], "c15_train": ["rp13_train", "rp13_train_hdrp"], 
        **{f"c32{k}{v}_{sp}": [f"rp32{k}_{sp}"] for k in ("rot", "roll") for v in ("P", "C") for sp in ("train", "val")},
        # v33: burst12-like slow roll + zoom, app aligner WITHOUT the homography (A: stepped edges) / WITH it (H: clean)
        **{f"c33{v}_{sp}": [f"rp33_{sp}"] for v in ("A", "H", "O") for sp in ("train", "val")},
+       # v37: burst9's scene under burst9's measured motion (O exact / A app aligner no H / H with H)
+       **{f"cb9{v}_{sp}": [f"rpb9_{sp}"] for v in ("A", "H", "O") for sp in ("train", "val")},
+       # v38: full 12 MP bursts stored as tiles (S still+perfect / M burst9 motion / C motion+patches+tile slips)
+       **{f"c38{v}_{sp}": [f"c38{v}_{sp}_tiles_src"] for v in ("S", "M", "C") for sp in ("train", "val")},
        # v27: edge-chart training bursts (thin lines .. big blocks) - slipped edge tiles (T) and the same perfect (P)
        **{f"cchartT{i}_train": [f"rpchartT{i}"] for i in range(4)}, **{f"cchartP{i}_train": [f"rpchartT{i}"] for i in range(4)},
        # v28: uniform 0.2-2 px slips (tile vectors anywhere + translated / rotated content patches), photos / text / charts
@@ -77,6 +81,12 @@ def _source(cache_file):
     """The synthetic burst a cache sample was made from (for its noise-free frames)."""
     stem = os.path.basename(cache_file)[:-4]
     roots = SRC[os.path.basename(os.path.dirname(cache_file))]
+    if "_t" in stem:   # v38: a tile of a big burst - its own source tile, same stem without the variant
+        name = stem.rsplit("_v", 1)[0] + ".npz"
+        for r in roots:
+            if os.path.exists(os.path.join(HERE, "data", r, name)):
+                return os.path.join(HERE, "data", r, name)
+        raise FileNotFoundError(name)
     if stem.startswith("val"):
         src = sorted(glob.glob(os.path.join(HERE, "data", roots[0], "*.npz")))
         return src[int(stem[3:]) % len(src)]

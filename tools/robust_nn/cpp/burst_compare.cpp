@@ -191,6 +191,19 @@ int main(int argc, char** argv) {
             }
         robust_nn::refine(rgrey.data(), cgrey.data(), fxy.data(), r0g.data(), P, rn.data(), &scratch, nullptr,
                           resid ? fres.data() : nullptr);
+        if (std::getenv("BC_DUMP_INPUTS")) {   // the mask net's guide-res inputs per frame (for Python mask models)
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "/inputs_f%d.f32", k);
+            FILE* fi = std::fopen((out + nm).c_str(), "wb");
+            int hdr[3] = {gw, gh, P.flow_step};
+            float prm[3] = {P.noise_a, P.noise_b, P.clip_level};
+            std::fwrite(hdr, 4, 3, fi); std::fwrite(prm, 4, 3, fi);
+            std::fwrite(rgrey.data(), 4, rgrey.size(), fi); std::fwrite(cgrey.data(), 4, cgrey.size(), fi);
+            std::fwrite(fxy.data(), 4, fxy.size(), fi);
+            std::fwrite(resid ? fres.data() : fxy.data(), 4, fxy.size(), fi);
+            std::fwrite(r0g.data(), 4, r0g.size(), fi);
+            std::fclose(fi);
+        }
         if (hi > lo)
             for (auto& v : rn) v = std::min(std::max((v - lo) / (hi - lo), 0.f), 1.f);
         std::fwrite(r0g.data(), 4, r0g.size(), fm);
@@ -201,6 +214,55 @@ int main(int argc, char** argv) {
                 rnn.at(y, x) = rn[(size_t)std::min(y / 2, gh - 1) * gw + std::min(x / 2, gw - 1)];
                 ones.at(y, x) = 1.f;
             }
+        // BC_GUIDED_UP=1: edge-guided, min-preserving upsample of the guide-resolution NN mask to raw resolution.
+        // Instead of one value per RGGB quad (a 2-raw-px staircase), each raw pixel takes a joint-bilateral
+        // average of the 3x3 guide cells around it, weighted by how similar the reference's same-CFA-phase raw
+        // sample in that cell is to this pixel (differences measured against the sensor noise, BC_GUIDED_TAU sigmas,
+        // default 3) and by a Gaussian of the distance (1 guide px). The result is then the MINIMUM with the quad
+        // value, so rejection is only ever extended along the edge the net flagged, never eroded.
+        if (std::getenv("BC_GUIDED_UP")) {
+            const float tau = std::getenv("BC_GUIDED_TAU") ? (float)std::atof(std::getenv("BC_GUIDED_TAU")) : 3.f;
+            const float na = (work.alpha_dng[0] + work.alpha_dng[1] + work.alpha_dng[2]) / 3.f;
+            const float nb = (work.beta_dng[0] + work.beta_dng[1] + work.beta_dng[2]) / 3.f;
+            Image up(comp.h, comp.w, 1);
+#pragma omp parallel for schedule(static)
+            for (int y = 0; y < comp.h; ++y)
+                for (int x = 0; x < comp.w; ++x) {
+                    const float ip = ref.at(y, x);
+                    const float s2 = tau * tau * std::max(na * std::max(ip, 0.f) + nb, 1e-10f);
+                    const float gyf = (y - 0.5f) * 0.5f, gxf = (x - 0.5f) * 0.5f;   // the merge's guide coordinate
+                    const int gy0 = std::min(gh - 1, std::max(0, (int)std::floor(gyf + 0.5f)));
+                    const int gx0 = std::min(gw - 1, std::max(0, (int)std::floor(gxf + 0.5f)));
+                    float wsum = 0.f, rsum = 0.f;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const int qy = gy0 + dy, qx = gx0 + dx;
+                            if (qy < 0 || qy >= gh || qx < 0 || qx >= gw) continue;
+                            const int ry = std::min(comp.h - 1, 2 * qy + (y & 1)), rx = std::min(comp.w - 1, 2 * qx + (x & 1));
+                            const float d = ref.at(ry, rx) - ip;
+                            const float sy = (float)qy - gyf, sx = (float)qx - gxf;
+                            const float w = std::exp(-0.5f * (sx * sx + sy * sy)) * std::exp(-0.5f * d * d / s2);
+                            wsum += w;
+                            rsum += w * rn[(size_t)qy * gw + qx];
+                        }
+                    const float jb = wsum > 0.f ? rsum / wsum : rnn.at(y, x);
+                    up.at(y, x) = std::min(jb, rnn.at(y, x));
+                }
+            rnn = up;
+        }
+        if (std::getenv("BC_DUMP_RAWMASK")) {   // the frame-averaged raw-resolution NN mask -> nn_rawmask.f32
+            static std::vector<double> acc; static int nacc = 0;
+            if (acc.empty()) acc.assign(rnn.data.size(), 0.0);
+            for (size_t i = 0; i < rnn.data.size(); ++i) acc[i] += rnn.data[i];
+            ++nacc;
+            if (k == (int)burst.size() - 1) {
+                std::vector<float> o(acc.size());
+                for (size_t i = 0; i < o.size(); ++i) o[i] = (float)(acc[i] / nacc);
+                FILE* fr = std::fopen((out + "/nn_rawmask.f32").c_str(), "wb");
+                std::fwrite(o.data(), 4, o.size(), fr);
+                std::fclose(fr);
+            }
+        }
         CovField covs = estimate_kernels(comp, work);
         if (want[0]) merge_comp(comp, flow, covs, ones, tile, num[0], den[0], work);
         if (want[1]) merge_comp(comp, flow, covs, rob, tile, num[1], den[1], work);

@@ -132,6 +132,10 @@ class Burst:
         Wt, Ht = int(tex_scale * (Wr + 2 * M)), int(tex_scale * (Hr + 2 * M))
         if bg_rgb is not None:
             bh, bw = bg_rgb.shape[:2]
+            if bh < Ht or bw < Wt:   # v38: a frame larger than the scene (full 12 MP at camera scale): mirror-pad
+                py, px = max(0, (Ht - bh + 1) // 2), max(0, (Wt - bw + 1) // 2)
+                bg_rgb = np.pad(bg_rgb, ((py, py), (px, px), (0, 0)), mode="reflect")
+                bh, bw = bg_rgb.shape[:2]
             y0, x0 = int(rng.integers(0, bh - Ht + 1)), int(rng.integers(0, bw - Wt + 1))
             bg = np.ascontiguousarray(bg_rgb[y0:y0 + Ht, x0:x0 + Wt])
             fx_, fy_ = rng.random() < 0.5, rng.random() < 0.5
@@ -350,11 +354,19 @@ class Burst:
                 cam = dict(ZERO_CAM)
                 objs = [dict(ZERO_OBJ) for _ in self.layers]
             else:
-                cam = dict(th=math.radians(rng.normal(0, sc["rot_deg"])) + rot_drift * k,
-                           tx=rng.normal(0, sc["tremor"]) + drift[0] * k,
-                           ty=rng.normal(0, sc["tremor"]) + drift[1] * k,
-                           dz=sc["zoom_rate"] * k + rng.normal(0, sc["zoom_rate"] * 0.1),
-                           p1=rng.normal(0, sc["persp"]), p2=rng.normal(0, sc["persp"]))
+                if sc.get("motion_table") is not None:
+                    # v37: replay a MEASURED camera motion (rows: rotation deg, shift x, shift y in px, zoom) frame
+                    # by frame, scaled by sc["motion_gain"] (per-burst variety); no perspective, no tremor on top.
+                    # The patch motions below are built exactly as without the table.
+                    row = sc["motion_table"][min(k - 1, len(sc["motion_table"]) - 1)]
+                    g = float(sc.get("motion_gain", 1.0))
+                    cam = dict(th=math.radians(row[0] * g), tx=row[1] * g, ty=row[2] * g, dz=row[3] * g, p1=0.0, p2=0.0)
+                else:
+                    cam = dict(th=math.radians(rng.normal(0, sc["rot_deg"])) + rot_drift * k,
+                               tx=rng.normal(0, sc["tremor"]) + drift[0] * k,
+                               ty=rng.normal(0, sc["tremor"]) + drift[1] * k,
+                               dz=sc["zoom_rate"] * k + rng.normal(0, sc["zoom_rate"] * 0.1),
+                               p1=rng.normal(0, sc["persp"]), p2=rng.normal(0, sc["persp"]))
                 objs = [dict(ZERO_OBJ)]
                 for li, v in enumerate(vel):
                     if v is None:                                   # rotated-content patch

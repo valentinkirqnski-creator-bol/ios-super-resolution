@@ -60,6 +60,7 @@ with tempfile.TemporaryDirectory() as d:
         r0 = analytic_r0(Ir, warp_by_flow(Ic, fl), na, nb, NOMINAL)
         with torch.no_grad():
             feats, J = compute_features(Ir, Ic, fl, r0, na, nb, clip, fs)
+            feats = feats[:, :net.base.c1.weight.shape[1]]   # the base's inputs (rnn.features may have more)
             R = net(feats, r0, pixel_inputs(Ir, J, na, nb))[0][0]
         if a.hi > a.lo:
             R = ((R - a.lo) / (a.hi - a.lo)).clamp(0, 1)
