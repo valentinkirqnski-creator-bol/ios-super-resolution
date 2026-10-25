@@ -461,6 +461,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"alignment_grey_fft"])
         cfg.grey_method = tuning[@"alignment_grey_fft"].boolValue
                               ? GreyMethod::FFT : GreyMethod::Decimate;
+    // One toggle: half-res decimate alignment + dense per-pixel flow. Forces the
+    // decimate grey (overriding alignment_grey_fft above) and runs the per-pixel
+    // dense refinement of the plain block-match vectors (no affine).
+    if (tuning[@"decimate_dense_align_enabled"]) {
+        cfg.decimate_dense_align_enabled = tuning[@"decimate_dense_align_enabled"].boolValue;
+        if (cfg.decimate_dense_align_enabled) cfg.grey_method = GreyMethod::Decimate;
+    }
     if (tuning[@"hf_min_texture_snr"])
         cfg.hf_min_texture_snr = tuning[@"hf_min_texture_snr"].floatValue;
     if (tuning[@"flow_regularize_aperture_ratio"])
@@ -600,6 +607,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.flow_fb_beta = tuning[@"flow_fb_beta"].floatValue;
     if (tuning[@"motion_geom_reject_enabled"])
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
+    if (tuning[@"robustness_gcam_enabled"])
+        cfg.robustness_gcam_enabled = tuning[@"robustness_gcam_enabled"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])

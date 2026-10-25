@@ -845,6 +845,11 @@ struct CameraView: View {
              some burst samples for artifact-free output. Lower threshold rejects more.
              """)
             .font(.caption2).foregroundColor(.secondary)
+        Toggle("GCam-Style Robustness", isOn: $cam.tuningParams.robustness_gcam_enabled)
+        Text("""
+             An alternative robustness mask that reproduces the behaviour of Google's Super Res Zoom rejection (reverse-engineered design, original math): it normalizes the frame difference by local CONTRAST (not just noise) and raises its tolerance in high-frequency/aliased regions, so aliasing and real detail survive; a Wiener term shrinks noise-level differences; and it rejects much harder where the per-tile flow is IRREGULAR and the region is textured — the rotation/parallax/moving-object tile ghosts. Measured on synthetic real-content bursts to catch ~58% of visible ghosts at ~0% aliasing over-rejection (vs ~1% for the plain mask); the remaining subtle sub-pixel band still needs better flow or multi-frame consensus, not the mask. Rejected pixels fall back to the reference. Runs on the CPU raw-resolution path and is UNVERIFIED on device (heavier memory); the constants are tuned on synthetic bursts and will want on-device A/B. Off by default.
+             """)
+            .font(.caption2).foregroundColor(.secondary)
         HStack {
             Text("Geom Threshold")
             Spacer()
@@ -1194,6 +1199,11 @@ struct CameraView: View {
                     Toggle("Feature-Metric Alignment (NN)", isOn: $cam.tuningParams.feat_metric_refine_enabled)
                     Text("""
                          A tiny learned convolutional network maps the reference and each comparison frame to scene-aware feature planes; a per-tile affine Lucas-Kanade then refines the flow ON THOSE FEATURES instead of raw brightness. The learned features disambiguate handheld tremor, parallax and repetitive/aliased texture that intensity matching locks onto wrongly — measured +16–37% alignment accuracy over the classical refinement on held-out real bursts, with the affine model keeping camera rotation from regressing. Produces the same dense per-pixel field the merge and mask sample (an alternative to Dense Per-Pixel Flow; if both are on, this one wins). Runs on a half-resolution grey so its memory fits the device, and every tile is kept only where it beats the seed photometrically, so it can't make a frame worse. Off by default; try it when a handheld burst still shows fine-edge misalignment with Affine + Half-Tile on.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Half-Res Decimate + Per-Pixel Flow", isOn: $cam.tuningParams.decimate_dense_align_enabled)
+                    Text("""
+                         Runs alignment on the half-resolution Bayer-decimate grey (block matching + tile ICA) and then refines the plain block-match tile vectors — no affine model — to one vector per grey pixel with 3 Lucas-Kanade iterations (windowed, noise-aware conditioning, each pixel bounded to its seed and kept only where it beats the seed). The per-pixel field is stored at half resolution and sampled back to full res by the merge and the mask. This is an alternative to the default full-resolution FFT aligner: it is cheaper (half-res), but because it starts from a lower-resolution base the per-pixel refinement has to recover the precision decimation gave up — so compare it against the default on your own bursts rather than assuming it's sharper. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)

@@ -1517,6 +1517,33 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // feature, not built here) -- mapped down from the raw pixel to its parent
 // guide pixel for that one lookup. Not the common case this toggle is meant
 // for; it stays correct, just at its existing granularity rather than the new one.
+// Per-tile flow irregularity for the GCam-form robustness boost: the length of
+// the min-max extent of the tile flow vectors over the 3x3 tile neighbourhood,
+// in raw pixels. Large where neighbouring tiles disagree -- rotation, parallax,
+// moving-object seams, block-match blunders -- which is where a one-vector-per-
+// tile fetch is most likely wrong. (Measured to catch the gross/irregular ghosts,
+// not the subtle sub-pixel band; see Config::robustness_gcam_enabled.)
+static std::vector<f32> compute_flow_irregularity(const FlowField& flow) {
+    const int ny = flow.ny, nx = flow.nx;
+    std::vector<f32> irr((size_t)std::max(0, ny) * std::max(0, nx), 0.f);
+    if (ny <= 0 || nx <= 0 || flow.flow.empty()) return irr;
+    auto cl = [](int a, int hi) { return a < 0 ? 0 : (a >= hi ? hi - 1 : a); };
+    for (int ty = 0; ty < ny; ++ty)
+        for (int tx = 0; tx < nx; ++tx) {
+            f32 mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int qy = cl(ty + dy, ny), qx = cl(tx + dx, nx);
+                    const f32 vx = flow.dx(qy, qx), vy = flow.dy(qy, qx);
+                    mnx = std::min(mnx, vx); mxx = std::max(mxx, vx);
+                    mny = std::min(mny, vy); mxy = std::max(mxy, vy);
+                }
+            const f32 rx = mxx - mnx, ry = mxy - mny;
+            irr[(size_t)ty * nx + tx] = std::sqrt(rx * rx + ry * ry);
+        }
+    return irr;
+}
+
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
                                         const FlowField& flow, int tile_size,
                                         const Config& cfg, Image* s_select_out) {
@@ -1556,12 +1583,18 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // peak is the upscaled comp_means plus the two scalar outputs rather than
     // the whole chain at once.
     Image comp_means;
+    Image comp_vars;   // only populated for the GCam-form path (min(std_ref,std_alt))
     {
-        Image comp_means_guide;
+        Image comp_means_guide, comp_vars_guide;
         {
             Image guide = compute_guide(comp_raw, cfg);
-            Image comp_vars_guide; // byproduct, never read -- freed with this scope
+            // comp_vars_guide is the comp frame's local variance; the Wronski path
+            // never reads it, but the GCam-form robustness needs it upscaled too.
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
+            if (cfg.robustness_gcam_enabled)
+                comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
+                                               tile_size, cfg.num_threads, false,
+                                               cfg.affine_flow_enabled);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false,
@@ -1597,6 +1630,15 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     if (!cfg.hf_artifact_removal_enabled)
         motion_irregular.assign(S.size(), 0u);
     const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
+
+    // GCam-form robustness (Config::robustness_gcam_enabled): per-tile flow
+    // irregularity for the strictness boost, and whether the comp variance was
+    // upscaled (for min(std_ref, std_alt)).
+    const bool gcam = cfg.robustness_gcam_enabled;
+    std::vector<f32> gcam_irr;
+    if (gcam) gcam_irr = compute_flow_irregularity(flow);
+    const bool gcam_have_cv = gcam && comp_vars.h == ref_means.h &&
+                              comp_vars.w == ref_means.w && comp_vars.c == ref_means.c;
 
     // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
     // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
@@ -1694,7 +1736,44 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
             // design ("infinite will imply R = 0"), which makes d^2 +inf and the
             // Wiener shrink inf/inf = NaN; a non-finite r_val is forced to 0.
-            if (per_channel) {
+            if (gcam) {
+                // GCam-form weight (original math; see Config::robustness_gcam_enabled).
+                // Normalise the photometric difference by local CONTRAST (floored at
+                // noise and raised in high-frequency/aliased regions), Wiener-shrink
+                // it under noise, and boost strictness where the tile flow is
+                // irregular AND the region is textured.
+                f32 d2 = 0.f, nvar = 0.f, vr = 0.f, va = 0.f;
+                for (int ch = 0; ch < nch; ++ch) {
+                    const f32 dm = comp_means.at(y, x, ch) - ref_means.at(y, x, ch);
+                    d2 += dm * dm;
+                    nvar += guide_noise_var(cfg, nch, ch, ref_means.at(y, x, ch));
+                    vr += ref_vars.at(y, x, ch);
+                    va += gcam_have_cv ? comp_vars.at(y, x, ch) : ref_vars.at(y, x, ch);
+                }
+                const f32 std_ref = std::sqrt(std::max(0.f, vr));
+                const f32 std_alt = std::sqrt(std::max(0.f, va));
+                const f32 nstd = std::sqrt(std::max(1e-10f, nvar));
+                // local HF (aliasing proxy): channel-summed |Laplacian| of the ref means
+                const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
+                const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
+                f32 hf = 0.f;
+                for (int ch = 0; ch < nch; ++ch)
+                    hf += std::fabs(ref_means.at(y, x, ch) -
+                                    0.25f * (ref_means.at(y, xl, ch) + ref_means.at(y, xr, ch) +
+                                             ref_means.at(yu, x, ch) + ref_means.at(yd, x, ch)));
+                const f32 std_eff = std::max(std::max(std::min(std_ref, std_alt), nstd),
+                                             cfg.gcam_alias_k * hf);
+                const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
+                const bool textured = std_ref > cfg.gcam_tex_gate * nstd;
+                const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
+                const f32 wiener = d2 * d2 / (d2 + 2.f * nvar + 1e-20f);
+                const f32 dist = cfg.gcam_mult * boost * wiener / (std_eff * std_eff + 1e-20f);
+                f32 arg = -dist + cfg.gcam_thresh;
+                if (arg > 0.f) arg = 0.f;
+                f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
+                if (!std::isfinite(r_val)) r_val = 0.f;
+                for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
+            } else if (per_channel) {
                 for (int ch = 0; ch < rch; ++ch) {
                     f32 sc = sigma_sq_ch.at(y, x, ch);
                     f32 rc = clampf(s * std::exp(-d_sq_ch.at(y, x, ch) / sc) - cfg.r_t, 0.f, 1.f);
@@ -1990,20 +2069,39 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     }
 
 #ifdef __APPLE__
+    // GCam-form robustness (Config::robustness_gcam_enabled) has no Metal kernel;
+    // it runs on the CPU raw-res path below. The Metal mask path returns before
+    // that path, so without this the toggle would be silently inert on device
+    // (the host-stage-no-ops-on-device trap). Bring the reference statistics
+    // across from the GPU (one readback per burst, cached in ref_stats) and
+    // build the hires stats on the host if init_robustness_metal left them GPU-
+    // resident, then fall through to the CPU raw-res path. UNVERIFIED ON DEVICE:
+    // the readback + the raw-res host buffers (~146 MB each at 12 MP) are heavier
+    // than the Metal path, so this needs on-device A/B for correctness + memory.
+    if (cfg.robustness_gcam_enabled) {
+        RefStats* ms = const_cast<RefStats*>(&ref_stats);
+        if (ms->means.data.empty()) metal_fetch_host_ref_stats(*ms);
+        if (ms->means_hires.h <= 0 && ms->means.h > 0) {
+            ms->means_hires = upscale_warp_stats(ms->means, /*is_ref=*/true, nullptr,
+                                                 tile_size, cfg.num_threads, false);
+            ms->stds_hires = upscale_warp_stats(ms->stds, /*is_ref=*/true, nullptr,
+                                                tile_size, cfg.num_threads, false);
+        }
+    }
     // Metal GPU path — same Alg. robustness math as the CPU path below. The
     // Metal noise kernel only implements the per-channel model, so when a 1.4
     // single-curve LUT is loaded (Config parity mode) skip Metal and run the
     // VERIFIED CPU path below instead. Robustness then runs on CPU for this
     // frame, but the expensive runtime Monte-Carlo curve build is skipped (the
     // LUT replaces it), so it is not necessarily slower overall.
-    if (!active_noise_lut14().valid) {
+    if (!active_noise_lut14().valid && !cfg.robustness_gcam_enabled) {
         Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
                                              s_select_out, refined_on_gpu);
         if (gpu.h > 0 && gpu.w > 0) return gpu;
         return Image();
     }
 #endif
-    if (cfg.robustness_raw_resolution_active()) {
+    if (cfg.robustness_raw_resolution_active() || cfg.robustness_gcam_enabled) {
         Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
                                                     cfg, s_select_out);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;

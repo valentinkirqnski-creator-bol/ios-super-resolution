@@ -878,6 +878,15 @@ struct Config {
     int   feat_metric_downsample = 2;   // run on 1/N grey (memory, like dense_flow_downsample)
     bool  feat_metric_accept_gate = true; // per-tile SSD accept vs seed (false only for parity tests)
 
+    // Half-res decimate alignment + dense per-pixel flow (one toggle). When on,
+    // the bridge sets grey_method = Decimate so alignment runs on the half-res
+    // Bayer-decimate grey (block match + tile ICA), then dense_lk_refine refines
+    // the PLAIN block-match tile vectors (no affine) to one vector per grey pixel
+    // with 3 LK iterations (windowed, noise-aware conditioning, bounded to seed,
+    // accept-gated). The merge/robustness sample flow.dense via sample_dense.
+    // Off by default; an explicit alternative to the full-res FFT aligner.
+    bool  decimate_dense_align_enabled = false;
+
     // Global homography warp-then-refine for large camera roll / global
     // perspective. Estimates one homography between the reference and each
     // comparison grey, warps the comparison into the reference frame before
@@ -1602,6 +1611,29 @@ struct Config {
     bool  motion_geom_relative = true;
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
+
+    // GCam-form robustness (robustness.cpp, raw-res path). An ALTERNATIVE weight
+    // to the Wronski Eq.6 above, reproducing the design reverse-engineered from
+    // Super Res Zoom's rejection shader (behaviour, not code), as original math:
+    //   std_eff = max( max( min(std_ref,std_alt), noise_std ), alias_k*hf )
+    //   dist    = mult * boost * wiener(d2) / std_eff^2    wiener(x)=x*x/(x+2*nvar)
+    //   boost   = gcam_boost where (std_ref > tex_gate*noise_std AND flow irregular)
+    //   R       = clamp( exp2( min(-dist + thresh, 0) ), 0, 1 )
+    // Normalising by local CONTRAST (not just noise) + the aliasing-tolerant hf
+    // term keeps aliasing/SR signal while the flow-irregularity boost rejects the
+    // gross/irregular-motion ghosts. MEASURED on synthetic real-content bursts:
+    // ~58% of visible ghosts caught at <=3% aliasing over-rejection vs ~1%
+    // baseline (ceiling 58%; the remaining subtle sub-pixel band needs flow /
+    // consensus, not the mask). Constants swept to that operating point; they are
+    // Pixel-noise-model-agnostic starting values and need on-device A/B. Off by
+    // default. Pair with the base-frame fallback + blurry-frame drop below.
+    bool  robustness_gcam_enabled = false;
+    float gcam_mult = 16.0f;       // overall strictness (distance multiplier)
+    float gcam_thresh = 0.0f;      // dead-zone: full accept while dist < thresh
+    float gcam_boost = 16.0f;      // extra strictness in irregular+textured tiles
+    float gcam_tex_gate = 1.5f;    // boost only where local std > this * noise_std
+    float gcam_irr_gate = 0.1f;    // boost only where per-tile flow irregularity > this (raw px)
+    float gcam_alias_k = 4.0f;     // aliasing-tolerant sigma: std_eff >= this * local HF
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an

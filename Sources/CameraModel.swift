@@ -226,6 +226,10 @@ struct TuningParams: Equatable, Codable {
     /// the same dense field as dense_flow (wins when both on). Host-side like
     /// dense, off by default.
     var feat_metric_refine_enabled: Bool = false
+    /// One toggle: half-res decimate alignment + dense per-pixel flow. Forces the
+    /// Bayer-decimate (half-res) alignment grey and refines the plain block-match
+    /// tile vectors (no affine) to one vector per grey pixel with 3 LK iterations.
+    var decimate_dense_align_enabled: Bool = false
     var real_rgb_guide: Bool = false
     var guide_white_balance: Bool = false
     var guide_color_matrix: Bool = false
@@ -248,6 +252,12 @@ struct TuningParams: Equatable, Codable {
     /// mask summed across channels. Only has effect with the Bayer (3-channel) guide;
     /// a no-op on the grey guide. Default false = 460-main's single cross-channel mask.
     var robustness_per_channel: Bool = false
+    /// GCam-form robustness (reverse-engineered behaviour, original math): contrast-
+    /// normalized + aliasing-tolerant + Wiener weight with a flow-irregularity
+    /// strictness boost. Measured to catch ~58% of visible ghosts at ~0% aliasing
+    /// over-rejection (vs ~1% baseline); ceiling 58% (subtle sub-pixel band needs
+    /// flow/consensus). Runs on the CPU raw-res path; UNVERIFIED on device. Off by default.
+    var robustness_gcam_enabled: Bool = false
     /// Perceptual-space robustness: compute the mask's local std and colour distance
     /// on sqrt(max(x,0)) of the guide — the variance-stabilizing / perceptual
     /// transform for the Poisson-Gaussian sensor — with a matching sqrt-space noise
@@ -471,7 +481,8 @@ struct TuningParams: Equatable, Codable {
         case bm_subpixel_enabled, lk_every_level_enabled, halftile_refine_enabled, halftile_refine_target_ts
         case dense_flow_enabled
         case feat_metric_refine_enabled
-        case robustness_per_channel
+        case decimate_dense_align_enabled
+        case robustness_per_channel, robustness_gcam_enabled
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case gyro_prealign_enabled
@@ -584,11 +595,13 @@ struct TuningParams: Equatable, Codable {
         halftile_refine_target_ts = try c.decodeIfPresent(Int.self, forKey: .halftile_refine_target_ts) ?? halftile_refine_target_ts
         dense_flow_enabled = try c.decodeIfPresent(Bool.self, forKey: .dense_flow_enabled) ?? dense_flow_enabled
         feat_metric_refine_enabled = try c.decodeIfPresent(Bool.self, forKey: .feat_metric_refine_enabled) ?? feat_metric_refine_enabled
+        decimate_dense_align_enabled = try c.decodeIfPresent(Bool.self, forKey: .decimate_dense_align_enabled) ?? decimate_dense_align_enabled
         real_rgb_guide = try c.decodeIfPresent(Bool.self, forKey: .real_rgb_guide) ?? real_rgb_guide
         guide_white_balance = try c.decodeIfPresent(Bool.self, forKey: .guide_white_balance) ?? guide_white_balance
         guide_color_matrix = try c.decodeIfPresent(Bool.self, forKey: .guide_color_matrix) ?? guide_color_matrix
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
+        robustness_gcam_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_gcam_enabled) ?? robustness_gcam_enabled
         robustness_perceptual_sqrt = try c.decodeIfPresent(Bool.self, forKey: .robustness_perceptual_sqrt) ?? robustness_perceptual_sqrt
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
@@ -2402,11 +2415,13 @@ final class CameraModel: NSObject, ObservableObject {
             "halftile_refine_target_ts": NSNumber(value: tuningParams.halftile_refine_target_ts),
             "dense_flow_enabled": NSNumber(value: tuningParams.dense_flow_enabled),
             "feat_metric_refine_enabled": NSNumber(value: tuningParams.feat_metric_refine_enabled),
+            "decimate_dense_align_enabled": NSNumber(value: tuningParams.decimate_dense_align_enabled),
             "real_rgb_guide": NSNumber(value: tuningParams.real_rgb_guide),
             "guide_white_balance": NSNumber(value: tuningParams.guide_white_balance),
             "guide_color_matrix": NSNumber(value: tuningParams.guide_color_matrix),
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
+            "robustness_gcam_enabled": NSNumber(value: tuningParams.robustness_gcam_enabled),
             "robustness_perceptual_sqrt": NSNumber(value: tuningParams.robustness_perceptual_sqrt),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
