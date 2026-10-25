@@ -1627,10 +1627,19 @@ struct Config {
     // consensus, not the mask). Constants swept to that operating point; they are
     // Pixel-noise-model-agnostic starting values and need on-device A/B. Off by
     // default. Pair with the base-frame fallback + blurry-frame drop below.
+    // Re-tuned after the first operating point (mult=16, thresh=0) darkened all
+    // flat/low-contrast regions: that sweep's over-rejection metric only protected
+    // high-frequency aliasing, so cranking the multiplier looked free while it was
+    // rejecting the flat majority (dist ~ mult/3 there -> R ~ exp2(-5) at mult=16).
+    // Re-tuned protecting ALL aligned pixels: LOW mult keeps flat/aligned at full
+    // weight (dead zone: dist < thresh -> R = 1), a LARGE boost concentrates the
+    // strictness only in the irregular+textured tiles where ghosts live. MEASURED:
+    // flat R=1.0, aligned-aliasing R=1.0, irregular ghost R=0.0; ~57% visible-ghost
+    // catch at 0% flat over-rejection.
     bool  robustness_gcam_enabled = false;
-    float gcam_mult = 16.0f;       // overall strictness (distance multiplier)
-    float gcam_thresh = 0.0f;      // dead-zone: full accept while dist < thresh
-    float gcam_boost = 16.0f;      // extra strictness in irregular+textured tiles
+    float gcam_mult = 2.0f;        // base strictness (keeps flat/aligned via the dead zone)
+    float gcam_thresh = 1.0f;      // dead-zone: full accept (R=1) while dist < thresh
+    float gcam_boost = 64.0f;      // extra strictness in irregular+textured tiles (ghosts)
     float gcam_tex_gate = 1.5f;    // boost only where local std > this * noise_std
     float gcam_irr_gate = 0.1f;    // boost only where per-tile flow irregularity > this (raw px)
     float gcam_alias_k = 4.0f;     // aliasing-tolerant sigma: std_eff >= this * local HF
