@@ -1734,27 +1734,40 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 // noise and raised in high-frequency/aliased regions), Wiener-shrink
                 // it under noise, and boost strictness where the tile flow is
                 // irregular AND the region is textured.
-                // MULTIPLICATIVE form: the STANDARD mask residual d_sq/sigma_sq (the
-                // same Wiener-shrunk, variance-floored value the else-branch below
-                // uses, so a regular-flow pixel is byte-identical to the default mask
-                // and cannot darken), with the EXPONENT multiplied by a strictness
-                // boost only where the tile flow is genuinely irregular AND the region
-                // is textured. Because the boost multiplies the residual, it rejects
-                // only where there is a real residual -- an aligned-but-jittery pixel
-                // (small residual) survives even if the irregularity gate fires on
-                // normal block-match jitter. (The earlier contrast-normalized / dead-
-                // zone forms darkened dark/textured aligned content and were replaced.)
-                f32 nvar = 0.f, vr = 0.f;
+                // GCam ComputeFrameWeight, reproduced in SQRT (VST) space -- the
+                // space GCam's guide uses (sqrt(rggb), "perceptually uniform"). The
+                // sqrt-space quantities are derived from the linear guide stats by
+                // the delta method: a sqrt-space variance is var(x)/(4x), and the
+                // sqrt-space noise variance (a*x+b)/(4x) is ~constant with
+                // brightness, so the contrast normalization does NOT collapse in
+                // dark regions (the bug the earlier linear contrast-norm had).
+                //   distance = sum_ch wiener((sqrt(cmp)-sqrt(ref))^2) / std_dev^2
+                //   std_dev^2 = max( sqrt-space ref variance, sqrt-space noise var )
+                //   R = clamp( exp2( min(thresh - mult*boost*distance, 0) ), 0, 1 )
+                // Faithful to the readable shader; its numeric constants and the
+                // unblocker are compiled in the APK and are tuned / omitted here.
+                f32 num = 0.f, vr_s = 0.f, nvar_s = 0.f;
                 for (int ch = 0; ch < nch; ++ch) {
-                    nvar += guide_noise_var(cfg, nch, ch, ref_means.at(y, x, ch));
-                    vr += ref_vars.at(y, x, ch);   // local contrast, only for the texture gate
+                    const f32 mr = std::max(ref_means.at(y, x, ch), 1e-6f);
+                    const f32 mc = std::max(comp_means.at(y, x, ch), 0.f);
+                    const f32 ds = std::sqrt(mc) - std::sqrt(mr);        // sqrt-space difference
+                    const f32 d2 = ds * ds;
+                    const f32 nv = guide_noise_var(cfg, nch, ch, mr) / (4.f * mr);  // delta method
+                    const f32 shrink = d2 / (d2 + nv + 1e-20f);          // Wiener
+                    num += d2 * shrink * shrink;
+                    vr_s += ref_vars.at(y, x, ch) / (4.f * mr);          // sqrt-space ref variance
+                    nvar_s += nv;
                 }
-                const f32 nstd = std::sqrt(std::max(1e-10f, nvar));
-                const bool textured = std::sqrt(std::max(0.f, vr)) > cfg.gcam_tex_gate * nstd;
+                const f32 nstd_s = std::sqrt(std::max(1e-10f, nvar_s));
+                const f32 std_dev2 = std::max(vr_s, nvar_s);            // contrast floored at noise
+                f32 dist = num / (std_dev2 + 1e-20f);
+                const bool textured = std::sqrt(std::max(0.f, vr_s)) > cfg.gcam_tex_gate * nstd_s;
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
-                const f32 strict = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
-                f32 r_val = clampf(s * std::exp(-(d_sq.at(y, x) / sigma_sq.at(y, x)) * strict) - cfg.r_t,
-                                   0.f, 1.f);
+                const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
+                dist *= cfg.gcam_mult * boost;
+                f32 arg = cfg.gcam_thresh - dist;
+                if (arg > 0.f) arg = 0.f;
+                f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
                 if (!std::isfinite(r_val)) r_val = 0.f;
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
             } else if (per_channel) {

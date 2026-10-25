@@ -1686,8 +1686,10 @@ struct RobMaskParamsCPU {
     float    gcam_boost = 1.0f;
     float    gcam_tex_gate = 1.5f;
     float    gcam_irr_gate = 0.5f;
+    float    gcam_mult = 1.0f;
+    float    gcam_thresh = 0.5f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 192, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 200, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -3015,6 +3017,8 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.gcam_boost = cfg.gcam_boost;
     mp.gcam_tex_gate = cfg.gcam_tex_gate;
     mp.gcam_irr_gate = cfg.gcam_irr_gate;
+    mp.gcam_mult = cfg.gcam_mult;
+    mp.gcam_thresh = cfg.gcam_thresh;
     mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
                      cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M

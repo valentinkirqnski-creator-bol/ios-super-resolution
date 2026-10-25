@@ -1794,6 +1794,8 @@ struct RobMaskParams {
     float gcam_boost;
     float gcam_tex_gate;
     float gcam_irr_gate;
+    float gcam_mult;
+    float gcam_thresh;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2440,24 +2442,38 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             if (!isfinite(rc)) rc = 0.f;
             R[obase + ch] = rc * emc;
         }
-    } else {
-        // GCam-form (Config::robustness_gcam_enabled): multiply the exponent by
-        // gcam_boost only where the tile flow is irregular AND the region is
-        // textured; strict == 1 everywhere else (identical to the default mask).
-        float strict = 1.f;
-        if (p.gcam_enabled != 0u) {
-            float vr = 0.f, nvar = 0.f;
-            for (uint ch = 0u; ch < p.nch; ++ch) {
-                uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-                vr += ref_vars[o];
-                nvar += max(p.alpha * ref_means[o] + p.beta, 0.f);
-            }
-            float nstd = sqrt(max(nvar, 1e-10f));
-            bool textured = sqrt(max(vr, 0.f)) > p.gcam_tex_gate * nstd;
-            float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
-            if (textured && irr > p.gcam_irr_gate) strict = p.gcam_boost;
+    } else if (p.gcam_enabled != 0u) {
+        // GCam ComputeFrameWeight in SQRT (VST) space (delta method). Twin of the
+        // CPU branch in robustness.cpp. Faithful to the readable shader; constants
+        // tuned, unblocker / green-diff / soft-dilation omitted.
+        float num = 0.f, vr_s = 0.f, nvar_s = 0.f;
+        for (uint ch = 0u; ch < p.nch; ++ch) {
+            uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+            float mr = max(ref_means[o], 1e-6f);
+            float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
+                                                   sample_y, sample_x, ch);
+            float nv = max(p.alpha * mr + p.beta, 0.f) / (4.f * mr);  // delta-method sqrt noise
+            float d2;
+            if (isfinite(comp)) { float ds = sqrt(max(comp, 0.f)) - sqrt(mr); d2 = ds * ds; }
+            else d2 = 1e30f;  // out of frame -> reject (matches the standard path's INF)
+            float shrink = d2 / (d2 + nv + 1e-20f);
+            num += d2 * shrink * shrink;
+            vr_s += ref_vars[o] / (4.f * mr);
+            nvar_s += nv;
         }
-        float r_val = clamp(s * exp(-(d_sq_ / sig) * strict) - p.r_t, 0.f, 1.f);
+        float nstd_s = sqrt(max(nvar_s, 1e-10f));
+        float std_dev2 = max(vr_s, nvar_s);
+        float dist = num / (std_dev2 + 1e-20f);
+        bool textured = sqrt(max(vr_s, 0.f)) > p.gcam_tex_gate * nstd_s;
+        float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
+        float boost = (textured && irr > p.gcam_irr_gate) ? p.gcam_boost : 1.f;
+        dist *= p.gcam_mult * boost;
+        float arg = p.gcam_thresh - dist; if (arg > 0.f) arg = 0.f;
+        float r_val = clamp(exp2(arg), 0.f, 1.f);
+        if (!isfinite(r_val)) r_val = 0.f;
+        R[obase] = r_val * emc;
+    } else {
+        float r_val = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
         R[obase] = r_val * emc;
     }
     // Which prior this pixel ended up on. Compared against r_s1 rather than
