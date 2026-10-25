@@ -1211,6 +1211,19 @@ struct CameraView: View {
                          An alternative robustness mask that reproduces the behaviour of Google's Super Res Zoom rejection (reverse-engineered design, original math): it normalizes the frame difference by local CONTRAST (not just noise) and raises its tolerance in high-frequency/aliased regions, so aliasing and real detail survive; a Wiener term shrinks noise-level differences; and it rejects much harder where the per-tile flow is IRREGULAR and the region is textured — the rotation/parallax/moving-object tile ghosts. Measured on synthetic real-content bursts to catch ~58% of visible ghosts at ~0% aliasing over-rejection (vs ~1% for the plain mask); the remaining subtle sub-pixel band still needs better flow or multi-frame consensus, not the mask. Rejected pixels fall back to the reference (robustness improves by rejecting, not by fusing — the hard regions get softer, not ghosted). Runs on the CPU raw-resolution path and is UNVERIFIED on device (heavier memory); constants tuned on synthetic bursts, will want on-device A/B. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    if cam.tuningParams.robustness_gcam_enabled {
+                        ispRow("Strictness (mult)", $cam.tuningParams.gcam_mult, 0.1...8.0, "%.2f")
+                        ispRow("Dead Zone (thresh)", $cam.tuningParams.gcam_thresh, 0.0...4.0, "%.2f")
+                        ispRow("Motion Boost", $cam.tuningParams.gcam_boost, 1.0...64.0, "%.1f")
+                        ispRow("Texture Gate", $cam.tuningParams.gcam_tex_gate, 0.5...4.0, "%.2f")
+                        ispRow("Irregularity Gate (px)", $cam.tuningParams.gcam_irr_gate, 0.0...3.0, "%.2f")
+                        ispRow("Green-Diff Tolerance", $cam.tuningParams.gcam_green_k, 0.0...8.0, "%.2f")
+                        ispRow("Soft Dilation", $cam.tuningParams.gcam_dilate_soft, 0.0...1.0, "%.2f")
+                        Text("""
+                             Tune on real bursts. Strictness/dead-zone set how aggressively any residual is rejected (lower mult or higher dead zone = gentler). Motion Boost + Texture/Irregularity gates aim the extra rejection at irregular-flow textured tiles (rotation/parallax ghosts) while leaving aligned pixels alone. Green-Diff Tolerance raises the allowed deviation in aliased detail so it survives (0 = off; it can only keep more, never darken). Soft Dilation controls how the rejection spreads to neighbours: 1.0 is the hard 5×5 min, lower softens it so a single rejected pixel doesn't erode clean detail around it. Google's own values are sensor-calibrated and won't match this camera — dial these in by eye.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                    }
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
                     Text("""
                          Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.

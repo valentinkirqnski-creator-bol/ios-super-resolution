@@ -1612,8 +1612,12 @@ static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
 
 struct RobStatsParamsCPU {
     uint32_t h, w, nch, _pad0 = 0;
+    // Soft 5x5 dilation strength for the GCam path (Config::gcam_dilate_soft).
+    // 1 = hard min (Eq.9), the default for every non-GCam dispatch. Only
+    // rob_local_min_5x5 reads it. Keep in lockstep with RobStatsParams.
+    float dilate_soft = 1.0f;
 };
-static_assert(sizeof(RobStatsParamsCPU) == 16, "RobStatsParamsCPU");
+static_assert(sizeof(RobStatsParamsCPU) == 20, "RobStatsParamsCPU");
 
 
 struct RobDogsonParamsCPU {
@@ -1688,8 +1692,9 @@ struct RobMaskParamsCPU {
     float    gcam_irr_gate = 0.5f;
     float    gcam_mult = 1.0f;
     float    gcam_thresh = 0.5f;
+    float    gcam_green_k = 0.0f;  // green-diff aliasing tolerance (0 = off)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 200, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 204, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -3019,6 +3024,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.gcam_irr_gate = cfg.gcam_irr_gate;
     mp.gcam_mult = cfg.gcam_mult;
     mp.gcam_thresh = cfg.gcam_thresh;
+    mp.gcam_green_k = cfg.gcam_green_k;
     mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
                      cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M
@@ -3078,6 +3084,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     sp.h = (uint32_t)gh;
     sp.w = (uint32_t)gw;
     sp.nch = rob_nch;  // 5x5 min is taken per channel
+    // GCam path softens the Eq.9 spread (gcam_dilate_soft); all other paths keep
+    // the hard min (1.0).
+    sp.dilate_soft = cfg.robustness_gcam_enabled ? cfg.gcam_dilate_soft : 1.0f;
     enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
     [enc setBuffer:b_out offset:out_off_bytes atIndex:0];

@@ -609,6 +609,13 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.motion_geom_reject_enabled = tuning[@"motion_geom_reject_enabled"].boolValue;
     if (tuning[@"robustness_gcam_enabled"])
         cfg.robustness_gcam_enabled = tuning[@"robustness_gcam_enabled"].boolValue;
+    if (tuning[@"gcam_mult"])       cfg.gcam_mult = tuning[@"gcam_mult"].floatValue;
+    if (tuning[@"gcam_thresh"])     cfg.gcam_thresh = tuning[@"gcam_thresh"].floatValue;
+    if (tuning[@"gcam_boost"])      cfg.gcam_boost = tuning[@"gcam_boost"].floatValue;
+    if (tuning[@"gcam_tex_gate"])   cfg.gcam_tex_gate = tuning[@"gcam_tex_gate"].floatValue;
+    if (tuning[@"gcam_irr_gate"])   cfg.gcam_irr_gate = tuning[@"gcam_irr_gate"].floatValue;
+    if (tuning[@"gcam_green_k"])    cfg.gcam_green_k = tuning[@"gcam_green_k"].floatValue;
+    if (tuning[@"gcam_dilate_soft"]) cfg.gcam_dilate_soft = tuning[@"gcam_dilate_soft"].floatValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])

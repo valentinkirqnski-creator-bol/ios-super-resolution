@@ -1457,6 +1457,9 @@ static Image local_min_5x5(const Image& R) {
 // R is evaluated per raw pixel (the toggle's point), but the spatial
 // safety margin is Wronski's own, on Wronski's own grid.
 static Image local_min_5x5_on_guide(const Image& R);
+// Soft version for the GCam path: blends the hard 5x5-min with the pre-dilation
+// value (soft in [0,1]; 1 = hard min). See Config::gcam_dilate_soft.
+static Image local_min_5x5_on_guide_soft(const Image& R, f32 soft);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
@@ -1759,7 +1762,24 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                     nvar_s += nv;
                 }
                 const f32 nstd_s = std::sqrt(std::max(1e-10f, nvar_s));
-                const f32 std_dev2 = std::max(vr_s, nvar_s);            // contrast floored at noise
+                f32 std_dev2 = std::max(vr_s, nvar_s);                  // contrast floored at noise
+                // Green-difference aliasing tolerance (RGB-guide adaptation; see
+                // Config::gcam_green_k). The two Bayer greens are merged into one
+                // channel in the guide, so the exact |Gr - Gb| is gone; use the
+                // green channel's local high-frequency content as the aliasing
+                // indicator. Can only RAISE std_dev (never darkens an aligned
+                // pixel): aliased detail keeps full weight. Default k=0 = no-op.
+                if (cfg.gcam_green_k > 0.f && nch >= 2) {
+                    const int gc = 1; // guide = [R, mean(two greens), B]
+                    const int xlg = std::max(0, x - 1), xrg = std::min(w - 1, x + 1);
+                    const int yug = std::max(0, y - 1), ydg = std::min(h - 1, y + 1);
+                    const f32 gcen = ref_means.at(y, x, gc);
+                    const f32 glp = 0.25f * (ref_means.at(y, xlg, gc) + ref_means.at(y, xrg, gc) +
+                                             ref_means.at(yug, x, gc) + ref_means.at(ydg, x, gc));
+                    const f32 ghf = gcen - glp;                         // linear green high-pass
+                    const f32 ghf_var_s = (ghf * ghf) / (4.f * std::max(gcen, 1e-6f)); // delta -> sqrt space
+                    std_dev2 = std::max(std_dev2, cfg.gcam_green_k * ghf_var_s);
+                }
                 f32 dist = num / (std_dev2 + 1e-20f);
                 const bool textured = std::sqrt(std::max(0.f, vr_s)) > cfg.gcam_tex_gate * nstd_s;
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
@@ -1788,8 +1808,9 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     }
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
     // there (= the paper's 10x10-raw footprint), nearest-upsample back. See
-    // local_min_5x5_on_guide.
-    return local_min_5x5_on_guide(R);
+    // local_min_5x5_on_guide. The GCam path softens that spread (gcam_dilate_soft).
+    return gcam ? local_min_5x5_on_guide_soft(R, cfg.gcam_dilate_soft)
+                : local_min_5x5_on_guide(R);
 }
 
 Image robustness_local_min_on_guide(const Image& R) {
@@ -1821,6 +1842,52 @@ static Image local_min_5x5_on_guide(const Image& R) {
         for (int x = 0; x < R.w; ++x)
             for (int ch = 0; ch < nc; ++ch)
                 out.at(y, x, ch) = M.at(gy, std::min(gw - 1, x / 2), ch);
+    }
+    return out;
+}
+
+// Soft 5x5 dilation for the GCam path. Same guide-lattice footprint as
+// local_min_5x5_on_guide, but each output cell is a blend of the hard 5x5 min
+// (M) and the pre-dilation guide value (G, the 2x2 min-reduce): soft = 1 is the
+// hard min exactly; soft < 1 lets the cell keep part of its own weight, so a
+// single rejected neighbour no longer nukes the whole 5x5 window. GCam spreads
+// the mask more gently than a pure min (Wronski's hard Eq.9 min over-erodes
+// clean detail); this is the tunable soft analogue, not the exact compiled form.
+// Twin of the blend in rob_local_min_5x5 (HHSRKernels.metal).
+static Image local_min_5x5_on_guide_soft(const Image& R, f32 soft) {
+    soft = soft < 0.f ? 0.f : (soft > 1.f ? 1.f : soft);
+    if (soft >= 1.f) return local_min_5x5_on_guide(R);
+    const int nc = R.c;
+    const int gh = R.h / 2, gw = R.w / 2;
+    if (gh <= 0 || gw <= 0) {
+        // No 2x2 reduce possible: blend at the native resolution.
+        Image M = local_min_5x5(R);
+        Image out(R.h, R.w, nc);
+        for (int y = 0; y < R.h; ++y)
+            for (int x = 0; x < R.w; ++x)
+                for (int ch = 0; ch < nc; ++ch)
+                    out.at(y, x, ch) = soft * M.at(y, x, ch) + (1.f - soft) * R.at(y, x, ch);
+        return out;
+    }
+    Image G(gh, gw, nc);
+    for (int gy = 0; gy < gh; ++gy)
+        for (int gx = 0; gx < gw; ++gx)
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 m = R.at(2 * gy, 2 * gx, ch);
+                m = std::min(m, R.at(2 * gy, 2 * gx + 1, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx + 1, ch));
+                G.at(gy, gx, ch) = m;
+            }
+    Image M = local_min_5x5(G);
+    Image out(R.h, R.w, nc);
+    for (int y = 0; y < R.h; ++y) {
+        const int gy = std::min(gh - 1, y / 2);
+        for (int x = 0; x < R.w; ++x) {
+            const int gx = std::min(gw - 1, x / 2);
+            for (int ch = 0; ch < nc; ++ch)
+                out.at(y, x, ch) = soft * M.at(gy, gx, ch) + (1.f - soft) * G.at(gy, gx, ch);
+        }
     }
     return out;
 }

@@ -1718,6 +1718,10 @@ struct RobGuideParams {
 struct RobStatsParams {
     uint h, w, nch;
     uint _pad0;
+    // Soft 5x5 dilation strength for the GCam path (Config::gcam_dilate_soft):
+    // 1 = hard min (Eq.9, the default for every other dispatch), <1 blends the
+    // min with the pre-dilation value. Only rob_local_min_5x5 reads it.
+    float dilate_soft;
 };
 
 struct RobDogsonParams {
@@ -1796,6 +1800,9 @@ struct RobMaskParams {
     float gcam_irr_gate;
     float gcam_mult;
     float gcam_thresh;
+    // Green-difference aliasing tolerance (Config::gcam_green_k): raises std_dev
+    // from the green channel's local high-frequency content. 0 = off.
+    float gcam_green_k;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2445,7 +2452,8 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
     } else if (p.gcam_enabled != 0u) {
         // GCam ComputeFrameWeight in SQRT (VST) space (delta method). Twin of the
         // CPU branch in robustness.cpp. Faithful to the readable shader; constants
-        // tuned, unblocker / green-diff / soft-dilation omitted.
+        // tuned, unblocker omitted. Green-diff tolerance (below) and the soft
+        // dilation (rob_local_min_5x5) are ported.
         float num = 0.f, vr_s = 0.f, nvar_s = 0.f;
         for (uint ch = 0u; ch < p.nch; ++ch) {
             uint o = (gid.y * p.w + gid.x) * p.nch + ch;
@@ -2463,6 +2471,23 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         }
         float nstd_s = sqrt(max(nvar_s, 1e-10f));
         float std_dev2 = max(vr_s, nvar_s);
+        // Green-difference aliasing tolerance (Config::gcam_green_k): the two
+        // Bayer greens are merged into channel 1 of the guide, so use its local
+        // high-frequency content as the aliasing signal. Can only RAISE std_dev
+        // (never darkens). Twin of the CPU block in robustness.cpp. 0 = no-op.
+        if (p.gcam_green_k > 0.f && p.nch >= 2u) {
+            uint gc = 1u; // guide = [R, mean(two greens), B]
+            int xlg = max(0, int(gid.x) - 1), xrg = min(int(p.w) - 1, int(gid.x) + 1);
+            int yug = max(0, int(gid.y) - 1), ydg = min(int(p.h) - 1, int(gid.y) + 1);
+            float gcen = ref_means[(gid.y * p.w + gid.x) * p.nch + gc];
+            float glp = 0.25f * (ref_means[(gid.y * p.w + uint(xlg)) * p.nch + gc] +
+                                 ref_means[(gid.y * p.w + uint(xrg)) * p.nch + gc] +
+                                 ref_means[(uint(yug) * p.w + gid.x) * p.nch + gc] +
+                                 ref_means[(uint(ydg) * p.w + gid.x) * p.nch + gc]);
+            float ghf = gcen - glp;
+            float ghf_var_s = (ghf * ghf) / (4.f * max(gcen, 1e-6f));
+            std_dev2 = max(std_dev2, p.gcam_green_k * ghf_var_s);
+        }
         float dist = num / (std_dev2 + 1e-20f);
         bool textured = sqrt(max(vr_s, 0.f)) > p.gcam_tex_gate * nstd_s;
         float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
@@ -2831,7 +2856,17 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
         }
     }
     uint obase = (gid.y * p.w + gid.x) * nch;
-    for (uint ch = 0u; ch < nch; ++ch) out[obase + ch] = mn[ch];
+    // Soft dilation (Config::gcam_dilate_soft): blend the hard min with the
+    // pre-dilation value. soft >= 1 is the hard min exactly (every non-GCam
+    // dispatch). Twin of local_min_5x5_on_guide_soft in robustness.cpp.
+    float soft = p.dilate_soft;
+    if (soft >= 1.f) {
+        for (uint ch = 0u; ch < nch; ++ch) out[obase + ch] = mn[ch];
+    } else {
+        soft = max(soft, 0.f);
+        for (uint ch = 0u; ch < nch; ++ch)
+            out[obase + ch] = soft * mn[ch] + (1.f - soft) * R[obase + ch];
+    }
 }
 
 // ---- learned refinement of the analytic mask (Config::

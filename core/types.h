@@ -1645,14 +1645,33 @@ struct Config {
     //   R = clamp(exp2(min(gcam_thresh - distance, 0)), 0, 1)
     // Faithful to the readable shader. NOT reproducible from the APK (compiled):
     // the numeric constants (tuned here, need on-device A/B) and the unblocker
-    // (omitted). Also not yet ported: the green-difference std augmentation and the
-    // soft 5x5 dilation. Off by default.
+    // (omitted). Two further readable pieces are ported below:
+    //   * gcam_green_k -- the green-difference aliasing tolerance. GCam raises the
+    //     allowed deviation (std_dev) using |Gr - Gb| between the two Bayer
+    //     greens, so aliased detail is not rejected. Our guide has already merged
+    //     the two greens into one channel before robustness runs, so the exact
+    //     |Gr - Gb| is unavailable without plumbing a 4th guide channel through
+    //     the whole stats chain; this reproduces its FUNCTION from the RGB guide,
+    //     using the green channel's local high-frequency content as the aliasing
+    //     indicator. It can only RAISE std_dev (never darken an aligned pixel).
+    //     Default 0 = off (no change), so it is an opt-in adaptation, not a
+    //     bit-faithful port.
+    //   * gcam_dilate_soft -- the soft mask spread. Wronski's Eq.9 hard 5x5 min
+    //     over-erodes clean detail (measured ~2 dB on the shipping guide); GCam
+    //     spreads the mask more gently. This blends the hard min with the
+    //     pre-dilation value: 1.0 = the hard min (today's behaviour), <1 softens
+    //     the spread. The exact compiled form is not recovered; this is the
+    //     tunable soft analogue. Applies to the GCam path only.
+    // All constants are Pixel-sensor-calibrated in the APK; these defaults are
+    // starting values and need on-device A/B. Off by default.
     bool  robustness_gcam_enabled = false;
     float gcam_mult = 1.0f;        // kDistanceMultiplier (overall strictness)
     float gcam_thresh = 0.5f;      // kRejectionThreshold (dead zone: distance < thresh -> R=1)
     float gcam_boost = 8.0f;       // extra_motion_robustness_boost in irregular+textured tiles
     float gcam_tex_gate = 1.5f;    // boost only where sqrt ref std > this * noise std
     float gcam_irr_gate = 0.5f;    // boost only where per-tile flow irregularity > this (raw px); A/B on device
+    float gcam_green_k = 0.0f;     // green-diff aliasing tolerance (RGB-guide adaptation); 0 = off
+    float gcam_dilate_soft = 1.0f; // soft 5x5 dilation: 1 = hard min (Eq.9), <1 softens the spread
     float gcam_alias_k = 4.0f;     // (unused; kept for config compatibility)
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where

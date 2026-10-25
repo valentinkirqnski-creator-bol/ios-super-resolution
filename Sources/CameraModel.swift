@@ -258,6 +258,21 @@ struct TuningParams: Equatable, Codable {
     /// over-rejection (vs ~1% baseline); ceiling 58% (subtle sub-pixel band needs
     /// flow/consensus). Runs on the CPU raw-res path; UNVERIFIED on device. Off by default.
     var robustness_gcam_enabled: Bool = false
+    /// GCam-form robustness constants (all A/B-tunable on device; Pixel's own
+    /// values are sensor-calibrated and don't transfer, so these are starting
+    /// points). mult = overall strictness; thresh = dead-zone width (distance <
+    /// thresh -> R=1); boost = extra strictness in irregular+textured tiles;
+    /// tex_gate = boost only where sqrt ref std > this * noise std; irr_gate =
+    /// boost only where per-tile flow irregularity exceeds this (raw px);
+    /// green_k = green-difference aliasing tolerance (0 = off); dilate_soft =
+    /// soft 5x5 dilation (1 = hard Eq.9 min, <1 softens the rejection spread).
+    var gcam_mult: Float = 1.0
+    var gcam_thresh: Float = 0.5
+    var gcam_boost: Float = 8.0
+    var gcam_tex_gate: Float = 1.5
+    var gcam_irr_gate: Float = 0.5
+    var gcam_green_k: Float = 0.0
+    var gcam_dilate_soft: Float = 1.0
     /// Perceptual-space robustness: compute the mask's local std and colour distance
     /// on sqrt(max(x,0)) of the guide — the variance-stabilizing / perceptual
     /// transform for the Poisson-Gaussian sensor — with a matching sqrt-space noise
@@ -483,6 +498,7 @@ struct TuningParams: Equatable, Codable {
         case feat_metric_refine_enabled
         case decimate_dense_align_enabled
         case robustness_per_channel, robustness_gcam_enabled
+        case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case gyro_prealign_enabled
@@ -602,6 +618,13 @@ struct TuningParams: Equatable, Codable {
         guide_curve = try c.decodeIfPresent(Int.self, forKey: .guide_curve) ?? guide_curve
         robustness_per_channel = try c.decodeIfPresent(Bool.self, forKey: .robustness_per_channel) ?? robustness_per_channel
         robustness_gcam_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_gcam_enabled) ?? robustness_gcam_enabled
+        gcam_mult = try c.decodeIfPresent(Float.self, forKey: .gcam_mult) ?? gcam_mult
+        gcam_thresh = try c.decodeIfPresent(Float.self, forKey: .gcam_thresh) ?? gcam_thresh
+        gcam_boost = try c.decodeIfPresent(Float.self, forKey: .gcam_boost) ?? gcam_boost
+        gcam_tex_gate = try c.decodeIfPresent(Float.self, forKey: .gcam_tex_gate) ?? gcam_tex_gate
+        gcam_irr_gate = try c.decodeIfPresent(Float.self, forKey: .gcam_irr_gate) ?? gcam_irr_gate
+        gcam_green_k = try c.decodeIfPresent(Float.self, forKey: .gcam_green_k) ?? gcam_green_k
+        gcam_dilate_soft = try c.decodeIfPresent(Float.self, forKey: .gcam_dilate_soft) ?? gcam_dilate_soft
         robustness_perceptual_sqrt = try c.decodeIfPresent(Bool.self, forKey: .robustness_perceptual_sqrt) ?? robustness_perceptual_sqrt
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
@@ -2422,6 +2445,13 @@ final class CameraModel: NSObject, ObservableObject {
             "guide_curve": NSNumber(value: tuningParams.guide_curve),
             "robustness_per_channel": NSNumber(value: tuningParams.robustness_per_channel),
             "robustness_gcam_enabled": NSNumber(value: tuningParams.robustness_gcam_enabled),
+            "gcam_mult": NSNumber(value: tuningParams.gcam_mult),
+            "gcam_thresh": NSNumber(value: tuningParams.gcam_thresh),
+            "gcam_boost": NSNumber(value: tuningParams.gcam_boost),
+            "gcam_tex_gate": NSNumber(value: tuningParams.gcam_tex_gate),
+            "gcam_irr_gate": NSNumber(value: tuningParams.gcam_irr_gate),
+            "gcam_green_k": NSNumber(value: tuningParams.gcam_green_k),
+            "gcam_dilate_soft": NSNumber(value: tuningParams.gcam_dilate_soft),
             "robustness_perceptual_sqrt": NSNumber(value: tuningParams.robustness_perceptual_sqrt),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
