@@ -1734,32 +1734,27 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 // noise and raised in high-frequency/aliased regions), Wiener-shrink
                 // it under noise, and boost strictness where the tile flow is
                 // irregular AND the region is textured.
-                // NOISE-NORMALIZED residual d^2/sigma^2 (channel-summed). This is ~0
-                // for ANY aligned pixel regardless of brightness or texture, so it
-                // cannot collapse the way contrast normalization did (which darkened
-                // dark/low-variance regions). The earlier contrast-normalized form
-                // was replaced after it rejected textured/dark content on well-aligned
-                // bursts; the irregularity boost is the only real lever and it rides
-                // on top of this stable base.
-                f32 d2 = 0.f, nvar = 0.f, vr = 0.f;
+                // MULTIPLICATIVE form: the STANDARD mask residual d_sq/sigma_sq (the
+                // same Wiener-shrunk, variance-floored value the else-branch below
+                // uses, so a regular-flow pixel is byte-identical to the default mask
+                // and cannot darken), with the EXPONENT multiplied by a strictness
+                // boost only where the tile flow is genuinely irregular AND the region
+                // is textured. Because the boost multiplies the residual, it rejects
+                // only where there is a real residual -- an aligned-but-jittery pixel
+                // (small residual) survives even if the irregularity gate fires on
+                // normal block-match jitter. (The earlier contrast-normalized / dead-
+                // zone forms darkened dark/textured aligned content and were replaced.)
+                f32 nvar = 0.f, vr = 0.f;
                 for (int ch = 0; ch < nch; ++ch) {
-                    const f32 dm = comp_means.at(y, x, ch) - ref_means.at(y, x, ch);
-                    d2 += dm * dm;
                     nvar += guide_noise_var(cfg, nch, ch, ref_means.at(y, x, ch));
                     vr += ref_vars.at(y, x, ch);   // local contrast, only for the texture gate
                 }
-                const f32 dist0 = d2 / (nvar + 1e-20f);
                 const f32 nstd = std::sqrt(std::max(1e-10f, nvar));
                 const bool textured = std::sqrt(std::max(0.f, vr)) > cfg.gcam_tex_gate * nstd;
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
-                // Boost strictness ONLY where the tile flow is genuinely irregular AND
-                // the region is textured -- a high irr gate avoids boosting the normal
-                // block-match jitter that textured regions carry even when aligned.
-                const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
-                const f32 dist = cfg.gcam_mult * boost * dist0;
-                f32 arg = -dist + cfg.gcam_thresh;   // dead zone: dist < thresh -> R = 1
-                if (arg > 0.f) arg = 0.f;
-                f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
+                const f32 strict = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
+                f32 r_val = clampf(s * std::exp(-(d_sq.at(y, x) / sigma_sq.at(y, x)) * strict) - cfg.r_t,
+                                   0.f, 1.f);
                 if (!std::isfinite(r_val)) r_val = 0.f;
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
             } else if (per_channel) {
@@ -2058,32 +2053,15 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     }
 
 #ifdef __APPLE__
-    // GCam-form robustness (Config::robustness_gcam_enabled) has no Metal kernel;
-    // it runs on the CPU raw-res path below. The Metal mask path returns before
-    // that path, so without this the toggle would be silently inert on device
-    // (the host-stage-no-ops-on-device trap). Bring the reference statistics
-    // across from the GPU (one readback per burst, cached in ref_stats) and
-    // build the hires stats on the host if init_robustness_metal left them GPU-
-    // resident, then fall through to the CPU raw-res path. UNVERIFIED ON DEVICE:
-    // the readback + the raw-res host buffers (~146 MB each at 12 MP) are heavier
-    // than the Metal path, so this needs on-device A/B for correctness + memory.
-    if (cfg.robustness_gcam_enabled) {
-        RefStats* ms = const_cast<RefStats*>(&ref_stats);
-        if (ms->means.data.empty()) metal_fetch_host_ref_stats(*ms);
-        if (ms->means_hires.h <= 0 && ms->means.h > 0) {
-            ms->means_hires = upscale_warp_stats(ms->means, /*is_ref=*/true, nullptr,
-                                                 tile_size, cfg.num_threads, false);
-            ms->stds_hires = upscale_warp_stats(ms->stds, /*is_ref=*/true, nullptr,
-                                                tile_size, cfg.num_threads, false);
-        }
-    }
     // Metal GPU path — same Alg. robustness math as the CPU path below. The
     // Metal noise kernel only implements the per-channel model, so when a 1.4
     // single-curve LUT is loaded (Config parity mode) skip Metal and run the
     // VERIFIED CPU path below instead. Robustness then runs on CPU for this
     // frame, but the expensive runtime Monte-Carlo curve build is skipped (the
-    // LUT replaces it), so it is not necessarily slower overall.
-    if (!active_noise_lut14().valid && !cfg.robustness_gcam_enabled) {
+    // LUT replaces it), so it is not necessarily slower overall. The GCam-form
+    // (robustness_gcam_enabled) has a Metal twin in rob_make_mask, so it runs on
+    // the GPU here -- no host readback, no raw-res host buffers.
+    if (!active_noise_lut14().valid) {
         Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
                                              s_select_out, refined_on_gpu);
         if (gpu.h > 0 && gpu.w > 0) return gpu;

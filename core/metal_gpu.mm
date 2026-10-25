@@ -1680,8 +1680,14 @@ struct RobMaskParamsCPU {
     float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};  // global homography (lr coords)
     uint32_t use_homography = 0;
     uint32_t per_channel = 0;  // 1 = write a separate R per guide channel (ISA)
+    // GCam-form robustness (Config::robustness_gcam_enabled). Same order as
+    // RobMaskParams in HHSRKernels.metal.
+    uint32_t gcam_enabled = 0;
+    float    gcam_boost = 1.0f;
+    float    gcam_tex_gate = 1.5f;
+    float    gcam_irr_gate = 0.5f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 176, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 192, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -3005,6 +3011,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
     mp.per_channel = (rob_nch > 1u) ? 1u : 0u;  // ISA per-channel R
+    mp.gcam_enabled = cfg.robustness_gcam_enabled ? 1u : 0u;
+    mp.gcam_boost = cfg.gcam_boost;
+    mp.gcam_tex_gate = cfg.gcam_tex_gate;
+    mp.gcam_irr_gate = cfg.gcam_irr_gate;
     mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
                      cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M

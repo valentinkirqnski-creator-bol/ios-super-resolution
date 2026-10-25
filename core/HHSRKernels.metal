@@ -1787,6 +1787,13 @@ struct RobMaskParams {
     float hmat[9];
     uint use_homography;
     uint per_channel;  // 1 = write a separate R per guide channel (ISA per-channel)
+    // GCam-form robustness (Config::robustness_gcam_enabled). Multiplies the
+    // standard mask's exponent by gcam_boost only where the tile flow is irregular
+    // AND the region is textured; 1 elsewhere (identical to the default mask).
+    uint gcam_enabled;
+    float gcam_boost;
+    float gcam_tex_gate;
+    float gcam_irr_gate;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2151,6 +2158,23 @@ inline float rob_edge_misalign_c(device const float* ref_means, device const flo
                                  float em_shift_z, float em_ghost_z, float em_min_conf,
                                  float alpha, float beta);
 
+// Per-tile flow irregularity for the GCam-form boost: min-max extent of the tile
+// flow vectors over the 3x3 tile neighbourhood (raw px). Twin of
+// compute_flow_irregularity in robustness.cpp.
+inline float rob_flow_irr(device const float* flow, uint fny, uint fnx, int ty, int tx) {
+    float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            int qy = clamp(ty + dy, 0, int(fny) - 1);
+            int qx = clamp(tx + dx, 0, int(fnx) - 1);
+            uint fi = (uint(qy) * fnx + uint(qx)) * 2u;
+            float vx = flow[fi + 0u], vy = flow[fi + 1u];
+            mnx = min(mnx, vx); mxx = max(mxx, vx);
+            mny = min(mny, vy); mxy = max(mxy, vy);
+        }
+    return sqrt((mxx - mnx) * (mxx - mnx) + (mxy - mny) * (mxy - mny));
+}
+
 kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device const float* comp_means [[buffer(1)]],
                           device const float* ref_means [[buffer(3)]],
@@ -2417,7 +2441,23 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             R[obase + ch] = rc * emc;
         }
     } else {
-        float r_val = clamp(s * exp(-d_sq_ / sig) - p.r_t, 0.f, 1.f);
+        // GCam-form (Config::robustness_gcam_enabled): multiply the exponent by
+        // gcam_boost only where the tile flow is irregular AND the region is
+        // textured; strict == 1 everywhere else (identical to the default mask).
+        float strict = 1.f;
+        if (p.gcam_enabled != 0u) {
+            float vr = 0.f, nvar = 0.f;
+            for (uint ch = 0u; ch < p.nch; ++ch) {
+                uint o = (gid.y * p.w + gid.x) * p.nch + ch;
+                vr += ref_vars[o];
+                nvar += max(p.alpha * ref_means[o] + p.beta, 0.f);
+            }
+            float nstd = sqrt(max(nvar, 1e-10f));
+            bool textured = sqrt(max(vr, 0.f)) > p.gcam_tex_gate * nstd;
+            float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
+            if (textured && irr > p.gcam_irr_gate) strict = p.gcam_boost;
+        }
+        float r_val = clamp(s * exp(-(d_sq_ / sig) * strict) - p.r_t, 0.f, 1.f);
         R[obase] = r_val * emc;
     }
     // Which prior this pixel ended up on. Compared against r_s1 rather than

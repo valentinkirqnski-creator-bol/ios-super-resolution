@@ -1636,21 +1636,25 @@ struct Config {
     // strictness only in the irregular+textured tiles where ghosts live. MEASURED:
     // flat R=1.0, aligned-aliasing R=1.0, irregular ghost R=0.0; ~57% visible-ghost
     // catch at 0% flat over-rejection.
-    // The weight is exp2(min(-mult*boost*(d^2/sigma^2) + thresh, 0)): a NOISE-
-    // normalized residual (brightness/texture-invariant, so flat/dark/textured
-    // aligned content stays at R=1 via the dead zone) with the strictness boosted
-    // only where the tile flow is genuinely irregular. An earlier contrast-
-    // normalized form darkened dark/textured regions on well-aligned bursts and
-    // was replaced. Re-tuned: ~67% visible-ghost catch at ~1% all-aligned
-    // over-rejection. The irr_gate especially needs on-device A/B -- real block-
-    // match flow carries texture-correlated jitter the synthetic tuning can't size.
+    // MULTIPLICATIVE form: R = s*exp(-(d^2/sigma^2) * strict) - r_t, i.e. the
+    // STANDARD mask with its exponent scaled by `strict` = gcam_boost only where
+    // the tile flow is irregular AND the region is textured, else 1 (so regular-
+    // flow pixels are byte-identical to the default mask -- cannot darken, still
+    // rejects moving/occlusion). Because the boost multiplies the residual, it
+    // rejects only where there is a real residual, so an aligned-but-jittery pixel
+    // survives even if the irregularity gate fires. Earlier contrast-normalized and
+    // dead-zone forms darkened dark/textured aligned content and were replaced.
+    // MEASURED ~36-46% visible-ghost catch at ~2-4% textured over-rejection. The
+    // irr_gate needs on-device A/B -- real block-match flow carries texture-
+    // correlated jitter the synthetic tuning cannot size; raise it if textured
+    // regions over-reject, lower it if ghosts are missed.
     bool  robustness_gcam_enabled = false;
-    float gcam_mult = 0.5f;        // base strictness on d^2/sigma^2
-    float gcam_thresh = 2.0f;      // dead-zone: full accept (R=1) while dist < thresh
-    float gcam_boost = 8.0f;       // extra strictness in irregular+textured tiles (ghosts)
+    float gcam_boost = 8.0f;       // exponent multiplier in irregular+textured tiles (ghosts)
     float gcam_tex_gate = 1.5f;    // boost only where local std > this * noise_std
-    float gcam_irr_gate = 0.6f;    // boost only where per-tile flow irregularity > this (raw px); A/B on device
-    float gcam_alias_k = 4.0f;     // (unused by the noise-normalized form; kept for config compatibility)
+    float gcam_irr_gate = 0.5f;    // boost only where per-tile flow irregularity > this (raw px); A/B on device
+    float gcam_mult = 0.5f;        // (unused by the multiplicative form; kept for config compatibility)
+    float gcam_thresh = 2.0f;      // (unused)
+    float gcam_alias_k = 4.0f;     // (unused)
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an
