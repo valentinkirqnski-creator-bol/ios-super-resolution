@@ -1583,18 +1583,12 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // peak is the upscaled comp_means plus the two scalar outputs rather than
     // the whole chain at once.
     Image comp_means;
-    Image comp_vars;   // only populated for the GCam-form path (min(std_ref,std_alt))
     {
-        Image comp_means_guide, comp_vars_guide;
+        Image comp_means_guide;
         {
             Image guide = compute_guide(comp_raw, cfg);
-            // comp_vars_guide is the comp frame's local variance; the Wronski path
-            // never reads it, but the GCam-form robustness needs it upscaled too.
+            Image comp_vars_guide;  // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
-            if (cfg.robustness_gcam_enabled)
-                comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
-                                               tile_size, cfg.num_threads, false,
-                                               cfg.affine_flow_enabled);
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false,
@@ -1637,8 +1631,6 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     const bool gcam = cfg.robustness_gcam_enabled;
     std::vector<f32> gcam_irr;
     if (gcam) gcam_irr = compute_flow_irregularity(flow);
-    const bool gcam_have_cv = gcam && comp_vars.h == ref_means.h &&
-                              comp_vars.w == ref_means.w && comp_vars.c == ref_means.c;
 
     // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
     // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
@@ -1742,16 +1734,18 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 // noise and raised in high-frequency/aliased regions), Wiener-shrink
                 // it under noise, and boost strictness where the tile flow is
                 // irregular AND the region is textured.
-                f32 d2 = 0.f, nvar = 0.f, vr = 0.f, va = 0.f;
+                f32 d2 = 0.f, nvar = 0.f, vr = 0.f;
                 for (int ch = 0; ch < nch; ++ch) {
                     const f32 dm = comp_means.at(y, x, ch) - ref_means.at(y, x, ch);
                     d2 += dm * dm;
                     nvar += guide_noise_var(cfg, nch, ch, ref_means.at(y, x, ch));
                     vr += ref_vars.at(y, x, ch);
-                    va += gcam_have_cv ? comp_vars.at(y, x, ch) : ref_vars.at(y, x, ch);
                 }
+                // std_alt (comp local std) would need an extra full-res upscale
+                // (~146 MB/frame) and barely moves the result -- the irregularity
+                // boost is the dominant term -- so use the reference contrast for both.
                 const f32 std_ref = std::sqrt(std::max(0.f, vr));
-                const f32 std_alt = std::sqrt(std::max(0.f, va));
+                const f32 std_alt = std_ref;
                 const f32 nstd = std::sqrt(std::max(1e-10f, nvar));
                 // local HF (aliasing proxy): channel-summed |Laplacian| of the ref means
                 const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
