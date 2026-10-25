@@ -845,11 +845,6 @@ struct CameraView: View {
              some burst samples for artifact-free output. Lower threshold rejects more.
              """)
             .font(.caption2).foregroundColor(.secondary)
-        Toggle("GCam-Style Robustness", isOn: $cam.tuningParams.robustness_gcam_enabled)
-        Text("""
-             An alternative robustness mask that reproduces the behaviour of Google's Super Res Zoom rejection (reverse-engineered design, original math): it normalizes the frame difference by local CONTRAST (not just noise) and raises its tolerance in high-frequency/aliased regions, so aliasing and real detail survive; a Wiener term shrinks noise-level differences; and it rejects much harder where the per-tile flow is IRREGULAR and the region is textured — the rotation/parallax/moving-object tile ghosts. Measured on synthetic real-content bursts to catch ~58% of visible ghosts at ~0% aliasing over-rejection (vs ~1% for the plain mask); the remaining subtle sub-pixel band still needs better flow or multi-frame consensus, not the mask. Rejected pixels fall back to the reference. Runs on the CPU raw-resolution path and is UNVERIFIED on device (heavier memory); the constants are tuned on synthetic bursts and will want on-device A/B. Off by default.
-             """)
-            .font(.caption2).foregroundColor(.secondary)
         HStack {
             Text("Geom Threshold")
             Spacer()
@@ -1209,6 +1204,11 @@ struct CameraView: View {
                     Toggle("Affine Tile Motion", isOn: $cam.tuningParams.affine_flow_enabled)
                     Text("""
                          Experimental. A full local affine (rotation/shear/scale) per tile instead of one translation, so camera rotation, yaw/pitch and smooth parallax align correctly within each tile rather than ghosting at tile seams. The affine is now MEASURED per tile against the pixels (6-parameter Gauss-Newton refinement seeded by the neighbour fit; a tile is kept only if it provably improves), and the robustness mask scores exactly the same affine correspondence the merge fetches — previously the mask used the plain per-tile vector while the merge warped affinely. Does not model sharp depth or moving-object edges — robustness still handles those.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
+                    Toggle("GCam-Style Robustness", isOn: $cam.tuningParams.robustness_gcam_enabled)
+                    Text("""
+                         An alternative robustness mask that reproduces the behaviour of Google's Super Res Zoom rejection (reverse-engineered design, original math): it normalizes the frame difference by local CONTRAST (not just noise) and raises its tolerance in high-frequency/aliased regions, so aliasing and real detail survive; a Wiener term shrinks noise-level differences; and it rejects much harder where the per-tile flow is IRREGULAR and the region is textured — the rotation/parallax/moving-object tile ghosts. Measured on synthetic real-content bursts to catch ~58% of visible ghosts at ~0% aliasing over-rejection (vs ~1% for the plain mask); the remaining subtle sub-pixel band still needs better flow or multi-frame consensus, not the mask. Rejected pixels fall back to the reference (robustness improves by rejecting, not by fusing — the hard regions get softer, not ghosted). Runs on the CPU raw-resolution path and is UNVERIFIED on device (heavier memory); constants tuned on synthetic bursts, will want on-device A/B. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
