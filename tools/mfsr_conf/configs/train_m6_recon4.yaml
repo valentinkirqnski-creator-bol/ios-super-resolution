@@ -1,0 +1,15 @@
+# Ablation of m1: Reconstruction loss weighted 4x.
+name: m6_recon4
+data: data/d1
+model: {ch: 16, fusion: true, dils: [1, 2, 4, 8], up_ch: 8, use_r0: false, refine_r0: false}
+crop: 96
+halo: 32
+n_crops: 4
+batch: 2
+lr: 0.002
+minutes: 30
+val_every: 200
+val_limit: 16          # validation bursts (x 2 alignment variants); the first 16 of the val split
+loss: {align: 1.0, merge: 1.0, recon: 4.0, align_sigma: 0.25, gamma: 4.0, keep_prior: 0.02, w_harm: 3.0, w_misalign: 3.0}
+workers: 2
+threads: 6

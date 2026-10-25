@@ -383,6 +383,10 @@ struct TuningParams: Equatable, Codable {
     /// sees the pixels, ~3x the mask step's GPU time and ~25 MB of band buffers on a 12 MP burst; falls back to v21
     /// if it cannot run.
     var robust_nn_v15_enabled: Bool = false
+    /// ConfNet confidence mask (tools/mfsr_conf): per-frame robustness weight from a network trained against the
+    /// app's own merge. Off by default. Combine: 0 network alone, 1 min(network, analytic), 2 network x analytic.
+    var conf_nn_enabled: Bool = false
+    var conf_nn_combine: Int = 0
     /// robust_nn output: R below this -> exactly 0 (rejected). v14/v17/v21/v22 default 0.20.
     /// Stored under new keys (…_v14) so a value saved by an earlier build cannot override the new default.
     var robust_nn_reject_below: Float = 0.20
@@ -492,6 +496,7 @@ struct TuningParams: Equatable, Codable {
         case robust_nn_enabled
         case exposure_match_enabled
         case robust_nn_v15_enabled
+        case conf_nn_enabled, conf_nn_combine
         case robust_nn_reject_below = "robust_nn_reject_below_v14"
         case robust_nn_accept_above = "robust_nn_accept_above_v14"
         case hdr_black_percentile, hdr_vibrance
@@ -621,6 +626,8 @@ struct TuningParams: Equatable, Codable {
         robust_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_enabled) ?? robust_nn_enabled
         exposure_match_enabled = try c.decodeIfPresent(Bool.self, forKey: .exposure_match_enabled) ?? exposure_match_enabled
         robust_nn_v15_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_v15_enabled) ?? robust_nn_v15_enabled
+        conf_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .conf_nn_enabled) ?? conf_nn_enabled
+        conf_nn_combine = try c.decodeIfPresent(Int.self, forKey: .conf_nn_combine) ?? conf_nn_combine
         robust_nn_reject_below = try c.decodeIfPresent(Float.self, forKey: .robust_nn_reject_below) ?? robust_nn_reject_below
         robust_nn_accept_above = try c.decodeIfPresent(Float.self, forKey: .robust_nn_accept_above) ?? robust_nn_accept_above
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
@@ -2439,6 +2446,8 @@ final class CameraModel: NSObject, ObservableObject {
             "robust_nn_enabled": NSNumber(value: tuningParams.robust_nn_enabled),
             "exposure_match_enabled": NSNumber(value: tuningParams.exposure_match_enabled),
             "robust_nn_v15_enabled": NSNumber(value: tuningParams.robust_nn_v15_enabled),
+            "conf_nn_enabled": NSNumber(value: tuningParams.conf_nn_enabled),
+            "conf_nn_combine": NSNumber(value: tuningParams.conf_nn_combine),
             "robust_nn_reject_below": NSNumber(value: tuningParams.robust_nn_reject_below),
             "robust_nn_accept_above": NSNumber(value: tuningParams.robust_nn_accept_above),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),

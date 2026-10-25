@@ -11,6 +11,7 @@ using namespace metal;
 #include "robustness_refine_shared.h"
 // tools/robust_nn: learned refinement of the robustness mask (rnn_refine_mask).
 #include "robust_nn_shared.h"
+#include "conf_nn_shared.h"
 
 constant float PI = 3.14159265358979323846f;
 
@@ -4399,5 +4400,86 @@ kernel void rnn15_out(device const float* hband [[buffer(0)]],
     float R = rnn15_out_at(th, zb, x, y);
     if (p.sharp_hi > p.sharp_lo)
         R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
+    r_out[y * W + x] = R;
+}
+
+
+// (Included here too so tools that compile this block on its own -- the robust_nn / mfsr_conf CPU kernel
+// emulators -- see the ConfNet code; #pragma once makes it a no-op in the full Metal build.)
+#include "conf_nn_shared.h"
+
+// ===========================================================================
+// ConfNet (Config::conf_nn_enabled, tools/mfsr_conf): per-frame robustness weight from a compact CNN trained
+// against the app's own merge. Banded exactly like the rnn15_* path above (same warp and 14-feature kernels, same
+// row-band buffers), then: 18 inputs -> 4 dilated 3x3 convs (dilations CNN_DIL0..3) -> 1x1 -> 3x3 -> head -> R.
+// Per-pixel code in conf_nn_shared.h (parity-tested on CPU against PyTorch: tools/mfsr_conf/parity_cnn.py).
+// Mirrors CnnBandCPU in metal_gpu.mm (64 bytes).
+struct CnnBand {
+    int lo, hi;                 // absolute rows this dispatch computes
+    int jb, jn, fb, fn, xb, xn; // band buffers (warped grey, features, inputs): first row, row count
+    int ib, in_, ob, on;        // layer input / output planes: first row, row count
+    int layer, dil;             // encoder layer 0..3 (cnn_enc)
+    int combine, _pad1;         // cnn_head: 0 network, 1 min(network, analytic), 2 network x analytic
+};
+
+kernel void cnn_inputs(device const float* ref_grey [[buffer(0)]],
+                       device const float* jband [[buffer(1)]],
+                       device const float* fband [[buffer(2)]],
+                       device float* xband [[buffer(3)]],
+                       constant RnnAppParams& p [[buffer(4)]],
+                       constant CnnBand& b [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    RNNParams P = {W, p.height, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RNNImg rf = {ref_grey, W};
+    Rnn15Rows tj = {jband, W, b.jb};
+    Rnn15Planes tf = {fband, W, b.fb, b.fn};
+    float xin[CNN_NG];
+    cnn_inputs_at(rf, tj, tf, P, x, y, xin);
+    for (int c = 0; c < CNN_NG; ++c) xband[(c * b.xn + (y - b.xb)) * W + x] = xin[c];
+}
+
+kernel void cnn_enc(device const float* in [[buffer(0)]],
+                    device float* out [[buffer(1)]],
+                    constant RnnAppParams& p [[buffer(2)]],
+                    constant CnnBand& b [[buffer(3)]],
+                    uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    Rnn15Planes ti = {in, W, b.ib, b.in_};
+    float o[CNN_CH];
+    cnn_encoder_layer_at(ti, b.layer, W, p.height, x, y, o);
+    for (int c = 0; c < CNN_CH; ++c) out[(c * b.on + (y - b.ob)) * W + x] = o[c];
+}
+
+kernel void cnn_f1(device const float* in [[buffer(0)]],
+                   device float* out [[buffer(1)]],
+                   constant RnnAppParams& p [[buffer(2)]],
+                   constant CnnBand& b [[buffer(3)]],
+                   uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    float fk[CNN_CH], o[CNN_CH];
+    for (int c = 0; c < CNN_CH; ++c) fk[c] = in[(c * b.in_ + (y - b.ib)) * W + x];
+    cnn_fuse1(fk, fk, fk, o);       // per-frame form: the host only runs this kernel when CNN_FUSION == 0
+    for (int c = 0; c < CNN_CH; ++c) out[(c * b.on + (y - b.ob)) * W + x] = o[c];
+}
+
+kernel void cnn_head(device const float* g1 [[buffer(0)]],
+                     device const float* r0 [[buffer(1)]],
+                     device float* r_out [[buffer(2)]],
+                     constant RnnAppParams& p [[buffer(3)]],
+                     constant CnnBand& b [[buffer(4)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    const int W = p.width, x = int(gid.x), y = b.lo + int(gid.y);
+    if (x >= W || y >= b.hi) return;
+    Rnn15Planes tg = {g1, W, b.ib, b.in_};
+    float hid[CNN_CH], lg[2];
+    cnn_head_at(tg, W, p.height, x, y, hid, lg);
+    const float r0v = r0[y * W + x];
+    float R = cnn_weight(lg[1], r0v);
+    if (b.combine == 1) R = min(R, r0v);
+    else if (b.combine == 2) R = R * r0v;
     r_out[y * W + x] = R;
 }

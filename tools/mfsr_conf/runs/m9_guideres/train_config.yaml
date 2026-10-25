@@ -1,0 +1,36 @@
+name: m9_guideres
+seed: 0
+data: data/d1
+model:
+  ch: 16
+  fusion: false
+  dils:
+  - 1
+  - 2
+  - 4
+  - 8
+  up_ch: 0
+  use_r0: false
+  refine_r0: false
+crop: 96
+halo: 32
+batch: 2
+lr: 0.002
+minutes: 35
+max_steps: 100000
+val_every: 200
+loss:
+  align: 1.0
+  merge: 1.0
+  recon: 1.0
+  align_sigma: 0.25
+  gamma: 4.0
+  keep_prior: 0.02
+  w_harm: 3.0
+  w_misalign: 3.0
+workers: 2
+threads: 6
+n_crops: 4
+val_limit: 16
+_git: fa1fb8b
+_hash: 2f37b1273142

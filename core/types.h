@@ -1665,6 +1665,16 @@ struct Config {
     // its own v14 base, banded kernels rnn15_*. ~3x v14's mask-step GPU work and ~25 MB of
     // band buffers on a 12 MP burst; falls back to v14 whenever it cannot run.
     bool  robust_nn_v15_enabled = false;
+    // ConfNet (tools/mfsr_conf, opt-in): per-frame confidence network trained against the app's own merge on
+    // synthetic bursts with exact ground truth (reconstruction-optimal labels, a misalignment priced 4x the same
+    // amount of noise). Runs on the robustness mask's guide grid after the analytic mask (banded kernels cnn_*,
+    // core/conf_nn_shared.h + conf_nn_weights.h, ~30 MB of band buffers on a 12 MP burst) and takes precedence over
+    // robust_nn v14 / v15 when both are on. Only the per-frame form (no cross-frame fusion, guide-resolution output)
+    // runs on device; with any other weights header it declines and the analytic mask is kept. Off by default.
+    bool  conf_nn_enabled = false;
+    // How the network's weight combines with the analytic mask: 0 = network alone, 1 = min(network, analytic),
+    // 2 = network x analytic.
+    int   conf_nn_combine = 0;
     // Decisiveness of robust_nn: R' = clamp((R - below) / (above - below), 0, 1).
     // The net hedges (~0.3 on ghosts, ~0.7 on good samples) and the merge's
     // normalisation turns a 0.3 leak across several frames into most of the

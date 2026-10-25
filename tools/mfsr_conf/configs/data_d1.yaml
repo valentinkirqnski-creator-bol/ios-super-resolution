@@ -1,0 +1,12 @@
+# Dataset d1: 128 px labelled patches (P), 48 px top/left margin, 112 px bottom/right margin (clear of the app
+# aligner's border band), 4-8 frames, the app's SHIPPED configuration (16 px tiles, k_detail 0.17, k_denoise 1.0,
+# k_stretch 3, k_shrink 1), labels with the linearised reconstruction cost (gamma 4, keep prior 0.02).
+# Splits by source scene; burst9 / burst12 references excluded (real test bursts).
+name: d1
+seed: 1
+patch: 128
+margin: 48
+margin_hi: 112
+counts: {train: 320, val: 40, test: 108}
+workers: 2
+labels: {iters: 120}
