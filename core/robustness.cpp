@@ -1734,35 +1734,30 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 // noise and raised in high-frequency/aliased regions), Wiener-shrink
                 // it under noise, and boost strictness where the tile flow is
                 // irregular AND the region is textured.
+                // NOISE-NORMALIZED residual d^2/sigma^2 (channel-summed). This is ~0
+                // for ANY aligned pixel regardless of brightness or texture, so it
+                // cannot collapse the way contrast normalization did (which darkened
+                // dark/low-variance regions). The earlier contrast-normalized form
+                // was replaced after it rejected textured/dark content on well-aligned
+                // bursts; the irregularity boost is the only real lever and it rides
+                // on top of this stable base.
                 f32 d2 = 0.f, nvar = 0.f, vr = 0.f;
                 for (int ch = 0; ch < nch; ++ch) {
                     const f32 dm = comp_means.at(y, x, ch) - ref_means.at(y, x, ch);
                     d2 += dm * dm;
                     nvar += guide_noise_var(cfg, nch, ch, ref_means.at(y, x, ch));
-                    vr += ref_vars.at(y, x, ch);
+                    vr += ref_vars.at(y, x, ch);   // local contrast, only for the texture gate
                 }
-                // std_alt (comp local std) would need an extra full-res upscale
-                // (~146 MB/frame) and barely moves the result -- the irregularity
-                // boost is the dominant term -- so use the reference contrast for both.
-                const f32 std_ref = std::sqrt(std::max(0.f, vr));
-                const f32 std_alt = std_ref;
+                const f32 dist0 = d2 / (nvar + 1e-20f);
                 const f32 nstd = std::sqrt(std::max(1e-10f, nvar));
-                // local HF (aliasing proxy): channel-summed |Laplacian| of the ref means
-                const int xl = std::max(0, x - 1), xr = std::min(w - 1, x + 1);
-                const int yu = std::max(0, y - 1), yd = std::min(h - 1, y + 1);
-                f32 hf = 0.f;
-                for (int ch = 0; ch < nch; ++ch)
-                    hf += std::fabs(ref_means.at(y, x, ch) -
-                                    0.25f * (ref_means.at(y, xl, ch) + ref_means.at(y, xr, ch) +
-                                             ref_means.at(yu, x, ch) + ref_means.at(yd, x, ch)));
-                const f32 std_eff = std::max(std::max(std::min(std_ref, std_alt), nstd),
-                                             cfg.gcam_alias_k * hf);
+                const bool textured = std::sqrt(std::max(0.f, vr)) > cfg.gcam_tex_gate * nstd;
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
-                const bool textured = std_ref > cfg.gcam_tex_gate * nstd;
+                // Boost strictness ONLY where the tile flow is genuinely irregular AND
+                // the region is textured -- a high irr gate avoids boosting the normal
+                // block-match jitter that textured regions carry even when aligned.
                 const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
-                const f32 wiener = d2 * d2 / (d2 + 2.f * nvar + 1e-20f);
-                const f32 dist = cfg.gcam_mult * boost * wiener / (std_eff * std_eff + 1e-20f);
-                f32 arg = -dist + cfg.gcam_thresh;
+                const f32 dist = cfg.gcam_mult * boost * dist0;
+                f32 arg = -dist + cfg.gcam_thresh;   // dead zone: dist < thresh -> R = 1
                 if (arg > 0.f) arg = 0.f;
                 f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
                 if (!std::isfinite(r_val)) r_val = 0.f;

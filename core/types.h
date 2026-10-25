@@ -1636,13 +1636,21 @@ struct Config {
     // strictness only in the irregular+textured tiles where ghosts live. MEASURED:
     // flat R=1.0, aligned-aliasing R=1.0, irregular ghost R=0.0; ~57% visible-ghost
     // catch at 0% flat over-rejection.
+    // The weight is exp2(min(-mult*boost*(d^2/sigma^2) + thresh, 0)): a NOISE-
+    // normalized residual (brightness/texture-invariant, so flat/dark/textured
+    // aligned content stays at R=1 via the dead zone) with the strictness boosted
+    // only where the tile flow is genuinely irregular. An earlier contrast-
+    // normalized form darkened dark/textured regions on well-aligned bursts and
+    // was replaced. Re-tuned: ~67% visible-ghost catch at ~1% all-aligned
+    // over-rejection. The irr_gate especially needs on-device A/B -- real block-
+    // match flow carries texture-correlated jitter the synthetic tuning can't size.
     bool  robustness_gcam_enabled = false;
-    float gcam_mult = 2.0f;        // base strictness (keeps flat/aligned via the dead zone)
-    float gcam_thresh = 1.0f;      // dead-zone: full accept (R=1) while dist < thresh
-    float gcam_boost = 64.0f;      // extra strictness in irregular+textured tiles (ghosts)
+    float gcam_mult = 0.5f;        // base strictness on d^2/sigma^2
+    float gcam_thresh = 2.0f;      // dead-zone: full accept (R=1) while dist < thresh
+    float gcam_boost = 8.0f;       // extra strictness in irregular+textured tiles (ghosts)
     float gcam_tex_gate = 1.5f;    // boost only where local std > this * noise_std
-    float gcam_irr_gate = 0.1f;    // boost only where per-tile flow irregularity > this (raw px)
-    float gcam_alias_k = 4.0f;     // aliasing-tolerant sigma: std_eff >= this * local HF
+    float gcam_irr_gate = 0.6f;    // boost only where per-tile flow irregularity > this (raw px); A/B on device
+    float gcam_alias_k = 4.0f;     // (unused by the noise-normalized form; kept for config compatibility)
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an
