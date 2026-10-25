@@ -1,5 +1,9 @@
 # mfsr_conf: neural confidence for the robustness mask
 
+> **Status:** shipped to the app in 9910c0c, then **removed from the app at the owner's request**; v21 remains the
+> app's learned mask. This directory is kept as research code. Its device-side code (the shared header, weights and
+> Metal kernels) lives in `cpp/app/` and `integrate_app.py`. Running `python integrate_app.py` would wire it back in.
+
 A compact network that predicts, for every comparison frame and every raw pixel, the robustness weight the app's
 merge multiplies that frame's samples by: R = 1 merges the sample fully, R = 0 discards it, and values in between
 give partial weight. A second output map, alignment confidence, says whether the sample comes from the right scene

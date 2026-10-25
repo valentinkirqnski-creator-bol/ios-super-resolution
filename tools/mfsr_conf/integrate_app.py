@@ -1,5 +1,8 @@
 """Wire ConfNet into the app (idempotent; run once, re-running is a no-op). Off by default everywhere.
 
+NOT WIRED IN TODAY: shipped in 9910c0c, removed from the app at the owner's request (v21 stays the app's learned
+mask). This script re-applies the integration and copies cpp/app/conf_nn_shared.h + conf_nn_weights.h into core/.
+
     python integrate_app.py
 
   core/types.h              Config::conf_nn_enabled, Config::conf_nn_combine
@@ -387,6 +390,9 @@ VIEW_HELP = ('''    private var chooseReferenceHelp: String {''', '''    // Out 
 
 
 def main():
+    import shutil
+    for h in ("conf_nn_shared.h", "conf_nn_weights.h"):
+        shutil.copy(os.path.join(ROOT, "tools", "mfsr_conf", "cpp", "app", h), os.path.join(ROOT, "core", h))
     patch("core/types.h", [TYPES], "conf_nn_enabled")
     patch("core/HHSRKernels.metal", [METAL_INC, (METAL_KERNELS_ANCHOR, METAL_KERNELS)], "cnn_inputs")
     patch("core/metal_gpu.mm", [MM_INC, MM_GLOBALS, MM_RESET, MM_PIN, (MM_FUNC_ANCHOR, MM_FUNC), MM_CALL],

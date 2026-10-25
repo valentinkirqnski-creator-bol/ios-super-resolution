@@ -1,4 +1,5 @@
-"""Export a trained ConfNet to a C/Metal weights header (core/conf_nn_weights.h by default).
+"""Export a trained ConfNet to a C/Metal weights header (cpp/app/conf_nn_weights.h by default; integrate_app.py
+copies it into core/ when the network is wired into the app).
 
     python export_weights.py runs/m9_guideres/best.pt [--out ../../core/conf_nn_weights.h]
 
@@ -78,7 +79,7 @@ def export(net, cfg_model, path, tag=""):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
-    ap.add_argument("--out", default=os.path.join(ROOT, "core", "conf_nn_weights.h"))
+    ap.add_argument("--out", default=os.path.join(HERE, "cpp", "app", "conf_nn_weights.h"))
     a = ap.parse_args()
     ck = torch.load(a.model, map_location="cpu", weights_only=False)
     net = M.build(ck["cfg"]["model"])

@@ -57,9 +57,11 @@ def main():
         EW.export(net, mc, hdr, tag="kernel test")
         src = open(os.path.join(core, "HHSRKernels.metal"), encoding="utf-8").read()
         block = os.path.join(d, "block.metal").replace("\\", "/")
-        open(block, "w", encoding="utf-8").write(src[src.index(MARK):])
+        import integrate_app as IA                 # the ConfNet kernels are no longer in the app: append them
+        cnn = IA.METAL_KERNELS[len(IA.METAL_KERNELS_ANCHOR):] if "cnn_inputs" not in src else ""
+        open(block, "w", encoding="utf-8").write(src[src.index(MARK):] + '\n#include "conf_nn_shared.h"\n' + cnn)
         exe = os.path.join(d, "emu.exe")
-        subprocess.run(["g++", "-O2", "-std=c++17", "-ffp-contract=off", "-static", "-I", core,
+        subprocess.run(["g++", "-O2", "-std=c++17", "-ffp-contract=off", "-static", "-I", os.path.join(HERE, "cpp", "app"), "-I", core,
                         f'-DCNN_WEIGHTS_HEADER="{hdr}"', f'-DRNN_APP_BLOCK="{block}"',
                         os.path.join(HERE, "cpp", "cnn_kernel_emu.cpp"), "-o", exe], check=True)
         files = sorted(glob.glob(os.path.join(HERE, "data", "d1", "val", "*.npz")))[:a.samples]

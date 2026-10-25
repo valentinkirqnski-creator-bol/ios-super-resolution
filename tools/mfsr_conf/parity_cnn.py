@@ -1,4 +1,4 @@
-"""Parity: the device-side ConfNet code (core/conf_nn_shared.h, compiled as C++ by cpp/conf_parity.cpp) against the
+"""Parity: the device-side ConfNet code (cpp/app/conf_nn_shared.h, compiled as C++ by cpp/conf_parity.cpp) against the
 PyTorch model and input pipeline, on a stored sample, for every architecture variant.
 
     python parity_cnn.py [--model runs/<x>/best.pt]      (default: random weights for each variant)
@@ -29,7 +29,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 
 
 def build(header, exe):
-    F = ["-O2", "-std=gnu++17", f"-I{ROOT}/core", f"-DCNN_WEIGHTS_HEADER=\"{header}\"", "-static"]
+    F = ["-O2", "-std=gnu++17", f"-I{HERE}/cpp/app", f"-I{ROOT}/core", f"-DCNN_WEIGHTS_HEADER=\"{header}\"", "-static"]
     subprocess.run(["g++", *F, os.path.join(HERE, "cpp", "conf_parity.cpp"), "-o", exe], check=True)
 
 

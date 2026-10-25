@@ -930,11 +930,6 @@ struct CameraView: View {
     // the two largest, and moving them lets each be checked on its own.
     // Out of the ViewBuilder deliberately: an inline ternary in a Text is the
     // shape that has previously pushed this file past the type-checker limit.
-    // Out of the ViewBuilder for the same type-checker reason as chooseReferenceHelp.
-    private var confNetHelp: String {
-        return "Per-frame robustness weight (0 = sample discarded, 1 = fully merged) from a compact network (tools/mfsr_conf) trained against this app's own merge on synthetic bursts with exact ground truth: it keeps correctly aligned samples, aliased detail and flat noisy areas, and drops samples whose misalignment would paint a ghost or a doubled edge in the merged image. Replaces Robust NN v21/v39 while on. Off by default."
-    }
-
     private var chooseReferenceHelp: String {
         if cam.tuningParams.global_prealignment_choose_reference {
             return "Picks the most central frame as the merge base. Costs a separate decode of every frame before the merge starts."
@@ -1282,16 +1277,6 @@ struct CameraView: View {
                          Scales every frame to the reference's brightness before aligning, masking and merging, using each frame's own exposure metadata (shutter x ISO). Bursts whose exposure changes mid-burst (auto-exposure on the ZSL ring, imported bursts from other apps, e.g. 1/2000 s and 1/2200 s) otherwise look misaligned everywhere to the robustness masks. Bursts with locked exposure are left untouched. On by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
-                    Toggle("ConfNet confidence mask", isOn: $cam.tuningParams.conf_nn_enabled)
-                    Text(confNetHelp)
-                        .font(.footnote).foregroundColor(.secondary)
-                    if cam.tuningParams.conf_nn_enabled {
-                        Picker("Combine with analytic mask", selection: $cam.tuningParams.conf_nn_combine) {
-                            Text("Network only").tag(0)
-                            Text("Minimum").tag(1)
-                            Text("Product").tag(2)
-                        }
-                    }
                     Toggle("Robust NN v21 (GPU)", isOn: $cam.tuningParams.robust_nn_enabled)
                     Text("""
                          Learned robustness mask (tools/robust_nn, v21): a per-pixel weight from 0 to 1 per frame that rejects samples whose misalignment would paint a visible ghost or doubled edge, and keeps correctly aligned samples — including aliased ones, which carry the super-resolution detail. It judges a misalignment by whether it would still be visible AFTER the burst is merged. v21 adds training on aliased fine text (perfectly aligned, and the same text misaligned), on whole-camera turns up to ~30° with the global homography, and on perfectly alignable bursts. On held-out bursts vs v17: aliased text wrongly rejected 7.6% vs 18.6% of its weight, at about the same misses on misaligned text (7.6% vs 7.4%); misalignments missed fewer on every other set (e.g. 6.6% vs 7.7% on real-scene bursts, 4.2% vs 7.4% under big rotation), at 0.6-1.5 points more good weight given up there. With Global Homography on, its motion inputs read the motion left after the homography, so large camera rotation no longer reads as misalignment. Same GPU kernel and memory as before. Off by default.
