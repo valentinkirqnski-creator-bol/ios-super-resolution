@@ -1224,9 +1224,9 @@ struct CameraView: View {
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
-                    Toggle("Paper-Exact R (guide-res + bilinear)", isOn: $cam.tuningParams.robustness_guide_res_bilinear)
+                    Toggle("Paper-Exact R (bilinear upsample)", isOn: $cam.tuningParams.robustness_guide_res_bilinear)
                     Text("""
-                         Computes the robustness mask at the half-resolution guide grid and bilinearly upsamples it to the merge grid — the exact SIGGRAPH 2019 scheme (step 3). The default instead computes R at full resolution with a hard (nearest) boundary, which we measured was +2.49 dB and rejects edge ghosts more completely. Turning this on matches the paper but tends to soften the mask and can re-admit faint edge ghosts (bilinear smooths the rejection boundary). A/B it against the default on the same imported burst. Off by default.
+                         Bilinearly upsamples the robustness mask from the guide (half) resolution to the merge grid — the SIGGRAPH 2019 step-3 upsampling — instead of our default nearest (blocky) upsample. The Eq.9 5×5 min already runs on the guide lattice; this just de-blocks its result with a smooth bilinear upsample, on the same working comparison (so it can't produce the tile-boundary artifact the earlier guide-res routing did). The default (nearest) was measured +2.49 dB and rejects edge ghosts more completely, so expect this to look softer and possibly re-admit faint ghosts. A/B it against the default on the same imported burst. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)

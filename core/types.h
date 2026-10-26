@@ -1259,17 +1259,19 @@ struct Config {
     // misalignment when turned on. Build 75 flipped it true by mistake; reverted.
     bool merge_robustness_bilinear = false;
 
-    // Paper-exact robustness upsampling (SIGGRAPH 2019 step 3, verbatim): compute
-    // R at GUIDE (half) resolution and BILINEARLY upsample it to the merge grid,
-    // instead of our default full-resolution R (Dodgson-upscaled stats) with a
-    // nearest upsample. Routes robustness to the guide-res mask path
-    // (robustness_raw_resolution_active() -> false) and bilinearly fetches it in
-    // the merge (= the paper's bilinear upsample; the merge auto-detects the
-    // half-res mask from its dimensions, so no other change is needed). We moved
-    // AWAY from this for a measured +2.49 dB from full-res R, and bilinear fetch
-    // of a FULL-res mask re-admits ghosts (see merge_robustness_bilinear) -- but
-    // for a HALF-res mask bilinear de-blocks correctly, which is the
-    // self-consistent paper regime. Off by default; for A/B against the default.
+    // Paper-exact robustness upsampling (SIGGRAPH 2019 step 3): BILINEARLY
+    // upsample the robustness map from the guide (half) resolution to the merge
+    // grid, instead of our default nearest (blocky) upsample. Implemented on the
+    // WORKING raw-res comparison path: the Eq.9 dilation already 2x2-min-reduces
+    // R to the guide lattice and runs the 5x5 min there (on the CPU host, even on
+    // device) -- this just makes that stage's final upsample bilinear rather than
+    // nearest, so the mask is smooth (the paper's de-blocked half-res mask)
+    // without resurrecting the stale guide-res routing (which mishandled the
+    // comp-vs-ref comparison on Bayer -> black tile-boundary lines). We moved to
+    // the full-res/nearest mask for a measured +2.49 dB and because bilinear on a
+    // FULL-res mask re-admits ghosts (merge_robustness_bilinear); bilinear from
+    // the HALF-res 5x5-min lattice is the de-blocking regime where it helps. Off
+    // by default; for A/B against the default.
     bool robustness_guide_res_bilinear = false;
 
     // Build the robustness guide from compute_grey_fft instead of the
@@ -1360,9 +1362,7 @@ struct Config {
         // (Algorithm 6). This is now the single robustness path, no longer tied to
         // robustness_raw_resolution_enabled. Grey (non-Bayer) input needs no upscale
         // -- its guide is already full-resolution -- so it stays false there.
-        // robustness_guide_res_bilinear (paper-exact #3) opts back out to the
-        // guide-res mask so it can be bilinearly upsampled at merge time.
-        return bayer_mode && !robustness_guide_res_bilinear;
+        return bayer_mode;
     }
     // The guide is always linear (460-main), never sqrt. Retired alongside the FFT
     // guide; the noise curve is indexed by brightness directly.

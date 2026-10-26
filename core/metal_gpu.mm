@@ -2818,12 +2818,18 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, (int)rob_nch);
     memcpy(R_pre.data.data(), [b_R contents], mask_b_r);
-    // GCam path softens Eq.9's spread (gcam_dilate_soft); all else keeps the hard
-    // min. robustness_local_min_on_guide_soft is defined in robustness.cpp.
+    // Eq.9 upsample: bilinear (paper step 3, robustness_guide_res_bilinear),
+    // else GCam soft spread (gcam_dilate_soft), else the hard nearest min. All
+    // three are defined in robustness.cpp.
     Image robustness_local_min_on_guide_soft(const Image& R, float soft);
-    Image r = (cfg.robustness_gcam_enabled && cfg.gcam_dilate_soft < 1.0f)
-                  ? robustness_local_min_on_guide_soft(R_pre, cfg.gcam_dilate_soft)
-                  : robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
+    Image robustness_local_min_on_guide_bilinear(const Image& R);
+    Image r;
+    if (cfg.robustness_guide_res_bilinear)
+        r = robustness_local_min_on_guide_bilinear(R_pre);
+    else if (cfg.robustness_gcam_enabled && cfg.gcam_dilate_soft < 1.0f)
+        r = robustness_local_min_on_guide_soft(R_pre, cfg.gcam_dilate_soft);
+    else
+        r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     // Learned refinement of the finished mask (Config::robust_nn_enabled). The
     // comparison guide is still in b_guide; R stays analytic if it declines.
     // v15 (Config::robust_nn_v15_enabled) when it can run, else v14.
@@ -5296,9 +5302,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_bilinear = 0u;
-        // robustness_guide_res_bilinear (paper-exact #3): bilinearly upsample the
-        // half-res mask (same as merge_robustness_bilinear, but the mask is guide-res).
-        p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) ? 1u : 0u;
+        p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
         p.cov_stride = g_bf.cov_stride;
         p.img_off  = (uint32_t)bf_raw_off(slot);
         p.flow_off = (uint32_t)bf_flow_off(slot);
@@ -5555,8 +5559,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // stats are missing, so the flag can say "raw" while the mask is guide.
     // See accumulate_comp in merge.cpp.
     p.flow_bilinear = false ? 1u : 0u;
-    // robustness_guide_res_bilinear (paper-exact #3): bilinear upsample of the half-res mask.
-    p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) ? 1u : 0u;
+    p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

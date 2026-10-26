@@ -1460,6 +1460,10 @@ static Image local_min_5x5_on_guide(const Image& R);
 // Soft version for the GCam path: blends the hard 5x5-min with the pre-dilation
 // value (soft in [0,1]; 1 = hard min). See Config::gcam_dilate_soft.
 static Image local_min_5x5_on_guide_soft(const Image& R, f32 soft);
+// Bilinear-upsample version (paper step 3): same 2x2-reduce + 5x5 guide min, but
+// bilinearly upsampled back to raw instead of nearest. See
+// Config::robustness_guide_res_bilinear.
+static Image local_min_5x5_on_guide_bilinear(const Image& R);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
@@ -1807,14 +1811,23 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         }
     }
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
-    // there (= the paper's 10x10-raw footprint), nearest-upsample back. See
-    // local_min_5x5_on_guide. The GCam path softens that spread (gcam_dilate_soft).
+    // there (= the paper's 10x10-raw footprint), upsample back. Nearest by
+    // default; robustness_guide_res_bilinear makes the upsample BILINEAR (the
+    // paper's step 3) -- same working comparison, just a de-blocked mask. The
+    // GCam path softens that spread (gcam_dilate_soft).
+    if (cfg.robustness_guide_res_bilinear) return local_min_5x5_on_guide_bilinear(R);
     return gcam ? local_min_5x5_on_guide_soft(R, cfg.gcam_dilate_soft)
                 : local_min_5x5_on_guide(R);
 }
 
 Image robustness_local_min_on_guide(const Image& R) {
     return local_min_5x5_on_guide(R);
+}
+
+// Public bilinear variant for the Metal raw-res host (Config::
+// robustness_guide_res_bilinear). Declared locally in metal_gpu.mm.
+Image robustness_local_min_on_guide_bilinear(const Image& R) {
+    return local_min_5x5_on_guide_bilinear(R);
 }
 
 // Public soft variant for the Metal raw-res host (which runs Eq.9 on the CPU
@@ -1849,6 +1862,50 @@ static Image local_min_5x5_on_guide(const Image& R) {
         for (int x = 0; x < R.w; ++x)
             for (int ch = 0; ch < nc; ++ch)
                 out.at(y, x, ch) = M.at(gy, std::min(gw - 1, x / 2), ch);
+    }
+    return out;
+}
+
+// Paper step 3: identical 2x2-min-reduce + 5x5 guide min, but BILINEARLY
+// upsampled back to raw (de-blocked) instead of nearest. The guide position of
+// raw pixel p is (p - 0.5)/2 -- the same guide<->raw convention the merge uses
+// when it fetches a half-res mask (rob_y = (lr_y - 0.5)/2). Only the final
+// upsample differs from local_min_5x5_on_guide, so the comparison that produced
+// R is the same, working one -- this cannot manufacture the stale-path tile
+// artifact. See Config::robustness_guide_res_bilinear.
+static Image local_min_5x5_on_guide_bilinear(const Image& R) {
+    const int nc = R.c;
+    const int gh = R.h / 2, gw = R.w / 2;
+    if (gh <= 0 || gw <= 0) return local_min_5x5(R);
+    Image G(gh, gw, nc);
+    for (int gy = 0; gy < gh; ++gy)
+        for (int gx = 0; gx < gw; ++gx)
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 m = R.at(2 * gy, 2 * gx, ch);
+                m = std::min(m, R.at(2 * gy, 2 * gx + 1, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx + 1, ch));
+                G.at(gy, gx, ch) = m;
+            }
+    Image M = local_min_5x5(G);
+    Image out(R.h, R.w, nc);
+    for (int y = 0; y < R.h; ++y) {
+        f32 gfy = ((f32)y - 0.5f) * 0.5f;              // (raw - 0.5) / 2
+        if (gfy < 0.f) gfy = 0.f; if (gfy > (f32)(gh - 1)) gfy = (f32)(gh - 1);
+        const int gy0 = (int)gfy, gy1 = std::min(gh - 1, gy0 + 1);
+        const f32 wy = gfy - (f32)gy0;
+        for (int x = 0; x < R.w; ++x) {
+            f32 gfx = ((f32)x - 0.5f) * 0.5f;
+            if (gfx < 0.f) gfx = 0.f; if (gfx > (f32)(gw - 1)) gfx = (f32)(gw - 1);
+            const int gx0 = (int)gfx, gx1 = std::min(gw - 1, gx0 + 1);
+            const f32 wx = gfx - (f32)gx0;
+            for (int ch = 0; ch < nc; ++ch) {
+                const f32 a = M.at(gy0, gx0, ch), b = M.at(gy0, gx1, ch);
+                const f32 c = M.at(gy1, gx0, ch), d = M.at(gy1, gx1, ch);
+                const f32 top = a + (b - a) * wx, bot = c + (d - c) * wx;
+                out.at(y, x, ch) = top + (bot - top) * wy;
+            }
+        }
     }
     return out;
 }
