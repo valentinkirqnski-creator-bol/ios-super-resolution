@@ -1274,6 +1274,17 @@ struct Config {
     // by default; for A/B against the default.
     bool robustness_guide_res_bilinear = false;
 
+    // Sample the half-res guide statistics with a CUBIC B-SPLINE (SABRE's
+    // SampleBicubic) when Dodgson-upscaling+warping them for the robustness
+    // comparison, instead of our default Dodgson approximate-quadratic. Same
+    // smooth-sub-pixel class (both avoid blocky nearest fetches); cubic B-spline
+    // is a slightly higher-order, blurrier smoothing spline. Applied to BOTH the
+    // reference and comparison stats so they stay sampled the same way. The paper
+    // (Algorithm 6) specifies Dodgson, so this is a SABRE divergence, off by
+    // default. Does not reject sub-pixel ghosts (it's a sampling-smoothness
+    // choice, not a rejection one); for A/B.
+    bool robustness_bicubic_guide = false;
+
     // Build the robustness guide from compute_grey_fft instead of the
     // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
     // anywhere in the chain.

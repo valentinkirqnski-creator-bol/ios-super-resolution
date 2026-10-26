@@ -1645,8 +1645,10 @@ struct RobDogsonParamsCPU {
     uint32_t dense_h = 0;
     float    dense_sx = 1.f;
     float    dense_sy = 1.f;
+    // 1 = cubic B-spline guide sampling (Config::robustness_bicubic_guide).
+    uint32_t bicubic = 0;
 };
-static_assert(sizeof(RobDogsonParamsCPU) == 108, "RobDogsonParamsCPU");
+static_assert(sizeof(RobDogsonParamsCPU) == 112, "RobDogsonParamsCPU");
 
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
@@ -1982,7 +1984,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
                        bool flow_bilinear, bool use_affine = false,
-                       bool use_dense = false) {
+                       bool use_dense = false, bool bicubic = false) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -2002,6 +2004,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.flow_nx = (!is_ref && flow) ? (uint32_t)flow->nx : 0u;
     dp.s = 2.f;
     dp.flow_bilinear = flow_bilinear ? 1u : 0u;
+    dp.bicubic = bicubic ? 1u : 0u;  // cubic B-spline guide sampling (SABRE SampleBicubic)
     // Compose the global pre-align homography for the comparison stats only, the
     // same transform the merge applies (comp_pos = H*(lr+flow)). Identity/off for
     // the reference stats and when no global transform was estimated.
@@ -2496,9 +2499,11 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
-                        nullptr, 0, mh, mw, cmd, false) ||
+                        nullptr, 0, mh, mw, cmd, false, /*use_affine=*/false,
+                        /*use_dense=*/false, cfg.robustness_bicubic_guide) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
-                       nullptr, 0, vh, vw, cmd, false) ||
+                       nullptr, 0, vh, vw, cmd, false, /*use_affine=*/false,
+                       /*use_dense=*/false, cfg.robustness_bicubic_guide) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -2638,7 +2643,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
                     false, /*use_affine=*/cfg.affine_flow_enabled,
-                    /*use_dense=*/cfg.dense_flow_enabled))
+                    /*use_dense=*/cfg.dense_flow_enabled,
+                    /*bicubic=*/cfg.robustness_bicubic_guide))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();

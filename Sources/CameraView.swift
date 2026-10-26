@@ -1234,6 +1234,11 @@ struct CameraView: View {
                          Makes the merge sample the robustness mask R bilinearly instead of nearest/round — the paper's bilinear upsampling applied at fetch time, so it affects the 0↔1 rejection boundaries only. Softens those boundaries; on our full-resolution mask this was measured to re-admit faint ghosts at rejection edges (the outer ring of a rejected region gets a fractional weight instead of 0), which is why it's off by default. A/B against the default on the same imported burst.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Bicubic Guide Sampling (SABRE)", isOn: $cam.tuningParams.robustness_bicubic_guide)
+                    Text("""
+                         Samples the half-res guide statistics with a cubic B-spline (SABRE's SampleBicubic) when warping them for the robustness comparison, instead of our default Dodgson quadratic. Both are smooth sub-pixel samplers (no blocky nearest fetches); cubic B-spline is slightly higher-order and blurrier. Applied to the reference and comparison stats alike. The paper (Algorithm 6) specifies Dodgson, so this is a SABRE divergence. It's a sampling-smoothness choice — it does not reject sub-pixel misalignment, so don't expect it to remove edge ghosts; A/B it on the same imported burst. Off by default.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
                     Text("""
                          Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.

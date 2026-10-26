@@ -620,6 +620,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"merge_robustness_bilinear"])
         cfg.merge_robustness_bilinear = tuning[@"merge_robustness_bilinear"].boolValue;
+    if (tuning[@"robustness_bicubic_guide"])
+        cfg.robustness_bicubic_guide = tuning[@"robustness_bicubic_guide"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])

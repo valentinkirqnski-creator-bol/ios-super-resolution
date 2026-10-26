@@ -917,10 +917,44 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     return buf / w_acc;
 }
 
+// Cubic B-spline basis weights for fractional offset a in [0,1), exactly the
+// w0..w3 of SABRE's SampleBicubic (a smoothing/approximating spline; all four
+// weights are non-negative, so no overshoot). Sum to 1.
+static inline void cubic_bspline_w(f32 a, f32 w[4]) {
+    w[0] = (1.f / 6.f) * (a * (a * (-a + 3.f) - 3.f) + 1.f);  // (1-a)^3 / 6
+    w[1] = (1.f / 6.f) * (a * a * (3.f * a - 6.f) + 4.f);
+    w[2] = (1.f / 6.f) * (a * (a * (-3.f * a + 3.f) + 3.f) + 1.f);
+    w[3] = (1.f / 6.f) * (a * a * a);
+}
+
+// Cubic B-spline sampling of the half-res guide stats (SABRE SampleBicubic). The
+// GPU trick folds the 16-tap cubic into 4 hardware-bilinear fetches; our buffers
+// are not sampler textures, so this is the mathematically identical 16-tap form
+// with the same weights. Same OOB semantics as sample_dogson (+inf -> R=0).
+static f32 sample_bicubic(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
+    if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
+        return std::numeric_limits<f32>::infinity();
+    const int iy = (int)std::floor(LR_y), ix = (int)std::floor(LR_x);
+    f32 wy[4], wx[4];
+    cubic_bspline_w(LR_y - (f32)iy, wy);
+    cubic_bspline_w(LR_x - (f32)ix, wx);
+    f32 buf = 0.f, w_acc = 0.f;
+    for (int m = 0; m < 4; ++m) {
+        const int y_ = (int)clampf((f32)(iy - 1 + m), 0.f, (f32)(stats.h - 1));
+        for (int n = 0; n < 4; ++n) {
+            const int x_ = (int)clampf((f32)(ix - 1 + n), 0.f, (f32)(stats.w - 1));
+            const f32 w = wy[m] * wx[n];
+            buf += stats.at(y_, x_, ch) * w;
+            w_acc += w;
+        }
+    }
+    return buf / w_acc;
+}
+
 static Image upscale_warp_stats(const Image& guide_stats,
                                 bool is_ref, const FlowField* flow, int tile_size,
                                 int num_threads, bool bilinear_flow,
-                                bool use_affine = false) {
+                                bool use_affine = false, bool bicubic = false) {
     const int nc = guide_stats.c;
     // Match Python upscale_warp_stats sizing: 3ch -> 2x, else same size
     const int out_h = (nc == 3) ? guide_stats.h * 2 : guide_stats.h;
@@ -973,7 +1007,9 @@ static Image upscale_warp_stats(const Image& guide_stats,
             f32 LR_y = (cyp + 0.5f) / s - 0.5f;
             f32 LR_x = (cxp + 0.5f) / s - 0.5f;
             for (int ch = 0; ch < nc; ++ch) {
-                out.at(y, x, ch) = sample_dogson(guide_stats, LR_y, LR_x, ch);
+                out.at(y, x, ch) = bicubic
+                    ? sample_bicubic(guide_stats, LR_y, LR_x, ch)
+                    : sample_dogson(guide_stats, LR_y, LR_x, ch);
             }
         }
     });
@@ -1502,9 +1538,11 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // never warps the reference's own stats -- only Gn's). Once per
         // burst here, not once per comparison frame.
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
-                                            0, cfg.num_threads, false);
+                                            0, cfg.num_threads, false,
+                                            /*use_affine=*/false, cfg.robustness_bicubic_guide);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
-                                           0, cfg.num_threads, false);
+                                           0, cfg.num_threads, false,
+                                           /*use_affine=*/false, cfg.robustness_bicubic_guide);
     }
     return st;
 #endif
@@ -1599,7 +1637,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false,
-                                        cfg.affine_flow_enabled);
+                                        cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -2156,7 +2194,7 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 // same transform the analytic raw-res path applies.
                 Image hires = upscale_warp_stats(cm_nn, /*is_ref=*/false, &flow,
                                                  tile_size, cfg.num_threads, false,
-                                                 cfg.affine_flow_enabled);
+                                                 cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
                 cm_nn = std::move(hires);
             }
         }
@@ -2798,7 +2836,7 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
         if (raw_res)
             comp_means = upscale_warp_stats(comp_means, /*is_ref=*/false, &flow,
                                             tile_size, cfg.num_threads, false,
-                                            cfg.affine_flow_enabled);
+                                            cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
     }
     if (comp_means.h <= 0 || comp_means.w <= 0) return false;
 

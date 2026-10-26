@@ -1746,6 +1746,9 @@ struct RobDogsonParams {
     uint dense_flow;
     uint dense_w, dense_h;
     float dense_sx, dense_sy;
+    // 1 = sample the guide stats with a cubic B-spline (SABRE SampleBicubic)
+    // instead of Dodgson quadratic (Config::robustness_bicubic_guide).
+    uint bicubic;
 };
 
 struct RobMaskParams {
@@ -1827,6 +1830,15 @@ inline float dogson_quadratic(float x) {
     if (ax <= 0.5f) return -2.f * ax * ax + 1.f;
     if (ax <= 1.5f) return ax * ax - 2.5f * ax + 1.5f;
     return 0.f;
+}
+
+// Cubic B-spline basis weights (SABRE SampleBicubic w0..w3) for fractional a.
+// Twin of cubic_bspline_w in robustness.cpp. All non-negative, sum to 1.
+inline void cubic_bspline_w(float a, thread float w[4]) {
+    w[0] = (1.f / 6.f) * (a * (a * (-a + 3.f) - 3.f) + 1.f);
+    w[1] = (1.f / 6.f) * (a * a * (3.f * a - 6.f) + 4.f);
+    w[2] = (1.f / 6.f) * (a * (a * (-3.f * a + 3.f) + 3.f) + 1.f);
+    w[3] = (1.f / 6.f) * (a * a * a);
 }
 
 inline int clamp_edge(int v, int hi) {
@@ -2055,10 +2067,32 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     float LR_y = (cyp + 0.5f) / p.s - 0.5f;
     float LR_x = (cxp + 0.5f) / p.s - 0.5f;
 
+    // Cubic B-spline (SABRE SampleBicubic, Config::robustness_bicubic_guide) vs
+    // the default Dodgson approximate-quadratic. Precompute the separable weights
+    // once per pixel when bicubic.
+    bool oob = !(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w));
+    int iy = int(floor(LR_y)), ix = int(floor(LR_x));
+    float bwy[4], bwx[4];
+    if (p.bicubic != 0u && !oob) {
+        cubic_bspline_w(LR_y - float(iy), bwy);
+        cubic_bspline_w(LR_x - float(ix), bwx);
+    }
     for (uint ch = 0u; ch < p.nch; ++ch) {
         float val;
-        if (!(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w))) {
+        if (oob) {
             val = INFINITY;
+        } else if (p.bicubic != 0u) {
+            float w_acc = 0.f, buf = 0.f;
+            for (int m = 0; m < 4; ++m) {
+                int y_ = clamp_edge(iy - 1 + m, int(p.in_h) - 1);
+                for (int n = 0; n < 4; ++n) {
+                    int x_ = clamp_edge(ix - 1 + n, int(p.in_w) - 1);
+                    float w = bwy[m] * bwx[n];
+                    buf += stats[(uint(y_) * p.in_w + uint(x_)) * p.nch + ch] * w;
+                    w_acc += w;
+                }
+            }
+            val = buf / w_acc;
         } else {
             int center_y = lround_away(LR_y);
             int center_x = lround_away(LR_x);
