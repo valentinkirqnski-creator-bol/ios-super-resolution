@@ -1259,6 +1259,19 @@ struct Config {
     // misalignment when turned on. Build 75 flipped it true by mistake; reverted.
     bool merge_robustness_bilinear = false;
 
+    // Paper-exact robustness upsampling (SIGGRAPH 2019 step 3, verbatim): compute
+    // R at GUIDE (half) resolution and BILINEARLY upsample it to the merge grid,
+    // instead of our default full-resolution R (Dodgson-upscaled stats) with a
+    // nearest upsample. Routes robustness to the guide-res mask path
+    // (robustness_raw_resolution_active() -> false) and bilinearly fetches it in
+    // the merge (= the paper's bilinear upsample; the merge auto-detects the
+    // half-res mask from its dimensions, so no other change is needed). We moved
+    // AWAY from this for a measured +2.49 dB from full-res R, and bilinear fetch
+    // of a FULL-res mask re-admits ghosts (see merge_robustness_bilinear) -- but
+    // for a HALF-res mask bilinear de-blocks correctly, which is the
+    // self-consistent paper regime. Off by default; for A/B against the default.
+    bool robustness_guide_res_bilinear = false;
+
     // Build the robustness guide from compute_grey_fft instead of the
     // decimated Bayer guide, which makes R FULL RESOLUTION with no upscale
     // anywhere in the chain.
@@ -1347,7 +1360,9 @@ struct Config {
         // (Algorithm 6). This is now the single robustness path, no longer tied to
         // robustness_raw_resolution_enabled. Grey (non-Bayer) input needs no upscale
         // -- its guide is already full-resolution -- so it stays false there.
-        return bayer_mode;
+        // robustness_guide_res_bilinear (paper-exact #3) opts back out to the
+        // guide-res mask so it can be bilinearly upsampled at merge time.
+        return bayer_mode && !robustness_guide_res_bilinear;
     }
     // The guide is always linear (460-main), never sqrt. Retired alongside the FFT
     // guide; the noise curve is indexed by brightness directly.

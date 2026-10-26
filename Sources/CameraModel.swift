@@ -273,6 +273,12 @@ struct TuningParams: Equatable, Codable {
     var gcam_irr_gate: Float = 0.5
     var gcam_green_k: Float = 0.0
     var gcam_dilate_soft: Float = 1.0
+    /// Paper-exact robustness upsampling (SIGGRAPH 2019 step 3): compute R at the
+    /// half-res guide resolution and bilinearly upsample it to the merge grid,
+    /// instead of our default full-resolution R with a nearest upsample. Off by
+    /// default; for A/B against the default. May soften the mask / re-admit faint
+    /// edge ghosts (we moved to full-res R for a measured dB gain).
+    var robustness_guide_res_bilinear: Bool = false
     /// Perceptual-space robustness: compute the mask's local std and colour distance
     /// on sqrt(max(x,0)) of the guide — the variance-stabilizing / perceptual
     /// transform for the Poisson-Gaussian sensor — with a matching sqrt-space noise
@@ -499,6 +505,7 @@ struct TuningParams: Equatable, Codable {
         case decimate_dense_align_enabled
         case robustness_per_channel, robustness_gcam_enabled
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft
+        case robustness_guide_res_bilinear
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
         case gyro_prealign_enabled
@@ -625,6 +632,7 @@ struct TuningParams: Equatable, Codable {
         gcam_irr_gate = try c.decodeIfPresent(Float.self, forKey: .gcam_irr_gate) ?? gcam_irr_gate
         gcam_green_k = try c.decodeIfPresent(Float.self, forKey: .gcam_green_k) ?? gcam_green_k
         gcam_dilate_soft = try c.decodeIfPresent(Float.self, forKey: .gcam_dilate_soft) ?? gcam_dilate_soft
+        robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         robustness_perceptual_sqrt = try c.decodeIfPresent(Bool.self, forKey: .robustness_perceptual_sqrt) ?? robustness_perceptual_sqrt
         hf_artifact_removal_enabled = try c.decodeIfPresent(Bool.self, forKey: .hf_artifact_removal_enabled) ?? hf_artifact_removal_enabled
         hf_variance_loss_threshold = try c.decodeIfPresent(Float.self, forKey: .hf_variance_loss_threshold) ?? hf_variance_loss_threshold
@@ -2452,6 +2460,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_irr_gate": NSNumber(value: tuningParams.gcam_irr_gate),
             "gcam_green_k": NSNumber(value: tuningParams.gcam_green_k),
             "gcam_dilate_soft": NSNumber(value: tuningParams.gcam_dilate_soft),
+            "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "robustness_perceptual_sqrt": NSNumber(value: tuningParams.robustness_perceptual_sqrt),
             "hf_artifact_removal_enabled": NSNumber(value: tuningParams.hf_artifact_removal_enabled),
             "hf_variance_loss_threshold": NSNumber(value: tuningParams.hf_variance_loss_threshold),
