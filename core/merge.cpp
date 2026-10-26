@@ -172,7 +172,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // sample's CFA channel.
             const int rnc = robustness.c;
             f32 local_r[3];
-            if (cfg.merge_robustness_bilinear) {
+            // robustness_guide_res_bilinear (paper-exact #3) forces the bilinear
+            // fetch -- it is the half-res mask being bilinearly upsampled.
+            if (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) {
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
             } else {
