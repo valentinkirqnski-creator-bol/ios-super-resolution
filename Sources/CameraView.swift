@@ -1229,6 +1229,11 @@ struct CameraView: View {
                          Bilinearly upsamples the robustness mask from the guide (half) resolution to the merge grid — the SIGGRAPH 2019 step-3 upsampling — instead of our default nearest (blocky) upsample. The Eq.9 5×5 min already runs on the guide lattice; this just de-blocks its result with a smooth bilinear upsample, on the same working comparison (so it can't produce the tile-boundary artifact the earlier guide-res routing did). The default (nearest) was measured +2.49 dB and rejects edge ghosts more completely, so expect this to look softer and possibly re-admit faint ghosts. A/B it against the default on the same imported burst. Off by default.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
+                    Toggle("Bilinear Mask Fetch (merge)", isOn: $cam.tuningParams.merge_robustness_bilinear)
+                    Text("""
+                         Makes the merge sample the robustness mask R bilinearly instead of nearest/round — the paper's bilinear upsampling applied at fetch time, so it affects the 0↔1 rejection boundaries only. Softens those boundaries; on our full-resolution mask this was measured to re-admit faint ghosts at rejection edges (the outer ring of a rejected region gets a fractional weight instead of 0), which is why it's off by default. A/B against the default on the same imported burst.
+                         """)
+                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
                     Text("""
                          Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.

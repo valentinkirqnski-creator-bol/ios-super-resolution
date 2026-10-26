@@ -618,6 +618,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_dilate_soft"]) cfg.gcam_dilate_soft = tuning[@"gcam_dilate_soft"].floatValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
+    if (tuning[@"merge_robustness_bilinear"])
+        cfg.merge_robustness_bilinear = tuning[@"merge_robustness_bilinear"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])
