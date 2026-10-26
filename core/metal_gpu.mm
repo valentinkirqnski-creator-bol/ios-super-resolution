@@ -1729,8 +1729,18 @@ struct RobMaskRawParamsCPU {
     float    geom_noise_floor_mult = 1.5f;
     float    geom_reject_threshold_relative = 0.04f;
     uint32_t affine_flow = 0;
+    // GCam-form robustness on the raw-res path (Config::robustness_gcam_enabled).
+    // Added so the GCam mask is live on device (every Bayer burst takes this
+    // path). Keep in lockstep with RobMaskRawParams in the .metal.
+    uint32_t gcam_enabled = 0;
+    float    gcam_boost = 1.0f;
+    float    gcam_tex_gate = 1.5f;
+    float    gcam_irr_gate = 0.5f;
+    float    gcam_mult = 1.0f;
+    float    gcam_thresh = 0.5f;
+    float    gcam_green_k = 0.0f;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 140, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 168, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2756,6 +2766,14 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.geom_reject_threshold_relative = cfg.motion_geom_reject_threshold_relative;
     const bool raw_geom_affine = cfg.affine_flow_enabled && flow.has_affine();
     mp.affine_flow = raw_geom_affine ? 1u : 0u;
+    // GCam-form robustness: live on device via this (raw-res) path.
+    mp.gcam_enabled = cfg.robustness_gcam_enabled ? 1u : 0u;
+    mp.gcam_boost = cfg.gcam_boost;
+    mp.gcam_tex_gate = cfg.gcam_tex_gate;
+    mp.gcam_irr_gate = cfg.gcam_irr_gate;
+    mp.gcam_mult = cfg.gcam_mult;
+    mp.gcam_thresh = cfg.gcam_thresh;
+    mp.gcam_green_k = cfg.gcam_green_k;
     // Flow (+ optional Jacobian) for the geometry test. Bound unconditionally
     // (the kernel declares them); inert single-element dummies when off.
     id<MTLBuffer> b_geom_flow = !flow.flow.empty()
@@ -2800,7 +2818,12 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, (int)rob_nch);
     memcpy(R_pre.data.data(), [b_R contents], mask_b_r);
-    Image r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
+    // GCam path softens Eq.9's spread (gcam_dilate_soft); all else keeps the hard
+    // min. robustness_local_min_on_guide_soft is defined in robustness.cpp.
+    Image robustness_local_min_on_guide_soft(const Image& R, float soft);
+    Image r = (cfg.robustness_gcam_enabled && cfg.gcam_dilate_soft < 1.0f)
+                  ? robustness_local_min_on_guide_soft(R_pre, cfg.gcam_dilate_soft)
+                  : robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     // Learned refinement of the finished mask (Config::robust_nn_enabled). The
     // comparison guide is still in b_guide; R stays analytic if it declines.
     // v15 (Config::robust_nn_v15_enabled) when it can run, else v14.

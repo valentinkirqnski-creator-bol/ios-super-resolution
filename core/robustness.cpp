@@ -1817,6 +1817,13 @@ Image robustness_local_min_on_guide(const Image& R) {
     return local_min_5x5_on_guide(R);
 }
 
+// Public soft variant for the Metal raw-res host (which runs Eq.9 on the CPU
+// after readback). soft = 1 is the hard min; < 1 softens the spread for the
+// GCam path (Config::gcam_dilate_soft). Declared locally in metal_gpu.mm.
+Image robustness_local_min_on_guide_soft(const Image& R, f32 soft) {
+    return local_min_5x5_on_guide_soft(R, soft);
+}
+
 static Image local_min_5x5_on_guide(const Image& R) {
     const int nc = R.c;
     const int gh = R.h / 2, gw = R.w / 2;
@@ -2139,8 +2146,11 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     // VERIFIED CPU path below instead. Robustness then runs on CPU for this
     // frame, but the expensive runtime Monte-Carlo curve build is skipped (the
     // LUT replaces it), so it is not necessarily slower overall. The GCam-form
-    // (robustness_gcam_enabled) has a Metal twin in rob_make_mask, so it runs on
-    // the GPU here -- no host readback, no raw-res host buffers.
+    // (robustness_gcam_enabled) has Metal twins in BOTH rob_make_mask (guide-res)
+    // and rob_make_mask_raw (raw-res) -- and since a Bayer burst always takes the
+    // raw-res path (robustness_raw_resolution_active == bayer_mode), the raw-res
+    // twin is the one that actually runs on device. So it runs on the GPU here --
+    // no host readback, no raw-res host buffers.
     if (!active_noise_lut14().valid) {
         Image gpu = compute_robustness_metal(comp_raw, ref_stats, flow, tile_size, cfg,
                                              s_select_out, refined_on_gpu);

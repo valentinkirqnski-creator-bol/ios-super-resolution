@@ -2547,6 +2547,17 @@ struct RobMaskRawParams {
     float geom_noise_floor_mult;
     float geom_reject_threshold_relative;
     uint affine_flow;
+    // GCam-form robustness on the RAW-RES path (Config::robustness_gcam_enabled).
+    // Twin of rob_make_mask's gcam block -- added here because every Bayer burst
+    // takes the raw-res path on device, so without this the GCam mask was inert
+    // on hardware. Keep in lockstep with RobMaskRawParamsCPU.
+    uint gcam_enabled;
+    float gcam_boost;
+    float gcam_tex_gate;
+    float gcam_irr_gate;
+    float gcam_mult;
+    float gcam_thresh;
+    float gcam_green_k;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2811,6 +2822,50 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
             if (!isfinite(rc)) rc = 0.f;        // OOB Dodgson -> NaN -> 0 (CPU parity)
             R[obase + ch] = rc * emc;
         }
+    } else if (p.gcam_enabled != 0u) {
+        // GCam ComputeFrameWeight in SQRT (VST) space on the RAW-RES path. Twin of
+        // the gcam branch in rob_make_mask (guide-res) and compute_robustness_raw_res
+        // (CPU). This is the branch that actually runs on device for a Bayer burst.
+        float num = 0.f, vr_s = 0.f, nvar_s = 0.f;
+        for (uint ch = 0u; ch < p.nch; ++ch) {
+            uint o = out_o * p.nch + ch;
+            float mr = max(ref_means[o], 1e-6f);
+            float comp = comp_means[o];
+            float nv = max(p.alpha * mr + p.beta, 0.f) / (4.f * mr);  // delta-method sqrt noise
+            float d2;
+            if (isfinite(comp)) { float ds = sqrt(max(comp, 0.f)) - sqrt(mr); d2 = ds * ds; }
+            else d2 = 1e30f;  // OOB Dodgson -> reject
+            float shrink = d2 / (d2 + nv + 1e-20f);
+            num += d2 * shrink * shrink;
+            vr_s += ref_vars[o] / (4.f * mr);
+            nvar_s += nv;
+        }
+        float nstd_s = sqrt(max(nvar_s, 1e-10f));
+        float std_dev2 = max(vr_s, nvar_s);
+        // Green-difference aliasing tolerance (Config::gcam_green_k): raises std_dev
+        // from the green channel's local high-frequency content (can only keep more).
+        if (p.gcam_green_k > 0.f && p.nch >= 2u) {
+            uint gc = 1u; // guide = [R, mean(two greens), B]
+            int xlg = max(0, int(gid.x) - 1), xrg = min(int(p.w) - 1, int(gid.x) + 1);
+            int yug = max(0, int(gid.y) - 1), ydg = min(int(p.h) - 1, int(gid.y) + 1);
+            float gcen = ref_means[(gid.y * p.w + gid.x) * p.nch + gc];
+            float glp = 0.25f * (ref_means[(gid.y * p.w + uint(xlg)) * p.nch + gc] +
+                                 ref_means[(gid.y * p.w + uint(xrg)) * p.nch + gc] +
+                                 ref_means[(uint(yug) * p.w + gid.x) * p.nch + gc] +
+                                 ref_means[(uint(ydg) * p.w + gid.x) * p.nch + gc]);
+            float ghf = gcen - glp;
+            float ghf_var_s = (ghf * ghf) / (4.f * max(gcen, 1e-6f));
+            std_dev2 = max(std_dev2, p.gcam_green_k * ghf_var_s);
+        }
+        float dist = num / (std_dev2 + 1e-20f);
+        bool textured = sqrt(max(vr_s, 0.f)) > p.gcam_tex_gate * nstd_s;
+        float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, int(patch_idy), int(patch_idx));
+        float boost = (textured && irr > p.gcam_irr_gate) ? p.gcam_boost : 1.f;
+        dist *= p.gcam_mult * boost;
+        float arg = p.gcam_thresh - dist; if (arg > 0.f) arg = 0.f;
+        float r_val = clamp(exp2(arg), 0.f, 1.f);
+        if (!isfinite(r_val)) r_val = 0.f;
+        R[obase] = r_val * emc;
     } else {
         float r_val = clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
         // An OOB Dodgson sample arrives as +inf -> d_sq_ = +inf -> NaN; force 0.
