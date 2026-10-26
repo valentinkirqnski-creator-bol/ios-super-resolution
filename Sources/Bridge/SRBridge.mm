@@ -616,8 +616,6 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_irr_gate"])   cfg.gcam_irr_gate = tuning[@"gcam_irr_gate"].floatValue;
     if (tuning[@"gcam_green_k"])    cfg.gcam_green_k = tuning[@"gcam_green_k"].floatValue;
     if (tuning[@"gcam_dilate_soft"]) cfg.gcam_dilate_soft = tuning[@"gcam_dilate_soft"].floatValue;
-    if (tuning[@"robustness_guide_res_bilinear"])
-        cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"motion_geom_reject_threshold"])
         cfg.motion_geom_reject_threshold = tuning[@"motion_geom_reject_threshold"].floatValue;
     if (tuning[@"motion_geom_relative"])

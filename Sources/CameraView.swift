@@ -1224,11 +1224,6 @@ struct CameraView: View {
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
-                    Toggle("Paper-Exact R (guide-res + bilinear)", isOn: $cam.tuningParams.robustness_guide_res_bilinear)
-                    Text("""
-                         Computes the robustness mask at the half-resolution guide grid and bilinearly upsamples it to the merge grid — the exact SIGGRAPH 2019 scheme (step 3). The default instead computes R at full resolution with a hard (nearest) boundary, which we measured was +2.49 dB and rejects edge ghosts more completely. Turning this on matches the paper but tends to soften the mask and can re-admit faint edge ghosts (bilinear smooths the rejection boundary). A/B it against the default on the same imported burst. Off by default.
-                         """)
-                        .font(.footnote).foregroundColor(.secondary)
                     Toggle("Global Homography (large roll)", isOn: $cam.tuningParams.global_homography_enabled)
                     Text("""
                          Experimental. Estimates one global homography per frame and warps it into the reference before alignment, so large camera roll/rotation is brought within the matcher's range before per-tile alignment. Helps heavily rolled handheld bursts; does not fix parallax or moving objects.

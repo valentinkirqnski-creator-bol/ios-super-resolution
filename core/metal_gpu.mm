@@ -5296,9 +5296,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_bilinear = 0u;
-        // robustness_guide_res_bilinear (paper-exact #3): bilinearly upsample the
-        // half-res mask (same as merge_robustness_bilinear, but the mask is guide-res).
-        p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) ? 1u : 0u;
+        p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
         p.cov_stride = g_bf.cov_stride;
         p.img_off  = (uint32_t)bf_raw_off(slot);
         p.flow_off = (uint32_t)bf_flow_off(slot);
@@ -5555,8 +5553,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // stats are missing, so the flag can say "raw" while the mask is guide.
     // See accumulate_comp in merge.cpp.
     p.flow_bilinear = false ? 1u : 0u;
-    // robustness_guide_res_bilinear (paper-exact #3): bilinear upsample of the half-res mask.
-    p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) ? 1u : 0u;
+    p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;
