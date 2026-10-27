@@ -2652,6 +2652,20 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
 
+    // GCam-form robustness needs the comparison frame's local variance too, for
+    // std_dev = max(min(std_ref, std_comp), min_std). Warp it the same way as
+    // comp_means (opt-in RAM: one extra hires buffer). Inert dummy otherwise.
+    id<MTLBuffer> b_comp_vars_hires = b_comp_means_hires;
+    if (cfg.robustness_gcam_enabled) {
+        int cvh = 0, cvw = 0;
+        if (!rob_dogson(b_gvars, b_comp_vars_hires, gh, gw, nch, /*is_ref=*/false,
+                        &flow, tile_size, cvh, cvw, cmd,
+                        false, /*use_affine=*/cfg.affine_flow_enabled,
+                        /*use_dense=*/cfg.dense_flow_enabled,
+                        /*bicubic=*/cfg.robustness_bicubic_guide))
+            return Image();
+    }
+
     const int curve_nch = std::max(1, std::min(3, nch));
     bool curves_stale = !g_rob_std_curve || !g_rob_diff_curve ||
         g_rob_curve_pixel4a != false ||
@@ -2811,6 +2825,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     [enc setBuffer:b_ref_hf offset:0 atIndex:13];
     [enc setBuffer:b_geom_flow offset:0 atIndex:14];
     [enc setBuffer:b_geom_affine offset:0 atIndex:15];
+    [enc setBuffer:b_comp_vars_hires offset:0 atIndex:16];  // GCam std_comp (inert dummy if off)
     dispatch2(enc, c.pipe("rob_make_mask_raw"), mp.w, mp.h);
     [enc endEncoding];
 

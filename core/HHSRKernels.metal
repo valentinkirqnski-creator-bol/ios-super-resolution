@@ -2516,50 +2516,33 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             R[obase + ch] = rc * emc;
         }
     } else if (p.gcam_enabled != 0u) {
-        // GCam ComputeFrameWeight in SQRT (VST) space (delta method). Twin of the
-        // CPU branch in robustness.cpp. Faithful to the readable shader; constants
-        // tuned, unblocker omitted. Green-diff tolerance (below) and the soft
-        // dilation (rob_local_min_5x5) are ported.
-        float num = 0.f, vr_s = 0.f, nvar_s = 0.f;
+        // EXACT GCam ComputeFrameWeight (linear guide space), guide-res path. Same
+        // formula as the raw-res twin; this path has no comparison variance buffer,
+        // so std_comp falls back to std_ref here (device GCam uses the raw-res path,
+        // which has the real min(std_ref, std_comp)).
+        float d = 0.f, ref_var_sum = 0.f, noise_var_sum = 0.f;
         for (uint ch = 0u; ch < p.nch; ++ch) {
             uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-            float mr = max(ref_means[o], 1e-6f);
+            float mr = ref_means[o];
             float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
                                                    sample_y, sample_x, ch);
-            float nv = max(p.alpha * mr + p.beta, 0.f) / (4.f * mr);  // delta-method sqrt noise
-            float d2;
-            if (isfinite(comp)) { float ds = sqrt(max(comp, 0.f)) - sqrt(mr); d2 = ds * ds; }
-            else d2 = 1e30f;  // out of frame -> reject (matches the standard path's INF)
-            float shrink = d2 / (d2 + nv + 1e-20f);
-            num += d2 * shrink * shrink;
-            vr_s += ref_vars[o] / (4.f * mr);
-            nvar_s += nv;
+            float delta = isfinite(comp) ? (comp - mr) : 1e15f;
+            float d2 = delta * delta;
+            float nv = max(p.alpha * max(mr, 0.f) + p.beta, 1e-12f);
+            d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);
+            ref_var_sum += ref_vars[o];
+            noise_var_sum += nv;
         }
-        float nstd_s = sqrt(max(nvar_s, 1e-10f));
-        float std_dev2 = max(vr_s, nvar_s);
-        // Green-difference aliasing tolerance (Config::gcam_green_k): the two
-        // Bayer greens are merged into channel 1 of the guide, so use its local
-        // high-frequency content as the aliasing signal. Can only RAISE std_dev
-        // (never darkens). Twin of the CPU block in robustness.cpp. 0 = no-op.
-        if (p.gcam_green_k > 0.f && p.nch >= 2u) {
-            uint gc = 1u; // guide = [R, mean(two greens), B]
-            int xlg = max(0, int(gid.x) - 1), xrg = min(int(p.w) - 1, int(gid.x) + 1);
-            int yug = max(0, int(gid.y) - 1), ydg = min(int(p.h) - 1, int(gid.y) + 1);
-            float gcen = ref_means[(gid.y * p.w + gid.x) * p.nch + gc];
-            float glp = 0.25f * (ref_means[(gid.y * p.w + uint(xlg)) * p.nch + gc] +
-                                 ref_means[(gid.y * p.w + uint(xrg)) * p.nch + gc] +
-                                 ref_means[(uint(yug) * p.w + gid.x) * p.nch + gc] +
-                                 ref_means[(uint(ydg) * p.w + gid.x) * p.nch + gc]);
-            float ghf = gcen - glp;
-            float ghf_var_s = (ghf * ghf) / (4.f * max(gcen, 1e-6f));
-            std_dev2 = max(std_dev2, p.gcam_green_k * ghf_var_s);
-        }
-        float dist = num / (std_dev2 + 1e-20f);
-        bool textured = sqrt(max(vr_s, 0.f)) > p.gcam_tex_gate * nstd_s;
+        float inv_nch = 1.f / float(max(1u, p.nch));
+        float ref_std = sqrt(max(0.f, ref_var_sum * inv_nch));
+        float min_std = sqrt(max(0.f, noise_var_sum * inv_nch));
+        float std_dev = max(ref_std, min_std);              // std_comp == std_ref fallback
+        float sig2 = std_dev * std_dev + 1e-20f;
+        bool textured = ref_std > p.gcam_tex_gate * min_std;
         float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
         float boost = (textured && irr > p.gcam_irr_gate) ? p.gcam_boost : 1.f;
-        dist *= p.gcam_mult * boost;
-        float arg = p.gcam_thresh - dist; if (arg > 0.f) arg = 0.f;
+        float distance = (d / sig2) * p.gcam_mult * boost;
+        float arg = p.gcam_thresh - distance; if (arg > 0.f) arg = 0.f;
         float r_val = clamp(exp2(arg), 0.f, 1.f);
         if (!isfinite(r_val)) r_val = 0.f;
         R[obase] = r_val * emc;
@@ -2745,6 +2728,7 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
                               device const float* ref_hf_loss [[buffer(13)]],
                               device const float* flow [[buffer(14)]],
                               device const float* affine_jac [[buffer(15)]],
+                              device const float* comp_vars [[buffer(16)]],  // GCam std_comp
                               uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint patch_idy = gid.y / p.tile_size;
@@ -2889,46 +2873,38 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
             R[obase + ch] = rc * emc;
         }
     } else if (p.gcam_enabled != 0u) {
-        // GCam ComputeFrameWeight in SQRT (VST) space on the RAW-RES path. Twin of
-        // the gcam branch in rob_make_mask (guide-res) and compute_robustness_raw_res
-        // (CPU). This is the branch that actually runs on device for a Bayer burst.
-        float num = 0.f, vr_s = 0.f, nvar_s = 0.f;
+        // EXACT GCam ComputeFrameWeight (linear guide space). Twin of the CPU
+        // branch in compute_robustness_raw_res. Per channel: Wiener-attenuated
+        // squared difference, noise term 2x single-frame variance:
+        //   d = sum_ch Delta^4 / (Delta^2 + 2*noise_var)
+        // std_dev = max(min(std_ref, std_comp), min_std); distance = d/std^2 *
+        // mult * boost; w = exp2(min(thresh - distance, 0)). boost where high-detail
+        // (std_ref > tex_gate*min_std) AND flow irregular. Single std collapsed from
+        // the 3-channel stats (mean variance); unblocker omitted.
+        float d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
         for (uint ch = 0u; ch < p.nch; ++ch) {
             uint o = out_o * p.nch + ch;
-            float mr = max(ref_means[o], 1e-6f);
-            float comp = comp_means[o];
-            float nv = max(p.alpha * mr + p.beta, 0.f) / (4.f * mr);  // delta-method sqrt noise
-            float d2;
-            if (isfinite(comp)) { float ds = sqrt(max(comp, 0.f)) - sqrt(mr); d2 = ds * ds; }
-            else d2 = 1e30f;  // OOB Dodgson -> reject
-            float shrink = d2 / (d2 + nv + 1e-20f);
-            num += d2 * shrink * shrink;
-            vr_s += ref_vars[o] / (4.f * mr);
-            nvar_s += nv;
+            float mr = ref_means[o];
+            float mc = comp_means[o];
+            float delta = isfinite(mc) ? (mc - mr) : 1e15f;   // OOB comp -> huge d
+            float d2 = delta * delta;
+            float nv = max(p.alpha * max(mr, 0.f) + p.beta, 1e-12f);
+            d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);          // Delta^4 / (Delta^2 + 2*nv)
+            ref_var_sum += ref_vars[o];
+            comp_var_sum += comp_vars[o];
+            noise_var_sum += nv;
         }
-        float nstd_s = sqrt(max(nvar_s, 1e-10f));
-        float std_dev2 = max(vr_s, nvar_s);
-        // Green-difference aliasing tolerance (Config::gcam_green_k): raises std_dev
-        // from the green channel's local high-frequency content (can only keep more).
-        if (p.gcam_green_k > 0.f && p.nch >= 2u) {
-            uint gc = 1u; // guide = [R, mean(two greens), B]
-            int xlg = max(0, int(gid.x) - 1), xrg = min(int(p.w) - 1, int(gid.x) + 1);
-            int yug = max(0, int(gid.y) - 1), ydg = min(int(p.h) - 1, int(gid.y) + 1);
-            float gcen = ref_means[(gid.y * p.w + gid.x) * p.nch + gc];
-            float glp = 0.25f * (ref_means[(gid.y * p.w + uint(xlg)) * p.nch + gc] +
-                                 ref_means[(gid.y * p.w + uint(xrg)) * p.nch + gc] +
-                                 ref_means[(uint(yug) * p.w + gid.x) * p.nch + gc] +
-                                 ref_means[(uint(ydg) * p.w + gid.x) * p.nch + gc]);
-            float ghf = gcen - glp;
-            float ghf_var_s = (ghf * ghf) / (4.f * max(gcen, 1e-6f));
-            std_dev2 = max(std_dev2, p.gcam_green_k * ghf_var_s);
-        }
-        float dist = num / (std_dev2 + 1e-20f);
-        bool textured = sqrt(max(vr_s, 0.f)) > p.gcam_tex_gate * nstd_s;
+        float inv_nch = 1.f / float(max(1u, p.nch));
+        float ref_std = sqrt(max(0.f, ref_var_sum * inv_nch));
+        float comp_std = sqrt(max(0.f, comp_var_sum * inv_nch));
+        float min_std = sqrt(max(0.f, noise_var_sum * inv_nch));
+        float std_dev = max(min(ref_std, comp_std), min_std);
+        float sig2 = std_dev * std_dev + 1e-20f;
+        bool textured = ref_std > p.gcam_tex_gate * min_std;
         float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, int(patch_idy), int(patch_idx));
         float boost = (textured && irr > p.gcam_irr_gate) ? p.gcam_boost : 1.f;
-        dist *= p.gcam_mult * boost;
-        float arg = p.gcam_thresh - dist; if (arg > 0.f) arg = 0.f;
+        float distance = (d / sig2) * p.gcam_mult * boost;
+        float arg = p.gcam_thresh - distance; if (arg > 0.f) arg = 0.f;
         float r_val = clamp(exp2(arg), 0.f, 1.f);
         if (!isfinite(r_val)) r_val = 0.f;
         R[obase] = r_val * emc;

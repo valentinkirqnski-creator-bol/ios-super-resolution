@@ -1639,40 +1639,24 @@ struct Config {
     float motion_geom_noise_floor_mult = 1.5f;
     float motion_geom_reject_threshold_relative = 0.04f;
 
-    // GCam-form robustness (robustness.cpp, raw-res path). An ALTERNATIVE weight
-    // to the Wronski Eq.6 above, reproducing the design reverse-engineered from
-    // Super Res Zoom's rejection shader (behaviour, not code), as original math:
-    //   std_eff = max( max( min(std_ref,std_alt), noise_std ), alias_k*hf )
-    //   dist    = mult * boost * wiener(d2) / std_eff^2    wiener(x)=x*x/(x+2*nvar)
-    //   boost   = gcam_boost where (std_ref > tex_gate*noise_std AND flow irregular)
-    //   R       = clamp( exp2( min(-dist + thresh, 0) ), 0, 1 )
-    // Normalising by local CONTRAST (not just noise) + the aliasing-tolerant hf
-    // term keeps aliasing/SR signal while the flow-irregularity boost rejects the
-    // gross/irregular-motion ghosts. MEASURED on synthetic real-content bursts:
-    // ~58% of visible ghosts caught at <=3% aliasing over-rejection vs ~1%
-    // baseline (ceiling 58%; the remaining subtle sub-pixel band needs flow /
-    // consensus, not the mask). Constants swept to that operating point; they are
-    // Pixel-noise-model-agnostic starting values and need on-device A/B. Off by
-    // default. Pair with the base-frame fallback + blurry-frame drop below.
-    // Re-tuned after the first operating point (mult=16, thresh=0) darkened all
-    // flat/low-contrast regions: that sweep's over-rejection metric only protected
-    // high-frequency aliasing, so cranking the multiplier looked free while it was
-    // rejecting the flat majority (dist ~ mult/3 there -> R ~ exp2(-5) at mult=16).
-    // Re-tuned protecting ALL aligned pixels: LOW mult keeps flat/aligned at full
-    // weight (dead zone: dist < thresh -> R = 1), a LARGE boost concentrates the
-    // strictness only in the irregular+textured tiles where ghosts live. MEASURED:
-    // flat R=1.0, aligned-aliasing R=1.0, irregular ghost R=0.0; ~57% visible-ghost
-    // catch at 0% flat over-rejection.
-    // Reproduces GCam's ComputeFrameWeight in SQRT (VST) space (the sqrt(rggb)
-    // guide the APK uses): sqrt-space quantities via the delta method (var(x)/(4x),
-    // noise (a*x+b)/(4x) ~ constant), so the contrast normalization does not
-    // collapse in dark regions:
-    //   distance = sum_ch wiener((sqrt(cmp)-sqrt(ref))^2) / max(ref_var, noise_var)
-    //   distance *= gcam_mult * (tile irregular & textured ? gcam_boost : 1)
-    //   R = clamp(exp2(min(gcam_thresh - distance, 0)), 0, 1)
-    // Faithful to the readable shader. NOT reproducible from the APK (compiled):
-    // the numeric constants (tuned here, need on-device A/B) and the unblocker
-    // (omitted). Two further readable pieces are ported below:
+    // GCam-form robustness (robustness.cpp raw-res path + Metal twins). The EXACT
+    // ComputeFrameWeight reverse-engineered from Super Res Zoom, in LINEAR guide
+    // space:
+    //   per channel: d += Delta^4 / (Delta^2 + 2*noise_var[ch])   (Delta = cmp-ref)
+    //   std_dev  = max( min(std_ref, std_comp), min_std )         (min_std = noise std)
+    //   distance = (d / std_dev^2) * gcam_mult * boost
+    //   boost    = gcam_boost where (std_ref > gcam_tex_gate*min_std AND flow irregular) else 1
+    //   w        = clamp( exp2( min(gcam_thresh - distance, 0) ), 0, 1 )
+    // GCam constants: mult=1, thresh=0 (additive inside exp2), boost=6, tex_gate=5.
+    // The noise term is 2x the single-frame variance (difference of two noisy
+    // samples). std_comp needs the comparison frame's local variance, so GCam warps
+    // comp_vars too (one extra hires buffer -- opt-in RAM). APPROXIMATIONS vs the
+    // APK: GCam stores one guide-std per pixel (.w); we collapse our 3-channel
+    // stats (mean variance). The UNBLOCKER (compiled variance-loss stage) is
+    // omitted. The exact soft 5x5 dilation (sum/3) is approximated by
+    // gcam_dilate_soft. Off by default. MEASURED (earlier sqrt-space form): the
+    // single-frame mask catches ~58% of visible ghosts but not the sub-pixel band
+    // (needs flow / consensus). Two further readable pieces exist below:
     //   * gcam_green_k -- the green-difference aliasing tolerance. GCam raises the
     //     allowed deviation (std_dev) using |Gr - Gb| between the two Bayer
     //     greens, so aliased detail is not rejected. Our guide has already merged
@@ -1692,10 +1676,10 @@ struct Config {
     // All constants are Pixel-sensor-calibrated in the APK; these defaults are
     // starting values and need on-device A/B. Off by default.
     bool  robustness_gcam_enabled = false;
-    float gcam_mult = 1.0f;        // kDistanceMultiplier (overall strictness)
-    float gcam_thresh = 0.5f;      // kRejectionThreshold (dead zone: distance < thresh -> R=1)
-    float gcam_boost = 8.0f;       // extra_motion_robustness_boost in irregular+textured tiles
-    float gcam_tex_gate = 1.5f;    // boost only where sqrt ref std > this * noise std
+    float gcam_mult = 1.0f;        // kDistanceMultiplier (GCam = 1)
+    float gcam_thresh = 0.0f;      // kRejectionThreshold, additive inside exp2 (GCam = 0)
+    float gcam_boost = 6.0f;       // extra_motion_robustness_boost in irregular+high-detail tiles (GCam = 6)
+    float gcam_tex_gate = 5.0f;    // boost only where ref std > this * noise std (GCam = 5)
     float gcam_irr_gate = 0.5f;    // boost only where per-tile flow irregularity > this (raw px); A/B on device
     float gcam_green_k = 0.0f;     // green-diff aliasing tolerance (RGB-guide adaptation); 0 = off
     float gcam_dilate_soft = 1.0f; // soft 5x5 dilation: 1 = hard min (Eq.9), <1 softens the spread

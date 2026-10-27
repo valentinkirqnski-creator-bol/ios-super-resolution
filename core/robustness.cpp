@@ -1627,17 +1627,28 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     // never materialised at all (folded into apply_noise_model_fused), so the
     // peak is the upscaled comp_means plus the two scalar outputs rather than
     // the whole chain at once.
-    Image comp_means;
+    // GCam-form robustness (Config::robustness_gcam_enabled) needs the comparison
+    // frame's LOCAL VARIANCE too (for std_dev = max(min(std_ref, std_comp),
+    // min_std)); the standard mask uses only the reference variance, so the comp
+    // variance is normally the discarded byproduct of local_stats_3x3. When GCam
+    // is on we keep it and Dodgson-upscale+warp it the same way as comp_means
+    // (one extra hires buffer -- opt-in RAM cost).
+    const bool gcam = cfg.robustness_gcam_enabled;
+    Image comp_means, comp_vars;
     {
-        Image comp_means_guide;
+        Image comp_means_guide, comp_vars_guide;
         {
             Image guide = compute_guide(comp_raw, cfg);
-            Image comp_vars_guide;  // byproduct, never read -- freed with this scope
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
+            if (!gcam) comp_vars_guide = Image();  // free unless GCam needs std_comp
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false,
                                         cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
+        if (gcam)
+            comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
+                                           tile_size, cfg.num_threads, false,
+                                           cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -1670,10 +1681,7 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         motion_irregular.assign(S.size(), 0u);
     const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
 
-    // GCam-form robustness (Config::robustness_gcam_enabled): per-tile flow
-    // irregularity for the strictness boost, and whether the comp variance was
-    // upscaled (for min(std_ref, std_alt)).
-    const bool gcam = cfg.robustness_gcam_enabled;
+    // Per-tile flow irregularity for the GCam strictness boost.
     std::vector<f32> gcam_irr;
     if (gcam) gcam_irr = compute_flow_irregularity(flow);
 
@@ -1776,58 +1784,47 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             if (gcam) {
                 // GCam-form weight (original math; see Config::robustness_gcam_enabled).
                 // Normalise the photometric difference by local CONTRAST (floored at
-                // noise and raised in high-frequency/aliased regions), Wiener-shrink
-                // it under noise, and boost strictness where the tile flow is
-                // irregular AND the region is textured.
-                // GCam ComputeFrameWeight, reproduced in SQRT (VST) space -- the
-                // space GCam's guide uses (sqrt(rggb), "perceptually uniform"). The
-                // sqrt-space quantities are derived from the linear guide stats by
-                // the delta method: a sqrt-space variance is var(x)/(4x), and the
-                // sqrt-space noise variance (a*x+b)/(4x) is ~constant with
-                // brightness, so the contrast normalization does NOT collapse in
-                // dark regions (the bug the earlier linear contrast-norm had).
-                //   distance = sum_ch wiener((sqrt(cmp)-sqrt(ref))^2) / std_dev^2
-                //   std_dev^2 = max( sqrt-space ref variance, sqrt-space noise var )
-                //   R = clamp( exp2( min(thresh - mult*boost*distance, 0) ), 0, 1 )
-                // Faithful to the readable shader; its numeric constants and the
-                // unblocker are compiled in the APK and are tuned / omitted here.
-                f32 num = 0.f, vr_s = 0.f, nvar_s = 0.f;
+                // EXACT GCam ComputeFrameWeight (reverse-engineered from the APK),
+                // in linear guide space. Per RGB channel: a Wiener-attenuated
+                // squared difference, summed; the noise term is 2x the single-frame
+                // variance (the difference of two noisy samples has twice the
+                // variance):
+                //   d = sum_ch  Delta^4 / (Delta^2 + 2*noise_var[ch])
+                // Local std is one value per pixel: the min of the two frames'
+                // local std, floored at the noise std at this luma:
+                //   std_dev = max( min(std_ref, std_comp), min_std )
+                //   distance = (d / std_dev^2) * mult * boost
+                //   w = exp2( min( thresh - distance, 0 ) )
+                // boost fires where the region is high-detail (std_ref >
+                // tex_gate*min_std) AND the per-tile flow is irregular. GCam's
+                // constants are mult=1, thresh=0, boost=6, tex_gate=5 (tunable here).
+                // Approximations vs the APK: GCam stores one guide-std in .w; we
+                // collapse our 3-channel stats (mean variance). The "unblocker"
+                // term is compiled in the APK and is omitted. The soft 5x5 dilation
+                // (sum/3) is applied downstream by local_min_5x5_on_guide_soft.
+                f32 d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
                 for (int ch = 0; ch < nch; ++ch) {
-                    const f32 mr = std::max(ref_means.at(y, x, ch), 1e-6f);
-                    const f32 mc = std::max(comp_means.at(y, x, ch), 0.f);
-                    const f32 ds = std::sqrt(mc) - std::sqrt(mr);        // sqrt-space difference
-                    const f32 d2 = ds * ds;
-                    const f32 nv = guide_noise_var(cfg, nch, ch, mr) / (4.f * mr);  // delta method
-                    const f32 shrink = d2 / (d2 + nv + 1e-20f);          // Wiener
-                    num += d2 * shrink * shrink;
-                    vr_s += ref_vars.at(y, x, ch) / (4.f * mr);          // sqrt-space ref variance
-                    nvar_s += nv;
+                    const f32 mr = ref_means.at(y, x, ch);
+                    const f32 mc = comp_means.at(y, x, ch);
+                    const f32 delta = std::isfinite(mc) ? (mc - mr) : 1e15f;  // OOB comp -> huge d
+                    const f32 d2 = delta * delta;
+                    const f32 nv = std::max(guide_noise_var(cfg, nch, ch, std::max(mr, 0.f)), 1e-12f);
+                    d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);             // Delta^4 / (Delta^2 + 2*nv)
+                    ref_var_sum += ref_vars.at(y, x, ch);
+                    comp_var_sum += comp_vars.at(y, x, ch);
+                    noise_var_sum += nv;
                 }
-                const f32 nstd_s = std::sqrt(std::max(1e-10f, nvar_s));
-                f32 std_dev2 = std::max(vr_s, nvar_s);                  // contrast floored at noise
-                // Green-difference aliasing tolerance (RGB-guide adaptation; see
-                // Config::gcam_green_k). The two Bayer greens are merged into one
-                // channel in the guide, so the exact |Gr - Gb| is gone; use the
-                // green channel's local high-frequency content as the aliasing
-                // indicator. Can only RAISE std_dev (never darkens an aligned
-                // pixel): aliased detail keeps full weight. Default k=0 = no-op.
-                if (cfg.gcam_green_k > 0.f && nch >= 2) {
-                    const int gc = 1; // guide = [R, mean(two greens), B]
-                    const int xlg = std::max(0, x - 1), xrg = std::min(w - 1, x + 1);
-                    const int yug = std::max(0, y - 1), ydg = std::min(h - 1, y + 1);
-                    const f32 gcen = ref_means.at(y, x, gc);
-                    const f32 glp = 0.25f * (ref_means.at(y, xlg, gc) + ref_means.at(y, xrg, gc) +
-                                             ref_means.at(yug, x, gc) + ref_means.at(ydg, x, gc));
-                    const f32 ghf = gcen - glp;                         // linear green high-pass
-                    const f32 ghf_var_s = (ghf * ghf) / (4.f * std::max(gcen, 1e-6f)); // delta -> sqrt space
-                    std_dev2 = std::max(std_dev2, cfg.gcam_green_k * ghf_var_s);
-                }
-                f32 dist = num / (std_dev2 + 1e-20f);
-                const bool textured = std::sqrt(std::max(0.f, vr_s)) > cfg.gcam_tex_gate * nstd_s;
+                const f32 inv_nch = 1.f / (f32)std::max(1, nch);
+                const f32 ref_std = std::sqrt(std::max(0.f, ref_var_sum * inv_nch));
+                const f32 comp_std = std::sqrt(std::max(0.f, comp_var_sum * inv_nch));
+                const f32 min_std = std::sqrt(std::max(0.f, noise_var_sum * inv_nch));  // noise floor
+                const f32 std_dev = std::max(std::min(ref_std, comp_std), min_std);
+                const f32 sig2 = std_dev * std_dev + 1e-20f;
+                const bool textured = ref_std > cfg.gcam_tex_gate * min_std;          // high-detail
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
                 const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
-                dist *= cfg.gcam_mult * boost;
-                f32 arg = cfg.gcam_thresh - dist;
+                const f32 distance = (d / sig2) * cfg.gcam_mult * boost;
+                f32 arg = cfg.gcam_thresh - distance;
                 if (arg > 0.f) arg = 0.f;
                 f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
                 if (!std::isfinite(r_val)) r_val = 0.f;
