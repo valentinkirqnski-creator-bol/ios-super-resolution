@@ -1224,9 +1224,9 @@ struct CameraView: View {
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
-                    Toggle("Paper-Exact R (bilinear upsample)", isOn: $cam.tuningParams.robustness_guide_res_bilinear)
+                    Toggle("Paper-Exact R (guide-res → bilinear to merge grid)", isOn: $cam.tuningParams.robustness_guide_res_bilinear)
                     Text("""
-                         Bilinearly upsamples the robustness mask from the guide (half) resolution to the merge grid — the SIGGRAPH 2019 step-3 upsampling — instead of our default nearest (blocky) upsample. The Eq.9 5×5 min already runs on the guide lattice; this just de-blocks its result with a smooth bilinear upsample, on the same working comparison (so it can't produce the tile-boundary artifact the earlier guide-res routing did). The default (nearest) was measured +2.49 dB and rejects edge ghosts more completely, so expect this to look softer and possibly re-admit faint ghosts. A/B it against the default on the same imported burst. Off by default.
+                         The literal SIGGRAPH step 3: compute the robustness map R at the half-res (~3 MP) guide resolution and bilinearly upsample it to the 48 MP merge grid (the merge fetches R bilinearly). Default instead computes R at raw (12 MP) with a nearest fetch. KNOWN ISSUE: this is the mechanism that previously showed black tile-boundary lines; the cause isn't yet pinned (it is NOT geometry rejection — that's off by default). If you see tile-grid lines, please tell me exactly which other toggles are on and screenshot the mask so I can fix it. Off by default; A/B on an imported burst.
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     Toggle("Bilinear Mask Fetch (merge)", isOn: $cam.tuningParams.merge_robustness_bilinear)

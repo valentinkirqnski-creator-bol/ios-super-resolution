@@ -1849,11 +1849,9 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         }
     }
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
-    // there (= the paper's 10x10-raw footprint), upsample back. Nearest by
-    // default; robustness_guide_res_bilinear makes the upsample BILINEAR (the
-    // paper's step 3) -- same working comparison, just a de-blocked mask. The
-    // GCam path softens that spread (gcam_dilate_soft).
-    if (cfg.robustness_guide_res_bilinear) return local_min_5x5_on_guide_bilinear(R);
+    // there (= the paper's 10x10-raw footprint), nearest-upsample back. The GCam
+    // path softens that spread (gcam_dilate_soft). (robustness_guide_res_bilinear
+    // does not reach here -- it routes to the guide-res mask path instead.)
     return gcam ? local_min_5x5_on_guide_soft(R, cfg.gcam_dilate_soft)
                 : local_min_5x5_on_guide(R);
 }
