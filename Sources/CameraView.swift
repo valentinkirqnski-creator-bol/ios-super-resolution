@@ -1215,7 +1215,7 @@ struct CameraView: View {
                         ispRow("Strictness (mult)", $cam.tuningParams.gcam_mult, 0.1...8.0, "%.2f")
                         ispRow("Dead Zone (thresh)", $cam.tuningParams.gcam_thresh, 0.0...4.0, "%.2f")
                         ispRow("Motion Boost", $cam.tuningParams.gcam_boost, 1.0...64.0, "%.1f")
-                        ispRow("Texture Gate", $cam.tuningParams.gcam_tex_gate, 0.5...4.0, "%.2f")
+                        ispRow("Texture Gate", $cam.tuningParams.gcam_tex_gate, 0.5...10.0, "%.2f")
                         ispRow("Irregularity Gate (px)", $cam.tuningParams.gcam_irr_gate, 0.0...3.0, "%.2f")
                         ispRow("Green-Diff Tolerance", $cam.tuningParams.gcam_green_k, 0.0...8.0, "%.2f")
                         ispRow("Soft Dilation", $cam.tuningParams.gcam_dilate_soft, 0.0...1.0, "%.2f")
