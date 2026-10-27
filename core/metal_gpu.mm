@@ -1695,8 +1695,11 @@ struct RobMaskParamsCPU {
     float    gcam_mult = 1.0f;
     float    gcam_thresh = 0.5f;
     float    gcam_green_k = 0.0f;  // green-diff aliasing tolerance (0 = off)
+    // 1 = smooth (Dodgson) comp sampling at the exact flow position
+    // (Config::robustness_guide_res_bilinear), matching the merge's correspondence.
+    uint32_t guide_res_bilinear = 0;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 204, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 208, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -3058,6 +3061,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.gcam_mult = cfg.gcam_mult;
     mp.gcam_thresh = cfg.gcam_thresh;
     mp.gcam_green_k = cfg.gcam_green_k;
+    mp.guide_res_bilinear = cfg.robustness_guide_res_bilinear ? 1u : 0u;
     mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
                      cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST
     mp.per_pixel_s = false ? 1u : 0u; // Wronski per-pixel M

@@ -2334,8 +2334,16 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 }
             }
             for (int ch = 0; ch < d_p.c; ++ch) {
-                // 460-parity: nearest (round) comp sample, not bilinear.
-                const f32 comp = sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
+                // 460-parity: nearest (round) comp sample, not bilinear. But that
+                // quantizes the comparison to the nearest guide pixel (~2 raw px),
+                // so the mask scores a different correspondence than the merge
+                // fetches (exact sub-pixel flow) -> misaligned samples slip
+                // through. robustness_guide_res_bilinear samples SMOOTHLY (Dodgson,
+                // same interpolant the raw-res stats-warp uses) at the exact
+                // position so the mask matches the merge's correspondence.
+                const f32 comp = cfg.robustness_guide_res_bilinear
+                    ? sample_dogson(comp_means, sample_y, sample_x, ch)
+                    : sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
                 const f32 dp = std::isfinite(comp)
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();

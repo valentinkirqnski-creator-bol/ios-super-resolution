@@ -1806,6 +1806,11 @@ struct RobMaskParams {
     // Green-difference aliasing tolerance (Config::gcam_green_k): raises std_dev
     // from the green channel's local high-frequency content. 0 = off.
     float gcam_green_k;
+    // 1 = sample the comparison stats SMOOTHLY (Dodgson) at the exact sub-pixel
+    // flow position instead of nearest, so the mask's correspondence matches the
+    // merge's (Config::robustness_guide_res_bilinear). Keep in lockstep with
+    // RobMaskParamsCPU.
+    uint guide_res_bilinear;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -1888,6 +1893,30 @@ inline float rob_sample_nearest_or_inf(device const float* img,
     int xi = int(round(x));
     if (!(yi >= 0 && yi < int(h) && xi >= 0 && xi < int(w))) return INFINITY;
     return img[(uint(yi) * w + uint(xi)) * nch + ch];
+}
+
+// Smooth (Dodgson quadratic) sample of a stat buffer at the exact sub-pixel
+// position, +inf out of bounds -- exact twin of sample_dogson in robustness.cpp.
+// Used by the guide-res robustness path (robustness_guide_res_bilinear) so the
+// mask scores the comparison at the SAME exact-flow position the merge fetches,
+// instead of the quantized nearest-pixel the 460-parity path used.
+inline float rob_sample_dogson_or_inf(device const float* img,
+                                      uint h, uint w, uint nch,
+                                      float y, float x, uint ch) {
+    if (!(y >= 0.f && y < float(h) && x >= 0.f && x < float(w))) return INFINITY;
+    int cy = int(round(y)), cx = int(round(x));
+    float acc = 0.f, buf = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        int y_ = clamp_edge(cy + i, int(h) - 1);
+        float wy = dogson_quadratic(float(y_) - y);
+        for (int j = -1; j <= 1; ++j) {
+            int x_ = clamp_edge(cx + j, int(w) - 1);
+            float wgt = wy * dogson_quadratic(float(x_) - x);
+            buf += img[(uint(y_) * w + uint(x_)) * nch + ch] * wgt;
+            acc += wgt;
+        }
+    }
+    return buf / acc;
 }
 
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
@@ -2337,9 +2366,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         float sigma_p_sq = ref_vars[o];
         float sigma_c = max(sigma_p_sq, sigma_t * sigma_t);
         sigma_sq_ += sigma_c;
-        // 460-parity: nearest (round) comp sample, not bilinear.
-        float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
-                                               sample_y, sample_x, ch);
+        // 460-parity: nearest (round) comp sample. robustness_guide_res_bilinear
+        // samples SMOOTHLY (Dodgson) at the exact flow position so the mask scores
+        // the same correspondence the merge fetches (twin of robustness.cpp).
+        float comp = (p.guide_res_bilinear != 0u)
+            ? rob_sample_dogson_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch)
+            : rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch);
         float d_p_ = isfinite(comp) ? fabs(ref_means[o] - comp) : INFINITY;
         float d_p_sq = d_p_ * d_p_;
         float denom = d_p_sq + d_t * d_t;
