@@ -1698,8 +1698,12 @@ struct RobMaskParamsCPU {
     // 1 = smooth (Dodgson) comp sampling at the exact flow position
     // (Config::robustness_guide_res_bilinear), matching the merge's correspondence.
     uint32_t guide_res_bilinear = 0;
+    // GCam per-channel noise variance (noise_var_rgb): robustness-scaled
+    // Var = gcam_na*clamp(luma)+gcam_nb, green channel halved in the gcam branch.
+    float    gcam_na = 0.0f;
+    float    gcam_nb = 0.0f;
 };
-static_assert(sizeof(RobMaskParamsCPU) == 208, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 216, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1744,8 +1748,12 @@ struct RobMaskRawParamsCPU {
     float    gcam_mult = 1.0f;
     float    gcam_thresh = 0.5f;
     float    gcam_green_k = 0.0f;
+    // GCam per-channel noise variance (noise_var_rgb): robustness-scaled
+    // Var = gcam_na*clamp(luma)+gcam_nb, green channel halved in the gcam branch.
+    float    gcam_na = 0.0f;
+    float    gcam_nb = 0.0f;
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 168, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 176, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2797,6 +2805,10 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     mp.gcam_mult = cfg.gcam_mult;
     mp.gcam_thresh = cfg.gcam_thresh;
     mp.gcam_green_k = cfg.gcam_green_k;
+    // Per-channel noise variance (noise_var_rgb): robustness-scaled, green halved
+    // in-kernel. Twin of guide_noise_var() in robustness.cpp.
+    mp.gcam_na = cfg.noise_alpha_robustness();
+    mp.gcam_nb = cfg.noise_beta_robustness();
     // Flow (+ optional Jacobian) for the geometry test. Bound unconditionally
     // (the kernel declares them); inert single-element dummies when off.
     id<MTLBuffer> b_geom_flow = !flow.flow.empty()
@@ -3076,6 +3088,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     mp.gcam_mult = cfg.gcam_mult;
     mp.gcam_thresh = cfg.gcam_thresh;
     mp.gcam_green_k = cfg.gcam_green_k;
+    // Per-channel noise variance (noise_var_rgb): robustness-scaled, green halved
+    // in-kernel. Twin of guide_noise_var() in robustness.cpp.
+    mp.gcam_na = cfg.noise_alpha_robustness();
+    mp.gcam_nb = cfg.noise_beta_robustness();
     mp.guide_res_bilinear = cfg.robustness_guide_res_bilinear ? 1u : 0u;
     mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
                      cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST

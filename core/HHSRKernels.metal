@@ -1811,6 +1811,12 @@ struct RobMaskParams {
     // merge's (Config::robustness_guide_res_bilinear). Keep in lockstep with
     // RobMaskParamsCPU.
     uint guide_res_bilinear;
+    // GCam per-channel noise variance (noise_var_rgb): the robustness-scaled
+    // noise model Var = gcam_na * clamp(luma,0,1) + gcam_nb, halved on the green
+    // guide channel (it is the average of two Bayer greens). Twin of
+    // guide_noise_var() in robustness.cpp; used only by the gcam branch.
+    float gcam_na;
+    float gcam_nb;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -2536,7 +2542,12 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                 : rob_sample_nearest_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch);
             float delta = isfinite(comp) ? (comp - mr) : 1e15f;   // OOB comp -> huge d
             float d2 = delta * delta;
-            float nv = max(p.alpha * max(mr, 0.f) + p.beta, 1e-12f);
+            // Per-channel noise variance (GCam noise_var_rgb; twin of
+            // guide_noise_var): robustness-scaled Var = na*clamp(luma)+nb, halved
+            // on the green guide channel (mean of two Bayer greens).
+            float nv = p.gcam_na * clamp(mr, 0.f, 1.f) + p.gcam_nb;
+            if (p.nch == 3u && ch == 1u) nv *= 0.5f;
+            nv = max(nv, 1e-12f);
             d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);          // Delta^4 / (Delta^2 + 2*nv)
             ref_var_sum += ref_vars[o];
             comp_var_sum += isfinite(cvar) ? cvar : ref_vars[o];  // OOB -> fall back to ref
@@ -2617,6 +2628,11 @@ struct RobMaskRawParams {
     float gcam_mult;
     float gcam_thresh;
     float gcam_green_k;
+    // GCam per-channel noise variance (noise_var_rgb): Var = gcam_na *
+    // clamp(luma,0,1) + gcam_nb, halved on the green guide channel. Twin of
+    // guide_noise_var() in robustness.cpp; used only by the gcam branch.
+    float gcam_na;
+    float gcam_nb;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2898,7 +2914,12 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
             float mc = comp_means[o];
             float delta = isfinite(mc) ? (mc - mr) : 1e15f;   // OOB comp -> huge d
             float d2 = delta * delta;
-            float nv = max(p.alpha * max(mr, 0.f) + p.beta, 1e-12f);
+            // Per-channel noise variance (GCam noise_var_rgb; twin of
+            // guide_noise_var): robustness-scaled Var = na*clamp(luma)+nb, halved
+            // on the green guide channel (mean of two Bayer greens).
+            float nv = p.gcam_na * clamp(mr, 0.f, 1.f) + p.gcam_nb;
+            if (p.nch == 3u && ch == 1u) nv *= 0.5f;
+            nv = max(nv, 1e-12f);
             d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);          // Delta^4 / (Delta^2 + 2*nv)
             ref_var_sum += ref_vars[o];
             comp_var_sum += comp_vars[o];
