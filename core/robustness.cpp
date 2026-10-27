@@ -2248,7 +2248,13 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         return Image();
     }
 #endif
-    if (cfg.robustness_raw_resolution_active() || cfg.robustness_gcam_enabled) {
+    // GCam-form robustness normally uses the raw-res twin, EXCEPT the guide-res
+    // combo (robustness_guide_res_bilinear): then GCam R is computed at guide
+    // resolution and the MERGE bilinearly upsamples it (GCam SABRE sec. 4-5), so
+    // it must take the guide-res path below -- exactly as compute_robustness_metal
+    // routes (robustness_raw_resolution_active() == bayer && !guide_res_bilinear).
+    if (cfg.robustness_raw_resolution_active() ||
+        (cfg.robustness_gcam_enabled && !cfg.robustness_guide_res_bilinear)) {
         Image raw_res = compute_robustness_raw_res(comp_raw, ref_stats, flow, tile_size,
                                                     cfg, s_select_out);
         if (raw_res.h > 0 && raw_res.w > 0) return raw_res;
@@ -2281,6 +2287,16 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     local_stats_3x3(guide, comp_means, comp_vars);
 
     const int h = comp_means.h, w = comp_means.w;
+    // GCam guide-res combo (sec. 4-5): compute the EXACT ComputeFrameWeight at
+    // guide resolution here; the merge bilinearly upsamples R to the merge grid.
+    // Twin of the raw-res CPU branch, except the comparison stats are SAMPLED at
+    // the warped guide coordinate (comp_vars gives the real min(std_ref,std_comp)).
+    const bool gcam = cfg.robustness_gcam_enabled;
+    const int nch_g = ref_stats.means.c;
+    std::vector<f32> gcam_irr;
+    if (gcam) gcam_irr = compute_flow_irregularity(flow);
+    Image R_gcam;
+    if (gcam) R_gcam = Image(h, w, 1);
     Image d_p(h, w, ref_stats.means.c);
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
@@ -2345,6 +2361,43 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                     ? std::fabs(ref_stats.means.at(y, x, ch) - comp)
                     : std::numeric_limits<f32>::infinity();
                 d_p.at(y, x, ch) = dp;
+            }
+            if (gcam) {
+                // EXACT GCam ComputeFrameWeight at guide resolution (twin of the
+                // raw-res branch). Comparison stats are SAMPLED warped here; smooth
+                // (Dodgson) matches the merge pose, as the Metal rob_make_mask does.
+                const bool smooth = gcam || cfg.robustness_guide_res_bilinear;
+                f32 d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
+                for (int ch = 0; ch < nch_g; ++ch) {
+                    const f32 mr = ref_stats.means.at(y, x, ch);
+                    const f32 mc = smooth ? sample_dogson(comp_means, sample_y, sample_x, ch)
+                                          : sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
+                    const f32 cv = smooth ? sample_dogson(comp_vars, sample_y, sample_x, ch)
+                                          : sample_nearest_or_inf(comp_vars, sample_y, sample_x, ch);
+                    const f32 delta = std::isfinite(mc) ? (mc - mr) : 1e15f;  // OOB -> huge d
+                    const f32 d2 = delta * delta;
+                    const f32 nv = std::max(guide_noise_var(cfg, nch_g, ch, std::max(mr, 0.f)), 1e-12f);
+                    d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);
+                    ref_var_sum += ref_stats.stds.at(y, x, ch);
+                    comp_var_sum += std::isfinite(cv) ? cv : ref_stats.stds.at(y, x, ch);
+                    noise_var_sum += nv;
+                }
+                const f32 inv_nch = 1.f / (f32)std::max(1, nch_g);
+                const f32 ref_std = std::sqrt(std::max(0.f, ref_var_sum * inv_nch));
+                const f32 comp_std = std::sqrt(std::max(0.f, comp_var_sum * inv_nch));
+                const f32 min_std = std::sqrt(std::max(0.f, noise_var_sum * inv_nch));
+                const f32 std_dev = std::max(std::min(ref_std, comp_std), min_std);
+                const f32 sig2 = std_dev * std_dev + 1e-20f;
+                const bool textured = ref_std > cfg.gcam_tex_gate * min_std;
+                const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
+                const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
+                const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
+                const f32 distance = (d / sig2) * cfg.gcam_mult * boost;
+                f32 arg = cfg.gcam_thresh - distance;
+                if (arg > 0.f) arg = 0.f;
+                f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
+                if (!std::isfinite(r_val)) r_val = 0.f;
+                R_gcam.at(y, x, 0) = r_val;
             }
         }
     }
@@ -2472,6 +2525,11 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             const bool hard_reject = geom_reject || hf_reject;
             if (hard_reject) {
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = 0.f;
+            } else if (gcam) {
+                // GCam guide-res weight precomputed above (sec. 4-5). Single
+                // channel-summed R, broadcast to every output channel.
+                const f32 r_val = R_gcam.at(y, x, 0);
+                for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
             } else if (per_channel) {
                 for (int ch = 0; ch < rch; ++ch) {
                     f32 sc2 = sigma_sq_ch.at(y, x, ch);
@@ -2486,6 +2544,20 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             }
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
+    }
+    // Eq. 9 min. R is ALREADY at guide resolution here, so the 5x5 min runs
+    // directly on it (no 2x2 reduce -- that is the raw-res path's job). GCam's
+    // dilate pass (sec. 4) softens the spread: blend toward the hard min by
+    // gcam_dilate_soft, at guide resolution. The merge then bilinearly upsamples.
+    if (gcam && cfg.gcam_dilate_soft < 1.f) {
+        const f32 soft = clampf(cfg.gcam_dilate_soft, 0.f, 1.f);
+        Image M = local_min_5x5(R);
+        Image out(R.h, R.w, R.c);
+        for (int y = 0; y < R.h; ++y)
+            for (int x = 0; x < R.w; ++x)
+                for (int ch = 0; ch < R.c; ++ch)
+                    out.at(y, x, ch) = soft * M.at(y, x, ch) + (1.f - soft) * R.at(y, x, ch);
+        return out;
     }
     return local_min_5x5(R);
 }

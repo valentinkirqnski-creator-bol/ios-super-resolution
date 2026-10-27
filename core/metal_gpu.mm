@@ -3129,6 +3129,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [enc setBuffer:b_s_select offset:0 atIndex:14];
     [enc setBuffer:b_match_amb offset:0 atIndex:15];
     [enc setBuffer:b_affine offset:0 atIndex:16];
+    // GCam std_comp at guide resolution: the comparison frame's local variance,
+    // sampled warped inside the gcam branch (sec. 4-5). b_gvars is the same
+    // guide-res variance the raw-res path Dodgson-upscales; here it stays at guide
+    // res. Non-gcam paths never read it (p.gcam_enabled == 0).
+    [enc setBuffer:b_gvars offset:0 atIndex:17];
     dispatch2(enc, c.pipe("rob_make_mask"), mp.w, mp.h);
     [enc endEncoding];
 

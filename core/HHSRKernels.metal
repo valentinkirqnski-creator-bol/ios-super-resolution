@@ -2263,6 +2263,7 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
                           device float* s_select [[buffer(14)]],
                           device const uint* match_ambiguous [[buffer(15)]],
                           device const float* affine_jac [[buffer(16)]],
+                          device const float* comp_vars [[buffer(17)]],  // GCam std_comp (guide res)
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     float d_sq_ = 0.f, sigma_sq_ = 0.f;
@@ -2516,27 +2517,36 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             R[obase + ch] = rc * emc;
         }
     } else if (p.gcam_enabled != 0u) {
-        // EXACT GCam ComputeFrameWeight (linear guide space), guide-res path. Same
-        // formula as the raw-res twin; this path has no comparison variance buffer,
-        // so std_comp falls back to std_ref here (device GCam uses the raw-res path,
-        // which has the real min(std_ref, std_comp)).
-        float d = 0.f, ref_var_sum = 0.f, noise_var_sum = 0.f;
+        // EXACT GCam ComputeFrameWeight (linear guide space), guide-RESOLUTION path.
+        // R is computed here at guide resolution and later bilinearly upsampled to
+        // the merge grid (GCam SABRE sec. 4-5). Twin of the raw-res branch, except
+        // the comparison stats are SAMPLED at the warped guide coordinate (the
+        // raw-res twin reads them pre-warped). comp_vars gives the real
+        // min(std_ref, std_comp); smooth (Dodgson) sampling matches the merge pose.
+        bool smooth = (p.gcam_enabled != 0u) || (p.guide_res_bilinear != 0u);
+        float d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
         for (uint ch = 0u; ch < p.nch; ++ch) {
             uint o = (gid.y * p.w + gid.x) * p.nch + ch;
             float mr = ref_means[o];
-            float comp = rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch,
-                                                   sample_y, sample_x, ch);
-            float delta = isfinite(comp) ? (comp - mr) : 1e15f;
+            float comp = smooth
+                ? rob_sample_dogson_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch)
+                : rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch);
+            float cvar = smooth
+                ? rob_sample_dogson_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch)
+                : rob_sample_nearest_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch);
+            float delta = isfinite(comp) ? (comp - mr) : 1e15f;   // OOB comp -> huge d
             float d2 = delta * delta;
             float nv = max(p.alpha * max(mr, 0.f) + p.beta, 1e-12f);
-            d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);
+            d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);          // Delta^4 / (Delta^2 + 2*nv)
             ref_var_sum += ref_vars[o];
+            comp_var_sum += isfinite(cvar) ? cvar : ref_vars[o];  // OOB -> fall back to ref
             noise_var_sum += nv;
         }
         float inv_nch = 1.f / float(max(1u, p.nch));
         float ref_std = sqrt(max(0.f, ref_var_sum * inv_nch));
+        float comp_std = sqrt(max(0.f, comp_var_sum * inv_nch));
         float min_std = sqrt(max(0.f, noise_var_sum * inv_nch));
-        float std_dev = max(ref_std, min_std);              // std_comp == std_ref fallback
+        float std_dev = max(min(ref_std, comp_std), min_std);
         float sig2 = std_dev * std_dev + 1e-20f;
         bool textured = ref_std > p.gcam_tex_gate * min_std;
         float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
