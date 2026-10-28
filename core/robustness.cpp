@@ -927,6 +927,38 @@ static inline void cubic_bspline_w(f32 a, f32 w[4]) {
     w[3] = (1.f / 6.f) * (a * a * a);
 }
 
+// Catmull-Rom cubic weights (a = -0.5 cubic convolution) -- the INTERPOLATING
+// bicubic GCam's SampleBicubic uses. Passes through the sample points, sums to
+// 1, can go slightly negative. Twin of cubic_catmull_w in HHSRKernels.metal.
+static inline void cubic_catmull_w(f32 a, f32 w[4]) {
+    const f32 a2 = a * a, a3 = a2 * a;
+    w[0] = 0.5f * (-a3 + 2.f * a2 - a);
+    w[1] = 0.5f * (3.f * a3 - 5.f * a2 + 2.f);
+    w[2] = 0.5f * (-3.f * a3 + 4.f * a2 + a);
+    w[3] = 0.5f * (a3 - a2);
+}
+
+// Bicubic Catmull-Rom sampling of the half-res guide stats (GCam SampleBicubic).
+// Same OOB semantics as sample_dogson (+inf -> R=0). Twin of
+// rob_sample_catmull_or_inf in HHSRKernels.metal.
+static f32 sample_catmull(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
+    if (!(LR_y >= 0.f && LR_y < (f32)stats.h && LR_x >= 0.f && LR_x < (f32)stats.w))
+        return std::numeric_limits<f32>::infinity();
+    const int iy = (int)std::floor(LR_y), ix = (int)std::floor(LR_x);
+    f32 wy[4], wx[4];
+    cubic_catmull_w(LR_y - (f32)iy, wy);
+    cubic_catmull_w(LR_x - (f32)ix, wx);
+    f32 buf = 0.f;
+    for (int m = 0; m < 4; ++m) {
+        const int y_ = (int)clampf((f32)(iy - 1 + m), 0.f, (f32)(stats.h - 1));
+        for (int n = 0; n < 4; ++n) {
+            const int x_ = (int)clampf((f32)(ix - 1 + n), 0.f, (f32)(stats.w - 1));
+            buf += stats.at(y_, x_, ch) * (wy[m] * wx[n]);
+        }
+    }
+    return buf;  // Catmull-Rom weights sum to 1 exactly; no renormalisation.
+}
+
 // Cubic B-spline sampling of the half-res guide stats (SABRE SampleBicubic). The
 // GPU trick folds the 16-tap cubic into 4 hardware-bilinear fetches; our buffers
 // are not sampler textures, so this is the mathematically identical 16-tap form
@@ -954,7 +986,8 @@ static f32 sample_bicubic(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
 static Image upscale_warp_stats(const Image& guide_stats,
                                 bool is_ref, const FlowField* flow, int tile_size,
                                 int num_threads, bool bilinear_flow,
-                                bool use_affine = false, bool bicubic = false) {
+                                bool use_affine = false, bool bicubic = false,
+                                bool catmull = false) {
     const int nc = guide_stats.c;
     // Match Python upscale_warp_stats sizing: 3ch -> 2x, else same size
     const int out_h = (nc == 3) ? guide_stats.h * 2 : guide_stats.h;
@@ -1007,9 +1040,10 @@ static Image upscale_warp_stats(const Image& guide_stats,
             f32 LR_y = (cyp + 0.5f) / s - 0.5f;
             f32 LR_x = (cxp + 0.5f) / s - 0.5f;
             for (int ch = 0; ch < nc; ++ch) {
-                out.at(y, x, ch) = bicubic
-                    ? sample_bicubic(guide_stats, LR_y, LR_x, ch)
-                    : sample_dogson(guide_stats, LR_y, LR_x, ch);
+                out.at(y, x, ch) = catmull
+                    ? sample_catmull(guide_stats, LR_y, LR_x, ch)
+                    : (bicubic ? sample_bicubic(guide_stats, LR_y, LR_x, ch)
+                               : sample_dogson(guide_stats, LR_y, LR_x, ch));
             }
         }
     });
@@ -1500,6 +1534,12 @@ static Image local_min_5x5_on_guide_soft(const Image& R, f32 soft);
 // bilinearly upsampled back to raw instead of nearest. See
 // Config::robustness_guide_res_bilinear.
 static Image local_min_5x5_on_guide_bilinear(const Image& R);
+// GCam dilate pass: GROW rejection by a weighted 5x5 sum of (1-R)/3, re-invert.
+// _grow_direct runs at R's own resolution (guide-res path); _on_guide_grow does
+// the 2x2 min-reduce to the guide lattice first (raw-res path). See the exact
+// formula in local_min_5x5_grow_direct.
+static Image local_min_5x5_grow_direct(const Image& R, f32 soft);
+static Image local_min_5x5_on_guide_grow(const Image& R, f32 soft);
 
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
@@ -1539,10 +1579,12 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // burst here, not once per comparison frame.
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
                                             0, cfg.num_threads, false,
-                                            /*use_affine=*/false, cfg.robustness_bicubic_guide);
+                                            /*use_affine=*/false, cfg.robustness_bicubic_guide,
+                                            /*catmull=*/cfg.robustness_gcam_enabled);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
                                            0, cfg.num_threads, false,
-                                           /*use_affine=*/false, cfg.robustness_bicubic_guide);
+                                           /*use_affine=*/false, cfg.robustness_bicubic_guide,
+                                           /*catmull=*/cfg.robustness_gcam_enabled);
     }
     return st;
 #endif
@@ -1644,11 +1686,13 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         }
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false,
-                                        cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
+                                        cfg.affine_flow_enabled, cfg.robustness_bicubic_guide,
+                                        /*catmull=*/gcam);
         if (gcam)
             comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
                                            tile_size, cfg.num_threads, false,
-                                           cfg.affine_flow_enabled, cfg.robustness_bicubic_guide);
+                                           cfg.affine_flow_enabled, cfg.robustness_bicubic_guide,
+                                           /*catmull=*/gcam);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -1847,9 +1891,11 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
     }
     // Eq. 9 on Wronski's own lattice: 2x2 min-reduce to guide, 5x5 min
     // there (= the paper's 10x10-raw footprint), nearest-upsample back. The GCam
-    // path softens that spread (gcam_dilate_soft). (robustness_guide_res_bilinear
-    // does not reach here -- it routes to the guide-res mask path instead.)
-    return gcam ? local_min_5x5_on_guide_soft(R, cfg.gcam_dilate_soft)
+    // path uses its own dilate instead: GROW rejection by the weighted 5x5 sum/3
+    // on the guide lattice (Super Res Zoom's dilate pass), blended by
+    // gcam_dilate_soft. (robustness_guide_res_bilinear does not reach here -- it
+    // routes to the guide-res mask path instead.)
+    return gcam ? local_min_5x5_on_guide_grow(R, cfg.gcam_dilate_soft)
                 : local_min_5x5_on_guide(R);
 }
 
@@ -1868,6 +1914,13 @@ Image robustness_local_min_on_guide_bilinear(const Image& R) {
 // GCam path (Config::gcam_dilate_soft). Declared locally in metal_gpu.mm.
 Image robustness_local_min_on_guide_soft(const Image& R, f32 soft) {
     return local_min_5x5_on_guide_soft(R, soft);
+}
+
+// Public GCam dilate-GROW variant for the Metal raw-res host: 2x2 reduce to the
+// guide lattice, weighted-5x5 grow of rejection, nearest-upsample. See
+// local_min_5x5_on_guide_grow. Declared locally in metal_gpu.mm.
+Image robustness_local_min_on_guide_grow(const Image& R, f32 soft) {
+    return local_min_5x5_on_guide_grow(R, soft);
 }
 
 static Image local_min_5x5_on_guide(const Image& R) {
@@ -1977,6 +2030,70 @@ static Image local_min_5x5_on_guide_soft(const Image& R, f32 soft) {
                 G.at(gy, gx, ch) = m;
             }
     Image M = local_min_5x5(G);
+    Image out(R.h, R.w, nc);
+    for (int y = 0; y < R.h; ++y) {
+        const int gy = std::min(gh - 1, y / 2);
+        for (int x = 0; x < R.w; ++x) {
+            const int gx = std::min(gw - 1, x / 2);
+            for (int ch = 0; ch < nc; ++ch)
+                out.at(y, x, ch) = soft * M.at(gy, gx, ch) + (1.f - soft) * G.at(gy, gx, ch);
+        }
+    }
+    return out;
+}
+
+// GCam dilate pass (grows rejection) applied DIRECTLY at R's resolution -- the
+// guide-res path, where R is already the half-res guide mask GCam builds. For
+// each cell: rejection = sum over a 5x5 of w*(1-R), w = 1 inner 3x3 / 0.5 outer
+// ring ("inner ring full, outer ring partial"); divide by 3; keep = 1-rejection.
+// The weights sum to 17/3 > 1 so a small rejected cluster spreads outward
+// (clamped). soft blends the grown keep with the original R. Twin of the
+// gcam_dilate branch in rob_local_min_5x5 (HHSRKernels.metal).
+static Image local_min_5x5_grow_direct(const Image& R, f32 soft) {
+    soft = soft < 0.f ? 0.f : (soft > 1.f ? 1.f : soft);
+    const int nc = R.c, H = R.h, W = R.w;
+    Image out(H, W, nc);
+    auto clampi = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+    for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 rej = 0.f;
+                for (int i = -2; i <= 2; ++i) {
+                    const int yy = clampi(y + i, H - 1);
+                    for (int j = -2; j <= 2; ++j) {
+                        const int xx = clampi(x + j, W - 1);
+                        const f32 w = (std::max(std::abs(i), std::abs(j)) <= 1) ? 1.f : 0.5f;
+                        rej += w * (1.f - clampf(R.at(yy, xx, ch), 0.f, 1.f));
+                    }
+                }
+                const f32 keep_grow = clampf(1.f - rej / 3.f, 0.f, 1.f);
+                out.at(y, x, ch) = soft * keep_grow + (1.f - soft) * R.at(y, x, ch);
+            }
+        }
+    }
+    return out;
+}
+
+// GCam dilate pass for the RAW-res path: 2x2 min-reduce to the guide lattice
+// (where GCam's mask natively lives), apply the same weighted-5x5 grow there,
+// then nearest-upsample back. Mirrors local_min_5x5_on_guide_soft's structure
+// with the grow operator in place of the min.
+static Image local_min_5x5_on_guide_grow(const Image& R, f32 soft) {
+    soft = soft < 0.f ? 0.f : (soft > 1.f ? 1.f : soft);
+    const int nc = R.c;
+    const int gh = R.h / 2, gw = R.w / 2;
+    if (gh <= 0 || gw <= 0) return local_min_5x5_grow_direct(R, soft);
+    Image G(gh, gw, nc);
+    for (int gy = 0; gy < gh; ++gy)
+        for (int gx = 0; gx < gw; ++gx)
+            for (int ch = 0; ch < nc; ++ch) {
+                f32 m = R.at(2 * gy, 2 * gx, ch);
+                m = std::min(m, R.at(2 * gy, 2 * gx + 1, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx, ch));
+                m = std::min(m, R.at(2 * gy + 1, 2 * gx + 1, ch));
+                G.at(gy, gx, ch) = m;
+            }
+    Image M = local_min_5x5_grow_direct(G, 1.f);  // grow at full strength on the lattice
     Image out(R.h, R.w, nc);
     for (int y = 0; y < R.h; ++y) {
         const int gy = std::min(gh - 1, y / 2);
@@ -2364,16 +2481,13 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             }
             if (gcam) {
                 // EXACT GCam ComputeFrameWeight at guide resolution (twin of the
-                // raw-res branch). Comparison stats are SAMPLED warped here; smooth
-                // (Dodgson) matches the merge pose, as the Metal rob_make_mask does.
-                const bool smooth = gcam || cfg.robustness_guide_res_bilinear;
+                // raw-res branch). Comparison stats are SAMPLED warped here with a
+                // bicubic Catmull-Rom (GCam SampleBicubic), matching the merge pose.
                 f32 d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
                 for (int ch = 0; ch < nch_g; ++ch) {
                     const f32 mr = ref_stats.means.at(y, x, ch);
-                    const f32 mc = smooth ? sample_dogson(comp_means, sample_y, sample_x, ch)
-                                          : sample_nearest_or_inf(comp_means, sample_y, sample_x, ch);
-                    const f32 cv = smooth ? sample_dogson(comp_vars, sample_y, sample_x, ch)
-                                          : sample_nearest_or_inf(comp_vars, sample_y, sample_x, ch);
+                    const f32 mc = sample_catmull(comp_means, sample_y, sample_x, ch);
+                    const f32 cv = sample_catmull(comp_vars, sample_y, sample_x, ch);
                     const f32 delta = std::isfinite(mc) ? (mc - mr) : 1e15f;  // OOB -> huge d
                     const f32 d2 = delta * delta;
                     const f32 nv = std::max(guide_noise_var(cfg, nch_g, ch, std::max(mr, 0.f)), 1e-12f);
@@ -2545,20 +2659,12 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             if (s_select_out) s_select_out->at(y, x) = (s <= cfg.r_s1) ? 1.f : 0.f;
         }
     }
-    // Eq. 9 min. R is ALREADY at guide resolution here, so the 5x5 min runs
+    // Eq. 9 min. R is ALREADY at guide resolution here, so the dilate runs
     // directly on it (no 2x2 reduce -- that is the raw-res path's job). GCam's
-    // dilate pass (sec. 4) softens the spread: blend toward the hard min by
-    // gcam_dilate_soft, at guide resolution. The merge then bilinearly upsamples.
-    if (gcam && cfg.gcam_dilate_soft < 1.f) {
-        const f32 soft = clampf(cfg.gcam_dilate_soft, 0.f, 1.f);
-        Image M = local_min_5x5(R);
-        Image out(R.h, R.w, R.c);
-        for (int y = 0; y < R.h; ++y)
-            for (int x = 0; x < R.w; ++x)
-                for (int ch = 0; ch < R.c; ++ch)
-                    out.at(y, x, ch) = soft * M.at(y, x, ch) + (1.f - soft) * R.at(y, x, ch);
-        return out;
-    }
+    // dilate pass (sec. 4) GROWS rejection by the weighted 5x5 sum/3 at guide
+    // resolution, blended by gcam_dilate_soft; the merge then bilinearly
+    // upsamples. Non-GCam keeps the hard Eq.9 5x5 min.
+    if (gcam) return local_min_5x5_grow_direct(R, cfg.gcam_dilate_soft);
     return local_min_5x5(R);
 }
 

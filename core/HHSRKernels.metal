@@ -1717,10 +1717,13 @@ struct RobGuideParams {
 
 struct RobStatsParams {
     uint h, w, nch;
-    uint _pad0;
+    // 1 = GCam dilate: grow rejection by a weighted 5x5 sum of (1-R) / 3 and
+    // re-invert (Super Res Zoom's dilate pass), instead of the Eq.9 5x5 MIN.
+    // Only rob_local_min_5x5 reads it (was _pad0).
+    uint gcam_dilate;
     // Soft 5x5 dilation strength for the GCam path (Config::gcam_dilate_soft):
-    // 1 = hard min (Eq.9, the default for every other dispatch), <1 blends the
-    // min with the pre-dilation value. Only rob_local_min_5x5 reads it.
+    // 1 = full dilation (hard min, or the GCam grow when gcam_dilate), <1 blends
+    // it with the pre-dilation value. Only rob_local_min_5x5 reads it.
     float dilate_soft;
 };
 
@@ -1749,6 +1752,10 @@ struct RobDogsonParams {
     // 1 = sample the guide stats with a cubic B-spline (SABRE SampleBicubic)
     // instead of Dodgson quadratic (Config::robustness_bicubic_guide).
     uint bicubic;
+    // 1 = sample the guide stats with a bicubic Catmull-Rom (GCam SampleBicubic).
+    // Takes precedence over `bicubic`. Set for the GCam path so the raw-res stats
+    // upscale/warp matches Super Res Zoom's interpolant.
+    uint catmull;
 };
 
 struct RobMaskParams {
@@ -1852,6 +1859,19 @@ inline void cubic_bspline_w(float a, thread float w[4]) {
     w[3] = (1.f / 6.f) * (a * a * a);
 }
 
+// Catmull-Rom cubic weights (a = -0.5 cubic convolution), the INTERPOLATING
+// bicubic GCam's SampleBicubic uses -- passes through the sample points (unlike
+// the approximating B-spline), sums to 1, can go slightly negative. Taps at
+// offsets {-1,0,1,2}; `a` is the fractional position past tap 1. Twin of
+// cubic_catmull_w in robustness.cpp.
+inline void cubic_catmull_w(float a, thread float w[4]) {
+    float a2 = a * a, a3 = a2 * a;
+    w[0] = 0.5f * (-a3 + 2.f * a2 - a);
+    w[1] = 0.5f * (3.f * a3 - 5.f * a2 + 2.f);
+    w[2] = 0.5f * (-3.f * a3 + 4.f * a2 + a);
+    w[3] = 0.5f * (a3 - a2);
+}
+
 inline int clamp_edge(int v, int hi) {
     float f = clamp(float(v), 0.f, float(hi));
     return int(f);
@@ -1923,6 +1943,29 @@ inline float rob_sample_dogson_or_inf(device const float* img,
         }
     }
     return buf / acc;
+}
+
+// Catmull-Rom bicubic sample of a stat buffer at the exact sub-pixel position,
+// +inf out of bounds -- GCam's SampleBicubic. Twin of sample_catmull in
+// robustness.cpp. Used by the gcam branch so the comparison stats are sampled
+// exactly as Super Res Zoom samples the guide.
+inline float rob_sample_catmull_or_inf(device const float* img,
+                                       uint h, uint w, uint nch,
+                                       float y, float x, uint ch) {
+    if (!(y >= 0.f && y < float(h) && x >= 0.f && x < float(w))) return INFINITY;
+    int iy = int(floor(y)), ix = int(floor(x));
+    float wy[4], wx[4];
+    cubic_catmull_w(y - float(iy), wy);
+    cubic_catmull_w(x - float(ix), wx);
+    float buf = 0.f;
+    for (int m = 0; m < 4; ++m) {
+        int y_ = clamp_edge(iy - 1 + m, int(h) - 1);
+        for (int n = 0; n < 4; ++n) {
+            int x_ = clamp_edge(ix - 1 + n, int(w) - 1);
+            buf += img[(uint(y_) * w + uint(x_)) * nch + ch] * (wy[m] * wx[n]);
+        }
+    }
+    return buf;  // Catmull-Rom weights sum to 1 exactly, so no renormalisation.
 }
 
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
@@ -2107,16 +2150,22 @@ kernel void rob_upscale_dogson(device float* out [[buffer(0)]],
     // once per pixel when bicubic.
     bool oob = !(LR_y >= 0.f && LR_y < float(p.in_h) && LR_x >= 0.f && LR_x < float(p.in_w));
     int iy = int(floor(LR_y)), ix = int(floor(LR_x));
+    const bool use_cubic = (p.catmull != 0u || p.bicubic != 0u);
     float bwy[4], bwx[4];
-    if (p.bicubic != 0u && !oob) {
-        cubic_bspline_w(LR_y - float(iy), bwy);
-        cubic_bspline_w(LR_x - float(ix), bwx);
+    if (use_cubic && !oob) {
+        if (p.catmull != 0u) {
+            cubic_catmull_w(LR_y - float(iy), bwy);
+            cubic_catmull_w(LR_x - float(ix), bwx);
+        } else {
+            cubic_bspline_w(LR_y - float(iy), bwy);
+            cubic_bspline_w(LR_x - float(ix), bwx);
+        }
     }
     for (uint ch = 0u; ch < p.nch; ++ch) {
         float val;
         if (oob) {
             val = INFINITY;
-        } else if (p.bicubic != 0u) {
+        } else if (use_cubic) {
             float w_acc = 0.f, buf = 0.f;
             for (int m = 0; m < 4; ++m) {
                 int y_ = clamp_edge(iy - 1 + m, int(p.in_h) - 1);
@@ -2528,18 +2577,15 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
         // the merge grid (GCam SABRE sec. 4-5). Twin of the raw-res branch, except
         // the comparison stats are SAMPLED at the warped guide coordinate (the
         // raw-res twin reads them pre-warped). comp_vars gives the real
-        // min(std_ref, std_comp); smooth (Dodgson) sampling matches the merge pose.
-        bool smooth = (p.gcam_enabled != 0u) || (p.guide_res_bilinear != 0u);
+        // min(std_ref, std_comp). GCam samples the guide with a bicubic Catmull-Rom
+        // (SampleBicubic); use it for both the comparison mean and variance so the
+        // mask scores exactly GCam's fetch.
         float d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
         for (uint ch = 0u; ch < p.nch; ++ch) {
             uint o = (gid.y * p.w + gid.x) * p.nch + ch;
             float mr = ref_means[o];
-            float comp = smooth
-                ? rob_sample_dogson_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch)
-                : rob_sample_nearest_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch);
-            float cvar = smooth
-                ? rob_sample_dogson_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch)
-                : rob_sample_nearest_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch);
+            float comp = rob_sample_catmull_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch);
+            float cvar = rob_sample_catmull_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch);
             float delta = isfinite(comp) ? (comp - mr) : 1e15f;   // OOB comp -> huge d
             float d2 = delta * delta;
             // Per-channel noise variance (GCam noise_var_rgb; twin of
@@ -2974,6 +3020,34 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
     // 5x5 min is taken independently per channel (nch==1 normally; 3 for ISA
     // per-channel R). nch <= 3.
     uint nch = max(1u, p.nch);
+    uint obase = (gid.y * p.w + gid.x) * nch;
+    if (p.gcam_dilate != 0u) {
+        // GCam dilate pass: grow rejection by a weighted 5x5 sum of (1-R), /3,
+        // then re-invert to a keep weight. Weights: inner 3x3 full (1.0), the
+        // 5x5 outer ring partial (0.5) -- "inner ring full, outer ring partial".
+        // The /3 makes a small rejected cluster spread outward (weights sum to
+        // 17/3 > 1 so a few rejected neighbours clamp the centre to 0). Twin of
+        // local_min_5x5_on_guide_grow in robustness.cpp.
+        float rej[3] = {0.f, 0.f, 0.f};
+        for (int i = -2; i <= 2; ++i) {
+            int yy = clamp_edge(y + i, H - 1);
+            for (int j = -2; j <= 2; ++j) {
+                int xx = clamp_edge(x + j, W - 1);
+                float wgt = (max(abs(i), abs(j)) <= 1) ? 1.f : 0.5f;  // inner full, outer partial
+                uint base = (uint(yy) * p.w + uint(xx)) * nch;
+                for (uint ch = 0u; ch < nch; ++ch)
+                    rej[ch] += wgt * (1.f - clamp(R[base + ch], 0.f, 1.f));
+            }
+        }
+        float soft = clamp(p.dilate_soft, 0.f, 1.f);
+        for (uint ch = 0u; ch < nch; ++ch) {
+            float keep_grow = clamp(1.f - rej[ch] / 3.f, 0.f, 1.f);
+            out[obase + ch] = soft * keep_grow + (1.f - soft) * R[obase + ch];
+        }
+        return;
+    }
+    // 5x5 min is taken independently per channel (nch==1 normally; 3 for ISA
+    // per-channel R). nch <= 3.
     float mn[3] = {INFINITY, INFINITY, INFINITY};
     for (int i = -2; i <= 2; ++i) {
         int yy = clamp_edge(y + i, H - 1);
@@ -2983,7 +3057,6 @@ kernel void rob_local_min_5x5(device float* out [[buffer(0)]],
             for (uint ch = 0u; ch < nch; ++ch) mn[ch] = min(mn[ch], R[base + ch]);
         }
     }
-    uint obase = (gid.y * p.w + gid.x) * nch;
     // Soft dilation (Config::gcam_dilate_soft): blend the hard min with the
     // pre-dilation value. soft >= 1 is the hard min exactly (every non-GCam
     // dispatch). Twin of local_min_5x5_on_guide_soft in robustness.cpp.

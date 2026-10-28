@@ -1611,10 +1611,14 @@ struct RobGuideParamsCPU {
 static_assert(sizeof(RobGuideParamsCPU) == 52, "RobGuideParamsCPU");
 
 struct RobStatsParamsCPU {
-    uint32_t h, w, nch, _pad0 = 0;
+    uint32_t h, w, nch;
+    // 1 = GCam dilate: grow rejection by a weighted 5x5 sum of (1-R)/3 and
+    // re-invert, instead of the Eq.9 5x5 min (was _pad0). Keep in lockstep with
+    // RobStatsParams.
+    uint32_t gcam_dilate = 0;
     // Soft 5x5 dilation strength for the GCam path (Config::gcam_dilate_soft).
-    // 1 = hard min (Eq.9), the default for every non-GCam dispatch. Only
-    // rob_local_min_5x5 reads it. Keep in lockstep with RobStatsParams.
+    // 1 = full dilation (hard min, or the GCam grow when gcam_dilate), the
+    // default for every non-GCam dispatch. Only rob_local_min_5x5 reads it.
     float dilate_soft = 1.0f;
 };
 static_assert(sizeof(RobStatsParamsCPU) == 20, "RobStatsParamsCPU");
@@ -1647,8 +1651,12 @@ struct RobDogsonParamsCPU {
     float    dense_sy = 1.f;
     // 1 = cubic B-spline guide sampling (Config::robustness_bicubic_guide).
     uint32_t bicubic = 0;
+    // 1 = bicubic Catmull-Rom guide sampling (GCam SampleBicubic). Takes
+    // precedence over `bicubic`; set for the GCam path. Keep in lockstep with
+    // RobDogsonParams.
+    uint32_t catmull = 0;
 };
-static_assert(sizeof(RobDogsonParamsCPU) == 112, "RobDogsonParamsCPU");
+static_assert(sizeof(RobDogsonParamsCPU) == 116, "RobDogsonParamsCPU");
 
 struct RobMaskParamsCPU {
     uint32_t h, w, nch, tile_size, flow_ny, flow_nx, curve_n, bayer;
@@ -1995,7 +2003,8 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
                        const FlowField* flow, int tile_size,
                        int& out_h, int& out_w, id<MTLCommandBuffer> cmd,
                        bool flow_bilinear, bool use_affine = false,
-                       bool use_dense = false, bool bicubic = false) {
+                       bool use_dense = false, bool bicubic = false,
+                       bool catmull = false) {
     auto& c = ctx();
     out_h = (nch == 3) ? in_h * 2 : in_h;
     out_w = (nch == 3) ? in_w * 2 : in_w;
@@ -2016,6 +2025,7 @@ static bool rob_dogson(id<MTLBuffer> b_in, __strong id<MTLBuffer>& b_out,
     dp.s = 2.f;
     dp.flow_bilinear = flow_bilinear ? 1u : 0u;
     dp.bicubic = bicubic ? 1u : 0u;  // cubic B-spline guide sampling (SABRE SampleBicubic)
+    dp.catmull = catmull ? 1u : 0u;  // bicubic Catmull-Rom (GCam SampleBicubic; beats bicubic)
     // Compose the global pre-align homography for the comparison stats only, the
     // same transform the merge applies (comp_pos = H*(lr+flow)). Identity/off for
     // the reference stats and when no global transform was estimated.
@@ -2511,10 +2521,12 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
         int mh = 0, mw = 0, vh = 0, vw = 0;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
                         nullptr, 0, mh, mw, cmd, false, /*use_affine=*/false,
-                        /*use_dense=*/false, cfg.robustness_bicubic_guide) ||
+                        /*use_dense=*/false, cfg.robustness_bicubic_guide,
+                        /*catmull=*/cfg.robustness_gcam_enabled) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
                        nullptr, 0, vh, vw, cmd, false, /*use_affine=*/false,
-                       /*use_dense=*/false, cfg.robustness_bicubic_guide) ||
+                       /*use_dense=*/false, cfg.robustness_bicubic_guide,
+                       /*catmull=*/cfg.robustness_gcam_enabled) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -2655,7 +2667,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
                     &flow, tile_size, ch_h, ch_w, cmd,
                     false, /*use_affine=*/cfg.affine_flow_enabled,
                     /*use_dense=*/cfg.dense_flow_enabled,
-                    /*bicubic=*/cfg.robustness_bicubic_guide))
+                    /*bicubic=*/cfg.robustness_bicubic_guide,
+                    /*catmull=*/cfg.robustness_gcam_enabled))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
@@ -2670,7 +2683,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
                         &flow, tile_size, cvh, cvw, cmd,
                         false, /*use_affine=*/cfg.affine_flow_enabled,
                         /*use_dense=*/cfg.dense_flow_enabled,
-                        /*bicubic=*/cfg.robustness_bicubic_guide))
+                        /*bicubic=*/cfg.robustness_bicubic_guide,
+                        /*catmull=*/cfg.robustness_gcam_enabled))
             return Image();
     }
 
@@ -2854,14 +2868,15 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
 
     Image R_pre(ch_h, ch_w, (int)rob_nch);
     memcpy(R_pre.data.data(), [b_R contents], mask_b_r);
-    // Eq.9 5x5 min on the guide lattice: GCam soft spread (gcam_dilate_soft) else
-    // the hard nearest min. (robustness_guide_res_bilinear does not reach this
-    // raw-res path -- it routes to the guide-res mask, upsampled by the merge's
-    // bilinear fetch.) Defined in robustness.cpp.
-    Image robustness_local_min_on_guide_soft(const Image& R, float soft);
+    // Eq.9 on the guide lattice. GCam uses its dilate GROW (weighted 5x5 sum of
+    // (1-R)/3, re-inverted), blended by gcam_dilate_soft; non-GCam keeps the hard
+    // nearest 5x5 min. (robustness_guide_res_bilinear does not reach this raw-res
+    // path -- it routes to the guide-res mask, upsampled by the merge's bilinear
+    // fetch.) Both defined in robustness.cpp.
+    Image robustness_local_min_on_guide_grow(const Image& R, float soft);
     Image r;
-    if (cfg.robustness_gcam_enabled && cfg.gcam_dilate_soft < 1.0f)
-        r = robustness_local_min_on_guide_soft(R_pre, cfg.gcam_dilate_soft);
+    if (cfg.robustness_gcam_enabled)
+        r = robustness_local_min_on_guide_grow(R_pre, cfg.gcam_dilate_soft);
     else
         r = robustness_local_min_on_guide(R_pre);   // channel-aware 5x5 min
     // Learned refinement of the finished mask (Config::robust_nn_enabled). The
@@ -3157,8 +3172,9 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     sp.h = (uint32_t)gh;
     sp.w = (uint32_t)gw;
     sp.nch = rob_nch;  // 5x5 min is taken per channel
-    // GCam path softens the Eq.9 spread (gcam_dilate_soft); all other paths keep
-    // the hard min (1.0).
+    // GCam uses its own dilate pass (grow rejection by the weighted 5x5 sum/3),
+    // blended by gcam_dilate_soft; all other paths keep the hard Eq.9 5x5 min (1.0).
+    sp.gcam_dilate = cfg.robustness_gcam_enabled ? 1u : 0u;
     sp.dilate_soft = cfg.robustness_gcam_enabled ? cfg.gcam_dilate_soft : 1.0f;
     enc = [cmd computeCommandEncoder];
     if (!enc) return Image();
