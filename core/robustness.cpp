@@ -13,6 +13,7 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 #include <utility>
@@ -1564,6 +1565,72 @@ static void gcam_noise_lut(const Config& cfg, f32 luma, f32 out[3]) {
         out[c] = std::max(guide_noise_var(cfg, 3, c, luma), 0.f);
 }
 
+// §3 Monte-Carlo noise LUT builder (Config::gcam_sabre_noise_model). For each of
+// 10 sqrt-space luma bins L = i/9 and each guide channel, propagate the raw noise
+// variance S*p+O through the WB gain, white clip, sqrt, and (for green) the
+// two-green average, by Monte Carlo -- the nonlinear steps (clip, sqrt) are why a
+// closed form can't be used. S = noise_alpha, O = noise_beta (per channel, on the
+// pre-WB normalized [0,1] signal); g = per-channel WB gain (green is the WB
+// reference, g=1). The green column stores the averaged-green variance (= half the
+// individual; the guide reads it x2). Fixed RNG seed so every build -- reference
+// guide, comparison guide, CPU operator, GPU upload -- is bit-identical. Rows 0
+// (reference) and 1 (comparison) are identical here (single ISO/exposure).
+GcamNoiseLut build_gcam_noise_lut(const Config& cfg) {
+    GcamNoiseLut lut{};
+    constexpr int kTrials = 20000;
+    f32 S[3], O[3], g[3];
+    for (int c = 0; c < 3; ++c) {
+        S[c] = std::max(cfg.noise_alpha_ch_robustness(c), 0.f);
+        O[c] = std::max(cfg.noise_beta_ch_robustness(c), 0.f);
+        f32 gc = 1.f;
+        if (cfg.raw_prewhitened) {
+            const f32 wg = cfg.white_balance[1], wc = cfg.white_balance[c];
+            if (std::isfinite(wg) && std::isfinite(wc) && wg > 0.f && wc > 0.f) gc = wc / wg;
+        }
+        g[c] = (gc > 1e-6f) ? gc : 1.f;
+    }
+    std::mt19937 rng(12345u);
+    std::normal_distribution<f32> N(0.f, 1.f);
+    for (int i = 0; i < 10; ++i) {
+        const f32 L = (f32)i / 9.f;
+        const f32 v = L * L;                       // WB-linear target signal
+        for (int c = 0; c < 3; ++c) {
+            const f32 p = v / g[c];                // pre-WB normalized
+            const f32 sigma = std::sqrt(std::max(0.f, g[c] * g[c] * (S[c] * p + O[c])));
+            double m = 0.0, m2 = 0.0;
+            for (int t = 0; t < kTrials; ++t) {
+                f32 s;
+                if (c == 1) {                      // green: average of two independent sqrt-greens
+                    const f32 gr = clampf(v + sigma * N(rng), 0.f, 1.f);
+                    const f32 gb = clampf(v + sigma * N(rng), 0.f, 1.f);
+                    s = 0.5f * (std::sqrt(gr) + std::sqrt(gb));
+                } else {
+                    s = std::sqrt(clampf(v + sigma * N(rng), 0.f, 1.f));
+                }
+                m += s; m2 += (double)s * s;
+            }
+            m /= kTrials; m2 /= kTrials;
+            const f32 var = (f32)std::max(0.0, m2 - m * m);
+            lut.v[(0 * 10 + i) * 4 + c] = var;     // row 0 (reference)
+            lut.v[(1 * 10 + i) * 4 + c] = var;     // row 1 (comparison) -- same ISO
+        }
+    }
+    return lut;
+}
+
+// §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over the 10 columns;
+// bilinear. row 0 = reference, row 1 = comparison. Twin of gcam_lut_sample in
+// HHSRKernels.metal.
+static f32 gcam_lut_sample(const GcamNoiseLut& lut, f32 luma, int row, int ch) {
+    const f32 tx = clampf(9.f * luma, 0.f, 9.f);
+    const int i0 = (int)std::floor(tx);
+    const int i1 = std::min(i0 + 1, 9);
+    const f32 f = tx - (f32)i0;
+    const f32 a = lut.v[(row * 10 + i0) * 4 + ch];
+    const f32 b = lut.v[(row * 10 + i1) * 4 + ch];
+    return a + (b - a) * f;
+}
+
 // §2.10 reference pre-filter: a sign-preserving cubic B-spline at the guide's own
 // grid (fract=0 -> the separable [1,4,1]/6 smoothing), abs() of each tap (the
 // variance channel's sign carries the green-only flag), sign restored from the
@@ -1627,6 +1694,11 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
         sGr = std::sqrt(std::max(0.f, g0));
         sGb = std::sqrt(std::max(0.f, g1));
     };
+    // §3/§6: the green-only gate's noise comes from the Monte-Carlo LUT when the
+    // noise model is on, else the reconstructed affine stand-in. Built once here
+    // (fixed seed), outside the pixel loop.
+    const bool use_mc = cfg.gcam_sabre_noise_model;
+    const GcamNoiseLut mc_lut = use_mc ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
     for (int y = 0; y < gh; ++y)
         for (int x = 0; x < gw; ++x) {
             f32 avg[3] = {0, 0, 0};                      // 1-2-1 weighted mean colour
@@ -1656,8 +1728,13 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
             const f32 gmean = gm0 / 18.f;
             const f32 green_var = std::max(0.f, gm1 / 18.f - gmean * gmean);
             const f32 avg_luma = 0.25f * avg[0] + 0.5f * avg[1] + 0.25f * avg[2];
-            f32 nlut[3]; gcam_noise_lut(cfg, avg_luma, nlut);
-            const f32 green_noise = 2.f * nlut[1];       // §2.6 recover per-green variance
+            f32 green_noise;                             // §2.6 recover per-green variance (x2)
+            if (use_mc) {
+                green_noise = 2.f * gcam_lut_sample(mc_lut, avg_luma, /*row=*/1, /*ch=*/1);
+            } else {
+                f32 nl[3]; gcam_noise_lut(cfg, avg_luma, nl);
+                green_noise = 2.f * nl[1];
+            }
             f32 col[3], var;
             if (green_var > cfg.gcam_sabre_green_factor * green_noise) {   // §2.7 green-only
                 col[0] = avg[0]; col[1] = center_green; col[2] = avg[2];
@@ -1922,6 +1999,10 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
     const f32 motion_thresh = cfg.gcam_sabre_motion_thresh * (f32)std::max(1, comp_raw.w);
     const bool aff = cfg.affine_flow_enabled && flow.has_affine();
+    // §3/§6: Monte-Carlo noise for the operator when the model is on (built once,
+    // fixed seed -> matches the guide's and the GPU's copy). Off -> affine stand-in.
+    const bool noise_model = cfg.gcam_sabre_noise_model;
+    const GcamNoiseLut mc_lut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
     Image R(gh, gw, 1);
     for (int y = 0; y < gh; ++y)
         for (int x = 0; x < gw; ++x) {
@@ -1956,13 +2037,22 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             }
             f32 ref_a = std::fabs(ref_var_signed);
             f32 cur_a = sample_bicubic_abs(compg, sy, sx, 3);
-            // §5.5 noise at the reference luma (both rows share our model), §3.6 scale.
+            // §5.5 noise at the reference luma. MC model on: ref/cur from the LUT
+            // rows at full strength (the paper's noise subtraction). Off: the affine
+            // stand-in scaled by gcam_sabre_rob_noise (0 = device noise-blind).
             const f32 luma = green_only ? refc[1] : (refc[0] + refc[1] + refc[2]) / 3.f;
-            f32 nlut[3]; gcam_noise_lut(cfg, luma, nlut);
             f32 ref_noise[3], cur_noise[3];
-            for (int c = 0; c < 3; ++c) {
-                ref_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
-                cur_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
+            if (noise_model) {
+                for (int c = 0; c < 3; ++c) {
+                    ref_noise[c] = gcam_lut_sample(mc_lut, luma, /*row=*/0, c);
+                    cur_noise[c] = gcam_lut_sample(mc_lut, luma, /*row=*/1, c);
+                }
+            } else {
+                f32 nlut[3]; gcam_noise_lut(cfg, luma, nlut);
+                for (int c = 0; c < 3; ++c) {
+                    ref_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
+                    cur_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
+                }
             }
             // §5.6 filter-variance scale on noise AND the measured variances.
             const f32 k = green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb;

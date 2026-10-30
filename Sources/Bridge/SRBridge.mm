@@ -631,6 +631,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_sabre_dilate_deadzone"]) cfg.gcam_sabre_dilate_deadzone = tuning[@"gcam_sabre_dilate_deadzone"].floatValue;
     if (tuning[@"gcam_sabre_dilate_div"])     cfg.gcam_sabre_dilate_div = tuning[@"gcam_sabre_dilate_div"].floatValue;
     if (tuning[@"gcam_sabre_gpu"])            cfg.gcam_sabre_gpu = tuning[@"gcam_sabre_gpu"].boolValue;
+    if (tuning[@"gcam_sabre_noise_model"])    cfg.gcam_sabre_noise_model = tuning[@"gcam_sabre_noise_model"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"merge_robustness_bilinear"])

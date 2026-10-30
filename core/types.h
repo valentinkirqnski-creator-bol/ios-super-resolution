@@ -1737,6 +1737,19 @@ struct Config {
     float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold, in normalized-UV; x raw width at use
     float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
     float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
+    // Monte-Carlo noise model (the paste's §3-§6). OFF (default): the guide's
+    // green-only gate uses the reconstructed affine stand-in and the operator runs
+    // noise-blind (gcam_sabre_rob_noise, default 0 = the measured device). ON:
+    // build the real noise LUT from the DNG NoiseProfile (S=noise_alpha, O=noise_beta
+    // per channel) propagated through WB gain + clip + sqrt + the two-green average
+    // by Monte Carlo (build_gcam_noise_lut, fixed seed so host==device), then (a)
+    // the guide green-only gate reads 2*LUT(luma,row1).g and (b) the operator
+    // subtracts (LUT.row0 + LUT.row1)*kFilterVarianceScale at full strength -- the
+    // paper's noise-corrected rejection, which lets the ×6 boost's variance test
+    // actually gate (min_variance > 0) and protects calm textured regions. In this
+    // mode gcam_sabre_rob_noise is ignored (the LUT is applied fully). Requires
+    // robustness_gcam_enabled.
+    bool  gcam_sabre_noise_model     = false;
     // Run the §5 operator on the Metal GPU twin (rob_gcam_sabre) instead of the
     // CPU reference. The guides are still built on the host (compute_gcam_guide)
     // and the §7 dilation still runs on the CPU (robustness_gcam_dilate) -- only

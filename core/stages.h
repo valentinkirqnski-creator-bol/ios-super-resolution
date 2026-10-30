@@ -187,6 +187,14 @@ Image robustness_local_min_on_guide(const Image& R);
 // can build the exact same guide image the classical path scores against.
 Image compute_guide(const Image& raw, const Config& cfg);
 
+// GCam SABRE (§3): Monte-Carlo noise LUT, 2 rows (ref/comp) x 10 luma columns x 4
+// channels (R,G,B,unused), flat row-major v[(row*10+col)*4+ch]. The green column
+// stores the averaged-two-green variance (half the individual); read it x2 for the
+// guide gate (§6). Built on the host with a fixed seed so the CPU operator and the
+// uploaded GPU copy are identical. Config::gcam_sabre_noise_model gates its use.
+struct GcamNoiseLut { float v[80]; };
+GcamNoiseLut build_gcam_noise_lut(const Config& cfg);
+
 // GCam SABRE (§2): the dedicated 4-channel sqrt guide (rgb + signed variance,
 // the sign carrying the green-only flag). half-res, built from the raw CFA. When
 // prefilter_ref is true the §2.10 sign-preserving B-spline pre-filter is applied

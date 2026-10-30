@@ -2020,7 +2020,21 @@ struct GcamSabreParams {
     float motion_thresh;  // raw-px (= uv threshold * raw width), precomputed on host
     float na;             // noise model alpha (robustness-scaled)
     float nb;             // noise model beta  (robustness-scaled)
+    uint  noise_model;    // §3: 1 = subtract the Monte-Carlo LUT noise (buffer 6)
 };
+
+// §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over 10 columns;
+// bilinear. row 0 = reference, row 1 = comparison. 10 cols x 4 ch per row. Twin
+// of gcam_lut_sample in robustness.cpp.
+inline float gcam_lut_sample(device const float* lut, float luma, uint row, uint ch) {
+    float tx = clamp(9.f * luma, 0.f, 9.f);
+    int i0 = int(floor(tx));
+    int i1 = min(i0 + 1, 9);
+    float f = tx - float(i0);
+    float a = lut[(row * 10u + uint(i0)) * 4u + ch];
+    float b = lut[(row * 10u + uint(i1)) * 4u + ch];
+    return a + (b - a) * f;
+}
 
 // §5.4 SampleBicubicAbsolute: cubic B-spline with abs() taps, edge-clamped (the
 // caller mirrors first). Twin of sample_bicubic_abs in robustness.cpp. Weights
@@ -2064,6 +2078,7 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
                            device const float* flow [[buffer(3)]],   // 2 per tile
                            device const float* irr [[buffer(4)]],    // 1 per tile (local motion extent, raw px)
                            constant GcamSabreParams& p [[buffer(5)]],
+                           device const float* lut [[buffer(6)]],    // §3 MC noise LUT (2x10x4); dummy if noise_model==0
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint x = gid.x, y = gid.y;
@@ -2096,12 +2111,20 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     }
     float ref_a = fabs(ref_var_signed);
     float cur_a = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, 3u);
-    // §5.5 noise at reference luma (guide_noise_var twin: green halved), §3.6 scale.
+    // §5.5 noise at reference luma. MC model on: ref/cur from the LUT rows at full
+    // strength (paper subtraction). Off: affine stand-in (green halved) x rob_noise.
     float luma = green_only ? refc[1] : (refc[0] + refc[1] + refc[2]) / 3.f;
-    float nbase = max(p.na * clamp(luma, 0.f, 1.f) + p.nb, 0.f);
-    float nlut[3]; nlut[0] = nbase; nlut[1] = 0.5f * nbase; nlut[2] = nbase;
     float ref_noise[3], cur_noise[3];
-    for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] = p.rob_noise * nlut[ch]; cur_noise[ch] = p.rob_noise * nlut[ch]; }
+    if (p.noise_model != 0u) {
+        for (uint ch = 0u; ch < 3u; ++ch) {
+            ref_noise[ch] = gcam_lut_sample(lut, luma, 0u, ch);
+            cur_noise[ch] = gcam_lut_sample(lut, luma, 1u, ch);
+        }
+    } else {
+        float nbase = max(p.na * clamp(luma, 0.f, 1.f) + p.nb, 0.f);
+        float nl[3]; nl[0] = nbase; nl[1] = 0.5f * nbase; nl[2] = nbase;
+        for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] = p.rob_noise * nl[ch]; cur_noise[ch] = p.rob_noise * nl[ch]; }
+    }
     // §5.6 filter-variance scale.
     float k = green_only ? p.k_green : p.k_rgb;
     for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] *= k; cur_noise[ch] *= k; }

@@ -1212,6 +1212,11 @@ struct CameraView: View {
                          """)
                         .font(.footnote).foregroundColor(.secondary)
                     if cam.tuningParams.robustness_gcam_enabled {
+                        Toggle("Noise Model (Monte-Carlo)", isOn: $cam.tuningParams.gcam_sabre_noise_model)
+                        Text("""
+                             Builds the real noise LUT from the DNG NoiseProfile (shot S + read O per channel) propagated through WB gain, white clip, sqrt and the two-green average by Monte Carlo, then applies it: the guide's green-only decision uses the true green noise, and the operator subtracts (ref+comp) noise before rejecting — the paper's noise-corrected form, which lets the ×6 boost's variance test actually gate and stops calm textured areas from being over-rejected. OFF = noise-blind device match (most aggressive). When ON, the "Robustness Noise" slider below is ignored (the LUT is applied in full).
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
                         ispRow("Robustness Noise (0=device, 1=paper)", $cam.tuningParams.gcam_sabre_rob_noise, 0.0...1.0, "%.2f")
                         ispRow("Motion Boost (×)", $cam.tuningParams.gcam_sabre_boost, 1.0...16.0, "%.1f")
                         ispRow("Green-Only Trigger", $cam.tuningParams.gcam_sabre_green_factor, 0.0...8.0, "%.2f")

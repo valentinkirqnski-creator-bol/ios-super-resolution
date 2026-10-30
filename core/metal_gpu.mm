@@ -1782,8 +1782,9 @@ struct GcamSabreParamsCPU {
     float    motion_thresh = 0.f;
     float    na = 0.f;
     float    nb = 0.f;
+    uint32_t noise_model = 0;   // §3: 1 = subtract the Monte-Carlo LUT noise
 };
-static_assert(sizeof(GcamSabreParamsCPU) == 100, "GcamSabreParamsCPU");
+static_assert(sizeof(GcamSabreParamsCPU) == 104, "GcamSabreParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2955,7 +2956,13 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     id<MTLBuffer> b_irr   = buf(irr.data(),        irr.size()        * sizeof(float));
     const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
     id<MTLBuffer> b_R    = buf(nullptr, mask_b);
-    if (!b_refg || !b_compg || !b_flow || !b_irr || !b_R) return Image();
+    // §3 Monte-Carlo noise LUT (host-built, fixed seed -> matches the CPU operator
+    // and the guides). Uploaded for the kernel's operator-noise term; a 1-float
+    // dummy when the model is off (the kernel never reads it then).
+    const bool noise_model = cfg.gcam_sabre_noise_model;
+    GcamNoiseLut nlut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
+    id<MTLBuffer> b_lut = noise_model ? buf(nlut.v, sizeof(nlut.v)) : buf(nullptr, sizeof(float));
+    if (!b_refg || !b_compg || !b_flow || !b_irr || !b_R || !b_lut) return Image();
 
     GcamSabreParamsCPU mp{};
     mp.h = (uint32_t)gh; mp.w = (uint32_t)gw;
@@ -2969,6 +2976,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.boost = cfg.gcam_sabre_boost; mp.boost_var_mult = cfg.gcam_sabre_boost_var_mult;
     mp.motion_thresh = cfg.gcam_sabre_motion_thresh * (float)std::max(1, comp_raw.w);
     mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
+    mp.noise_model = noise_model ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -2980,6 +2988,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     [enc setBuffer:b_flow  offset:0 atIndex:3];
     [enc setBuffer:b_irr   offset:0 atIndex:4];
     [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+    [enc setBuffer:b_lut   offset:0 atIndex:6];
     dispatch2(enc, pipe, (NSUInteger)gw, (NSUInteger)gh);
     [enc endEncoding];
     prof_tag_gpu(cmd, "robustness:gcam-sabre");
