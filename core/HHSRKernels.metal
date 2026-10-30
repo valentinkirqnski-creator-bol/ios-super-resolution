@@ -1998,6 +1998,141 @@ inline float rob_sample_bspline_or_inf(device const float* img,
     return buf / w_acc;
 }
 
+// ===================== GCam SABRE exact operator =====================
+// Parameters for rob_gcam_sabre. Twin of GcamSabreParamsCPU in metal_gpu.mm
+// (identical field order and types -- all 4-byte scalars, so no padding). The
+// guides are the 4-channel sqrt guide (rgb + signed variance) built on the host.
+struct GcamSabreParams {
+    uint  h;              // guide height
+    uint  w;              // guide width
+    uint  tile_size;
+    uint  flow_ny;
+    uint  flow_nx;
+    uint  use_homography;
+    float hmat[9];
+    float k_rgb;
+    float k_green;
+    float rob_noise;
+    float mult_rgb;
+    float mult_green;
+    float boost;
+    float boost_var_mult;
+    float motion_thresh;  // raw-px (= uv threshold * raw width), precomputed on host
+    float na;             // noise model alpha (robustness-scaled)
+    float nb;             // noise model beta  (robustness-scaled)
+};
+
+// §5.4 SampleBicubicAbsolute: cubic B-spline with abs() taps, edge-clamped (the
+// caller mirrors first). Twin of sample_bicubic_abs in robustness.cpp. Weights
+// sum to 1; renormalised for edge-clamp parity.
+inline float rob_sample_bspline_abs(device const float* img,
+                                    uint h, uint w, uint nch,
+                                    float y, float x, uint ch) {
+    int iy = int(floor(y)), ix = int(floor(x));
+    float wy[4], wx[4];
+    cubic_bspline_w(y - float(iy), wy);
+    cubic_bspline_w(x - float(ix), wx);
+    float buf = 0.f, w_acc = 0.f;
+    for (int m = 0; m < 4; ++m) {
+        int y_ = clamp_edge(iy - 1 + m, int(h) - 1);
+        for (int n = 0; n < 4; ++n) {
+            int x_ = clamp_edge(ix - 1 + n, int(w) - 1);
+            float wgt = wy[m] * wx[n];
+            buf += fabs(img[(uint(y_) * w + uint(x_)) * nch + ch]) * wgt;
+            w_acc += wgt;
+        }
+    }
+    return (w_acc != 0.f) ? buf / w_acc : buf;
+}
+
+// §5.3 MirrorUVs in guide-pixel space: reflect a coordinate back into [0, n-1].
+inline float gcam_mirror(float v, float n) {
+    float hi = n - 1.f;
+    if (v < 0.f) v = -v;
+    if (v > hi)  v = 2.f * hi - v;
+    return clamp(v, 0.f, hi);
+}
+
+// §5 the ComputeFrameWeight operator (guide resolution, sqrt space). Writes the
+// pre-dilation KEEP weight; the host applies §7 (robustness_gcam_dilate). Twin of
+// compute_robustness_gcam_sabre in robustness.cpp. Uses the piecewise per-tile
+// flow (§4.3) -- no affine/dense (gcam-faithful flow is per-tile) -- plus the
+// optional global homography.
+kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
+                           device const float* refg [[buffer(1)]],   // 4ch ref guide (pre-filtered)
+                           device const float* compg [[buffer(2)]],  // 4ch comp guide
+                           device const float* flow [[buffer(3)]],   // 2 per tile
+                           device const float* irr [[buffer(4)]],    // 1 per tile (local motion extent, raw px)
+                           constant GcamSabreParams& p [[buffer(5)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    uint x = gid.x, y = gid.y;
+    // §5.1 piecewise per-tile flow (nearest), guide->raw->guide for the half-res grid.
+    uint patch_idy = uint((2.f * float(y) + 0.5f) / float(max(p.tile_size, 1u)));
+    uint patch_idx = uint((2.f * float(x) + 0.5f) / float(max(p.tile_size, 1u)));
+    patch_idy = min(patch_idy, (p.flow_ny > 0u) ? p.flow_ny - 1u : 0u);
+    patch_idx = min(patch_idx, (p.flow_nx > 0u) ? p.flow_nx - 1u : 0u);
+    uint tofs = (patch_idy * p.flow_nx + patch_idx) * 2u;
+    float sx = float(x) + 0.5f * flow[tofs + 0u];
+    float sy = float(y) + 0.5f * flow[tofs + 1u];
+    if (p.use_homography != 0u) {
+        float X = 2.f * sx, Y = 2.f * sy;
+        float hx = p.hmat[0] * X + p.hmat[1] * Y + p.hmat[2];
+        float hy = p.hmat[3] * X + p.hmat[4] * Y + p.hmat[5];
+        float hw = p.hmat[6] * X + p.hmat[7] * Y + p.hmat[8];
+        if (hw != 0.f) { hx /= hw; hy /= hw; }
+        sx = 0.5f * hx; sy = 0.5f * hy;
+    }
+    sx = gcam_mirror(sx, float(p.w));                 // §5.3
+    sy = gcam_mirror(sy, float(p.h));
+    // §5.4 reference (plain lookup) + comparison (bicubic-abs).
+    uint rofs = (y * p.w + x) * 4u;
+    float ref_var_signed = refg[rofs + 3u];
+    bool green_only = ref_var_signed < 0.f;
+    float refc[3], curc[3];
+    for (uint ch = 0u; ch < 3u; ++ch) {
+        refc[ch] = refg[rofs + ch];
+        curc[ch] = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, ch);
+    }
+    float ref_a = fabs(ref_var_signed);
+    float cur_a = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, 3u);
+    // §5.5 noise at reference luma (guide_noise_var twin: green halved), §3.6 scale.
+    float luma = green_only ? refc[1] : (refc[0] + refc[1] + refc[2]) / 3.f;
+    float nbase = max(p.na * clamp(luma, 0.f, 1.f) + p.nb, 0.f);
+    float nlut[3]; nlut[0] = nbase; nlut[1] = 0.5f * nbase; nlut[2] = nbase;
+    float ref_noise[3], cur_noise[3];
+    for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] = p.rob_noise * nlut[ch]; cur_noise[ch] = p.rob_noise * nlut[ch]; }
+    // §5.6 filter-variance scale.
+    float k = green_only ? p.k_green : p.k_rgb;
+    for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] *= k; cur_noise[ch] *= k; }
+    ref_a *= k; cur_a *= k;
+    // §5.7 variances.
+    float pixel_variance = 2.f * min(ref_a, cur_a);
+    float noise_variance[3];
+    for (uint ch = 0u; ch < 3u; ++ch) noise_variance[ch] = ref_noise[ch] + cur_noise[ch];
+    // §5.8 motion-aware boost.
+    float min_variance = green_only ? ref_noise[1] : (ref_noise[0] + ref_noise[1] + ref_noise[2]) / 3.f;
+    float motion_extent = irr[patch_idy * p.flow_nx + patch_idx];
+    bool motion_prior = motion_extent > p.motion_thresh;
+    float boost = 1.f;
+    if (ref_a > p.boost_var_mult * min_variance && motion_prior) boost = p.boost;
+    // §5.9 noise-corrected normalized distance -> weight.
+    float diff2n[3];
+    for (uint ch = 0u; ch < 3u; ++ch) {
+        float d = curc[ch] - refc[ch];
+        float diff2 = max(0.f, d * d - noise_variance[ch]);
+        float var_rgb = max(pixel_variance, noise_variance[ch]) + 1e-20f;
+        diff2n[ch] = diff2 / var_rgb;
+    }
+    float distance = green_only ? p.mult_green * diff2n[1]
+                                : p.mult_rgb * (diff2n[0] + diff2n[1] + diff2n[2]) / 3.f;
+    distance *= boost;
+    float arg = -distance; if (arg > 0.f) arg = 0.f;
+    float wv = exp2(arg);
+    if (!isfinite(wv)) wv = 0.f;
+    R[y * p.w + x] = clamp(wv, 0.f, 1.f);              // keep weight (unblocker = 0)
+}
+
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
                             device const float* raw [[buffer(1)]],
                             constant RobGuideParams& p [[buffer(2)]],

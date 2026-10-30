@@ -273,6 +273,28 @@ struct TuningParams: Equatable, Codable {
     var gcam_irr_gate: Float = 0.5
     var gcam_green_k: Float = 0.0
     var gcam_dilate_soft: Float = 1.0
+    // GCam SABRE exact path (SABRE_robustness_exact_instructions.md). Active
+    // whenever robustness_gcam_enabled is on: it replaces the older gcam knobs
+    // above (which go inert). Defaults are GCam's measured constants.
+    var gcam_sabre_green_factor: Float = 3.0
+    var gcam_sabre_clip_point: Float = 1.0
+    var gcam_sabre_k_rgb: Float = 0.0898866
+    var gcam_sabre_k_green: Float = 0.211665
+    /// Robustness-operator noise scale (§3.6). 0 = match the measured device
+    /// (noise-blind, most aggressive); 1 = the paper's full noise subtraction.
+    var gcam_sabre_rob_noise: Float = 0.0
+    var gcam_sabre_mult_rgb: Float = 0.07
+    var gcam_sabre_mult_green: Float = 0.35
+    var gcam_sabre_boost: Float = 6.0
+    var gcam_sabre_boost_var_mult: Float = 25.0
+    var gcam_sabre_motion_thresh: Float = 1.9236641e-4
+    var gcam_sabre_dilate_deadzone: Float = 0.2
+    var gcam_sabre_dilate_div: Float = 2.0
+    /// Run the §5 operator on the Metal GPU kernel (rob_gcam_sabre) instead of the
+    /// CPU reference. Guides are still built on the host and §7 dilation runs on the
+    /// CPU; only the per-pixel loop moves to the GPU. Falls back to CPU if the kernel
+    /// is unavailable. Off by default — the kernel is unverified until a device build.
+    var gcam_sabre_gpu: Bool = false
     /// kFilterVarianceScale (Config::gcam_filter_var_scale). 1.0 = off; GCam's
     /// literal RGB value is 0.090. Defaulted off because our variances are already
     /// measured on the filtered guide (see the Config comment).
@@ -521,6 +543,9 @@ struct TuningParams: Equatable, Codable {
         case decimate_dense_align_enabled
         case robustness_per_channel, robustness_gcam_enabled
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
+        case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
+        case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -649,6 +674,19 @@ struct TuningParams: Equatable, Codable {
         gcam_green_k = try c.decodeIfPresent(Float.self, forKey: .gcam_green_k) ?? gcam_green_k
         gcam_dilate_soft = try c.decodeIfPresent(Float.self, forKey: .gcam_dilate_soft) ?? gcam_dilate_soft
         gcam_filter_var_scale = try c.decodeIfPresent(Float.self, forKey: .gcam_filter_var_scale) ?? gcam_filter_var_scale
+        gcam_sabre_green_factor = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_green_factor) ?? gcam_sabre_green_factor
+        gcam_sabre_clip_point = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_clip_point) ?? gcam_sabre_clip_point
+        gcam_sabre_k_rgb = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_k_rgb) ?? gcam_sabre_k_rgb
+        gcam_sabre_k_green = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_k_green) ?? gcam_sabre_k_green
+        gcam_sabre_rob_noise = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_rob_noise) ?? gcam_sabre_rob_noise
+        gcam_sabre_mult_rgb = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_mult_rgb) ?? gcam_sabre_mult_rgb
+        gcam_sabre_mult_green = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_mult_green) ?? gcam_sabre_mult_green
+        gcam_sabre_boost = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_boost) ?? gcam_sabre_boost
+        gcam_sabre_boost_var_mult = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_boost_var_mult) ?? gcam_sabre_boost_var_mult
+        gcam_sabre_motion_thresh = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_motion_thresh) ?? gcam_sabre_motion_thresh
+        gcam_sabre_dilate_deadzone = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_dilate_deadzone) ?? gcam_sabre_dilate_deadzone
+        gcam_sabre_dilate_div = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_dilate_div) ?? gcam_sabre_dilate_div
+        gcam_sabre_gpu = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu) ?? gcam_sabre_gpu
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         merge_robustness_bilinear = try c.decodeIfPresent(Bool.self, forKey: .merge_robustness_bilinear) ?? merge_robustness_bilinear
         robustness_bicubic_guide = try c.decodeIfPresent(Bool.self, forKey: .robustness_bicubic_guide) ?? robustness_bicubic_guide
@@ -2480,6 +2518,19 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_green_k": NSNumber(value: tuningParams.gcam_green_k),
             "gcam_dilate_soft": NSNumber(value: tuningParams.gcam_dilate_soft),
             "gcam_filter_var_scale": NSNumber(value: tuningParams.gcam_filter_var_scale),
+            "gcam_sabre_green_factor": NSNumber(value: tuningParams.gcam_sabre_green_factor),
+            "gcam_sabre_clip_point": NSNumber(value: tuningParams.gcam_sabre_clip_point),
+            "gcam_sabre_k_rgb": NSNumber(value: tuningParams.gcam_sabre_k_rgb),
+            "gcam_sabre_k_green": NSNumber(value: tuningParams.gcam_sabre_k_green),
+            "gcam_sabre_rob_noise": NSNumber(value: tuningParams.gcam_sabre_rob_noise),
+            "gcam_sabre_mult_rgb": NSNumber(value: tuningParams.gcam_sabre_mult_rgb),
+            "gcam_sabre_mult_green": NSNumber(value: tuningParams.gcam_sabre_mult_green),
+            "gcam_sabre_boost": NSNumber(value: tuningParams.gcam_sabre_boost),
+            "gcam_sabre_boost_var_mult": NSNumber(value: tuningParams.gcam_sabre_boost_var_mult),
+            "gcam_sabre_motion_thresh": NSNumber(value: tuningParams.gcam_sabre_motion_thresh),
+            "gcam_sabre_dilate_deadzone": NSNumber(value: tuningParams.gcam_sabre_dilate_deadzone),
+            "gcam_sabre_dilate_div": NSNumber(value: tuningParams.gcam_sabre_dilate_div),
+            "gcam_sabre_gpu": NSNumber(value: tuningParams.gcam_sabre_gpu),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "merge_robustness_bilinear": NSNumber(value: tuningParams.merge_robustness_bilinear),
             "robustness_bicubic_guide": NSNumber(value: tuningParams.robustness_bicubic_guide),

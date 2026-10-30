@@ -205,6 +205,16 @@ Image compute_robustness_metal(const Image& comp_raw, const RefStats& ref_stats,
                                Image* s_select_out = nullptr,
                                bool* refined_out = nullptr);
 
+// GCam SABRE operator on the GPU (Config::gcam_sabre_gpu). Builds the 4-channel
+// sqrt guides on the host (compute_gcam_guide), runs the §5 ComputeFrameWeight as
+// the rob_gcam_sabre kernel, reads back, and applies the §7 dilation on the CPU
+// (robustness_gcam_dilate) -- returning a guide-resolution host keep mask the
+// merge consumes exactly as the CPU operator's. Returns an empty Image if the
+// kernel/guide are unavailable so the caller can fall back to the CPU operator.
+Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats& ref_stats,
+                                          const FlowField& flow, int tile_size,
+                                          const Config& cfg, Image* s_select_out = nullptr);
+
 // Alg. 4 / 11 band merge on GPU. Accumulates into num_band/den_band.
 // Same math as merge_comp_band / merge_ref_band (robustness unchanged).
 // No CPU fallback. Host caches per-frame GPU buffers across bands and batches

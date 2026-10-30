@@ -1765,6 +1765,26 @@ struct RobMaskRawParamsCPU {
 };
 static_assert(sizeof(RobMaskRawParamsCPU) == 180, "RobMaskRawParamsCPU");
 
+// Twin of GcamSabreParams in HHSRKernels.metal (same order, all 4-byte scalars).
+struct GcamSabreParamsCPU {
+    uint32_t h = 0, w = 0;
+    uint32_t tile_size = 0;
+    uint32_t flow_ny = 0, flow_nx = 0;
+    uint32_t use_homography = 0;
+    float    hmat[9] = {1,0,0, 0,1,0, 0,0,1};
+    float    k_rgb = 0.0898866f;
+    float    k_green = 0.211665f;
+    float    rob_noise = 0.f;
+    float    mult_rgb = 0.07f;
+    float    mult_green = 0.35f;
+    float    boost = 6.f;
+    float    boost_var_mult = 25.f;
+    float    motion_thresh = 0.f;
+    float    na = 0.f;
+    float    nb = 0.f;
+};
+static_assert(sizeof(GcamSabreParamsCPU) == 100, "GcamSabreParamsCPU");
+
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
     uint32_t _pad0 = 0;
@@ -2901,6 +2921,81 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
         memcpy(s_select_out->data.data(), [b_s_select contents], mask_b);
     }
     return r;
+}
+
+// GCam SABRE operator on the GPU (Config::gcam_sabre_gpu). Self-contained: builds
+// the 4-channel sqrt guides on the host (the verified compute_gcam_guide), runs the
+// §5 ComputeFrameWeight as the rob_gcam_sabre kernel, reads back the pre-dilation
+// keep mask, and applies the §7 dilation on the CPU (robustness_gcam_dilate). It
+// deliberately avoids the resident-buffer / sticky-cache machinery of the other
+// robustness paths: it returns a guide-resolution HOST mask the merge consumes
+// exactly like the CPU operator's. Empty return -> caller falls back to the CPU
+// operator. The kernel is looked up lazily (not in the required pipeline list), so
+// if it is somehow absent Metal stays up for everything else and gcam uses the CPU.
+Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats& ref_stats,
+                                          const FlowField& flow, int tile_size,
+                                          const Config& cfg, Image* s_select_out) {
+  @autoreleasepool {
+    if (!metal_gpu_init() || comp_raw.w <= 0 || tile_size <= 0) return Image();
+    if (flow.ny <= 0 || flow.nx <= 0 || flow.flow.empty()) return Image();
+    const Image& refg = ref_stats.gcam_guide;
+    if (refg.h <= 0 || refg.w <= 0 || refg.c < 4) return Image();
+    auto& c = ctx();
+    id<MTLComputePipelineState> pipe = c.pipe("rob_gcam_sabre");
+    if (!pipe) return Image();                 // kernel absent -> CPU fallback
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/false);
+    if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
+    const int gh = refg.h, gw = refg.w;
+    const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
+    if ((int)irr.size() != flow.ny * flow.nx) return Image();
+
+    id<MTLBuffer> b_refg  = buf(refg.data.data(),  refg.data.size()  * sizeof(float));
+    id<MTLBuffer> b_compg = buf(compg.data.data(), compg.data.size() * sizeof(float));
+    id<MTLBuffer> b_flow  = buf(flow.flow.data(),  flow.flow.size()  * sizeof(float));
+    id<MTLBuffer> b_irr   = buf(irr.data(),        irr.size()        * sizeof(float));
+    const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
+    id<MTLBuffer> b_R    = buf(nullptr, mask_b);
+    if (!b_refg || !b_compg || !b_flow || !b_irr || !b_R) return Image();
+
+    GcamSabreParamsCPU mp{};
+    mp.h = (uint32_t)gh; mp.w = (uint32_t)gw;
+    mp.tile_size = (uint32_t)tile_size;
+    mp.flow_ny = (uint32_t)flow.ny; mp.flow_nx = (uint32_t)flow.nx;
+    mp.use_homography = flow.has_global_h ? 1u : 0u;
+    for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
+    mp.k_rgb = cfg.gcam_sabre_k_rgb; mp.k_green = cfg.gcam_sabre_k_green;
+    mp.rob_noise = cfg.gcam_sabre_rob_noise;
+    mp.mult_rgb = cfg.gcam_sabre_mult_rgb; mp.mult_green = cfg.gcam_sabre_mult_green;
+    mp.boost = cfg.gcam_sabre_boost; mp.boost_var_mult = cfg.gcam_sabre_boost_var_mult;
+    mp.motion_thresh = cfg.gcam_sabre_motion_thresh * (float)std::max(1, comp_raw.w);
+    mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
+
+    id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
+    if (!cmd) return Image();
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return Image();
+    [enc setBuffer:b_R     offset:0 atIndex:0];
+    [enc setBuffer:b_refg  offset:0 atIndex:1];
+    [enc setBuffer:b_compg offset:0 atIndex:2];
+    [enc setBuffer:b_flow  offset:0 atIndex:3];
+    [enc setBuffer:b_irr   offset:0 atIndex:4];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:5];
+    dispatch2(enc, pipe, (NSUInteger)gw, (NSUInteger)gh);
+    [enc endEncoding];
+    prof_tag_gpu(cmd, "robustness:gcam-sabre");
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
+
+    Image R_pre(gh, gw, 1);
+    memcpy(R_pre.data.data(), [b_R contents], mask_b);
+    Image dil = robustness_gcam_dilate(R_pre, cfg);        // §7 (verified CPU helper)
+    if (s_select_out) {
+        *s_select_out = Image(dil.h, dil.w, 1);
+        std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
+    }
+    return dil;
+  }
 }
 
 static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats& ref_stats,

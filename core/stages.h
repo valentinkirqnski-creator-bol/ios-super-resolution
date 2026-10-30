@@ -167,6 +167,12 @@ struct RefStats {
     // change. Empty unless that toggle is on.
     Image means_hires;
     Image stds_hires;
+    // GCam SABRE path only (Config::robustness_gcam_enabled): the reference's
+    // dedicated 4-channel sqrt guide (rgb + signed variance), already sign-
+    // preservingly pre-filtered per §2.10 so the operator reads it with a plain
+    // lookup. Built once per burst in init_robustness (host, both platforms).
+    // Empty on every other path.
+    Image gcam_guide;
 }; // guide resolution [h/2, w/2, ch] for Bayer (means_hires/stds_hires: raw [h, w, ch])
 RefStats init_robustness(const Image& ref_raw, const Config& cfg);
 // Eq. 9 for the raw-resolution robustness path: 2x2 min-reduce to the guide
@@ -180,6 +186,31 @@ Image robustness_local_min_on_guide(const Image& R);
 // mode). Exposed so callers besides robustness.cpp (neural_flow's caller)
 // can build the exact same guide image the classical path scores against.
 Image compute_guide(const Image& raw, const Config& cfg);
+
+// GCam SABRE (§2): the dedicated 4-channel sqrt guide (rgb + signed variance,
+// the sign carrying the green-only flag). half-res, built from the raw CFA. When
+// prefilter_ref is true the §2.10 sign-preserving B-spline pre-filter is applied
+// (reference frame); comparison guides pass false. Exposed for the Metal host.
+Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref);
+// GCam SABRE (§7): dilate a guide-resolution KEEP mask (R in [0,1]) by the
+// (sum25 - deadzone)/div rejection-contrast rule. Returns a guide-resolution keep
+// mask (the 2x downsample of the shader is dropped -- strictly finer, same math).
+Image robustness_gcam_dilate(const Image& R, const Config& cfg);
+// GCam SABRE (§4.1): per-component 3x3 median of the per-tile flow vectors, in
+// place, edge-clamped. Both robustness and merge read the result. No-op on an
+// empty / dense-only field.
+void median3x3_tile_flow(FlowField& flow);
+// GCam SABRE (§4.2): per-tile local motion extent = length of the min-max spread
+// of the flow vectors over the 3x3 tile neighbourhood (raw px). Drives the motion
+// boost. Exposed so the Metal host can build the same buffer the CPU operator uses.
+std::vector<f32> compute_flow_irregularity(const FlowField& flow);
+// GCam SABRE (§5+§7): the full CPU ComputeFrameWeight operator -> guide-resolution
+// keep mask (dilated). The verified reference and the device default; also the
+// fallback when the GPU twin is unavailable. Empty if the reference guide
+// (ref_stats.gcam_guide) was not built.
+Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_stats,
+                                    const FlowField& flow, int tile_size,
+                                    const Config& cfg, Image* s_select_out = nullptr);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);

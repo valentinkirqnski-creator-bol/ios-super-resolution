@@ -1702,6 +1702,50 @@ struct Config {
     float gcam_filter_var_scale = 1.0f;
     float gcam_alias_k = 4.0f;     // (unused; kept for config compatibility)
 
+    // ====================================================================
+    // GCam SABRE EXACT robustness (SABRE_robustness_exact_instructions.md).
+    // When robustness_gcam_enabled is true this path REPLACES everything else
+    // (the standard s*exp(-d^2/sigma^2) Eq.5-9 mask, the learned mask, AND the
+    // earlier gcam approximation above). It is a self-contained reimplementation
+    // of GCam's ComputeFrameWeight, verbatim from the recovered shader, built on
+    // its own dedicated 4-channel guide (rgb + signed variance) in SQUARE-ROOT
+    // color space. Pipeline map, section by section, in robustness.cpp:
+    //   §2  compute_gcam_guide       -- sqrt guide, 1-2-1 mean, green-only sign
+    //                                   flag, clip guard; ref guide pre-filtered.
+    //   §3  gcam_noise_lut           -- reconstructed noise model; the robustness
+    //                                   operator runs noise-blind (rob_noise=0,
+    //                                   the measured device) while the guide's
+    //                                   green-only decision uses the real value.
+    //   §4  median3x3_tile_flow (pipeline_paths) + compute_flow_irregularity
+    //                                   -- 3x3 flow median (shared with merge) and
+    //                                   the local-motion-extent boost gate.
+    //   §5  compute_robustness_gcam_sabre -- the ComputeFrameWeight operator.
+    //   §7  robustness_gcam_dilate   -- the (sum25 - deadzone)/div dilation.
+    // Defaults are GCam's measured constants; it is bit-faithful to the spec
+    // where our pipeline allows (the structural non-matches -- the single packed
+    // guide variance, the unblocker (zero on-device), per-frame flowScaleOffset,
+    // the 2x dilation downsample -- are noted at each site). Off by default.
+    float gcam_sabre_green_factor    = 3.0f;        // §2.7 green-only trigger: green_var > factor*green_noise
+    float gcam_sabre_clip_point      = 1.0f;        // §2.8 sqrt-space green clip; center_green>=this -> poison ref
+    float gcam_sabre_k_rgb           = 0.0898866f;  // §3.5 kFilterVarianceScale, RGB bicubic path
+    float gcam_sabre_k_green         = 0.211665f;   // §3.5 kFilterVarianceScale, green-only path
+    float gcam_sabre_rob_noise       = 0.0f;        // §3.6 robustness-operator noise scale (0=device, 1=paper LUT)
+    float gcam_sabre_mult_rgb        = 0.07f;       // §5.9 color_difference_multiplier, RGB
+    float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only
+    float gcam_sabre_boost           = 6.0f;        // §5.8 extra_motion_robustness_boost
+    float gcam_sabre_boost_var_mult  = 25.0f;       // §5.8 motion_robustness_boost_variance_threshold
+    float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold, in normalized-UV; x raw width at use
+    float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
+    float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
+    // Run the §5 operator on the Metal GPU twin (rob_gcam_sabre) instead of the
+    // CPU reference. The guides are still built on the host (compute_gcam_guide)
+    // and the §7 dilation still runs on the CPU (robustness_gcam_dilate) -- only
+    // the per-pixel ComputeFrameWeight loop moves to the GPU. The kernel is looked
+    // up lazily, so if it is unavailable the path falls back to the CPU operator.
+    // Off by default: the CPU operator is the verified reference and runs on device
+    // as-is. The Metal kernel is unverified until a device/CI build compiles it.
+    bool  gcam_sabre_gpu             = false;
+
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an
     // edge: it measures the sub-pixel shift along the edge normal and a genuine

@@ -2133,6 +2133,16 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             continue;
         }
 
+        // GCam SABRE (§4.1): clean the finalized per-tile flow with a 3x3
+        // per-component median before anyone reads it. Both robustness AND merge
+        // consume the median-filtered field (nothing downstream reads the raw
+        // flow), which is what rejects the tile-edge / rotation / parallax
+        // outliers. Applied to the shared flow by design, gated on the gcam
+        // toggle so every other path keeps its exact flow. Done before the GPU
+        // upload below so the resident merge reads the same median field.
+        if (work.robustness_gcam_enabled)
+            median3x3_tile_flow(flow);
+
 #if defined(__APPLE__)
         // The flow is the one per-frame analysis result the host still owns: the
         // CPU genuinely reads it (compute_motion_irregular, rob_compute_s) and it

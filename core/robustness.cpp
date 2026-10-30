@@ -1541,12 +1541,236 @@ static Image local_min_5x5_on_guide_bilinear(const Image& R);
 static Image local_min_5x5_grow_direct(const Image& R, f32 soft);
 static Image local_min_5x5_on_guide_grow(const Image& R, f32 soft);
 
+// ======================================================================
+// GCam SABRE EXACT robustness (SABRE_robustness_exact_instructions.md).
+// A self-contained reimplementation of GCam's ComputeFrameWeight, active only
+// when Config::robustness_gcam_enabled. It replaces the standard Eq.5-9 mask,
+// the learned mask, and the earlier gcam approximation entirely, and runs in
+// SQUARE-ROOT colour space on its own 4-channel guide (rgb + signed variance).
+// ======================================================================
+
+// §3.3-3.4 reconstructed noise read. row 0 = reference, row 1 = comparison; we
+// have one calibration so both rows share our affine model (alpha*b+beta),
+// evaluated per guide channel. Returns per-channel VARIANCE at the given luma.
+// guide_noise_var already halves green (the guide green is the mean of two Bayer
+// greens). The ROBUSTNESS operator scales this by gcam_sabre_rob_noise (0 on the
+// measured device, §3.6); the GUIDE's green-only decision uses it unscaled.
+// NOTE: our model is linear-domain affine indexed here by a sqrt-space luma -- an
+// approximation the spec itself flags (the MC generator is reconstructed, only
+// the read path is exact). It only sets the green-only gate scale; with the
+// operator noise-blind by default it does not enter the rejection arithmetic.
+static void gcam_noise_lut(const Config& cfg, f32 luma, f32 out[3]) {
+    for (int c = 0; c < 3; ++c)
+        out[c] = std::max(guide_noise_var(cfg, 3, c, luma), 0.f);
+}
+
+// §2.10 reference pre-filter: a sign-preserving cubic B-spline at the guide's own
+// grid (fract=0 -> the separable [1,4,1]/6 smoothing), abs() of each tap (the
+// variance channel's sign carries the green-only flag), sign restored from the
+// center's original variance. So the operator reads the reference with a plain
+// lookup and still gets the B-spline-filtered base GCam assumes.
+static Image gcam_prefilter_ref(const Image& g) {
+    static constexpr f32 w1d[3] = {1.f / 6.f, 4.f / 6.f, 1.f / 6.f};
+    Image out(g.h, g.w, g.c);
+    for (int y = 0; y < g.h; ++y)
+        for (int x = 0; x < g.w; ++x)
+            for (int ch = 0; ch < g.c; ++ch) {
+                f32 s = 0.f;
+                for (int i = -1; i <= 1; ++i) {
+                    const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(g.h - 1));
+                    for (int j = -1; j <= 1; ++j) {
+                        const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(g.w - 1));
+                        s += w1d[i + 1] * w1d[j + 1] * std::fabs(g.at(yy, xx, ch));
+                    }
+                }
+                out.at(y, x, ch) = s;
+            }
+    const int vch = g.c - 1;                  // variance channel
+    for (int y = 0; y < g.h; ++y)
+        for (int x = 0; x < g.w; ++x)
+            if (g.at(y, x, vch) < 0.f) out.at(y, x, vch) = -out.at(y, x, vch);
+    return out;
+}
+
+// §2 the dedicated 4-channel sqrt guide. Per half-res guide pixel (one 2x2 Bayer
+// quad), over the 3x3 neighbourhood of quads: rgb=(sR, mean(sGr,sGb), sB) in sqrt
+// space, a 1-2-1 center-weighted mean colour, the unweighted 3x3 colour variance,
+// the 18-sample green variance, the green-only sign-flag branch, and the clipped-
+// highlight guard. Channel 3 is the SIGNED reference variance (negative =
+// green-only). prefilter_ref applies §2.10 (reference frame only).
+Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref) {
+    if (!cfg.bayer_mode) {
+        Image g(raw.h, raw.w, 4);             // degenerate grey: sqrt plane, var 0
+        for (int y = 0; y < raw.h; ++y)
+            for (int x = 0; x < raw.w; ++x) {
+                const f32 s = std::sqrt(std::max(0.f, raw.at(y, x)));
+                g.at(y, x, 0) = s; g.at(y, x, 1) = s; g.at(y, x, 2) = s; g.at(y, x, 3) = 0.f;
+            }
+        return prefilter_ref ? gcam_prefilter_ref(g) : g;
+    }
+    const int gh = raw.h / 2, gw = raw.w / 2;
+    Image guide(gh, gw, 4);
+    static constexpr f32 W[3] = {0.25f, 0.5f, 0.25f};   // separable 1-2-1 / 4
+    auto quad = [&](int qy, int qx, f32& sR, f32& sGr, f32& sGb, f32& sB) {
+        qy = (int)clampf((f32)qy, 0.f, (f32)(gh - 1));
+        qx = (int)clampf((f32)qx, 0.f, (f32)(gw - 1));
+        f32 vR = 0.f, vB = 0.f, g0 = 0.f, g1 = 0.f; int gi = 0;
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j) {
+                const uint8_t c = cfg.cfa.p[i][j];
+                const f32 v = raw.at(2 * qy + i, 2 * qx + j);
+                if (c == 0) vR = v; else if (c == 2) vB = v;
+                else { if (gi == 0) g0 = v; else g1 = v; ++gi; }
+            }
+        sR  = std::sqrt(std::max(0.f, vR));
+        sB  = std::sqrt(std::max(0.f, vB));
+        sGr = std::sqrt(std::max(0.f, g0));
+        sGb = std::sqrt(std::max(0.f, g1));
+    };
+    for (int y = 0; y < gh; ++y)
+        for (int x = 0; x < gw; ++x) {
+            f32 avg[3] = {0, 0, 0};                      // 1-2-1 weighted mean colour
+            f32 m0[3] = {0, 0, 0}, m1[3] = {0, 0, 0};    // unweighted colour moments
+            f32 gm0 = 0.f, gm1 = 0.f;                    // 18-sample green moments
+            f32 center_green = 0.f;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    f32 sR, sGr, sGb, sB;
+                    quad(y + dy, x + dx, sR, sGr, sGb, sB);
+                    const f32 rgb[3] = {sR, 0.5f * (sGr + sGb), sB};
+                    const f32 wq = W[dy + 1] * W[dx + 1];
+                    for (int c = 0; c < 3; ++c) {
+                        avg[c] += wq * rgb[c];
+                        m0[c]  += rgb[c];
+                        m1[c]  += rgb[c] * rgb[c];
+                    }
+                    gm0 += sGr + sGb;
+                    gm1 += sGr * sGr + sGb * sGb;
+                    if (dy == 0 && dx == 0) center_green = rgb[1];
+                }
+            f32 rgb_var[3];
+            for (int c = 0; c < 3; ++c) {
+                const f32 mean = m0[c] / 9.f;
+                rgb_var[c] = std::max(0.f, m1[c] / 9.f - mean * mean);
+            }
+            const f32 gmean = gm0 / 18.f;
+            const f32 green_var = std::max(0.f, gm1 / 18.f - gmean * gmean);
+            const f32 avg_luma = 0.25f * avg[0] + 0.5f * avg[1] + 0.25f * avg[2];
+            f32 nlut[3]; gcam_noise_lut(cfg, avg_luma, nlut);
+            const f32 green_noise = 2.f * nlut[1];       // §2.6 recover per-green variance
+            f32 col[3], var;
+            if (green_var > cfg.gcam_sabre_green_factor * green_noise) {   // §2.7 green-only
+                col[0] = avg[0]; col[1] = center_green; col[2] = avg[2];
+                var = -std::max(rgb_var[1], green_var);   // NEGATIVE = green-only flag
+            } else {
+                col[0] = avg[0]; col[1] = avg[1]; col[2] = avg[2];
+                var = (rgb_var[0] + rgb_var[1] + rgb_var[2]) / 3.f;        // POSITIVE
+            }
+            if (center_green >= cfg.gcam_sabre_clip_point)                 // §2.8 clip guard
+                col[0] = col[1] = col[2] = 10000.f;
+            guide.at(y, x, 0) = col[0];
+            guide.at(y, x, 1) = col[1];
+            guide.at(y, x, 2) = col[2];
+            guide.at(y, x, 3) = var;
+        }
+    return prefilter_ref ? gcam_prefilter_ref(guide) : guide;
+}
+
+// §5.3 MirrorUVs in guide-pixel space: reflect a sample coordinate back into
+// [0, n-1] (one reflection per side) so border regions still compare.
+static inline f32 gcam_mirror(f32 v, f32 n) {
+    const f32 hi = n - 1.f;
+    if (v < 0.f) v = -v;
+    if (v > hi)  v = 2.f * hi - v;
+    return clampf(v, 0.f, hi);
+}
+
+// §5.4 SampleBicubicAbsolute: cubic B-spline of the comparison guide with abs() of
+// each tap (edge-clamped; the caller mirrors first). Twin of the inline form in
+// rob_gcam_sabre (HHSRKernels.metal). B-spline weights sum to 1.
+static f32 sample_bicubic_abs(const Image& g, f32 fy, f32 fx, int ch) {
+    const int iy = (int)std::floor(fy), ix = (int)std::floor(fx);
+    f32 wy[4], wx[4];
+    cubic_bspline_w(fy - (f32)iy, wy);
+    cubic_bspline_w(fx - (f32)ix, wx);
+    f32 buf = 0.f, wacc = 0.f;
+    for (int m = 0; m < 4; ++m) {
+        const int y_ = (int)clampf((f32)(iy - 1 + m), 0.f, (f32)(g.h - 1));
+        for (int n = 0; n < 4; ++n) {
+            const int x_ = (int)clampf((f32)(ix - 1 + n), 0.f, (f32)(g.w - 1));
+            const f32 w = wy[m] * wx[n];
+            buf  += std::fabs(g.at(y_, x_, ch)) * w;
+            wacc += w;
+        }
+    }
+    return (wacc != 0.f) ? buf / wacc : buf;
+}
+
+// §7 dilation: grade each guide pixel by the 5x5 sum of neighbours' rejection
+// (1 - keep), apply (sum - deadzone)/div, store the keep mask. The shader's 2x
+// downsample is dropped -- staying at guide resolution is a strictly finer mask
+// that plugs into our merge's nearest guide-res read; the contrast math is
+// unchanged. Edge-clamped.
+Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
+    if (R.h <= 0 || R.w <= 0) return R;
+    Image out(R.h, R.w, 1);
+    const f32 dz = cfg.gcam_sabre_dilate_deadzone;
+    const f32 dv = (cfg.gcam_sabre_dilate_div != 0.f) ? cfg.gcam_sabre_dilate_div : 1.f;
+    for (int y = 0; y < R.h; ++y)
+        for (int x = 0; x < R.w; ++x) {
+            f32 sum = 0.f;
+            for (int i = -2; i <= 2; ++i) {
+                const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
+                for (int j = -2; j <= 2; ++j) {
+                    const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
+                    sum += 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);   // rejection
+                }
+            }
+            const f32 rej = (sum - dz) / dv;
+            out.at(y, x, 0) = clampf(1.f - rej, 0.f, 1.f);
+        }
+    return out;
+}
+
+// §4.1 per-component 3x3 median of the per-tile flow vectors (edge-clamped), in
+// place. Cleans isolated outlier vectors before robustness AND merge read the
+// field. Leaves affine/dense/global_h untouched (off in the gcam-faithful config).
+void median3x3_tile_flow(FlowField& flow) {
+    const int ny = flow.ny, nx = flow.nx;
+    if (ny <= 0 || nx <= 0 || flow.flow.empty()) return;
+    std::vector<f32> out(flow.flow.size());
+    auto cl = [](int a, int hi) { return a < 0 ? 0 : (a >= hi ? hi - 1 : a); };
+    auto med9 = [](f32 v[9]) -> f32 { std::nth_element(v, v + 4, v + 9); return v[4]; };
+    for (int ty = 0; ty < ny; ++ty)
+        for (int tx = 0; tx < nx; ++tx) {
+            f32 vx[9], vy[9]; int k = 0;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int qy = cl(ty + dy, ny), qx = cl(tx + dx, nx);
+                    vx[k] = flow.dx(qy, qx);
+                    vy[k] = flow.dy(qy, qx);
+                    ++k;
+                }
+            const size_t base = ((size_t)ty * nx + tx) * 2;
+            out[base + 0] = med9(vx);
+            out[base + 1] = med9(vy);
+        }
+    flow.flow = std::move(out);
+}
+
 RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
     if (!cfg.robustness_enabled) return RefStats();
 #ifdef __APPLE__
     // Metal GPU only — same math as the CPU path below (golden reference).
     RefStats gpu = init_robustness_metal(ref_raw, cfg);
-    if (gpu.means.h > 0 && gpu.means.w > 0) return gpu;
+    if (gpu.means.h > 0 && gpu.means.w > 0) {
+        // GCam SABRE (§2): the reference's 4-channel sqrt guide, pre-filtered
+        // (§2.10), built once per burst on the host. The CPU operator reads it on
+        // device; the opt-in Metal twin uploads it. Other paths leave it empty.
+        if (cfg.robustness_gcam_enabled)
+            gpu.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
+        return gpu;
+    }
     return RefStats();
 #else
     RefStats st;
@@ -1573,22 +1797,29 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         local_stats_3x3(lp_guide, lp_means, lp_vars);
         st.hf_loss = high_frequency_loss_map_adaptive(st.means, st.stds, lp_vars, cfg);
     }
-    if (cfg.robustness_raw_resolution_active()) {
+    // The raw-res Dodgson upscale is for the standard path only. The GCam SABRE
+    // path computes at guide resolution and never reads means_hires/stds_hires,
+    // so skip the big raw-res buffers entirely when gcam is enabled.
+    if (cfg.robustness_raw_resolution_active() && !cfg.robustness_gcam_enabled) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
         // burst here, not once per comparison frame.
-        // GCam samples the guide with SampleBicubic (cubic B-spline), so force the
-        // B-spline interpolant for the gcam stats upscale (not Catmull-Rom).
-        const bool gcam_bicubic = cfg.robustness_bicubic_guide || cfg.robustness_gcam_enabled;
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
                                             0, cfg.num_threads, false,
-                                            /*use_affine=*/false, gcam_bicubic,
+                                            /*use_affine=*/false,
+                                            cfg.robustness_bicubic_guide,
                                             /*catmull=*/false);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
                                            0, cfg.num_threads, false,
-                                           /*use_affine=*/false, gcam_bicubic,
+                                           /*use_affine=*/false,
+                                           cfg.robustness_bicubic_guide,
                                            /*catmull=*/false);
     }
+    // GCam SABRE (§2): the reference's 4-channel sqrt guide, pre-filtered (§2.10),
+    // built once per burst. Read by the operator (CPU) / uploaded by the Metal
+    // twin. Other paths leave it empty.
+    if (cfg.robustness_gcam_enabled)
+        st.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
     return st;
 #endif
 }
@@ -1613,7 +1844,7 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
 // moving-object seams, block-match blunders -- which is where a one-vector-per-
 // tile fetch is most likely wrong. (Measured to catch the gross/irregular ghosts,
 // not the subtle sub-pixel band; see Config::robustness_gcam_enabled.)
-static std::vector<f32> compute_flow_irregularity(const FlowField& flow) {
+std::vector<f32> compute_flow_irregularity(const FlowField& flow) {
     const int ny = flow.ny, nx = flow.nx;
     std::vector<f32> irr((size_t)std::max(0, ny) * std::max(0, nx), 0.f);
     if (ny <= 0 || nx <= 0 || flow.flow.empty()) return irr;
@@ -1669,6 +1900,114 @@ static inline f32 gcam_frame_weight(const f32* ref_mean, const f32* comp_mean,
     f32 w = std::exp2(arg);
     if (!std::isfinite(w)) w = 0.f;
     return clampf(w, 0.f, 1.f);
+}
+
+// §5 the ComputeFrameWeight operator, at guide resolution, in sqrt space. Per
+// guide pixel: fetch the pre-filtered reference colour, bicubic-abs sample the
+// flow-warped comparison colour+variance, subtract noise, normalise by the
+// measured variance, apply the motion-aware boost, map to a keep weight. The
+// comparison is warped INSIDE the pass (§5.1/5.4), so the merge reads the dilated
+// mask unwarped at the reference-frame position (matching §8). Returns a guide-
+// resolution keep mask, dilated per §7. Empty if the reference guide was not
+// built (robustness toggled on mid-burst) so the caller can fall through. Twin
+// of the inline operator in rob_gcam_sabre (HHSRKernels.metal).
+Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_stats,
+                                           const FlowField& flow, int tile_size,
+                                           const Config& cfg, Image* s_select_out) {
+    const Image& refg = ref_stats.gcam_guide;
+    if (refg.h <= 0 || refg.w <= 0 || refg.c < 4 || tile_size <= 0) return Image();
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/false);
+    if (compg.h != refg.h || compg.w != refg.w) return Image();
+    const int gh = refg.h, gw = refg.w;
+    const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
+    const f32 motion_thresh = cfg.gcam_sabre_motion_thresh * (f32)std::max(1, comp_raw.w);
+    const bool aff = cfg.affine_flow_enabled && flow.has_affine();
+    Image R(gh, gw, 1);
+    for (int y = 0; y < gh; ++y)
+        for (int x = 0; x < gw; ++x) {
+            // §5.1 flow (piecewise per tile, nearest), guide->raw->guide for the
+            // half-res grid -- the same mapping the existing guide-res branch uses.
+            const int patch_idy = (int)((2.f * (f32)y + 0.5f) / (f32)tile_size);
+            const int patch_idx = (int)((2.f * (f32)x + 0.5f) / (f32)tile_size);
+            f32 flow_x, flow_y;
+            if (aff) {
+                f32 rdx, rdy;
+                flow.sample_affine(2.f * (f32)y + 0.5f, 2.f * (f32)x + 0.5f, tile_size, rdx, rdy);
+                flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+            } else {
+                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
+                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+            }
+            f32 sx = (f32)x + flow_x, sy = (f32)y + flow_y;
+            if (flow.has_global_h) {
+                f32 hx, hy;
+                apply_homography(flow.global_h, 2.f * sx, 2.f * sy, hx, hy);
+                sx = 0.5f * hx; sy = 0.5f * hy;
+            }
+            sx = gcam_mirror(sx, (f32)gw);                 // §5.3
+            sy = gcam_mirror(sy, (f32)gh);
+            // §5.4 reference (plain lookup at the guide centre) + comparison (bicubic-abs).
+            const f32 ref_var_signed = refg.at(y, x, 3);
+            const bool green_only = ref_var_signed < 0.f;
+            f32 refc[3], curc[3];
+            for (int c = 0; c < 3; ++c) {
+                refc[c] = refg.at(y, x, c);
+                curc[c] = sample_bicubic_abs(compg, sy, sx, c);
+            }
+            f32 ref_a = std::fabs(ref_var_signed);
+            f32 cur_a = sample_bicubic_abs(compg, sy, sx, 3);
+            // §5.5 noise at the reference luma (both rows share our model), §3.6 scale.
+            const f32 luma = green_only ? refc[1] : (refc[0] + refc[1] + refc[2]) / 3.f;
+            f32 nlut[3]; gcam_noise_lut(cfg, luma, nlut);
+            f32 ref_noise[3], cur_noise[3];
+            for (int c = 0; c < 3; ++c) {
+                ref_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
+                cur_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
+            }
+            // §5.6 filter-variance scale on noise AND the measured variances.
+            const f32 k = green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb;
+            for (int c = 0; c < 3; ++c) { ref_noise[c] *= k; cur_noise[c] *= k; }
+            ref_a *= k; cur_a *= k;
+            // §5.7 variances.
+            const f32 pixel_variance = 2.f * std::min(ref_a, cur_a);
+            f32 noise_variance[3];
+            for (int c = 0; c < 3; ++c) noise_variance[c] = ref_noise[c] + cur_noise[c];
+            // §5.8 motion-aware boost (the parallax / rotation fix).
+            const f32 min_variance = green_only
+                ? ref_noise[1]
+                : (ref_noise[0] + ref_noise[1] + ref_noise[2]) / 3.f;
+            const size_t pidx = (size_t)patch_idy * (size_t)std::max(1, flow.nx) + patch_idx;
+            const f32 motion_extent = (pidx < irr.size()) ? irr[pidx] : 0.f;
+            const bool motion_prior = motion_extent > motion_thresh;
+            f32 boost = 1.f;
+            if (ref_a > cfg.gcam_sabre_boost_var_mult * min_variance && motion_prior)
+                boost = cfg.gcam_sabre_boost;
+            // §5.9 noise-corrected normalized distance -> weight.
+            f32 diff2n[3];
+            for (int c = 0; c < 3; ++c) {
+                const f32 d = curc[c] - refc[c];
+                const f32 diff2 = std::max(0.f, d * d - noise_variance[c]);
+                const f32 var_rgb = std::max(pixel_variance, noise_variance[c]) + 1e-20f;
+                diff2n[c] = diff2 / var_rgb;
+            }
+            f32 distance = green_only
+                ? cfg.gcam_sabre_mult_green * diff2n[1]
+                : cfg.gcam_sabre_mult_rgb * (diff2n[0] + diff2n[1] + diff2n[2]) / 3.f;
+            distance *= boost;
+            f32 arg = -distance;
+            if (arg > 0.f) arg = 0.f;
+            f32 w = std::exp2(arg);
+            if (!std::isfinite(w)) w = 0.f;
+            R.at(y, x, 0) = clampf(w, 0.f, 1.f);           // keep weight (unblocker = 0)
+        }
+    Image dil = robustness_gcam_dilate(R, cfg);            // §7
+    // The operator makes no s1/s2 prior choice; report the strict prior uniformly
+    // so the debug split masks stay well-formed (matches the learned-mask path).
+    if (s_select_out) {
+        *s_select_out = Image(dil.h, dil.w, 1);
+        std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
+    }
+    return dil;
 }
 
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
@@ -2287,6 +2626,29 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         std::fill(r.data.begin(), r.data.end(), 0.f);
         if (s_select_out) *s_select_out = Image(guide.h, guide.w, 1);
         return r;
+    }
+
+    // GCam SABRE exact robustness (Config::robustness_gcam_enabled): a self-
+    // contained ComputeFrameWeight port that REPLACES the standard Eq.5-9 mask,
+    // the learned mask, and the earlier gcam approximation. ALL gcam routing is
+    // handled here, before the NN / Metal / raw-res dispatch, so gcam can never
+    // fall through to those. With gcam_sabre_gpu the §5 operator runs as the
+    // rob_gcam_sabre Metal kernel (guides built on the host); otherwise -- and
+    // whenever the GPU twin is unavailable -- it runs the VERIFIED CPU operator,
+    // which runs on device too. On an empty return (reference guide not built,
+    // e.g. robustness toggled on mid-burst) fall through to the standard paths.
+    if (cfg.robustness_gcam_enabled) {
+#ifdef __APPLE__
+        if (cfg.gcam_sabre_gpu) {
+            Image g = compute_robustness_gcam_sabre_metal(comp_raw, ref_stats, flow,
+                                                          tile_size, cfg, s_select_out);
+            if (g.h > 0 && g.w > 0) return g;
+            // GPU twin unavailable -> fall through to the CPU operator below.
+        }
+#endif
+        Image r = compute_robustness_gcam_sabre(comp_raw, ref_stats, flow, tile_size,
+                                                cfg, s_select_out);
+        if (r.h > 0 && r.w > 0) return r;
     }
 
     // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both

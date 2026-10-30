@@ -617,6 +617,20 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_green_k"])    cfg.gcam_green_k = tuning[@"gcam_green_k"].floatValue;
     if (tuning[@"gcam_dilate_soft"]) cfg.gcam_dilate_soft = tuning[@"gcam_dilate_soft"].floatValue;
     if (tuning[@"gcam_filter_var_scale"]) cfg.gcam_filter_var_scale = tuning[@"gcam_filter_var_scale"].floatValue;
+    // GCam SABRE exact path (active whenever robustness_gcam_enabled).
+    if (tuning[@"gcam_sabre_green_factor"])   cfg.gcam_sabre_green_factor = tuning[@"gcam_sabre_green_factor"].floatValue;
+    if (tuning[@"gcam_sabre_clip_point"])     cfg.gcam_sabre_clip_point = tuning[@"gcam_sabre_clip_point"].floatValue;
+    if (tuning[@"gcam_sabre_k_rgb"])          cfg.gcam_sabre_k_rgb = tuning[@"gcam_sabre_k_rgb"].floatValue;
+    if (tuning[@"gcam_sabre_k_green"])        cfg.gcam_sabre_k_green = tuning[@"gcam_sabre_k_green"].floatValue;
+    if (tuning[@"gcam_sabre_rob_noise"])      cfg.gcam_sabre_rob_noise = tuning[@"gcam_sabre_rob_noise"].floatValue;
+    if (tuning[@"gcam_sabre_mult_rgb"])       cfg.gcam_sabre_mult_rgb = tuning[@"gcam_sabre_mult_rgb"].floatValue;
+    if (tuning[@"gcam_sabre_mult_green"])     cfg.gcam_sabre_mult_green = tuning[@"gcam_sabre_mult_green"].floatValue;
+    if (tuning[@"gcam_sabre_boost"])          cfg.gcam_sabre_boost = tuning[@"gcam_sabre_boost"].floatValue;
+    if (tuning[@"gcam_sabre_boost_var_mult"]) cfg.gcam_sabre_boost_var_mult = tuning[@"gcam_sabre_boost_var_mult"].floatValue;
+    if (tuning[@"gcam_sabre_motion_thresh"])  cfg.gcam_sabre_motion_thresh = tuning[@"gcam_sabre_motion_thresh"].floatValue;
+    if (tuning[@"gcam_sabre_dilate_deadzone"]) cfg.gcam_sabre_dilate_deadzone = tuning[@"gcam_sabre_dilate_deadzone"].floatValue;
+    if (tuning[@"gcam_sabre_dilate_div"])     cfg.gcam_sabre_dilate_div = tuning[@"gcam_sabre_dilate_div"].floatValue;
+    if (tuning[@"gcam_sabre_gpu"])            cfg.gcam_sabre_gpu = tuning[@"gcam_sabre_gpu"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"merge_robustness_bilinear"])
