@@ -1198,6 +1198,24 @@ bool metal_frame_has_raw(int slot) {
     return g_bf.valid_slot(slot) && g_bf.have_raw[(size_t)slot] != 0u;
 }
 
+// Upload a host robustness mask into the resident rob slot and mark it ready, so
+// the fused merge (which reads g_bf.robs, not a host stash) accepts the frame. The
+// GCam SABRE path returns a HOST guide-resolution keep mask; the standard resident
+// robustness writes this slot in-kernel, gcam doesn't. The resident slot is guide
+// resolution / rob_nch channels -- exactly the gcam mask's shape. False (no flag
+// set) on a shape mismatch, so the frame stays "not ready" rather than merging
+// garbage.
+bool metal_frame_put_rob(int slot, const Image& mask) {
+    if (!g_bf.valid_slot(slot) || !g_bf.robs) return false;
+    if (mask.h != g_bf.rob_h || mask.w != g_bf.rob_w || mask.c != g_bf.rob_nch) return false;
+    const size_t need = (size_t)g_bf.rob_h * (size_t)g_bf.rob_w * (size_t)g_bf.rob_nch;
+    if (mask.data.size() < need) return false;
+    memcpy((uint8_t*)[g_bf.robs contents] + bf_rob_off(slot) * sizeof(float),
+           mask.data.data(), need * sizeof(float));
+    g_bf.have_rob[(size_t)slot] = 1u;
+    return true;
+}
+
 bool metal_frame_merge_ready(int slot) {
     if (!g_bf.valid_slot(slot)) return false;
     return g_bf.have_raw[(size_t)slot] && g_bf.have_cov[(size_t)slot] &&

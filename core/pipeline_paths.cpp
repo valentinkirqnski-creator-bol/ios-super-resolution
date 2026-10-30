@@ -2226,6 +2226,17 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             rob.h == ref_grey.h && rob.w == ref_grey.w)
             rob_mask_nn_refine(rob, ref_grey, mask_nn_aligned_grey, mask_nn_consensus,
                                flow, merge_ts, work);
+#if defined(__APPLE__)
+        // GCam SABRE returns a HOST mask (guide resolution); the resident fused
+        // merge reads the GPU rob slot, which the gcam path never wrote (the
+        // standard resident robustness writes it in-kernel). Push the finished mask
+        // into slot k and mark its robustness ready, so the fused merge accepts the
+        // frame instead of refusing it ("rob 0"). No-op off the resident path --
+        // there the online / non-fused merge consumes the host mask directly.
+        if (work.robustness_gcam_enabled && frames_resident && rob_has_nonzero &&
+            !rob.data.empty())
+            metal_frame_put_rob(k, rob);
+#endif
         // Folded in here rather than beside absorb_robustness_sum, because that
         // call is made in only two of the three stash branches -- the cached
         // banded path defers to build_robustness_sum after the loop, and would

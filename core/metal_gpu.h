@@ -199,6 +199,12 @@ bool metal_fetch_host_ref_stats(RefStats& ref_stats);
 // shell), so the gcam path calls this to recover the pixels. False if residency is
 // off or the slot has no raw.
 bool metal_fetch_host_raw(Image& out);
+// Upload a host robustness mask into slot's resident rob slice and mark it ready.
+// The GCam SABRE path returns a host guide-resolution mask; the fused merge reads
+// the GPU rob slot, so this pushes it in (mirrors what the standard resident mask
+// kernel does in-place). The resident slot is guide-res / rob_nch -- the gcam mask
+// matches it. Returns false on a shape mismatch (frame then stays "not ready").
+bool metal_frame_put_rob(int slot, const Image& mask);
 // s_select_out, when non-null, also receives a per-pixel record of which motion
 // prior was applied: 1 where the strict s1 was used, 0 where s2 was.
 //
