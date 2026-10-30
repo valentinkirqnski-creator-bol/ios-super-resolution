@@ -2594,6 +2594,30 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     return st;
 }
 
+// Read the ACTIVE frame's resident raw plane back to a host Image (inverse of
+// metal_frame_put_raw). Needed by the GCam SABRE path, whose sqrt guide is built
+// on the host: on the capture path the Bayer frame is decoded straight into the
+// GPU slot and the host Image is a header-only shell. Returns false (leaving out
+// untouched) when residency is off or the slot has no raw.
+bool metal_fetch_host_raw(Image& out) {
+    if (!metal_gpu_init()) return false;
+    const int slot = bf_active();
+    if (slot < 0) return false;
+    id<MTLBuffer> rb = bf_raw_buffer(slot);
+    if (!rb) return false;
+    const int h = g_bf.raw_h, w = g_bf.raw_w;
+    if (h <= 0 || w <= 0) return false;
+    const size_t need = (size_t)h * (size_t)w;
+    if ([rb length] < (bf_raw_off(slot) + need) * sizeof(float)) return false;
+    // The resident raw is written without a wait by the decode; ensure it landed.
+    if (!metal_merge_wait_inflight()) return false;
+    out = Image(h, w, 1);
+    memcpy(out.data.data(),
+           (const uint8_t*)[rb contents] + bf_raw_off(slot) * sizeof(float),
+           need * sizeof(float));
+    return true;
+}
+
 bool metal_fetch_host_ref_stats(RefStats& ref_stats) {
     if (!g_rob_ref_m || !g_rob_ref_v) return false;
     if (g_rob_ref_h <= 0 || g_rob_ref_w <= 0 || g_rob_ref_c <= 0) return false;

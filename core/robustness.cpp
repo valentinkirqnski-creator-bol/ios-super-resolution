@@ -1666,6 +1666,13 @@ static Image gcam_prefilter_ref(const Image& g) {
 // highlight guard. Channel 3 is the SIGNED reference variance (negative =
 // green-only). prefilter_ref applies §2.10 (reference frame only).
 Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref) {
+    // The guide is built from host pixels. On the capture path the Bayer frame is
+    // decoded straight into the GPU slot, leaving a header-only host shell (h/w set,
+    // data empty) -- reading raw.at() there is a null deref. Bail to an empty guide
+    // so the caller falls back rather than crashing; the callers fetch the resident
+    // raw back to the host before calling this on that path.
+    if (raw.h <= 0 || raw.w <= 0 || raw.data.size() < (size_t)raw.h * (size_t)raw.w)
+        return Image();
     if (!cfg.bayer_mode) {
         Image g(raw.h, raw.w, 4);             // degenerate grey: sqrt plane, var 0
         for (int y = 0; y < raw.h; ++y)
@@ -1844,8 +1851,18 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // GCam SABRE (§2): the reference's 4-channel sqrt guide, pre-filtered
         // (§2.10), built once per burst on the host. The CPU operator reads it on
         // device; the opt-in Metal twin uploads it. Other paths leave it empty.
-        if (cfg.robustness_gcam_enabled)
-            gpu.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
+        // If the reference raw is a header-only shell (decoded into the GPU slot),
+        // pull it back from the resident buffer first (same as the comp path).
+        if (cfg.robustness_gcam_enabled) {
+            if (ref_raw.data.size() >= (size_t)ref_raw.h * (size_t)ref_raw.w) {
+                gpu.gcam_guide = compute_gcam_guide(ref_raw, cfg, /*prefilter_ref=*/true);
+            } else {
+                Image ref_host;
+                if (metal_fetch_host_raw(ref_host) &&
+                    ref_host.h == ref_raw.h && ref_host.w == ref_raw.w)
+                    gpu.gcam_guide = compute_gcam_guide(ref_host, cfg, /*prefilter_ref=*/true);
+            }
+        }
         return gpu;
     }
     return RefStats();
@@ -2728,15 +2745,25 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     // which runs on device too. On an empty return (reference guide not built,
     // e.g. robustness toggled on mid-burst) fall through to the standard paths.
     if (cfg.robustness_gcam_enabled) {
+        const Image* craw = &comp_raw;
 #ifdef __APPLE__
+        // Capture path: the Bayer frame is decoded straight into the GPU slot, so
+        // comp_raw is a header-only host shell (no pixels). The gcam guide is built
+        // on the host, so pull the resident raw back first. (Import path keeps host
+        // pixels, so the fetch is skipped.)
+        Image comp_host;
+        if (comp_raw.data.size() < (size_t)comp_raw.h * (size_t)comp_raw.w &&
+            metal_fetch_host_raw(comp_host) &&
+            comp_host.h == comp_raw.h && comp_host.w == comp_raw.w)
+            craw = &comp_host;
         if (cfg.gcam_sabre_gpu) {
-            Image g = compute_robustness_gcam_sabre_metal(comp_raw, ref_stats, flow,
+            Image g = compute_robustness_gcam_sabre_metal(*craw, ref_stats, flow,
                                                           tile_size, cfg, s_select_out);
             if (g.h > 0 && g.w > 0) return g;
             // GPU twin unavailable -> fall through to the CPU operator below.
         }
 #endif
-        Image r = compute_robustness_gcam_sabre(comp_raw, ref_stats, flow, tile_size,
+        Image r = compute_robustness_gcam_sabre(*craw, ref_stats, flow, tile_size,
                                                 cfg, s_select_out);
         if (r.h > 0 && r.w > 0) return r;
     }

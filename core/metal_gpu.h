@@ -193,6 +193,12 @@ void metal_release_host_ref_stats(RefStats& ref_stats); // free host pixels; kee
 //
 // Returns false if the buffers are missing or the dimensions disagree.
 bool metal_fetch_host_ref_stats(RefStats& ref_stats);
+// Read the ACTIVE frame's resident raw plane back to a host Image (h,w,1), the
+// inverse of metal_frame_put_raw. The GCam SABRE guide is built on the host, but on
+// the capture path the Bayer frame lives only in the GPU slot (header-only host
+// shell), so the gcam path calls this to recover the pixels. False if residency is
+// off or the slot has no raw.
+bool metal_fetch_host_raw(Image& out);
 // s_select_out, when non-null, also receives a per-pixel record of which motion
 // prior was applied: 1 where the strict s1 was used, 0 where s2 was.
 //
