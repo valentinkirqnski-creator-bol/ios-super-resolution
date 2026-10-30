@@ -1710,8 +1710,9 @@ struct RobMaskParamsCPU {
     // Var = gcam_na*clamp(luma)+gcam_nb, green channel halved in the gcam branch.
     float    gcam_na = 0.0f;
     float    gcam_nb = 0.0f;
+    float    gcam_fvs = 1.0f;  // kFilterVarianceScale (Config::gcam_filter_var_scale)
 };
-static_assert(sizeof(RobMaskParamsCPU) == 216, "RobMaskParamsCPU");
+static_assert(sizeof(RobMaskParamsCPU) == 220, "RobMaskParamsCPU");
 
 // Keep in lockstep with RobMaskRawParams in HHSRKernels.metal.
 struct RobMaskRawParamsCPU {
@@ -1760,8 +1761,9 @@ struct RobMaskRawParamsCPU {
     // Var = gcam_na*clamp(luma)+gcam_nb, green channel halved in the gcam branch.
     float    gcam_na = 0.0f;
     float    gcam_nb = 0.0f;
+    float    gcam_fvs = 1.0f;  // kFilterVarianceScale (Config::gcam_filter_var_scale)
 };
-static_assert(sizeof(RobMaskRawParamsCPU) == 176, "RobMaskRawParamsCPU");
+static_assert(sizeof(RobMaskRawParamsCPU) == 180, "RobMaskRawParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2519,14 +2521,17 @@ static RefStats init_robustness_metal_impl(const Image& ref_raw, const Config& c
     int hires_h = 0, hires_w = 0;
     if (cfg.robustness_raw_resolution_active()) {
         int mh = 0, mw = 0, vh = 0, vw = 0;
+        // GCam's SampleBicubic is a cubic B-spline, so force B-spline (not
+        // Catmull-Rom) for the gcam stats upscale.
+        const bool gcam_bicubic = cfg.robustness_bicubic_guide || cfg.robustness_gcam_enabled;
         if (!rob_dogson(b_means, b_means_hires, gh, gw, nch, /*is_ref=*/true,
                         nullptr, 0, mh, mw, cmd, false, /*use_affine=*/false,
-                        /*use_dense=*/false, cfg.robustness_bicubic_guide,
-                        /*catmull=*/cfg.robustness_gcam_enabled) ||
+                        /*use_dense=*/false, gcam_bicubic,
+                        /*catmull=*/false) ||
             !rob_dogson(b_vars, b_vars_hires, gh, gw, nch, /*is_ref=*/true,
                        nullptr, 0, vh, vw, cmd, false, /*use_affine=*/false,
-                       /*use_dense=*/false, cfg.robustness_bicubic_guide,
-                       /*catmull=*/cfg.robustness_gcam_enabled) ||
+                       /*use_dense=*/false, gcam_bicubic,
+                       /*catmull=*/false) ||
             mh != vh || mw != vw) {
             return RefStats();
         }
@@ -2661,14 +2666,17 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     if (gh != g_rob_ref_h || gw != g_rob_ref_w || nch != g_rob_ref_c)
         return Image();
 
+    // GCam's SampleBicubic is a cubic B-spline, so force B-spline (not Catmull-Rom)
+    // for the gcam comp-stats warp.
+    const bool gcam_bicubic = cfg.robustness_bicubic_guide || cfg.robustness_gcam_enabled;
     id<MTLBuffer> b_comp_means_hires = nil;
     int ch_h = 0, ch_w = 0;
     if (!rob_dogson(b_gmeans, b_comp_means_hires, gh, gw, nch, /*is_ref=*/false,
                     &flow, tile_size, ch_h, ch_w, cmd,
                     false, /*use_affine=*/cfg.affine_flow_enabled,
                     /*use_dense=*/cfg.dense_flow_enabled,
-                    /*bicubic=*/cfg.robustness_bicubic_guide,
-                    /*catmull=*/cfg.robustness_gcam_enabled))
+                    /*bicubic=*/gcam_bicubic,
+                    /*catmull=*/false))
         return Image();
     if (ch_h != g_rob_ref_hires_h || ch_w != g_rob_ref_hires_w)
         return Image();
@@ -2683,8 +2691,8 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
                         &flow, tile_size, cvh, cvw, cmd,
                         false, /*use_affine=*/cfg.affine_flow_enabled,
                         /*use_dense=*/cfg.dense_flow_enabled,
-                        /*bicubic=*/cfg.robustness_bicubic_guide,
-                        /*catmull=*/cfg.robustness_gcam_enabled))
+                        /*bicubic=*/gcam_bicubic,
+                        /*catmull=*/false))
             return Image();
     }
 
@@ -2823,6 +2831,7 @@ static Image compute_robustness_metal_raw_res_impl(const Image& comp_raw,
     // in-kernel. Twin of guide_noise_var() in robustness.cpp.
     mp.gcam_na = cfg.noise_alpha_robustness();
     mp.gcam_nb = cfg.noise_beta_robustness();
+    mp.gcam_fvs = cfg.gcam_filter_var_scale;
     // Flow (+ optional Jacobian) for the geometry test. Bound unconditionally
     // (the kernel declares them); inert single-element dummies when off.
     id<MTLBuffer> b_geom_flow = !flow.flow.empty()
@@ -3107,6 +3116,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // in-kernel. Twin of guide_noise_var() in robustness.cpp.
     mp.gcam_na = cfg.noise_alpha_robustness();
     mp.gcam_nb = cfg.noise_beta_robustness();
+    mp.gcam_fvs = cfg.gcam_filter_var_scale;
     mp.guide_res_bilinear = cfg.robustness_guide_res_bilinear ? 1u : 0u;
     mp.sqrt_index = (cfg.robustness_guide_sqrt_active() ||
                      cfg.robustness_perceptual_sqrt) ? 1u : 0u; // 1.4 parity / VST

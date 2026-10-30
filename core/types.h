@@ -1640,21 +1640,30 @@ struct Config {
     float motion_geom_reject_threshold_relative = 0.04f;
 
     // GCam-form robustness (robustness.cpp raw-res path + Metal twins). The EXACT
-    // ComputeFrameWeight reverse-engineered from Super Res Zoom, in LINEAR guide
-    // space:
-    //   per channel: d += Delta^4 / (Delta^2 + 2*noise_var[ch])   (Delta = cmp-ref)
-    //   std_dev  = max( min(std_ref, std_comp), min_std )         (min_std = noise std)
-    //   distance = (d / std_dev^2) * gcam_mult * boost
+    // SABRE ComputeFrameWeight, reverse-engineered from the real Super Res Zoom
+    // shader source, in LINEAR guide space. Per channel, then averaged:
+    //   d2_c   = (comp_c - ref_c)^2                           (filtered guide samples)
+    //   noise  = ref_noise_c + cur_noise_c ~ 2*noise_var[ch]  (Var(X-Y)=Var X+Var Y)
+    //   num_c  = max(0, d2_c - noise)                         (HARD noise subtraction)
+    //   pv     = 2 * min(var_ref, var_comp)                   (GCam's single .w, doubled)
+    //   den_c  = max(pv, noise)
+    //   distance = gcam_mult * mean_c( num_c / den_c ) * boost
     //   boost    = gcam_boost where (std_ref > gcam_tex_gate*min_std AND flow irregular) else 1
     //   w        = clamp( exp2( min(gcam_thresh - distance, 0) ), 0, 1 )
     // GCam constants: mult=1, thresh=0 (additive inside exp2), boost=6, tex_gate=5.
-    // The noise term is 2x the single-frame variance (difference of two noisy
-    // samples). std_comp needs the comparison frame's local variance, so GCam warps
-    // comp_vars too (one extra hires buffer -- opt-in RAM). APPROXIMATIONS vs the
-    // APK: GCam stores one guide-std per pixel (.w); we collapse our 3-channel
-    // stats (mean variance). The UNBLOCKER (compiled variance-loss stage) is
-    // omitted. The exact soft 5x5 dilation (sum/3) is approximated by
-    // gcam_dilate_soft. Off by default. MEASURED (earlier sqrt-space form): the
+    // Every variance/noise term is first multiplied by gcam_filter_var_scale (the
+    // guide's filter variance reduction); the squared difference is NOT. This is the
+    // PRODUCTION operator, not the published HHSR paper form: there is NO Wiener
+    // shrink -- the noise is subtracted hard and clamped at 0, and each channel's
+    // distance is normalised by max(2*measured_var, noise) then averaged. std_comp
+    // needs the comparison frame's local variance, so GCam warps comp_vars too (one
+    // extra hires buffer -- opt-in RAM). APPROXIMATIONS vs the APK: GCam stores one
+    // guide variance per pixel (.w) and broadcasts it over channels; we use the
+    // per-channel mean of our 3-channel stats as that one scalar. The UNBLOCKER
+    // (compiled variance-loss stage), the green-only sign-bit mode, and the border
+    // MirrorUVs are omitted. The exact soft 5x5 dilation (sum/3) is approximated by
+    // gcam_dilate_soft. The comparison stats are sampled with GCam's SampleBicubic
+    // (cubic B-spline). Off by default. MEASURED (earlier sqrt-space form): the
     // single-frame mask catches ~58% of visible ghosts but not the sub-pixel band
     // (needs flow / consensus). Two further readable pieces exist below:
     //   * gcam_green_k -- the green-difference aliasing tolerance. GCam raises the
@@ -1683,6 +1692,14 @@ struct Config {
     float gcam_irr_gate = 0.5f;    // boost only where per-tile flow irregularity > this (raw px); A/B on device
     float gcam_green_k = 0.0f;     // green-diff aliasing tolerance (RGB-guide adaptation); 0 = off
     float gcam_dilate_soft = 1.0f; // soft 5x5 dilation: 1 = hard min (Eq.9), <1 softens the spread
+    // kFilterVarianceScale: scales the noise model AND the measured variances (NOT
+    // d^2) to the guide's post-filter domain. GCam's literal value for the RGB
+    // bicubic path is 0.0898866 (green-only 0.211665). Defaulted to 1.0 (off)
+    // because our ref/comp variances are already measured on the filtered guide, so
+    // GCam's 0.0898866 would double-count and over-reject; set it to GCam's value
+    // only if you confirm our variances are raw-domain. It is in the formula at
+    // GCam's exact positions, so the operator SHAPE matches regardless of the value.
+    float gcam_filter_var_scale = 1.0f;
     float gcam_alias_k = 4.0f;     // (unused; kept for config compatibility)
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where

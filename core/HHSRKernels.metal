@@ -1824,6 +1824,10 @@ struct RobMaskParams {
     // guide_noise_var() in robustness.cpp; used only by the gcam branch.
     float gcam_na;
     float gcam_nb;
+    // kFilterVarianceScale (Config::gcam_filter_var_scale): scales the noise AND the
+    // measured variances (not d^2) in the gcam distance. Keep in lockstep with
+    // RobMaskParamsCPU.
+    float gcam_fvs;
 };
 
 // Bilinear sample of the per-tile motion scale S at a tile coordinate (already
@@ -1966,6 +1970,32 @@ inline float rob_sample_catmull_or_inf(device const float* img,
         }
     }
     return buf;  // Catmull-Rom weights sum to 1 exactly, so no renormalisation.
+}
+
+// Cubic B-spline bicubic sample of a stat buffer at the exact sub-pixel position,
+// +inf out of bounds -- GCam's SampleBicubic. Twin of sample_bicubic in
+// robustness.cpp (the 16-tap form; GCam folds it into 4 bilinear fetches). Used by
+// the gcam branch so the comparison stats are sampled exactly as Super Res Zoom
+// samples the guide. Renormalises by the accumulated weight for edge-clamp parity.
+inline float rob_sample_bspline_or_inf(device const float* img,
+                                       uint h, uint w, uint nch,
+                                       float y, float x, uint ch) {
+    if (!(y >= 0.f && y < float(h) && x >= 0.f && x < float(w))) return INFINITY;
+    int iy = int(floor(y)), ix = int(floor(x));
+    float wy[4], wx[4];
+    cubic_bspline_w(y - float(iy), wy);
+    cubic_bspline_w(x - float(ix), wx);
+    float buf = 0.f, w_acc = 0.f;
+    for (int m = 0; m < 4; ++m) {
+        int y_ = clamp_edge(iy - 1 + m, int(h) - 1);
+        for (int n = 0; n < 4; ++n) {
+            int x_ = clamp_edge(ix - 1 + n, int(w) - 1);
+            float wgt = wy[m] * wx[n];
+            buf += img[(uint(y_) * w + uint(x_)) * nch + ch] * wgt;
+            w_acc += wgt;
+        }
+    }
+    return buf / w_acc;
 }
 
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
@@ -2572,43 +2602,51 @@ kernel void rob_make_mask(device float* R [[buffer(0)]],
             R[obase + ch] = rc * emc;
         }
     } else if (p.gcam_enabled != 0u) {
-        // EXACT GCam ComputeFrameWeight (linear guide space), guide-RESOLUTION path.
+        // EXACT SABRE ComputeFrameWeight (linear guide space), guide-RESOLUTION path.
         // R is computed here at guide resolution and later bilinearly upsampled to
-        // the merge grid (GCam SABRE sec. 4-5). Twin of the raw-res branch, except
-        // the comparison stats are SAMPLED at the warped guide coordinate (the
-        // raw-res twin reads them pre-warped). comp_vars gives the real
-        // min(std_ref, std_comp). GCam samples the guide with a bicubic Catmull-Rom
-        // (SampleBicubic); use it for both the comparison mean and variance so the
-        // mask scores exactly GCam's fetch.
-        float d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
-        for (uint ch = 0u; ch < p.nch; ++ch) {
+        // the merge grid (GCam SABRE sec. 4-5). Twin of the raw-res branch and of
+        // gcam_frame_weight in robustness.cpp: d2 unscaled; noise = 2*k*nv; measured
+        // term one scalar pv = 2*k*min(mean ref var, mean comp var); per-channel
+        // num/den averaged; NO Wiener shrink. The comparison stats are SAMPLED at the
+        // warped guide coordinate with GCam's SampleBicubic (cubic B-spline) so the
+        // mask scores exactly GCam's fetch; comp_vars gives the real min(var).
+        uint ncl = min(p.nch, 3u);
+        float inv_ncl = 1.f / float(max(1u, ncl));
+        float mr[3], mc[3], rvv[3], cvv[3], nvv[3];
+        float rvs = 0.f, cvs = 0.f, nvm = 0.f;
+        for (uint ch = 0u; ch < ncl; ++ch) {
             uint o = (gid.y * p.w + gid.x) * p.nch + ch;
-            float mr = ref_means[o];
-            float comp = rob_sample_catmull_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch);
-            float cvar = rob_sample_catmull_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch);
-            float delta = isfinite(comp) ? (comp - mr) : 1e15f;   // OOB comp -> huge d
-            float d2 = delta * delta;
+            float r = ref_means[o];
+            float comp = rob_sample_bspline_or_inf(comp_means, p.h, p.w, p.nch, sample_y, sample_x, ch);
+            float cvar = rob_sample_bspline_or_inf(comp_vars, p.h, p.w, p.nch, sample_y, sample_x, ch);
             // Per-channel noise variance (GCam noise_var_rgb; twin of
             // guide_noise_var): robustness-scaled Var = na*clamp(luma)+nb, halved
             // on the green guide channel (mean of two Bayer greens).
-            float nv = p.gcam_na * clamp(mr, 0.f, 1.f) + p.gcam_nb;
+            float nv = p.gcam_na * clamp(r, 0.f, 1.f) + p.gcam_nb;
             if (p.nch == 3u && ch == 1u) nv *= 0.5f;
             nv = max(nv, 1e-12f);
-            d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);          // Delta^4 / (Delta^2 + 2*nv)
-            ref_var_sum += ref_vars[o];
-            comp_var_sum += isfinite(cvar) ? cvar : ref_vars[o];  // OOB -> fall back to ref
-            noise_var_sum += nv;
+            mr[ch] = r;
+            mc[ch] = isfinite(comp) ? comp : 1e15f;               // OOB comp -> huge diff
+            rvv[ch] = ref_vars[o];
+            cvv[ch] = isfinite(cvar) ? cvar : rvv[ch];            // OOB comp var -> ref var
+            nvv[ch] = nv;
+            rvs += rvv[ch]; cvs += cvv[ch]; nvm += nvv[ch];
         }
-        float inv_nch = 1.f / float(max(1u, p.nch));
-        float ref_std = sqrt(max(0.f, ref_var_sum * inv_nch));
-        float comp_std = sqrt(max(0.f, comp_var_sum * inv_nch));
-        float min_std = sqrt(max(0.f, noise_var_sum * inv_nch));
-        float std_dev = max(min(ref_std, comp_std), min_std);
-        float sig2 = std_dev * std_dev + 1e-20f;
-        bool textured = ref_std > p.gcam_tex_gate * min_std;
+        rvs *= inv_ncl; cvs *= inv_ncl; nvm *= inv_ncl;
+        float k = p.gcam_fvs;
+        float pv = 2.f * k * min(rvs, cvs);                       // scalar measured variance
+        float acc = 0.f;
+        for (uint ch = 0u; ch < ncl; ++ch) {
+            float d2 = (mc[ch] - mr[ch]) * (mc[ch] - mr[ch]);
+            float noise = 2.f * k * nvv[ch];                      // ref+cur noise ~ 2*nv
+            acc += max(0.f, d2 - noise) / (max(pv, noise) + 1e-20f);
+        }
+        float ref_std = sqrt(max(0.f, rvs));
+        float noise_std = sqrt(max(0.f, nvm));
+        bool textured = ref_std > p.gcam_tex_gate * noise_std;
         float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, patch_idy, patch_idx);
         float boost = (textured && irr > p.gcam_irr_gate) ? p.gcam_boost : 1.f;
-        float distance = (d / sig2) * p.gcam_mult * boost;
+        float distance = p.gcam_mult * (acc * inv_ncl) * boost;
         float arg = p.gcam_thresh - distance; if (arg > 0.f) arg = 0.f;
         float r_val = clamp(exp2(arg), 0.f, 1.f);
         if (!isfinite(r_val)) r_val = 0.f;
@@ -2679,6 +2717,9 @@ struct RobMaskRawParams {
     // guide_noise_var() in robustness.cpp; used only by the gcam branch.
     float gcam_na;
     float gcam_nb;
+    // kFilterVarianceScale (Config::gcam_filter_var_scale). Keep in lockstep with
+    // RobMaskRawParamsCPU.
+    float gcam_fvs;
 };
 
 // Algorithm 6, read literally: ref_means/ref_vars/comp_means are already at
@@ -2945,42 +2986,51 @@ kernel void rob_make_mask_raw(device float* R [[buffer(0)]],
             R[obase + ch] = rc * emc;
         }
     } else if (p.gcam_enabled != 0u) {
-        // EXACT GCam ComputeFrameWeight (linear guide space). Twin of the CPU
-        // branch in compute_robustness_raw_res. Per channel: Wiener-attenuated
-        // squared difference, noise term 2x single-frame variance:
-        //   d = sum_ch Delta^4 / (Delta^2 + 2*noise_var)
-        // std_dev = max(min(std_ref, std_comp), min_std); distance = d/std^2 *
-        // mult * boost; w = exp2(min(thresh - distance, 0)). boost where high-detail
-        // (std_ref > tex_gate*min_std) AND flow irregular. Single std collapsed from
-        // the 3-channel stats (mean variance); unblocker omitted.
-        float d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
-        for (uint ch = 0u; ch < p.nch; ++ch) {
+        // EXACT SABRE ComputeFrameWeight (linear guide space). Twin of the CPU branch
+        // in compute_robustness_raw_res and of gcam_frame_weight: d2 unscaled; noise =
+        // 2*k*nv; measured term one scalar pv = 2*k*min(mean ref var, mean comp var);
+        // per-channel num/den = max(0, d2 - noise)/max(pv, noise), averaged. NO Wiener
+        // shrink. boost where high-detail (std_ref > tex_gate*noise_std) AND flow
+        // irregular. Single scalar variance collapsed from the 3-channel stats
+        // (mean); the measured stats are already flow-warped (rob_upscale_dogson,
+        // B-spline). Unblocker / green-only / border-mirror omitted.
+        uint ncl = min(p.nch, 3u);
+        float inv_ncl = 1.f / float(max(1u, ncl));
+        float mr[3], mc[3], rvv[3], cvv[3], nvv[3];
+        float rvs = 0.f, cvs = 0.f, nvm = 0.f;
+        for (uint ch = 0u; ch < ncl; ++ch) {
             uint o = out_o * p.nch + ch;
-            float mr = ref_means[o];
-            float mc = comp_means[o];
-            float delta = isfinite(mc) ? (mc - mr) : 1e15f;   // OOB comp -> huge d
-            float d2 = delta * delta;
+            float r = ref_means[o];
+            float comp = comp_means[o];
+            float cvar = comp_vars[o];
             // Per-channel noise variance (GCam noise_var_rgb; twin of
             // guide_noise_var): robustness-scaled Var = na*clamp(luma)+nb, halved
             // on the green guide channel (mean of two Bayer greens).
-            float nv = p.gcam_na * clamp(mr, 0.f, 1.f) + p.gcam_nb;
+            float nv = p.gcam_na * clamp(r, 0.f, 1.f) + p.gcam_nb;
             if (p.nch == 3u && ch == 1u) nv *= 0.5f;
             nv = max(nv, 1e-12f);
-            d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);          // Delta^4 / (Delta^2 + 2*nv)
-            ref_var_sum += ref_vars[o];
-            comp_var_sum += comp_vars[o];
-            noise_var_sum += nv;
+            mr[ch] = r;
+            mc[ch] = isfinite(comp) ? comp : 1e15f;               // OOB comp -> huge diff
+            rvv[ch] = ref_vars[o];
+            cvv[ch] = isfinite(cvar) ? cvar : rvv[ch];            // OOB comp var -> ref var
+            nvv[ch] = nv;
+            rvs += rvv[ch]; cvs += cvv[ch]; nvm += nvv[ch];
         }
-        float inv_nch = 1.f / float(max(1u, p.nch));
-        float ref_std = sqrt(max(0.f, ref_var_sum * inv_nch));
-        float comp_std = sqrt(max(0.f, comp_var_sum * inv_nch));
-        float min_std = sqrt(max(0.f, noise_var_sum * inv_nch));
-        float std_dev = max(min(ref_std, comp_std), min_std);
-        float sig2 = std_dev * std_dev + 1e-20f;
-        bool textured = ref_std > p.gcam_tex_gate * min_std;
+        rvs *= inv_ncl; cvs *= inv_ncl; nvm *= inv_ncl;
+        float k = p.gcam_fvs;
+        float pv = 2.f * k * min(rvs, cvs);                       // scalar measured variance
+        float acc = 0.f;
+        for (uint ch = 0u; ch < ncl; ++ch) {
+            float d2 = (mc[ch] - mr[ch]) * (mc[ch] - mr[ch]);
+            float noise = 2.f * k * nvv[ch];                      // ref+cur noise ~ 2*nv
+            acc += max(0.f, d2 - noise) / (max(pv, noise) + 1e-20f);
+        }
+        float ref_std = sqrt(max(0.f, rvs));
+        float noise_std = sqrt(max(0.f, nvm));
+        bool textured = ref_std > p.gcam_tex_gate * noise_std;
         float irr = rob_flow_irr(flow, p.flow_ny, p.flow_nx, int(patch_idy), int(patch_idx));
         float boost = (textured && irr > p.gcam_irr_gate) ? p.gcam_boost : 1.f;
-        float distance = (d / sig2) * p.gcam_mult * boost;
+        float distance = p.gcam_mult * (acc * inv_ncl) * boost;
         float arg = p.gcam_thresh - distance; if (arg > 0.f) arg = 0.f;
         float r_val = clamp(exp2(arg), 0.f, 1.f);
         if (!isfinite(r_val)) r_val = 0.f;

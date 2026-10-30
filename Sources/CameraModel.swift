@@ -273,6 +273,10 @@ struct TuningParams: Equatable, Codable {
     var gcam_irr_gate: Float = 0.5
     var gcam_green_k: Float = 0.0
     var gcam_dilate_soft: Float = 1.0
+    /// kFilterVarianceScale (Config::gcam_filter_var_scale). 1.0 = off; GCam's
+    /// literal RGB value is 0.090. Defaulted off because our variances are already
+    /// measured on the filtered guide (see the Config comment).
+    var gcam_filter_var_scale: Float = 1.0
     /// Paper-exact robustness upsampling (SIGGRAPH 2019 step 3): compute R at the
     /// half-res guide resolution and bilinearly upsample it to the merge grid,
     /// instead of our default full-resolution R with a nearest upsample. Off by
@@ -516,7 +520,7 @@ struct TuningParams: Equatable, Codable {
         case feat_metric_refine_enabled
         case decimate_dense_align_enabled
         case robustness_per_channel, robustness_gcam_enabled
-        case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft
+        case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -644,6 +648,7 @@ struct TuningParams: Equatable, Codable {
         gcam_irr_gate = try c.decodeIfPresent(Float.self, forKey: .gcam_irr_gate) ?? gcam_irr_gate
         gcam_green_k = try c.decodeIfPresent(Float.self, forKey: .gcam_green_k) ?? gcam_green_k
         gcam_dilate_soft = try c.decodeIfPresent(Float.self, forKey: .gcam_dilate_soft) ?? gcam_dilate_soft
+        gcam_filter_var_scale = try c.decodeIfPresent(Float.self, forKey: .gcam_filter_var_scale) ?? gcam_filter_var_scale
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         merge_robustness_bilinear = try c.decodeIfPresent(Bool.self, forKey: .merge_robustness_bilinear) ?? merge_robustness_bilinear
         robustness_bicubic_guide = try c.decodeIfPresent(Bool.self, forKey: .robustness_bicubic_guide) ?? robustness_bicubic_guide
@@ -2474,6 +2479,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_irr_gate": NSNumber(value: tuningParams.gcam_irr_gate),
             "gcam_green_k": NSNumber(value: tuningParams.gcam_green_k),
             "gcam_dilate_soft": NSNumber(value: tuningParams.gcam_dilate_soft),
+            "gcam_filter_var_scale": NSNumber(value: tuningParams.gcam_filter_var_scale),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "merge_robustness_bilinear": NSNumber(value: tuningParams.merge_robustness_bilinear),
             "robustness_bicubic_guide": NSNumber(value: tuningParams.robustness_bicubic_guide),

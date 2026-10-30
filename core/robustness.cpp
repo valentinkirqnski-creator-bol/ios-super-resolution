@@ -1577,14 +1577,17 @@ RefStats init_robustness(const Image& ref_raw, const Config& cfg) {
         // is_ref=true: no flow warp, just the Dodgson upscale (Algorithm 6
         // never warps the reference's own stats -- only Gn's). Once per
         // burst here, not once per comparison frame.
+        // GCam samples the guide with SampleBicubic (cubic B-spline), so force the
+        // B-spline interpolant for the gcam stats upscale (not Catmull-Rom).
+        const bool gcam_bicubic = cfg.robustness_bicubic_guide || cfg.robustness_gcam_enabled;
         st.means_hires = upscale_warp_stats(st.means, /*is_ref=*/true, nullptr,
                                             0, cfg.num_threads, false,
-                                            /*use_affine=*/false, cfg.robustness_bicubic_guide,
-                                            /*catmull=*/cfg.robustness_gcam_enabled);
+                                            /*use_affine=*/false, gcam_bicubic,
+                                            /*catmull=*/false);
         st.stds_hires = upscale_warp_stats(st.stds, /*is_ref=*/true, nullptr,
                                            0, cfg.num_threads, false,
-                                           /*use_affine=*/false, cfg.robustness_bicubic_guide,
-                                           /*catmull=*/cfg.robustness_gcam_enabled);
+                                           /*use_affine=*/false, gcam_bicubic,
+                                           /*catmull=*/false);
     }
     return st;
 #endif
@@ -1629,6 +1632,43 @@ static std::vector<f32> compute_flow_irregularity(const FlowField& flow) {
             irr[(size_t)ty * nx + tx] = std::sqrt(rx * rx + ry * ry);
         }
     return irr;
+}
+
+// EXACT SABRE ComputeFrameWeight -> frame weight (linear guide space), shared by
+// both GCam CPU branches (raw-res and guide-res) so the operator lives in one
+// place. Inputs are per-channel guide means (ref/comp), per-channel measured
+// variances (ref/comp), and the per-channel single-frame noise variance at the
+// reference luma (already green-halved by guide_noise_var). Matches the real
+// shader (see Config::robustness_gcam_enabled): d2 unscaled; noise = 2*k*nv (the
+// summed two-frame noise, Var(X-Y)=Var X+Var Y); the measured term is ONE scalar
+// pv = 2*k*min(mean ref var, mean comp var) broadcast over channels (GCam's single
+// .w, doubled); per-channel num/den averaged; boost passed in by the caller
+// (needs the tile flow irregularity). k = gcam_filter_var_scale. NO Wiener shrink.
+// Twin of the inline operator in rob_make_mask / rob_make_mask_raw (HHSRKernels.metal).
+static inline f32 gcam_frame_weight(const f32* ref_mean, const f32* comp_mean,
+                                    const f32* ref_var, const f32* comp_var,
+                                    const f32* noise_var, int nch, f32 k,
+                                    f32 mult, f32 thresh, f32 boost) {
+    const f32 inv_nch = 1.f / (f32)(nch > 0 ? nch : 1);
+    f32 rvs = 0.f, cvs = 0.f;
+    for (int ch = 0; ch < nch; ++ch) { rvs += ref_var[ch]; cvs += comp_var[ch]; }
+    rvs *= inv_nch; cvs *= inv_nch;
+    const f32 pv = 2.f * k * std::min(rvs, cvs);             // scalar measured variance
+    f32 acc = 0.f;
+    for (int ch = 0; ch < nch; ++ch) {
+        const f32 delta = comp_mean[ch] - ref_mean[ch];
+        const f32 d2 = delta * delta;
+        const f32 noise = 2.f * k * noise_var[ch];           // ref+cur noise ~ 2*nv
+        const f32 num = std::max(0.f, d2 - noise);
+        const f32 den = std::max(pv, noise) + 1e-20f;
+        acc += num / den;
+    }
+    const f32 distance = mult * (acc * inv_nch) * boost;
+    f32 arg = thresh - distance;
+    if (arg > 0.f) arg = 0.f;
+    f32 w = std::exp2(arg);
+    if (!std::isfinite(w)) w = 0.f;
+    return clampf(w, 0.f, 1.f);
 }
 
 static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& ref_stats,
@@ -1684,15 +1724,18 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
             local_stats_3x3(guide, comp_means_guide, comp_vars_guide);
             if (!gcam) comp_vars_guide = Image();  // free unless GCam needs std_comp
         }
+        // GCam's SampleBicubic is a cubic B-spline; force that interpolant for the
+        // gcam comp-stats warp (not Catmull-Rom).
+        const bool gcam_bicubic = cfg.robustness_bicubic_guide || gcam;
         comp_means = upscale_warp_stats(comp_means_guide, /*is_ref=*/false, &flow,
                                         tile_size, cfg.num_threads, false,
-                                        cfg.affine_flow_enabled, cfg.robustness_bicubic_guide,
-                                        /*catmull=*/gcam);
+                                        cfg.affine_flow_enabled, gcam_bicubic,
+                                        /*catmull=*/false);
         if (gcam)
             comp_vars = upscale_warp_stats(comp_vars_guide, /*is_ref=*/false, &flow,
                                            tile_size, cfg.num_threads, false,
-                                           cfg.affine_flow_enabled, cfg.robustness_bicubic_guide,
-                                           /*catmull=*/gcam);
+                                           cfg.affine_flow_enabled, gcam_bicubic,
+                                           /*catmull=*/false);
     }
 
     const Image& ref_means = ref_stats.means_hires;
@@ -1823,55 +1866,38 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
                 }
             }
             // An out-of-bounds Dodgson sample writes +inf into comp_means by
-            // design ("infinite will imply R = 0"), which makes d^2 +inf and the
-            // Wiener shrink inf/inf = NaN; a non-finite r_val is forced to 0.
+            // design ("infinite will imply R = 0"); it becomes the 1e15 sentinel
+            // below so the noise-corrected difference is huge and w collapses to 0.
             if (gcam) {
-                // GCam-form weight (original math; see Config::robustness_gcam_enabled).
-                // Normalise the photometric difference by local CONTRAST (floored at
-                // EXACT GCam ComputeFrameWeight (reverse-engineered from the APK),
-                // in linear guide space. Per RGB channel: a Wiener-attenuated
-                // squared difference, summed; the noise term is 2x the single-frame
-                // variance (the difference of two noisy samples has twice the
-                // variance):
-                //   d = sum_ch  Delta^4 / (Delta^2 + 2*noise_var[ch])
-                // Local std is one value per pixel: the min of the two frames'
-                // local std, floored at the noise std at this luma:
-                //   std_dev = max( min(std_ref, std_comp), min_std )
-                //   distance = (d / std_dev^2) * mult * boost
-                //   w = exp2( min( thresh - distance, 0 ) )
-                // boost fires where the region is high-detail (std_ref >
-                // tex_gate*min_std) AND the per-tile flow is irregular. GCam's
-                // constants are mult=1, thresh=0, boost=6, tex_gate=5 (tunable here).
-                // Approximations vs the APK: GCam stores one guide-std in .w; we
-                // collapse our 3-channel stats (mean variance). The "unblocker"
-                // term is compiled in the APK and is omitted. The soft 5x5 dilation
-                // (sum/3) is applied downstream by local_min_5x5_on_guide_soft.
-                f32 d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
-                for (int ch = 0; ch < nch; ++ch) {
-                    const f32 mr = ref_means.at(y, x, ch);
-                    const f32 mc = comp_means.at(y, x, ch);
-                    const f32 delta = std::isfinite(mc) ? (mc - mr) : 1e15f;  // OOB comp -> huge d
-                    const f32 d2 = delta * delta;
-                    const f32 nv = std::max(guide_noise_var(cfg, nch, ch, std::max(mr, 0.f)), 1e-12f);
-                    d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);             // Delta^4 / (Delta^2 + 2*nv)
-                    ref_var_sum += ref_vars.at(y, x, ch);
-                    comp_var_sum += comp_vars.at(y, x, ch);
-                    noise_var_sum += nv;
+                // EXACT SABRE ComputeFrameWeight (raw-res path). The operator lives in
+                // gcam_frame_weight (shared with the guide-res branch, twinned in
+                // HHSRKernels.metal). Build the per-channel inputs here; the boost gate
+                // needs the per-tile flow irregularity, computed from ref variance and
+                // the noise floor.
+                f32 mr[3], mc[3], rv[3], cv[3], nv[3];
+                const int ncl = std::min(nch, 3);
+                f32 ref_var_sum = 0.f, noise_var_sum = 0.f;
+                for (int ch = 0; ch < ncl; ++ch) {
+                    const f32 r = ref_means.at(y, x, ch);
+                    const f32 c = comp_means.at(y, x, ch);
+                    const f32 cvar = comp_vars.at(y, x, ch);
+                    mr[ch] = r;
+                    mc[ch] = std::isfinite(c) ? c : 1e15f;            // OOB comp -> huge diff
+                    rv[ch] = ref_vars.at(y, x, ch);
+                    cv[ch] = std::isfinite(cvar) ? cvar : rv[ch];     // OOB comp var -> ref var
+                    nv[ch] = std::max(guide_noise_var(cfg, nch, ch, std::max(r, 0.f)), 1e-12f);
+                    ref_var_sum += rv[ch];
+                    noise_var_sum += nv[ch];
                 }
-                const f32 inv_nch = 1.f / (f32)std::max(1, nch);
-                const f32 ref_std = std::sqrt(std::max(0.f, ref_var_sum * inv_nch));
-                const f32 comp_std = std::sqrt(std::max(0.f, comp_var_sum * inv_nch));
-                const f32 min_std = std::sqrt(std::max(0.f, noise_var_sum * inv_nch));  // noise floor
-                const f32 std_dev = std::max(std::min(ref_std, comp_std), min_std);
-                const f32 sig2 = std_dev * std_dev + 1e-20f;
-                const bool textured = ref_std > cfg.gcam_tex_gate * min_std;          // high-detail
+                const f32 inv_ncl = 1.f / (f32)std::max(1, ncl);
+                const f32 ref_std = std::sqrt(std::max(0.f, ref_var_sum * inv_ncl));
+                const f32 min_std = std::sqrt(std::max(0.f, noise_var_sum * inv_ncl));  // noise floor
+                const bool textured = ref_std > cfg.gcam_tex_gate * min_std;           // high-detail
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
                 const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
-                const f32 distance = (d / sig2) * cfg.gcam_mult * boost;
-                f32 arg = cfg.gcam_thresh - distance;
-                if (arg > 0.f) arg = 0.f;
-                f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
-                if (!std::isfinite(r_val)) r_val = 0.f;
+                const f32 r_val = gcam_frame_weight(mr, mc, rv, cv, nv, ncl,
+                                                    cfg.gcam_filter_var_scale,
+                                                    cfg.gcam_mult, cfg.gcam_thresh, boost);
                 for (int ch = 0; ch < rch; ++ch) R.at(y, x, ch) = r_val;
             } else if (per_channel) {
                 for (int ch = 0; ch < rch; ++ch) {
@@ -2480,38 +2506,35 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
                 d_p.at(y, x, ch) = dp;
             }
             if (gcam) {
-                // EXACT GCam ComputeFrameWeight at guide resolution (twin of the
-                // raw-res branch). Comparison stats are SAMPLED warped here with a
-                // bicubic Catmull-Rom (GCam SampleBicubic), matching the merge pose.
-                f32 d = 0.f, ref_var_sum = 0.f, comp_var_sum = 0.f, noise_var_sum = 0.f;
-                for (int ch = 0; ch < nch_g; ++ch) {
-                    const f32 mr = ref_stats.means.at(y, x, ch);
-                    const f32 mc = sample_catmull(comp_means, sample_y, sample_x, ch);
-                    const f32 cv = sample_catmull(comp_vars, sample_y, sample_x, ch);
-                    const f32 delta = std::isfinite(mc) ? (mc - mr) : 1e15f;  // OOB -> huge d
-                    const f32 d2 = delta * delta;
-                    const f32 nv = std::max(guide_noise_var(cfg, nch_g, ch, std::max(mr, 0.f)), 1e-12f);
-                    d += d2 * d2 / (d2 + 2.f * nv + 1e-20f);
-                    ref_var_sum += ref_stats.stds.at(y, x, ch);
-                    comp_var_sum += std::isfinite(cv) ? cv : ref_stats.stds.at(y, x, ch);
-                    noise_var_sum += nv;
+                // EXACT SABRE ComputeFrameWeight at guide resolution (twin of the
+                // raw-res branch; operator in gcam_frame_weight). Comparison stats are
+                // SAMPLED warped here with GCam's SampleBicubic (cubic B-spline),
+                // matching the fetch the merge will make.
+                f32 mr[3], mc[3], rv[3], cv[3], nv[3];
+                const int ncl = std::min(nch_g, 3);
+                f32 ref_var_sum = 0.f, noise_var_sum = 0.f;
+                for (int ch = 0; ch < ncl; ++ch) {
+                    const f32 r = ref_stats.means.at(y, x, ch);
+                    const f32 c = sample_bicubic(comp_means, sample_y, sample_x, ch);
+                    const f32 cvar = sample_bicubic(comp_vars, sample_y, sample_x, ch);
+                    mr[ch] = r;
+                    mc[ch] = std::isfinite(c) ? c : 1e15f;                 // OOB comp -> huge diff
+                    rv[ch] = ref_stats.stds.at(y, x, ch);
+                    cv[ch] = std::isfinite(cvar) ? cvar : rv[ch];          // OOB comp var -> ref var
+                    nv[ch] = std::max(guide_noise_var(cfg, nch_g, ch, std::max(r, 0.f)), 1e-12f);
+                    ref_var_sum += rv[ch];
+                    noise_var_sum += nv[ch];
                 }
-                const f32 inv_nch = 1.f / (f32)std::max(1, nch_g);
-                const f32 ref_std = std::sqrt(std::max(0.f, ref_var_sum * inv_nch));
-                const f32 comp_std = std::sqrt(std::max(0.f, comp_var_sum * inv_nch));
-                const f32 min_std = std::sqrt(std::max(0.f, noise_var_sum * inv_nch));
-                const f32 std_dev = std::max(std::min(ref_std, comp_std), min_std);
-                const f32 sig2 = std_dev * std_dev + 1e-20f;
+                const f32 inv_ncl = 1.f / (f32)std::max(1, ncl);
+                const f32 ref_std = std::sqrt(std::max(0.f, ref_var_sum * inv_ncl));
+                const f32 min_std = std::sqrt(std::max(0.f, noise_var_sum * inv_ncl));
                 const bool textured = ref_std > cfg.gcam_tex_gate * min_std;
                 const size_t pidx = (size_t)patch_idy * flow.nx + patch_idx;
                 const f32 irr = (pidx < gcam_irr.size()) ? gcam_irr[pidx] : 0.f;
                 const f32 boost = (textured && irr > cfg.gcam_irr_gate) ? cfg.gcam_boost : 1.f;
-                const f32 distance = (d / sig2) * cfg.gcam_mult * boost;
-                f32 arg = cfg.gcam_thresh - distance;
-                if (arg > 0.f) arg = 0.f;
-                f32 r_val = clampf(std::exp2(arg), 0.f, 1.f);
-                if (!std::isfinite(r_val)) r_val = 0.f;
-                R_gcam.at(y, x, 0) = r_val;
+                R_gcam.at(y, x, 0) = gcam_frame_weight(mr, mc, rv, cv, nv, ncl,
+                                                       cfg.gcam_filter_var_scale,
+                                                       cfg.gcam_mult, cfg.gcam_thresh, boost);
             }
         }
     }
