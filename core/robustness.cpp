@@ -2046,7 +2046,18 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     if (compg.h != refg.h || compg.w != refg.w) return Image();
     const int gh = refg.h, gw = refg.w;
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
-    const f32 motion_thresh = cfg.gcam_sabre_motion_thresh * (f32)std::max(1, comp_raw.w);
+    // GCam's flow.z threshold (gcam_sabre_motion_thresh, normalized UV) was measured
+    // over a 3x3 neighbourhood of its ~16-raw-px tiles (258 across a 4128px frame,
+    // spec §1). Our M (compute_flow_irregularity) is the flow spread in RAW PIXELS
+    // over OUR 3x3 tile neighbourhood, whose span is 2*tile_size raw px -- so M scales
+    // with OUR tile size, not the frame width. Convert the UV threshold to raw px as
+    // thresh * tile_size * (GCam frame / GCam tile) so the boost arms at the same flow
+    // GRADIENT GCam does, regardless of grid density or sensor resolution. This is
+    // identical to the old "* raw_width" at GCam's exact config (4128px, 16px tiles),
+    // but corrects the under-firing when half-tile/dense subdivides the grid (smaller
+    // tiles -> smaller M) or the sensor is wider than 4128 ("* raw_width" ran too high).
+    constexpr f32 kGcamTilesAcross = 4128.f / 16.f;   // spec §1: 258 tiles / 4128px frame
+    const f32 motion_thresh = cfg.gcam_sabre_motion_thresh * (f32)std::max(1, tile_size) * kGcamTilesAcross;
     const bool aff = cfg.affine_flow_enabled && flow.has_affine();
     // §3/§6: Monte-Carlo noise for the operator when the model is on (built once,
     // fixed seed -> matches the guide's and the GPU's copy). Off -> affine stand-in.

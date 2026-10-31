@@ -1734,7 +1734,7 @@ struct Config {
     float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only
     float gcam_sabre_boost           = 6.0f;        // §5.8 extra_motion_robustness_boost
     float gcam_sabre_boost_var_mult  = 25.0f;       // §5.8 motion_robustness_boost_variance_threshold
-    float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold, in normalized-UV; x raw width at use
+    float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold (UV); converted to raw px as x tile_size x (4128/16) so the boost arms at GCam's flow GRADIENT independent of grid density/sensor res
     float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
     float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
     // §7 2x downsample: dilate AND halve the mask (guide-res -> quarter-Bayer), exactly

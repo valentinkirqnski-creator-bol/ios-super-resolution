@@ -3016,7 +3016,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.rob_noise = cfg.gcam_sabre_rob_noise;
     mp.mult_rgb = cfg.gcam_sabre_mult_rgb; mp.mult_green = cfg.gcam_sabre_mult_green;
     mp.boost = cfg.gcam_sabre_boost; mp.boost_var_mult = cfg.gcam_sabre_boost_var_mult;
-    mp.motion_thresh = cfg.gcam_sabre_motion_thresh * (float)std::max(1, comp_raw.w);
+    // Scale by OUR raw tile size x GCam's tiles-across (4128/16 = 258), NOT the frame
+    // width, so the ×6 boost arms at GCam's flow gradient regardless of grid density
+    // (half-tile/dense) or sensor resolution. Twin of compute_robustness_gcam_sabre.
+    mp.motion_thresh = cfg.gcam_sabre_motion_thresh * (float)std::max(1, tile_size) * (4128.f / 16.f);
     mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
     mp.noise_model = noise_model ? 1u : 0u;
 
