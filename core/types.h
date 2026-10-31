@@ -1737,6 +1737,12 @@ struct Config {
     float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold, in normalized-UV; x raw width at use
     float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
     float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
+    // §7 2x downsample: dilate AND halve the mask (guide-res -> quarter-Bayer), exactly
+    // as GCam does, then nearest-upsample the coarse result back to guide resolution so
+    // our guide-res merge applies GCam's blockier per-2x2-block decision unchanged.
+    // true = byte-for-byte GCam (coarser mask). false = keep it at full guide resolution
+    // (strictly finer / sharper rejection boundaries, less over-rejection of neighbours).
+    bool  gcam_sabre_dilate_2x       = true;
     // Monte-Carlo noise model (the paste's §3-§6). OFF (default): the guide's
     // green-only gate uses the reconstructed affine stand-in and the operator runs
     // noise-blind (gcam_sabre_rob_noise, default 0 = the measured device). ON:

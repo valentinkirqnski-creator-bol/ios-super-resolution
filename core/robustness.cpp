@@ -1797,22 +1797,54 @@ static f32 sample_bicubic_abs(const Image& g, f32 fy, f32 fx, int ch) {
 // unchanged. Edge-clamped.
 Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
     if (R.h <= 0 || R.w <= 0) return R;
-    Image out(R.h, R.w, 1);
     const f32 dz = cfg.gcam_sabre_dilate_deadzone;
     const f32 dv = (cfg.gcam_sabre_dilate_div != 0.f) ? cfg.gcam_sabre_dilate_div : 1.f;
-    for (int y = 0; y < R.h; ++y)
-        for (int x = 0; x < R.w; ++x) {
-            f32 sum = 0.f;
-            for (int i = -2; i <= 2; ++i) {
-                const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
-                for (int j = -2; j <= 2; ++j) {
-                    const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
-                    sum += 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);   // rejection
-                }
+    // 5x5 sum of neighbour rejection (1 - keep) centred at (cy,cx) -> keep weight,
+    // via the (sum - deadzone)/div contrast rule. Edge-clamped.
+    auto dilate_at = [&](int cy, int cx) -> f32 {
+        f32 sum = 0.f;
+        for (int i = -2; i <= 2; ++i) {
+            const int yy = (int)clampf((f32)(cy + i), 0.f, (f32)(R.h - 1));
+            for (int j = -2; j <= 2; ++j) {
+                const int xx = (int)clampf((f32)(cx + j), 0.f, (f32)(R.w - 1));
+                sum += 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);   // rejection
             }
-            const f32 rej = (sum - dz) / dv;
-            out.at(y, x, 0) = clampf(1.f - rej, 0.f, 1.f);
         }
+        return clampf(1.f - (sum - dz) / dv, 0.f, 1.f);
+    };
+    Image out(R.h, R.w, 1);
+    if (cfg.gcam_sabre_dilate_2x) {
+        // GCam §7: dilate AND 2x-downsample (guide-res -> quarter-Bayer). The centre
+        // is EXACT: output pixel o maps to source texel tc*source_size = 2*o+1, and
+        // GCam's 25-texel gather footprint is source rows/cols 2*o-1 .. 2*o+3 -- a 5x5
+        // centred at 2*o+1, which is exactly what dilate_at(2*oy+1, 2*ox+1) with its
+        // +-2 window sums. The coarse mask is then nearest-upsampled back to guide
+        // resolution (each decision filling its 2x2 block) so our guide-res merge
+        // applies it. This guide-res-replicated read is PROVABLY identical to a
+        // direct quarter-res read -- at scale 2, output hr -> coarse index
+        // floor(floor((hr+1)/4)/2) == floor((hr+1)/8) by the nested-floor identity,
+        // the same index a direct quarter fetch (rob=(lr-1.5)/4) yields -- so there
+        // is NO double-rounding seam; reworking the merge to quarter-res changes
+        // nothing. The only residual vs GCam is our merge's nearest-sampler half-
+        // pixel convention (floor((hr+1)/8)) vs GL UV-nearest (floor((hr+0.5)/8)): a
+        // 1-output-pixel shift at block edges, shared by every mask read in our merge
+        // (raw/guide/quarter) and unverifiable without GCam's merge source.
+        const int dh = std::max(1, R.h / 2), dw = std::max(1, R.w / 2);
+        Image coarse(dh, dw, 1);
+        for (int oy = 0; oy < dh; ++oy)
+            for (int ox = 0; ox < dw; ++ox)
+                coarse.at(oy, ox, 0) = dilate_at(2 * oy + 1, 2 * ox + 1);
+        for (int y = 0; y < R.h; ++y)
+            for (int x = 0; x < R.w; ++x) {
+                const int oy = std::min(y / 2, dh - 1), ox = std::min(x / 2, dw - 1);
+                out.at(y, x, 0) = coarse.at(oy, ox, 0);
+            }
+        return out;
+    }
+    // Finer: keep the mask at full guide resolution (dropped GCam's downsample).
+    for (int y = 0; y < R.h; ++y)
+        for (int x = 0; x < R.w; ++x)
+            out.at(y, x, 0) = dilate_at(y, x);
     return out;
 }
 

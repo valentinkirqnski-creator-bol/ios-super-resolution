@@ -1219,15 +1219,21 @@ struct CameraView: View {
                             .font(.footnote).foregroundColor(.secondary)
                         ispRow("Robustness Noise (0=device, 1=paper)", $cam.tuningParams.gcam_sabre_rob_noise, 0.0...1.0, "%.2f")
                         ispRow("Motion Boost (×)", $cam.tuningParams.gcam_sabre_boost, 1.0...16.0, "%.1f")
+                        ispRow("Motion Boost Threshold (UV)", $cam.tuningParams.gcam_sabre_motion_thresh, 0.0...0.001, "%.5f")
                         ispRow("Green-Only Trigger", $cam.tuningParams.gcam_sabre_green_factor, 0.0...8.0, "%.2f")
                         ispRow("Strictness RGB (mult)", $cam.tuningParams.gcam_sabre_mult_rgb, 0.0...0.5, "%.3f")
                         ispRow("Strictness Green (mult)", $cam.tuningParams.gcam_sabre_mult_green, 0.0...1.0, "%.3f")
                         ispRow("Filter Var RGB (k)", $cam.tuningParams.gcam_sabre_k_rgb, 0.0...1.0, "%.4f")
                         ispRow("Filter Var Green (k)", $cam.tuningParams.gcam_sabre_k_green, 0.0...1.0, "%.4f")
                         ispRow("Dilation Dead Zone", $cam.tuningParams.gcam_sabre_dilate_deadzone, 0.0...2.0, "%.2f")
+                        Toggle("GCam 2× Dilation Downsample", isOn: $cam.tuningParams.gcam_sabre_dilate_2x)
+                        Text("""
+                             ON (default) = byte-for-byte GCam: the mask is dilated and 2× downsampled to a quarter-Bayer grid, so each rejection decision governs a 2×2 block (coarser/blockier). OFF keeps the mask at full guide resolution — strictly finer, sharper rejection boundaries, and less over-rejection of good neighbours. Turn OFF if you want the cleaner mask; leave ON to match GCam exactly.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
                         Toggle("Run operator on GPU", isOn: $cam.tuningParams.gcam_sabre_gpu)
                         Text("""
-                             All defaults are GCam's measured constants, so the toggle alone gives the faithful model. Robustness Noise is kFilterVarianceScale's noise term: 0 matches the device (noise-blind, rejects hardest), 1 is the paper's full noise subtraction (more tolerant of sensor grain). Motion Boost is how much harder irregular-flow textured tiles are rejected (GCam = 6). The two Strictness multipliers are GCam's 0.07 (RGB) / 0.35 (green-only) color_difference_multiplier; the two Filter Var k's are 0.0899 / 0.2117. Green-Only Trigger is how much local green variance must exceed the green noise before a region switches to single-green comparison (GCam = 3). Run operator on GPU moves the per-pixel loop to the Metal kernel (guides still build on the host; it falls back to the CPU operator if the kernel is unavailable) — the CPU path is the verified reference, so A/B them if in doubt. Google's constants are sensor-calibrated for the Pixel; tune on real imported bursts.
+                             All defaults are GCam's measured constants, so the toggle alone gives the faithful model. Robustness Noise is kFilterVarianceScale's noise term: 0 matches the device (noise-blind, rejects hardest), 1 is the paper's full noise subtraction (more tolerant of sensor grain). Motion Boost is how much harder irregular-flow textured tiles are rejected (GCam = 6); Motion Boost Threshold is the local-motion-extent (in normalized UV) the flow must vary by before that ×6 boost arms (GCam = 0.00019 ≈ 0.8 raw px over a 3×3 tile neighbourhood). LOWER it to arm the boost on smaller rotations/parallax (rejects those seams harder, but also fires on flow noise → more over-rejection); 0 = boost everywhere there's any motion variation. The two Strictness multipliers are GCam's 0.07 (RGB) / 0.35 (green-only) color_difference_multiplier — raise them to reject a detected misalignment harder across the board; the two Filter Var k's are 0.0899 / 0.2117. Green-Only Trigger is how much local green variance must exceed the green noise before a region switches to single-green comparison (GCam = 3; LOWER it to push more edges onto the stricter green-only path). Run operator on GPU moves the per-pixel loop to the Metal kernel (guides still build on the host; it falls back to the CPU operator if the kernel is unavailable) — the CPU path is the verified reference, so A/B them if in doubt. Google's constants are sensor-calibrated for the Pixel; tune on real imported bursts.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                     }
