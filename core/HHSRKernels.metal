@@ -2059,12 +2059,19 @@ inline float rob_sample_bspline_abs(device const float* img,
     return (w_acc != 0.f) ? buf / w_acc : buf;
 }
 
-// §5.3 MirrorUVs in guide-pixel space: reflect a coordinate back into [0, n-1].
-inline float gcam_mirror(float v, float n) {
-    float hi = n - 1.f;
-    if (v < 0.f) v = -v;
-    if (v > hi)  v = 2.f * hi - v;
-    return clamp(v, 0.f, hi);
+// §5.3 frame_border_padded (measured, §9): ~1px UV inset GCam mirrors about so the
+// bicubic 3x3 footprint stays valid. X/Y differ (non-square frame). Twin of the CPU
+// kGcamBorder* constants in robustness.cpp.
+constant float kGcamBorderMinX = 7.1565e-4f, kGcamBorderMaxX = 0.99928f;
+constant float kGcamBorderMinY = 9.4697e-4f, kGcamBorderMaxY = 0.99905f;
+
+// §5.3 MirrorUVs: reflect a sample position (guide-pixel coord, integer = pixel
+// centre) back inside the inset border, in UV (v -> (v+0.5)/n) then back to pixels.
+inline float gcam_mirror(float v, float n, float lo_uv, float hi_uv) {
+    float uv = (v + 0.5f) / n;
+    if (uv <= lo_uv) uv = 2.f * lo_uv - uv;
+    if (uv >  hi_uv) uv = 2.f * hi_uv - uv;
+    return uv * n - 0.5f;
 }
 
 // §5 the ComputeFrameWeight operator (guide resolution, sqrt space). Writes the
@@ -2098,8 +2105,8 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
         if (hw != 0.f) { hx /= hw; hy /= hw; }
         sx = 0.5f * hx; sy = 0.5f * hy;
     }
-    sx = gcam_mirror(sx, float(p.w));                 // §5.3
-    sy = gcam_mirror(sy, float(p.h));
+    sx = gcam_mirror(sx, float(p.w), kGcamBorderMinX, kGcamBorderMaxX);   // §5.3
+    sy = gcam_mirror(sy, float(p.h), kGcamBorderMinY, kGcamBorderMaxY);
     // §5.4 reference (plain lookup) + comparison (bicubic-abs).
     uint rofs = (y * p.w + x) * 4u;
     float ref_var_signed = refg[rofs + 3u];

@@ -1760,13 +1760,19 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
     return prefilter_ref ? gcam_prefilter_ref(guide) : guide;
 }
 
-// §5.3 MirrorUVs in guide-pixel space: reflect a sample coordinate back into
-// [0, n-1] (one reflection per side) so border regions still compare.
-static inline f32 gcam_mirror(f32 v, f32 n) {
-    const f32 hi = n - 1.f;
-    if (v < 0.f) v = -v;
-    if (v > hi)  v = 2.f * hi - v;
-    return clampf(v, 0.f, hi);
+// §5.3 frame_border_padded (measured, §9): the ~1px UV inset GCam mirrors about so
+// the bicubic 3x3 footprint stays in valid data. X/Y differ (non-square frame).
+static constexpr f32 kGcamBorderMinX = 7.1565e-4f, kGcamBorderMaxX = 0.99928f;
+static constexpr f32 kGcamBorderMinY = 9.4697e-4f, kGcamBorderMaxY = 0.99905f;
+
+// §5.3 MirrorUVs: reflect a sample position (guide-pixel coord, integer = pixel
+// centre) back inside GCam's inset border, done in UV (v -> (v+0.5)/n) so it
+// matches the shader exactly, then back to pixel coords. One reflection per side.
+static inline f32 gcam_mirror(f32 v, f32 n, f32 lo_uv, f32 hi_uv) {
+    f32 uv = (v + 0.5f) / n;
+    if (uv <= lo_uv) uv = 2.f * lo_uv - uv;
+    if (uv >  hi_uv) uv = 2.f * hi_uv - uv;
+    return uv * n - 0.5f;
 }
 
 // §5.4 SampleBicubicAbsolute: cubic B-spline of the comparison guide with abs() of
@@ -2085,8 +2091,8 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 apply_homography(flow.global_h, 2.f * sx, 2.f * sy, hx, hy);
                 sx = 0.5f * hx; sy = 0.5f * hy;
             }
-            sx = gcam_mirror(sx, (f32)gw);                 // §5.3
-            sy = gcam_mirror(sy, (f32)gh);
+            sx = gcam_mirror(sx, (f32)gw, kGcamBorderMinX, kGcamBorderMaxX);   // §5.3
+            sy = gcam_mirror(sy, (f32)gh, kGcamBorderMinY, kGcamBorderMaxY);
             // §5.4 reference (plain lookup at the guide centre) + comparison (bicubic-abs).
             const f32 ref_var_signed = refg.at(y, x, 3);
             const bool green_only = ref_var_signed < 0.f;
