@@ -1750,21 +1750,22 @@ struct Config {
     float gcam_sabre_clip_point      = 3.4028235e38f;
     float gcam_sabre_k_rgb           = 0.0898866f;  // §3.5 kFilterVarianceScale, RGB bicubic path
     float gcam_sabre_k_green         = 0.211665f;   // §3.5 kFilterVarianceScale, green-only path
-    // THE ground-truth fix (real GCam A20e dump, [[gcam-sabre-ground-truth-diff]]): the
-    // noise/variance used by the gate AND the operator must be propagated through the
-    // guide's 1-2-1 (x) 1-2-1 spatial averaging, which the per-sample noise LUT/MC does
-    // NOT include. For separable weights [0.25,0.5,0.25] (sum sq = 0.375 per axis) the
-    // 2-D variance-reduction factor is 0.375^2 = 0.140625. Without it our noise ran ~7x
-    // hot, so the factor-3.0 green gate fired 5% (vs GCam 94.8%) and the operator barely
-    // rejected -- the single root cause behind all four apparent deviations. Applying it
-    // (keeping the shader kFVS + factor 3.0 + subtract + original denom) reproduces GCam
-    // at corr 0.82 / green-only 94.3% / mean reject 0.44 vs 0.46 across all 6 draws.
-    float gcam_sabre_kfvs_scale      = 0.140625f;   // 0.375^2: guide 1-2-1 filter variance reduction on noise+variance
-    // §3.6 robustness-operator noise strength. Was 0 ("noise-blind on device") while the
-    // noise ran ~7x hot -- turning it off was less wrong than leaving it on. With the
-    // kfvs_scale fix the noise is correct and the operator NEEDS it: noise-blind now
-    // OVER-rejects (ground-truth mean 0.76 vs 0.46, corr 0.68 vs 0.82). Default 1 (full).
-    float gcam_sabre_rob_noise       = 1.0f;
+    // THE ground-truth fix (real GCam A20e dump, [[gcam-sabre-ground-truth-diff]]), applied
+    // ONLY to the green-only GATE noise (compute_gcam_guide), NOT the operator: the gate
+    // compares green_var to the PER-SAMPLE noise LUT, but must propagate it through the
+    // guide's 1-2-1 (x) 1-2-1 spatial averaging. For weights [0.25,0.5,0.25] (sum sq 0.375)
+    // the 2-D variance-reduction factor is 0.375^2 = 0.140625. Without it the noise ran ~7x
+    // hot so the factor-3.0 gate fired 5% (vs GCam 94.8%), stranding us on the lenient RGB
+    // path. With it the gate fires 94.3%. (Do NOT also apply this to the operator k -- that
+    // shrinks the denominator 7x and over-rejects to near-black, since the operator's
+    // denom is the guide .w variance, already correctly averaged, scaled by the plain
+    // shader kFVS.) Gate fix alone: corr 0.87, green-only 94.3%, mean reject 0.46 vs 0.46.
+    float gcam_sabre_kfvs_scale      = 0.140625f;   // 0.375^2: 1-2-1 variance reduction, GATE noise only
+    // §3.6 robustness-operator noise strength. Ground truth: the operator matches GCam best
+    // NOISE-BLIND (0). Its denominator is the guide .w variance (correct scale); subtracting
+    // the device's affine LINEAR-space noise makes it over-lenient, while the kfvs'd noise
+    // over-rejects. Keep 0. (The gate still uses the real noise, scaled by kfvs above.)
+    float gcam_sabre_rob_noise       = 0.0f;
     float gcam_sabre_mult_rgb        = 0.07f;       // §5.9 color_difference_multiplier, RGB
     float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only
     float gcam_sabre_boost           = 6.0f;        // §5.8 extra_motion_robustness_boost

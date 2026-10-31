@@ -2021,7 +2021,6 @@ struct GcamSabreParams {
     float na;             // noise model alpha (robustness-scaled)
     float nb;             // noise model beta  (robustness-scaled)
     uint  noise_model;    // §3: 1 = subtract the Monte-Carlo LUT noise (buffer 6)
-    float kfvs_scale;     // guide 1-2-1 filter variance reduction (0.375^2) on noise+variance
 };
 
 // §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over 10 columns;
@@ -2133,9 +2132,9 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
         float nl[3]; nl[0] = nbase; nl[1] = 0.5f * nbase; nl[2] = nbase;
         for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] = p.rob_noise * nl[ch]; cur_noise[ch] = p.rob_noise * nl[ch]; }
     }
-    // §5.6 filter-variance scale, incl. the guide 1-2-1 averaging reduction (kfvs_scale,
-    // 0.375^2) that the per-sample noise LUT omits. See robustness.cpp twin.
-    float k = (green_only ? p.k_green : p.k_rgb) * p.kfvs_scale;
+    // §5.6 filter-variance scale (plain shader kFVS; the 1-2-1 reduction applies ONLY to
+    // the gate noise, built host-side -- see robustness.cpp twin).
+    float k = green_only ? p.k_green : p.k_rgb;
     for (uint ch = 0u; ch < 3u; ++ch) { ref_noise[ch] *= k; cur_noise[ch] *= k; }
     ref_a *= k; cur_a *= k;
     // §5.7 variances.

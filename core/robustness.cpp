@@ -2137,12 +2137,14 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                     cur_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
                 }
             }
-            // §5.6 filter-variance scale on noise AND the measured variances, INCLUDING
-            // the guide's 1-2-1 spatial-averaging variance reduction (gcam_sabre_kfvs_scale,
-            // 0.375^2). Without it the noise/variance ran ~7x hot -> the operator barely
-            // rejected. See [[gcam-sabre-ground-truth-diff]].
-            const f32 k = (green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb)
-                          * cfg.gcam_sabre_kfvs_scale;
+            // §5.6 filter-variance scale on noise AND the measured variances. The plain
+            // shader kFVS (0.09/0.21) is correct HERE -- do NOT also apply the gate's
+            // 1-2-1 reduction (gcam_sabre_kfvs_scale): that belongs only on the per-sample
+            // gate noise. Applying it to the operator shrinks the denominator ~7x and,
+            // because the device noise can't cancel the flat-area diffs, over-rejects to a
+            // near-black mask. Ground truth: operator with plain k + noise-blind matches
+            // GCam best (corr 0.87, mean 0.46). See [[gcam-sabre-ground-truth-diff]].
+            const f32 k = green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb;
             for (int c = 0; c < 3; ++c) { ref_noise[c] *= k; cur_noise[c] *= k; }
             ref_a *= k; cur_a *= k;
             // §5.7 variances (original SABRE form; ref_a/cur_a and the noise already carry
