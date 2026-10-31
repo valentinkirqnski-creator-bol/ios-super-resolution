@@ -1741,11 +1741,30 @@ struct Config {
     // where our pipeline allows (the structural non-matches -- the single packed
     // guide variance, the unblocker (zero on-device), per-frame flowScaleOffset,
     // the 2x dilation downsample -- are noted at each site). Off by default.
-    float gcam_sabre_green_factor    = 3.0f;        // §2.7 green-only trigger: green_var > factor*green_noise
-    float gcam_sabre_clip_point      = 1.0f;        // §2.8 sqrt-space green clip; center_green>=this -> poison ref
+    float gcam_sabre_green_factor    = 3.0f;        // §2.7 green-only trigger: green_var > factor*green_noise (shader constant)
+    // §2.8 green clip (sqrt space): center_green>=this -> poison ref to 10000 (forces
+    // reject of clipped highlights). GCam's green_clipping_point is PER-SHOT; on the
+    // ground-truth dump it was 3.4e38 (off). Our old hardcoded 1.0 spuriously poisoned
+    // every white-saturated green pixel. Default off (FLT_MAX); set finite per shot if
+    // highlight poisoning is wanted. See [[gcam-sabre-ground-truth-diff]].
+    float gcam_sabre_clip_point      = 3.4028235e38f;
     float gcam_sabre_k_rgb           = 0.0898866f;  // §3.5 kFilterVarianceScale, RGB bicubic path
     float gcam_sabre_k_green         = 0.211665f;   // §3.5 kFilterVarianceScale, green-only path
-    float gcam_sabre_rob_noise       = 0.0f;        // §3.6 robustness-operator noise scale (0=device, 1=paper LUT)
+    // THE ground-truth fix (real GCam A20e dump, [[gcam-sabre-ground-truth-diff]]): the
+    // noise/variance used by the gate AND the operator must be propagated through the
+    // guide's 1-2-1 (x) 1-2-1 spatial averaging, which the per-sample noise LUT/MC does
+    // NOT include. For separable weights [0.25,0.5,0.25] (sum sq = 0.375 per axis) the
+    // 2-D variance-reduction factor is 0.375^2 = 0.140625. Without it our noise ran ~7x
+    // hot, so the factor-3.0 green gate fired 5% (vs GCam 94.8%) and the operator barely
+    // rejected -- the single root cause behind all four apparent deviations. Applying it
+    // (keeping the shader kFVS + factor 3.0 + subtract + original denom) reproduces GCam
+    // at corr 0.82 / green-only 94.3% / mean reject 0.44 vs 0.46 across all 6 draws.
+    float gcam_sabre_kfvs_scale      = 0.140625f;   // 0.375^2: guide 1-2-1 filter variance reduction on noise+variance
+    // §3.6 robustness-operator noise strength. Was 0 ("noise-blind on device") while the
+    // noise ran ~7x hot -- turning it off was less wrong than leaving it on. With the
+    // kfvs_scale fix the noise is correct and the operator NEEDS it: noise-blind now
+    // OVER-rejects (ground-truth mean 0.76 vs 0.46, corr 0.68 vs 0.82). Default 1 (full).
+    float gcam_sabre_rob_noise       = 1.0f;
     float gcam_sabre_mult_rgb        = 0.07f;       // §5.9 color_difference_multiplier, RGB
     float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only
     float gcam_sabre_boost           = 6.0f;        // §5.8 extra_motion_robustness_boost

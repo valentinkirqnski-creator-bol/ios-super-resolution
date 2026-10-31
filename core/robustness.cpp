@@ -1735,12 +1735,18 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
             const f32 gmean = gm0 / 18.f;
             const f32 green_var = std::max(0.f, gm1 / 18.f - gmean * gmean);
             const f32 avg_luma = 0.25f * avg[0] + 0.5f * avg[1] + 0.25f * avg[2];
-            f32 green_noise;                             // §2.6 recover per-green variance (x2)
+            // §2.6/2.7 per-green noise (x2 for two greens), scaled by the green kFVS and
+            // the 1-2-1 spatial-averaging reduction (gcam_sabre_kfvs_scale) -- the per-
+            // sample LUT/MC does not include the averaging, so without this the gate ran
+            // ~7x strict and green-only fired ~5% instead of GCam's ~95%. See
+            // [[gcam-sabre-ground-truth-diff]].
+            const f32 gate_nscale = cfg.gcam_sabre_k_green * cfg.gcam_sabre_kfvs_scale;
+            f32 green_noise;
             if (use_mc) {
-                green_noise = 2.f * gcam_lut_sample(mc_lut, avg_luma, /*row=*/1, /*ch=*/1);
+                green_noise = 2.f * gate_nscale * gcam_lut_sample(mc_lut, avg_luma, /*row=*/1, /*ch=*/1);
             } else {
                 f32 nl[3]; gcam_noise_lut(cfg, avg_luma, nl);
-                green_noise = 2.f * nl[1];
+                green_noise = 2.f * gate_nscale * nl[1];
             }
             f32 col[3], var;
             if (green_var > cfg.gcam_sabre_green_factor * green_noise) {   // §2.7 green-only
@@ -2131,11 +2137,16 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                     cur_noise[c] = cfg.gcam_sabre_rob_noise * nlut[c];
                 }
             }
-            // §5.6 filter-variance scale on noise AND the measured variances.
-            const f32 k = green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb;
+            // §5.6 filter-variance scale on noise AND the measured variances, INCLUDING
+            // the guide's 1-2-1 spatial-averaging variance reduction (gcam_sabre_kfvs_scale,
+            // 0.375^2). Without it the noise/variance ran ~7x hot -> the operator barely
+            // rejected. See [[gcam-sabre-ground-truth-diff]].
+            const f32 k = (green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb)
+                          * cfg.gcam_sabre_kfvs_scale;
             for (int c = 0; c < 3; ++c) { ref_noise[c] *= k; cur_noise[c] *= k; }
             ref_a *= k; cur_a *= k;
-            // §5.7 variances.
+            // §5.7 variances (original SABRE form; ref_a/cur_a and the noise already carry
+            // the kfvs_scale reduction above).
             const f32 pixel_variance = 2.f * std::min(ref_a, cur_a);
             f32 noise_variance[3];
             for (int c = 0; c < 3; ++c) noise_variance[c] = ref_noise[c] + cur_noise[c];

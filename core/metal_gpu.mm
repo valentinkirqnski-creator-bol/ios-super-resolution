@@ -1801,8 +1801,9 @@ struct GcamSabreParamsCPU {
     float    na = 0.f;
     float    nb = 0.f;
     uint32_t noise_model = 0;   // §3: 1 = subtract the Monte-Carlo LUT noise
+    float    kfvs_scale = 0.140625f;  // guide 1-2-1 variance reduction (0.375^2) on noise+variance
 };
-static_assert(sizeof(GcamSabreParamsCPU) == 104, "GcamSabreParamsCPU");
+static_assert(sizeof(GcamSabreParamsCPU) == 108, "GcamSabreParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -3022,6 +3023,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.motion_thresh = cfg.gcam_sabre_motion_thresh * (float)std::max(1, tile_size) * (4128.f / 16.f);
     mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
     mp.noise_model = noise_model ? 1u : 0u;
+    mp.kfvs_scale = cfg.gcam_sabre_kfvs_scale;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
