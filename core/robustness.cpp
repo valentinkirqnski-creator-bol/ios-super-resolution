@@ -1997,6 +1997,17 @@ std::vector<f32> compute_flow_irregularity(const FlowField& flow) {
     return irr;
 }
 
+// The per-tile flow irregularity used for the GCam §5.8 motion boost. GCam
+// measures localMotionExtent (flow.z) on the RAW flow, before the §4.1 median
+// smooths x/y, so prefer the pre-median extent the pipeline stashed on the field
+// (FlowField::motion_extent). Fall back to recomputing from the current flow when
+// it was not captured -- the CPU harness, or any path that skips the median -- in
+// which case the extent is measured on whatever flow we were handed.
+std::vector<f32> gcam_motion_extent(const FlowField& flow) {
+    if (flow.has_motion_extent()) return flow.motion_extent;
+    return compute_flow_irregularity(flow);
+}
+
 // EXACT SABRE ComputeFrameWeight -> frame weight (linear guide space), shared by
 // both GCam CPU branches (raw-res and guide-res) so the operator lives in one
 // place. Inputs are per-channel guide means (ref/comp), per-channel measured
@@ -2051,7 +2062,7 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/false);
     if (compg.h != refg.h || compg.w != refg.w) return Image();
     const int gh = refg.h, gw = refg.w;
-    const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
+    const std::vector<f32> irr = gcam_motion_extent(flow);  // §4.2 localMotionExtent, pre-median (raw px)
     // GCam's flow.z threshold (gcam_sabre_motion_thresh, normalized UV) was measured
     // over a 3x3 neighbourhood of its ~16-raw-px tiles (258 across a 4128px frame,
     // spec §1). Our M (compute_flow_irregularity) is the flow spread in RAW PIXELS
@@ -2263,9 +2274,9 @@ static Image compute_robustness_raw_res(const Image& comp_raw, const RefStats& r
         motion_irregular.assign(S.size(), 0u);
     const bool have_hf_loss = !ref_stats.hf_loss.data.empty();
 
-    // Per-tile flow irregularity for the GCam strictness boost.
+    // Per-tile flow irregularity for the GCam strictness boost (pre-median).
     std::vector<f32> gcam_irr;
-    if (gcam) gcam_irr = compute_flow_irregularity(flow);
+    if (gcam) gcam_irr = gcam_motion_extent(flow);
 
     // Per-channel robustness (ISA, Config::robustness_per_channel). Default off
     // => a single channel-summed weight (Wronski Eq. 6), exactly as before.
@@ -2965,7 +2976,7 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     const bool gcam = cfg.robustness_gcam_enabled;
     const int nch_g = ref_stats.means.c;
     std::vector<f32> gcam_irr;
-    if (gcam) gcam_irr = compute_flow_irregularity(flow);
+    if (gcam) gcam_irr = gcam_motion_extent(flow);
     Image R_gcam;
     if (gcam) R_gcam = Image(h, w, 1);
     Image d_p(h, w, ref_stats.means.c);

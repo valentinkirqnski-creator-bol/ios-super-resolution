@@ -124,6 +124,18 @@ struct FlowField {
     // deriving it, which is what the full-resolution FFT path relies on.
     std::vector<uint32_t> motion_irregular;
 
+    // GCam SABRE localMotionExtent (flow.z): the length of the min-max extent of
+    // the tile flow vectors over the 3x3 tile neighbourhood, in raw pixels. It is
+    // a RELIABILITY signal about the RAW flow's disagreement and gates the §5.8
+    // motion boost. GCam carries it as its own flow channel, measured on the flow
+    // BEFORE the §4.1 median smooths x/y -- so it must be captured before
+    // median3x3_tile_flow runs (the median pulls disagreeing neighbours together
+    // and would under-report the spread, blunting the boost on exactly the
+    // rotation/parallax tiles it exists to catch). Populated by the pipeline just
+    // before the median; empty => consumers recompute from the current flow (the
+    // CPU harness and any path that skips §4.1). See gcam_motion_extent.
+    std::vector<f32> motion_extent;
+
     // 1 = this tile's vector was REPLACED by the forward-backward consistency
     // check (neighbour-median of round-trip-consistent tiles). The replacement
     // deliberately overrides pixel evidence: on the ambiguous/flat/repetitive
@@ -173,6 +185,10 @@ struct FlowField {
     // True when motion_irregular carries a measurement for this grid.
     inline bool has_motion_prior() const {
         return motion_irregular.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
+    }
+    // True when motion_extent carries the pre-median localMotionExtent for this grid.
+    inline bool has_motion_extent() const {
+        return motion_extent.size() == (size_t)ny * (size_t)nx && ny > 0 && nx > 0;
     }
     // True when fb_corrected carries marks for this grid.
     inline bool has_fb_marks() const {

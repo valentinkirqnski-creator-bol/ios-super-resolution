@@ -2140,8 +2140,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // outliers. Applied to the shared flow by design, gated on the gcam
         // toggle so every other path keeps its exact flow. Done before the GPU
         // upload below so the resident merge reads the same median field.
-        if (work.robustness_gcam_enabled)
+        //
+        // §4.2: capture localMotionExtent (flow.z) FIRST, from the raw pre-median
+        // flow. GCam measures the extent on the unsmoothed field -- it is the
+        // reliability signal gating the §5.8 boost -- whereas the median then
+        // smooths the x/y used to fetch. Measuring the extent after the median
+        // would pull disagreeing neighbours together and under-report the spread,
+        // silently under-arming the boost on the rotation/parallax tiles it is
+        // meant to catch. The operator reads flow.motion_extent via
+        // gcam_motion_extent; the fetch vector still uses the median-cleaned flow.
+        if (work.robustness_gcam_enabled) {
+            flow.motion_extent = compute_flow_irregularity(flow);
             median3x3_tile_flow(flow);
+        }
 
 #if defined(__APPLE__)
         // The flow is the one per-frame analysis result the host still owns: the

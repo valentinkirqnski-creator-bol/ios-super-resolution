@@ -212,6 +212,11 @@ void median3x3_tile_flow(FlowField& flow);
 // of the flow vectors over the 3x3 tile neighbourhood (raw px). Drives the motion
 // boost. Exposed so the Metal host can build the same buffer the CPU operator uses.
 std::vector<f32> compute_flow_irregularity(const FlowField& flow);
+// GCam SABRE (§4.2): the localMotionExtent the motion boost reads. Returns the
+// pre-median extent stashed on the field (FlowField::motion_extent, captured
+// before median3x3_tile_flow) when present, else recomputes from the current
+// flow. Use this -- not compute_flow_irregularity -- wherever the boost is gated.
+std::vector<f32> gcam_motion_extent(const FlowField& flow);
 // GCam SABRE (§5+§7): the full CPU ComputeFrameWeight operator -> guide-resolution
 // keep mask (dilated). The verified reference and the device default; also the
 // fallback when the GPU twin is unavailable. Empty if the reference guide

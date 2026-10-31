@@ -2989,7 +2989,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/false);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
-    const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
+    const std::vector<f32> irr = gcam_motion_extent(flow);  // §4.2 localMotionExtent, pre-median (raw px)
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 
     id<MTLBuffer> b_refg  = buf(refg.data.data(),  refg.data.size()  * sizeof(float));
