@@ -1188,6 +1188,16 @@ struct Config {
     // falls back to leaving R untouched whenever the model is missing or
     // fails to load, so enabling it can never leave the pipeline maskless.
     bool  robustness_refine_nn_enabled = false;
+    // robust_nn v40 (tools/robust_nn; kernels rnn_grey_from_raw + rnn_refine_mask, net in
+    // robust_nn_shared.h / robust_nn_weights.h): learned refinement of the finished analytic mask at
+    // guide resolution, R = sigmoid(logit(R0) + delta). v21's inputs plus the motion prior of Wronski
+    // et al. Eq. 7 (3x3 tile-flow extent, M_th 0.80 raw px, gated by reference structure) and
+    // frame-vs-reference structure-tensor inputs, trained on same-burst twins. Metal guide-resolution
+    // path only (declines on the raw-resolution / FFT-guide path); replaces robustness_refine_nn when on.
+    bool  robust_nn_enabled = true;
+    // Output sharpening: R below reject_below -> 0, above accept_above -> 1 (identity when hi <= lo).
+    float robust_nn_reject_below = 0.20f;
+    float robust_nn_accept_above = 0.90f;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency

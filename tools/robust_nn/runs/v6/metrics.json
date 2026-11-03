@@ -1,0 +1,43 @@
+{
+ "args": {
+  "cmd": "train",
+  "init": "runs/v5/model.pt",
+  "train": "data/rp_train,data/rp_train_hdrp",
+  "val": "C:\\Users\\valen\\Downloads\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\ios-super-resolution-1d39c2446f8978fdc5caedcd5b52a6d6bc746a85\\tools\\robust_nn\\data\\rp_val",
+  "out": "runs/v6",
+  "steps": 350,
+  "accum": 4,
+  "lr": 0.001,
+  "workers": 3,
+  "eval_every": 100,
+  "zero_head": false,
+  "w_corr": 2.0
+ },
+ "hist": [
+  {
+   "step": 0,
+   "clean": 0.09407978417972723,
+   "bad": 0.8471816673874855
+  },
+  {
+   "step": 100,
+   "clean": 0.0944288073418041,
+   "bad": 0.8368218461672465
+  },
+  {
+   "step": 200,
+   "clean": 0.09710018855209152,
+   "bad": 0.8295187880595525
+  },
+  {
+   "step": 300,
+   "clean": 0.09779760716482996,
+   "bad": 0.8275475924213728
+  },
+  {
+   "step": 350,
+   "clean": 0.0978994419487814,
+   "bad": 0.8274299427866936
+  }
+ ]
+}

@@ -267,6 +267,14 @@ struct TuningParams: Equatable, Codable {
     /// rather than less. Off by default; falls back to leaving R untouched if
     /// the model is missing. See tools/rob_refine.
     var robustness_refine_nn_enabled: Bool = false
+    /// Learned motion-rejection mask (tools/robust_nn v40): refines the analytic
+    /// mask with v21's network plus the paper's motion prior (Eq. 7) and
+    /// structure-tensor inputs. ON by default; a new key, so saved presets
+    /// pick up the default. Replaces robustness_refine_nn when on.
+    var robust_nn_enabled: Bool = true
+    /// Its decisiveness: R below this -> 0, above accept -> 1.
+    var robust_nn_reject_below: Float = 0.20
+    var robust_nn_accept_above: Float = 0.90
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -380,6 +388,7 @@ struct TuningParams: Equatable, Codable {
         case kernel_selection_linear
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
+        case robust_nn_enabled, robust_nn_reject_below, robust_nn_accept_above
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
@@ -479,6 +488,9 @@ struct TuningParams: Equatable, Codable {
         edge_misalign_min_conf = try c.decodeIfPresent(Float.self, forKey: .edge_misalign_min_conf) ?? edge_misalign_min_conf
         use_neural_robustness = try c.decodeIfPresent(Bool.self, forKey: .use_neural_robustness) ?? use_neural_robustness
         robustness_refine_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_refine_nn_enabled) ?? robustness_refine_nn_enabled
+        robust_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_enabled) ?? robust_nn_enabled
+        robust_nn_reject_below = try c.decodeIfPresent(Float.self, forKey: .robust_nn_reject_below) ?? robust_nn_reject_below
+        robust_nn_accept_above = try c.decodeIfPresent(Float.self, forKey: .robust_nn_accept_above) ?? robust_nn_accept_above
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
@@ -2262,6 +2274,9 @@ final class CameraModel: NSObject, ObservableObject {
             "edge_misalign_min_conf": NSNumber(value: tuningParams.edge_misalign_min_conf),
             "use_neural_robustness": NSNumber(value: tuningParams.use_neural_robustness),
             "robustness_refine_nn_enabled": NSNumber(value: tuningParams.robustness_refine_nn_enabled),
+            "robust_nn_enabled": NSNumber(value: tuningParams.robust_nn_enabled),
+            "robust_nn_reject_below": NSNumber(value: tuningParams.robust_nn_reject_below),
+            "robust_nn_accept_above": NSNumber(value: tuningParams.robust_nn_accept_above),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),

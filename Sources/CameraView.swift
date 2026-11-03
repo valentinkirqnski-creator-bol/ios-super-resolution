@@ -1078,6 +1078,12 @@ struct CameraView: View {
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
+            Toggle("Learned Motion Mask", isOn: $cam.tuningParams.robust_nn_enabled)
+            Text("""
+                 A small neural network refines which samples of each frame are merged. Besides the usual brightness evidence it reads how irregular the alignment vectors are around each tile (large local spread on an edge means a likely misalignment) and whether the frame's edges sit where the reference's do. Trained on the same bursts with and without deliberate misalignments, so it learns to drop shifted edges without throwing away correctly aligned detail. On by default; needs Robustness at Raw Resolution OFF.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
         }
     }
 
