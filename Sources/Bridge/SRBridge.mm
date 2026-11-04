@@ -583,6 +583,8 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.robust_nn_reject_below = tuning[@"robust_nn_reject_below"].floatValue;
     if (tuning[@"robust_nn_accept_above"])
         cfg.robust_nn_accept_above = tuning[@"robust_nn_accept_above"].floatValue;
+    if (tuning[@"robust_nn_raw_bilinear"])
+        cfg.robust_nn_raw_bilinear = tuning[@"robust_nn_raw_bilinear"].boolValue;
     if (tuning[@"robustness_refine_max_reduction"])
         cfg.robustness_refine_max_reduction = tuning[@"robustness_refine_max_reduction"].floatValue;
     if (tuning[@"robustness_refine_deadzone"])

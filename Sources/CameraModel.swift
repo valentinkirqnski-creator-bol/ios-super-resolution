@@ -278,6 +278,9 @@ struct TuningParams: Equatable, Codable {
     /// Its decisiveness: R below this -> 0, above accept -> 1.
     var robust_nn_reject_below: Float = 0.20
     var robust_nn_accept_above: Float = 0.90
+    /// v42: how the merge reads the learned mask's raw-resolution plane at each
+    /// output pixel -- nearest (false, default) or bilinear (true).
+    var robust_nn_raw_bilinear: Bool = false
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -391,7 +394,7 @@ struct TuningParams: Equatable, Codable {
         case kernel_selection_linear
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
-        case robust_nn_enabled, robust_nn_reject_below, robust_nn_accept_above
+        case robust_nn_enabled, robust_nn_reject_below, robust_nn_accept_above, robust_nn_raw_bilinear
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
@@ -495,6 +498,7 @@ struct TuningParams: Equatable, Codable {
         robust_nn_enabled = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_enabled) ?? robust_nn_enabled
         robust_nn_reject_below = try c.decodeIfPresent(Float.self, forKey: .robust_nn_reject_below) ?? robust_nn_reject_below
         robust_nn_accept_above = try c.decodeIfPresent(Float.self, forKey: .robust_nn_accept_above) ?? robust_nn_accept_above
+        robust_nn_raw_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_raw_bilinear) ?? robust_nn_raw_bilinear
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
@@ -2282,6 +2286,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robust_nn_enabled": NSNumber(value: tuningParams.robust_nn_enabled),
             "robust_nn_reject_below": NSNumber(value: tuningParams.robust_nn_reject_below),
             "robust_nn_accept_above": NSNumber(value: tuningParams.robust_nn_accept_above),
+            "robust_nn_raw_bilinear": NSNumber(value: tuningParams.robust_nn_raw_bilinear),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),

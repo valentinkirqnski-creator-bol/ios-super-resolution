@@ -1100,7 +1100,14 @@ struct CameraView: View {
                 .foregroundColor(.secondary)
             Toggle("Learned Motion Mask", isOn: $cam.tuningParams.robust_nn_enabled)
             Text("""
-                 A small neural network refines which samples of each frame are merged. Besides the usual brightness evidence it reads how irregular the alignment vectors are around each tile (large local spread on an edge means a likely misalignment) and whether the frame's edges sit where the reference's do. Trained on the same bursts with and without deliberate misalignments, so it learns to drop shifted edges without throwing away correctly aligned detail. On by default; needs Robustness at Raw Resolution OFF.
+                 A small neural network refines which samples of each frame are merged. Besides the usual brightness evidence it reads how irregular the alignment vectors are around each tile (large local spread on an edge means a likely misalignment) and whether the frame's edges sit where the reference's do. Trained on the same bursts with and without deliberate misalignments, so it learns to drop shifted edges without throwing away correctly aligned detail. Its mask is upsampled to the sensor's full resolution before the final 5x5 widening, so rejections land twice as precisely in each direction, at no extra memory. On by default; needs Robustness at Raw Resolution OFF.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+            Toggle("Smooth Learned Mask (Bilinear)", isOn: $cam.tuningParams.robust_nn_raw_bilinear)
+                .disabled(!cam.tuningParams.robust_nn_enabled)
+            Text("""
+                 How the merge reads the learned mask at each output pixel. Off: the nearest sensor pixel's value. On: blended between the four nearest, which softens the one-pixel rim of each rejected area. Off by default; compare both on a burst with motion.
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)

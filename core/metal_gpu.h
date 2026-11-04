@@ -96,6 +96,9 @@ bool metal_frame_has_raw(int slot);
 // still sourcing the same bytes. Exists so the save-mask PGM export can sum the
 // burst once at the tail instead of forcing every mask back to the host.
 const float* metal_frame_rob_plane(int slot, int* h, int* w);
+// robust_nn v42: true when the slot's plane is the raw-resolution 8-bit mask packed into the guide-sized slice
+// (raw rows 2y and 2y+1 of guide row y, one byte per raw pixel, value / 255).
+bool metal_frame_rob_is_u8(int slot);
 
 // Direct RAW app path: uint16 Bayer -> normalized float Bayer with the same
 // black/WB/clamp math as DecodeRawFrameDictionary's CPU fallback.

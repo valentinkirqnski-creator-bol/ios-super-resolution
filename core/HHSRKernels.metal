@@ -1074,6 +1074,35 @@ inline float sample_robustness_bilinear(device const float* robustness,
     return top + (bot - top) * fy;
 }
 
+// robust_nn v42 -- BEGIN rob_fetch_u8
+// R from a raw-resolution mask packed 8 bits per pixel (value / 255), at
+// raw-pixel coordinates (y, x): nearest (floor(v + 0.5), clamped -- the
+// float path's rounding) or bilinear (clamped, sample_robustness_bilinear's
+// arithmetic). Config::robust_nn_raw_bilinear picks.
+inline float rob_fetch_u8(device const uchar* r8, uint h, uint w, float y, float x, bool bil) {
+    if (h == 0u || w == 0u) return 0.f;
+    const float k = 1.f / 255.f;
+    if (!bil) {
+        int iy = clamp(int(floor(y + 0.5f)), 0, int(h) - 1);
+        int ix = clamp(int(floor(x + 0.5f)), 0, int(w) - 1);
+        return float(r8[uint(iy) * w + uint(ix)]) * k;
+    }
+    y = clamp(y, 0.f, float(h - 1u));
+    x = clamp(x, 0.f, float(w - 1u));
+    int y0 = int(floor(y));
+    int x0 = int(floor(x));
+    int y1 = min(y0 + 1, int(h) - 1);
+    int x1 = min(x0 + 1, int(w) - 1);
+    float fy = y - float(y0);
+    float fx = x - float(x0);
+    float a = float(r8[uint(y0) * w + uint(x0)]) * k, b = float(r8[uint(y0) * w + uint(x1)]) * k;
+    float c = float(r8[uint(y1) * w + uint(x0)]) * k, d = float(r8[uint(y1) * w + uint(x1)]) * k;
+    float top = a + (b - a) * fx;
+    float bot = c + (d - c) * fx;
+    return top + (bot - top) * fy;
+}
+// robust_nn v42 -- END rob_fetch_u8
+
 // Alg. 4 — merge.cpp accumulate_comp
 // One comparison frame's contribution at one output pixel.
 //
@@ -1122,7 +1151,12 @@ static inline void merge_comp_contrib(device const float* img,
     // would have made turning one on silently change the alignment the merge
     // fetches with. See Config::merge_robustness_bilinear.
     float local_r;
-    if (p.rob_bilinear != 0u) {
+    if (p.raw_res_robustness == 2u) {
+        // robust_nn v42: the frame's slot holds the RAW-resolution mask packed
+        // 8 bits per raw pixel (rnn_raw_upmin), so R is read 1:1 at lr.
+        local_r = rob_fetch_u8((device const uchar*)robustness, p.rob_h, p.rob_w, rob_y, rob_x,
+                               p.rob_bilinear != 0u);
+    } else if (p.rob_bilinear != 0u) {
         local_r = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x);
     } else {
         int iy = clamp(int(floor(rob_y + 0.5f)), 0, int(p.rob_h) - 1);
@@ -2341,7 +2375,10 @@ kernel void rob_row_activity(device uint* rows [[buffer(0)]],
     const uint count = p.w * nch;
     uint any = 0u;
     for (uint i = 0u; i < count; ++i) {
-        if (R[base + i] != 0.f) { any = 1u; break; }
+        // Bit test, not != 0.f: a v42 slot holds 8-bit raw R packed four to a
+        // float, which can read as a (flushed) denormal. For a float mask the
+        // only difference is -0.0 counting as active -- conservative.
+        if (as_type<uint>(R[base + i]) != 0u) { any = 1u; break; }
     }
     rows[gid] = any;
 }
@@ -3396,6 +3433,9 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
 //
 // Order (v41): rob_make_mask -> rnn_refine_mask (reads the analytic mask
 // BEFORE Eq. 9) -> rob_local_min_5x5 over the refined mask, last.
+// Order (v42, Config::robust_nn_raw_res): rob_make_mask -> rnn_refine_mask
+// (unsharpened) -> rnn_raw_upmin (Dodgson x2 to raw, sharpening, 5x5 min at
+// raw, 8-bit) -- see the end of this file.
 //
 // Memory: one fused kernel. Each 16x16 threadgroup builds its warped-grey
 // tile (26x26) and its 18x18 feature halo in threadgroup memory (<= 30 KB at
@@ -3516,5 +3556,90 @@ kernel void rnn_refine_mask(device const float* ref_grey [[buffer(0)]],
         if (p.sharp_hi > p.sharp_lo)
             R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
         r_out[y * W + x] = R;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// robust_nn v42: the net's guide-resolution R (unsharpened) -> Dodgson x2 to
+// RAW resolution -> clamp [0,1] -> sharpening (lo/hi; identity when hi <= lo,
+// as for the analytic fallback) -> Eq. 9's 5x5 minimum at RAW resolution,
+// last -> 8 bits per raw pixel into the frame's guide-sized float slot (4
+// bytes per guide px == 1 byte per raw px, so the resident burst buffers do
+// not grow). The merge reads it with raw_res_robustness == 2.
+//
+// Raw pixel i sits at guide (i + 0.5) / 2 - 0.5; the three Dodgson taps
+// around lround(.) are clamped to the image and weighted by the distance to
+// the CLAMPED tap, normalised by the weight sum (sample_dogson, minus its
+// +inf outside the image: this resamples R, not statistics). The minimum's
+// window is clamped to the image (== replicate padding). Mirrors
+// tools/robust_nn/train_v17.py raw_chain bit for bit up to float order.
+//
+// One 16x16 threadgroup: the 20x20 upsampled apron in threadgroup memory
+// (1.6 KB), then the 25-tap minimum from there. No raw-resolution scratch.
+// ---------------------------------------------------------------------------
+#define RNN_UP_TS 16
+#define RNN_UP_N (RNN_UP_TS + 4)
+
+// Mirrors RnnUpminParamsCPU in metal_gpu.mm (32 bytes).
+struct RnnUpminParams {
+    uint gw, gh, raw_w, raw_h;
+    float lo, hi;
+    uint _pad0, _pad1;
+};
+
+inline float rnn_dq(float x) {
+    float ax = fabs(x);
+    if (ax <= 0.5f) return -2.f * ax * ax + 1.f;
+    if (ax <= 1.5f) return ax * ax - 2.5f * ax + 1.5f;
+    return 0.f;
+}
+
+inline float rnn_up_at(device const float* Rg, constant RnnUpminParams& p, int y, int x) {
+    const float ly = (float(y) + 0.5f) * 0.5f - 0.5f;
+    const float lx = (float(x) + 0.5f) * 0.5f - 0.5f;
+    const int cy = (ly >= 0.f) ? int(floor(ly + 0.5f)) : int(ceil(ly - 0.5f));
+    const int cx = (lx >= 0.f) ? int(floor(lx + 0.5f)) : int(ceil(lx - 0.5f));
+    const int gh = int(p.gh), gw = int(p.gw);
+    float acc = 0.f, wacc = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        const int yy = clamp(cy + i, 0, gh - 1);
+        const float wy = rnn_dq(float(yy) - ly);
+        for (int j = -1; j <= 1; ++j) {
+            const int xx = clamp(cx + j, 0, gw - 1);
+            const float w = wy * rnn_dq(float(xx) - lx);
+            acc += Rg[yy * gw + xx] * w;
+            wacc += w;
+        }
+    }
+    float v = clamp(acc / wacc, 0.f, 1.f);
+    if (p.hi > p.lo) v = clamp((v - p.lo) / (p.hi - p.lo), 0.f, 1.f);
+    return v;
+}
+
+kernel void rnn_raw_upmin(device const float* Rg [[buffer(0)]],
+                          device uchar* out [[buffer(1)]],
+                          constant RnnUpminParams& p [[buffer(2)]],
+                          uint2 tgid [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 tpt [[threads_per_threadgroup]]) {
+    threadgroup float sU[RNN_UP_N * RNN_UP_N];
+    const int H = int(p.raw_h), W = int(p.raw_w);
+    const int nt = int(tpt.x * tpt.y);
+    const int x0 = int(tgid.x) * RNN_UP_TS, y0 = int(tgid.y) * RNN_UP_TS;
+    for (int i = int(tid); i < RNN_UP_N * RNN_UP_N; i += nt) {
+        const int yy = clamp(y0 - 2 + i / RNN_UP_N, 0, H - 1);
+        const int xx = clamp(x0 - 2 + i % RNN_UP_N, 0, W - 1);
+        sU[i] = rnn_up_at(Rg, p, yy, xx);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(tid); i < RNN_UP_TS * RNN_UP_TS; i += nt) {
+        const int ly = i / RNN_UP_TS, lx = i % RNN_UP_TS;
+        const int y = y0 + ly, x = x0 + lx;
+        if (x >= W || y >= H) continue;
+        float mn = 1.f;
+        for (int dy = 0; dy < 5; ++dy)
+            for (int dx = 0; dx < 5; ++dx) mn = min(mn, sU[(ly + dy) * RNN_UP_N + lx + dx]);
+        out[y * W + x] = uchar(floor(mn * 255.f + 0.5f));
     }
 }

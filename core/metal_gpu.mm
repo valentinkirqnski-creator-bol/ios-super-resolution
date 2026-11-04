@@ -944,6 +944,9 @@ struct BurstFrames {
     size_t rob_rows_b = 0;
 
     std::vector<uint8_t> have_raw, have_cov, have_rob, have_flow;
+    // robust_nn v42: 1 = this slot's mask is the raw-resolution 8-bit plane
+    // (rnn_raw_upmin), packed into the guide-sized float slice.
+    std::vector<uint8_t> rob_u8;
 
     bool valid_slot(int slot) const { return open && slot >= 0 && slot < n; }
 };
@@ -983,6 +986,7 @@ static void bf_release() {
     g_bf.have_cov.clear();
     g_bf.have_rob.clear();
     g_bf.have_flow.clear();
+    g_bf.rob_u8.clear();
     g_bf.open = false;
     g_bf.n = 0;
     g_active_slot = -1;
@@ -1096,6 +1100,7 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.have_cov.assign(nn, 0u);
     g_bf.have_rob.assign(nn, 0u);
     g_bf.have_flow.assign(nn, 0u);
+    g_bf.rob_u8.assign(nn, 0u);
     g_bf.open = true;
     return true;
 }
@@ -1150,8 +1155,17 @@ bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
     const uint32_t* flags = (const uint32_t*)[g_bf.rob_rows contents];
     if (!flags) return false;
     rows.assign((size_t)g_bf.rob_h, 0u);
+    const bool u8 = g_bf.rob_u8[(size_t)slot] != 0u;
     for (int y = 0; y < g_bf.rob_h; ++y) {
-        const uint8_t v = flags[y] ? 1u : 0u;
+        // A v42 slot's guide row y holds raw rows 2y and 2y+1; the bilinear
+        // fetch can also touch raw rows 2y-1 and 2y+2, so a row is live when
+        // its neighbours are.
+        uint32_t f = flags[y];
+        if (u8) {
+            if (y > 0) f |= flags[y - 1];
+            if (y + 1 < g_bf.rob_h) f |= flags[y + 1];
+        }
+        const uint8_t v = f ? 1u : 0u;
         rows[(size_t)y] = v;
         any = any || (v != 0u);
     }
@@ -1179,6 +1193,11 @@ const float* metal_frame_rob_plane(int slot, int* h, int* w) {
     if (h) *h = g_bf.rob_h;
     if (w) *w = g_bf.rob_w;
     return (const float*)[g_bf.robs contents] + bf_rob_off(slot);
+}
+
+bool metal_frame_rob_is_u8(int slot) {
+    return g_bf.valid_slot(slot) && g_bf.have_rob[(size_t)slot] != 0u &&
+           g_bf.rob_u8[(size_t)slot] != 0u;
 }
 
 bool metal_frame_merge_ready(int slot) {
@@ -2207,6 +2226,12 @@ struct RnnGreyParamsCPU {
     float u00, u01, u10, u11;
 };
 static_assert(sizeof(RnnGreyParamsCPU) == 32, "RnnGreyParamsCPU must mirror RnnGreyParams");
+struct RnnUpminParamsCPU {
+    uint32_t gw, gh, raw_w, raw_h;
+    float lo, hi;
+    uint32_t _pad0 = 0, _pad1 = 0;
+};
+static_assert(sizeof(RnnUpminParamsCPU) == 32, "RnnUpminParamsCPU must mirror RnnUpminParams");
 
 // The net's domain: Bayer bursts on the half-resolution guide lattice (nch 3).
 // The raw-resolution / FFT-guide path is not covered (its mask is not on the
@@ -2261,10 +2286,14 @@ static void rnn_pin_ref_grey(const Image& ref_raw, int gh, int gw, int nch, cons
 // g_rnn_out. The caller runs Eq. 9's 5x5 minimum over g_rnn_out last -- the
 // order the net was trained in (tools/robust_nn v41, NN_POSTMIN). Returns
 // false (nothing encoded) whenever a precondition fails.
+//
+// unsharpened (v42): the net's R without the lo/hi sharpening, which
+// rnn_raw_upmin applies after the upsample instead.
 static bool rnn_encode_refine(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, size_t raw_off_bytes,
                               int raw_w, int raw_h, int gh, int gw, int nch,
                               id<MTLBuffer> r0_buf, size_t r0_off, id<MTLBuffer> b_flow,
-                              const FlowField& flow, int tile_size, const Config& cfg) {
+                              const FlowField& flow, int tile_size, const Config& cfg,
+                              bool unsharpened = false) {
     if (!rnn_domain_ok(cfg, nch) || !cmd || !raw_buf || !r0_buf || !b_flow) return false;
     if (!g_rnn_ref_grey || g_rnn_h != gh || g_rnn_w != gw) return false;
     if (raw_w < 2 * gw || raw_h < 2 * gh || flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return false;
@@ -2300,6 +2329,7 @@ static bool rnn_encode_refine(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, s
     p.tile_size = (float)tile_size;
     p.sharp_lo = std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f);
     p.sharp_hi = std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f);   // hi <= lo: raw output
+    if (unsharpened) p.sharp_lo = p.sharp_hi = 0.f;
 
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     if (!enc) return false;
@@ -2318,6 +2348,37 @@ static bool rnn_encode_refine(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, s
     const NSUInteger total = std::min<NSUInteger>(256, pnet.maxTotalThreadsPerThreadgroup);
     const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)gw + 15) / 16, ((NSUInteger)gh + 15) / 16, 1)
+        threadsPerThreadgroup:tg];
+    [enc endEncoding];
+    return true;
+}
+
+// robust_nn v42: guide-resolution R (src, gh x gw floats) -> Dodgson x2 ->
+// sharpening (lo/hi; identity when hi <= lo) -> 5x5 minimum at raw ->
+// 8-bit raw plane written into out at out_off bytes (raw_h x raw_w bytes ==
+// the guide-sized float slice). See rnn_raw_upmin.
+static bool rnn_encode_raw_upmin(id<MTLCommandBuffer> cmd, id<MTLBuffer> src, int gh, int gw,
+                                 id<MTLBuffer> out, size_t out_off, float lo, float hi) {
+    if (!cmd || !src || !out || gh <= 0 || gw <= 0) return false;
+    id<MTLComputePipelineState> pup = ctx().pipe("rnn_raw_upmin");
+    if (!pup) return false;
+    RnnUpminParamsCPU p{};
+    p.gw = (uint32_t)gw;
+    p.gh = (uint32_t)gh;
+    p.raw_w = (uint32_t)(2 * gw);
+    p.raw_h = (uint32_t)(2 * gh);
+    p.lo = lo;
+    p.hi = hi;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setComputePipelineState:pup];
+    [enc setBuffer:src offset:0 atIndex:0];
+    [enc setBuffer:out offset:out_off atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    // Strides over its 16x16 tile, so any group size is correct.
+    const NSUInteger total = std::min<NSUInteger>(256, pup.maxTotalThreadsPerThreadgroup);
+    const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)p.raw_w + 15) / 16, ((NSUInteger)p.raw_h + 15) / 16, 1)
         threadsPerThreadgroup:tg];
     [enc endEncoding];
     return true;
@@ -2776,10 +2837,19 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                         : buf(nullptr, mask_b));
     const size_t out_off_bytes = rob_resident ? bf_rob_off(bf_slot) * sizeof(float) : 0;
     bool rnn_done = false;   // robust_nn: the net ran (between rob_make_mask and Eq. 9)
+    bool rob_u8 = false;     // robust_nn v42: this frame's slot got the raw-resolution 8-bit mask
     // Bound unconditionally because the kernel declares it; sized for real only
     // when asked, so the off case costs 4 bytes rather than a full mask plane.
     const bool want_s_select = (s_select_out != nullptr);
     id<MTLBuffer> b_s_select = buf(nullptr, want_s_select ? mask_b : sizeof(float));
+    // robust_nn v42 order: only into a resident slot (the fused merge is the
+    // only reader that knows the packed layout), and only when nothing on the
+    // host reads this mask as floats.
+    const bool rnn_raw_mode = cfg.robust_nn_raw_res && rob_resident && rnn_domain_ok(cfg, nch) &&
+                              !want_s_select && !debug_dumps_enabled() &&
+                              g_bf.rob_h == gh && g_bf.rob_w == gw &&
+                              g_bf.raw_h == 2 * gh && g_bf.raw_w == 2 * gw &&
+                              c.pipe("rnn_raw_upmin") != nil;
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
         !b_S || !b_motion || !b_aperture || !b_tile_residual_high || !b_flow ||
         !b_R || !b_out || !b_s_select)
@@ -2878,16 +2948,27 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             if (!rnn_raw && !comp_raw.data.empty())
                 rnn_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
             rnn_done = rnn_encode_refine(cmd, rnn_raw, rnn_raw_off, comp_raw.w, comp_raw.h, gh, gw, nch,
-                                         b_R, 0, b_flow, flow, tile_size, cfg);
+                                         b_R, 0, b_flow, flow, tile_size, cfg, rnn_raw_mode);
             if (rnn_done) min_src = g_rnn_out;
         }
-        enc = [cmd computeCommandEncoder];
-        if (!enc) return Image();
-        [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
-        [enc setBuffer:min_src offset:0 atIndex:1];
-        [enc setBytes:&sp length:sizeof(sp) atIndex:2];
-        dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
-        [enc endEncoding];
+        if (rnn_raw_mode) {
+            // v42: upsample + sharpen + 5x5 minimum at RAW resolution, into
+            // the slot as 8 bits per raw pixel. The analytic mask (net
+            // declined) takes the same path unsharpened.
+            const float lo = rnn_done ? std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f) : 0.f;
+            const float hi = rnn_done ? std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f) : 0.f;
+            rob_u8 = rnn_encode_raw_upmin(cmd, min_src, gh, gw, b_out, out_off_bytes, lo, hi);
+            if (!rob_u8) return Image();   // encoder failure (the pipeline was checked above)
+        }
+        if (!rob_u8) {
+            enc = [cmd computeCommandEncoder];
+            if (!enc) return Image();
+            [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
+            [enc setBuffer:min_src offset:0 atIndex:1];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+            dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
+            [enc endEncoding];
+        }
     }
 
     // ---- learned refinement (Config::robustness_refine_nn_enabled) --------
@@ -2905,7 +2986,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     // Deliberately NOT in the pipeline list metal_gpu_init() requires, so a
     // missing rob_refine_mask leaves the whole Metal backend working and this
     // one stage off, rather than falling the entire pipeline back to the CPU.
-    if (cfg.robustness_refine_nn_enabled && !rnn_done) {
+    if (cfg.robustness_refine_nn_enabled && !rnn_done && !rob_u8) {
         id<MTLComputePipelineState> refine = c.pipe("rob_refine_mask");
         id<MTLBuffer> b_w = refine ? rob_refine_weights() : nil;
         if (refine && b_w) {
@@ -2959,7 +3040,10 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    if (rob_resident) g_bf.have_rob[(size_t)bf_slot] = 1u;
+    if (rob_resident) {
+        g_bf.have_rob[(size_t)bf_slot] = 1u;
+        g_bf.rob_u8[(size_t)bf_slot] = rob_u8 ? 1u : 0u;
+    }
 
     // The mask only comes back to the host when something on the CPU reads it:
     // the debug dumps or the s1/s2 split. The merge reads the slice.
@@ -4861,6 +4945,13 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_bilinear = 0u;
         p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
+        if (g_bf.rob_u8[(size_t)slot]) {
+            // robust_nn v42: the slot holds the raw-resolution 8-bit mask.
+            p.rob_h = (uint32_t)g_bf.raw_h;
+            p.rob_w = (uint32_t)g_bf.raw_w;
+            p.raw_res_robustness = 2u;
+            p.rob_bilinear = cfg.robust_nn_raw_bilinear ? 1u : 0u;
+        }
         p.cov_stride = g_bf.cov_stride;
         p.img_off  = (uint32_t)bf_raw_off(slot);
         p.flow_off = (uint32_t)bf_flow_off(slot);

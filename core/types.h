@@ -1208,6 +1208,15 @@ struct Config {
     // Output sharpening: R below reject_below -> 0, above accept_above -> 1 (identity when hi <= lo).
     float robust_nn_reject_below = 0.20f;
     float robust_nn_accept_above = 0.90f;
+    // robust_nn v42 order (the order the shipped weights are trained in): the net's guide-resolution R,
+    // unsharpened, is Dodgson x2 upsampled to RAW resolution, sharpened, and Eq. 9's 5x5 minimum runs there,
+    // last (kernel rnn_raw_upmin). Stored 8 bits per raw pixel in the frame's own guide-sized float slot (4
+    // bytes per guide px == 1 byte per raw px), so the resident burst buffers do not grow; the merge reads it
+    // 1:1 at raw resolution. Needs the resident (fused) merge, no s1/s2 split and no debug dumps; otherwise
+    // that frame falls back to the guide order (net -> guide 5x5 minimum).
+    bool  robust_nn_raw_res = true;
+    // How the merge reads that raw mask at each output pixel: nearest (false) or bilinear (true).
+    bool  robust_nn_raw_bilinear = false;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency
