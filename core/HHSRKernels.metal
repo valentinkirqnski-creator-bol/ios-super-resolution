@@ -3394,6 +3394,9 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
 // the linear camera-native quad grey -- and the flow is the nearest tile
 // vector only (no global homography / per-tile affine here).
 //
+// Order (v41): rob_make_mask -> rnn_refine_mask (reads the analytic mask
+// BEFORE Eq. 9) -> rob_local_min_5x5 over the refined mask, last.
+//
 // Memory: one fused kernel. Each 16x16 threadgroup builds its warped-grey
 // tile (26x26) and its 18x18 feature halo in threadgroup memory (<= 30 KB at
 // 21 features) and runs the net from there. Device buffers: the reference

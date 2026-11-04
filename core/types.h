@@ -1198,8 +1198,9 @@ struct Config {
     // fails to load, so enabling it can never leave the pipeline maskless.
     bool  robustness_refine_nn_enabled = false;
     // robust_nn v40 (tools/robust_nn; kernels rnn_grey_from_raw + rnn_refine_mask, net in
-    // robust_nn_shared.h / robust_nn_weights.h): learned refinement of the finished analytic mask at
-    // guide resolution, R = sigmoid(logit(R0) + delta). v21's inputs plus the motion prior of Wronski
+    // robust_nn_shared.h / robust_nn_weights.h): learned refinement of the analytic mask at
+    // guide resolution, R = sigmoid(logit(R0) + delta), BETWEEN the analytic mask and Eq. 9: R0 is the mask
+    // before the 5x5 minimum, and the minimum runs last over the refined mask (v41 order). v21's inputs plus the motion prior of Wronski
     // et al. Eq. 7 (3x3 tile-flow extent, M_th 0.80 raw px, gated by reference structure) and
     // frame-vs-reference structure-tensor inputs, trained on same-burst twins. Metal guide-resolution
     // path only (declines on the raw-resolution / FFT-guide path); replaces robustness_refine_nn when on.

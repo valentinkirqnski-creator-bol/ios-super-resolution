@@ -2255,15 +2255,17 @@ static void rnn_pin_ref_grey(const Image& ref_raw, int gh, int gw, int nch, cons
     g_rnn_w = gw;
 }
 
-// Encodes the refinement of one frame's finished guide-resolution mask into
-// cmd: comparison grey from its raw, the fused net, and a copy of the result
-// back over the mask (b_mask at mask_off bytes). Returns false (nothing
-// encoded, mask untouched) whenever a precondition fails.
+// Encodes the refinement of one frame's guide-resolution analytic mask into
+// cmd: comparison grey from its raw, then the fused net reading the mask
+// BEFORE Eq. 9 (r0_buf at r0_off bytes) and writing the refined mask to
+// g_rnn_out. The caller runs Eq. 9's 5x5 minimum over g_rnn_out last -- the
+// order the net was trained in (tools/robust_nn v41, NN_POSTMIN). Returns
+// false (nothing encoded) whenever a precondition fails.
 static bool rnn_encode_refine(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, size_t raw_off_bytes,
                               int raw_w, int raw_h, int gh, int gw, int nch,
-                              id<MTLBuffer> b_mask, size_t mask_off, id<MTLBuffer> b_flow,
+                              id<MTLBuffer> r0_buf, size_t r0_off, id<MTLBuffer> b_flow,
                               const FlowField& flow, int tile_size, const Config& cfg) {
-    if (!rnn_domain_ok(cfg, nch) || !cmd || !raw_buf || !b_mask || !b_flow) return false;
+    if (!rnn_domain_ok(cfg, nch) || !cmd || !raw_buf || !r0_buf || !b_flow) return false;
     if (!g_rnn_ref_grey || g_rnn_h != gh || g_rnn_w != gw) return false;
     if (raw_w < 2 * gw || raw_h < 2 * gh || flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return false;
     auto& c = ctx();
@@ -2308,7 +2310,7 @@ static bool rnn_encode_refine(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, s
     [enc setComputePipelineState:pnet];
     [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
     [enc setBuffer:g_rnn_cmp_grey offset:0 atIndex:1];
-    [enc setBuffer:b_mask offset:mask_off atIndex:2];
+    [enc setBuffer:r0_buf offset:r0_off atIndex:2];
     [enc setBuffer:g_rnn_out offset:0 atIndex:3];
     [enc setBuffer:b_flow offset:0 atIndex:4];
     [enc setBytes:&p length:sizeof(p) atIndex:5];
@@ -2318,10 +2320,6 @@ static bool rnn_encode_refine(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, s
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)gw + 15) / 16, ((NSUInteger)gh + 15) / 16, 1)
         threadsPerThreadgroup:tg];
     [enc endEncoding];
-    id<MTLBlitCommandEncoder> bl = [cmd blitCommandEncoder];
-    if (!bl) return false;
-    [bl copyFromBuffer:g_rnn_out sourceOffset:0 toBuffer:b_mask destinationOffset:mask_off size:bytes];
-    [bl endEncoding];
     return true;
 }
 
@@ -2777,6 +2775,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         : (resident_raw ? c.scratch(c.rob_mask_min, c.rob_mask_min_b, mask_b)
                         : buf(nullptr, mask_b));
     const size_t out_off_bytes = rob_resident ? bf_rob_off(bf_slot) * sizeof(float) : 0;
+    bool rnn_done = false;   // robust_nn: the net ran (between rob_make_mask and Eq. 9)
     // Bound unconditionally because the kernel declares it; sized for real only
     // when asked, so the off case costs 4 bytes rather than a full mask plane.
     const bool want_s_select = (s_select_out != nullptr);
@@ -2868,27 +2867,27 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         sp.h = (uint32_t)gh;
         sp.w = (uint32_t)gw;
         sp.nch = 1u;
+        // robust_nn (Config::robust_nn_enabled): the net refines the analytic
+        // mask BEFORE Eq. 9, and Eq. 9's 5x5 minimum runs last, over the
+        // refined mask -- the order the net was trained in. Declines silently
+        // (the analytic mask goes straight to Eq. 9) if anything is missing.
+        id<MTLBuffer> min_src = b_R;
+        if (rnn_domain_ok(cfg, nch)) {
+            id<MTLBuffer> rnn_raw = resident_raw;
+            size_t rnn_raw_off = resident_raw ? resident_off * sizeof(float) : 0;
+            if (!rnn_raw && !comp_raw.data.empty())
+                rnn_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
+            rnn_done = rnn_encode_refine(cmd, rnn_raw, rnn_raw_off, comp_raw.w, comp_raw.h, gh, gw, nch,
+                                         b_R, 0, b_flow, flow, tile_size, cfg);
+            if (rnn_done) min_src = g_rnn_out;
+        }
         enc = [cmd computeCommandEncoder];
         if (!enc) return Image();
         [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
-        [enc setBuffer:b_R offset:0 atIndex:1];
+        [enc setBuffer:min_src offset:0 atIndex:1];
         [enc setBytes:&sp length:sizeof(sp) atIndex:2];
         dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
         [enc endEncoding];
-    }
-
-    // ---- robust_nn v40 (Config::robust_nn_enabled) --------------------------
-    // Refines the finished guide-resolution mask in place on this command
-    // buffer (comparison grey from its raw, fused net, copy back). Declines
-    // silently -- the analytic mask stands -- if anything is missing.
-    bool rnn_done = false;
-    if (rnn_domain_ok(cfg, nch)) {
-        id<MTLBuffer> rnn_raw = resident_raw;
-        size_t rnn_raw_off = resident_raw ? resident_off * sizeof(float) : 0;
-        if (!rnn_raw && !comp_raw.data.empty())
-            rnn_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
-        rnn_done = rnn_encode_refine(cmd, rnn_raw, rnn_raw_off, comp_raw.w, comp_raw.h, gh, gw, nch,
-                                     b_out, out_off_bytes, b_flow, flow, tile_size, cfg);
     }
 
     // ---- learned refinement (Config::robustness_refine_nn_enabled) --------
