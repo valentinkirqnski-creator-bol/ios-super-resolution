@@ -1801,8 +1801,10 @@ struct GcamSabreParamsCPU {
     float    na = 0.f;
     float    nb = 0.f;
     uint32_t noise_model = 0;   // §3: 1 = subtract the Monte-Carlo LUT noise
+    uint32_t out_h = 0, out_w = 0;   // merge-output grid (gcam_sabre_mask_upscale)
+    uint32_t upscale = 0;            // 1 = run the operator on the merge grid
 };
-static_assert(sizeof(GcamSabreParamsCPU) == 104, "GcamSabreParamsCPU");
+static_assert(sizeof(GcamSabreParamsCPU) == 116, "GcamSabreParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -2986,9 +2988,19 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     auto& c = ctx();
     id<MTLComputePipelineState> pipe = c.pipe("rob_gcam_sabre");
     if (!pipe) return Image();                 // kernel absent -> CPU fallback
-    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/false);
+    // Mask-upscale: match the reference's prefilter so aligned content keeps R=1 (the
+    // sharp Dodgson sampling + 5x5 otherwise amplify the ref-prefiltered/comp-raw
+    // residual). Twin of compute_robustness_gcam_sabre. Guide-res path: raw comp.
+    const Image compg = compute_gcam_guide(comp_raw, cfg,
+                                           /*prefilter_ref=*/cfg.gcam_sabre_mask_upscale);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
+    // gcam_sabre_mask_upscale: evaluate the operator on the merge-output grid
+    // (= scale*raw, 2x the input frame) instead of the guide, Dodgson-upsampling the
+    // stats inline (the ref unwarped, the comp warped). Twin of the CPU upscale path.
+    const bool upscale = cfg.gcam_sabre_mask_upscale;
+    const int th = upscale ? (int)std::lround(cfg.scale * (f32)comp_raw.h) : gh;
+    const int tw = upscale ? (int)std::lround(cfg.scale * (f32)comp_raw.w) : gw;
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 
@@ -2996,7 +3008,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     id<MTLBuffer> b_compg = buf(compg.data.data(), compg.data.size() * sizeof(float));
     id<MTLBuffer> b_flow  = buf(flow.flow.data(),  flow.flow.size()  * sizeof(float));
     id<MTLBuffer> b_irr   = buf(irr.data(),        irr.size()        * sizeof(float));
-    const size_t mask_b = (size_t)gh * (size_t)gw * sizeof(float);
+    const size_t mask_b = (size_t)th * (size_t)tw * sizeof(float);   // target grid
     id<MTLBuffer> b_R    = buf(nullptr, mask_b);
     // §3 Monte-Carlo noise LUT (host-built, fixed seed -> matches the CPU operator
     // and the guides). Uploaded for the kernel's operator-noise term; a 1-float
@@ -3022,6 +3034,8 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.motion_thresh = cfg.gcam_sabre_motion_thresh * (float)std::max(1, tile_size) * (4128.f / 16.f);
     mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
     mp.noise_model = noise_model ? 1u : 0u;
+    mp.out_h = (uint32_t)th; mp.out_w = (uint32_t)tw;
+    mp.upscale = upscale ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -3034,16 +3048,20 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     [enc setBuffer:b_irr   offset:0 atIndex:4];
     [enc setBytes:&mp length:sizeof(mp) atIndex:5];
     [enc setBuffer:b_lut   offset:0 atIndex:6];
-    dispatch2(enc, pipe, (NSUInteger)gw, (NSUInteger)gh);
+    dispatch2(enc, pipe, (NSUInteger)tw, (NSUInteger)th);
     [enc endEncoding];
     prof_tag_gpu(cmd, "robustness:gcam-sabre");
     [cmd commit];
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    Image R_pre(gh, gw, 1);
+    Image R_pre(th, tw, 1);
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    Image dil = robustness_gcam_dilate(R_pre, cfg);        // §7 (verified CPU helper)
+    // §7 at the target grid. Upscale: the merge grid, 2x-downsample sub-mode off
+    // (guide-res specific) so the merge reads one weight per output pixel.
+    Config dcfg = cfg;
+    if (upscale) dcfg.gcam_sabre_dilate_2x = false;
+    Image dil = robustness_gcam_dilate(R_pre, dcfg);       // §7 (verified CPU helper)
     if (s_select_out) {
         *s_select_out = Image(dil.h, dil.w, 1);
         std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);

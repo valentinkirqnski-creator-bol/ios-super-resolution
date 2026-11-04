@@ -1443,7 +1443,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     // this makes it explicit so the refined host mask is what the banded merge
     // uploads -- the whole net path then runs host-side with no Metal kernel and
     // the device result is bit-identical to the CPU path.
+    // gcam_sabre_mask_upscale: the robustness mask is at the 48MP merge grid
+    // (~195MB/frame). The fused/resident path needs every frame's mask resident at
+    // once (~1.5GB for 8 frames); force the pre-residency online merge instead, which
+    // computes and consumes one frame's mask at a time (kOnlineFuse==1).
     frames_resident = (work.merge_arch != 2) && !work.rob_mask_nn_enabled &&
+                      !work.gcam_sabre_mask_upscale &&
                       metal_frames_begin(frame_count, ref.h, ref.w,
                                          frames_tile_size, work);
     if (frames_resident) {
@@ -1675,6 +1680,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (!frames_resident && use_online && work.merge_arch != 2 &&
         metal_frames_alloc_refused())
         use_online = false;
+    // gcam_sabre_mask_upscale: residency was disabled above, so take the online
+    // accumulator -- it computes and consumes one 48MP mask per frame (kOnlineFuse==1)
+    // and reads it 1:1 at output resolution. The fused/banded resident paths can't
+    // hold 8 such masks at once.
+    if (work.gcam_sabre_mask_upscale) use_online = true;
 #endif
     // Every comparison frame's slice has to be complete before the fused kernel
     // can read them, which is only true on the resident path.

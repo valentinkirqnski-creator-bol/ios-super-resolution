@@ -159,11 +159,23 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // guide-resolution path, so the flag can say "raw" while the mask
             // handed to us is guide. Trusting the flag there would sample R
             // at half the correct position everywhere.
+            // gcam_sabre_mask_upscale: the mask is already at the merge-output grid
+            // (scale*raw == num.w wide), Dodgson-upscaled + 5x5'd there, so it is read
+            // 1:1 at the output pixel, nearest -- no lr/guide conversion, no bilinear
+            // re-stretch. Identified by width == output width (distinct from guide
+            // lr/2 and raw lr).
+            const int out_h_full = (int)std::lround(scale * (f32)lr_h);
+            const bool rob_is_output = (robustness.h == out_h_full && robustness.w == Ws);
             const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
-            f32 rob_y = lr_y, rob_x = lr_x;
-            if (!rob_is_raw && cfg.bayer_mode) {
-                rob_y = (lr_y - 0.5f) / 2.f;
-                rob_x = (lr_x - 0.5f) / 2.f;
+            f32 rob_y, rob_x;
+            if (rob_is_output) {
+                rob_y = (f32)hr_i; rob_x = (f32)hr_j;
+            } else {
+                rob_y = lr_y; rob_x = lr_x;
+                if (!rob_is_raw && cfg.bayer_mode) {
+                    rob_y = (lr_y - 0.5f) / 2.f;
+                    rob_x = (lr_x - 0.5f) / 2.f;
+                }
             }
             // Config::merge_robustness_bilinear documents why this is no longer
             // nearest by default, and what the nearest branch was protecting.
@@ -173,8 +185,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             const int rnc = robustness.c;
             f32 local_r[3];
             // robustness_guide_res_bilinear: the guide-res mask bilinearly
-            // upsampled to the merge grid IS this bilinear fetch.
-            if (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) {
+            // upsampled to the merge grid IS this bilinear fetch. (Never for an
+            // output-res mask -- it is already 1:1, read nearest.)
+            if (!rob_is_output &&
+                (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear)) {
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
             } else {

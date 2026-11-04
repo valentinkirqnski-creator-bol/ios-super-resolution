@@ -1764,6 +1764,20 @@ struct Config {
     // Off by default: the CPU operator is the verified reference and runs on device
     // as-is. The Metal kernel is unverified until a device/CI build compiles it.
     bool  gcam_sabre_gpu             = false;
+    // Compute the gcam robustness map on the guide image exactly as now (§5
+    // ComputeFrameWeight at guide res), then DODGSON-UPSCALE that guide-res R to
+    // the merge-output grid (= scale*raw, 2x the input frame, ~48.8MP at 2x), and
+    // run the §7 5x5 soft-dilate there -- so the merge reads one robustness weight
+    // PER OUTPUT PIXEL (1:1, nearest) instead of bilinearly stretching a guide-res
+    // mask over a ~4x4 block. R is already in the reference frame (the comp was
+    // flow-warped inside the operator), so the upscale is a pure resolution step
+    // (DodgsonApproximateQuadratic, no extra warp). The §7 dilate runs at the fine
+    // grid (its gcam_sabre_dilate_2x downsample sub-mode is skipped here). Memory:
+    // the upscaled mask is ~195MB/frame at 48MP, so on device this FORCES the
+    // online (one-frame-at-a-time) merge and the mask is built transiently per
+    // comparison frame. Off by default (guide-res bilinear stays the default).
+    // Requires robustness_gcam_enabled.
+    bool  gcam_sabre_mask_upscale    = false;
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an
