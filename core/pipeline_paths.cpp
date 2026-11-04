@@ -85,6 +85,11 @@ struct CachedCompFrame {
     std::vector<uint8_t> rob_rows_nonzero;
     bool rob_has_nonzero = true;
     int index = 0;
+    // gcam_sabre_mask_upscale: the 48MP mask kept quantized to uint8 (R in [0,1] ->
+    // [0,255]) so 8 frames fit in ~390MB instead of 1.56GB; sliced to the current
+    // band and dequantized in the band loop. Empty on every other path (rob holds it).
+    std::vector<uint8_t> rob_u8;
+    int ru8_h = 0, ru8_w = 0, ru8_c = 0;
 };
 
 struct CachedCompMeta {
@@ -94,7 +99,37 @@ struct CachedCompMeta {
     std::vector<uint8_t> rob_rows_nonzero;
     bool rob_has_nonzero = true;
     int index = 0;
+    // See CachedCompFrame::rob_u8 (gcam_sabre_mask_upscale, band-streamed mask).
+    std::vector<uint8_t> rob_u8;
+    int ru8_h = 0, ru8_w = 0, ru8_c = 0;
 };
+
+// gcam_sabre_mask_upscale band-streaming helpers. The merge-grid mask is quantized
+// to uint8 for compact host storage, then one band is dequantized per band merge so
+// a full 48MP float mask is never held. Quantization is ~0.4%; R=0 and R=1 are exact.
+static void quantize_mask_u8(const Image& m, std::vector<uint8_t>& out,
+                             int& h, int& w, int& c) {
+    h = m.h; w = m.w; c = std::max(1, m.c);
+    out.resize((size_t)h * (size_t)w * (size_t)c);
+    for (size_t i = 0; i < out.size(); ++i) {
+        float v = m.data[i];
+        v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+        out[i] = (uint8_t)(v * 255.f + 0.5f);
+    }
+}
+// Rows [y0, y0+bh) of a uint8 mask -> a (bh x w x c) float Image (edge-clamped).
+static Image slice_mask_u8(const std::vector<uint8_t>& u8, int h, int w, int c,
+                           int y0, int bh) {
+    Image band(bh, w, c);
+    const float inv = 1.f / 255.f;
+    for (int y = 0; y < bh; ++y) {
+        int sy = std::min(y0 + y, h - 1);
+        const uint8_t* src = &u8[(size_t)sy * (size_t)w * (size_t)c];
+        float* dst = &band.data[(size_t)y * (size_t)w * (size_t)c];
+        for (int x = 0; x < w * c; ++x) dst[x] = (float)src[x] * inv;
+    }
+    return band;
+}
 
 static bool load_cached_comp_raw(const fs::path& cache, int k, Image& comp) {
     return load_image(cache / ("f" + std::to_string(k) + ".raw"), comp) && comp.h > 0;
@@ -1680,11 +1715,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (!frames_resident && use_online && work.merge_arch != 2 &&
         metal_frames_alloc_refused())
         use_online = false;
-    // gcam_sabre_mask_upscale: residency was disabled above, so take the online
-    // accumulator -- it computes and consumes one 48MP mask per frame (kOnlineFuse==1)
-    // and reads it 1:1 at output resolution. The fused/banded resident paths can't
-    // hold 8 such masks at once.
-    if (work.gcam_sabre_mask_upscale) use_online = true;
+    // gcam_sabre_mask_upscale: take the BANDED path (band-sized accumulator, not the
+    // online 1.17GB-at-48MP num/den). The 48MP masks are held on the host quantized to
+    // uint8 (~49MB/frame) and, in the band loop below, each frame's mask is sliced to
+    // the current band and uploaded per band -- so a full 48MP mask is never resident.
+    if (work.gcam_sabre_mask_upscale) use_online = false;
 #endif
     // Every comparison frame's slice has to be complete before the fused kernel
     // can read them, which is only true on the resident path.
@@ -2353,7 +2388,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             // cache would duplicate ~110MB per frame for nothing.
             if (frames_resident) {
                 uploaded_to_gpu = true;
-            } else if (rob_has_nonzero && comp.h > 0 && comp.w > 0 && headroom_ok) {
+            } else if (rob_has_nonzero && comp.h > 0 && comp.w > 0 && headroom_ok &&
+                       !work.gcam_sabre_mask_upscale) {
+                // mask-upscale keeps the 48MP mask host-side as uint8 and band-slices
+                // it in the merge, so it must NOT be prefetched (uploaded) whole here.
                 uploaded_to_gpu = metal_merge_prefetch_frame(comp, flow, covs, rob, k);
             }
 #endif
@@ -2392,6 +2430,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 meta.rob = std::move(rob);
                 meta.covs = rob_has_nonzero ? std::move(covs) : CovField();
             }
+            if (work.gcam_sabre_mask_upscale && meta.rob.h > 0 && meta.rob.w > 0) {
+                quantize_mask_u8(meta.rob, meta.rob_u8, meta.ru8_h, meta.ru8_w, meta.ru8_c);
+                meta.rob = Image();   // band-sliced from rob_u8 in the band loop
+            }
             meta.rob_rows_nonzero = std::move(rob_rows_nonzero);
             meta.rob_has_nonzero = rob_has_nonzero;
             cached_meta.push_back(std::move(meta));
@@ -2403,6 +2445,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             fc.rob = std::move(rob);
             fc.covs = rob_has_nonzero ? std::move(covs) : CovField();
             fc.comp = rob_has_nonzero ? std::move(comp) : Image();
+            if (work.gcam_sabre_mask_upscale && fc.rob.h > 0 && fc.rob.w > 0) {
+                quantize_mask_u8(fc.rob, fc.rob_u8, fc.ru8_h, fc.ru8_w, fc.ru8_c);
+                fc.rob = Image();   // band-sliced from rob_u8 in the band loop
+            }
             fc.rob_rows_nonzero = std::move(rob_rows_nonzero);
             fc.rob_has_nonzero = rob_has_nonzero;
             cached.push_back(std::move(fc));
@@ -2788,20 +2834,29 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         // readback happens inside the first ensure_acc_buffers below, so this
         // bucket is "GPU stall + encode", not encode alone.
         const double t_comp_bands = prof_now_ms();
+        // gcam_sabre_mask_upscale: dequantize only THIS band of the uint8 mask (a
+        // bh x Ws float slice), so a full 48MP float mask is never materialised. The
+        // merge reads it band-local (rob_output_res). rob_band stays alive for the
+        // merge call via band_mask.
         if (stream_comp_raw) {
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!meta.rob_has_nonzero ||
                     !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
                                                     work.scale, work.bayer_mode))
                     continue;
-                if (metal_merge_has_frame(meta.index)) {
+                Image band_mask;
+                const bool up = work.gcam_sabre_mask_upscale && !meta.rob_u8.empty();
+                if (up) band_mask = slice_mask_u8(meta.rob_u8, meta.ru8_h, meta.ru8_w,
+                                                  meta.ru8_c, y0, bh);
+                const Image& rob_use = up ? band_mask : meta.rob;
+                if (!up && metal_merge_has_frame(meta.index)) {
                     Image empty;
-                    merge_comp_band(empty, meta.flow, meta.covs, meta.rob, merge_ts,
+                    merge_comp_band(empty, meta.flow, meta.covs, rob_use, merge_ts,
                                     num_band, den_band, y0, work, meta.index);
                     continue;
                 }
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
-                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
+                merge_comp_band(comp_scratch, meta.flow, meta.covs, rob_use, merge_ts,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
@@ -2810,14 +2865,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
                                                     work.scale, work.bayer_mode))
                     continue;
-                if (metal_merge_has_frame(fc.index)) {
+                Image band_mask;
+                const bool up = work.gcam_sabre_mask_upscale && !fc.rob_u8.empty();
+                if (up) band_mask = slice_mask_u8(fc.rob_u8, fc.ru8_h, fc.ru8_w,
+                                                  fc.ru8_c, y0, bh);
+                const Image& rob_use = up ? band_mask : fc.rob;
+                if (!up && metal_merge_has_frame(fc.index)) {
                     Image empty;
-                    merge_comp_band(empty, fc.flow, fc.covs, fc.rob, merge_ts,
+                    merge_comp_band(empty, fc.flow, fc.covs, rob_use, merge_ts,
                                     num_band, den_band, y0, work, fc.index);
                     continue;
                 }
                 if (fc.comp.h <= 0) continue;
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
+                merge_comp_band(fc.comp, fc.flow, fc.covs, rob_use, merge_ts,
                                 num_band, den_band, y0, work, fc.index);
             }
         }
@@ -2904,7 +2964,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                     work.scale, work.bayer_mode))
                     continue;
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
-                merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
+                Image band_mask;
+                const bool up = work.gcam_sabre_mask_upscale && !meta.rob_u8.empty();
+                if (up) band_mask = slice_mask_u8(meta.rob_u8, meta.ru8_h, meta.ru8_w,
+                                                  meta.ru8_c, y0, bh);
+                merge_comp_band(comp_scratch, meta.flow, meta.covs,
+                                up ? band_mask : meta.rob, merge_ts,
                                 num_band, den_band, y0, work, meta.index);
             }
         } else {
@@ -2913,7 +2978,11 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
                                                     work.scale, work.bayer_mode))
                     continue;
-                merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
+                Image band_mask;
+                const bool up = work.gcam_sabre_mask_upscale && !fc.rob_u8.empty();
+                if (up) band_mask = slice_mask_u8(fc.rob_u8, fc.ru8_h, fc.ru8_w,
+                                                  fc.ru8_c, y0, bh);
+                merge_comp_band(fc.comp, fc.flow, fc.covs, up ? band_mask : fc.rob, merge_ts,
                                 num_band, den_band, y0, work, fc.index);
             }
         }

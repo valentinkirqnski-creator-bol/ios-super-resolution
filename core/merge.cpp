@@ -159,17 +159,17 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // guide-resolution path, so the flag can say "raw" while the mask
             // handed to us is guide. Trusting the flag there would sample R
             // at half the correct position everywhere.
-            // gcam_sabre_mask_upscale: the mask is already at the merge-output grid
-            // (scale*raw == num.w wide), Dodgson-upscaled + 5x5'd there, so it is read
-            // 1:1 at the output pixel, nearest -- no lr/guide conversion, no bilinear
-            // re-stretch. Identified by width == output width (distinct from guide
-            // lr/2 and raw lr).
-            const int out_h_full = (int)std::lround(scale * (f32)lr_h);
-            const bool rob_is_output = (robustness.h == out_h_full && robustness.w == Ws);
+            // gcam_sabre_mask_upscale: the mask is at the merge-output grid
+            // (scale*raw == num.w wide), Dodgson-upscaled + 5x5'd there, and band-
+            // streamed -- only THIS band's rows are passed (robustness.h == band_h),
+            // so it is read 1:1 at the BAND-LOCAL output pixel (local_i, hr_j), nearest
+            // -- no lr/guide conversion, no bilinear re-stretch. Identified by width ==
+            // output width (distinct from guide lr/2 and raw lr).
+            const bool rob_is_output = (robustness.w == Ws && robustness.h == band_h);
             const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
             f32 rob_y, rob_x;
             if (rob_is_output) {
-                rob_y = (f32)hr_i; rob_x = (f32)hr_j;
+                rob_y = (f32)local_i; rob_x = (f32)hr_j;
             } else {
                 rob_y = lr_y; rob_x = lr_x;
                 if (!rob_is_raw && cfg.bayer_mode) {

@@ -904,6 +904,9 @@ struct MergeCompParams {
     uint dense_h;
     float dense_sx;
     float dense_sy;
+    // gcam_sabre_mask_upscale: 1 => the robustness buffer is this band's slice of the
+    // merge-output-grid mask (rob_h == band_h), read 1:1 band-local (local_i, hr_j).
+    uint rob_output_res;
 };
 
 struct MergeRefParams {
@@ -1188,16 +1191,15 @@ static inline void merge_comp_contrib(device const float* img,
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
     // (merge.cpp) for the mirrored fix.
-    // gcam_sabre_mask_upscale: the mask is at the merge-output grid (rob dims ==
-    // output dims == lr*scale), Dodgson-upscaled + 5x5'd there, so read it 1:1 at the
-    // output pixel, nearest -- no lr/guide conversion, no bilinear re-stretch. Twin of
-    // the rob_is_output branch in accumulate_comp (merge.cpp).
-    uint out_h_full = uint(float(p.lr_h) * p.scale + 0.5f);
-    uint out_w_full = uint(float(p.lr_w) * p.scale + 0.5f);
-    bool rob_output_res = (p.rob_h == out_h_full && p.rob_w == out_w_full);
+    // gcam_sabre_mask_upscale: the mask is at the merge-output grid, Dodgson-upscaled
+    // + 5x5'd there, and BAND-STREAMED -- the host binds only this band's rows
+    // (p.rob_h == band_h) and sets p.rob_output_res, so read it 1:1 at the band-local
+    // output pixel (local_i, hr_j), nearest -- no lr/guide conversion, no bilinear
+    // re-stretch. Twin of the rob_is_output branch in accumulate_comp (merge.cpp).
+    bool rob_output_res = (p.rob_output_res != 0u);
     float rob_y, rob_x;
     if (rob_output_res) {
-        rob_y = float(hr_i); rob_x = float(hr_j);
+        rob_y = float(local_i); rob_x = float(hr_j);
     } else {
         rob_y = lr_y; rob_x = lr_x;
         if (p.raw_res_robustness == 0u && p.bayer != 0u) {

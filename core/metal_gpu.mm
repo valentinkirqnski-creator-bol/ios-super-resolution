@@ -4701,8 +4701,11 @@ struct MergeCompParamsCPU {
     uint32_t dense_h = 0;
     float    dense_sx = 1.f;
     float    dense_sy = 1.f;
+    // gcam_sabre_mask_upscale: 1 => robustness is this band's slice of the merge-grid
+    // mask (rob_h == band_h), read band-local (local_i, hr_j), nearest.
+    uint32_t rob_output_res = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 184, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 188, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -5840,6 +5843,17 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // looked wrong. Invisible with a guide mask, where 0 is correct anyway.
     p.raw_res_robustness =
         (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
+    // gcam_sabre_mask_upscale (band-streamed): the mask bound is THIS band's slice of
+    // the merge-output-grid mask -- its dims equal the band accumulator's (rob_h ==
+    // band_h, rob_w == Ws). Read it band-local (local_i). The slice changes per band,
+    // so it must NOT come from the per-frame GPU cache: upload the passed band fresh,
+    // overriding any cached (first-band) b_rob, while img/flow/cov stay cached.
+    p.rob_output_res =
+        (p.rob_h == (uint32_t)acc_h && p.rob_w == (uint32_t)acc_w) ? 1u : 0u;
+    if (p.rob_output_res && !robustness.data.empty()) {
+        b_rob = buf(robustness.data.data(), robustness.data.size() * sizeof(float));
+        if (!b_rob) return false;
+    }
     // Global pre-align homography: the comp pixels are fetched at comp_pos =
     // H*(lr+flow). Without it a pre-aligned burst is fetched in the wrong pose ->
     // ghosted/blurred output. The direct call has the frame's flow in hand, but
