@@ -904,9 +904,6 @@ struct MergeCompParams {
     uint dense_h;
     float dense_sx;
     float dense_sy;
-    // gcam_sabre_mask_upscale: 1 => the robustness buffer is this band's slice of the
-    // merge-output-grid mask (rob_h == band_h), read 1:1 band-local (local_i, hr_j).
-    uint rob_output_res;
 };
 
 struct MergeRefParams {
@@ -1191,21 +1188,10 @@ static inline void merge_comp_contrib(device const float* img,
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
     // (merge.cpp) for the mirrored fix.
-    // gcam_sabre_mask_upscale: the mask is at the merge-output grid, Dodgson-upscaled
-    // + 5x5'd there, and BAND-STREAMED -- the host binds only this band's rows
-    // (p.rob_h == band_h) and sets p.rob_output_res, so read it 1:1 at the band-local
-    // output pixel (local_i, hr_j), nearest -- no lr/guide conversion, no bilinear
-    // re-stretch. Twin of the rob_is_output branch in accumulate_comp (merge.cpp).
-    bool rob_output_res = (p.rob_output_res != 0u);
-    float rob_y, rob_x;
-    if (rob_output_res) {
-        rob_y = float(local_i); rob_x = float(hr_j);
-    } else {
-        rob_y = lr_y; rob_x = lr_x;
-        if (p.raw_res_robustness == 0u && p.bayer != 0u) {
-            rob_y = (lr_y - 0.5f) / 2.f;
-            rob_x = (lr_x - 0.5f) / 2.f;
-        }
+    float rob_y = lr_y, rob_x = lr_x;
+    if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+        rob_y = (lr_y - 0.5f) / 2.f;
+        rob_x = (lr_x - 0.5f) / 2.f;
     }
     // Driven by its OWN bit, not p.flow_bilinear: interpolating the mask and
     // interpolating the tile flow are different decisions, and sharing a flag
@@ -1217,7 +1203,7 @@ static inline void merge_comp_contrib(device const float* img,
     // default path is unchanged.
     const uint rnc = max(p.rob_nch, 1u);
     float local_r0, local_r1, local_r2;
-    if (p.rob_bilinear != 0u && !rob_output_res) {
+    if (p.rob_bilinear != 0u) {
         local_r0 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 0u);
         local_r1 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 1u);
         local_r2 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 2u);
@@ -2035,14 +2021,11 @@ struct GcamSabreParams {
     float na;             // noise model alpha (robustness-scaled)
     float nb;             // noise model beta  (robustness-scaled)
     uint  noise_model;    // §3: 1 = subtract the Monte-Carlo LUT noise (buffer 6)
-    // gcam_sabre_mask_upscale: evaluate the operator on the merge-output grid
-    // (out_h x out_w) instead of the guide grid (h x w). Dodgson-upsample the
-    // reference stats (unwarped) and upsample+warp the comparison stats, then run
-    // §5 per output pixel. upscale==0 => out_h/out_w == h/w and the guide-res path
-    // (plain ref lookup + bicubic comp) runs, bit-exact with before.
+    // gcam_sabre_raw_res: evaluate on the input-frame (raw) grid (out_h x out_w),
+    // Dodgson-upsampling the stats. raw_res==0 => out==h/w and the guide-res path runs.
     uint  out_h;
     uint  out_w;
-    uint  upscale;        // 1 = merge-grid operator (Dodgson ref + warped comp)
+    uint  raw_res;
 };
 
 // §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over 10 columns;
@@ -2102,19 +2085,18 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
                            constant GcamSabreParams& p [[buffer(5)]],
                            device const float* lut [[buffer(6)]],    // §3 MC noise LUT (2x10x4); dummy if noise_model==0
                            uint2 gid [[thread_position_in_grid]]) {
-    uint out_h = (p.upscale != 0u) ? p.out_h : p.h;
-    uint out_w = (p.upscale != 0u) ? p.out_w : p.w;
+    uint out_h = (p.raw_res != 0u) ? p.out_h : p.h;
+    uint out_w = (p.raw_res != 0u) ? p.out_w : p.w;
     if (gid.x >= out_w || gid.y >= out_h) return;
     uint tx = gid.x, ty = gid.y;
-    // Guide-space coordinate of this target pixel. Upscale: merge grid -> guide via
-    // (t+0.5)/s-0.5, clamped. Default: the integer guide pixel (bit-exact).
+    // Guide coordinate of this pixel. Raw-res: Dodgson x2 raw->guide (g=(raw+0.5)/2-0.5),
+    // clamped. Guide-res: the integer guide pixel (bit-exact).
     float gy, gx;
-    if (p.upscale != 0u) {
-        float syu = float(out_h) / float(p.h), sxu = float(out_w) / float(p.w);
-        gy = clamp((float(ty) + 0.5f) / syu - 0.5f, 0.f, float(p.h) - 1.f);
-        gx = clamp((float(tx) + 0.5f) / sxu - 0.5f, 0.f, float(p.w) - 1.f);
+    if (p.raw_res != 0u) {
+        gy = clamp((float(ty) + 0.5f) * 0.5f - 0.5f, 0.f, float(p.h) - 1.f);
+        gx = clamp((float(tx) + 0.5f) * 0.5f - 0.5f, 0.f, float(p.w) - 1.f);
     } else { gy = float(ty); gx = float(tx); }
-    // §5.1 piecewise per-tile flow (nearest), guide->raw->guide for the half-res grid.
+    // §5.1 piecewise per-tile flow (nearest), guide->raw->guide (2*g ~ raw).
     uint patch_idy = uint((2.f * gy + 0.5f) / float(max(p.tile_size, 1u)));
     uint patch_idx = uint((2.f * gx + 0.5f) / float(max(p.tile_size, 1u)));
     patch_idy = min(patch_idy, (p.flow_ny > 0u) ? p.flow_ny - 1u : 0u);
@@ -2132,13 +2114,11 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     }
     sx = gcam_mirror(sx, float(p.w));                 // §5.3
     sy = gcam_mirror(sy, float(p.h));
-    // §5.4 reference (unwarped) + comparison (flow-warped) statistics. Upscale: both
-    // Dodgson-upsampled to the merge grid (DodgsonApproximateQuadratic); default:
-    // exact integer ref lookup + bicubic comp.
+    // §5.4 reference (unwarped) + comparison (warped). Raw-res: both signed Dodgson from
+    // the guide, abs only on the variance (ch 3). Guide-res: integer ref lookup +
+    // bicubic-abs comp (bit-exact).
     float ref_var_signed, refc[3], curc[3], cur_a;
-    if (p.upscale != 0u) {
-        // Sample ref and comp with the SAME signed Dodgson so identical frames give
-        // d==0 (chroma channels are signed); abs only the variance magnitude (ch 3).
+    if (p.raw_res != 0u) {
         ref_var_signed = rob_sample_dogson_or_inf(refg, p.h, p.w, 4u, gy, gx, 3u);
         for (uint ch = 0u; ch < 3u; ++ch) {
             refc[ch] = rob_sample_dogson_or_inf(refg, p.h, p.w, 4u, gy, gx, ch);

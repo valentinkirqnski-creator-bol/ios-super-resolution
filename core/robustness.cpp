@@ -2042,16 +2042,19 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                                            const Config& cfg, Image* s_select_out) {
     const Image& refg = ref_stats.gcam_guide;
     if (refg.h <= 0 || refg.w <= 0 || refg.c < 4 || tile_size <= 0) return Image();
-    // Paper Alg. 6 computes G1 and Gn with the SAME ComputeGuideImage. Our guide-res
-    // path prefilters only the reference (compg raw), and its smoothing bicubic comp
-    // sampler + noise budget hide the resulting prefilter residual. The mask-upscale
-    // path samples sharply (Dodgson) and the 5x5 then amplifies any residual, so match
-    // the reference's prefilter here -> aligned content stays R=1 (identical frames
-    // -> white). Guide-res default keeps the raw comp (unchanged).
-    const Image compg = compute_gcam_guide(comp_raw, cfg,
-                                           /*prefilter_ref=*/cfg.gcam_sabre_mask_upscale);
+    // gcam_sabre_raw_res (paper Alg. 6): instead of computing R on the ~3MP guide, the
+    // guide statistics are Dodgson x2 upscaled + flow-warped to the INPUT-FRAME (raw)
+    // resolution and R + the 5x5 are computed THERE (one weight per raw pixel, 4x the
+    // guide detail; the merge reads it via its existing raw-res path). compg is then
+    // PREFILTERED to match refg -- the paper's ComputeGuideImage is identical for G1/Gn;
+    // without it the sharp Dodgson sampling + the 5x5 amplify the (ref-prefiltered vs
+    // comp-raw) residual and reject aligned content (identical frames must stay R=1).
+    // Off (default): the original guide-res operator (raw comp, bicubic sampling).
+    const bool raw_res = cfg.gcam_sabre_raw_res;
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/raw_res);
     if (compg.h != refg.h || compg.w != refg.w) return Image();
     const int gh = refg.h, gw = refg.w;
+    const int rh = comp_raw.h, rw = comp_raw.w;   // input-frame (raw) resolution
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
     // GCam's flow.z threshold (gcam_sabre_motion_thresh, normalized UV) was measured
     // over a 3x3 neighbourhood of its ~16-raw-px tiles (258 across a 4128px frame,
@@ -2070,29 +2073,21 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // fixed seed -> matches the guide's and the GPU's copy). Off -> affine stand-in.
     const bool noise_model = cfg.gcam_sabre_noise_model;
     const GcamNoiseLut mc_lut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
-    // gcam_sabre_mask_upscale (paper Alg. 6 order): the local statistics stay
-    // computed at the guide image, but the operator is evaluated on the MERGE-OUTPUT
-    // grid (= scale*raw, 2x the input frame). Per output pixel we Dodgson-upsample
-    // the reference stats (unwarped) and Dodgson-upsample+warp the comparison stats
-    // (the warp is carried by the sample position), run §5 there, then 5x5 at that
-    // grid. Default (flag off): target == guide, bit-exact with the original path.
-    const bool upscale = cfg.gcam_sabre_mask_upscale;
-    const int th = upscale ? (int)std::lround(cfg.scale * (f32)comp_raw.h) : gh;
-    const int tw = upscale ? (int)std::lround(cfg.scale * (f32)comp_raw.w) : gw;
-    const f32 syu = (f32)th / (f32)gh;      // guide -> target scale
-    const f32 sxu = (f32)tw / (f32)gw;
+    const int th = raw_res ? rh : gh;    // target grid: raw (Alg.6) or guide (default)
+    const int tw = raw_res ? rw : gw;
     Image R(th, tw, 1);
-    for (int ty = 0; ty < th; ++ty)
-        for (int tx = 0; tx < tw; ++tx) {
-            // Guide-space coordinate of this target pixel. Upscale: merge grid ->
-            // guide via (t+0.5)/s-0.5, clamped. Default: the integer guide pixel.
+    for (int ry = 0; ry < th; ++ry)
+        for (int rx = 0; rx < tw; ++rx) {
+            // Guide coordinate of this pixel. Raw-res: Dodgson x2 raw->guide (a guide
+            // cell g sits at raw 2g+0.5 -> g=(raw+0.5)/2-0.5), edge-clamped. Guide-res:
+            // the integer guide pixel (bit-exact with the original path).
             f32 gy, gx;
-            if (upscale) {
-                gy = clampf(((f32)ty + 0.5f) / syu - 0.5f, 0.f, (f32)(gh - 1));
-                gx = clampf(((f32)tx + 0.5f) / sxu - 0.5f, 0.f, (f32)(gw - 1));
-            } else { gy = (f32)ty; gx = (f32)tx; }
-            // §5.1 flow (piecewise per tile, nearest), guide->raw->guide for the
-            // half-res grid -- the same mapping the existing guide-res branch uses.
+            if (raw_res) {
+                gy = clampf(((f32)ry + 0.5f) * 0.5f - 0.5f, 0.f, (f32)(gh - 1));
+                gx = clampf(((f32)rx + 0.5f) * 0.5f - 0.5f, 0.f, (f32)(gw - 1));
+            } else { gy = (f32)ry; gx = (f32)rx; }
+            // §5.1 flow (piecewise per tile), raw tile index (2*g ~ raw); the flow is
+            // halved to guide units because the stats are sampled in guide coords.
             const int patch_idy = (int)((2.f * gy + 0.5f) / (f32)tile_size);
             const int patch_idx = (int)((2.f * gx + 0.5f) / (f32)tile_size);
             f32 flow_x, flow_y;
@@ -2112,15 +2107,13 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             }
             sx = gcam_mirror(sx, (f32)gw);                 // §5.3
             sy = gcam_mirror(sy, (f32)gh);
-            // §5.4 reference (unwarped) + comparison (flow-warped) statistics. Upscale:
-            // both Dodgson-upsampled to the merge grid (DodgsonApproximateQuadratic);
-            // default: exact integer ref lookup + bicubic comp (unchanged).
+            // §5.4 reference (unwarped) + comparison (flow-warped) statistics. Raw-res:
+            // both Dodgson-sampled from the guide (DodgsonApproximateQuadratic), signed,
+            // abs only on the variance magnitude (ch 3) -- sampling both the same way
+            // keeps identical frames at d==0. Guide-res: exact integer ref lookup +
+            // bicubic-abs comp (bit-exact with the original path).
             f32 ref_var_signed, refc[3], curc[3], cur_a;
-            if (upscale) {
-                // Sample ref and comp with the SAME signed Dodgson so identical frames
-                // give d==0 (the guide's chroma channels are signed; abs'ing only the
-                // comp would otherwise reject zero-motion pixels). abs is applied only
-                // to the variance magnitude (channel 3), like the guide-res path.
+            if (raw_res) {
                 ref_var_signed = sample_dogson(refg, gy, gx, 3);
                 for (int c = 0; c < 3; ++c) {
                     refc[c] = sample_dogson(refg, gy, gx, c);
@@ -2189,14 +2182,14 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             if (arg > 0.f) arg = 0.f;
             f32 w = std::exp2(arg);
             if (!std::isfinite(w)) w = 0.f;
-            R.at(ty, tx, 0) = clampf(w, 0.f, 1.f);         // keep weight (unblocker = 0)
+            R.at(ry, rx, 0) = clampf(w, 0.f, 1.f);         // keep weight (unblocker = 0)
         }
-    // §7 5x5 soft-dilate at the target grid. Upscale: the merge grid, with the
-    // 2x-downsample sub-mode (guide-res specific) forced off, so the merge reads
-    // one weight per output pixel (1:1, nearest). Default: guide resolution.
+    // §7 5x5 local-min. Raw-res: at raw res with the gcam_sabre_dilate_2x downsample
+    // sub-mode forced off (it is guide-res specific and would halve the raw-res mask).
+    // Guide-res: unchanged.
     Config dcfg = cfg;
-    if (upscale) dcfg.gcam_sabre_dilate_2x = false;
-    Image dil = robustness_gcam_dilate(R, dcfg);
+    if (raw_res) dcfg.gcam_sabre_dilate_2x = false;
+    Image dil = robustness_gcam_dilate(R, dcfg);           // §7
     // The operator makes no s1/s2 prior choice; report the strict prior uniformly
     // so the debug split masks stay well-formed (matches the learned-mask path).
     if (s_select_out) {

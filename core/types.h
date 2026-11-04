@@ -1764,20 +1764,16 @@ struct Config {
     // Off by default: the CPU operator is the verified reference and runs on device
     // as-is. The Metal kernel is unverified until a device/CI build compiles it.
     bool  gcam_sabre_gpu             = false;
-    // Compute the gcam robustness map on the guide image exactly as now (§5
-    // ComputeFrameWeight at guide res), then DODGSON-UPSCALE that guide-res R to
-    // the merge-output grid (= scale*raw, 2x the input frame, ~48.8MP at 2x), and
-    // run the §7 5x5 soft-dilate there -- so the merge reads one robustness weight
-    // PER OUTPUT PIXEL (1:1, nearest) instead of bilinearly stretching a guide-res
-    // mask over a ~4x4 block. R is already in the reference frame (the comp was
-    // flow-warped inside the operator), so the upscale is a pure resolution step
-    // (DodgsonApproximateQuadratic, no extra warp). The §7 dilate runs at the fine
-    // grid (its gcam_sabre_dilate_2x downsample sub-mode is skipped here). Memory:
-    // the upscaled mask is ~195MB/frame at 48MP, so on device this FORCES the
-    // online (one-frame-at-a-time) merge and the mask is built transiently per
-    // comparison frame. Off by default (guide-res bilinear stays the default).
-    // Requires robustness_gcam_enabled.
-    bool  gcam_sabre_mask_upscale    = false;
+    // Compute the gcam robustness mask at the INPUT-FRAME (raw) resolution instead of
+    // the ~3MP guide -- the paper's Algorithm 6 literally: the 3x3 statistics are
+    // computed on the guide, then Dodgson x2 upscaled + flow-warped to raw res, where R
+    // and the 5x5 local-min are computed (one robustness weight per raw pixel = 4x the
+    // guide detail; the merge reads it through its existing raw-resolution path). compg
+    // is prefiltered to match the reference guide (paper uses the same ComputeGuideImage
+    // for G1/Gn) so the sharp Dodgson sampling + 5x5 keep aligned content at R=1. ~49MB
+    // mask/frame (12MP), fits the normal merge -- no band-streaming. Off by default
+    // (guide-res operator). Requires robustness_gcam_enabled.
+    bool  gcam_sabre_raw_res         = false;
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an

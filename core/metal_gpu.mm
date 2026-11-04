@@ -1801,8 +1801,11 @@ struct GcamSabreParamsCPU {
     float    na = 0.f;
     float    nb = 0.f;
     uint32_t noise_model = 0;   // §3: 1 = subtract the Monte-Carlo LUT noise
-    uint32_t out_h = 0, out_w = 0;   // merge-output grid (gcam_sabre_mask_upscale)
-    uint32_t upscale = 0;            // 1 = run the operator on the merge grid
+    // gcam_sabre_raw_res: evaluate the operator on the INPUT-FRAME (raw) grid
+    // (out_h x out_w) instead of the guide grid (h x w), Dodgson-upsampling the stats.
+    // raw_res==0 => out_h/out_w == h/w and the guide-res path runs (bit-exact).
+    uint32_t out_h = 0, out_w = 0;
+    uint32_t raw_res = 0;
 };
 static_assert(sizeof(GcamSabreParamsCPU) == 116, "GcamSabreParamsCPU");
 
@@ -2988,19 +2991,15 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     auto& c = ctx();
     id<MTLComputePipelineState> pipe = c.pipe("rob_gcam_sabre");
     if (!pipe) return Image();                 // kernel absent -> CPU fallback
-    // Mask-upscale: match the reference's prefilter so aligned content keeps R=1 (the
-    // sharp Dodgson sampling + 5x5 otherwise amplify the ref-prefiltered/comp-raw
-    // residual). Twin of compute_robustness_gcam_sabre. Guide-res path: raw comp.
-    const Image compg = compute_gcam_guide(comp_raw, cfg,
-                                           /*prefilter_ref=*/cfg.gcam_sabre_mask_upscale);
+    // gcam_sabre_raw_res: evaluate on the input-frame (raw) grid, Dodgson-upsampling the
+    // guide stats (ref unwarped, comp warped), compg prefiltered to match ref. Twin of
+    // the CPU compute_robustness_gcam_sabre.
+    const bool raw_res = cfg.gcam_sabre_raw_res;
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/raw_res);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
-    // gcam_sabre_mask_upscale: evaluate the operator on the merge-output grid
-    // (= scale*raw, 2x the input frame) instead of the guide, Dodgson-upsampling the
-    // stats inline (the ref unwarped, the comp warped). Twin of the CPU upscale path.
-    const bool upscale = cfg.gcam_sabre_mask_upscale;
-    const int th = upscale ? (int)std::lround(cfg.scale * (f32)comp_raw.h) : gh;
-    const int tw = upscale ? (int)std::lround(cfg.scale * (f32)comp_raw.w) : gw;
+    const int th = raw_res ? comp_raw.h : gh;   // target grid: raw or guide
+    const int tw = raw_res ? comp_raw.w : gw;
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 
@@ -3035,7 +3034,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
     mp.noise_model = noise_model ? 1u : 0u;
     mp.out_h = (uint32_t)th; mp.out_w = (uint32_t)tw;
-    mp.upscale = upscale ? 1u : 0u;
+    mp.raw_res = raw_res ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -3057,10 +3056,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
 
     Image R_pre(th, tw, 1);
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    // §7 at the target grid. Upscale: the merge grid, 2x-downsample sub-mode off
-    // (guide-res specific) so the merge reads one weight per output pixel.
+    // §7 at the target grid. Raw-res: force the 2x-downsample sub-mode off (guide-res
+    // specific). Twin of compute_robustness_gcam_sabre.
     Config dcfg = cfg;
-    if (upscale) dcfg.gcam_sabre_dilate_2x = false;
+    if (raw_res) dcfg.gcam_sabre_dilate_2x = false;
     Image dil = robustness_gcam_dilate(R_pre, dcfg);       // §7 (verified CPU helper)
     if (s_select_out) {
         *s_select_out = Image(dil.h, dil.w, 1);
@@ -4701,11 +4700,8 @@ struct MergeCompParamsCPU {
     uint32_t dense_h = 0;
     float    dense_sx = 1.f;
     float    dense_sy = 1.f;
-    // gcam_sabre_mask_upscale: 1 => robustness is this band's slice of the merge-grid
-    // mask (rob_h == band_h), read band-local (local_i, hr_j), nearest.
-    uint32_t rob_output_res = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 188, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 184, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -5843,17 +5839,6 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // looked wrong. Invisible with a guide mask, where 0 is correct anyway.
     p.raw_res_robustness =
         (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
-    // gcam_sabre_mask_upscale (band-streamed): the mask bound is THIS band's slice of
-    // the merge-output-grid mask -- its dims equal the band accumulator's (rob_h ==
-    // band_h, rob_w == Ws). Read it band-local (local_i). The slice changes per band,
-    // so it must NOT come from the per-frame GPU cache: upload the passed band fresh,
-    // overriding any cached (first-band) b_rob, while img/flow/cov stay cached.
-    p.rob_output_res =
-        (p.rob_h == (uint32_t)acc_h && p.rob_w == (uint32_t)acc_w) ? 1u : 0u;
-    if (p.rob_output_res && !robustness.data.empty()) {
-        b_rob = buf(robustness.data.data(), robustness.data.size() * sizeof(float));
-        if (!b_rob) return false;
-    }
     // Global pre-align homography: the comp pixels are fetched at comp_pos =
     // H*(lr+flow). Without it a pre-aligned burst is fetched in the wrong pose ->
     // ghosted/blurred output. The direct call has the frame's flow in hand, but
