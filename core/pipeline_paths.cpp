@@ -190,13 +190,21 @@ static inline int round_away_to_int(f32 x) {
 
 static bool robustness_band_can_contribute(const std::vector<uint8_t>& rows,
                                            int y0, int bh, float scale,
-                                           bool bayer_mode) {
+                                           bool bayer_mode, int raw_h) {
     if (rows.empty()) return true;
     const int rh = (int)rows.size();
+    // Map the output band row to the mask row the SAME way the merge fetch does
+    // (merge.cpp accumulate_comp): decided by the mask's ACTUAL resolution, not a
+    // flag. A raw-resolution mask (gcam_sabre_raw_res, or the standard raw-res path)
+    // has one row per raw/lr pixel (rh == raw_h) and is indexed at lr_y directly; a
+    // guide-res mask has rh == raw_h/2 and is indexed at (lr_y-0.5)/2. Using the guide
+    // mapping on a raw-res mask would only ever test the top half of the rows and
+    // wrongly skip bands lower in the frame.
+    const bool rob_is_raw = (rh == raw_h);
     for (int local_y = 0; local_y < bh; ++local_y) {
         const f32 lr_y = (f32)(y0 + local_y) / scale;
         int ry;
-        if (bayer_mode)
+        if (bayer_mode && !rob_is_raw)
             ry = std::min(std::max(round_away_to_int((lr_y - 0.5f) / 2.f), 0), rh - 1);
         else
             ry = std::min(std::max(round_away_to_int(lr_y), 0), rh - 1);
@@ -2782,7 +2790,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!meta.rob_has_nonzero ||
                     !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode))
+                                                    work.scale, work.bayer_mode, ref_h))
                     continue;
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
@@ -2798,7 +2806,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompFrame& fc : cached) {
                 if (!fc.rob_has_nonzero ||
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode))
+                                                    work.scale, work.bayer_mode, ref_h))
                     continue;
                 if (metal_merge_has_frame(fc.index)) {
                     Image empty;
@@ -2891,7 +2899,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompMeta& meta : cached_meta) {
                 if (!meta.rob_has_nonzero ||
                     !robustness_band_can_contribute(meta.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode))
+                                                    work.scale, work.bayer_mode, ref_h))
                     continue;
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
@@ -2901,7 +2909,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             for (const CachedCompFrame& fc : cached) {
                 if (!fc.rob_has_nonzero ||
                     !robustness_band_can_contribute(fc.rob_rows_nonzero, y0, bh,
-                                                    work.scale, work.bayer_mode))
+                                                    work.scale, work.bayer_mode, ref_h))
                     continue;
                 merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
                                 num_band, den_band, y0, work, fc.index);

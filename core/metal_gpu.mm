@@ -1033,6 +1033,11 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     // merge outright, so that path keeps the pre-residency behaviour -- slower,
     // but it is not the shipped configuration (it requires the Decimate grey).
     if (cfg.robustness_raw_resolution_active()) return false;
+    // gcam_sabre_raw_res produces a RAW-resolution gcam mask (one row per raw pixel),
+    // which will not fit the guide-sized (raw/2) resident rob slice below. Keep the
+    // pre-residency (banded/online) merge for it -- that path sizes the mask buffer
+    // from the mask's own dims and the fetch auto-detects raw vs guide resolution.
+    if (cfg.robustness_gcam_enabled && cfg.gcam_sabre_raw_res) return false;
 
     auto& c = ctx();
     g_bf.n = n_frames;
