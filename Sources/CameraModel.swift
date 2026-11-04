@@ -296,6 +296,7 @@ struct TuningParams: Equatable, Codable {
     /// is unavailable. Off by default — the kernel is unverified until a device build.
     var gcam_sabre_gpu: Bool = false
     var gcam_sabre_raw_res: Bool = false
+    var gcam_sabre_bilinear_upscale: Bool = false
     /// Build the Monte-Carlo noise model from the DNG NoiseProfile and apply it
     /// (guide green-only gate + operator noise subtraction, §3-§6). Off = device
     /// noise-blind (the reconstructed affine stand-in). Requires the GCam toggle.
@@ -554,7 +555,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -697,6 +698,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_dilate_div = try c.decodeIfPresent(Float.self, forKey: .gcam_sabre_dilate_div) ?? gcam_sabre_dilate_div
         gcam_sabre_gpu = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu) ?? gcam_sabre_gpu
         gcam_sabre_raw_res = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_raw_res) ?? gcam_sabre_raw_res
+        gcam_sabre_bilinear_upscale = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_bilinear_upscale) ?? gcam_sabre_bilinear_upscale
         gcam_sabre_noise_model = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_noise_model) ?? gcam_sabre_noise_model
         gcam_sabre_dilate_2x = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_dilate_2x) ?? gcam_sabre_dilate_2x
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
@@ -2544,6 +2546,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_dilate_div": NSNumber(value: tuningParams.gcam_sabre_dilate_div),
             "gcam_sabre_gpu": NSNumber(value: tuningParams.gcam_sabre_gpu),
             "gcam_sabre_raw_res": NSNumber(value: tuningParams.gcam_sabre_raw_res),
+            "gcam_sabre_bilinear_upscale": NSNumber(value: tuningParams.gcam_sabre_bilinear_upscale),
             "gcam_sabre_noise_model": NSNumber(value: tuningParams.gcam_sabre_noise_model),
             "gcam_sabre_dilate_2x": NSNumber(value: tuningParams.gcam_sabre_dilate_2x),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),

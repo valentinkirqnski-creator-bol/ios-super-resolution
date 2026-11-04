@@ -1774,6 +1774,16 @@ struct Config {
     // mask/frame (12MP), fits the normal merge -- no band-streaming. Off by default
     // (guide-res operator). Requires robustness_gcam_enabled.
     bool  gcam_sabre_raw_res         = false;
+    // Bilinearly upsample the GUIDE-res gcam mask to the merge-output grid: R and the
+    // 5x5 are still computed on the ~3MP guide (unchanged), but the merge samples that
+    // guide-res mask BILINEARLY per output pixel instead of nearest -- so every one of
+    // the ~48MP output pixels gets a distinct (interpolated) rejection weight rather
+    // than one weight per ~4x4 block. Zero extra memory (interpolated at fetch time).
+    // This is the merge's existing bilinear fetch (= merge_robustness_bilinear) exposed
+    // as a gcam toggle. Only applies to the guide-res mask (ignored when
+    // gcam_sabre_raw_res is on, which already has a per-raw-pixel mask). Off by default
+    // (nearest). Requires robustness_gcam_enabled.
+    bool  gcam_sabre_bilinear_upscale = false;
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an

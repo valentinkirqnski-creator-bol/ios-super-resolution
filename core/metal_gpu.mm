@@ -3061,11 +3061,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
 
     Image R_pre(th, tw, 1);
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    // §7 at the target grid. Raw-res: force the 2x-downsample sub-mode off (guide-res
-    // specific). Twin of compute_robustness_gcam_sabre.
-    Config dcfg = cfg;
-    if (raw_res) dcfg.gcam_sabre_dilate_2x = false;
-    Image dil = robustness_gcam_dilate(R_pre, dcfg);       // §7 (verified CPU helper)
+    // §7 refinement. Raw-res (paper Alg. 6): HARD 5x5 ComputeLocalMin at raw res.
+    // Guide-res (default): GCam's soft reject-grow. Twin of compute_robustness_gcam_sabre.
+    Image dil = raw_res ? robustness_gcam_min_5x5(R_pre)
+                        : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
     if (s_select_out) {
         *s_select_out = Image(dil.h, dil.w, 1);
         std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
@@ -5545,7 +5544,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.flow_bilinear = 0u;
         // robustness_guide_res_bilinear: bilinear fetch = the guide-res mask's
         // upsample to the merge grid.
-        p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) ? 1u : 0u;
+        p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
         p.cov_stride = g_bf.cov_stride;
         p.img_off  = (uint32_t)bf_raw_off(slot);
         p.flow_off = (uint32_t)bf_flow_off(slot);
@@ -5804,7 +5803,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     p.flow_bilinear = false ? 1u : 0u;
     // robustness_guide_res_bilinear: bilinear fetch of the guide-res mask = its
     // upsample to the merge grid.
-    p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear) ? 1u : 0u;
+    p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

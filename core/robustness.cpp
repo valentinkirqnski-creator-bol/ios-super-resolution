@@ -1848,6 +1848,29 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
     return out;
 }
 
+// Paper Alg. 6 ComputeLocalMin: the HARD minimum keep weight over a 5x5 window
+// (R_hat = min_{j in N5} R(j)), edge-clamped. Used by the raw-res gcam path
+// (gcam_sabre_raw_res) as the §7 refinement -- the paper's literal morphological min,
+// in place of GCam's soft reject-grow (robustness_gcam_dilate), now that R is computed
+// per raw pixel. Exported so the Metal gcam driver can apply it to the GPU-computed R.
+Image robustness_gcam_min_5x5(const Image& R) {
+    if (R.h <= 0 || R.w <= 0) return R;
+    Image out(R.h, R.w, 1);
+    for (int y = 0; y < R.h; ++y)
+        for (int x = 0; x < R.w; ++x) {
+            f32 mn = std::numeric_limits<f32>::infinity();
+            for (int i = -2; i <= 2; ++i) {
+                const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
+                for (int j = -2; j <= 2; ++j) {
+                    const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
+                    mn = std::min(mn, R.at(yy, xx, 0));
+                }
+            }
+            out.at(y, x, 0) = mn;
+        }
+    return out;
+}
+
 // §4.1 per-component 3x3 median of the per-tile flow vectors (edge-clamped), in
 // place. Cleans isolated outlier vectors before robustness AND merge read the
 // field. Leaves affine/dense/global_h untouched (off in the gcam-faithful config).
@@ -2184,12 +2207,11 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             if (!std::isfinite(w)) w = 0.f;
             R.at(ry, rx, 0) = clampf(w, 0.f, 1.f);         // keep weight (unblocker = 0)
         }
-    // §7 5x5 local-min. Raw-res: at raw res with the gcam_sabre_dilate_2x downsample
-    // sub-mode forced off (it is guide-res specific and would halve the raw-res mask).
-    // Guide-res: unchanged.
-    Config dcfg = cfg;
-    if (raw_res) dcfg.gcam_sabre_dilate_2x = false;
-    Image dil = robustness_gcam_dilate(R, dcfg);           // §7
+    // §7 refinement. Raw-res (paper Alg. 6): the HARD 5x5 ComputeLocalMin at raw res
+    // (R_hat = min over 5x5), now that R is computed per raw pixel. Guide-res (default):
+    // GCam's soft reject-grow (robustness_gcam_dilate), unchanged.
+    Image dil = raw_res ? robustness_gcam_min_5x5(R)
+                        : robustness_gcam_dilate(R, cfg);
     // The operator makes no s1/s2 prior choice; report the strict prior uniformly
     // so the debug split masks stay well-formed (matches the learned-mask path).
     if (s_select_out) {

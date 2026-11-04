@@ -204,6 +204,9 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
 // (sum25 - deadzone)/div rejection-contrast rule. Returns a guide-resolution keep
 // mask (the 2x downsample of the shader is dropped -- strictly finer, same math).
 Image robustness_gcam_dilate(const Image& R, const Config& cfg);
+// Paper Alg. 6 ComputeLocalMin: hard 5x5 minimum keep weight (R_hat = min over N5),
+// edge-clamped. The §7 refinement for the raw-res gcam path (gcam_sabre_raw_res).
+Image robustness_gcam_min_5x5(const Image& R);
 // GCam SABRE (§4.1): per-component 3x3 median of the per-tile flow vectors, in
 // place, edge-clamped. Both robustness and merge read the result. No-op on an
 // empty / dense-only field.
