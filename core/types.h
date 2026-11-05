@@ -1791,6 +1791,17 @@ struct Config {
     // mask/frame (12MP), fits the normal merge -- no band-streaming. Off by default
     // (guide-res operator). Requires robustness_gcam_enabled.
     bool  gcam_sabre_raw_res         = false;
+    // Like gcam_sabre_raw_res, but the guide statistics are Dodgson x2 upscaled +
+    // flow-warped all the way to the MERGE-OUTPUT grid (scale x the input frame, e.g.
+    // ~48MP at scale 2) and R + the 5x5 ComputeLocalMin are computed per OUTPUT pixel
+    // -- one robustness weight for every merged pixel, which the merge then reads 1:1
+    // (nearest). Same operator as the raw-res path, only the target grid is finer
+    // (8x the guide detail vs 4x for raw-res). Mutually exclusive with gcam_sabre_raw_res:
+    // when BOTH are set this one wins (raw-res is ignored) -- they target different grids
+    // and cannot both drive the mask at once. Heavier: ~195MB mask/frame at 48MP, built
+    // transiently per comparison frame (forces the non-resident merge path, like raw-res).
+    // Off by default. Requires robustness_gcam_enabled.
+    bool  gcam_sabre_merge_res       = false;
     // Bilinearly upsample the GUIDE-res gcam mask to the merge-output grid: R and the
     // 5x5 are still computed on the ~3MP guide (unchanged), but the merge samples that
     // guide-res mask BILINEARLY per output pixel instead of nearest -- so every one of
@@ -1808,6 +1819,13 @@ struct Config {
     // the mask always gets DARKER (never brighter). Off by default. Requires
     // robustness_gcam_enabled.
     bool  gcam_sabre_min5x5         = false;
+    // Size n of the hard ComputeLocalMin window used by the gcam resample-path §7
+    // min AND the gcam_sabre_min5x5 extra-darkening pass: R_hat(p) = min over the
+    // n x n neighbourhood. 5 = the paper's literal 5x5; larger (6,10,20,...) grows
+    // each rejection into a wider neighbourhood (darker, more conservative). Spans
+    // exactly n samples/axis, centred. Clamped to >= 1. Implemented separably so
+    // large n stays cheap. Only affects the gcam path.
+    int   gcam_sabre_min_window     = 5;
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an
@@ -1940,6 +1958,13 @@ struct Config {
     // pixels, so at 2x it costs four times what it does at 1x and loses to
     // banding until the burst is long. 0 compares the two and picks.
     int   merge_arch = 0;
+    // Windows D3D11 GPU merge backend (core/d3d11_merge.cpp). When true and a
+    // D3D11 compute device is available, the comparison-frame merge accumulation
+    // runs on the GPU (e.g. an AMD Radeon) instead of the CPU; the reference pass
+    // stays on the CPU, and any unsupported frame config silently falls back to
+    // the CPU accumulate. Results are close to but NOT bit-identical to the CPU /
+    // Metal paths. No effect on Apple (Metal) or where no D3D11 GPU exists.
+    bool  merge_backend_d3d11 = false;
     // Total frames in the burst, filled in by the pipeline rather than tuned.
     // The reference-kernel enlargement is derived from this and the accumulated
     // robustness, so there is no threshold to set. 0 means unknown, which

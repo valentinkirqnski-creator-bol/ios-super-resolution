@@ -341,8 +341,11 @@ Image process_burst_to_dng(const std::vector<Image>& burst, const Config& cfg,
     writer.close();
     if (work.robustness_save_mask && have_acc_rob) {
         // Save at raw resolution (nearest-upsampled from the guide grid),
-        // matching 1.4's full-res mask export.
-        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", ref.h, ref.w))
+        // matching 1.4's full-res mask export. gcam_sabre_merge_res: already at the
+        // output grid -- dump natively to keep the per-output-pixel detail.
+        const int rob_tgt_h = work.gcam_sabre_merge_res ? acc_rob.h : ref.h;
+        const int rob_tgt_w = work.gcam_sabre_merge_res ? acc_rob.w : ref.w;
+        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", rob_tgt_h, rob_tgt_w))
             report("Wrote robustness mask", 0.99f);
     }
     report("Done", 1.0f);

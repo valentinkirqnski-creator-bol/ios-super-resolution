@@ -1251,14 +1251,38 @@ struct CameraView: View {
                              Keeps R and the 5×5 computed on the ~3 MP guide (the default operator, unchanged), but makes the merge sample that guide-res mask BILINEARLY per output pixel instead of nearest — so each of the ~48 MP output pixels gets its own interpolated rejection weight rather than one weight shared across a ~4×4 block. Zero extra memory (it's interpolated at fetch time, nothing is materialised). This is the lightweight way to get a per-output-pixel mask without the raw-res operator. Ignored when "Mask at Input-Frame Resolution" is on (that already has a per-raw-pixel mask). Off by default (nearest fetch); A/B on an imported burst. Requires GCam SABRE Robustness.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
-                        Toggle("Extra 5×5 Minimum (darken mask)", isOn: $cam.tuningParams.gcam_sabre_min5x5)
+                        Toggle("Extra N×N Minimum (darken mask)", isOn: $cam.tuningParams.gcam_sabre_min5x5)
                         Text("""
-                             Applies one extra HARD 5×5 local-minimum pass on top of whatever the §7 refinement produced (on either the guide-res or the input-frame-res mask): each pixel takes the LOWEST confidence weight in its 5×5 window. Because the minimum can never exceed the centre weight, turning this on can only DARKEN the mask — never brighten it — growing every rejection into its 5×5 neighbourhood for a more conservative merge. Use it when ghosts/edges are still being kept. Off by default; A/B on an imported burst. Requires GCam SABRE Robustness.
+                             Applies one extra HARD N×N local-minimum pass on top of whatever the §7 refinement produced (on either the guide-res, input-frame-res, or merge-res mask): each pixel takes the LOWEST confidence weight in its N×N window. Because the minimum can never exceed the centre weight, turning this on can only DARKEN the mask — never brighten it — growing every rejection into its N×N neighbourhood for a more conservative merge. Use it when ghosts/edges are still being kept. Off by default; A/B on an imported burst. Requires GCam SABRE Robustness.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        HStack {
+                            Text("Min Window Size")
+                            Spacer()
+                            Text("\(cam.tuningParams.gcam_sabre_min_window)×\(cam.tuningParams.gcam_sabre_min_window)")
+                        }
+                        Slider(value: Binding(
+                                   get: { Double(cam.tuningParams.gcam_sabre_min_window) },
+                                   set: { cam.tuningParams.gcam_sabre_min_window = Int($0.rounded()) }),
+                               in: 3...31, step: 1)
+                        Text("""
+                             The size N of the hard local-minimum window used by BOTH the §7 minimum (on the input-frame / merge-res paths) and the "Extra N×N Minimum" pass above. 5 = the paper's literal 5×5. Larger (6, 10, 20…) spreads each rejection across a wider neighbourhood — darker, more conservative, better at sealing ghost edges but over-rejects more good pixels. Same logic, just a bigger window; computed separably so even 31×31 stays fast. Only affects the GCam path.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Mask at Input-Frame Resolution (Alg. 6)", isOn: $cam.tuningParams.gcam_sabre_raw_res)
+                            .onChange(of: cam.tuningParams.gcam_sabre_raw_res) { on in
+                                if on { cam.tuningParams.gcam_sabre_merge_res = false }
+                            }
                         Text("""
                              Paper Algorithm 6 literally: the 3×3 statistics are still computed on the ~3 MP guide, but they're then Dodgson-quadratic upsampled (reference unwarped, comparison upsampled AND warped by the flow) to the INPUT-FRAME (raw, ~12 MP) resolution, where R and the 5×5 local-minimum are computed — so the merge gets one robustness weight per raw pixel (≈ per 2×2 output pixels) instead of per ~4×4 block from the guide-res mask. 4× finer than the default, better-localized rejection at edges, and it fits in memory normally (~49 MB/frame, no band-streaming). The comparison guide is prefiltered to match the reference (the paper uses the same guide for both), so aligned content stays fully kept. Off by default (guide-res operator); A/B on an imported burst. Requires GCam SABRE Robustness.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Mask at Merge-Output Resolution (48 MP)", isOn: $cam.tuningParams.gcam_sabre_merge_res)
+                            .onChange(of: cam.tuningParams.gcam_sabre_merge_res) { on in
+                                if on { cam.tuningParams.gcam_sabre_raw_res = false }
+                            }
+                        Text("""
+                             Same operator and Dodgson upsample+warp as Algorithm 6, but taken all the way to the MERGE-OUTPUT grid (scale × the input frame, ~48 MP at 2×): R and the 5×5 local-minimum are computed per OUTPUT pixel, and the merge reads the mask 1:1 (nearest) — one distinct rejection weight for every merged pixel (8× the guide detail vs 4× for Input-Frame res). MUTUALLY EXCLUSIVE with "Mask at Input-Frame Resolution" (turning either on turns the other off) — they target different grids. Heavier: ~195 MB mask/frame, built transiently per comparison frame on the non-resident merge path. Turn on "Save Robustness Mask" to inspect the full 48 MP mask. Off by default; A/B on an imported burst. Requires GCam SABRE Robustness.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Run operator on GPU", isOn: $cam.tuningParams.gcam_sabre_gpu)

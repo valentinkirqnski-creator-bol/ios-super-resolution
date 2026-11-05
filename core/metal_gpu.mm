@@ -1037,7 +1037,9 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     // which will not fit the guide-sized (raw/2) resident rob slice below. Keep the
     // pre-residency (banded/online) merge for it -- that path sizes the mask buffer
     // from the mask's own dims and the fetch auto-detects raw vs guide resolution.
-    if (cfg.robustness_gcam_enabled && cfg.gcam_sabre_raw_res) return false;
+    // gcam_sabre_merge_res makes the mask even larger (one row per OUTPUT pixel).
+    if (cfg.robustness_gcam_enabled && (cfg.gcam_sabre_raw_res || cfg.gcam_sabre_merge_res))
+        return false;
 
     auto& c = ctx();
     g_bf.n = n_frames;
@@ -2999,12 +3001,19 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     // gcam_sabre_raw_res: evaluate on the input-frame (raw) grid, Dodgson-upsampling the
     // guide stats (ref unwarped, comp warped), compg prefiltered to match ref. Twin of
     // the CPU compute_robustness_gcam_sabre.
-    const bool raw_res = cfg.gcam_sabre_raw_res;
-    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/raw_res);
+    // merge_res wins over raw_res (mutually exclusive). resample (Dodgson, prefilter
+    // both, hard 5x5) covers both the raw-grid and the 48MP merge-grid targets.
+    const bool merge_res = cfg.gcam_sabre_merge_res;
+    const bool raw_res = cfg.gcam_sabre_raw_res && !merge_res;
+    const bool resample = raw_res || merge_res;
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/resample);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
-    const int th = raw_res ? comp_raw.h : gh;   // target grid: raw or guide
-    const int tw = raw_res ? comp_raw.w : gw;
+    const int oh = (int)std::llround((double)comp_raw.h * (double)cfg.scale);
+    const int ow = (int)std::llround((double)comp_raw.w * (double)cfg.scale);
+    // target grid: merge-output (48MP) > raw > guide.
+    const int th = merge_res ? oh : (raw_res ? comp_raw.h : gh);
+    const int tw = merge_res ? ow : (raw_res ? comp_raw.w : gw);
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 
@@ -3039,7 +3048,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.na = cfg.noise_alpha_robustness(); mp.nb = cfg.noise_beta_robustness();
     mp.noise_model = noise_model ? 1u : 0u;
     mp.out_h = (uint32_t)th; mp.out_w = (uint32_t)tw;
-    mp.raw_res = raw_res ? 1u : 0u;
+    mp.raw_res = resample ? 1u : 0u;   // "resample" flag: raw OR merge grid (Dodgson)
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();
@@ -3063,10 +3072,11 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     memcpy(R_pre.data.data(), [b_R contents], mask_b);
     // §7 refinement. Raw-res (paper Alg. 6): HARD 5x5 ComputeLocalMin at raw res.
     // Guide-res (default): GCam's soft reject-grow. Twin of compute_robustness_gcam_sabre.
-    Image dil = raw_res ? robustness_gcam_min_5x5(R_pre)
-                        : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
-    // Opt-in extra HARD 5x5 min on top of §7 -- can only darken (min(window) <= center).
-    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_5x5(dil);
+    const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
+    Image dil = resample ? robustness_gcam_min_window(R_pre, min_win)
+                         : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
+    // Opt-in extra HARD n x n min on top of §7 -- can only darken (min(window) <= center).
+    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_window(dil, min_win);
     if (s_select_out) {
         *s_select_out = Image(dil.h, dil.w, 1);
         std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
@@ -4706,8 +4716,11 @@ struct MergeCompParamsCPU {
     uint32_t dense_h = 0;
     float    dense_sx = 1.f;
     float    dense_sy = 1.f;
+    // 1 = robustness mask at the merge-OUTPUT grid (gcam_sabre_merge_res): read 1:1
+    // (nearest) at the output pixel. Keep last to match MergeCompParams in the metal.
+    uint32_t rob_output_res = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 184, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 188, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -5543,6 +5556,10 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         // merge_comp_band_metal.
         p.raw_res_robustness =
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
+        // gcam_sabre_merge_res: mask at the output grid (lr * scale) -> read 1:1.
+        p.rob_output_res =
+            (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
+             p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
         p.flow_bilinear = 0u;
         // robustness_guide_res_bilinear: bilinear fetch = the guide-res mask's
         // upsample to the merge grid.
@@ -5845,6 +5862,10 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     // looked wrong. Invisible with a guide mask, where 0 is correct anyway.
     p.raw_res_robustness =
         (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
+    // gcam_sabre_merge_res: mask at the output grid (lr * scale) -> read 1:1.
+    p.rob_output_res =
+        (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
+         p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
     // Global pre-align homography: the comp pixels are fetched at comp_pos =
     // H*(lr+flow). Without it a pre-aligned burst is fetched in the wrong pose ->
     // ghosted/blurred output. The direct call has the frame's flow in hand, but

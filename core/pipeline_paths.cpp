@@ -201,10 +201,17 @@ static bool robustness_band_can_contribute(const std::vector<uint8_t>& rows,
     // mapping on a raw-res mask would only ever test the top half of the rows and
     // wrongly skip bands lower in the frame.
     const bool rob_is_raw = (rh == raw_h);
+    // gcam_sabre_merge_res: one mask row per OUTPUT row (rh == raw_h*scale), indexed by
+    // the output row directly (merge reads it 1:1).
+    const int out_h = round_away_to_int((f32)raw_h * scale);
+    const bool rob_is_output = (rh == out_h);
     for (int local_y = 0; local_y < bh; ++local_y) {
-        const f32 lr_y = (f32)(y0 + local_y) / scale;
+        const int out_y = y0 + local_y;
+        const f32 lr_y = (f32)out_y / scale;
         int ry;
-        if (bayer_mode && !rob_is_raw)
+        if (rob_is_output)
+            ry = std::min(std::max(out_y, 0), rh - 1);
+        else if (bayer_mode && !rob_is_raw)
             ry = std::min(std::max(round_away_to_int((lr_y - 0.5f) / 2.f), 0), rh - 1);
         else
             ry = std::min(std::max(round_away_to_int(lr_y), 0), rh - 1);
@@ -2940,14 +2947,19 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
     if (work.robustness_save_mask && have_acc_rob) {
         // Save at raw resolution (nearest-upsampled from the guide grid),
         // matching 1.4's full-res mask export. No-op if already raw-res.
-        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", ref.h, ref.w))
+        // gcam_sabre_merge_res: the mask is already at the output grid (48MP) --
+        // dump it natively so the per-output-pixel detail is preserved, instead of
+        // downsampling it back to raw.
+        const int rob_tgt_h = work.gcam_sabre_merge_res ? acc_rob.h : ref.h;
+        const int rob_tgt_w = work.gcam_sabre_merge_res ? acc_rob.w : ref.w;
+        if (write_robustness_mask_pgm(acc_rob, n - 1, dng_path, "", rob_tgt_h, rob_tgt_w))
             report("Wrote robustness mask", 0.985f);
         // Same normalisation as the combined mask, so the three are directly
         // comparable: a pixel is bright in exactly one of _s1 and _s2, at the
         // value it contributed to the combined one.
         if (want_s_masks && have_acc_rob_split) {
-            write_robustness_mask_pgm(acc_rob_s1, n - 1, dng_path, "_s1", ref.h, ref.w);
-            write_robustness_mask_pgm(acc_rob_s2, n - 1, dng_path, "_s2", ref.h, ref.w);
+            write_robustness_mask_pgm(acc_rob_s1, n - 1, dng_path, "_s1", rob_tgt_h, rob_tgt_w);
+            write_robustness_mask_pgm(acc_rob_s2, n - 1, dng_path, "_s2", rob_tgt_h, rob_tgt_w);
             report("Wrote s1/s2 robustness masks", 0.986f);
         }
     }

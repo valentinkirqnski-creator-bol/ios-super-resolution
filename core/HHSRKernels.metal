@@ -904,6 +904,10 @@ struct MergeCompParams {
     uint dense_h;
     float dense_sx;
     float dense_sy;
+    // 1 = the robustness mask is at the merge-OUTPUT grid (gcam_sabre_merge_res):
+    // read it 1:1 (nearest) at the output pixel, bypassing the guide/raw rescale
+    // and rob_bilinear. (was implicit padding at struct end.)
+    uint rob_output_res;
 };
 
 struct MergeRefParams {
@@ -1188,10 +1192,18 @@ static inline void merge_comp_contrib(device const float* img,
     // robustness_raw_resolution_active), same coordinate space as lr_y/lr_x
     // already -- skip the guide-scale conversion. See CPU accumulate_comp
     // (merge.cpp) for the mirrored fix.
-    float rob_y = lr_y, rob_x = lr_x;
-    if (p.raw_res_robustness == 0u && p.bayer != 0u) {
-        rob_y = (lr_y - 0.5f) / 2.f;
-        rob_x = (lr_x - 0.5f) / 2.f;
+    // p.rob_output_res: the mask is at the MERGE-OUTPUT grid (gcam_sabre_merge_res),
+    // one weight per output pixel -> read it 1:1 (nearest) at this output pixel.
+    float rob_y, rob_x;
+    if (p.rob_output_res != 0u) {
+        rob_y = float(hr_i);
+        rob_x = float(hr_j);
+    } else {
+        rob_y = lr_y; rob_x = lr_x;
+        if (p.raw_res_robustness == 0u && p.bayer != 0u) {
+            rob_y = (lr_y - 0.5f) / 2.f;
+            rob_x = (lr_x - 0.5f) / 2.f;
+        }
     }
     // Driven by its OWN bit, not p.flow_bilinear: interpolating the mask and
     // interpolating the tile flow are different decisions, and sharing a flag
@@ -1203,7 +1215,7 @@ static inline void merge_comp_contrib(device const float* img,
     // default path is unchanged.
     const uint rnc = max(p.rob_nch, 1u);
     float local_r0, local_r1, local_r2;
-    if (p.rob_bilinear != 0u) {
+    if (p.rob_bilinear != 0u && p.rob_output_res == 0u) {
         local_r0 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 0u);
         local_r1 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 1u);
         local_r2 = sample_robustness_bilinear(robustness, p.rob_h, p.rob_w, rob_y, rob_x, rnc, 2u);
@@ -2089,12 +2101,15 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     uint out_w = (p.raw_res != 0u) ? p.out_w : p.w;
     if (gid.x >= out_w || gid.y >= out_h) return;
     uint tx = gid.x, ty = gid.y;
-    // Guide coordinate of this pixel. Raw-res: Dodgson x2 raw->guide (g=(raw+0.5)/2-0.5),
-    // clamped. Guide-res: the integer guide pixel (bit-exact).
+    // Guide coordinate of this pixel. Resample (raw_res != 0 => raw OR merge grid):
+    // Dodgson guide->target, g = (t+0.5)*(guide_dim/target_dim) - 0.5 (x0.5 for raw,
+    // x0.25 for the 48MP merge grid), clamped. Guide-res: the integer guide pixel.
     float gy, gx;
     if (p.raw_res != 0u) {
-        gy = clamp((float(ty) + 0.5f) * 0.5f - 0.5f, 0.f, float(p.h) - 1.f);
-        gx = clamp((float(tx) + 0.5f) * 0.5f - 0.5f, 0.f, float(p.w) - 1.f);
+        float gpt_y = float(p.h) / float(max(out_h, 1u));
+        float gpt_x = float(p.w) / float(max(out_w, 1u));
+        gy = clamp((float(ty) + 0.5f) * gpt_y - 0.5f, 0.f, float(p.h) - 1.f);
+        gx = clamp((float(tx) + 0.5f) * gpt_x - 0.5f, 0.f, float(p.w) - 1.f);
     } else { gy = float(ty); gx = float(tx); }
     // §5.1 piecewise per-tile flow (nearest), guide->raw->guide (2*g ~ raw).
     uint patch_idy = uint((2.f * gy + 0.5f) / float(max(p.tile_size, 1u)));

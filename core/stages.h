@@ -207,6 +207,8 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg);
 // Paper Alg. 6 ComputeLocalMin: hard 5x5 minimum keep weight (R_hat = min over N5),
 // edge-clamped. The §7 refinement for the raw-res gcam path (gcam_sabre_raw_res).
 Image robustness_gcam_min_5x5(const Image& R);
+// Generalised n x n hard local-minimum (separable; n=5 == robustness_gcam_min_5x5).
+Image robustness_gcam_min_window(const Image& R, int n);
 // GCam SABRE (§4.1): per-component 3x3 median of the per-tile flow vectors, in
 // place, edge-clamped. Both robustness and merge read the result. No-op on an
 // empty / dense-only field.

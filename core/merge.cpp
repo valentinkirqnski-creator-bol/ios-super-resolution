@@ -4,6 +4,9 @@
 #ifdef __APPLE__
 #include "metal_gpu.h"
 #endif
+#ifdef _WIN32
+#include "d3d11_merge.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -160,8 +163,16 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // handed to us is guide. Trusting the flag there would sample R
             // at half the correct position everywhere.
             const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
+            // gcam_sabre_merge_res: one R weight per OUTPUT pixel -> the mask is at the
+            // output grid and is read 1:1 (nearest) at this output pixel, no rescale.
+            const int out_h_full = (int)std::llround((double)lr_h * (double)scale);
+            const int out_w_full = (int)std::llround((double)lr_w * (double)scale);
+            const bool rob_is_output = (robustness.h == out_h_full && robustness.w == out_w_full);
             f32 rob_y = lr_y, rob_x = lr_x;
-            if (!rob_is_raw && cfg.bayer_mode) {
+            if (rob_is_output) {
+                rob_y = (f32)hr_i;
+                rob_x = (f32)hr_j;
+            } else if (!rob_is_raw && cfg.bayer_mode) {
                 rob_y = (lr_y - 0.5f) / 2.f;
                 rob_x = (lr_x - 0.5f) / 2.f;
             }
@@ -174,8 +185,9 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             f32 local_r[3];
             // robustness_guide_res_bilinear: the guide-res mask bilinearly
             // upsampled to the merge grid IS this bilinear fetch.
-            if (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear ||
-                (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) {
+            if (!rob_is_output &&
+                (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear ||
+                 (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res))) {
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
             } else {
@@ -338,6 +350,14 @@ bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovFiel
     return merge_comp_band_metal(comp_raw, flow, covs, robustness, tile_size,
                                  num_band, den_band, y0, cfg, frame_id);
 #else
+#ifdef _WIN32
+    // Windows D3D11 GPU merge (opt-in). Falls through to CPU for unsupported
+    // configs or any GPU error.
+    if (cfg.merge_backend_d3d11 && d3d11_merge_available() &&
+        merge_comp_band_d3d11(comp_raw, flow, covs, robustness, tile_size,
+                              num_band, den_band, y0, cfg, frame_id))
+        return true;
+#endif
     (void)frame_id;
     accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg);
     return true;

@@ -1853,23 +1853,44 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
 // (gcam_sabre_raw_res) as the §7 refinement -- the paper's literal morphological min,
 // in place of GCam's soft reject-grow (robustness_gcam_dilate), now that R is computed
 // per raw pixel. Exported so the Metal gcam driver can apply it to the GPU-computed R.
-Image robustness_gcam_min_5x5(const Image& R) {
+// Generalised hard local-minimum over an n x n window (R_hat(p) = min over the
+// n-neighbourhood). Separable: a horizontal n-min then a vertical n-min, which
+// equals the 2D box min exactly but costs O(n) per pixel instead of O(n^2), so
+// large windows (e.g. 20x20) stay fast. The window spans exactly n samples per
+// axis, centred: offsets [-(n-1)/2 .. n/2] (so n=5 -> [-2..2], matching the old
+// 5x5; n=6 -> [-2..3]; n=20 -> [-9..10]). Edge-clamped.
+Image robustness_gcam_min_window(const Image& R, int n) {
     if (R.h <= 0 || R.w <= 0) return R;
-    Image out(R.h, R.w, 1);
-    for (int y = 0; y < R.h; ++y)
-        for (int x = 0; x < R.w; ++x) {
+    if (n < 1) n = 1;
+    const int lo = -((n - 1) / 2), hi = n / 2;
+    const int h = R.h, w = R.w;
+    Image tmp(h, w, 1);
+    // horizontal n-min
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
             f32 mn = std::numeric_limits<f32>::infinity();
-            for (int i = -2; i <= 2; ++i) {
-                const int yy = (int)clampf((f32)(y + i), 0.f, (f32)(R.h - 1));
-                for (int j = -2; j <= 2; ++j) {
-                    const int xx = (int)clampf((f32)(x + j), 0.f, (f32)(R.w - 1));
-                    mn = std::min(mn, R.at(yy, xx, 0));
-                }
+            for (int dx = lo; dx <= hi; ++dx) {
+                int xx = x + dx; xx = xx < 0 ? 0 : (xx >= w ? w - 1 : xx);
+                mn = std::min(mn, R.at(y, xx, 0));
+            }
+            tmp.at(y, x, 0) = mn;
+        }
+    // vertical n-min
+    Image out(h, w, 1);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            f32 mn = std::numeric_limits<f32>::infinity();
+            for (int dy = lo; dy <= hi; ++dy) {
+                int yy = y + dy; yy = yy < 0 ? 0 : (yy >= h ? h - 1 : yy);
+                mn = std::min(mn, tmp.at(yy, x, 0));
             }
             out.at(y, x, 0) = mn;
         }
     return out;
 }
+
+// Back-compat wrapper: the paper's literal 5x5 ComputeLocalMin.
+Image robustness_gcam_min_5x5(const Image& R) { return robustness_gcam_min_window(R, 5); }
 
 // §4.1 per-component 3x3 median of the per-tile flow vectors (edge-clamped), in
 // place. Cleans isolated outlier vectors before robustness AND merge read the
@@ -2073,11 +2094,19 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // without it the sharp Dodgson sampling + the 5x5 amplify the (ref-prefiltered vs
     // comp-raw) residual and reject aligned content (identical frames must stay R=1).
     // Off (default): the original guide-res operator (raw comp, bicubic sampling).
-    const bool raw_res = cfg.gcam_sabre_raw_res;
-    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/raw_res);
+    // merge_res wins over raw_res when both are set (mutually exclusive -- they drive
+    // different target grids). Both run the SAME operator in guide space; only the
+    // target resolution (and hence the Dodgson upscale factor) differs.
+    const bool merge_res = cfg.gcam_sabre_merge_res;
+    const bool raw_res = cfg.gcam_sabre_raw_res && !merge_res;
+    const bool resample = raw_res || merge_res;   // Dodgson-sample both guides
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/resample);
     if (compg.h != refg.h || compg.w != refg.w) return Image();
     const int gh = refg.h, gw = refg.w;
     const int rh = comp_raw.h, rw = comp_raw.w;   // input-frame (raw) resolution
+    // merge-output grid = scale x the input frame (what the merge accumulates onto).
+    const int oh = (int)std::llround((double)rh * (double)cfg.scale);
+    const int ow = (int)std::llround((double)rw * (double)cfg.scale);
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 local motion extent (raw px)
     // GCam's flow.z threshold (gcam_sabre_motion_thresh, normalized UV) was measured
     // over a 3x3 neighbourhood of its ~16-raw-px tiles (258 across a 4128px frame,
@@ -2096,8 +2125,14 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // fixed seed -> matches the guide's and the GPU's copy). Off -> affine stand-in.
     const bool noise_model = cfg.gcam_sabre_noise_model;
     const GcamNoiseLut mc_lut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
-    const int th = raw_res ? rh : gh;    // target grid: raw (Alg.6) or guide (default)
-    const int tw = raw_res ? rw : gw;
+    // target grid: merge-output (48MP) > raw (Alg.6) > guide (default).
+    const int th = merge_res ? oh : (raw_res ? rh : gh);
+    const int tw = merge_res ? ow : (raw_res ? rw : gw);
+    // guide coords per target pixel: guide has gh/gw samples over the same field of
+    // view as the th/tw target, so g = (t+0.5)*(g_dim/t_dim) - 0.5. raw-res -> *0.5
+    // (2x), merge-res -> *0.25 (4x), guide-res -> *1 (the gy=ry branch below).
+    const f32 g_per_ty = (f32)gh / (f32)th;
+    const f32 g_per_tx = (f32)gw / (f32)tw;
     Image R(th, tw, 1);
     for (int ry = 0; ry < th; ++ry)
         for (int rx = 0; rx < tw; ++rx) {
@@ -2105,9 +2140,9 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             // cell g sits at raw 2g+0.5 -> g=(raw+0.5)/2-0.5), edge-clamped. Guide-res:
             // the integer guide pixel (bit-exact with the original path).
             f32 gy, gx;
-            if (raw_res) {
-                gy = clampf(((f32)ry + 0.5f) * 0.5f - 0.5f, 0.f, (f32)(gh - 1));
-                gx = clampf(((f32)rx + 0.5f) * 0.5f - 0.5f, 0.f, (f32)(gw - 1));
+            if (resample) {
+                gy = clampf(((f32)ry + 0.5f) * g_per_ty - 0.5f, 0.f, (f32)(gh - 1));
+                gx = clampf(((f32)rx + 0.5f) * g_per_tx - 0.5f, 0.f, (f32)(gw - 1));
             } else { gy = (f32)ry; gx = (f32)rx; }
             // §5.1 flow (piecewise per tile), raw tile index (2*g ~ raw); the flow is
             // halved to guide units because the stats are sampled in guide coords.
@@ -2136,7 +2171,7 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             // keeps identical frames at d==0. Guide-res: exact integer ref lookup +
             // bicubic-abs comp (bit-exact with the original path).
             f32 ref_var_signed, refc[3], curc[3], cur_a;
-            if (raw_res) {
+            if (resample) {
                 ref_var_signed = sample_dogson(refg, gy, gx, 3);
                 for (int c = 0; c < 3; ++c) {
                     refc[c] = sample_dogson(refg, gy, gx, c);
@@ -2210,13 +2245,14 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // §7 refinement. Raw-res (paper Alg. 6): the HARD 5x5 ComputeLocalMin at raw res
     // (R_hat = min over 5x5), now that R is computed per raw pixel. Guide-res (default):
     // GCam's soft reject-grow (robustness_gcam_dilate), unchanged.
-    Image dil = raw_res ? robustness_gcam_min_5x5(R)
-                        : robustness_gcam_dilate(R, cfg);
-    // Opt-in extra darkening: an additional HARD 5x5 ComputeLocalMin (R_hat = min over
-    // the 5x5 window) applied ON TOP of the §7 result. min(window) <= center always, so
+    const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
+    Image dil = resample ? robustness_gcam_min_window(R, min_win)
+                         : robustness_gcam_dilate(R, cfg);
+    // Opt-in extra darkening: an additional HARD n x n ComputeLocalMin (R_hat = min over
+    // the n-window) applied ON TOP of the §7 result. min(window) <= center always, so
     // turning this on can only darken the mask (grows each rejection into its neighbours),
-    // regardless of which §7 branch ran above.
-    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_5x5(dil);
+    // regardless of which §7 branch ran above. Window size = gcam_sabre_min_window.
+    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_window(dil, min_win);
     // The operator makes no s1/s2 prior choice; report the strict prior uniformly
     // so the debug split masks stay well-formed (matches the learned-mask path).
     if (s_select_out) {
