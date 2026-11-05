@@ -1639,8 +1639,9 @@ static f32 gcam_lut_sample(const GcamNoiseLut& lut, f32 luma, int row, int ch) {
 static Image gcam_prefilter_ref(const Image& g) {
     static constexpr f32 w1d[3] = {1.f / 6.f, 4.f / 6.f, 1.f / 6.f};
     Image out(g.h, g.w, g.c);
-    for (int y = 0; y < g.h; ++y)
-        for (int x = 0; x < g.w; ++x)
+    const int vch = g.c - 1;                  // variance channel
+    parallel_rows(g.h, 0, [&](int y) {
+        for (int x = 0; x < g.w; ++x) {
             for (int ch = 0; ch < g.c; ++ch) {
                 f32 s = 0.f;
                 for (int i = -1; i <= 1; ++i) {
@@ -1652,10 +1653,10 @@ static Image gcam_prefilter_ref(const Image& g) {
                 }
                 out.at(y, x, ch) = s;
             }
-    const int vch = g.c - 1;                  // variance channel
-    for (int y = 0; y < g.h; ++y)
-        for (int x = 0; x < g.w; ++x)
+            // Re-sign the variance channel (negative = green-only flag) in the same pass.
             if (g.at(y, x, vch) < 0.f) out.at(y, x, vch) = -out.at(y, x, vch);
+        }
+    });
     return out;
 }
 
@@ -1706,7 +1707,9 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
     // (fixed seed), outside the pixel loop.
     const bool use_mc = cfg.gcam_sabre_noise_model;
     const GcamNoiseLut mc_lut = use_mc ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
-    for (int y = 0; y < gh; ++y)
+    // Per-guide-pixel stats; rows independent (write own guide row, read-only raw/lut)
+    // -> parallel. dispatch_apply on Apple; big win since this runs per comp frame.
+    parallel_rows(gh, cfg.num_threads, [&](int y) {
         for (int x = 0; x < gw; ++x) {
             f32 avg[3] = {0, 0, 0};                      // 1-2-1 weighted mean colour
             f32 m0[3] = {0, 0, 0}, m1[3] = {0, 0, 0};    // unweighted colour moments
@@ -1757,6 +1760,7 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
             guide.at(y, x, 2) = col[2];
             guide.at(y, x, 3) = var;
         }
+    });
     return prefilter_ref ? gcam_prefilter_ref(guide) : guide;
 }
 
@@ -1831,20 +1835,24 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
         // (raw/guide/quarter) and unverifiable without GCam's merge source.
         const int dh = std::max(1, R.h / 2), dw = std::max(1, R.w / 2);
         Image coarse(dh, dw, 1);
-        for (int oy = 0; oy < dh; ++oy)
+        parallel_rows(dh, 0, [&](int oy) {
             for (int ox = 0; ox < dw; ++ox)
                 coarse.at(oy, ox, 0) = dilate_at(2 * oy + 1, 2 * ox + 1);
-        for (int y = 0; y < R.h; ++y)
+        });
+        parallel_rows(R.h, 0, [&](int y) {
             for (int x = 0; x < R.w; ++x) {
                 const int oy = std::min(y / 2, dh - 1), ox = std::min(x / 2, dw - 1);
                 out.at(y, x, 0) = coarse.at(oy, ox, 0);
             }
+        });
         return out;
     }
     // Finer: keep the mask at full guide resolution (dropped GCam's downsample).
-    for (int y = 0; y < R.h; ++y)
+    // Rows are independent -> parallel (dispatch_apply on Apple, thread pool else).
+    parallel_rows(R.h, 0, [&](int y) {
         for (int x = 0; x < R.w; ++x)
             out.at(y, x, 0) = dilate_at(y, x);
+    });
     return out;
 }
 
@@ -1865,27 +1873,32 @@ Image robustness_gcam_min_window(const Image& R, int n) {
     const int lo = -((n - 1) / 2), hi = n / 2;
     const int h = R.h, w = R.w;
     Image tmp(h, w, 1);
-    // horizontal n-min
-    for (int y = 0; y < h; ++y)
+    // horizontal n-min (rows are independent -> parallel; dispatch_apply on Apple)
+    parallel_rows(h, 0, [&](int y) {
+        const f32* rin = &R.data[(size_t)y * w];
+        f32* rout = &tmp.data[(size_t)y * w];
         for (int x = 0; x < w; ++x) {
             f32 mn = std::numeric_limits<f32>::infinity();
             for (int dx = lo; dx <= hi; ++dx) {
                 int xx = x + dx; xx = xx < 0 ? 0 : (xx >= w ? w - 1 : xx);
-                mn = std::min(mn, R.at(y, xx, 0));
+                mn = std::min(mn, rin[xx]);
             }
-            tmp.at(y, x, 0) = mn;
+            rout[x] = mn;
         }
-    // vertical n-min
+    });
+    // vertical n-min (rows independent)
     Image out(h, w, 1);
-    for (int y = 0; y < h; ++y)
+    parallel_rows(h, 0, [&](int y) {
+        f32* rout = &out.data[(size_t)y * w];
         for (int x = 0; x < w; ++x) {
             f32 mn = std::numeric_limits<f32>::infinity();
             for (int dy = lo; dy <= hi; ++dy) {
                 int yy = y + dy; yy = yy < 0 ? 0 : (yy >= h ? h - 1 : yy);
-                mn = std::min(mn, tmp.at(yy, x, 0));
+                mn = std::min(mn, tmp.data[(size_t)yy * w + x]);
             }
-            out.at(y, x, 0) = mn;
+            rout[x] = mn;
         }
+    });
     return out;
 }
 
@@ -2142,7 +2155,10 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const f32 g_per_ty = (f32)gh / (f32)th;
     const f32 g_per_tx = (f32)gw / (f32)tw;
     Image R(th, tw, 1);
-    for (int ry = 0; ry < th; ++ry)
+    // Per-output-pixel ComputeFrameWeight. Rows are independent (each writes its own
+    // R row; everything else is read-only), so this parallelises exactly -- a big win
+    // at raw/merge res (th up to 12MP) on the CPU path. dispatch_apply on Apple.
+    parallel_rows(th, cfg.num_threads, [&](int ry) {
         for (int rx = 0; rx < tw; ++rx) {
             // Guide coordinate of this pixel. Raw-res: Dodgson x2 raw->guide (a guide
             // cell g sits at raw 2g+0.5 -> g=(raw+0.5)/2-0.5), edge-clamped. Guide-res:
@@ -2250,6 +2266,7 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             if (!std::isfinite(w)) w = 0.f;
             R.at(ry, rx, 0) = clampf(w, 0.f, 1.f);         // keep weight (unblocker = 0)
         }
+    });
     // §7 refinement. Raw-res (paper Alg. 6): the HARD 5x5 ComputeLocalMin at raw res
     // (R_hat = min over 5x5), now that R is computed per raw pixel. Guide-res (default):
     // GCam's soft reject-grow (robustness_gcam_dilate), unchanged.
