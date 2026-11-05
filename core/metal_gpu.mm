@@ -3009,11 +3009,11 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/resample);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
-    const int oh = (int)std::llround((double)comp_raw.h * (double)cfg.scale);
-    const int ow = (int)std::llround((double)comp_raw.w * (double)cfg.scale);
-    // target grid: merge-output (48MP) > raw > guide.
-    const int th = merge_res ? oh : (raw_res ? comp_raw.h : gh);
-    const int tw = merge_res ? ow : (raw_res ? comp_raw.w : gw);
+    // RAM-safe merge-res: compute R + min at the INPUT-FRAME (raw) grid (~49MB/frame,
+    // like raw_res), NOT the 48MP output grid (materialising that per frame OOM'd on
+    // device). The merge bilinearly upsamples this raw-res mask to the output pixels.
+    const int th = resample ? comp_raw.h : gh;
+    const int tw = resample ? comp_raw.w : gw;
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 
@@ -5563,7 +5563,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.flow_bilinear = 0u;
         // robustness_guide_res_bilinear: bilinear fetch = the guide-res mask's
         // upsample to the merge grid.
-        p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
+        p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || cfg.gcam_sabre_merge_res || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
         p.cov_stride = g_bf.cov_stride;
         p.img_off  = (uint32_t)bf_raw_off(slot);
         p.flow_off = (uint32_t)bf_flow_off(slot);
@@ -5822,7 +5822,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     p.flow_bilinear = false ? 1u : 0u;
     // robustness_guide_res_bilinear: bilinear fetch of the guide-res mask = its
     // upsample to the merge grid.
-    p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
+    p.rob_bilinear = (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear || cfg.gcam_sabre_merge_res || (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) ? 1u : 0u;
 
     if (comp_raw.h > 0 && comp_raw.w > 0) {
         p.lr_h = (uint32_t)comp_raw.h;

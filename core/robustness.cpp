@@ -2126,8 +2126,16 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const bool noise_model = cfg.gcam_sabre_noise_model;
     const GcamNoiseLut mc_lut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
     // target grid: merge-output (48MP) > raw (Alg.6) > guide (default).
-    const int th = merge_res ? oh : (raw_res ? rh : gh);
-    const int tw = merge_res ? ow : (raw_res ? rw : gw);
+    // RAM-safe merge-res: R + the N x N min are computed at the INPUT-FRAME (raw)
+    // resolution -- the same ~49MB/frame footprint as gcam_sabre_raw_res -- and the
+    // merge bilinearly upsamples that mask to every 48MP output pixel at fetch time
+    // (see merge.cpp). Materialising a full 48MP float mask per frame (~195MB x N
+    // frames) OOM'd on device, so merge_res no longer targets the output grid; the
+    // per-output-pixel weight is the bilinear interpolation of the raw-res R, which
+    // (the stats being guide-res) is numerically ~identical to computing R at 48MP.
+    (void)oh; (void)ow;
+    const int th = resample ? rh : gh;
+    const int tw = resample ? rw : gw;
     // guide coords per target pixel: guide has gh/gw samples over the same field of
     // view as the th/tw target, so g = (t+0.5)*(g_dim/t_dim) - 0.5. raw-res -> *0.5
     // (2x), merge-res -> *0.25 (4x), guide-res -> *1 (the gy=ry branch below).

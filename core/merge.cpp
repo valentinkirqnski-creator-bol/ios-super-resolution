@@ -187,6 +187,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // upsampled to the merge grid IS this bilinear fetch.
             if (!rob_is_output &&
                 (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear ||
+                 cfg.gcam_sabre_merge_res ||   // raw-res mask bilinearly upsampled to 48MP
                  (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res))) {
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
