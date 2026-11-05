@@ -1678,6 +1678,7 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
         Image g(raw.h, raw.w, 4);             // degenerate grey: sqrt plane, var 0
         for (int y = 0; y < raw.h; ++y)
             for (int x = 0; x < raw.w; ++x) {
+                // +1e-4 is applied in the sensor domain at raw load (raw_io.cpp).
                 const f32 s = std::sqrt(std::max(0.f, raw.at(y, x)));
                 g.at(y, x, 0) = s; g.at(y, x, 1) = s; g.at(y, x, 2) = s; g.at(y, x, 3) = 0.f;
             }
@@ -1697,6 +1698,10 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
                 if (c == 0) vR = v; else if (c == 2) vB = v;
                 else { if (gi == 0) g0 = v; else g1 = v; ++gi; }
             }
+        // GCam parity: ExtractBayer's +1e-4 is applied in the SENSOR domain at raw
+        // load (raw_io.cpp), so it is already baked into these values -- do NOT add
+        // it again here (that would be ~1000x GCam's floor). Plain sqrt, matching
+        // ComputeGuideImage's sqrt(max(0, rggb)).
         sR  = std::sqrt(std::max(0.f, vR));
         sB  = std::sqrt(std::max(0.f, vB));
         sGr = std::sqrt(std::max(0.f, g0));

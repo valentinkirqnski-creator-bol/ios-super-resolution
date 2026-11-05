@@ -391,7 +391,13 @@ static Image decode_raw_file(LibRaw& raw, Config& cfg, bool is_reference,
             const int fj = x & 1;
             float bl = site_black[fi][fj];
             float denom = site_denom[fi][fj];
-            float v = ((float)raw_image[(top + y) * stride + (left + x)] - bl) / denom;
+            // GCam parity: ExtractBayer adds +1e-4 to the extracted SENSOR value before
+            // the (v-black)/(white-black) normalization and WB gain, so it is a ~1e-7
+            // floor in the normalized [0,1] domain -- "nothing is exactly zero" before
+            // the guide's sqrt / variance / division. Applied here so it propagates to
+            // everything the extracted Bayer feeds (guide, grey/align, merge), as GCam.
+            float sensor = (float)raw_image[(top + y) * stride + (left + x)] + 1e-4f;
+            float v = (sensor - bl) / denom;
             v *= site_wb[fi][fj];
             if (!std::isfinite(v)) v = 0.f;
             // No upper clip. White balance multiplies red by ~2 and blue by
