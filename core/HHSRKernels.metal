@@ -2134,8 +2134,11 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     sx = gcam_mirror(sx, float(p.w));                 // §5.3
     sy = gcam_mirror(sy, float(p.h));
     // §5.4 reference (unwarped) + comparison (warped). Raw-res: both signed Dodgson from
-    // the guide, abs only on the variance (ch 3). Guide-res: integer ref lookup +
-    // bicubic-abs comp (bit-exact).
+    // the guide, abs only on the variance (ch 3). Guide-res (GCam BaseFrameRefColor +
+    // Rejection, non-REJECTION_ONLY bicubic variant -- the one our kFilterVarianceScale
+    // targets): BOTH ref and comp are bicubic-B-spline-abs sampled, green-only flag from
+    // a POINT sample of the variance sign. Twin of compute_robustness_gcam_sabre's CPU
+    // guide-res branch (shared kernel + prefilter-both keeps identical frames at d==0).
     float ref_var_signed, refc[3], curc[3], cur_a;
     if (p.raw_res != 0u) {
         ref_var_signed = rob_sample_dogson_or_inf(refg, p.h, p.w, 4u, gy, gx, 3u);
@@ -2145,10 +2148,13 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
         }
         cur_a = fabs(rob_sample_dogson_or_inf(compg, p.h, p.w, 4u, sy, sx, 3u));
     } else {
-        uint rofs = (uint(gy) * p.w + uint(gx)) * 4u;
-        ref_var_signed = refg[rofs + 3u];
+        uint iyy = uint(clamp(float(int(round(gy))), 0.f, float(p.h) - 1.f));
+        uint ixx = uint(clamp(float(int(round(gx))), 0.f, float(p.w) - 1.f));
+        bool green_pt = refg[(iyy * p.w + ixx) * 4u + 3u] < 0.f;
+        float ref_mag = fabs(rob_sample_bspline_abs(refg, p.h, p.w, 4u, gy, gx, 3u));
+        ref_var_signed = green_pt ? -ref_mag : ref_mag;
         for (uint ch = 0u; ch < 3u; ++ch) {
-            refc[ch] = refg[rofs + ch];
+            refc[ch] = rob_sample_bspline_abs(refg, p.h, p.w, 4u, gy, gx, ch);
             curc[ch] = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, ch);
         }
         cur_a = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, 3u);
