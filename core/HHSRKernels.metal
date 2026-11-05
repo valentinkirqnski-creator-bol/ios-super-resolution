@@ -33,7 +33,11 @@ kernel void raw16_to_float_bayer(device const ushort* raw [[buffer(0)]],
     if (gid.x >= p.w || gid.y >= p.h) return;
     uint site = ((gid.y & 1u) << 1u) | (gid.x & 1u);
     ushort rawv = raw[(p.src_y0 + gid.y) * p.stride_shorts + (p.src_x0 + gid.x)];
-    float v = (float(rawv) - p.black[site]) / p.denom[site];
+    // GCam ExtractBayer parity: +1e-4 on the SENSOR value before the (v-black)/denom
+    // normalization and WB gain (a ~1e-7 floor in [0,1]) so nothing is exactly zero
+    // before the guide sqrt/variance/division. Matches raw_io.cpp load_raw_dng (the
+    // import/CPU path); applied here for the on-device capture GPU decode.
+    float v = (float(rawv) + 1e-4f - p.black[site]) / p.denom[site];
     v *= p.wb[site];
     if (!isfinite(v)) v = 0.f;
     // No upper clip -- see load_raw_dng in raw_io.cpp.
