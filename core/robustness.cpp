@@ -2305,24 +2305,25 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 }
                 cur_a = std::fabs(sample_dogson(compg, sy, sx, 3));
             } else {
-                // Guide-res (both toggles off): GCam BaseFrameRefColor, REJECTION_ONLY.
-                // The reference guide is resampled with SampleBiquadraticAbsolute, and
-                // the green-only flag comes from a POINT sample of the variance sign (at
-                // a texel centre the shader's bilinear texture() == the texel value).
-                // The comparison is sampled with the SAME biquadratic filter so an
-                // identical frame (zero flow) still gives d==0 -- ref and comp must share
-                // the resample kernel. (Was: nearest ref + bicubic-B-spline comp, an
-                // asymmetric pairing that is not what GCam does.)
+                // Guide-res (both toggles off): GCam BaseFrameRefColor + Rejection, the
+                // NON-REJECTION_ONLY (bicubic) variant -- which is the one our
+                // kFilterVarianceScale constants (gcam_sabre_k_rgb=0.0898866,
+                // k_green=0.211665) are calibrated to (the biquadratic/REJECTION_ONLY
+                // variant uses 0.0976597/0.25). So BOTH the reference (BaseFrameRefColor
+                // SampleBicubicAbsolute) and the warped comparison (Rejection's
+                // current_values SampleBicubicAbsolute) are cubic-B-spline-abs sampled.
+                // green-only flag from a POINT sample of the variance sign. Sharing the
+                // kernel (and prefiltering both guides) keeps identical frames at d==0.
                 const int iy = std::min(std::max((int)std::lround(gy), 0), gh - 1);
                 const int ix = std::min(std::max((int)std::lround(gx), 0), gw - 1);
                 const bool green_pt = refg.at(iy, ix, 3) < 0.f;
-                const f32 ref_mag = sample_biquad_abs(refg, gy, gx, 3);  // |variance|
+                const f32 ref_mag = std::fabs(sample_bicubic_abs(refg, gy, gx, 3));
                 ref_var_signed = green_pt ? -ref_mag : ref_mag;          // restore sign
                 for (int c = 0; c < 3; ++c) {
-                    refc[c] = sample_biquad_abs(refg, gy, gx, c);
-                    curc[c] = sample_biquad_abs(compg, sy, sx, c);
+                    refc[c] = sample_bicubic_abs(refg, gy, gx, c);
+                    curc[c] = sample_bicubic_abs(compg, sy, sx, c);
                 }
-                cur_a = sample_biquad_abs(compg, sy, sx, 3);
+                cur_a = sample_bicubic_abs(compg, sy, sx, 3);
             }
             const bool green_only = ref_var_signed < 0.f;
             f32 ref_a = std::fabs(ref_var_signed);
