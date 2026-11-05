@@ -3006,7 +3006,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     const bool merge_res = cfg.gcam_sabre_merge_res;
     const bool raw_res = cfg.gcam_sabre_raw_res && !merge_res;
     const bool resample = raw_res || merge_res;
-    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/resample);
+    // Prefilter BOTH guides identically (see compute_robustness_gcam_sabre): the ref
+    // guide is always prefiltered, so prefilter the comp too, or identical frames
+    // self-reject in guide-res. Was `resample` (asymmetric on the guide-res path).
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/true);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
     const int oh = (int)std::llround((double)comp_raw.h * (double)cfg.scale);

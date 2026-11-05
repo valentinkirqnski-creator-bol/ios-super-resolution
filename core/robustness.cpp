@@ -918,6 +918,35 @@ static f32 sample_dogson(const Image& stats, f32 LR_y, f32 LR_x, int ch) {
     return buf / w_acc;
 }
 
+// GCam SampleBiquadraticAbsolute (the REJECTION_ONLY BaseFrameRefColor filter):
+// Dodgson's approximating biquadratic, implemented EXACTLY as the shader's 4-bilinear-
+// tap ABS form. gy/gx are guide texel coordinates (texel i centred at i). The shader
+// works in GL texel space P = coord + 0.5, computes c = fract(P)^2 - fract(P) + 0.5,
+// and takes 4 bilinear taps at coord +-c, abs each, average. OOB (centre outside the
+// guide) -> +inf (R=0), matching sample_dogson's Python semantics.
+static f32 sample_biquad_abs(const Image& g, f32 gy, f32 gx, int ch) {
+    if (!(gy >= 0.f && gy < (f32)g.h && gx >= 0.f && gx < (f32)g.w))
+        return std::numeric_limits<f32>::infinity();
+    auto bilin = [&](f32 y, f32 x) -> f32 {
+        y = clampf(y, 0.f, (f32)(g.h - 1)); x = clampf(x, 0.f, (f32)(g.w - 1));
+        const int y0 = (int)std::floor(y), x0 = (int)std::floor(x);
+        const int y1 = std::min(y0 + 1, g.h - 1), x1 = std::min(x0 + 1, g.w - 1);
+        const f32 fy = y - (f32)y0, fx = x - (f32)x0;
+        const f32 a = g.at(y0, x0, ch), b = g.at(y0, x1, ch);
+        const f32 c = g.at(y1, x0, ch), d = g.at(y1, x1, ch);
+        const f32 top = a + (b - a) * fx, bot = c + (d - c) * fx;
+        return top + (bot - top) * fy;
+    };
+    const f32 Py = gy + 0.5f, Px = gx + 0.5f;
+    const f32 fy = Py - std::floor(Py), fx = Px - std::floor(Px);
+    const f32 cy = fy * fy - fy + 0.5f, cx = fx * fx - fx + 0.5f;
+    const f32 y0 = gy - cy, y1 = gy + cy, x0 = gx - cx, x1 = gx + cx;
+    // Shader tap order: (w0.x,w0.y),(w0.x,w1.y),(w1.x,w1.y),(w1.x,w0.y).
+    const f32 s = std::fabs(bilin(y0, x0)) + std::fabs(bilin(y1, x0)) +
+                  std::fabs(bilin(y1, x1)) + std::fabs(bilin(y0, x1));
+    return s * 0.25f;
+}
+
 // Cubic B-spline basis weights for fractional offset a in [0,1), exactly the
 // w0..w3 of SABRE's SampleBicubic (a smoothing/approximating spline; all four
 // weights are non-negative, so no overshoot). Sum to 1.
@@ -2175,7 +2204,13 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const bool merge_res = cfg.gcam_sabre_merge_res;
     const bool raw_res = cfg.gcam_sabre_raw_res && !merge_res;
     const bool resample = raw_res || merge_res;   // Dodgson-sample both guides
-    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/resample);
+    // Prefilter BOTH guides identically (GCam builds every frame's guide the same way
+    // via ComputeGuideImage -- no asymmetric blur). The reference guide
+    // (ref_stats.gcam_guide) is always prefiltered, so the comparison guide must be too,
+    // or an IDENTICAL frame reads ref=blurred vs comp=sharp -> d!=0 -> self-rejection.
+    // Was `resample`, which prefiltered the comp only on the raw/merge-res paths and left
+    // guide-res asymmetric (identical frames mean 236/255, 41% rejected).
+    const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/true);
     if (compg.h != refg.h || compg.w != refg.w) return Image();
     const int gh = refg.h, gw = refg.w;
     const int rh = comp_raw.h, rw = comp_raw.w;   // input-frame (raw) resolution
@@ -2270,13 +2305,24 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 }
                 cur_a = std::fabs(sample_dogson(compg, sy, sx, 3));
             } else {
-                const int iy = (int)gy, ix = (int)gx;
-                ref_var_signed = refg.at(iy, ix, 3);
+                // Guide-res (both toggles off): GCam BaseFrameRefColor, REJECTION_ONLY.
+                // The reference guide is resampled with SampleBiquadraticAbsolute, and
+                // the green-only flag comes from a POINT sample of the variance sign (at
+                // a texel centre the shader's bilinear texture() == the texel value).
+                // The comparison is sampled with the SAME biquadratic filter so an
+                // identical frame (zero flow) still gives d==0 -- ref and comp must share
+                // the resample kernel. (Was: nearest ref + bicubic-B-spline comp, an
+                // asymmetric pairing that is not what GCam does.)
+                const int iy = std::min(std::max((int)std::lround(gy), 0), gh - 1);
+                const int ix = std::min(std::max((int)std::lround(gx), 0), gw - 1);
+                const bool green_pt = refg.at(iy, ix, 3) < 0.f;
+                const f32 ref_mag = sample_biquad_abs(refg, gy, gx, 3);  // |variance|
+                ref_var_signed = green_pt ? -ref_mag : ref_mag;          // restore sign
                 for (int c = 0; c < 3; ++c) {
-                    refc[c] = refg.at(iy, ix, c);
-                    curc[c] = sample_bicubic_abs(compg, sy, sx, c);
+                    refc[c] = sample_biquad_abs(refg, gy, gx, c);
+                    curc[c] = sample_biquad_abs(compg, sy, sx, c);
                 }
-                cur_a = sample_bicubic_abs(compg, sy, sx, 3);
+                cur_a = sample_biquad_abs(compg, sy, sx, 3);
             }
             const bool green_only = ref_var_signed < 0.f;
             f32 ref_a = std::fabs(ref_var_signed);
