@@ -3073,15 +3073,46 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    Image R_pre(th, tw, 1);
-    memcpy(R_pre.data.data(), [b_R contents], mask_b);
-    // §7 refinement. Raw-res (paper Alg. 6): HARD 5x5 ComputeLocalMin at raw res.
-    // Guide-res (default): GCam's soft reject-grow. Twin of compute_robustness_gcam_sabre.
+    // §7 refinement. Guide-res default (soft reject-grow): run it on the GPU too
+    // (rob_gcam_dilate reads the GPU R buffer -- no R readback, no host dilate), with a
+    // CPU fallback. Raw/merge-res (HARD min) and the extra n x n min stay on the host.
     const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
-    Image dil = resample ? robustness_gcam_min_window(R_pre, min_win)
-                         : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
-    // Opt-in extra HARD n x n min on top of §7 -- can only darken (min(window) <= center).
-    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_window(dil, min_win);
+    Image dil;
+    id<MTLComputePipelineState> dpipe = c.pipe("rob_gcam_dilate");
+    if (!resample && !cfg.gcam_sabre_min5x5 && dpipe) {
+        id<MTLBuffer> b_dil = buf(nullptr, mask_b);
+        if (b_dil) {
+            struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
+            RobGcamDilateParamsCPU dp{};
+            dp.h = (uint32_t)th; dp.w = (uint32_t)tw;
+            dp.dilate_2x = cfg.gcam_sabre_dilate_2x ? 1u : 0u;
+            dp.deadzone = cfg.gcam_sabre_dilate_deadzone; dp.div = cfg.gcam_sabre_dilate_div;
+            id<MTLCommandBuffer> cmd2 = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc2 = cmd2 ? [cmd2 computeCommandEncoder] : nil;
+            if (enc2) {
+                [enc2 setBuffer:b_dil offset:0 atIndex:0];
+                [enc2 setBuffer:b_R   offset:0 atIndex:1];
+                [enc2 setBytes:&dp length:sizeof(dp) atIndex:2];
+                dispatch2(enc2, dpipe, (NSUInteger)tw, (NSUInteger)th);
+                [enc2 endEncoding];
+                prof_tag_gpu(cmd2, "robustness:gcam-dilate");
+                [cmd2 commit];
+                [cmd2 waitUntilCompleted];
+                if (cmd2.status == MTLCommandBufferStatusCompleted) {
+                    dil = Image(th, tw, 1);
+                    memcpy(dil.data.data(), [b_dil contents], mask_b);
+                }
+            }
+        }
+    }
+    if (dil.h <= 0 || dil.w <= 0) {
+        // GPU dilate not taken (resample / extra-min / kernel absent / error) -> host §7.
+        Image R_pre(th, tw, 1);
+        memcpy(R_pre.data.data(), [b_R contents], mask_b);
+        dil = resample ? robustness_gcam_min_window(R_pre, min_win)
+                       : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
+        if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_window(dil, min_win);
+    }
     if (s_select_out) {
         *s_select_out = Image(dil.h, dil.w, 1);
         std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);

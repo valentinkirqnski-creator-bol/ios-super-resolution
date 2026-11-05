@@ -2206,6 +2206,33 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     R[ty * out_w + tx] = clamp(wv, 0.f, 1.f);          // keep weight (unblocker = 0)
 }
 
+// §7 GCam DilateMask reject-grow, GPU twin of robustness_gcam_dilate (robustness.cpp).
+// rej = sum over a 5x5 of (1 - clamp(R)); keep = clamp(1 - (rej - deadzone)/div, 0, 1).
+// dilate_2x (GCam default): sample the 5x5 centred at the 2x-downsampled grid texel
+// (2*o+1) and nearest-upsample -> each output in a 2x2 block shares one decision,
+// matching the CPU coarse.at(o)=dilate_at(2o+1) + nearest-upsample.
+struct RobGcamDilateParams { uint h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
+kernel void rob_gcam_dilate(device float* out [[buffer(0)]],
+                            device const float* R [[buffer(1)]],
+                            constant RobGcamDilateParams& p [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.w || gid.y >= p.h) return;
+    const int H = int(p.h), W = int(p.w);
+    int cy, cx;
+    if (p.dilate_2x != 0u) { cy = 2 * (int(gid.y) / 2) + 1; cx = 2 * (int(gid.x) / 2) + 1; }
+    else                   { cy = int(gid.y);               cx = int(gid.x); }
+    float sum = 0.f;
+    for (int i = -2; i <= 2; ++i) {
+        int yy = clamp(cy + i, 0, H - 1);
+        for (int j = -2; j <= 2; ++j) {
+            int xx = clamp(cx + j, 0, W - 1);
+            sum += 1.f - clamp(R[uint(yy) * p.w + uint(xx)], 0.f, 1.f);   // rejection
+        }
+    }
+    const float dv = (p.div != 0.f) ? p.div : 1.f;
+    out[gid.y * p.w + gid.x] = clamp(1.f - (sum - p.deadzone) / dv, 0.f, 1.f);
+}
+
 kernel void rob_guide_bayer(device float* guide [[buffer(0)]],
                             device const float* raw [[buffer(1)]],
                             constant RobGuideParams& p [[buffer(2)]],
