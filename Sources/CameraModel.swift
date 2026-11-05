@@ -281,6 +281,8 @@ struct TuningParams: Equatable, Codable {
     /// v42: how the merge reads the learned mask's raw-resolution plane at each
     /// output pixel -- nearest (false, default) or bilinear (true).
     var robust_nn_raw_bilinear: Bool = false
+    /// robust_nn v43: one learned weight per 48 MP output pixel (statistics at 12 MP).
+    var robust_nn_out48: Bool = false
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
@@ -395,6 +397,7 @@ struct TuningParams: Equatable, Codable {
         case use_neural_robustness
         case robustness_refine_nn_enabled, robustness_refine_max_reduction
         case robust_nn_enabled, robust_nn_reject_below, robust_nn_accept_above, robust_nn_raw_bilinear
+        case robust_nn_out48
         case robustness_refine_deadzone
         case hdr_black_percentile, hdr_vibrance
         case jpeg_match_python14
@@ -499,6 +502,7 @@ struct TuningParams: Equatable, Codable {
         robust_nn_reject_below = try c.decodeIfPresent(Float.self, forKey: .robust_nn_reject_below) ?? robust_nn_reject_below
         robust_nn_accept_above = try c.decodeIfPresent(Float.self, forKey: .robust_nn_accept_above) ?? robust_nn_accept_above
         robust_nn_raw_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_raw_bilinear) ?? robust_nn_raw_bilinear
+        robust_nn_out48 = try c.decodeIfPresent(Bool.self, forKey: .robust_nn_out48) ?? robust_nn_out48
         robustness_refine_max_reduction = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_max_reduction) ?? robustness_refine_max_reduction
         robustness_refine_deadzone = try c.decodeIfPresent(Float.self, forKey: .robustness_refine_deadzone) ?? robustness_refine_deadzone
         hdr_black_percentile = try c.decodeIfPresent(Float.self, forKey: .hdr_black_percentile) ?? hdr_black_percentile
@@ -2287,6 +2291,7 @@ final class CameraModel: NSObject, ObservableObject {
             "robust_nn_reject_below": NSNumber(value: tuningParams.robust_nn_reject_below),
             "robust_nn_accept_above": NSNumber(value: tuningParams.robust_nn_accept_above),
             "robust_nn_raw_bilinear": NSNumber(value: tuningParams.robust_nn_raw_bilinear),
+            "robust_nn_out48": NSNumber(value: tuningParams.robust_nn_out48),
             "robustness_refine_max_reduction": NSNumber(value: tuningParams.robustness_refine_max_reduction),
             "robustness_refine_deadzone": NSNumber(value: tuningParams.robustness_refine_deadzone),
             "hdr_black_percentile": NSNumber(value: tuningParams.hdr_black_percentile),

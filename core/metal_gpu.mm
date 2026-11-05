@@ -946,7 +946,10 @@ struct BurstFrames {
     std::vector<uint8_t> have_raw, have_cov, have_rob, have_flow;
     // robust_nn v42: 1 = this slot's mask is the raw-resolution 8-bit plane
     // (rnn_raw_upmin), packed into the guide-sized float slice.
+    // robust_nn v43: 2 = one 8-bit weight per OUTPUT pixel (rnn43_min_out),
+    // 2 raw_h x 2 raw_w bytes -- the slices are sized for it (rob_out48).
     std::vector<uint8_t> rob_u8;
+    bool rob_out48 = false;
 
     bool valid_slot(int slot) const { return open && slot >= 0 && slot < n; }
 };
@@ -987,6 +990,7 @@ static void bf_release() {
     g_bf.have_rob.clear();
     g_bf.have_flow.clear();
     g_bf.rob_u8.clear();
+    g_bf.rob_out48 = false;
     g_bf.open = false;
     g_bf.n = 0;
     g_active_slot = -1;
@@ -1053,6 +1057,13 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     const bool rob_raw_res = cfg.robustness_fft_guide_active();
     g_bf.rob_h = (cfg.bayer_mode && !rob_raw_res) ? raw_h / 2 : raw_h;
     g_bf.rob_w = (cfg.bayer_mode && !rob_raw_res) ? raw_w / 2 : raw_w;
+    // robust_nn v43 (Config::robust_nn_out48): each slice holds one byte per
+    // OUTPUT pixel of the 2x grid -- 16 bytes per guide pixel, 4x the float
+    // slice (48 MB instead of 12 MB per frame at 12 MP). Decided here, with
+    // the resolution, so the fused merge can size its reads; a frame whose net
+    // declines writes a smaller mask into the same slice.
+    g_bf.rob_out48 = cfg.robust_nn_enabled && cfg.robust_nn_out48 && cfg.bayer_mode && !rob_raw_res &&
+                     cfg.scale == 2.0f && raw_h == 2 * g_bf.rob_h && raw_w == 2 * g_bf.rob_w;
     g_bf.flow_ny = raw_h / tile_size;
     g_bf.flow_nx = raw_w / tile_size;
     g_bf.cov_stride = 3u;
@@ -1064,7 +1075,8 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.raw_elems  = align_slice((size_t)raw_h * (size_t)raw_w * f) / f;
     g_bf.cov_elems  = align_slice((size_t)g_bf.cov_h * (size_t)g_bf.cov_w *
                                   (size_t)g_bf.cov_stride * f) / f;
-    g_bf.rob_elems  = align_slice((size_t)g_bf.rob_h * (size_t)g_bf.rob_w * f) / f;
+    g_bf.rob_elems  = align_slice((size_t)g_bf.rob_h * (size_t)g_bf.rob_w * f *
+                                  (g_bf.rob_out48 ? 4u : 1u)) / f;
     g_bf.flow_elems = align_slice((size_t)g_bf.flow_ny * (size_t)g_bf.flow_nx * 2u * f) / f;
 
     const size_t nn = (size_t)n_frames;
@@ -1083,7 +1095,7 @@ bool metal_frames_begin(int n_frames, int raw_h, int raw_w, int tile_size,
     g_bf.flows = buf(nullptr, nn * g_bf.flow_elems * f);
     g_bf.fft_in = c.scratch(g_bf.fft_in, g_bf.fft_in_b, (size_t)raw_h * (size_t)raw_w * f);
     g_bf.rob_rows = c.scratch(g_bf.rob_rows, g_bf.rob_rows_b,
-                              (size_t)g_bf.rob_h * sizeof(uint32_t));
+                              (size_t)g_bf.rob_h * (g_bf.rob_out48 ? 4u : 1u) * sizeof(uint32_t));
     if (!g_bf.raws || !g_bf.covs || !g_bf.robs || !g_bf.flows || !g_bf.fft_in ||
         !g_bf.rob_rows) {
         // Residency refused. The caller treats this as "fall back", but the
@@ -1132,8 +1144,12 @@ bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
     if (!pipe) return false;
 
     struct RobStatsParamsLocal { uint32_t h, w, nch, pad; };
+    // A v43 slot's guide row y is output rows 4y..4y+3, and one output row is
+    // 4 * rob_w bytes == rob_w floats: test 4 * rob_h float rows.
+    const uint8_t kind = g_bf.rob_u8[(size_t)slot];
+    const uint32_t nrows = (uint32_t)g_bf.rob_h * (kind == 2u ? 4u : 1u);
     RobStatsParamsLocal sp{};
-    sp.h = (uint32_t)g_bf.rob_h;
+    sp.h = nrows;
     sp.w = (uint32_t)g_bf.rob_w;
     sp.nch = 1u;
     sp.pad = 0u;
@@ -1145,7 +1161,7 @@ bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
     [enc setBuffer:g_bf.rob_rows offset:0 atIndex:0];
     [enc setBuffer:g_bf.robs offset:bf_rob_off(slot) * sizeof(float) atIndex:1];
     [enc setBytes:&sp length:sizeof(sp) atIndex:2];
-    dispatch1(enc, pipe, (NSUInteger)g_bf.rob_h);
+    dispatch1(enc, pipe, (NSUInteger)nrows);
     [enc endEncoding];
     prof_tag_gpu(cmd, "robustness:row-activity");
     [cmd commit];
@@ -1155,12 +1171,14 @@ bool metal_frame_rob_rows(int slot, std::vector<uint8_t>& rows, bool& any) {
     const uint32_t* flags = (const uint32_t*)[g_bf.rob_rows contents];
     if (!flags) return false;
     rows.assign((size_t)g_bf.rob_h, 0u);
-    const bool u8 = g_bf.rob_u8[(size_t)slot] != 0u;
+    const bool u8 = kind == 1u;
     for (int y = 0; y < g_bf.rob_h; ++y) {
         // A v42 slot's guide row y holds raw rows 2y and 2y+1; the bilinear
         // fetch can also touch raw rows 2y-1 and 2y+2, so a row is live when
-        // its neighbours are.
-        uint32_t f = flags[y];
+        // its neighbours are. A v43 slot is read 1:1 at the output pixel: the
+        // guide row is live when any of its four output rows is.
+        uint32_t f = (kind == 2u) ? (flags[4 * y] | flags[4 * y + 1] | flags[4 * y + 2] | flags[4 * y + 3])
+                                  : flags[y];
         if (u8) {
             if (y > 0) f |= flags[y - 1];
             if (y + 1 < g_bf.rob_h) f |= flags[y + 1];
@@ -1193,6 +1211,11 @@ const float* metal_frame_rob_plane(int slot, int* h, int* w) {
     if (h) *h = g_bf.rob_h;
     if (w) *w = g_bf.rob_w;
     return (const float*)[g_bf.robs contents] + bf_rob_off(slot);
+}
+
+int metal_frame_rob_kind(int slot) {
+    if (!g_bf.valid_slot(slot) || g_bf.have_rob[(size_t)slot] == 0u) return 0;
+    return (int)g_bf.rob_u8[(size_t)slot];
 }
 
 bool metal_frame_rob_is_u8(int slot) {
@@ -2232,6 +2255,17 @@ struct RnnUpminParamsCPU {
     uint32_t _pad0 = 0, _pad1 = 0;
 };
 static_assert(sizeof(RnnUpminParamsCPU) == 32, "RnnUpminParamsCPU must mirror RnnUpminParams");
+struct Rnn43R0ParamsCPU {
+    uint32_t gw, gh, raw_w, raw_h;
+    uint32_t nch, tile_size, flow_ny, flow_nx;
+    uint32_t curve_n, sqrt_index, ambiguous_enabled, _pad0 = 0;
+    float r_t, r_s1, _pad1 = 0.f, _pad2 = 0.f;
+};
+static_assert(sizeof(Rnn43R0ParamsCPU) == 64, "Rnn43R0ParamsCPU must mirror Rnn43R0Params");
+struct Rnn43MinParamsCPU {
+    uint32_t out_w, out_h, r, _pad0 = 0;
+};
+static_assert(sizeof(Rnn43MinParamsCPU) == 16, "Rnn43MinParamsCPU must mirror Rnn43MinParams");
 
 // The net's domain: Bayer bursts on the half-resolution guide lattice (nch 3).
 // The raw-resolution / FFT-guide path is not covered (its mask is not on the
@@ -2380,6 +2414,134 @@ static bool rnn_encode_raw_upmin(id<MTLCommandBuffer> cmd, id<MTLBuffer> src, in
     const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)p.raw_w + 15) / 16, ((NSUInteger)p.raw_h + 15) / 16, 1)
         threadsPerThreadgroup:tg];
+    [enc endEncoding];
+    return true;
+}
+
+// robust_nn v43 (Config::robust_nn_out48): one learned weight per 48 MP OUTPUT
+// pixel from statistics at 12 MP, into the frame's slot (out at out_off bytes,
+// 2 raw_h x 2 raw_w bytes). rnn43_raw_r0 (Algorithm 6 per raw pixel, fused:
+// the guide statistics Dodgson-sampled on the fly, the comparison's at the
+// flow-warped position; 8-bit raw mask -> g_rnn_out, its quad minimum -> r0min)
+// -> the comparison grey -> rnn_refine_mask43 (v40's features + the quad's raw
+// values; 16 sharpened weights per guide px -> g_rnn43_pre) -> rnn43_min_out
+// (Eq. 9 on the output grid). Scratch: g_rnn_out (12 MB: the raw mask, one
+// byte per raw px == the guide float buffer) and g_rnn43_pre (48 MB, once per
+// burst). Returns false with NOTHING encoded when a precondition fails.
+static id<MTLBuffer> g_rnn43_pre = nil;
+
+static bool rnn43_encode(id<MTLCommandBuffer> cmd, id<MTLBuffer> raw_buf, size_t raw_off_bytes,
+                         int raw_w, int raw_h, int gh, int gw, int nch,
+                         id<MTLBuffer> b_ref_m, id<MTLBuffer> b_ref_v, id<MTLBuffer> b_gmeans,
+                         id<MTLBuffer> b_std, id<MTLBuffer> b_diff, uint32_t curve_n, id<MTLBuffer> b_S,
+                         id<MTLBuffer> b_match_amb, bool amb_on, id<MTLBuffer> b_flow,
+                         const FlowField& flow, int tile_size, const Config& cfg,
+                         id<MTLBuffer> b_r0min, id<MTLBuffer> out, size_t out_off) {
+    if (!rnn_domain_ok(cfg, nch) || !cmd || !raw_buf || !b_ref_m || !b_ref_v || !b_gmeans || !b_std ||
+        !b_diff || !b_S || !b_match_amb || !b_flow || !b_r0min || !out || curve_n == 0u)
+        return false;
+    if (!g_rnn_ref_grey || g_rnn_h != gh || g_rnn_w != gw) return false;
+    if (raw_w != 2 * gw || raw_h != 2 * gh || flow.ny <= 0 || flow.nx <= 0 || tile_size <= 0) return false;
+    auto& c = ctx();
+    id<MTLComputePipelineState> pr0 = c.pipe("rnn43_raw_r0");
+    id<MTLComputePipelineState> pgrey = c.pipe("rnn_grey_from_raw");
+    id<MTLComputePipelineState> pnet = c.pipe("rnn_refine_mask43");
+    id<MTLComputePipelineState> pmin = c.pipe("rnn43_min_out");
+    if (!pr0 || !pgrey || !pnet || !pmin) return false;
+    const size_t gbytes = (size_t)gh * (size_t)gw * sizeof(float);   // == raw_h * raw_w bytes
+    const size_t obytes = (size_t)16 * (size_t)gh * (size_t)gw;       // one byte per output px
+    if (!g_rnn_cmp_grey || [g_rnn_cmp_grey length] < gbytes) g_rnn_cmp_grey = buf(nullptr, gbytes);
+    if (!g_rnn_out || [g_rnn_out length] < gbytes) g_rnn_out = buf(nullptr, gbytes);
+    if (!g_rnn43_pre || [g_rnn43_pre length] < obytes) g_rnn43_pre = buf(nullptr, obytes);
+    if (!g_rnn_cmp_grey || !g_rnn_out || !g_rnn43_pre) return false;
+
+    Rnn43R0ParamsCPU rp{};
+    rp.gw = (uint32_t)gw;
+    rp.gh = (uint32_t)gh;
+    rp.raw_w = (uint32_t)raw_w;
+    rp.raw_h = (uint32_t)raw_h;
+    rp.nch = (uint32_t)nch;
+    rp.tile_size = (uint32_t)tile_size;
+    rp.flow_ny = (uint32_t)flow.ny;
+    rp.flow_nx = (uint32_t)flow.nx;
+    rp.curve_n = curve_n;
+    rp.sqrt_index = cfg.robustness_guide_sqrt_active() ? 1u : 0u;
+    rp.ambiguous_enabled = amb_on ? 1u : 0u;
+    rp.r_t = cfg.r_t;
+    rp.r_s1 = cfg.r_s1;
+
+    RnnGreyParamsCPU gp{};
+    gp.raw_w = (uint32_t)raw_w;
+    gp.raw_h = (uint32_t)raw_h;
+    gp.gw = (uint32_t)gw;
+    gp.gh = (uint32_t)gh;
+    float u[4];
+    rnn_unwhiten(cfg, u);
+    gp.u00 = u[0]; gp.u01 = u[1]; gp.u10 = u[2]; gp.u11 = u[3];
+
+    RnnAppParamsCPU p{};
+    p.width = gw;
+    p.height = gh;
+    p.flow_step = std::max(1, tile_size / 2);
+    p.noise_a = (cfg.alpha_dng[0] + 2.f * cfg.alpha_dng[1] + cfg.alpha_dng[2]) / 16.f;
+    p.noise_b = (cfg.beta_dng[0] + 2.f * cfg.beta_dng[1] + cfg.beta_dng[2]) / 16.f;
+    p.clip_level = 0.9f;
+    p.flow_ny = (uint32_t)flow.ny;
+    p.flow_nx = (uint32_t)flow.nx;
+    p.tile_size = (float)tile_size;
+    p.sharp_lo = std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f);
+    p.sharp_hi = std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f);
+
+    Rnn43MinParamsCPU mp{};
+    mp.out_w = (uint32_t)(4 * gw);
+    mp.out_h = (uint32_t)(4 * gh);
+    mp.r = (uint32_t)std::min(std::max(cfg.robust_nn_out48_min_radius, 0), 6);
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!enc) return false;
+    [enc setBuffer:b_ref_m offset:0 atIndex:0];
+    [enc setBuffer:b_ref_v offset:0 atIndex:1];
+    [enc setBuffer:b_gmeans offset:0 atIndex:2];
+    [enc setBuffer:b_std offset:0 atIndex:3];
+    [enc setBuffer:b_diff offset:0 atIndex:4];
+    [enc setBuffer:b_S offset:0 atIndex:5];
+    [enc setBuffer:b_match_amb offset:0 atIndex:6];
+    [enc setBuffer:b_flow offset:0 atIndex:7];
+    [enc setBuffer:g_rnn_out offset:0 atIndex:8];
+    [enc setBuffer:b_r0min offset:0 atIndex:9];
+    [enc setBytes:&rp length:sizeof(rp) atIndex:10];
+    dispatch2(enc, pr0, (NSUInteger)gw, (NSUInteger)gh);
+
+    [enc setBuffer:raw_buf offset:raw_off_bytes atIndex:0];
+    [enc setBuffer:g_rnn_cmp_grey offset:0 atIndex:1];
+    [enc setBytes:&gp length:sizeof(gp) atIndex:2];
+    dispatch2(enc, pgrey, (NSUInteger)gw, (NSUInteger)gh);
+
+    [enc setComputePipelineState:pnet];
+    [enc setBuffer:g_rnn_ref_grey offset:0 atIndex:0];
+    [enc setBuffer:g_rnn_cmp_grey offset:0 atIndex:1];
+    [enc setBuffer:b_r0min offset:0 atIndex:2];
+    [enc setBuffer:b_flow offset:0 atIndex:4];
+    [enc setBytes:&p length:sizeof(p) atIndex:5];
+    [enc setBuffer:g_rnn_out offset:0 atIndex:6];
+    [enc setBuffer:g_rnn43_pre offset:0 atIndex:7];
+    {   // strides over its 16x16 tile, so any group size is correct
+        const NSUInteger total = std::min<NSUInteger>(256, pnet.maxTotalThreadsPerThreadgroup);
+        const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)gw + 15) / 16, ((NSUInteger)gh + 15) / 16, 1)
+            threadsPerThreadgroup:tg];
+    }
+
+    [enc setComputePipelineState:pmin];
+    [enc setBuffer:g_rnn43_pre offset:0 atIndex:0];
+    [enc setBuffer:out offset:out_off atIndex:1];
+    [enc setBytes:&mp length:sizeof(mp) atIndex:2];
+    {
+        const NSUInteger total = std::min<NSUInteger>(256, pmin.maxTotalThreadsPerThreadgroup);
+        const MTLSize tg = (total >= 16) ? MTLSizeMake(16, total / 16, 1) : MTLSizeMake(total, 1, 1);
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mp.out_w + 15) / 16, ((NSUInteger)mp.out_h + 15) / 16, 1)
+            threadsPerThreadgroup:tg];
+    }
     [enc endEncoding];
     return true;
 }
@@ -2838,6 +3000,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
     const size_t out_off_bytes = rob_resident ? bf_rob_off(bf_slot) * sizeof(float) : 0;
     bool rnn_done = false;   // robust_nn: the net ran (between rob_make_mask and Eq. 9)
     bool rob_u8 = false;     // robust_nn v42: this frame's slot got the raw-resolution 8-bit mask
+    bool rob_out48 = false;  // robust_nn v43: this frame's slot got one 8-bit weight per output pixel
     // Bound unconditionally because the kernel declares it; sized for real only
     // when asked, so the off case costs 4 bytes rather than a full mask plane.
     const bool want_s_select = (s_select_out != nullptr);
@@ -2850,6 +3013,11 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                               g_bf.rob_h == gh && g_bf.rob_w == gw &&
                               g_bf.raw_h == 2 * gh && g_bf.raw_w == 2 * gw &&
                               c.pipe("rnn_raw_upmin") != nil;
+    // robust_nn v43: the same preconditions, plus slices sized for the output grid.
+    const bool rnn_out48_mode = cfg.robust_nn_out48 && g_bf.rob_out48 && rob_resident &&
+                                rnn_domain_ok(cfg, nch) && !want_s_select && !debug_dumps_enabled() &&
+                                g_bf.rob_h == gh && g_bf.rob_w == gw &&
+                                g_bf.raw_h == 2 * gh && g_bf.raw_w == 2 * gw;
     if (!b_ref_m || !b_ref_v || !b_std || !b_diff ||
         !b_S || !b_motion || !b_aperture || !b_tile_residual_high || !b_flow ||
         !b_R || !b_out || !b_s_select)
@@ -2942,7 +3110,15 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         // refined mask -- the order the net was trained in. Declines silently
         // (the analytic mask goes straight to Eq. 9) if anything is missing.
         id<MTLBuffer> min_src = b_R;
-        if (rnn_domain_ok(cfg, nch)) {
+        if (rnn_out48_mode && resident_raw) {
+            // v43 first; if it declines (nothing encoded), the v42 / v41 order below runs.
+            rob_out48 = rnn43_encode(cmd, resident_raw, resident_off * sizeof(float), comp_raw.w, comp_raw.h,
+                                     gh, gw, nch, b_ref_m, b_ref_v, b_gmeans, b_std, b_diff,
+                                     (uint32_t)g_rob_curve_n, b_S, b_match_amb, amb_on, b_flow, flow, tile_size,
+                                     cfg, b_R, b_out, out_off_bytes);
+            if (rob_out48) rnn_done = true;
+        }
+        if (!rob_out48 && rnn_domain_ok(cfg, nch)) {
             id<MTLBuffer> rnn_raw = resident_raw;
             size_t rnn_raw_off = resident_raw ? resident_off * sizeof(float) : 0;
             if (!rnn_raw && !comp_raw.data.empty())
@@ -2951,7 +3127,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
                                          b_R, 0, b_flow, flow, tile_size, cfg, rnn_raw_mode);
             if (rnn_done) min_src = g_rnn_out;
         }
-        if (rnn_raw_mode) {
+        if (!rob_out48 && rnn_raw_mode) {
             // v42: upsample + sharpen + 5x5 minimum at RAW resolution, into
             // the slot as 8 bits per raw pixel. The analytic mask (net
             // declined) takes the same path unsharpened.
@@ -2960,7 +3136,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
             rob_u8 = rnn_encode_raw_upmin(cmd, min_src, gh, gw, b_out, out_off_bytes, lo, hi);
             if (!rob_u8) return Image();   // encoder failure (the pipeline was checked above)
         }
-        if (!rob_u8) {
+        if (!rob_u8 && !rob_out48) {
             enc = [cmd computeCommandEncoder];
             if (!enc) return Image();
             [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
@@ -3042,7 +3218,7 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
 
     if (rob_resident) {
         g_bf.have_rob[(size_t)bf_slot] = 1u;
-        g_bf.rob_u8[(size_t)bf_slot] = rob_u8 ? 1u : 0u;
+        g_bf.rob_u8[(size_t)bf_slot] = rob_out48 ? 2u : (rob_u8 ? 1u : 0u);
     }
 
     // The mask only comes back to the host when something on the CPU reads it:
@@ -4945,7 +5121,13 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
             (p.rob_h == p.lr_h && p.rob_w == p.lr_w) ? 1u : 0u;
         p.flow_bilinear = 0u;
         p.rob_bilinear = cfg.merge_robustness_bilinear ? 1u : 0u;
-        if (g_bf.rob_u8[(size_t)slot]) {
+        if (g_bf.rob_u8[(size_t)slot] == 2u) {
+            // robust_nn v43: one 8-bit weight per output pixel (the 2x grid).
+            p.rob_h = (uint32_t)(2 * g_bf.raw_h);
+            p.rob_w = (uint32_t)(2 * g_bf.raw_w);
+            p.raw_res_robustness = 3u;
+            p.rob_bilinear = 0u;
+        } else if (g_bf.rob_u8[(size_t)slot]) {
             // robust_nn v42: the slot holds the raw-resolution 8-bit mask.
             p.rob_h = (uint32_t)g_bf.raw_h;
             p.rob_w = (uint32_t)g_bf.raw_w;

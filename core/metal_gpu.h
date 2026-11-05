@@ -99,6 +99,8 @@ const float* metal_frame_rob_plane(int slot, int* h, int* w);
 // robust_nn v42: true when the slot's plane is the raw-resolution 8-bit mask packed into the guide-sized slice
 // (raw rows 2y and 2y+1 of guide row y, one byte per raw pixel, value / 255).
 bool metal_frame_rob_is_u8(int slot);
+// 0 = float guide mask, 1 = v42 raw-resolution bytes, 2 = v43 one byte per output pixel (2 raw_h x 2 raw_w).
+int metal_frame_rob_kind(int slot);
 
 // Direct RAW app path: uint16 Bayer -> normalized float Bayer with the same
 // black/WB/clamp math as DecodeRawFrameDictionary's CPU fallback.

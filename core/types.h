@@ -1217,6 +1217,15 @@ struct Config {
     bool  robust_nn_raw_res = true;
     // How the merge reads that raw mask at each output pixel: nearest (false) or bilinear (true).
     bool  robust_nn_raw_bilinear = false;
+    // robust_nn v43: one learned weight per 48 MP OUTPUT pixel (scale 2) from statistics at 12 MP. Algorithm 6
+    // per raw pixel (guide statistics Dodgson-upsampled and flow-warped on the fly, no raw-resolution buffers) ->
+    // the net on the guide lattice reading its quad's four raw values and writing its 4x4 output block's weights
+    // -> Eq. 9's minimum on the output grid, (2r+1)^2 output px (r = robust_nn_out48_min_radius; 4 = 9x9, the
+    // paper's 5x5 raw window) -> one byte per output pixel in the frame's slot, read 1:1 by the merge. Slots grow
+    // 12 -> 48 MB per frame at 12 MP, plus one 48 MB scratch. Takes precedence over robust_nn_raw_res; needs the
+    // v43 weights (core/robust_nn43_weights.h), the resident merge, no s1/s2 split, no debug dumps.
+    bool  robust_nn_out48 = false;
+    int   robust_nn_out48_min_radius = 4;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost
     // of a wrong rejection (a correctly aligned, aliased, high-frequency

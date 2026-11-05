@@ -2437,6 +2437,20 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                             int sh = 0, sw = 0;
                             const float* p = metal_frame_rob_plane(s, &sh, &sw);
                             if (!p || sh != mh || sw != mw) continue;
+                            if (metal_frame_rob_kind(s) == 2) {
+                                // v43 48 MP bytes: the guide pixel's 4x4 output block's mean.
+                                const uint8_t* b = (const uint8_t*)p;
+                                const size_t ow = 4u * (size_t)mw;
+                                for (int x = 0; x < mw; ++x) {
+                                    unsigned acc = 0;
+                                    for (int dy = 0; dy < 4; ++dy) {
+                                        const uint8_t* r = b + (size_t)(4 * sy + dy) * ow + 4u * (size_t)x;
+                                        acc += (unsigned)r[0] + r[1] + r[2] + r[3];
+                                    }
+                                    row[(size_t)x] += (float)acc * (1.f / 4080.f);
+                                }
+                                continue;
+                            }
                             if (metal_frame_rob_is_u8(s)) {
                                 // v42 raw 8-bit plane: the quad's mean.
                                 const uint8_t* b = (const uint8_t*)p;

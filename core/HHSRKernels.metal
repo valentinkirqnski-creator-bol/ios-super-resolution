@@ -1151,7 +1151,13 @@ static inline void merge_comp_contrib(device const float* img,
     // would have made turning one on silently change the alignment the merge
     // fetches with. See Config::merge_robustness_bilinear.
     float local_r;
-    if (p.raw_res_robustness == 2u) {
+    if (p.raw_res_robustness == 3u) {
+        // robust_nn v43: the frame's slot holds one 8-bit weight per OUTPUT
+        // pixel (rob_h x rob_w == the output grid), read at this pixel.
+        const int iy = clamp(hr_i, 0, int(p.rob_h) - 1);
+        const int ix = clamp(int(hr_j), 0, int(p.rob_w) - 1);
+        local_r = float(((device const uchar*)robustness)[uint(iy) * p.rob_w + uint(ix)]) * (1.f / 255.f);
+    } else if (p.raw_res_robustness == 2u) {
         // robust_nn v42: the frame's slot holds the RAW-resolution mask packed
         // 8 bits per raw pixel (rnn_raw_upmin), so R is read 1:1 at lr.
         local_r = rob_fetch_u8((device const uchar*)robustness, p.rob_h, p.rob_w, rob_y, rob_x,
@@ -3641,5 +3647,242 @@ kernel void rnn_raw_upmin(device const float* Rg [[buffer(0)]],
         for (int dy = 0; dy < 5; ++dy)
             for (int dx = 0; dx < 5; ++dx) mn = min(mn, sU[(ly + dy) * RNN_UP_N + lx + dx]);
         out[y * W + x] = uchar(floor(mn * 255.f + 0.5f));
+    }
+}
+
+
+// ===========================================================================
+// robust_nn v43 (Config::robust_nn_out48): one learned weight per 48 MP OUTPUT
+// pixel, from statistics at 12 MP. tools/robust_nn rnn/model.py RobustNet43.
+//
+//   rnn43_raw_r0      Algorithm 6 at RAW resolution, fused: for each raw pixel
+//                     the guide statistics are Dodgson-upsampled (reference)
+//                     and Dodgson-upsampled at the flow-warped position
+//                     (comparison) on the fly -- the sampling of
+//                     rob_upscale_dogson, the Eq. 5-8 of rob_make_mask_raw --
+//                     so no raw-resolution statistics buffers exist. Writes
+//                     the 8-bit raw mask (12 MP) and its quad minimum (the
+//                     net's r0 input, as the training harness made it).
+//   rnn_refine_mask43 v40's fused net (same features, threadgroup tiles) plus
+//                     the quad's four raw values as inputs and 16 outputs: the
+//                     weight of each output pixel of its 4x4 block, sharpened,
+//                     8 bits, before the minimum.
+//   rnn43_min_out     Eq. 9's minimum on the output grid ((2r+1)^2 output px,
+//                     clamp-to-edge), into the frame's slot (2x raw by 2x raw
+//                     bytes). The merge reads it 1:1 at the output pixel
+//                     (raw_res_robustness == 3).
+// ===========================================================================
+#include "robust_nn43_shared.h"
+
+// Mirrors Rnn43R0ParamsCPU in metal_gpu.mm (64 bytes).
+struct Rnn43R0Params {
+    uint gw, gh, raw_w, raw_h;
+    uint nch, tile_size, flow_ny, flow_nx;
+    uint curve_n, sqrt_index, ambiguous_enabled, _pad0;
+    float r_t, r_s1, _pad1, _pad2;
+};
+
+// Own copies of lround_away / clamp_edge (identical arithmetic), so this block
+// compiles on its own like the rest of the robust_nn section; rnn_dq is v42's
+// copy of dogson_quadratic.
+inline int rnn43_lround(float x) {
+    return (x >= 0.f) ? int(floor(x + 0.5f)) : int(ceil(x - 0.5f));
+}
+inline int rnn43_clamp_edge(int v, int hi) {
+    float f = clamp(float(v), 0.f, float(hi));
+    return int(f);
+}
+
+// sample_dogson / rob_upscale_dogson: +inf outside the guide (=> R = 0).
+inline float rnn43_dogson(device const float* st, uint h, uint w, uint nch,
+                          float LR_y, float LR_x, uint ch) {
+    if (!(LR_y >= 0.f && LR_y < float(h) && LR_x >= 0.f && LR_x < float(w))) return INFINITY;
+    int center_y = rnn43_lround(LR_y);
+    int center_x = rnn43_lround(LR_x);
+    float w_acc = 0.f, buf = 0.f;
+    for (int i = -1; i <= 1; ++i) {
+        int y_ = rnn43_clamp_edge(center_y + i, int(h) - 1);
+        float wy = rnn_dq(float(y_) - LR_y);
+        for (int j = -1; j <= 1; ++j) {
+            int x_ = rnn43_clamp_edge(center_x + j, int(w) - 1);
+            float wgt = wy * rnn_dq(float(x_) - LR_x);
+            buf += st[(uint(y_) * w + uint(x_)) * nch + ch] * wgt;
+            w_acc += wgt;
+        }
+    }
+    return buf / w_acc;
+}
+
+// One raw pixel's analytic R (rob_make_mask_raw on Dodgson samples).
+inline float rnn43_r0_at(device const float* ref_m, device const float* ref_v,
+                         device const float* comp_m, device const float* std_curve,
+                         device const float* diff_curve, device const float* S,
+                         device const uint* match_amb, device const float* flow,
+                         constant Rnn43R0Params& p, int ry, int rx) {
+    uint patch_idy = uint(ry) / p.tile_size;
+    uint patch_idx = uint(rx) / p.tile_size;
+    if (patch_idy >= p.flow_ny || patch_idx >= p.flow_nx) return 0.f;
+    uint pidx = patch_idy * p.flow_nx + patch_idx;
+    float flow_x = flow[pidx * 2u + 0u], flow_y = flow[pidx * 2u + 1u];
+    float LRr_y = (float(ry) + 0.5f) / 2.f - 0.5f;
+    float LRr_x = (float(rx) + 0.5f) / 2.f - 0.5f;
+    float LRc_y = (float(ry) + flow_y + 0.5f) / 2.f - 0.5f;
+    float LRc_x = (float(rx) + flow_x + 0.5f) / 2.f - 0.5f;
+    float sigma_ms_sq = 0.f, sigma_md_sq = 0.f;
+    float d_ms_sq = 0.f, d_md_sq = 0.f;
+    for (uint ch = 0u; ch < p.nch; ++ch) {
+        float brightness = rnn43_dogson(ref_m, p.gh, p.gw, p.nch, LRr_y, LRr_x, ch);
+        float bidx = (p.sqrt_index != 0u) ? brightness * brightness : brightness;
+        int id_noise = rnn43_lround(1000.f * bidx);
+        if (!isfinite(brightness))
+            id_noise = 0;
+        else if (id_noise < 0)
+            id_noise = 0;
+        else if (id_noise >= int(p.curve_n))
+            id_noise = int(p.curve_n) - 1;
+        uint curve_id = ch * p.curve_n + uint(id_noise);
+        float sigma_t = std_curve[curve_id];
+        float d_t = diff_curve[curve_id];
+        sigma_ms_sq += rnn43_dogson(ref_v, p.gh, p.gw, p.nch, LRr_y, LRr_x, ch);
+        sigma_md_sq += sigma_t * sigma_t;
+        float comp = rnn43_dogson(comp_m, p.gh, p.gw, p.nch, LRc_y, LRc_x, ch);
+        float d_p_ = isfinite(comp) ? fabs(brightness - comp) : INFINITY;
+        d_ms_sq += d_p_ * d_p_;
+        d_md_sq += d_t * d_t;
+    }
+    float sigma_sq_ = max(sigma_ms_sq, sigma_md_sq);
+    float shrink = d_ms_sq / (d_ms_sq + d_md_sq);
+    float d_sq_ = d_ms_sq * shrink * shrink;
+    float s = S[pidx];
+    if (p.ambiguous_enabled != 0u && match_amb[pidx] != 0u) s = min(s, p.r_s1);
+    float r_val = clamp(s * exp(-d_sq_ / sigma_sq_) - p.r_t, 0.f, 1.f);
+    if (!isfinite(r_val)) r_val = 0.f;
+    return r_val;
+}
+
+kernel void rnn43_raw_r0(device const float* ref_m [[buffer(0)]],
+                         device const float* ref_v [[buffer(1)]],
+                         device const float* comp_m [[buffer(2)]],
+                         device const float* std_curve [[buffer(3)]],
+                         device const float* diff_curve [[buffer(4)]],
+                         device const float* S [[buffer(5)]],
+                         device const uint* match_amb [[buffer(6)]],
+                         device const float* flow [[buffer(7)]],
+                         device uchar* raw8 [[buffer(8)]],
+                         device float* r0min [[buffer(9)]],
+                         constant Rnn43R0Params& p [[buffer(10)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.gw || gid.y >= p.gh) return;
+    float mn = 1.f;
+    for (int dy = 0; dy < 2; ++dy)
+        for (int dx = 0; dx < 2; ++dx) {
+            const int ry = 2 * int(gid.y) + dy, rx = 2 * int(gid.x) + dx;
+            const float r = rnn43_r0_at(ref_m, ref_v, comp_m, std_curve, diff_curve, S, match_amb, flow, p, ry, rx);
+            raw8[uint(ry) * p.raw_w + uint(rx)] = uchar(floor(r * 255.f + 0.5f));
+            mn = min(mn, r);
+        }
+    r0min[gid.y * p.gw + gid.x] = mn;
+}
+
+// The quad's four 8-bit raw values as net inputs (clamped guide coords).
+struct Rnn43RawFeat {
+    device const uchar* r8;
+    int raw_w;
+    float operator()(int k, int x, int y) const {
+        return rnn43_raw_feature(float(r8[(2 * y + k / 2) * raw_w + 2 * x + k % 2]) * (1.f / 255.f));
+    }
+};
+
+kernel void rnn_refine_mask43(device const float* ref_grey [[buffer(0)]],
+                              device const float* comp_grey [[buffer(1)]],
+                              device const float* r0 [[buffer(2)]],
+                              device const float* flow [[buffer(4)]],
+                              constant RnnAppParams& p [[buffer(5)]],
+                              device const uchar* raw8 [[buffer(6)]],
+                              device uchar* out48 [[buffer(7)]],
+                              uint2 tgid [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint2 tpt [[threads_per_threadgroup]]) {
+    threadgroup float sJ[RNN_JN * RNN_JN];
+    threadgroup float sF[RNN_NF * RNN_HN * RNN_HN];
+    const int W = p.width, H = p.height;
+    const int nt = int(tpt.x * tpt.y);
+    const int x0 = int(tgid.x) * RNN_TS, y0 = int(tgid.y) * RNN_TS;
+    RNNParams P = {W, H, p.flow_step, p.noise_a, p.noise_b, p.clip_level, 0, 0};
+    RnnAppFlow fl = {flow, &p};
+
+    // 1) + 2): exactly rnn_refine_mask's warped grey tile and feature halo
+    RNNImg cg = {comp_grey, W};
+    for (int i = int(tid); i < RNN_JN * RNN_JN; i += nt) {
+        int gx = clamp(x0 - RNN_JR + i % RNN_JN, 0, W - 1);
+        int gy = clamp(y0 - RNN_JR + i / RNN_JN, 0, H - 1);
+        sJ[i] = rnn_warp_at(cg, fl, W, H, gx, gy);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    RNNImg rf = {ref_grey, W};
+    RnnTgImg tj = {sJ, x0 - RNN_JR, y0 - RNN_JR};
+    for (int i = int(tid); i < RNN_HN * RNN_HN; i += nt) {
+        int gx = clamp(x0 - 1 + i % RNN_HN, 0, W - 1);
+        int gy = clamp(y0 - 1 + i / RNN_HN, 0, H - 1);
+        float f[RNN_NF];
+        rnn_features_at(rf, tj, fl, r0[gy * W + gx], P, gx, gy, f);
+        for (int c = 0; c < RNN_NF; ++c) sF[c * RNN_HN * RNN_HN + i] = f[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3) the net: 16 corrections -> the 4x4 output block's weights
+    RnnTgFeat tf = {sF, x0 - 1, y0 - 1};
+    Rnn43RawFeat rw = {raw8, 2 * W};
+    const int OW = 4 * W;
+    for (int i = int(tid); i < RNN_TS * RNN_TS; i += nt) {
+        int x = x0 + i % RNN_TS, y = y0 + i / RNN_TS;
+        if (x >= W || y >= H) continue;
+        float d[16];
+        rnn43_net_at(tf, rw, W, H, x, y, d);
+        for (int o = 0; o < 16; ++o) {
+            const int dy = o / 4, dx = o % 4;
+            const float q = float(raw8[(2 * y + dy / 2) * (2 * W) + 2 * x + dx / 2]) * (1.f / 255.f);
+            float R = rnn43_weight(q, d[o]);
+            if (p.sharp_hi > p.sharp_lo)
+                R = clamp((R - p.sharp_lo) / (p.sharp_hi - p.sharp_lo), 0.f, 1.f);
+            out48[(4 * y + dy) * OW + 4 * x + dx] = uchar(floor(R * 255.f + 0.5f));
+        }
+    }
+}
+
+// Mirrors Rnn43MinParamsCPU in metal_gpu.mm (16 bytes).
+struct Rnn43MinParams {
+    uint out_w, out_h, r, _pad0;
+};
+
+#define RNN43_MT 16
+#define RNN43_MR_MAX 6
+#define RNN43_MN (RNN43_MT + 2 * RNN43_MR_MAX)
+
+kernel void rnn43_min_out(device const uchar* src [[buffer(0)]],
+                          device uchar* dst [[buffer(1)]],
+                          constant Rnn43MinParams& p [[buffer(2)]],
+                          uint2 tgid [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 tpt [[threads_per_threadgroup]]) {
+    threadgroup uchar sM[RNN43_MN * RNN43_MN];
+    const int H = int(p.out_h), W = int(p.out_w);
+    const int r = min(int(p.r), RNN43_MR_MAX), n = RNN43_MT + 2 * r;
+    const int nt = int(tpt.x * tpt.y);
+    const int x0 = int(tgid.x) * RNN43_MT, y0 = int(tgid.y) * RNN43_MT;
+    for (int i = int(tid); i < n * n; i += nt) {
+        const int yy = clamp(y0 - r + i / n, 0, H - 1);
+        const int xx = clamp(x0 - r + i % n, 0, W - 1);
+        sM[i] = src[yy * W + xx];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(tid); i < RNN43_MT * RNN43_MT; i += nt) {
+        const int ly = i / RNN43_MT, lx = i % RNN43_MT;
+        const int y = y0 + ly, x = x0 + lx;
+        if (x >= W || y >= H) continue;
+        uchar mn = 255;
+        for (int dy = 0; dy <= 2 * r; ++dy)
+            for (int dx = 0; dx <= 2 * r; ++dx) mn = min(mn, sM[(ly + dy) * n + lx + dx]);
+        dst[y * W + x] = mn;
     }
 }
