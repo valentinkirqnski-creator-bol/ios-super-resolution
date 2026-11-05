@@ -3009,11 +3009,13 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     const Image compg = compute_gcam_guide(comp_raw, cfg, /*prefilter_ref=*/resample);
     if (compg.h != refg.h || compg.w != refg.w || compg.c < 4) return Image();
     const int gh = refg.h, gw = refg.w;
-    // RAM-safe merge-res: compute R + min at the INPUT-FRAME (raw) grid (~49MB/frame,
-    // like raw_res), NOT the 48MP output grid (materialising that per frame OOM'd on
-    // device). The merge bilinearly upsamples this raw-res mask to the output pixels.
-    const int th = resample ? comp_raw.h : gh;
-    const int tw = resample ? comp_raw.w : gw;
+    const int oh = (int)std::llround((double)comp_raw.h * (double)cfg.scale);
+    const int ow = (int)std::llround((double)comp_raw.w * (double)cfg.scale);
+    // target grid: merge-output (48MP) > raw > guide. merge_res computes R per output
+    // pixel; the caller quantises the returned fp32 mask to 8-bit (Mask8, ~48MB/frame)
+    // so the 48MP fp32 mask is transient (one frame) rather than cached for all frames.
+    const int th = merge_res ? oh : (raw_res ? comp_raw.h : gh);
+    const int tw = merge_res ? ow : (raw_res ? comp_raw.w : gw);
     const std::vector<f32> irr = compute_flow_irregularity(flow);  // §4.2 (raw px)
     if ((int)irr.size() != flow.ny * flow.nx) return Image();
 

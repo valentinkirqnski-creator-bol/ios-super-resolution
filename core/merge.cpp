@@ -117,12 +117,16 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
 // On Apple, merge_comp_band_metal runs the same math on GPU.
 static void accumulate_comp(const Image& img, const FlowField& flow, const CovField& covs,
                             const Image& robustness, int tile_size,
-                            Image& num, Image& den, int y0, const Config& cfg) {
+                            Image& num, Image& den, int y0, const Config& cfg,
+                            const Mask8* rob8 = nullptr) {
     const int band_h = num.h, Ws = num.w;
     const int lr_h = img.h, lr_w = img.w;
     const int nch = cfg.bayer_mode ? 3 : 1;
     const bool iso = (cfg.kernel == KernelShape::Iso);
     const f32 scale = cfg.scale;
+    // gcam_sabre_merge_res: the mask is a compact 8-bit output-grid mask (Mask8),
+    // read 1:1 at the output pixel (v/255). Avoids a 48MP fp32 mask in memory.
+    const bool use_m8 = (rob8 && !rob8->empty());
 
     parallel_rows(band_h, cfg.num_threads, [&](int local_i) {
         const int hr_i = y0 + local_i;
@@ -162,17 +166,24 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // guide-resolution path, so the flag can say "raw" while the mask
             // handed to us is guide. Trusting the flag there would sample R
             // at half the correct position everywhere.
+            f32 local_r[3];
+            if (use_m8) {
+                // gcam_sabre_merge_res: compact 8-bit output-grid mask, read 1:1.
+                const int iy = std::min(rob8->h - 1, std::max(0, hr_i));
+                const int ix = std::min(rob8->w - 1, std::max(0, hr_j));
+                const f32 r = rob8->keep(iy, ix);
+                local_r[0] = local_r[1] = local_r[2] = r;
+            } else {
+            // Which coordinate space R lives in is decided by R's ACTUAL
+            // dimensions, not Config::robustness_raw_resolution_active():
+            // the raw-resolution path returns an empty image when the hires
+            // ref stats are missing and silently falls through to the
+            // guide-resolution path, so the flag can say "raw" while the mask
+            // handed to us is guide. Trusting the flag there would sample R
+            // at half the correct position everywhere.
             const bool rob_is_raw = (robustness.h == lr_h && robustness.w == lr_w);
-            // gcam_sabre_merge_res: one R weight per OUTPUT pixel -> the mask is at the
-            // output grid and is read 1:1 (nearest) at this output pixel, no rescale.
-            const int out_h_full = (int)std::llround((double)lr_h * (double)scale);
-            const int out_w_full = (int)std::llround((double)lr_w * (double)scale);
-            const bool rob_is_output = (robustness.h == out_h_full && robustness.w == out_w_full);
             f32 rob_y = lr_y, rob_x = lr_x;
-            if (rob_is_output) {
-                rob_y = (f32)hr_i;
-                rob_x = (f32)hr_j;
-            } else if (!rob_is_raw && cfg.bayer_mode) {
+            if (!rob_is_raw && cfg.bayer_mode) {
                 rob_y = (lr_y - 0.5f) / 2.f;
                 rob_x = (lr_x - 0.5f) / 2.f;
             }
@@ -182,13 +193,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
             // mask broadcasts (local_r[*] equal). Indexed below by the raw
             // sample's CFA channel.
             const int rnc = robustness.c;
-            f32 local_r[3];
             // robustness_guide_res_bilinear: the guide-res mask bilinearly
             // upsampled to the merge grid IS this bilinear fetch.
-            if (!rob_is_output &&
-                (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear ||
-                 cfg.gcam_sabre_merge_res ||   // raw-res mask bilinearly upsampled to 48MP
-                 (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res))) {
+            if (cfg.merge_robustness_bilinear || cfg.robustness_guide_res_bilinear ||
+                (cfg.gcam_sabre_bilinear_upscale && !cfg.gcam_sabre_raw_res)) {
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = sample_robustness_bilinear(robustness, rob_y, rob_x, rc);
             } else {
@@ -198,6 +206,7 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                                         std::max(0, (int)std::floor(rob_x + 0.5f)));
                 for (int rc = 0; rc < 3; ++rc)
                     local_r[rc] = robustness.at(iy, ix, rc < rnc ? rc : rnc - 1);
+            }
             }
 
             f32 lr_mov_x = lr_x + flowx;
@@ -345,22 +354,29 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
 bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
                      Image& num_band, Image& den_band, int y0, const Config& cfg,
-                     int frame_id) {
+                     int frame_id, const Mask8* rob8) {
+    // gcam_sabre_merge_res 8-bit output-grid mask: run the CPU accumulate (which reads
+    // the Mask8). On device the frames are non-resident for merge_res, so comp_raw is
+    // on the host. The GPU merge kernels read a float mask and don't handle Mask8.
+    if (rob8 && !rob8->empty()) {
+        accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg, rob8);
+        return true;
+    }
 #ifdef __APPLE__
     // Metal GPU only — same Alg. 4 math as accumulate_comp (incl. per-pixel robustness).
     return merge_comp_band_metal(comp_raw, flow, covs, robustness, tile_size,
                                  num_band, den_band, y0, cfg, frame_id);
 #else
 #ifdef _WIN32
-    // Windows D3D11 GPU merge (opt-in). Falls through to CPU for unsupported
-    // configs or any GPU error.
-    if (cfg.merge_backend_d3d11 && d3d11_merge_available() &&
+    // Windows D3D11 GPU merge (opt-in). Skipped for the Mask8 (merge-res) path --
+    // the shader reads a float mask -- so that falls through to the CPU accumulate.
+    if (cfg.merge_backend_d3d11 && (!rob8 || rob8->empty()) && d3d11_merge_available() &&
         merge_comp_band_d3d11(comp_raw, flow, covs, robustness, tile_size,
                               num_band, den_band, y0, cfg, frame_id))
         return true;
 #endif
     (void)frame_id;
-    accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg);
+    accumulate_comp(comp_raw, flow, covs, robustness, tile_size, num_band, den_band, y0, cfg, rob8);
     return true;
 #endif
 }

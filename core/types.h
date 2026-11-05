@@ -342,6 +342,20 @@ struct CovField {
     inline const f32* at(int y, int x) const { return &cov[((size_t)y * w + x) * 4]; }
 };
 
+// Compact 8-bit single-channel mask (keep weight in [0,1] quantised to 0..255).
+// Used by the gcam merge-output-res path so a 48MP robustness mask costs 1 byte/
+// pixel (~48MB/frame, the same budget as a 12MP fp32 raw-res mask) instead of 4
+// bytes (~195MB/frame, which OOM'd). The merge reads it 1:1 at the output pixel
+// and dequantises (v/255). 8 bits is visually lossless for a merge weight, and
+// the saved mask is already 8-bit.
+struct Mask8 {
+    int h = 0;
+    int w = 0;
+    std::vector<uint8_t> data;             // h*w, row-major
+    bool empty() const { return data.empty() || h <= 0 || w <= 0; }
+    inline f32 keep(int y, int x) const { return (f32)data[(size_t)y * w + x] * (1.f / 255.f); }
+};
+
 enum class GreyMethod { FFT, Decimate };
 enum class KernelShape { Iso, Steerable };
 enum class SelectionLaw { HardThreshold, Linear };

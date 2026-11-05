@@ -80,6 +80,7 @@ static bool load_image(const fs::path& p, Image& im) {
 struct CachedCompFrame {
     FlowField flow;
     Image rob;
+    Mask8 rob8;        // gcam_sabre_merge_res: 8-bit 48MP mask (rob stays empty then)
     CovField covs;
     Image comp;
     std::vector<uint8_t> rob_rows_nonzero;
@@ -90,6 +91,7 @@ struct CachedCompFrame {
 struct CachedCompMeta {
     FlowField flow;
     Image rob;
+    Mask8 rob8;        // gcam_sabre_merge_res: 8-bit 48MP mask (rob stays empty then)
     CovField covs;
     std::vector<uint8_t> rob_rows_nonzero;
     bool rob_has_nonzero = true;
@@ -729,6 +731,21 @@ static void absorb_robustness_sum(Image& acc_rob, const Image& rob, bool& have) 
         acc_rob.data[i] += rob.data[i];
 }
 
+// gcam_sabre_merge_res: the mask is cached 8-bit (Mask8); dequantise (v/255) into the
+// fp32 accumulator for the save-mask dump. Same running sum as absorb_robustness_sum.
+static void absorb_robustness_sum_u8(Image& acc_rob, const Mask8& m, bool& have) {
+    if (m.empty()) return;
+    const size_t n = m.data.size();
+    if (!have) {
+        acc_rob = Image(m.h, m.w, 1);
+        for (size_t i = 0; i < n; ++i) acc_rob.data[i] = (f32)m.data[i] * (1.f / 255.f);
+        have = true;
+        return;
+    }
+    for (size_t i = 0; i < n && i < acc_rob.data.size(); ++i)
+        acc_rob.data[i] += (f32)m.data[i] * (1.f / 255.f);
+}
+
 // Split the same sum by which motion prior scored each pixel. sel is 1 where
 // the strict s1 applied and 0 where s2 did, so the two accumulators partition
 // the robustness exactly: acc_s1 + acc_s2 == acc_rob, pixel for pixel.
@@ -753,10 +770,12 @@ static void build_robustness_sum(const std::vector<CachedCompFrame>& cached,
                                  Image& acc_rob, bool& have) {
     if (stream_comp_raw) {
         for (const CachedCompMeta& meta : cached_meta)
-            absorb_robustness_sum(acc_rob, meta.rob, have);
+            if (!meta.rob8.empty()) absorb_robustness_sum_u8(acc_rob, meta.rob8, have);
+            else                    absorb_robustness_sum(acc_rob, meta.rob, have);
     } else {
         for (const CachedCompFrame& fc : cached)
-            absorb_robustness_sum(acc_rob, fc.rob, have);
+            if (!fc.rob8.empty()) absorb_robustness_sum_u8(acc_rob, fc.rob8, have);
+            else                  absorb_robustness_sum(acc_rob, fc.rob, have);
     }
 }
 
@@ -2218,6 +2237,15 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   &rob_accept_frac);
             covs = cov_fut.get();
         }
+        // gcam_sabre_merge_res: the mask was computed per OUTPUT pixel (48MP). Cache it
+        // at 8-bit (Mask8, ~48MB/frame) instead of fp32 (~195MB, which OOM'd) and free
+        // the fp32 now; the merge reads the Mask8 1:1. rob_rows_nonzero was already
+        // derived from the fp32 mask above, so band culling is unaffected.
+        Mask8 rob8;
+        if (work.gcam_sabre_merge_res && rob.h > 0 && rob.w > 0) {
+            rob8 = quantize_mask_u8(rob);
+            rob = Image();
+        }
         // Frame discard (Config::frame_discard_enabled): a comparison frame whose
         // alignment confidence -- the fraction of mask samples confidently
         // accepted -- is below the threshold cannot be aligned (motion blur, a
@@ -2279,7 +2307,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
 #if defined(__APPLE__)
             // Same frames in the same order the banded path walks, so the
             // robustness sum is float-for-float what it produces.
-            if (want_acc_rob) absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            if (want_acc_rob) {
+                if (!rob8.empty()) absorb_robustness_sum_u8(acc_rob, rob8, have_acc_rob);
+                else               absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            }
             bool merged = true;
             bool contributed = false;
             if (!rob_has_nonzero) {
@@ -2287,7 +2318,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             } else if (comp.h <= 0 || comp.w <= 0) {
                 online_skip_nodata++;
             } else if (!merge_comp_band(comp, flow, covs, rob, merge_ts,
-                                        num_sink, den_sink, 0, work, k)) {
+                                        num_sink, den_sink, 0, work, k, &rob8)) {
                 // The GPU refused the frame -- geometry, an allocation, or the
                 // upload. Dropping that silently is how a burst ends up as the
                 // reference frame alone with nothing reported anywhere.
@@ -2378,7 +2409,10 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             }
             // Same frames in the same order build_robustness_sum walked, so
             // the sum is float-for-float what it produced.
-            if (want_acc_rob) absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            if (want_acc_rob) {
+                if (!rob8.empty()) absorb_robustness_sum_u8(acc_rob, rob8, have_acc_rob);
+                else               absorb_robustness_sum(acc_rob, rob, have_acc_rob);
+            }
 
             CachedCompMeta meta;
             meta.index = k;
@@ -2395,6 +2429,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             } else {
                 meta.flow = rob_has_nonzero ? std::move(flow) : FlowField();
                 meta.rob = std::move(rob);
+                meta.rob8 = rob_has_nonzero ? std::move(rob8) : Mask8();
                 meta.covs = rob_has_nonzero ? std::move(covs) : CovField();
             }
             meta.rob_rows_nonzero = std::move(rob_rows_nonzero);
@@ -2406,6 +2441,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
             fc.index = k;
             fc.flow = rob_has_nonzero ? std::move(flow) : FlowField();
             fc.rob = std::move(rob);
+            fc.rob8 = rob_has_nonzero ? std::move(rob8) : Mask8();
             fc.covs = rob_has_nonzero ? std::move(covs) : CovField();
             fc.comp = rob_has_nonzero ? std::move(comp) : Image();
             fc.rob_rows_nonzero = std::move(rob_rows_nonzero);
@@ -2802,12 +2838,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 if (metal_merge_has_frame(meta.index)) {
                     Image empty;
                     merge_comp_band(empty, meta.flow, meta.covs, meta.rob, merge_ts,
-                                    num_band, den_band, y0, work, meta.index);
+                                    num_band, den_band, y0, work, meta.index, &meta.rob8);
                     continue;
                 }
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
-                                num_band, den_band, y0, work, meta.index);
+                                num_band, den_band, y0, work, meta.index, &meta.rob8);
             }
         } else {
             for (const CachedCompFrame& fc : cached) {
@@ -2818,12 +2854,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                 if (metal_merge_has_frame(fc.index)) {
                     Image empty;
                     merge_comp_band(empty, fc.flow, fc.covs, fc.rob, merge_ts,
-                                    num_band, den_band, y0, work, fc.index);
+                                    num_band, den_band, y0, work, fc.index, &fc.rob8);
                     continue;
                 }
                 if (fc.comp.h <= 0) continue;
                 merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
-                                num_band, den_band, y0, work, fc.index);
+                                num_band, den_band, y0, work, fc.index, &fc.rob8);
             }
         }
 
@@ -2910,7 +2946,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                     continue;
                 if (!load_streamed_comp_raw(meta.index, comp_scratch)) continue;
                 merge_comp_band(comp_scratch, meta.flow, meta.covs, meta.rob, merge_ts,
-                                num_band, den_band, y0, work, meta.index);
+                                num_band, den_band, y0, work, meta.index, &meta.rob8);
             }
         } else {
             for (const CachedCompFrame& fc : cached) {
@@ -2919,7 +2955,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                     work.scale, work.bayer_mode, ref_h))
                     continue;
                 merge_comp_band(fc.comp, fc.flow, fc.covs, fc.rob, merge_ts,
-                                num_band, den_band, y0, work, fc.index);
+                                num_band, den_band, y0, work, fc.index, &fc.rob8);
             }
         }
 

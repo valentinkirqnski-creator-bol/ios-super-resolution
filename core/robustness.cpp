@@ -1905,6 +1905,24 @@ Image robustness_gcam_min_window(const Image& R, int n) {
 // Back-compat wrapper: the paper's literal 5x5 ComputeLocalMin.
 Image robustness_gcam_min_5x5(const Image& R) { return robustness_gcam_min_window(R, 5); }
 
+// Quantise a single-channel keep mask (R in [0,1]) to 8-bit (round-half-up). Lets
+// the gcam merge-output-res mask be cached at 1 byte/pixel instead of 4. Parallel.
+Mask8 quantize_mask_u8(const Image& R) {
+    Mask8 m;
+    if (R.h <= 0 || R.w <= 0) return m;
+    m.h = R.h; m.w = R.w; m.data.resize((size_t)R.h * R.w);
+    const int w = R.w;
+    parallel_rows(R.h, 0, [&](int y) {
+        const f32* rin = &R.data[(size_t)y * w];
+        uint8_t* rout = &m.data[(size_t)y * w];
+        for (int x = 0; x < w; ++x) {
+            f32 v = rin[x]; v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+            rout[x] = (uint8_t)(v * 255.f + 0.5f);
+        }
+    });
+    return m;
+}
+
 // §4.1 per-component 3x3 median of the per-tile flow vectors (edge-clamped), in
 // place. Cleans isolated outlier vectors before robustness AND merge read the
 // field. Leaves affine/dense/global_h untouched (off in the gcam-faithful config).
@@ -2139,16 +2157,13 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const bool noise_model = cfg.gcam_sabre_noise_model;
     const GcamNoiseLut mc_lut = noise_model ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
     // target grid: merge-output (48MP) > raw (Alg.6) > guide (default).
-    // RAM-safe merge-res: R + the N x N min are computed at the INPUT-FRAME (raw)
-    // resolution -- the same ~49MB/frame footprint as gcam_sabre_raw_res -- and the
-    // merge bilinearly upsamples that mask to every 48MP output pixel at fetch time
-    // (see merge.cpp). Materialising a full 48MP float mask per frame (~195MB x N
-    // frames) OOM'd on device, so merge_res no longer targets the output grid; the
-    // per-output-pixel weight is the bilinear interpolation of the raw-res R, which
-    // (the stats being guide-res) is numerically ~identical to computing R at 48MP.
-    (void)oh; (void)ow;
-    const int th = resample ? rh : gh;
-    const int tw = resample ? rw : gw;
+    // target grid: merge-output (48MP) > raw (Alg.6) > guide (default). merge_res
+    // computes R genuinely per OUTPUT pixel (stats sampled inline at guide res, so no
+    // 48MP stats buffer); the caller quantises the fp32 result to an 8-bit Mask8 for
+    // storage (~48MB/frame, the raw-res budget) so the full 48MP float mask is never
+    // cached. See quantize_mask_u8 / the merge's Mask8 path.
+    const int th = merge_res ? oh : (raw_res ? rh : gh);
+    const int tw = merge_res ? ow : (raw_res ? rw : gw);
     // guide coords per target pixel: guide has gh/gw samples over the same field of
     // view as the th/tw target, so g = (t+0.5)*(g_dim/t_dim) - 0.5. raw-res -> *0.5
     // (2x), merge-res -> *0.25 (4x), guide-res -> *1 (the gy=ry branch below).

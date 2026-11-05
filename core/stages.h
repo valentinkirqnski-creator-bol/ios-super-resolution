@@ -209,6 +209,8 @@ Image robustness_gcam_dilate(const Image& R, const Config& cfg);
 Image robustness_gcam_min_5x5(const Image& R);
 // Generalised n x n hard local-minimum (separable; n=5 == robustness_gcam_min_5x5).
 Image robustness_gcam_min_window(const Image& R, int n);
+// Quantise a keep mask (R in [0,1]) to a compact 8-bit Mask8 (gcam merge-res cache).
+Mask8 quantize_mask_u8(const Image& R);
 // GCam SABRE (§4.1): per-component 3x3 median of the per-tile flow vectors, in
 // place, edge-clamped. Both robustness and merge read the result. No-op on an
 // empty / dense-only field.
@@ -528,7 +530,7 @@ CovField estimate_kernels(const Image& raw, const Config& cfg);
 bool merge_comp_band(const Image& comp_raw, const FlowField& flow, const CovField& covs,
                      const Image& robustness, int tile_size,
                      Image& num_band, Image& den_band, int y0, const Config& cfg,
-                     int frame_id = -1);
+                     int frame_id = -1, const Mask8* rob8 = nullptr);
 
 void merge_ref_band(const Image& ref_raw, const CovField& covs,
                     Image& num_band, Image& den_band, int y0, const Config& cfg,
