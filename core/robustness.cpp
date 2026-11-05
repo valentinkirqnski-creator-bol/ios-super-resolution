@@ -1905,6 +1905,44 @@ Image robustness_gcam_min_window(const Image& R, int n) {
 // Back-compat wrapper: the paper's literal 5x5 ComputeLocalMin.
 Image robustness_gcam_min_5x5(const Image& R) { return robustness_gcam_min_window(R, 5); }
 
+// n x n hard local-minimum directly on an 8-bit Mask8 (separable, parallel). Because
+// quantisation (round, monotonic) commutes with min, min-on-uint8 == quantise(min on
+// fp32), so this is bit-identical to robustness_gcam_min_window on the fp32 mask then
+// quantised -- but never allocates a 48MP fp32 buffer. Used by the merge-res path.
+Mask8 robustness_gcam_min_window_u8(const Mask8& in, int n) {
+    if (in.empty()) return in;
+    if (n < 1) n = 1;
+    const int lo = -((n - 1) / 2), hi = n / 2;
+    const int h = in.h, w = in.w;
+    std::vector<uint8_t> tmp((size_t)h * w);
+    parallel_rows(h, 0, [&](int y) {
+        const uint8_t* rin = &in.data[(size_t)y * w];
+        uint8_t* rout = &tmp[(size_t)y * w];
+        for (int x = 0; x < w; ++x) {
+            uint8_t mn = 255;
+            for (int dx = lo; dx <= hi; ++dx) {
+                int xx = x + dx; xx = xx < 0 ? 0 : (xx >= w ? w - 1 : xx);
+                if (rin[xx] < mn) mn = rin[xx];
+            }
+            rout[x] = mn;
+        }
+    });
+    Mask8 out; out.h = h; out.w = w; out.data.resize((size_t)h * w);
+    parallel_rows(h, 0, [&](int y) {
+        uint8_t* rout = &out.data[(size_t)y * w];
+        for (int x = 0; x < w; ++x) {
+            uint8_t mn = 255;
+            for (int dy = lo; dy <= hi; ++dy) {
+                int yy = y + dy; yy = yy < 0 ? 0 : (yy >= h ? h - 1 : yy);
+                uint8_t v = tmp[(size_t)yy * w + x];
+                if (v < mn) mn = v;
+            }
+            rout[x] = mn;
+        }
+    });
+    return out;
+}
+
 // Quantise a single-channel keep mask (R in [0,1]) to 8-bit (round-half-up). Lets
 // the gcam merge-output-res mask be cached at 1 byte/pixel instead of 4. Parallel.
 Mask8 quantize_mask_u8(const Image& R) {
@@ -2114,7 +2152,8 @@ static inline f32 gcam_frame_weight(const f32* ref_mean, const f32* comp_mean,
 // of the inline operator in rob_gcam_sabre (HHSRKernels.metal).
 Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_stats,
                                            const FlowField& flow, int tile_size,
-                                           const Config& cfg, Image* s_select_out) {
+                                           const Config& cfg, Image* s_select_out,
+                                           Mask8* out8) {
     const Image& refg = ref_stats.gcam_guide;
     if (refg.h <= 0 || refg.w <= 0 || refg.c < 4 || tile_size <= 0) return Image();
     // gcam_sabre_raw_res (paper Alg. 6): instead of computing R on the ~3MP guide, the
@@ -2169,11 +2208,19 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // (2x), merge-res -> *0.25 (4x), guide-res -> *1 (the gy=ry branch below).
     const f32 g_per_ty = (f32)gh / (f32)th;
     const f32 g_per_tx = (f32)gw / (f32)tw;
-    Image R(th, tw, 1);
+    // merge-res: write the keep weight STRAIGHT to an 8-bit Mask8 (no 48MP fp32 mask,
+    // and the §7 min runs on 8-bit) so the transient footprint stays at the raw-res
+    // budget -- the 48MP fp32 R + fp32 min buffers (~0.6GB) were the on-device OOM.
+    // Quantisation commutes with the min, so the result is identical to fp32-then-8bit.
+    const bool to8 = (merge_res && out8 != nullptr);
+    if (to8) { out8->h = th; out8->w = tw; out8->data.assign((size_t)th * tw, 0); }
+    Image R;
+    if (!to8) R = Image(th, tw, 1);
     // Per-output-pixel ComputeFrameWeight. Rows are independent (each writes its own
     // R row; everything else is read-only), so this parallelises exactly -- a big win
     // at raw/merge res (th up to 12MP) on the CPU path. dispatch_apply on Apple.
     parallel_rows(th, cfg.num_threads, [&](int ry) {
+        uint8_t* r8row = to8 ? &out8->data[(size_t)ry * tw] : nullptr;
         for (int rx = 0; rx < tw; ++rx) {
             // Guide coordinate of this pixel. Raw-res: Dodgson x2 raw->guide (a guide
             // cell g sits at raw 2g+0.5 -> g=(raw+0.5)/2-0.5), edge-clamped. Guide-res:
@@ -2279,13 +2326,26 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             if (arg > 0.f) arg = 0.f;
             f32 w = std::exp2(arg);
             if (!std::isfinite(w)) w = 0.f;
-            R.at(ry, rx, 0) = clampf(w, 0.f, 1.f);         // keep weight (unblocker = 0)
+            const f32 wc = clampf(w, 0.f, 1.f);            // keep weight (unblocker = 0)
+            if (to8) r8row[rx] = (uint8_t)(wc * 255.f + 0.5f);
+            else     R.at(ry, rx, 0) = wc;
         }
     });
+    const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
+    // merge-res: §7 HARD n x n min directly on the 8-bit mask (identical to fp32 min +
+    // 8-bit, but no 48MP fp32 buffer). Returns an empty Image; the mask is in *out8.
+    if (to8) {
+        *out8 = robustness_gcam_min_window_u8(*out8, min_win);
+        if (cfg.gcam_sabre_min5x5) *out8 = robustness_gcam_min_window_u8(*out8, min_win);
+        if (s_select_out) {
+            *s_select_out = Image(th, tw, 1);
+            std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
+        }
+        return Image();
+    }
     // §7 refinement. Raw-res (paper Alg. 6): the HARD 5x5 ComputeLocalMin at raw res
     // (R_hat = min over 5x5), now that R is computed per raw pixel. Guide-res (default):
     // GCam's soft reject-grow (robustness_gcam_dilate), unchanged.
-    const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
     Image dil = resample ? robustness_gcam_min_window(R, min_win)
                          : robustness_gcam_dilate(R, cfg);
     // Opt-in extra darkening: an additional HARD n x n ComputeLocalMin (R_hat = min over
@@ -2899,7 +2959,7 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
 static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_stats,
                                      const FlowField& flow, int tile_size,
                                      const Config& cfg, Image* s_select_out,
-                                     bool* refined_on_gpu) {
+                                     bool* refined_on_gpu, Mask8* out8 = nullptr) {
     if (!cfg.robustness_enabled) {
         Image guide = compute_guide(comp_raw, cfg);
         Image r(guide.h, guide.w, 1);
@@ -2930,6 +2990,10 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
     // which runs on device too. On an empty return (reference guide not built,
     // e.g. robustness toggled on mid-burst) fall through to the standard paths.
     if (cfg.robustness_gcam_enabled) {
+        // merge-res: produce the 48MP mask straight into the 8-bit out8 (no 48MP fp32
+        // buffer). On success out8 is filled and an empty Image is returned as the
+        // "handled" signal (the caller reads out8, not the Image).
+        const bool want8 = (cfg.gcam_sabre_merge_res && out8 != nullptr);
         const Image* craw = &comp_raw;
 #ifdef __APPLE__
         // Capture path: the Bayer frame is decoded straight into the GPU slot, so
@@ -2941,7 +3005,10 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
             metal_fetch_host_raw(comp_host) &&
             comp_host.h == comp_raw.h && comp_host.w == comp_raw.w)
             craw = &comp_host;
-        if (cfg.gcam_sabre_gpu) {
+        // merge-res uses the CPU operator (below), which writes the keep weight
+        // straight to 8-bit -- no 48MP fp32 mask on GPU or host. The Metal kernel
+        // would allocate a 48MP fp32 buffer (the on-device OOM), so skip it here.
+        if (cfg.gcam_sabre_gpu && !want8) {
             Image g = compute_robustness_gcam_sabre_metal(*craw, ref_stats, flow,
                                                           tile_size, cfg, s_select_out);
             if (g.h > 0 && g.w > 0) return g;
@@ -2949,8 +3016,9 @@ static Image compute_robustness_core(const Image& comp_raw, const RefStats& ref_
         }
 #endif
         Image r = compute_robustness_gcam_sabre(*craw, ref_stats, flow, tile_size,
-                                                cfg, s_select_out);
-        if (r.h > 0 && r.w > 0) return r;
+                                                cfg, s_select_out, want8 ? out8 : nullptr);
+        if (want8) { if (out8 && !out8->empty()) return Image(); }
+        else if (r.h > 0 && r.w > 0) return r;
     }
 
     // Learned mask (robustness_nn.h) in place of Eq. 5-9. Tried before both
@@ -3812,10 +3880,13 @@ bool apply_robustness_refinement(Image& R, const Image& comp_raw,
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
-                         Image* s_select_out) {
+                         Image* s_select_out, Mask8* out8) {
     bool refined_on_gpu = false;
     Image R = compute_robustness_core(comp_raw, ref_stats, flow, tile_size, cfg,
-                                      s_select_out, &refined_on_gpu);
+                                      s_select_out, &refined_on_gpu, out8);
+    // merge-res: the mask is in *out8 (empty R); learned refinement isn't used with
+    // the gcam operator, so return the empty R and let the caller read out8.
+    if (out8 && !out8->empty()) return R;
     // The Metal path refines inside its own command buffer -- one kernel over
     // the finished mask, with the guide, the statistics and the flow already in
     // GPU buffers and nothing read back. Doing it again here would apply the

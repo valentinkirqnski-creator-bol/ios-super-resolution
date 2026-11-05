@@ -145,6 +145,34 @@ static bool robustness_row_activity(const Image& rob, std::vector<uint8_t>& rows
     return any;
 }
 
+// Same per-row activity + accept fraction for a compact 8-bit Mask8 (merge-res).
+static bool robustness_row_activity_u8(const Mask8& m, std::vector<uint8_t>& rows,
+                                       double* accept_frac = nullptr,
+                                       bool want_accept_frac = false) {
+    if (accept_frac) *accept_frac = 1.0;
+    rows.assign((size_t)std::max(0, m.h), 0u);
+    if (m.empty()) return false;
+    const uint8_t tau = (uint8_t)(kFrameAcceptTau * 255.f);  // 0.25 -> 63
+    bool any = false; size_t accepted = 0;
+    for (int y = 0; y < m.h; ++y) {
+        bool row_any = false;
+        const size_t base = (size_t)y * m.w;
+        for (int x = 0; x < m.w; ++x) {
+            const uint8_t v = m.data[base + x];
+            if (v != 0u) row_any = true;
+            if (want_accept_frac) { if (v > tau) ++accepted; }
+            else if (row_any) break;
+        }
+        rows[(size_t)y] = row_any ? 1u : 0u;
+        any = any || row_any;
+    }
+    if (accept_frac && want_accept_frac) {
+        const double total = (double)m.h * (double)m.w;
+        *accept_frac = (total > 0.0) ? (double)accepted / total : 1.0;
+    }
+    return any;
+}
+
 static Image compute_robustness_and_activity(const Image& comp,
                                              const RefStats& ref_stats,
                                              const FlowField& flow,
@@ -154,9 +182,17 @@ static Image compute_robustness_and_activity(const Image& comp,
                                              bool& has_nonzero,
                                              Image* s_select_out = nullptr,
                                              int gpu_slot = -1,
-                                             double* accept_frac = nullptr) {
+                                             double* accept_frac = nullptr,
+                                             Mask8* out8 = nullptr) {
     if (accept_frac) *accept_frac = 1.0;
-    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work, s_select_out);
+    Image rob = compute_robustness(comp, ref_stats, flow, tile_size, work, s_select_out, out8);
+    // merge-res: the mask is the 8-bit out8 (rob is empty). Row activity + accept
+    // fraction come from the Mask8.
+    if (out8 && !out8->empty()) {
+        has_nonzero = robustness_row_activity_u8(*out8, rows, accept_frac,
+                                                 work.frame_discard_enabled);
+        return rob;
+    }
 #if defined(__APPLE__)
     // The mask stayed in its slice, so read the per-row activity from there --
     // a few KB, against pulling the whole 12MB plane back to test for non-zeros.
@@ -2187,6 +2223,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
         }
 #endif
         Image rob;
+        Mask8 rob8;   // gcam_sabre_merge_res: operator writes the 48MP mask here at 8-bit
         CovField covs;
         std::vector<uint8_t> rob_rows_nonzero;
         bool rob_has_nonzero = true;
@@ -2204,7 +2241,7 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr,
                                                   frames_resident ? k : -1,
-                                                  &rob_accept_frac);
+                                                  &rob_accept_frac, &rob8);
             prof_add_cpu("comp:robustness", prof_now_ms() - t_rob);
             // robustness_row_activity is a pure CPU pass over the finished mask,
             // while estimate_kernels is GPU, so these two can run together. This
@@ -2234,18 +2271,12 @@ Image process_burst_loader_to_dng(int frame_count, const RawFrameLoaderFn& loade
                                                   rob_has_nonzero,
                                                   rob_s_select_ptr,
                                                   frames_resident ? k : -1,
-                                                  &rob_accept_frac);
+                                                  &rob_accept_frac, &rob8);
             covs = cov_fut.get();
         }
-        // gcam_sabre_merge_res: the mask was computed per OUTPUT pixel (48MP). Cache it
-        // at 8-bit (Mask8, ~48MB/frame) instead of fp32 (~195MB, which OOM'd) and free
-        // the fp32 now; the merge reads the Mask8 1:1. rob_rows_nonzero was already
-        // derived from the fp32 mask above, so band culling is unaffected.
-        Mask8 rob8;
-        if (work.gcam_sabre_merge_res && rob.h > 0 && rob.w > 0) {
-            rob8 = quantize_mask_u8(rob);
-            rob = Image();
-        }
+        // gcam_sabre_merge_res: the operator wrote the 48MP mask straight into rob8 at
+        // 8-bit (~48MB/frame, the raw-res budget) -- no 48MP fp32 mask was ever built,
+        // so the per-frame transient stays small. rob is empty here.
         // Frame discard (Config::frame_discard_enabled): a comparison frame whose
         // alignment confidence -- the fraction of mask samples confidently
         // accepted -- is below the threshold cannot be aligned (motion blur, a

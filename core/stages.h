@@ -211,6 +211,8 @@ Image robustness_gcam_min_5x5(const Image& R);
 Image robustness_gcam_min_window(const Image& R, int n);
 // Quantise a keep mask (R in [0,1]) to a compact 8-bit Mask8 (gcam merge-res cache).
 Mask8 quantize_mask_u8(const Image& R);
+// n x n hard local-minimum directly on an 8-bit Mask8 (== fp32 min then quantise).
+Mask8 robustness_gcam_min_window_u8(const Mask8& in, int n);
 // GCam SABRE (§4.1): per-component 3x3 median of the per-tile flow vectors, in
 // place, edge-clamped. Both robustness and merge read the result. No-op on an
 // empty / dense-only field.
@@ -223,9 +225,12 @@ std::vector<f32> compute_flow_irregularity(const FlowField& flow);
 // keep mask (dilated). The verified reference and the device default; also the
 // fallback when the GPU twin is unavailable. Empty if the reference guide
 // (ref_stats.gcam_guide) was not built.
+// out8 (gcam_sabre_merge_res only): when non-null, the 48MP keep mask is written
+// straight to this 8-bit Mask8 (no 48MP fp32 buffer) and an empty Image is returned.
 Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_stats,
                                     const FlowField& flow, int tile_size,
-                                    const Config& cfg, Image* s_select_out = nullptr);
+                                    const Config& cfg, Image* s_select_out = nullptr,
+                                    Mask8* out8 = nullptr);
 
 // MC noise std at brightness in [0,1]: std_curve[round(1000*b)] (fast_monte_carlo).
 f32 noise_std_at_brightness(f32 brightness, f32 alpha, f32 beta);
@@ -303,7 +308,7 @@ Image build_robustness_nn_features(const RefStats& ref_stats, const Image& comp_
 
 Image compute_robustness(const Image& comp_raw, const RefStats& ref_stats,
                          const FlowField& flow, int tile_size, const Config& cfg,
-                         Image* s_select_out = nullptr);
+                         Image* s_select_out = nullptr, Mask8* out8 = nullptr);
 
 // ---- learned refinement of the analytic mask (Config::
 // robustness_refine_nn_enabled) -------------------------------------------
