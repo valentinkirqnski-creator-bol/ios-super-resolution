@@ -491,6 +491,11 @@ struct Config {
     // Also sets the ICA step clamp, which bounds one iteration to the level's
     // search radius -- so this is 3px at the finest level.
     std::vector<int> bm_search_radii = {3, 4, 4, 4};
+    // Added to the COARSEST level's search radius (Settings, -5..+5; the result is clamped to >= 0, where 0
+    // means the coarsest level only re-scores the incoming / pre-aligned position). The coarsest level is
+    // where the largest motion is caught: each step of radius there is abs_factor raw px of reach (32 with
+    // factors {1,2,4,4}), and costs (2R+1)^2 candidates on a level that has very few tiles.
+    int bm_coarsest_radius_offset = 0;
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
 
     // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
@@ -600,10 +605,14 @@ struct Config {
     // Block-match search radius for a pyramid level, fine (0) to coarse.
     // Single source of truth for both align.cpp and metal_gpu.mm so the 1.4
     // finest-radius override lands on the CPU and the device identically.
-    int search_radius_for_level(int lvl) const {
+    // nlev: the pyramid's actual level count (defaults to bm_factors' length);
+    // its last level gets bm_coarsest_radius_offset.
+    int search_radius_for_level(int lvl, int nlev = -1) const {
         int r = (lvl >= 0 && lvl < (int)bm_search_radii.size())
                     ? bm_search_radii[(size_t)lvl] : 2;
         if (align_match_14 && lvl == 0) r = 1; // 1.4 ships [1,4,4,4]
+        const int coarsest = (nlev > 0 ? nlev : (int)bm_factors.size()) - 1;
+        if (lvl == coarsest && lvl > 0) r = std::max(0, r + bm_coarsest_radius_offset);
         return r;
     }
 

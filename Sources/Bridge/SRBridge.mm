@@ -481,6 +481,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.global_prealignment_rotation_step_deg =
             std::max(0.05f, std::min(1.f,
                 tuning[@"global_prealignment_rotation_step_deg"].floatValue));
+    if (tuning[@"bm_coarsest_radius_offset"])
+        cfg.bm_coarsest_radius_offset =
+            std::max(-5, std::min(5, tuning[@"bm_coarsest_radius_offset"].intValue));
     if (tuning[@"global_prealignment_max_shift"])
         cfg.global_prealignment_max_shift =
             std::max(0, std::min(64, tuning[@"global_prealignment_max_shift"].intValue));

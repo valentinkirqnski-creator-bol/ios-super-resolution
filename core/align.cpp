@@ -1237,7 +1237,7 @@ FlowField align(const Pyramid& ref_pyr, const Image& ref_grey,
         // is built on the alignment grey. See Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = cfg.search_radius_for_level(lvl);
+        int radius = cfg.search_radius_for_level(lvl, nlev);
 
         // Tile grid from padded ref level (Python: h // tile_size)
         int ny = r.h / ts;

@@ -3832,7 +3832,7 @@ static bool align_metal_impl(const Pyramid& ref_pyr, const Image& ref_grey,
         // align() in align.cpp; see Config::grey_tile_size.
         int ts = cfg.grey_tile_size((lvl < (int)cfg.bm_tile_sizes.size())
                      ? cfg.bm_tile_sizes[lvl] : tile_size);
-        int radius = cfg.search_radius_for_level(lvl);
+        int radius = cfg.search_radius_for_level(lvl, nlev);
 
         id<MTLBuffer> b_ref = ref_level_buffer(r);
         if (!b_ref) return false;

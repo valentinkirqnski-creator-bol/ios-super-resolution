@@ -1063,6 +1063,26 @@ struct CameraView: View {
                 }
     }
 
+    // Its own small section, extracted like motionRejectionSection below.
+    private var alignmentSection: some View {
+        Section(header: Text("Alignment")) {
+            Stepper(value: $cam.tuningParams.bm_coarsest_radius_offset, in: -5...5, step: 1) {
+                HStack {
+                    Text("Coarsest Search Radius")
+                    Spacer()
+                    let off = cam.tuningParams.bm_coarsest_radius_offset
+                    Text("\(off >= 0 ? "+" : "")\(off)  (radius \(max(0, 4 + off)))")
+                        .foregroundColor(.secondary)
+                }
+            }
+            Text("""
+                 How far the coarsest (lowest-resolution) alignment level searches for each tile, as a change from the default radius of 4. Each step reaches about 32 more sensor pixels. Raise it for fast or large hand motion; lower it on still, repetitive scenes where a wide search can lock onto the wrong repeat. 0 keeps the default.
+                 """)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+        }
+    }
+
     // Extracted rather than inline for the same reason kernelsSection is: the Form
     // body was once a single 343-line expression and the Swift type checker gave
     // up on it. These are the only tuning controls still reachable after cef567b
@@ -1125,6 +1145,8 @@ struct CameraView: View {
                     Text("One-time \(store.displayPrice) purchase. Permanently removes the \(StoreManager.freeTotalLimit)-photo free limit.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
+
+                alignmentSection
 
                 motionRejectionSection
 

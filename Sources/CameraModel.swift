@@ -112,6 +112,9 @@ struct TuningParams: Equatable, Codable {
     var global_prealignment_rotation_range_deg: Float = 0.0
     var global_prealignment_rotation_step_deg: Float = 0.25
     var global_prealignment_max_shift: Int = 24
+    /// Added to the coarsest alignment level's block-match search radius
+    /// (default 4), -5...+5; the result never goes below 0.
+    var bm_coarsest_radius_offset: Int = 0
     /// Off merges every frame at full weight everywhere. Diagnostic: it shows
     /// what the alignment actually produced, with no mask hiding the errors.
     var robustness_enabled: Bool = true
@@ -372,7 +375,7 @@ struct TuningParams: Equatable, Codable {
         case snr_auto_tune, alignment_tile_size
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
-        case global_prealignment_max_shift
+        case global_prealignment_max_shift, bm_coarsest_radius_offset
         case robustness_enabled, robustness_save_mask
         case dng_codec, dng_store_unwhitened
         case merge_arch
@@ -430,6 +433,7 @@ struct TuningParams: Equatable, Codable {
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
         global_prealignment_rotation_step_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_step_deg) ?? global_prealignment_rotation_step_deg
         global_prealignment_max_shift = try c.decodeIfPresent(Int.self, forKey: .global_prealignment_max_shift) ?? global_prealignment_max_shift
+        bm_coarsest_radius_offset = try c.decodeIfPresent(Int.self, forKey: .bm_coarsest_radius_offset) ?? bm_coarsest_radius_offset
         robustness_enabled = try c.decodeIfPresent(Bool.self, forKey: .robustness_enabled) ?? robustness_enabled
         robustness_save_mask = try c.decodeIfPresent(Bool.self, forKey: .robustness_save_mask) ?? robustness_save_mask
         // Older presets carry the boolean. Only an explicit `true` is honoured,
@@ -2231,6 +2235,7 @@ final class CameraModel: NSObject, ObservableObject {
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
             "global_prealignment_rotation_step_deg": NSNumber(value: tuningParams.global_prealignment_rotation_step_deg),
             "global_prealignment_max_shift": NSNumber(value: tuningParams.global_prealignment_max_shift),
+            "bm_coarsest_radius_offset": NSNumber(value: tuningParams.bm_coarsest_radius_offset),
             "robustness_enabled": NSNumber(value: tuningParams.robustness_enabled),
             "robustness_save_mask": NSNumber(value: tuningParams.robustness_save_mask),
             "dng_codec": NSNumber(value: tuningParams.dng_codec),
