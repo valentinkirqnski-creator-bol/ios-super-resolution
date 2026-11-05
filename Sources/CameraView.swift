@@ -1029,7 +1029,22 @@ struct CameraView: View {
                     Text("8 can follow smaller local motion in good light, but is slower and less stable on noise, straight edges, and repeated patterns. Auto keeps the SNR-based choice.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
-                    
+
+                    Stepper(value: $cam.tuningParams.coarsest_search_radius_delta,
+                            in: -5...5,
+                            step: 1) {
+                        HStack {
+                            Text("Coarsest Search Radius")
+                            Spacer()
+                            Text(cam.tuningParams.coarsest_search_radius_delta >= 0
+                                 ? "+\(cam.tuningParams.coarsest_search_radius_delta)"
+                                 : "\(cam.tuningParams.coarsest_search_radius_delta)")
+                        }
+                    }
+                    Text("Offsets the block-match search window at the coarsest (largest-motion) pyramid level, from -5 to +5 around the default. Raise it to catch bigger inter-frame motion (handheld drift, moving subjects); lower it to tighten the window on near-still bursts and reduce false matches on repeating structure. 0 = default.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     HStack {
                         Text("Detail Sharpness (k_detail)")
                         Spacer()
@@ -1234,6 +1249,11 @@ struct CameraView: View {
                         Toggle("Bilinear Upsample Mask to Output (guide-res)", isOn: $cam.tuningParams.gcam_sabre_bilinear_upscale)
                         Text("""
                              Keeps R and the 5×5 computed on the ~3 MP guide (the default operator, unchanged), but makes the merge sample that guide-res mask BILINEARLY per output pixel instead of nearest — so each of the ~48 MP output pixels gets its own interpolated rejection weight rather than one weight shared across a ~4×4 block. Zero extra memory (it's interpolated at fetch time, nothing is materialised). This is the lightweight way to get a per-output-pixel mask without the raw-res operator. Ignored when "Mask at Input-Frame Resolution" is on (that already has a per-raw-pixel mask). Off by default (nearest fetch); A/B on an imported burst. Requires GCam SABRE Robustness.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
+                        Toggle("Extra 5×5 Minimum (darken mask)", isOn: $cam.tuningParams.gcam_sabre_min5x5)
+                        Text("""
+                             Applies one extra HARD 5×5 local-minimum pass on top of whatever the §7 refinement produced (on either the guide-res or the input-frame-res mask): each pixel takes the LOWEST confidence weight in its 5×5 window. Because the minimum can never exceed the centre weight, turning this on can only DARKEN the mask — never brighten it — growing every rejection into its 5×5 neighbourhood for a more conservative merge. Use it when ghosts/edges are still being kept. Off by default; A/B on an imported burst. Requires GCam SABRE Robustness.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Mask at Input-Frame Resolution (Alg. 6)", isOn: $cam.tuningParams.gcam_sabre_raw_res)

@@ -663,6 +663,15 @@ struct Config {
     std::vector<int> bm_search_radii = {1, 4, 4, 4};
     std::vector<std::string> bm_metrics = {"L1", "L2", "L2", "L2"};
 
+    // User-adjustable offset applied ONLY to the coarsest pyramid level's block-match
+    // search radius (the largest-motion level). Range [-5, +5]; 0 = ship default. The
+    // coarsest radius bounds how far a tile can move between frames at the top of the
+    // pyramid -- raise it to catch bigger inter-frame motion (handheld drift, moving
+    // subjects), lower it to tighten the window on near-still bursts (fewer false
+    // matches on repeating structure). The effective radius is clamped to >= 1.
+    // Applied in search_radius_for_level so the CPU and Metal paths stay identical.
+    int coarsest_search_radius_delta = 0;
+
     // Settings "Use Neural Flow" toggle. When true, pipeline_paths.cpp routes
     // alignment through the bundled PWCNet Core ML model (neural_flow.h)
     // instead of align()'s block-matching pyramid, then re-uses the exact
@@ -943,6 +952,14 @@ struct Config {
         int r = (lvl >= 0 && lvl < (int)bm_search_radii.size())
                     ? bm_search_radii[(size_t)lvl] : 2;
         if (align_match_14 && lvl == 0) r = 1; // 1.4 ships [1,4,4,4]
+        // Coarsest level (largest index the radii vector addresses): apply the
+        // user offset, clamped to [-5,+5], and keep the final radius >= 1.
+        if (!bm_search_radii.empty() && lvl == (int)bm_search_radii.size() - 1) {
+            int d = coarsest_search_radius_delta;
+            if (d < -5) d = -5; else if (d > 5) d = 5;
+            r += d;
+            if (r < 1) r = 1;
+        }
         return r;
     }
 
@@ -1784,6 +1801,13 @@ struct Config {
     // gcam_sabre_raw_res is on, which already has a per-raw-pixel mask). Off by default
     // (nearest). Requires robustness_gcam_enabled.
     bool  gcam_sabre_bilinear_upscale = false;
+    // Extra darkening pass: apply one additional HARD 5x5 ComputeLocalMin
+    // (R_hat(p) = min over the 5x5 window around p) ON TOP of the §7 result, on either
+    // gcam branch (guide-res or raw-res). Because min(window) <= center, turning this on
+    // can only lower weights -- it grows every rejection into its 5x5 neighbourhood, so
+    // the mask always gets DARKER (never brighter). Off by default. Requires
+    // robustness_gcam_enabled.
+    bool  gcam_sabre_min5x5         = false;
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an

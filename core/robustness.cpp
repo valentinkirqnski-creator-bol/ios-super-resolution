@@ -2212,6 +2212,11 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // GCam's soft reject-grow (robustness_gcam_dilate), unchanged.
     Image dil = raw_res ? robustness_gcam_min_5x5(R)
                         : robustness_gcam_dilate(R, cfg);
+    // Opt-in extra darkening: an additional HARD 5x5 ComputeLocalMin (R_hat = min over
+    // the 5x5 window) applied ON TOP of the §7 result. min(window) <= center always, so
+    // turning this on can only darken the mask (grows each rejection into its neighbours),
+    // regardless of which §7 branch ran above.
+    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_5x5(dil);
     // The operator makes no s1/s2 prior choice; report the strict prior uniformly
     // so the debug split masks stay well-formed (matches the learned-mask path).
     if (s_select_out) {

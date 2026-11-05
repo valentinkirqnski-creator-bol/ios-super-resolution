@@ -486,6 +486,9 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.alignment_tile_size =
             (ts == 8 || ts == 16 || ts == 32 || ts == 64) ? ts : 0;
     }
+    if (tuning[@"coarsest_search_radius_delta"])
+        cfg.coarsest_search_radius_delta =
+            std::max(-5, std::min(5, tuning[@"coarsest_search_radius_delta"].intValue));
     if (tuning[@"global_prealignment_enabled"])
         cfg.global_prealignment_enabled = tuning[@"global_prealignment_enabled"].boolValue;
     if (tuning[@"global_prealignment_choose_reference"])
@@ -633,6 +636,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
     if (tuning[@"gcam_sabre_gpu"])            cfg.gcam_sabre_gpu = tuning[@"gcam_sabre_gpu"].boolValue;
     if (tuning[@"gcam_sabre_raw_res"])        cfg.gcam_sabre_raw_res = tuning[@"gcam_sabre_raw_res"].boolValue;
     if (tuning[@"gcam_sabre_bilinear_upscale"]) cfg.gcam_sabre_bilinear_upscale = tuning[@"gcam_sabre_bilinear_upscale"].boolValue;
+    if (tuning[@"gcam_sabre_min5x5"]) cfg.gcam_sabre_min5x5 = tuning[@"gcam_sabre_min5x5"].boolValue;
     if (tuning[@"gcam_sabre_noise_model"])    cfg.gcam_sabre_noise_model = tuning[@"gcam_sabre_noise_model"].boolValue;
     if (tuning[@"gcam_sabre_dilate_2x"])      cfg.gcam_sabre_dilate_2x = tuning[@"gcam_sabre_dilate_2x"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])

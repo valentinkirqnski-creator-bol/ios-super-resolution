@@ -99,6 +99,8 @@ struct TuningParams: Equatable, Codable {
     var k_shrink: Float = 1.0
     var snr_auto_tune: Bool = false
     var alignment_tile_size: Int = 16
+    /// Offset (-5...+5) applied to the coarsest pyramid level's block-match search radius.
+    var coarsest_search_radius_delta: Int = 0
     var global_prealignment_enabled: Bool = false
     /// Off: keeps frame 0 as the merge base, which lets the pre-alignment run
     /// inside the analysis loop instead of as a separate decode pass.
@@ -297,6 +299,7 @@ struct TuningParams: Equatable, Codable {
     var gcam_sabre_gpu: Bool = false
     var gcam_sabre_raw_res: Bool = false
     var gcam_sabre_bilinear_upscale: Bool = false
+    var gcam_sabre_min5x5: Bool = false
     /// Build the Monte-Carlo noise model from the DNG NoiseProfile and apply it
     /// (guide green-only gate + operator noise subtraction, §3-§6). Off = device
     /// noise-blind (the reconstructed affine stand-in). Requires the GCam toggle.
@@ -534,7 +537,7 @@ struct TuningParams: Equatable, Codable {
         case flow_regularize_aperture_ratio
         case flow_reject_1d_ambiguity_ratio
         case k_detail, k_denoise, k_stretch, k_shrink
-        case snr_auto_tune, alignment_tile_size
+        case snr_auto_tune, alignment_tile_size, coarsest_search_radius_delta
         case global_prealignment_enabled, global_prealignment_choose_reference
         case global_prealignment_rotation_range_deg, global_prealignment_rotation_step_deg
         case global_prealignment_max_shift
@@ -555,7 +558,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -614,6 +617,7 @@ struct TuningParams: Equatable, Codable {
         k_shrink = try c.decodeIfPresent(Float.self, forKey: .k_shrink) ?? k_shrink
         snr_auto_tune = try c.decodeIfPresent(Bool.self, forKey: .snr_auto_tune) ?? snr_auto_tune
         alignment_tile_size = try c.decodeIfPresent(Int.self, forKey: .alignment_tile_size) ?? alignment_tile_size
+        coarsest_search_radius_delta = try c.decodeIfPresent(Int.self, forKey: .coarsest_search_radius_delta) ?? coarsest_search_radius_delta
         global_prealignment_enabled = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_enabled) ?? global_prealignment_enabled
         global_prealignment_choose_reference = try c.decodeIfPresent(Bool.self, forKey: .global_prealignment_choose_reference) ?? global_prealignment_choose_reference
         global_prealignment_rotation_range_deg = try c.decodeIfPresent(Float.self, forKey: .global_prealignment_rotation_range_deg) ?? global_prealignment_rotation_range_deg
@@ -699,6 +703,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_gpu = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_gpu) ?? gcam_sabre_gpu
         gcam_sabre_raw_res = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_raw_res) ?? gcam_sabre_raw_res
         gcam_sabre_bilinear_upscale = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_bilinear_upscale) ?? gcam_sabre_bilinear_upscale
+        gcam_sabre_min5x5 = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_min5x5) ?? gcam_sabre_min5x5
         gcam_sabre_noise_model = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_noise_model) ?? gcam_sabre_noise_model
         gcam_sabre_dilate_2x = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_dilate_2x) ?? gcam_sabre_dilate_2x
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
@@ -2477,6 +2482,7 @@ final class CameraModel: NSObject, ObservableObject {
             "k_shrink": NSNumber(value: tuningParams.k_shrink),
             "snr_auto_tune": NSNumber(value: tuningParams.snr_auto_tune),
             "alignment_tile_size": NSNumber(value: tuningParams.alignment_tile_size),
+            "coarsest_search_radius_delta": NSNumber(value: tuningParams.coarsest_search_radius_delta),
             "global_prealignment_enabled": NSNumber(value: tuningParams.global_prealignment_enabled),
             "global_prealignment_choose_reference": NSNumber(value: tuningParams.global_prealignment_choose_reference),
             "global_prealignment_rotation_range_deg": NSNumber(value: tuningParams.global_prealignment_rotation_range_deg),
@@ -2547,6 +2553,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_gpu": NSNumber(value: tuningParams.gcam_sabre_gpu),
             "gcam_sabre_raw_res": NSNumber(value: tuningParams.gcam_sabre_raw_res),
             "gcam_sabre_bilinear_upscale": NSNumber(value: tuningParams.gcam_sabre_bilinear_upscale),
+            "gcam_sabre_min5x5": NSNumber(value: tuningParams.gcam_sabre_min5x5),
             "gcam_sabre_noise_model": NSNumber(value: tuningParams.gcam_sabre_noise_model),
             "gcam_sabre_dilate_2x": NSNumber(value: tuningParams.gcam_sabre_dilate_2x),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),

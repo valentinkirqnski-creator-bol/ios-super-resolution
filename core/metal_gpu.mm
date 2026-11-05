@@ -3065,6 +3065,8 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     // Guide-res (default): GCam's soft reject-grow. Twin of compute_robustness_gcam_sabre.
     Image dil = raw_res ? robustness_gcam_min_5x5(R_pre)
                         : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
+    // Opt-in extra HARD 5x5 min on top of §7 -- can only darken (min(window) <= center).
+    if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_5x5(dil);
     if (s_select_out) {
         *s_select_out = Image(dil.h, dil.w, 1);
         std::fill(s_select_out->data.begin(), s_select_out->data.end(), 1.f);
