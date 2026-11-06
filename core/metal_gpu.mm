@@ -3096,11 +3096,20 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     if (!cfg.gcam_sabre_min5x5 && dpipe) {
         id<MTLBuffer> b_dil = buf(nullptr, mask_b);
         if (b_dil) {
-            struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
+            struct RobGcamDilateParamsCPU { uint32_t h, w, dilate_2x, window; float deadzone, div, _p1, _p2; };
             RobGcamDilateParamsCPU dp{};
             dp.h = (uint32_t)th; dp.w = (uint32_t)tw;
             dp.dilate_2x = (!resample && cfg.gcam_sabre_dilate_2x) ? 1u : 0u;
-            dp.deadzone = cfg.gcam_sabre_dilate_deadzone; dp.div = cfg.gcam_sabre_dilate_div;
+            // Scale the dilate window (and deadzone/div by N^2/25) on the finer resample
+            // grid so the footprint stays 5 guide px (~20 output px). Twin of the host
+            // robustness_gcam_dilate window logic.
+            const int win = resample
+                ? std::max(1, (int)std::lround(5.0 * (double)th / (double)std::max(1, gh)))
+                : 5;
+            const float kscale = (float)(win * win) / 25.f;
+            dp.window = (uint32_t)win;
+            dp.deadzone = cfg.gcam_sabre_dilate_deadzone * kscale;
+            dp.div = cfg.gcam_sabre_dilate_div * kscale;
             id<MTLCommandBuffer> cmd2 = [c.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc2 = cmd2 ? [cmd2 computeCommandEncoder] : nil;
             if (enc2) {
@@ -3127,7 +3136,8 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
         // Raw-res: the 2x guide->quarter downsample is forced OFF (already finer than guide).
         if (resample) {
             Config c2 = cfg; c2.gcam_sabre_dilate_2x = false;
-            dil = robustness_gcam_dilate(R_pre, c2);
+            const int win = std::max(1, (int)std::lround(5.0 * (double)th / (double)std::max(1, gh)));
+            dil = robustness_gcam_dilate(R_pre, c2, win);
         } else {
             dil = robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
         }

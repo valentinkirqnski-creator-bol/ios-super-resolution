@@ -2013,17 +2013,26 @@ static inline void gcam_tile_bilinear(f32 raw_y, f32 raw_x, int tile_size,
 // downsample is dropped -- staying at guide resolution is a strictly finer mask
 // that plugs into our merge's nearest guide-res read; the contrast math is
 // unchanged. Edge-clamped.
-Image robustness_gcam_dilate(const Image& R, const Config& cfg) {
+Image robustness_gcam_dilate(const Image& R, const Config& cfg, int window) {
     if (R.h <= 0 || R.w <= 0) return R;
-    const f32 dz = cfg.gcam_sabre_dilate_deadzone;
-    const f32 dv = (cfg.gcam_sabre_dilate_div != 0.f) ? cfg.gcam_sabre_dilate_div : 1.f;
-    // 5x5 sum of neighbour rejection (1 - keep) centred at (cy,cx) -> keep weight,
+    // GCam's DilateMask is a 5x5 at GUIDE res -> a 5-guide-px (= 20-output-px at scale 2)
+    // physical footprint. When R is computed at a FINER grid (raw-res upsample: 2x the
+    // guide; merge-res: 4x), a literal 5x5 would reach only 10 / 5 output px. The caller
+    // passes window = round(5 * target/guide) so the footprint stays 5 guide px (~20
+    // output px). The tap count grows (N^2 vs 25), so scale deadzone AND div by N^2/25 to
+    // preserve GCam's (sum - 0.2)/2 contrast exactly for uniform regions.
+    const int N = (window >= 1) ? window : 5;
+    const int lo = -(N / 2), hi = N - 1 + lo;             // N taps, centred (even N: -N/2..N/2-1)
+    const f32 kscale = (f32)(N * N) / 25.f;
+    const f32 dz = cfg.gcam_sabre_dilate_deadzone * kscale;
+    const f32 dv = ((cfg.gcam_sabre_dilate_div != 0.f) ? cfg.gcam_sabre_dilate_div : 1.f) * kscale;
+    // N x N sum of neighbour rejection (1 - keep) centred at (cy,cx) -> keep weight,
     // via the (sum - deadzone)/div contrast rule. Edge-clamped.
     auto dilate_at = [&](int cy, int cx) -> f32 {
         f32 sum = 0.f;
-        for (int i = -2; i <= 2; ++i) {
+        for (int i = lo; i <= hi; ++i) {
             const int yy = (int)clampf((f32)(cy + i), 0.f, (f32)(R.h - 1));
-            for (int j = -2; j <= 2; ++j) {
+            for (int j = lo; j <= hi; ++j) {
                 const int xx = (int)clampf((f32)(cx + j), 0.f, (f32)(R.w - 1));
                 sum += 1.f - clampf(R.at(yy, xx, 0), 0.f, 1.f);   // rejection
             }
@@ -2591,7 +2600,11 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     Image dil;
     if (resample) {
         Config c2 = cfg; c2.gcam_sabre_dilate_2x = false;
-        dil = robustness_gcam_dilate(R, c2);
+        // R is at th (raw or output); GCam's 5x5 is at guide (gh). Scale the dilate window
+        // so its footprint stays 5 guide px (~20 output px at scale 2): raw-res -> 10,
+        // merge-res -> 20. (th/gh = 2 for raw, 4 for merge-output.)
+        const int win = std::max(1, (int)std::lround(5.0 * (double)th / (double)std::max(1, gh)));
+        dil = robustness_gcam_dilate(R, c2, win);
     } else {
         dil = robustness_gcam_dilate(R, cfg);
     }

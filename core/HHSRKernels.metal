@@ -2288,7 +2288,10 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
 // dilate_2x (GCam default): sample the 5x5 centred at the 2x-downsampled grid texel
 // (2*o+1) and nearest-upsample -> each output in a 2x2 block shares one decision,
 // matching the CPU coarse.at(o)=dilate_at(2o+1) + nearest-upsample.
-struct RobGcamDilateParams { uint h, w, dilate_2x, _pad; float deadzone, div, _p1, _p2; };
+// window (was _pad): N x N tap footprint; 0/5 = GCam's guide-res 5x5. On finer grids the
+// host passes a larger N (raw-res 10, merge-res 20) to keep the 5-guide-px (~20-output-px)
+// reach, with deadzone/div already scaled by N^2/25 host-side to preserve the contrast.
+struct RobGcamDilateParams { uint h, w, dilate_2x, window; float deadzone, div, _p1, _p2; };
 kernel void rob_gcam_dilate(device float* out [[buffer(0)]],
                             device const float* R [[buffer(1)]],
                             constant RobGcamDilateParams& p [[buffer(2)]],
@@ -2298,10 +2301,12 @@ kernel void rob_gcam_dilate(device float* out [[buffer(0)]],
     int cy, cx;
     if (p.dilate_2x != 0u) { cy = 2 * (int(gid.y) / 2) + 1; cx = 2 * (int(gid.x) / 2) + 1; }
     else                   { cy = int(gid.y);               cx = int(gid.x); }
+    int N = (p.window >= 1u) ? int(p.window) : 5;
+    int lo = -(N / 2), hi = N - 1 + lo;
     float sum = 0.f;
-    for (int i = -2; i <= 2; ++i) {
+    for (int i = lo; i <= hi; ++i) {
         int yy = clamp(cy + i, 0, H - 1);
-        for (int j = -2; j <= 2; ++j) {
+        for (int j = lo; j <= hi; ++j) {
             int xx = clamp(cx + j, 0, W - 1);
             sum += 1.f - clamp(R[uint(yy) * p.w + uint(xx)], 0.f, 1.f);   // rejection
         }
