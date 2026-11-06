@@ -1789,12 +1789,13 @@ struct Config {
     float gcam_sabre_motion_thresh   = 1.9236641e-4f; // §5.2/5.8 motion threshold (UV); converted to raw px as x tile_size x (4128/16) so the boost arms at GCam's flow GRADIENT independent of grid density/sensor res
     float gcam_sabre_dilate_deadzone = 0.2f;        // §7 dead-zone subtracted from the 25-neighbour rejection sum
     float gcam_sabre_dilate_div      = 2.0f;        // §7 divisor after the dead-zone
-    // §7 2x downsample: dilate AND halve the mask (guide-res -> quarter-Bayer), exactly
-    // as GCam does, then nearest-upsample the coarse result back to guide resolution so
-    // our guide-res merge applies GCam's blockier per-2x2-block decision unchanged.
-    // true = byte-for-byte GCam (coarser mask). false = keep it at full guide resolution
-    // (strictly finer / sharper rejection boundaries, less over-rejection of neighbours).
-    bool  gcam_sabre_dilate_2x       = true;
+    // §7 2x downsample: dilate AND halve the mask (guide-res -> quarter-Bayer), then
+    // nearest-upsample back. DEFAULT OFF: the recovered DilateMask shader does a plain
+    // same-resolution 5x5 dilate (gather at tex_coord +-{0.5,1.5} texels, no 2x on the
+    // coordinate), so dilate_2x=false is the byte-for-byte match. true = the coarser
+    // per-2x2-block variant (an earlier RE assumption; keep for A/B). The raw-res path
+    // forces this off regardless.
+    bool  gcam_sabre_dilate_2x       = false;
     // Monte-Carlo noise model (the paste's §3-§6). OFF (default): the guide's
     // green-only gate uses the reconstructed affine stand-in and the operator runs
     // noise-blind (gcam_sabre_rob_noise, default 0 = the measured device). ON:

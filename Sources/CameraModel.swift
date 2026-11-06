@@ -312,7 +312,8 @@ struct TuningParams: Equatable, Codable {
     /// §7: dilate AND 2× downsample the mask like GCam (coarser/blockier), then
     /// upsample back for our merge. true = byte-for-byte GCam. false = keep the mask
     /// at full guide resolution (finer, sharper boundaries).
-    var gcam_sabre_dilate_2x: Bool = true
+    // DEFAULT OFF: the real DilateMask shader is a same-res 5x5 dilate (no 2x downsample).
+    var gcam_sabre_dilate_2x: Bool = false
     /// GCam REJECTION_ONLY: on EVERY path, sample ref+comp with the sharper biquadratic
     /// (SampleBiquadraticAbsolute) + the biquadratic kFilterVarianceScale pair instead of
     /// the cubic B-spline (SampleBicubicAbsolute) + bicubic pair. Off = the exact

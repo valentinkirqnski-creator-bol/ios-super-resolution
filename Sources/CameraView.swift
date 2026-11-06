@@ -1248,7 +1248,7 @@ struct CameraView: View {
                         ispRow("Dilation Dead Zone", $cam.tuningParams.gcam_sabre_dilate_deadzone, 0.0...2.0, "%.2f")
                         Toggle("GCam 2× Dilation Downsample", isOn: $cam.tuningParams.gcam_sabre_dilate_2x)
                         Text("""
-                             ON (default) = byte-for-byte GCam: the mask is dilated and 2× downsampled to a quarter-Bayer grid, so each rejection decision governs a 2×2 block (coarser/blockier). OFF keeps the mask at full guide resolution — strictly finer, sharper rejection boundaries, and less over-rejection of good neighbours. Turn OFF if you want the cleaner mask; leave ON to match GCam exactly.
+                             OFF (default) = byte-for-byte GCam: the recovered DilateMask shader is a plain same-resolution 5×5 dilate (gather at ±0.5/±1.5 texels, no 2× on the coordinate). ON adds a 2× downsample to a quarter-Bayer grid so each rejection decision governs a 2×2 block (coarser/blockier) — an earlier RE assumption, kept for A/B. Leave OFF to match GCam exactly; the input-frame-res path forces it off regardless.
                              """)
                             .font(.footnote).foregroundColor(.secondary)
                         Toggle("Bilinear Upsample Mask to Output (guide-res)", isOn: $cam.tuningParams.gcam_sabre_bilinear_upscale)
