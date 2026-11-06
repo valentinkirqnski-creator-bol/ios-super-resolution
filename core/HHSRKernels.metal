@@ -946,7 +946,7 @@ struct MergeRefParams {
     // below (was _pad0).
     uint raw_res_robustness;
     uint cov_stride;    // see MergeCompParams::cov_stride
-    uint _pad1;
+    uint gcam_kernel;   // 1 = GCam merge kernel (precision cov, floor anchor, +eps). was _pad1
     uint _pad2;
     uint _pad3;         // 112 bytes, a multiple of 16 for setBytes
 };
@@ -1000,7 +1000,7 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
                            uint cov_stride,
                            float kmap_i, float kmap_j,
                            thread float& ixx, thread float& ixy, thread float& iyy,
-                           bool raw_det) {
+                           bool raw_det, bool no_invert = false) {
     const uint stride = (cov_stride == 3u) ? 3u : 4u;
     float frac_x = kmap_j - trunc(kmap_j);
     float frac_y = kmap_i - trunc(kmap_i);
@@ -1018,6 +1018,12 @@ inline void interp_inv_cov(device const float* covs, uint cov_h, uint cov_w,
     float xx = cov_lerp2(covs, cov_w, stride, fy, fx, cy, cx, frac_x, frac_y, 0);
     float xy = cov_lerp2(covs, cov_w, stride, fy, fx, cy, cx, frac_x, frac_y, 1);
     float yy = cov_lerp2(covs, cov_w, stride, fy, fx, cy, cx, frac_x, frac_y, 3);
+    if (no_invert) {
+        // GCam merge kernel: field holds the PRECISION; interpolate and use directly
+        // (no inversion, no soften). Twin of merge.cpp interp_inv_cov no_invert.
+        ixx = xx; ixy = xy; iyy = yy;
+        return;
+    }
     if (raw_det) {
         float det = xx * yy - xy * xy;
         if (fabs(det) > 1e-10f) {
@@ -1284,11 +1290,15 @@ static inline void merge_comp_contrib(device const float* img,
             kmap_i = lr_mov_y - 0.5f;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, p.cov_stride,
-                       kmap_i, kmap_j, ixx, ixy, iyy, true);
+                       kmap_i, kmap_j, ixx, ixy, iyy, true,
+                       /*no_invert=*/p.gcam_kernel != 0u);
     }
 
-    int center_j = lround_away(lr_mov_x);
-    int center_i = lround_away(lr_mov_y);
+    // GCam merge: floor anchor + (j+0.5) pixel-centre offset (SampleNeighborhoodRBF).
+    bool gk = (p.gcam_kernel != 0u);
+    float ctr = gk ? 0.5f : 0.f;
+    int center_j = gk ? int(floor(lr_mov_x)) : lround_away(lr_mov_x);
+    int center_i = gk ? int(floor(lr_mov_y)) : lround_away(lr_mov_y);
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -1300,8 +1310,8 @@ static inline void merge_comp_contrib(device const float* img,
 
             int channel = cfa_channel(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
-            float dist_x = float(j) - lr_mov_x;
-            float dist_y = float(i) - lr_mov_y;
+            float dist_x = (float(j) + ctr) - lr_mov_x;
+            float dist_y = (float(i) + ctr) - lr_mov_y;
             float z;
             if (p.iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
             else       z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
@@ -1495,11 +1505,15 @@ static inline void merge_ref_contrib(device const float* img,
             kmap_i = coarse_y;
         }
         interp_inv_cov(covs, p.cov_h, p.cov_w, p.cov_stride,
-                       kmap_i, kmap_j, ixx, ixy, iyy, false);
+                       kmap_i, kmap_j, ixx, ixy, iyy, false,
+                       /*no_invert=*/p.gcam_kernel != 0u);
     }
 
-    int center_j = int(round(coarse_x));
-    int center_i = int(round(coarse_y));
+    // GCam merge: floor anchor + (j+0.5) pixel-centre offset for the base frame too.
+    bool gk = (p.gcam_kernel != 0u);
+    float ctr = gk ? 0.5f : 0.f;
+    int center_j = gk ? int(floor(coarse_x)) : int(round(coarse_x));
+    int center_i = gk ? int(floor(coarse_y)) : int(round(coarse_y));
 
     float val0 = 0.f, val1 = 0.f, val2 = 0.f;
     float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
@@ -1511,14 +1525,14 @@ static inline void merge_ref_contrib(device const float* img,
 
             int channel = cfa_channel_ref(p, i, j);
             float c = img[uint(i) * p.lr_w + uint(j)];
-            float dist_x = float(j) - coarse_x;
-            float dist_y = float(i) - coarse_y;
+            float dist_x = (float(j) + ctr) - coarse_x;
+            float dist_y = (float(i) + ctr) - coarse_y;
             float y;
             if (p.iso) y = max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
             else       y = max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                     iyy * dist_y * dist_y);
             y /= additional_denoise_power;
-            float w = fast::exp(-0.5f * y); // see merge_accumulate_comp
+            float w = fast::exp(-0.5f * y) + (gk ? 5e-5f : 0.f); // see merge_accumulate_comp
 
             if (channel == 0)      { val0 += c * w; acc0 += w; }
             else if (channel == 1) { val1 += c * w; acc1 += w; }

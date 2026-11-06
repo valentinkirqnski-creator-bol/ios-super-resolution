@@ -4789,7 +4789,8 @@ struct MergeRefParamsCPU {
     // robustness_raw_resolution_active) -- was _pad0.
     uint32_t raw_res_robustness = 0;
     uint32_t cov_stride = 4;      // see MergeCompParamsCPU::cov_stride
-    uint32_t _pad1 = 0, _pad2 = 0, _pad3 = 0;
+    uint32_t gcam_kernel = 0;     // 1 = GCam merge kernel (precision cov, floor anchor, +eps)
+    uint32_t _pad2 = 0, _pad3 = 0;
 };
 static_assert(sizeof(MergeRefParamsCPU) == 112, "MergeRefParamsCPU layout");
 
@@ -5672,6 +5673,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
     rp.cfa11 = cfg.cfa.p[1][1];
     rp.raw_res_robustness = 0u;
     rp.cov_stride = g_bf.cov_stride;
+    rp.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
 
     MergeNormParamsCPU np = merge_norm_params(bh, Ws, nch, cfg);
     np.y0 = (uint32_t)y0;

@@ -68,7 +68,8 @@ static inline f32 sample_robustness_bilinear(const Image& robustness, f32 y, f32
 // ref (accumulate_ref): floor indices + modf fracs; invert_2x2 → I on singular.
 // comp (accumulate): int() indices + modf fracs; raw 1/det.
 static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
-                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det) {
+                                  f32& ixx, f32& ixy, f32& iyy, bool raw_det,
+                                  bool no_invert = false) {
     // math.modf: fractional part keeps sign of value
     f32 frac_x = kmap_j - std::trunc(kmap_j);
     f32 frac_y = kmap_i - std::trunc(kmap_i);
@@ -95,6 +96,14 @@ static inline void interp_inv_cov(const CovField& covs, f32 kmap_i, f32 kmap_j,
         return top + frac_y * (bot - top);
     };
     f32 xx = lerp2(0), xy = lerp2(1), yy = lerp2(3);
+    if (no_invert) {
+        // GCam merge kernel: the field already holds the PRECISION (inverse covariance);
+        // GCam bilinearly interpolates it and uses it directly (texture(kernel_covariance)
+        // + UNPACK, no inversion). Return the interpolated precision as-is -- no invert, no
+        // soften (GCam does neither).
+        ixx = xx; ixy = xy; iyy = yy;
+        return;
+    }
     if (raw_det) {
         f32 det = xx * yy - xy * xy;
         if (std::fabs(det) > 1e-10f) {
@@ -251,11 +260,18 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     kmap_j = lr_mov_x - 0.5f;
                     kmap_i = lr_mov_y - 0.5f;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/true,
+                               /*no_invert=*/cfg.gcam_sabre_kernel);
             }
 
-            const int center_j = cuda_round_to_int(lr_mov_x);
-            const int center_i = cuda_round_to_int(lr_mov_y);
+            // GCam SampleNeighborhoodRBF anchors at floor(coord) and measures the kernel
+            // offset from each neighbour's pixel CENTRE (pos+0.5): offset = (j+0.5) - coord.
+            // Our default path anchors at round() and uses offset = j - coord (a benign
+            // half-pixel). Match GCam exactly on the gcam-kernel path.
+            const bool gk = cfg.gcam_sabre_kernel;
+            const f32 ctr = gk ? 0.5f : 0.f;
+            const int center_j = gk ? (int)std::floor(lr_mov_x) : cuda_round_to_int(lr_mov_x);
+            const int center_i = gk ? (int)std::floor(lr_mov_y) : cuda_round_to_int(lr_mov_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -1; di <= 1; ++di) {
@@ -267,8 +283,8 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
                     const f32 c = img.at(i, j);
 
-                    const f32 dist_x = (f32)j - lr_mov_x;
-                    const f32 dist_y = (f32)i - lr_mov_y;
+                    const f32 dist_x = ((f32)j + ctr) - lr_mov_x;
+                    const f32 dist_y = ((f32)i + ctr) - lr_mov_y;
                     f32 z;
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
@@ -325,12 +341,16 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     kmap_j = coarse_x;
                     kmap_i = coarse_y;
                 }
-                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false);
+                interp_inv_cov(covs, kmap_i, kmap_j, ixx, ixy, iyy, /*raw_det=*/false,
+                               /*no_invert=*/cfg.gcam_sabre_kernel);
             }
 
-            // Python: center = round(coarse)
-            const int center_j = cuda_round_to_int(coarse_x);
-            const int center_i = cuda_round_to_int(coarse_y);
+            // Python: center = round(coarse). GCam merge kernel: floor anchor + (j+0.5)
+            // pixel-centre offset (matches SampleNeighborhoodRBF for the base frame too).
+            const bool gk = cfg.gcam_sabre_kernel;
+            const f32 ctr = gk ? 0.5f : 0.f;
+            const int center_j = gk ? (int)std::floor(coarse_x) : cuda_round_to_int(coarse_x);
+            const int center_i = gk ? (int)std::floor(coarse_y) : cuda_round_to_int(coarse_y);
 
             f32 val[3] = {0, 0, 0}, acc[3] = {0, 0, 0};
             for (int di = -rad; di <= rad; ++di) {
@@ -342,14 +362,16 @@ static void accumulate_ref(const Image& img, const CovField& covs, const Image* 
                     const int channel = cfg.bayer_mode ? cfg.cfa.p[i & 1][j & 1] : 0;
                     const f32 c = img.at(i, j);
 
-                    const f32 dist_x = (f32)j - coarse_x;
-                    const f32 dist_y = (f32)i - coarse_y;
+                    const f32 dist_x = ((f32)j + ctr) - coarse_x;
+                    const f32 dist_y = ((f32)i + ctr) - coarse_y;
                     f32 y;
                     if (iso) y = std::max(0.f, 2.f * (dist_x * dist_x + dist_y * dist_y));
                     else     y = std::max(0.f, ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y +
                                                  iyy * dist_y * dist_y);
                     y /= additional_denoise_power;
-                    const f32 w = std::exp(-0.5f * y);
+                    // GCam GetKernelWeight: exp2(-0.5 kd) + 5e-5 (exp2 reconciled via the
+                    // ln2-scaled precision on the gcam-kernel path).
+                    const f32 w = std::exp(-0.5f * y) + (gk ? 5e-5f : 0.f);
 
                     val[channel] += c * w;
                     acc[channel] += w;

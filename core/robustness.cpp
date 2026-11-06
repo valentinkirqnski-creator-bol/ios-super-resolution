@@ -1934,17 +1934,17 @@ CovField compute_gcam_kernel_cov(const Image& raw, const Config& cfg) {
             const f32 rr00 = nev1 * e1x * e1x + nev2 * e1y * e1y;
             const f32 rr11 = nev1 * e2x * e2x + nev2 * e2y * e2y;
             const f32 rr01 = nev1 * e1x * e2x + nev2 * e1y * e2y;
-            // P = kprec * rr ; store C = inv(P) (merge inverts C back to P)
-            const f32 Pxx = kprec * rr00, Pyy = kprec * rr11, Pxy = kprec * rr01;
-            const f32 det = Pxx * Pyy - Pxy * Pxy;
+            // Store the PRECISION P = kprec * rr DIRECTLY (not inv(P)): GCam's merge
+            // bilinearly interpolates this precision and uses it as-is in exp2(-0.5 o^T P o)
+            // (kernel_covariance_texture). Our merge, on the gcam-kernel path, reads it with
+            // interp_inv_cov(..., no_invert=true) -- interpolate, no inversion -- so the
+            // interpolation happens in the SAME (precision) domain as GCam. kprec folds in
+            // ln2 so our exp(-0.5 z) reproduces GCam's exp2.
             f32* c = out.at(y, x);
-            if (!std::isfinite(det) || std::fabs(det) < 1e-20f) {
-                const f32 iso = 1.f / std::max(kprec * base * base, 1e-20f);  // isotropic base
-                c[0] = iso; c[1] = 0.f; c[2] = 0.f; c[3] = iso;
-            } else {
-                const f32 inv = 1.f / det;
-                c[0] = Pyy * inv; c[1] = -Pxy * inv; c[2] = c[1]; c[3] = Pxx * inv;
-            }
+            c[0] = kprec * rr00;   // Pxx
+            c[1] = kprec * rr01;   // Pxy
+            c[2] = c[1];
+            c[3] = kprec * rr11;   // Pyy
         }
     });
     return out;
