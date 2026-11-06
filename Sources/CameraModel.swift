@@ -313,10 +313,10 @@ struct TuningParams: Equatable, Codable {
     /// upsample back for our merge. true = byte-for-byte GCam. false = keep the mask
     /// at full guide resolution (finer, sharper boundaries).
     var gcam_sabre_dilate_2x: Bool = true
-    /// GCam REJECTION_ONLY: guide-res only -- sample ref+comp with the sharper
-    /// biquadratic (SampleBiquadraticAbsolute) + the biquadratic kFilterVarianceScale
-    /// pair, instead of the smoothing cubic B-spline. More sensitive to small
-    /// sub-pixel misalignments. Off = the exact non-REJECTION_ONLY bicubic match.
+    /// GCam REJECTION_ONLY: on EVERY path, sample ref+comp with the sharper biquadratic
+    /// (SampleBiquadraticAbsolute) + the biquadratic kFilterVarianceScale pair instead of
+    /// the cubic B-spline (SampleBicubicAbsolute) + bicubic pair. Off = the exact
+    /// non-REJECTION_ONLY (#else) match.
     var gcam_sabre_rejection_only: Bool = false
     /// GCam ComputeGuideImage o_gauss_cov: build the MERGE kernel from the GCam structure
     /// tensor (ConstructGaussianCovariance) instead of estimate_kernels. Opt-in, merge-

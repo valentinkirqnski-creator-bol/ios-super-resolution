@@ -2177,15 +2177,12 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     // targets): BOTH ref and comp are bicubic-B-spline-abs sampled, green-only flag from
     // a POINT sample of the variance sign. Twin of compute_robustness_gcam_sabre's CPU
     // guide-res branch (shared kernel + prefilter-both keeps identical frames at d==0).
+    // GCam BaseFrameRefColor + Rejection current_values, IDENTICAL on every path:
+    // SampleBicubicAbsolute (rj=0) or SampleBiquadraticAbsolute (rj=1 = REJECTION_ONLY) of
+    // ref (unwarped) + comp (warped), abs taps, green-only sign from a POINT sample. Only
+    // gy/gx/sy/sx differ (integer guide vs Dodgson-upsampled). Twin of the CPU operator.
     float ref_var_signed, refc[3], curc[3], cur_a;
-    if (p.raw_res != 0u) {
-        ref_var_signed = rob_sample_dogson_or_inf(refg, p.h, p.w, 4u, gy, gx, 3u);
-        for (uint ch = 0u; ch < 3u; ++ch) {
-            refc[ch] = rob_sample_dogson_or_inf(refg, p.h, p.w, 4u, gy, gx, ch);
-            curc[ch] = rob_sample_dogson_or_inf(compg, p.h, p.w, 4u, sy, sx, ch);
-        }
-        cur_a = fabs(rob_sample_dogson_or_inf(compg, p.h, p.w, 4u, sy, sx, 3u));
-    } else {
+    {
         bool rj = (p.rejection_only != 0u);   // biquadratic (REJECTION_ONLY) vs B-spline
         uint iyy = uint(clamp(float(int(round(gy))), 0.f, float(p.h) - 1.f));
         uint ixx = uint(clamp(float(int(round(gx))), 0.f, float(p.w) - 1.f));

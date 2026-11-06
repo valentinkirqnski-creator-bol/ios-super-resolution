@@ -3045,8 +3045,9 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.flow_ny = (uint32_t)flow.ny; mp.flow_nx = (uint32_t)flow.nx;
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
-    // GCam REJECTION_ONLY (guide-res only): biquadratic sampler + biquadratic k pair.
-    const bool rej_only = cfg.gcam_sabre_rejection_only && !resample;
+    // GCam sampler variant on EVERY path: off = SampleBicubicAbsolute + bicubic k;
+    // on (REJECTION_ONLY) = SampleBiquadraticAbsolute + biquadratic k.
+    const bool rej_only = cfg.gcam_sabre_rejection_only;
     mp.k_rgb   = rej_only ? cfg.gcam_sabre_k_rgb_biquad   : cfg.gcam_sabre_k_rgb;
     mp.k_green = rej_only ? cfg.gcam_sabre_k_green_biquad : cfg.gcam_sabre_k_green;
     mp.rob_noise = cfg.gcam_sabre_rob_noise;

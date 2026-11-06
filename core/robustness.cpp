@@ -2355,11 +2355,13 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     // target resolution (and hence the Dodgson upscale factor) differs.
     const bool merge_res = cfg.gcam_sabre_merge_res;
     const bool raw_res = cfg.gcam_sabre_raw_res && !merge_res;
-    const bool resample = raw_res || merge_res;   // Dodgson-sample both guides
-    // GCam REJECTION_ONLY: guide-res only -- swap the bicubic B-spline for the sharper
-    // SampleBiquadraticAbsolute (Dodgson) + the biquadratic kFilterVarianceScale pair.
-    // Ignored on the resample paths (they already Dodgson-sample).
-    const bool rej_only = cfg.gcam_sabre_rejection_only && !resample;
+    const bool resample = raw_res || merge_res;   // upsample both guides to the target grid
+    // GCam's two BaseFrameRefColor/Rejection sampler variants, on EVERY path (guide-res
+    // AND raw/merge-res): off = SampleBicubicAbsolute (#else, cubic B-spline) + the bicubic
+    // kFilterVarianceScale pair; on = SampleBiquadraticAbsolute (#ifdef REJECTION_ONLY,
+    // sharper Dodgson) + the biquadratic pair. The resample paths sample at the upsampled
+    // (Dodgson-mapped) coordinates, still with the shader-exact kernel.
+    const bool rej_only = cfg.gcam_sabre_rejection_only;
     const f32 k_rgb_eff   = rej_only ? cfg.gcam_sabre_k_rgb_biquad   : cfg.gcam_sabre_k_rgb;
     const f32 k_green_eff = rej_only ? cfg.gcam_sabre_k_green_biquad : cfg.gcam_sabre_k_green;
     // Prefilter BOTH guides identically (GCam builds every frame's guide the same way
@@ -2449,46 +2451,30 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             }
             sx = gcam_mirror(sx, (f32)gw);                 // §5.3
             sy = gcam_mirror(sy, (f32)gh);
-            // §5.4 reference (unwarped) + comparison (flow-warped) statistics. Raw-res:
-            // both Dodgson-sampled from the guide (DodgsonApproximateQuadratic), signed,
-            // abs only on the variance magnitude (ch 3) -- sampling both the same way
-            // keeps identical frames at d==0. Guide-res: exact integer ref lookup +
-            // bicubic-abs comp (bit-exact with the original path).
+            // §5.4 GCam BaseFrameRefColor + Rejection current_values, IDENTICAL on every
+            // path: the reference (unwarped) and the comparison (flow-warped) guides are
+            // SampleBicubicAbsolute (cubic-B-spline abs) -- or SampleBiquadraticAbsolute
+            // (sharper Dodgson) when rej_only -- with the green-only flag from a POINT
+            // sample of the variance sign and the magnitude restored with that sign
+            // (reference_values.w = -reference_values.w). Only the gy/gx (ref) and sy/sx
+            // (comp) coordinates differ between guide-res (integer) and raw/merge-res
+            // (Dodgson-upsampled), computed above. Sampling both guides the same way and
+            // prefiltering both keeps identical frames at d==0.
+            auto gsamp = [&](const Image& g, f32 yy, f32 xx, int ch) -> f32 {
+                return rej_only ? sample_biquad_abs(g, yy, xx, ch)
+                                : sample_bicubic_abs(g, yy, xx, ch);
+            };
+            const int iy = std::min(std::max((int)std::lround(gy), 0), gh - 1);
+            const int ix = std::min(std::max((int)std::lround(gx), 0), gw - 1);
+            const bool green_pt = refg.at(iy, ix, 3) < 0.f;      // texture(guide, uv).w < 0
             f32 ref_var_signed, refc[3], curc[3], cur_a;
-            if (resample) {
-                ref_var_signed = sample_dogson(refg, gy, gx, 3);
-                for (int c = 0; c < 3; ++c) {
-                    refc[c] = sample_dogson(refg, gy, gx, c);
-                    curc[c] = sample_dogson(compg, sy, sx, c);
-                }
-                cur_a = std::fabs(sample_dogson(compg, sy, sx, 3));
-            } else {
-                // Guide-res (both toggles off): GCam BaseFrameRefColor + Rejection, the
-                // NON-REJECTION_ONLY (bicubic) variant -- which is the one our
-                // kFilterVarianceScale constants (gcam_sabre_k_rgb=0.0898866,
-                // k_green=0.211665) are calibrated to (the biquadratic/REJECTION_ONLY
-                // variant uses 0.0976597/0.25). So BOTH the reference (BaseFrameRefColor
-                // SampleBicubicAbsolute) and the warped comparison (Rejection's
-                // current_values SampleBicubicAbsolute) are cubic-B-spline-abs sampled.
-                // green-only flag from a POINT sample of the variance sign. Sharing the
-                // kernel (and prefiltering both guides) keeps identical frames at d==0.
-                // rej_only (GCam REJECTION_ONLY): SampleBiquadraticAbsolute in place of the
-                // B-spline -- sharper, more sensitive to sub-pixel misalignment.
-                auto gsamp = [&](const Image& g, f32 yy, f32 xx, int ch) -> f32 {
-                    return rej_only ? sample_biquad_abs(g, yy, xx, ch)
-                                    : sample_bicubic_abs(g, yy, xx, ch);
-                };
-                const int iy = std::min(std::max((int)std::lround(gy), 0), gh - 1);
-                const int ix = std::min(std::max((int)std::lround(gx), 0), gw - 1);
-                const bool green_pt = refg.at(iy, ix, 3) < 0.f;
-                const f32 ref_mag = std::fabs(gsamp(refg, gy, gx, 3));
-                ref_var_signed = green_pt ? -ref_mag : ref_mag;          // restore sign
-                for (int c = 0; c < 3; ++c) {
-                    refc[c] = gsamp(refg, gy, gx, c);
-                    curc[c] = gsamp(compg, sy, sx, c);
-                }
-                cur_a = gsamp(compg, sy, sx, 3);
+            const f32 ref_mag = std::fabs(gsamp(refg, gy, gx, 3));
+            ref_var_signed = green_pt ? -ref_mag : ref_mag;      // reference_values.w sign
+            for (int c = 0; c < 3; ++c) {
+                refc[c] = gsamp(refg, gy, gx, c);
+                curc[c] = gsamp(compg, sy, sx, c);
             }
+            cur_a = gsamp(compg, sy, sx, 3);
             const bool green_only = ref_var_signed < 0.f;
             f32 ref_a = std::fabs(ref_var_signed);
             // §5.5 noise at the reference luma. MC model on: ref/cur from the LUT
