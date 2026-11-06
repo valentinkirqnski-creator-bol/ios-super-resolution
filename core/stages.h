@@ -207,10 +207,7 @@ CovField compute_gcam_kernel_cov(const Image& raw, const Config& cfg);
 // GCam SABRE (§7): dilate a guide-resolution KEEP mask (R in [0,1]) by the
 // (sum25 - deadzone)/div rejection-contrast rule. Returns a guide-resolution keep
 // mask (the 2x downsample of the shader is dropped -- strictly finer, same math).
-// window = N x N tap footprint (default 5 = GCam's guide-res 5x5). Pass a larger N on
-// finer grids (raw-res: 10, merge-res: 20) to keep the 5-guide-px (~20-output-px)
-// physical reach; deadzone/div auto-scale by N^2/25 to preserve the contrast.
-Image robustness_gcam_dilate(const Image& R, const Config& cfg, int window = 5);
+Image robustness_gcam_dilate(const Image& R, const Config& cfg);
 // Paper Alg. 6 ComputeLocalMin: hard 5x5 minimum keep weight (R_hat = min over N5),
 // edge-clamped. The §7 refinement for the raw-res gcam path (gcam_sabre_raw_res).
 Image robustness_gcam_min_5x5(const Image& R);
