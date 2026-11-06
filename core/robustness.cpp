@@ -1980,6 +1980,34 @@ static f32 sample_bicubic_abs(const Image& g, f32 fy, f32 fx, int ch) {
     return (wacc != 0.f) ? buf / wacc : buf;
 }
 
+// GCam Rejection samples alt_flow_texture with texture() = BILINEAR interpolation of the
+// per-tile flow (x,y) AND the packed min-max motion extent (z). Tile (i,j) represents the
+// raw tile CENTRE at (i+0.5)*tile_size, so a raw position maps to tile coordinate
+// raw/tile - 0.5; blend the 4 surrounding tiles, edge-clamped (matches GL_LINEAR). Twin of
+// the inline form in rob_gcam_sabre (HHSRKernels.metal).
+static inline void gcam_tile_bilinear(f32 raw_y, f32 raw_x, int tile_size,
+                                      const FlowField& flow, const std::vector<f32>& irr,
+                                      f32& fdx, f32& fdy, f32& fz) {
+    const int ny = flow.ny, nx = flow.nx;
+    const f32 ty = raw_y / (f32)tile_size - 0.5f;
+    const f32 tx = raw_x / (f32)tile_size - 0.5f;
+    const int y0 = (int)std::floor(ty), x0 = (int)std::floor(tx);
+    const f32 wy = ty - (f32)y0, wx = tx - (f32)x0;
+    auto cl = [](int v, int hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+    const int ay = cl(y0, ny - 1), by = cl(y0 + 1, ny - 1);
+    const int ax = cl(x0, nx - 1), bx = cl(x0 + 1, nx - 1);
+    auto b2 = [&](f32 v00, f32 v01, f32 v10, f32 v11) {
+        const f32 top = v00 + (v01 - v00) * wx, bot = v10 + (v11 - v10) * wx;
+        return top + (bot - top) * wy;
+    };
+    fdx = b2(flow.dx(ay, ax), flow.dx(ay, bx), flow.dx(by, ax), flow.dx(by, bx));
+    fdy = b2(flow.dy(ay, ax), flow.dy(ay, bx), flow.dy(by, ax), flow.dy(by, bx));
+    auto IR = [&](int i, int j) -> f32 {
+        const size_t p = (size_t)i * nx + j; return p < irr.size() ? irr[p] : 0.f;
+    };
+    fz = b2(IR(ay, ax), IR(ay, bx), IR(by, ax), IR(by, bx));
+}
+
 // §7 dilation: grade each guide pixel by the 5x5 sum of neighbours' rejection
 // (1 - keep), apply (sum - deadzone)/div, store the keep mask. The shader's 2x
 // downsample is dropped -- staying at guide resolution is a strictly finer mask
@@ -2430,18 +2458,26 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 gy = clampf(((f32)ry + 0.5f) * g_per_ty - 0.5f, 0.f, (f32)(gh - 1));
                 gx = clampf(((f32)rx + 0.5f) * g_per_tx - 0.5f, 0.f, (f32)(gw - 1));
             } else { gy = (f32)ry; gx = (f32)rx; }
-            // §5.1 flow (piecewise per tile), raw tile index (2*g ~ raw); the flow is
-            // halved to guide units because the stats are sampled in guide coords.
+            // §5.1 flow at the raw position (2*g ~ raw); halved to guide units because the
+            // stats are sampled in guide coords. GCam does texture(alt_flow_texture) =
+            // BILINEAR over the per-tile flow AND the packed flow.z motion extent -- so we
+            // bilinearly blend the surrounding tiles (gcam_tile_bilinear), not the nearest
+            // tile. (The affine-flow path keeps its own per-tile affine sampling.)
             const int patch_idy = (int)((2.f * gy + 0.5f) / (f32)tile_size);
             const int patch_idx = (int)((2.f * gx + 0.5f) / (f32)tile_size);
-            f32 flow_x, flow_y;
+            f32 flow_x, flow_y, motion_extent;
             if (aff) {
                 f32 rdx, rdy;
                 flow.sample_affine(2.f * gy + 0.5f, 2.f * gx + 0.5f, tile_size, rdx, rdy);
                 flow_x = 0.5f * rdx; flow_y = 0.5f * rdy;
+                const size_t pidx = (size_t)std::min(std::max(patch_idy, 0), std::max(0, flow.ny - 1)) *
+                                        (size_t)std::max(1, flow.nx) +
+                                    std::min(std::max(patch_idx, 0), std::max(0, flow.nx - 1));
+                motion_extent = (pidx < irr.size()) ? irr[pidx] : 0.f;
             } else {
-                flow_x = 0.5f * flow.dx(patch_idy, patch_idx);
-                flow_y = 0.5f * flow.dy(patch_idy, patch_idx);
+                f32 fdx, fdy, fz;
+                gcam_tile_bilinear(2.f * gy + 0.5f, 2.f * gx + 0.5f, tile_size, flow, irr, fdx, fdy, fz);
+                flow_x = 0.5f * fdx; flow_y = 0.5f * fdy; motion_extent = fz;
             }
             f32 sx = gx + flow_x, sy = gy + flow_y;
             if (flow.has_global_h) {
@@ -2507,8 +2543,7 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
             const f32 min_variance = green_only
                 ? ref_noise[1]
                 : (ref_noise[0] + ref_noise[1] + ref_noise[2]) / 3.f;
-            const size_t pidx = (size_t)patch_idy * (size_t)std::max(1, flow.nx) + patch_idx;
-            const f32 motion_extent = (pidx < irr.size()) ? irr[pidx] : 0.f;
+            // motion_extent (= GCam flow.z, bilinearly sampled above) drives the boost.
             const bool motion_prior = motion_extent > motion_thresh;
             f32 boost = 1.f;
             if (ref_a > cfg.gcam_sabre_boost_var_mult * min_variance && motion_prior)

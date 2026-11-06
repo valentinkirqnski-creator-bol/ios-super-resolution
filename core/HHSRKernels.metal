@@ -2153,14 +2153,22 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
         gy = clamp((float(ty) + 0.5f) * gpt_y - 0.5f, 0.f, float(p.h) - 1.f);
         gx = clamp((float(tx) + 0.5f) * gpt_x - 0.5f, 0.f, float(p.w) - 1.f);
     } else { gy = float(ty); gx = float(tx); }
-    // §5.1 piecewise per-tile flow (nearest), guide->raw->guide (2*g ~ raw).
-    uint patch_idy = uint((2.f * gy + 0.5f) / float(max(p.tile_size, 1u)));
-    uint patch_idx = uint((2.f * gx + 0.5f) / float(max(p.tile_size, 1u)));
-    patch_idy = min(patch_idy, (p.flow_ny > 0u) ? p.flow_ny - 1u : 0u);
-    patch_idx = min(patch_idx, (p.flow_nx > 0u) ? p.flow_nx - 1u : 0u);
-    uint tofs = (patch_idy * p.flow_nx + patch_idx) * 2u;
-    float sx = gx + 0.5f * flow[tofs + 0u];
-    float sy = gy + 0.5f * flow[tofs + 1u];
+    // §5.1 GCam texture(alt_flow_texture) = BILINEAR per-tile flow + flow.z (motion
+    // extent). Tile centre at (i+0.5)*tile -> tile coord = raw/tile - 0.5; blend 4 tiles,
+    // edge-clamped. Twin of gcam_tile_bilinear (robustness.cpp).
+    float t_y = (2.f * gy + 0.5f) / float(max(p.tile_size, 1u)) - 0.5f;
+    float t_x = (2.f * gx + 0.5f) / float(max(p.tile_size, 1u)) - 0.5f;
+    int fy0 = int(floor(t_y)), fx0 = int(floor(t_x));
+    float wfy = t_y - float(fy0), wfx = t_x - float(fx0);
+    int ny1 = max(int(p.flow_ny) - 1, 0), nx1 = max(int(p.flow_nx) - 1, 0);
+    uint ay = uint(clamp(fy0, 0, ny1)), byy = uint(clamp(fy0 + 1, 0, ny1));
+    uint axx = uint(clamp(fx0, 0, nx1)), bxx = uint(clamp(fx0 + 1, 0, nx1));
+    uint i00 = (ay * p.flow_nx + axx) * 2u, i01 = (ay * p.flow_nx + bxx) * 2u;
+    uint i10 = (byy * p.flow_nx + axx) * 2u, i11 = (byy * p.flow_nx + bxx) * 2u;
+    float fdx = mix(mix(flow[i00 + 0u], flow[i01 + 0u], wfx), mix(flow[i10 + 0u], flow[i11 + 0u], wfx), wfy);
+    float fdy = mix(mix(flow[i00 + 1u], flow[i01 + 1u], wfx), mix(flow[i10 + 1u], flow[i11 + 1u], wfx), wfy);
+    float sx = gx + 0.5f * fdx;
+    float sy = gy + 0.5f * fdy;
     if (p.use_homography != 0u) {
         float X = 2.f * sx, Y = 2.f * sy;
         float hx = p.hmat[0] * X + p.hmat[1] * Y + p.hmat[2];
@@ -2225,7 +2233,8 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
     for (uint ch = 0u; ch < 3u; ++ch) noise_variance[ch] = ref_noise[ch] + cur_noise[ch];
     // §5.8 motion-aware boost.
     float min_variance = green_only ? ref_noise[1] : (ref_noise[0] + ref_noise[1] + ref_noise[2]) / 3.f;
-    float motion_extent = irr[patch_idy * p.flow_nx + patch_idx];
+    float motion_extent = mix(mix(irr[ay * p.flow_nx + axx], irr[ay * p.flow_nx + bxx], wfx),
+                              mix(irr[byy * p.flow_nx + axx], irr[byy * p.flow_nx + bxx], wfx), wfy);
     bool motion_prior = motion_extent > p.motion_thresh;
     float boost = 1.f;
     if (ref_a > p.boost_var_mult * min_variance && motion_prior) boost = p.boost;
