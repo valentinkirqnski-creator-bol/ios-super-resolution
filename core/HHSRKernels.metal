@@ -912,6 +912,9 @@ struct MergeCompParams {
     // read it 1:1 (nearest) at the output pixel, bypassing the guide/raw rescale
     // and rob_bilinear. (was implicit padding at struct end.)
     uint rob_output_res;
+    // 1 = GCam merge kernel (Config::gcam_sabre_kernel): add the +5e-5 kernel epsilon
+    // and MirrorUVs the warped sample at the border instead of skipping it.
+    uint gcam_kernel;
 };
 
 struct MergeRefParams {
@@ -1252,9 +1255,20 @@ static inline void merge_comp_contrib(device const float* img,
         float hy = (p.hmat[3] * lr_mov_x + p.hmat[4] * lr_mov_y + p.hmat[5]) * iwq;
         lr_mov_x = hx; lr_mov_y = hy;
     }
-    if (!(lr_mov_x >= 0.f && lr_mov_x < float(p.lr_w) &&
-          lr_mov_y >= 0.f && lr_mov_y < float(p.lr_h)))
+    if (p.gcam_kernel != 0u) {
+        // GCam Merge MirrorUVs: reflect the warped sample into the frame ([1, lr-2])
+        // instead of skipping, so border pixels still merge. Reads the real pixel.
+        float hx2 = float(p.lr_w) - 2.f, hy2 = float(p.lr_h) - 2.f;
+        if (lr_mov_x < 1.f) lr_mov_x = 2.f - lr_mov_x;
+        if (lr_mov_x > hx2) lr_mov_x = 2.f * hx2 - lr_mov_x;
+        if (lr_mov_y < 1.f) lr_mov_y = 2.f - lr_mov_y;
+        if (lr_mov_y > hy2) lr_mov_y = 2.f * hy2 - lr_mov_y;
+        lr_mov_x = clamp(lr_mov_x, 1.f, hx2);
+        lr_mov_y = clamp(lr_mov_y, 1.f, hy2);
+    } else if (!(lr_mov_x >= 0.f && lr_mov_x < float(p.lr_w) &&
+                 lr_mov_y >= 0.f && lr_mov_y < float(p.lr_h))) {
         return;
+    }
 
     float ixx = 0.f, ixy = 0.f, iyy = 0.f;
     if (!p.iso) {
@@ -1296,7 +1310,7 @@ static inline void merge_comp_contrib(device const float* img,
             // precise range reduction. Called 9x per output pixel per frame, so
             // it is a measurable share of this kernel. The relative error is
             // ~1e-7, far below one 16-bit LSB; tools/compare_dng.py gates it.
-            float w = fast::exp(-0.5f * z);
+            float w = fast::exp(-0.5f * z) + (p.gcam_kernel != 0u ? 5e-5f : 0.f);
 
             float lr_c = (channel == 0) ? local_r0 : (channel == 1) ? local_r1 : local_r2;
             float contrib_v = w * lr_c * c;

@@ -220,9 +220,22 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                 apply_homography(flow.global_h, lr_mov_x, lr_mov_y, hx, hy);
                 lr_mov_x = hx; lr_mov_y = hy;
             }
-            if (!(lr_mov_x >= 0.f && lr_mov_x < (f32)lr_w &&
-                  lr_mov_y >= 0.f && lr_mov_y < (f32)lr_h))
+            if (cfg.gcam_sabre_kernel) {
+                // GCam Merge MirrorUVs: reflect the warped sample back into the frame
+                // (inset by the 3x3 footprint, [1, lr-2]) instead of skipping out-of-frame
+                // samples, so border pixels still merge. One reflection per side, then
+                // clamp. Reads the real mirrored pixel (correct CFA phase).
+                auto mir = [](f32 v, f32 hi) {
+                    if (v < 1.f) v = 2.f - v;
+                    if (v > hi)  v = 2.f * hi - v;
+                    return clampf(v, 1.f, hi);
+                };
+                lr_mov_x = mir(lr_mov_x, (f32)(lr_w - 2));
+                lr_mov_y = mir(lr_mov_y, (f32)(lr_h - 2));
+            } else if (!(lr_mov_x >= 0.f && lr_mov_x < (f32)lr_w &&
+                         lr_mov_y >= 0.f && lr_mov_y < (f32)lr_h)) {
                 continue;
+            }
 
             f32 ixx = 0.f, ixy = 0.f, iyy = 0.f;
             if (!iso) {
@@ -260,7 +273,10 @@ static void accumulate_comp(const Image& img, const FlowField& flow, const CovFi
                     if (iso) z = 2.f * (dist_x * dist_x + dist_y * dist_y);
                     else     z = ixx * dist_x * dist_x + 2.f * ixy * dist_x * dist_y + iyy * dist_y * dist_y;
                     z = std::max(0.f, z);
-                    const f32 w = std::exp(-0.5f * z);
+                    // GCam GetKernelWeight = exp2(-0.5*kd) + 5e-5. On the gcam-kernel path
+                    // the stored covariance folds in ln2, so exp(-0.5*z) == exp2(...); add
+                    // GCam's kEpsilon so far taps keep a tiny floor (matches the merge).
+                    const f32 w = std::exp(-0.5f * z) + (cfg.gcam_sabre_kernel ? 5e-5f : 0.f);
 
                     const f32 lr_c = local_r[channel < 3 ? channel : 2];
                     val[channel] += w * lr_c * c;

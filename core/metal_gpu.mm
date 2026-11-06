@@ -4770,8 +4770,10 @@ struct MergeCompParamsCPU {
     // 1 = robustness mask at the merge-OUTPUT grid (gcam_sabre_merge_res): read 1:1
     // (nearest) at the output pixel. Keep last to match MergeCompParams in the metal.
     uint32_t rob_output_res = 0;
+    // 1 = GCam merge kernel (gcam_sabre_kernel): +5e-5 kernel epsilon + border MirrorUVs.
+    uint32_t gcam_kernel = 0;
 };
-static_assert(sizeof(MergeCompParamsCPU) == 188, "MergeCompParamsCPU layout");
+static_assert(sizeof(MergeCompParamsCPU) == 192, "MergeCompParamsCPU layout");
 
 struct MergeRefParamsCPU {
     uint32_t band_h, Ws, y0, lr_h, lr_w;
@@ -5611,6 +5613,7 @@ bool metal_merge_band_fused(const int* comp_slots, int n_comp, int ref_slot,
         p.rob_output_res =
             (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
              p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
+        p.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
         p.flow_bilinear = 0u;
         // robustness_guide_res_bilinear: bilinear fetch = the guide-res mask's
         // upsample to the merge grid.
@@ -5917,6 +5920,7 @@ bool merge_comp_band_metal(const Image& comp_raw, const FlowField& flow,
     p.rob_output_res =
         (p.rob_h == (uint32_t)std::llround((double)p.lr_h * (double)p.scale) &&
          p.rob_w == (uint32_t)std::llround((double)p.lr_w * (double)p.scale)) ? 1u : 0u;
+    p.gcam_kernel = cfg.gcam_sabre_kernel ? 1u : 0u;
     // Global pre-align homography: the comp pixels are fetched at comp_pos =
     // H*(lr+flow). Without it a pre-aligned burst is fetched in the wrong pose ->
     // ghosted/blurred output. The direct call has the frame's flow in hand, but
