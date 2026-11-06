@@ -8,6 +8,13 @@
 namespace hhsr {
 
 CovField estimate_kernels(const Image& raw, const Config& cfg) {
+    // GCam ComputeGuideImage o_gauss_cov: build the merge kernel from the GCam structure
+    // tensor instead of Alg.5. Runs on the host (CPU) on both platforms for now; a Metal
+    // twin is TODO. Falls through to the standard estimator if it returns empty.
+    if (cfg.robustness_gcam_enabled && cfg.gcam_sabre_kernel) {
+        CovField k = compute_gcam_kernel_cov(raw, cfg);
+        if (k.h > 0 && k.w > 0) return k;
+    }
 #ifdef __APPLE__
     // Metal GPU only — same Alg. 5 math as the CPU path below (golden reference).
     CovField gpu = estimate_kernels_metal(raw, cfg);

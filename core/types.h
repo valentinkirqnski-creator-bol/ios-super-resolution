@@ -1762,6 +1762,25 @@ struct Config {
     float gcam_sabre_k_green         = 0.211665f;   // §3.5 kFilterVarianceScale, green-only path
     float gcam_sabre_k_rgb_biquad    = 0.0976597f;  // §3.5 kFilterVarianceScale, RGB biquadratic (REJECTION_ONLY)
     float gcam_sabre_k_green_biquad  = 0.25f;       // §3.5 kFilterVarianceScale, green-only biquadratic (REJECTION_ONLY)
+    // ---- GCam ComputeGuideImage o_gauss_cov: the MERGE KERNEL covariance (structure-
+    // tensor -> ConstructGaussianCovariance), NOT the robustness mask. When on (and
+    // robustness_gcam_enabled) the merge kernel is built from the GCam structure tensor
+    // instead of estimate_kernels. The six covariance_parameters are PER-SHOT in GCam
+    // (derived at runtime from zoom x ISO/gain); these defaults are the realshot2 clean
+    // 2x-SRZ green-path capture -- re-tune for a different zoom/ISO. Opt-in: this is a
+    // merge-critical change and the constants are shot-specific.
+    bool  gcam_sabre_kernel          = false;
+    float gcam_cov_shrinked_sigma    = 6.0f;        // cov_parameters1.x (precision eigenvalue, sharpen along gradient)
+    float gcam_cov_stretched_sigma   = 1.33333f;    // cov_parameters1.y (widen along the edge)
+    float gcam_cov_gradient_clip     = 0.001f;      // cov_parameters1.z (denoise gradient threshold)
+    float gcam_cov_base_sigma        = 4.0f;        // cov_parameters1.w (isotropic default)
+    float gcam_cov_blurred_sigma     = 1.1630679f;  // cov_parameters2.x (widest, flat/undercovered)
+    float gcam_cov_gradient_transition = 86.18796f; // cov_parameters2.y
+    // Offset-unit calibration: GCam's merge consumes rr as exp2(-0.5 o^T rr o); our merge
+    // is exp(-0.5 o^T P o). We set P = ln2 * gcam_cov_scale * rr so the exp2 kernel is
+    // reproduced (scale=1) and the absolute kernel SIZE can be tuned if GCam's merge
+    // offset units differ from ours.
+    float gcam_cov_scale             = 1.0f;
     float gcam_sabre_rob_noise       = 0.0f;        // §3.6 robustness-operator noise scale (0=device, 1=paper LUT)
     float gcam_sabre_mult_rgb        = 0.07f;       // §5.9 color_difference_multiplier, RGB
     float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only

@@ -200,6 +200,10 @@ GcamNoiseLut build_gcam_noise_lut(const Config& cfg);
 // prefilter_ref is true the §2.10 sign-preserving B-spline pre-filter is applied
 // (reference frame); comparison guides pass false. Exposed for the Metal host.
 Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref);
+// GCam ComputeGuideImage's o_gauss_cov: merge KERNEL covariance from the structure
+// tensor (guide res), stored as the merge COVARIANCE our exp(-0.5) merge consumes.
+// Used in place of estimate_kernels when robustness_gcam_enabled && gcam_sabre_kernel.
+CovField compute_gcam_kernel_cov(const Image& raw, const Config& cfg);
 // GCam SABRE (§7): dilate a guide-resolution KEEP mask (R in [0,1]) by the
 // (sum25 - deadzone)/div rejection-contrast rule. Returns a guide-resolution keep
 // mask (the 2x downsample of the shader is dropped -- strictly finer, same math).

@@ -1803,6 +1803,153 @@ Image compute_gcam_guide(const Image& raw, const Config& cfg, bool prefilter_ref
     return prefilter_ref ? gcam_prefilter_ref(guide) : guide;
 }
 
+// GCam ComputeGuideImage SECOND output (o_gauss_cov): the merge KERNEL covariance from
+// local structure-tensor analysis, in sqrt (perceptual) space. EXACT port of
+// ComputeStructureTensorFromGreen -> RotateStructureTensor -> AnalyzeStructureTensor ->
+// ComputeGradientBlurring -> ConstructGaussianCovariance (bayer_4.glsl). GCam's result
+// rr is the PRECISION (inverse covariance) consumed as exp2(-0.5 o^T rr o); our merge is
+// exp(-0.5 o^T P o) over a stored COVARIANCE C=inv(P) that interp_inv_cov inverts. So we
+// set P = ln2 * gcam_cov_scale * rr and store C=inv(P): the merge reproduces GCam's exp2
+// kernel (scale=1). Guide resolution (raw/2), matching estimate_kernels' grey-decimate
+// grid. The rr off-diagonal uses transpose(R)*D*R (see memory gcam-cfa-stencil-and-rr01).
+// PACK/UNPACK (10-bit RGB10_A2 quantization) is intentionally dropped -- float is exact.
+CovField compute_gcam_kernel_cov(const Image& raw, const Config& cfg) {
+    if (raw.h <= 0 || raw.w <= 0 || !cfg.bayer_mode ||
+        raw.data.size() < (size_t)raw.h * (size_t)raw.w)
+        return CovField();
+    const int gh = raw.h / 2, gw = raw.w / 2;
+    if (gh <= 0 || gw <= 0) return CovField();
+    CovField out(gh, gw);
+
+    // CFA layout: R and B sites; Gr = green sharing R's row, Gb = green sharing B's row.
+    int ry = 0, rx = 0, by = 0, bx = 0;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            const uint8_t c = cfg.cfa.p[i][j];
+            if (c == 0) { ry = i; rx = j; } else if (c == 2) { by = i; bx = j; }
+        }
+    // bayer_4.glsl groupings: green_0/green_1 assignment and the gradient-formula branch.
+    const bool blue_top    = (by == 0);               // BGGR/GBRG -> green_0=Gb, green_1=Gr
+    const bool diag_branch = (cfg.cfa.p[0][0] == 1);  // GBRG/GRBG use the diagonal formulas
+
+    auto quad = [&](int qy, int qx, f32& R, f32& Gr, f32& Gb, f32& B) {
+        qy = (int)clampf((f32)qy, 0.f, (f32)(gh - 1));
+        qx = (int)clampf((f32)qx, 0.f, (f32)(gw - 1));
+        const f32 vR  = raw.at(2 * qy + ry, 2 * qx + rx);
+        const f32 vB  = raw.at(2 * qy + by, 2 * qx + bx);
+        const f32 vGr = raw.at(2 * qy + ry, 2 * qx + (1 - rx));  // green on R's row
+        const f32 vGb = raw.at(2 * qy + by, 2 * qx + (1 - bx));  // green on B's row
+        R  = std::sqrt(std::max(0.f, vR));  B  = std::sqrt(std::max(0.f, vB));
+        Gr = std::sqrt(std::max(0.f, vGr)); Gb = std::sqrt(std::max(0.f, vGb));
+    };
+
+    const bool use_mc = cfg.gcam_sabre_noise_model;
+    const GcamNoiseLut mc_lut = use_mc ? build_gcam_noise_lut(cfg) : GcamNoiseLut{};
+    static constexpr f32 W3[3] = {0.25f, 0.5f, 0.25f};
+    const f32 LN2 = 0.69314718056f;
+    const f32 kprec = LN2 * ((cfg.gcam_cov_scale != 0.f) ? cfg.gcam_cov_scale : 1.f);
+    auto mix = [](f32 a, f32 b, f32 t) { return a + (b - a) * t; };
+
+    parallel_rows(gh, cfg.num_threads, [&](int y) {
+        for (int x = 0; x < gw; ++x) {
+            f32 g0[9], g1[9];              // green_0_values / green_1_values (3x3 quads)
+            f32 avg[3] = {0, 0, 0};
+            f32 gm0 = 0.f, gm1 = 0.f;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    f32 R, Gr, Gb, B; quad(y + dy, x + dx, R, Gr, Gb, B);
+                    const int idx = (dy + 1) * 3 + (dx + 1);
+                    g0[idx] = blue_top ? Gb : Gr;
+                    g1[idx] = blue_top ? Gr : Gb;
+                    const f32 rgb[3] = {R, 0.5f * (Gr + Gb), B};
+                    const f32 wq = W3[dy + 1] * W3[dx + 1];
+                    for (int c = 0; c < 3; ++c) avg[c] += wq * rgb[c];
+                    gm0 += Gr + Gb; gm1 += Gr * Gr + Gb * Gb;
+                }
+            const f32 gmean = gm0 / 18.f;
+            const f32 green_var = std::max(0.f, gm1 / 18.f - gmean * gmean);
+            const f32 avg_luma = 0.25f * avg[0] + 0.5f * avg[1] + 0.25f * avg[2];
+            f32 green_var_noise;
+            if (use_mc) green_var_noise = 2.f * gcam_lut_sample(mc_lut, avg_luma, 1, 1);
+            else { f32 nl[3]; gcam_noise_lut(cfg, avg_luma, nl); green_var_noise = 2.f * nl[1]; }
+
+            // ---- ComputeStructureTensorFromGreen (sqrt space) ----
+            f32 st[4] = {0, 0, 0, 0};      // Sxx, Syy, Sxy, N
+            for (int sy = 0; sy < 2; ++sy)
+                for (int sx = 0; sx < 2; ++sx) {
+                    const f32 G00 = g0[sy * 3 + sx],       G01 = g0[sy * 3 + sx + 1];
+                    const f32 G10 = g1[sy * 3 + sx],       G11 = g1[sy * 3 + sx + 1];
+                    const f32 G20 = g0[(sy + 1) * 3 + sx], G21 = g0[(sy + 1) * 3 + sx + 1];
+                    const f32 G30 = g1[(sy + 1) * 3 + sx], G31 = g1[(sy + 1) * 3 + sx + 1];
+                    f32 b_dx, b_dy, r_dx, r_dy, g1_dx, g1_dy, g2_dx, g2_dy;
+                    if (diag_branch) {
+                        b_dx = 0.5f * ((G11 - G01) + (G21 - G10)); b_dy = 0.5f * ((G01 - G10) + (G11 - G21));
+                        r_dx = 0.5f * ((G21 - G10) + (G30 - G20)); r_dy = 0.5f * ((G21 - G30) + (G10 - G20));
+                    } else {
+                        b_dx = 0.5f * ((G11 - G00) + (G20 - G10)); b_dy = 0.5f * ((G00 - G10) + (G11 - G20));
+                        r_dx = 0.5f * ((G21 - G11) + (G31 - G20)); r_dy = 0.5f * ((G21 - G31) + (G11 - G20));
+                    }
+                    g1_dx = 0.5f * (G21 - G00); g1_dy = 0.5f * (G01 - G20);
+                    g2_dx = 0.5f * (G31 - G10); g2_dy = 0.5f * (G11 - G30);
+                    st[0] += b_dx * b_dx + r_dx * r_dx + g1_dx * g1_dx + g2_dx * g2_dx;
+                    st[1] += b_dy * b_dy + r_dy * r_dy + g1_dy * g1_dy + g2_dy * g2_dy;
+                    st[2] += b_dx * b_dy + r_dx * r_dy + g1_dx * g1_dy + g2_dx * g2_dy;
+                }
+            st[0] /= 16.f; st[1] /= 16.f; st[2] /= 16.f; st[3] = 3.f / 4.f;
+            // RotateStructureTensor (45deg)
+            {
+                const f32 c0 = 0.5f * (st[0] + st[1]), c1 = 0.5f * (st[1] - st[0]);
+                const f32 nx = c0 + st[2], ny = c0 - st[2], nz = c1;
+                st[0] = nx; st[1] = ny; st[2] = nz;   // st[3] (N) unchanged
+            }
+            // AnalyzeStructureTensor(st, green_var_noise)
+            const f32 sum_xx = st[0], sum_yy = st[1], sum_xy = st[2];
+            const f32 trace = sum_xx + sum_yy, diff = sum_xx - sum_yy;
+            const f32 sqrt_d = std::sqrt(std::max(diff * diff + 4.f * sum_xy * sum_xy, 0.f));
+            const f32 ev1 = (trace + sqrt_d) * 0.5f, ev2 = (trace - sqrt_d) * 0.5f;
+            f32 e1x = 1.f, e1y = 0.f, e2x = 0.f, e2y = 1.f;
+            if (std::fabs(sum_xy) > 1e-4f) {
+                f32 vx = sum_xy, vy = ev1 - sum_xx; const f32 n = std::sqrt(vx * vx + vy * vy);
+                if (n > 0.f) { vx /= n; vy /= n; }
+                const f32 s = (sum_xy < 0.f) ? 1.f : -1.f;     // * -sign(sum_xy)
+                e1x = vx * s; e1y = vy * s; e2x = -e1y; e2y = e1x;
+            } else if (sum_xx < sum_yy) { e1x = 0.f; e1y = 1.f; e2x = 1.f; e2y = 0.f; }
+            const f32 sv1 = std::sqrt(std::max(ev1, 0.f));
+            const f32 sv2 = std::sqrt(std::max(ev2, 0.f));
+            const f32 noise_corr = st[3] * green_var_noise;
+            f32 ev1d = ev1; ev1d *= ev1d / (ev1d + noise_corr + 1e-30f);
+            const f32 strength = std::sqrt(std::max(ev1d, 0.f));
+            const f32 coherence = (sv1 - sv2) / (sv1 + sv2 + 1e-6f);
+            const f32 green_std = std::sqrt(green_var * green_var / (green_var + green_var_noise + 1e-30f));
+            // ConstructGaussianCovariance
+            const f32 base = cfg.gcam_cov_base_sigma, shrk = cfg.gcam_cov_shrinked_sigma;
+            const f32 strc = cfg.gcam_cov_stretched_sigma, blur = cfg.gcam_cov_blurred_sigma;
+            const f32 dom = std::max(strength, green_std) - cfg.gcam_cov_gradient_clip;
+            const f32 gb  = clampf(1.f - dom * cfg.gcam_cov_gradient_transition, 0.f, 1.f);  // ComputeGradientBlurring
+            const f32 aniso = mix(base, shrk, std::min(coherence, strength * 5.f));
+            const f32 svp1 = mix(aniso, blur, gb);
+            const f32 svp2 = mix(mix(base, strc, coherence), blur, gb);
+            const f32 nev1 = svp1 * svp1, nev2 = svp2 * svp2;
+            // rr = transpose(R) * diag(nev1,nev2) * R, R = mat2(e1,e2) columns -> precision
+            const f32 rr00 = nev1 * e1x * e1x + nev2 * e1y * e1y;
+            const f32 rr11 = nev1 * e2x * e2x + nev2 * e2y * e2y;
+            const f32 rr01 = nev1 * e1x * e2x + nev2 * e1y * e2y;
+            // P = kprec * rr ; store C = inv(P) (merge inverts C back to P)
+            const f32 Pxx = kprec * rr00, Pyy = kprec * rr11, Pxy = kprec * rr01;
+            const f32 det = Pxx * Pyy - Pxy * Pxy;
+            f32* c = out.at(y, x);
+            if (!std::isfinite(det) || std::fabs(det) < 1e-20f) {
+                const f32 iso = 1.f / std::max(kprec * base * base, 1e-20f);  // isotropic base
+                c[0] = iso; c[1] = 0.f; c[2] = 0.f; c[3] = iso;
+            } else {
+                const f32 inv = 1.f / det;
+                c[0] = Pyy * inv; c[1] = -Pxy * inv; c[2] = c[1]; c[3] = Pxx * inv;
+            }
+        }
+    });
+    return out;
+}
+
 // §5.3 MirrorUVs in guide-pixel space: reflect a sample coordinate back into
 // [0, n-1] (one reflection per side) so border regions still compare.
 static inline f32 gcam_mirror(f32 v, f32 n) {
