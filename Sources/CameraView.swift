@@ -1100,21 +1100,14 @@ struct CameraView: View {
                 .foregroundColor(.secondary)
             Toggle("Learned Motion Mask", isOn: $cam.tuningParams.robust_nn_enabled)
             Text("""
-                 A small neural network refines which samples of each frame are merged. Besides the usual brightness evidence it reads how irregular the alignment vectors are around each tile (large local spread on an edge means a likely misalignment) and whether the frame's edges sit where the reference's do. Trained on the same bursts with and without deliberate misalignments, so it learns to drop shifted edges without throwing away correctly aligned detail. Its mask is upsampled to the sensor's full resolution before the final 5x5 widening, so rejections land twice as precisely in each direction, at no extra memory. On by default; needs Robustness at Raw Resolution OFF.
+                 A small neural network refines which samples of each frame are merged. Besides the usual brightness evidence it reads how irregular the alignment vectors are around each tile (large local spread on an edge means a likely misalignment) and whether the frame's edges sit where the reference's do. Trained on the same bursts with and without deliberate misalignments, so it learns to drop shifted edges without throwing away correctly aligned detail. On by default; needs Robustness at Raw Resolution OFF.
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)
             Toggle("48 MP Learned Mask", isOn: $cam.tuningParams.robust_nn_out48)
                 .disabled(!cam.tuningParams.robust_nn_enabled)
             Text("""
-                 Decides every output pixel of the 48 MP image on its own. The alignment evidence is first brought to the sensor's full 12 MP resolution (the guide statistics are upsampled and warped by the alignment, as in the paper's Algorithm 6), and the network then sets a separate weight for each of the four output pixels around every sensor pixel. Uses about 36 MB more memory per frame. Off by default.
-                 """)
-                .font(.footnote)
-                .foregroundColor(.secondary)
-            Toggle("Smooth Learned Mask (Bilinear)", isOn: $cam.tuningParams.robust_nn_raw_bilinear)
-                .disabled(!cam.tuningParams.robust_nn_enabled || cam.tuningParams.robust_nn_out48)
-            Text("""
-                 How the merge reads the learned mask at each output pixel. Off: the nearest sensor pixel's value. On: blended between the four nearest, which softens the one-pixel rim of each rejected area. Off by default; compare both on a burst with motion.
+                 Decides every output pixel of the 48 MP image on its own. The alignment evidence is first brought to the sensor's full 12 MP resolution (the guide statistics are upsampled and warped by the alignment, as in the paper's Algorithm 6), and the network then sets a separate weight for each of the four output pixels around every sensor pixel. Uses about 36 MB more memory per frame. On by default; off uses the 3 MP learned mask.
                  """)
                 .font(.footnote)
                 .foregroundColor(.secondary)

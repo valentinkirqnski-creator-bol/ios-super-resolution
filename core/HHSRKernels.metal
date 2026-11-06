@@ -3437,11 +3437,12 @@ kernel void merge_band_fused(device ushort* out16          [[buffer(0)]],
 // the linear camera-native quad grey -- and the flow is the nearest tile
 // vector only (no global homography / per-tile affine here).
 //
-// Order (v41): rob_make_mask -> rnn_refine_mask (reads the analytic mask
-// BEFORE Eq. 9) -> rob_local_min_5x5 over the refined mask, last.
-// Order (v42, Config::robust_nn_raw_res): rob_make_mask -> rnn_refine_mask
+// Order (shipped v40b weights, the fallback when v43 declines): rob_make_mask
+// -> rob_local_min_5x5 -> rnn_refine_mask over the finished mask, copied back.
+// Order (v42, Config::robust_nn_raw_res, off): rob_make_mask -> rnn_refine_mask
 // (unsharpened) -> rnn_raw_upmin (Dodgson x2 to raw, sharpening, 5x5 min at
-// raw, 8-bit) -- see the end of this file.
+// raw, 8-bit). v43 (Config::robust_nn_out48, the default): see the end of
+// this file.
 //
 // Memory: one fused kernel. Each 16x16 threadgroup builds its warped-grey
 // tile (26x26) and its 18x18 feature halo in threadgroup memory (<= 30 KB at

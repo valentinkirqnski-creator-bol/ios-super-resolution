@@ -1198,9 +1198,9 @@ struct Config {
     // fails to load, so enabling it can never leave the pipeline maskless.
     bool  robustness_refine_nn_enabled = false;
     // robust_nn v40 (tools/robust_nn; kernels rnn_grey_from_raw + rnn_refine_mask, net in
-    // robust_nn_shared.h / robust_nn_weights.h): learned refinement of the analytic mask at
-    // guide resolution, R = sigmoid(logit(R0) + delta), BETWEEN the analytic mask and Eq. 9: R0 is the mask
-    // before the 5x5 minimum, and the minimum runs last over the refined mask (v41 order). v21's inputs plus the motion prior of Wronski
+    // robust_nn_shared.h / robust_nn_weights.h): learned refinement of the finished analytic mask at
+    // guide resolution (after Eq. 9's 5x5 minimum: the order the shipped v40b weights were trained in),
+    // R = sigmoid(logit(R0) + delta). Used whenever v43 (robust_nn_out48) declines. v21's inputs plus the motion prior of Wronski
     // et al. Eq. 7 (3x3 tile-flow extent, M_th 0.80 raw px, gated by reference structure) and
     // frame-vs-reference structure-tensor inputs, trained on same-burst twins. Metal guide-resolution
     // path only (declines on the raw-resolution / FFT-guide path); replaces robustness_refine_nn when on.
@@ -1208,13 +1208,13 @@ struct Config {
     // Output sharpening: R below reject_below -> 0, above accept_above -> 1 (identity when hi <= lo).
     float robust_nn_reject_below = 0.20f;
     float robust_nn_accept_above = 0.90f;
-    // robust_nn v42 order (the order the shipped weights are trained in): the net's guide-resolution R,
+    // robust_nn v42 order (OFF: only for v42 weights, which do not ship): the net's guide-resolution R,
     // unsharpened, is Dodgson x2 upsampled to RAW resolution, sharpened, and Eq. 9's 5x5 minimum runs there,
     // last (kernel rnn_raw_upmin). Stored 8 bits per raw pixel in the frame's own guide-sized float slot (4
     // bytes per guide px == 1 byte per raw px), so the resident burst buffers do not grow; the merge reads it
     // 1:1 at raw resolution. Needs the resident (fused) merge, no s1/s2 split and no debug dumps; otherwise
     // that frame falls back to the guide order (net -> guide 5x5 minimum).
-    bool  robust_nn_raw_res = true;
+    bool  robust_nn_raw_res = false;
     // How the merge reads that raw mask at each output pixel: nearest (false) or bilinear (true).
     bool  robust_nn_raw_bilinear = false;
     // robust_nn v43: one learned weight per 48 MP OUTPUT pixel (scale 2) from statistics at 12 MP. Algorithm 6
@@ -1223,8 +1223,9 @@ struct Config {
     // -> Eq. 9's minimum on the output grid, (2r+1)^2 output px (r = robust_nn_out48_min_radius; 4 = 9x9, the
     // paper's 5x5 raw window) -> one byte per output pixel in the frame's slot, read 1:1 by the merge. Slots grow
     // 12 -> 48 MB per frame at 12 MP, plus one 48 MB scratch. Takes precedence over robust_nn_raw_res; needs the
-    // v43 weights (core/robust_nn43_weights.h), the resident merge, no s1/s2 split, no debug dumps.
-    bool  robust_nn_out48 = false;
+    // v43 weights (core/robust_nn43_weights.h), the resident merge, no s1/s2 split, no debug dumps; otherwise
+    // that frame uses v40b (robust_nn_enabled's guide-resolution order).
+    bool  robust_nn_out48 = true;
     int   robust_nn_out48_min_radius = 4;
     // kappa. 1.0 lets the network veto a pixel outright; the default keeps a
     // quarter of the weight even where it is most certain, because the cost

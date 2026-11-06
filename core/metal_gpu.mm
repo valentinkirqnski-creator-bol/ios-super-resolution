@@ -3105,45 +3105,55 @@ static Image compute_robustness_metal_impl(const Image& comp_raw, const RefStats
         sp.h = (uint32_t)gh;
         sp.w = (uint32_t)gw;
         sp.nch = 1u;
-        // robust_nn (Config::robust_nn_enabled): the net refines the analytic
-        // mask BEFORE Eq. 9, and Eq. 9's 5x5 minimum runs last, over the
-        // refined mask -- the order the net was trained in. Declines silently
-        // (the analytic mask goes straight to Eq. 9) if anything is missing.
-        id<MTLBuffer> min_src = b_R;
+        // Learned masks (Config::robust_nn_enabled), each in the order its
+        // weights were trained in. Every branch declines silently -- the next
+        // one, or the analytic mask through Eq. 9, takes over:
+        //  v43 (robust_nn_out48, the default): Algorithm 6 at 12 MP -> net ->
+        //      one 8-bit weight per 48 MP output pixel (rnn43_encode).
+        //  v42 order (robust_nn_raw_res, off: no v42 weights ship): the net on
+        //      the mask BEFORE Eq. 9, unsharpened -> rnn_raw_upmin.
+        //  v40b, the fallback whenever v43 declines: Eq. 9's 5x5 minimum
+        //      FIRST, then the net refines the finished mask in place -- the
+        //      order the shipped v40b weights were trained in (60fb060).
         if (rnn_out48_mode && resident_raw) {
-            // v43 first; if it declines (nothing encoded), the v42 / v41 order below runs.
             rob_out48 = rnn43_encode(cmd, resident_raw, resident_off * sizeof(float), comp_raw.w, comp_raw.h,
                                      gh, gw, nch, b_ref_m, b_ref_v, b_gmeans, b_std, b_diff,
                                      (uint32_t)g_rob_curve_n, b_S, b_match_amb, amb_on, b_flow, flow, tile_size,
                                      cfg, b_R, b_out, out_off_bytes);
             if (rob_out48) rnn_done = true;
         }
-        if (!rob_out48 && rnn_domain_ok(cfg, nch)) {
-            id<MTLBuffer> rnn_raw = resident_raw;
-            size_t rnn_raw_off = resident_raw ? resident_off * sizeof(float) : 0;
-            if (!rnn_raw && !comp_raw.data.empty())
-                rnn_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
-            rnn_done = rnn_encode_refine(cmd, rnn_raw, rnn_raw_off, comp_raw.w, comp_raw.h, gh, gw, nch,
-                                         b_R, 0, b_flow, flow, tile_size, cfg, rnn_raw_mode);
-            if (rnn_done) min_src = g_rnn_out;
-        }
+        id<MTLBuffer> rnn_raw = resident_raw;
+        size_t rnn_raw_off = resident_raw ? resident_off * sizeof(float) : 0;
+        if (!rob_out48 && rnn_domain_ok(cfg, nch) && !rnn_raw && !comp_raw.data.empty())
+            rnn_raw = buf(comp_raw.data.data(), comp_raw.data.size() * sizeof(float));
         if (!rob_out48 && rnn_raw_mode) {
-            // v42: upsample + sharpen + 5x5 minimum at RAW resolution, into
-            // the slot as 8 bits per raw pixel. The analytic mask (net
-            // declined) takes the same path unsharpened.
+            if (rnn_domain_ok(cfg, nch))
+                rnn_done = rnn_encode_refine(cmd, rnn_raw, rnn_raw_off, comp_raw.w, comp_raw.h, gh, gw, nch,
+                                             b_R, 0, b_flow, flow, tile_size, cfg, /*unsharpened*/true);
             const float lo = rnn_done ? std::min(std::max(cfg.robust_nn_reject_below, 0.f), 1.f) : 0.f;
             const float hi = rnn_done ? std::min(std::max(cfg.robust_nn_accept_above, 0.f), 1.f) : 0.f;
-            rob_u8 = rnn_encode_raw_upmin(cmd, min_src, gh, gw, b_out, out_off_bytes, lo, hi);
+            rob_u8 = rnn_encode_raw_upmin(cmd, rnn_done ? g_rnn_out : b_R, gh, gw, b_out, out_off_bytes, lo, hi);
             if (!rob_u8) return Image();   // encoder failure (the pipeline was checked above)
         }
         if (!rob_u8 && !rob_out48) {
             enc = [cmd computeCommandEncoder];
             if (!enc) return Image();
             [enc setBuffer:b_out offset:out_off_bytes atIndex:0];
-            [enc setBuffer:min_src offset:0 atIndex:1];
+            [enc setBuffer:b_R offset:0 atIndex:1];
             [enc setBytes:&sp length:sizeof(sp) atIndex:2];
             dispatch2(enc, c.pipe("rob_local_min_5x5"), sp.w, sp.h);
             [enc endEncoding];
+            if (rnn_domain_ok(cfg, nch)) {
+                rnn_done = rnn_encode_refine(cmd, rnn_raw, rnn_raw_off, comp_raw.w, comp_raw.h, gh, gw, nch,
+                                             b_out, out_off_bytes, b_flow, flow, tile_size, cfg);
+                if (rnn_done) {
+                    id<MTLBlitCommandEncoder> bl = [cmd blitCommandEncoder];
+                    if (!bl) return Image();
+                    [bl copyFromBuffer:g_rnn_out sourceOffset:0 toBuffer:b_out destinationOffset:out_off_bytes
+                                  size:mask_b];
+                    [bl endEncoding];
+                }
+            }
         }
     }
 

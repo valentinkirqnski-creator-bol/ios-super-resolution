@@ -282,7 +282,7 @@ struct TuningParams: Equatable, Codable {
     /// output pixel -- nearest (false, default) or bilinear (true).
     var robust_nn_raw_bilinear: Bool = false
     /// robust_nn v43: one learned weight per 48 MP output pixel (statistics at 12 MP).
-    var robust_nn_out48: Bool = false
+    var robust_nn_out48: Bool = true
     /// kappa: the most weight the network may take from any one pixel.
     var robustness_refine_max_reduction: Float = 1.0
     /// Below this much predicted reduction the pixel is passed through exactly
