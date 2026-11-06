@@ -1240,6 +1240,19 @@ struct CameraView: View {
                         ispRow("Strictness Green (mult)", $cam.tuningParams.gcam_sabre_mult_green, 0.0...1.0, "%.3f")
                         ispRow("Filter Var RGB (k)", $cam.tuningParams.gcam_sabre_k_rgb, 0.0...1.0, "%.4f")
                         ispRow("Filter Var Green (k)", $cam.tuningParams.gcam_sabre_k_green, 0.0...1.0, "%.4f")
+                        Toggle("Biquadratic Guide Sampling (REJECTION_ONLY)", isOn: $cam.tuningParams.gcam_sabre_rejection_only)
+                            .onChange(of: cam.tuningParams.gcam_sabre_rejection_only) { on in
+                                // Only applies at guide resolution, so switch the pipeline
+                                // there: turning it on turns off both upsample paths.
+                                if on {
+                                    cam.tuningParams.gcam_sabre_raw_res = false
+                                    cam.tuningParams.gcam_sabre_merge_res = false
+                                }
+                            }
+                        Text("""
+                             Guide-res only (both "Mask at …Resolution" toggles off). Turning this ON switches the pipeline to the guide-res operator (it turns both upsample toggles off) and samples the reference and the warped comparison with GCam's SampleBiquadraticAbsolute (Dodgson biquadratic — the shader's "slightly sharper alternative to bicubic") instead of the smoothing cubic B-spline, and switches to the biquadratic kFilterVarianceScale pair (0.0976597 / 0.25). Sharper sampling grows the difference d at a given sub-pixel flow error, so slight misalignments are more likely to be rejected — at the cost of a little more over-rejection. This is exactly GCam's #ifdef REJECTION_ONLY mode. Off by default (bicubic B-spline = the exact non-REJECTION_ONLY match); A/B on an imported burst. Requires GCam SABRE Robustness.
+                             """)
+                            .font(.footnote).foregroundColor(.secondary)
                         ispRow("Dilation Dead Zone", $cam.tuningParams.gcam_sabre_dilate_deadzone, 0.0...2.0, "%.2f")
                         Toggle("GCam 2× Dilation Downsample", isOn: $cam.tuningParams.gcam_sabre_dilate_2x)
                         Text("""

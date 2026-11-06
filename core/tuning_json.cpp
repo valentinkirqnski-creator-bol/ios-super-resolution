@@ -245,6 +245,9 @@ void apply_tuning_kv(Config& cfg, const std::map<std::string, double>& kv) {
     if (has("gcam_sabre_min_window"))   cfg.gcam_sabre_min_window = std::max(1, std::min(31, iv("gcam_sabre_min_window")));
     if (has("gcam_sabre_noise_model"))  cfg.gcam_sabre_noise_model = bv("gcam_sabre_noise_model");
     if (has("gcam_sabre_dilate_2x"))    cfg.gcam_sabre_dilate_2x = bv("gcam_sabre_dilate_2x");
+    if (has("gcam_sabre_rejection_only")) cfg.gcam_sabre_rejection_only = bv("gcam_sabre_rejection_only");
+    if (has("gcam_sabre_k_rgb_biquad")) cfg.gcam_sabre_k_rgb_biquad = fv("gcam_sabre_k_rgb_biquad");
+    if (has("gcam_sabre_k_green_biquad")) cfg.gcam_sabre_k_green_biquad = fv("gcam_sabre_k_green_biquad");
 
     // --- mask fetch / geom reject / edge misalign ---
     if (has("robustness_guide_res_bilinear")) cfg.robustness_guide_res_bilinear = bv("robustness_guide_res_bilinear");

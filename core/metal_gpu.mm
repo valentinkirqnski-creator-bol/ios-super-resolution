@@ -1813,8 +1813,11 @@ struct GcamSabreParamsCPU {
     // raw_res==0 => out_h/out_w == h/w and the guide-res path runs (bit-exact).
     uint32_t out_h = 0, out_w = 0;
     uint32_t raw_res = 0;
+    // GCam REJECTION_ONLY (guide-res only): 1 = sample ref+comp with the biquadratic
+    // instead of the B-spline. k_rgb/k_green already carry the biquadratic pair.
+    uint32_t rejection_only = 0;
 };
-static_assert(sizeof(GcamSabreParamsCPU) == 116, "GcamSabreParamsCPU");
+static_assert(sizeof(GcamSabreParamsCPU) == 120, "GcamSabreParamsCPU");
 
 struct RobHfLossParamsCPU {
     uint32_t h, w, nch;
@@ -3042,7 +3045,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.flow_ny = (uint32_t)flow.ny; mp.flow_nx = (uint32_t)flow.nx;
     mp.use_homography = flow.has_global_h ? 1u : 0u;
     for (int i = 0; i < 9; ++i) mp.hmat[i] = flow.global_h[i];
-    mp.k_rgb = cfg.gcam_sabre_k_rgb; mp.k_green = cfg.gcam_sabre_k_green;
+    // GCam REJECTION_ONLY (guide-res only): biquadratic sampler + biquadratic k pair.
+    const bool rej_only = cfg.gcam_sabre_rejection_only && !resample;
+    mp.k_rgb   = rej_only ? cfg.gcam_sabre_k_rgb_biquad   : cfg.gcam_sabre_k_rgb;
+    mp.k_green = rej_only ? cfg.gcam_sabre_k_green_biquad : cfg.gcam_sabre_k_green;
     mp.rob_noise = cfg.gcam_sabre_rob_noise;
     mp.mult_rgb = cfg.gcam_sabre_mult_rgb; mp.mult_green = cfg.gcam_sabre_mult_green;
     mp.boost = cfg.gcam_sabre_boost; mp.boost_var_mult = cfg.gcam_sabre_boost_var_mult;
@@ -3054,6 +3060,7 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     mp.noise_model = noise_model ? 1u : 0u;
     mp.out_h = (uint32_t)th; mp.out_w = (uint32_t)tw;
     mp.raw_res = resample ? 1u : 0u;   // "resample" flag: raw OR merge grid (Dodgson)
+    mp.rejection_only = rej_only ? 1u : 0u;
 
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     if (!cmd) return Image();

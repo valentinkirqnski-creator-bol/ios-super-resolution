@@ -312,6 +312,11 @@ struct TuningParams: Equatable, Codable {
     /// upsample back for our merge. true = byte-for-byte GCam. false = keep the mask
     /// at full guide resolution (finer, sharper boundaries).
     var gcam_sabre_dilate_2x: Bool = true
+    /// GCam REJECTION_ONLY: guide-res only -- sample ref+comp with the sharper
+    /// biquadratic (SampleBiquadraticAbsolute) + the biquadratic kFilterVarianceScale
+    /// pair, instead of the smoothing cubic B-spline. More sensitive to small
+    /// sub-pixel misalignments. Off = the exact non-REJECTION_ONLY bicubic match.
+    var gcam_sabre_rejection_only: Bool = false
     /// kFilterVarianceScale (Config::gcam_filter_var_scale). 1.0 = off; GCam's
     /// literal RGB value is 0.090. Defaulted off because our variances are already
     /// measured on the filtered guide (see the Config comment).
@@ -562,7 +567,7 @@ struct TuningParams: Equatable, Codable {
         case gcam_mult, gcam_thresh, gcam_boost, gcam_tex_gate, gcam_irr_gate, gcam_green_k, gcam_dilate_soft, gcam_filter_var_scale
         case gcam_sabre_green_factor, gcam_sabre_clip_point, gcam_sabre_k_rgb, gcam_sabre_k_green, gcam_sabre_rob_noise
         case gcam_sabre_mult_rgb, gcam_sabre_mult_green, gcam_sabre_boost, gcam_sabre_boost_var_mult, gcam_sabre_motion_thresh
-        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window
+        case gcam_sabre_dilate_deadzone, gcam_sabre_dilate_div, gcam_sabre_gpu, gcam_sabre_noise_model, gcam_sabre_dilate_2x, gcam_sabre_raw_res, gcam_sabre_bilinear_upscale, gcam_sabre_min5x5, gcam_sabre_merge_res, gcam_sabre_min_window, gcam_sabre_rejection_only
         case robustness_guide_res_bilinear, merge_robustness_bilinear, robustness_bicubic_guide
         case robustness_perceptual_sqrt
         case hf_artifact_removal_enabled, hf_variance_loss_threshold
@@ -712,6 +717,7 @@ struct TuningParams: Equatable, Codable {
         gcam_sabre_min_window = try c.decodeIfPresent(Int.self, forKey: .gcam_sabre_min_window) ?? gcam_sabre_min_window
         gcam_sabre_noise_model = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_noise_model) ?? gcam_sabre_noise_model
         gcam_sabre_dilate_2x = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_dilate_2x) ?? gcam_sabre_dilate_2x
+        gcam_sabre_rejection_only = try c.decodeIfPresent(Bool.self, forKey: .gcam_sabre_rejection_only) ?? gcam_sabre_rejection_only
         robustness_guide_res_bilinear = try c.decodeIfPresent(Bool.self, forKey: .robustness_guide_res_bilinear) ?? robustness_guide_res_bilinear
         merge_robustness_bilinear = try c.decodeIfPresent(Bool.self, forKey: .merge_robustness_bilinear) ?? merge_robustness_bilinear
         robustness_bicubic_guide = try c.decodeIfPresent(Bool.self, forKey: .robustness_bicubic_guide) ?? robustness_bicubic_guide
@@ -2564,6 +2570,7 @@ final class CameraModel: NSObject, ObservableObject {
             "gcam_sabre_min_window": NSNumber(value: tuningParams.gcam_sabre_min_window),
             "gcam_sabre_noise_model": NSNumber(value: tuningParams.gcam_sabre_noise_model),
             "gcam_sabre_dilate_2x": NSNumber(value: tuningParams.gcam_sabre_dilate_2x),
+            "gcam_sabre_rejection_only": NSNumber(value: tuningParams.gcam_sabre_rejection_only),
             "robustness_guide_res_bilinear": NSNumber(value: tuningParams.robustness_guide_res_bilinear),
             "merge_robustness_bilinear": NSNumber(value: tuningParams.merge_robustness_bilinear),
             "robustness_bicubic_guide": NSNumber(value: tuningParams.robustness_bicubic_guide),

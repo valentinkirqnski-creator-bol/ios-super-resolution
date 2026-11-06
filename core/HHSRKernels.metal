@@ -1879,9 +1879,10 @@ inline void cubic_bspline_w(float a, thread float w[4]) {
     w[3] = (1.f / 6.f) * (a * a * a);
 }
 
-// Catmull-Rom cubic weights (a = -0.5 cubic convolution), the INTERPOLATING
-// bicubic GCam's SampleBicubic uses -- passes through the sample points (unlike
-// the approximating B-spline), sums to 1, can go slightly negative. Taps at
+// Catmull-Rom cubic weights (a = -0.5 cubic convolution): the INTERPOLATING
+// bicubic that passes through the sample points, sums to 1, can go slightly
+// negative. NOTE: this is NOT GCam's SampleBicubic -- the recovered shader uses
+// the cubic B-SPLINE (cubic_bspline_w). Retained only for experiments. Taps at
 // offsets {-1,0,1,2}; `a` is the fractional position past tap 1. Twin of
 // cubic_catmull_w in robustness.cpp.
 inline void cubic_catmull_w(float a, thread float w[4]) {
@@ -2042,6 +2043,10 @@ struct GcamSabreParams {
     uint  out_h;
     uint  out_w;
     uint  raw_res;
+    // GCam REJECTION_ONLY (guide-res only): sample ref+comp with the biquadratic
+    // (rob_sample_biquad_abs) instead of the B-spline. The host passes the matching
+    // biquadratic k in k_rgb/k_green, so only the sampler selection lives here.
+    uint  rejection_only;
 };
 
 // §5 LUT read: uv.x = luma*0.9+0.05 -> texel position 9*luma over 10 columns;
@@ -2078,6 +2083,39 @@ inline float rob_sample_bspline_abs(device const float* img,
         }
     }
     return (w_acc != 0.f) ? buf / w_acc : buf;
+}
+
+// Edge-clamped bilinear tap (one of the four SampleBiquadraticAbsolute reads).
+inline float rob_bilin_clamp(device const float* img, uint h, uint w, uint nch,
+                             float y, float x, uint ch) {
+    y = clamp(y, 0.f, float(h) - 1.f);
+    x = clamp(x, 0.f, float(w) - 1.f);
+    int y0 = int(floor(y)), x0 = int(floor(x));
+    int y1 = min(y0 + 1, int(h) - 1), x1 = min(x0 + 1, int(w) - 1);
+    float fy = y - float(y0), fx = x - float(x0);
+    float a = img[(uint(y0) * w + uint(x0)) * nch + ch];
+    float b = img[(uint(y0) * w + uint(x1)) * nch + ch];
+    float c = img[(uint(y1) * w + uint(x0)) * nch + ch];
+    float d = img[(uint(y1) * w + uint(x1)) * nch + ch];
+    float top = a + (b - a) * fx, bot = c + (d - c) * fx;
+    return top + (bot - top) * fy;
+}
+
+// §5.4 SampleBiquadraticAbsolute (GCam REJECTION_ONLY): Dodgson biquadratic as 4
+// abs()'d bilinear taps at uv +- c, c = f*f - f + 0.5. Twin of sample_biquad_abs in
+// robustness.cpp (same tap order). OOB -> INFINITY (matches the B-spline/Dodgson twins).
+inline float rob_sample_biquad_abs(device const float* img, uint h, uint w, uint nch,
+                                   float gy, float gx, uint ch) {
+    if (!(gy >= 0.f && gy < float(h) && gx >= 0.f && gx < float(w))) return INFINITY;
+    float Py = gy + 0.5f, Px = gx + 0.5f;
+    float fy = Py - floor(Py), fx = Px - floor(Px);
+    float cy = fy * fy - fy + 0.5f, cx = fx * fx - fx + 0.5f;
+    float y0 = gy - cy, y1 = gy + cy, x0 = gx - cx, x1 = gx + cx;
+    float s = fabs(rob_bilin_clamp(img, h, w, nch, y0, x0, ch))
+            + fabs(rob_bilin_clamp(img, h, w, nch, y1, x0, ch))
+            + fabs(rob_bilin_clamp(img, h, w, nch, y1, x1, ch))
+            + fabs(rob_bilin_clamp(img, h, w, nch, y0, x1, ch));
+    return s * 0.25f;
 }
 
 // §5.3 MirrorUVs in guide-pixel space: reflect a coordinate back into [0, n-1].
@@ -2148,16 +2186,21 @@ kernel void rob_gcam_sabre(device float* R [[buffer(0)]],
         }
         cur_a = fabs(rob_sample_dogson_or_inf(compg, p.h, p.w, 4u, sy, sx, 3u));
     } else {
+        bool rj = (p.rejection_only != 0u);   // biquadratic (REJECTION_ONLY) vs B-spline
         uint iyy = uint(clamp(float(int(round(gy))), 0.f, float(p.h) - 1.f));
         uint ixx = uint(clamp(float(int(round(gx))), 0.f, float(p.w) - 1.f));
         bool green_pt = refg[(iyy * p.w + ixx) * 4u + 3u] < 0.f;
-        float ref_mag = fabs(rob_sample_bspline_abs(refg, p.h, p.w, 4u, gy, gx, 3u));
+        float ref_mag = fabs(rj ? rob_sample_biquad_abs(refg, p.h, p.w, 4u, gy, gx, 3u)
+                                : rob_sample_bspline_abs(refg, p.h, p.w, 4u, gy, gx, 3u));
         ref_var_signed = green_pt ? -ref_mag : ref_mag;
         for (uint ch = 0u; ch < 3u; ++ch) {
-            refc[ch] = rob_sample_bspline_abs(refg, p.h, p.w, 4u, gy, gx, ch);
-            curc[ch] = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, ch);
+            refc[ch] = rj ? rob_sample_biquad_abs(refg, p.h, p.w, 4u, gy, gx, ch)
+                          : rob_sample_bspline_abs(refg, p.h, p.w, 4u, gy, gx, ch);
+            curc[ch] = rj ? rob_sample_biquad_abs(compg, p.h, p.w, 4u, sy, sx, ch)
+                          : rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, ch);
         }
-        cur_a = rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, 3u);
+        cur_a = rj ? rob_sample_biquad_abs(compg, p.h, p.w, 4u, sy, sx, 3u)
+                   : rob_sample_bspline_abs(compg, p.h, p.w, 4u, sy, sx, 3u);
     }
     bool green_only = ref_var_signed < 0.f;
     float ref_a = fabs(ref_var_signed);

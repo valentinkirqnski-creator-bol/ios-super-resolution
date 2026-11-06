@@ -1760,6 +1760,8 @@ struct Config {
     float gcam_sabre_clip_point      = 1.0f;        // §2.8 sqrt-space green clip; center_green>=this -> poison ref
     float gcam_sabre_k_rgb           = 0.0898866f;  // §3.5 kFilterVarianceScale, RGB bicubic path
     float gcam_sabre_k_green         = 0.211665f;   // §3.5 kFilterVarianceScale, green-only path
+    float gcam_sabre_k_rgb_biquad    = 0.0976597f;  // §3.5 kFilterVarianceScale, RGB biquadratic (REJECTION_ONLY)
+    float gcam_sabre_k_green_biquad  = 0.25f;       // §3.5 kFilterVarianceScale, green-only biquadratic (REJECTION_ONLY)
     float gcam_sabre_rob_noise       = 0.0f;        // §3.6 robustness-operator noise scale (0=device, 1=paper LUT)
     float gcam_sabre_mult_rgb        = 0.07f;       // §5.9 color_difference_multiplier, RGB
     float gcam_sabre_mult_green      = 0.35f;       // §5.9 color_difference_multiplier, green-only
@@ -1840,6 +1842,17 @@ struct Config {
     // exactly n samples/axis, centred. Clamped to >= 1. Implemented separably so
     // large n stays cheap. Only affects the gcam path.
     int   gcam_sabre_min_window     = 5;
+    // GCam's #ifdef REJECTION_ONLY variant of BaseFrameRefColor + Rejection: sample
+    // the guide-res reference AND the warped comparison with SampleBiquadraticAbsolute
+    // (Dodgson biquadratic -- GCam's shader calls it "a slightly sharper alternative to
+    // bicubic") instead of the smoothing cubic B-spline, and use the biquadratic
+    // kFilterVarianceScale pair (gcam_sabre_k_rgb_biquad/k_green_biquad = 0.0976597/0.25)
+    // in place of the bicubic pair. Sharper sampling = larger d at a given sub-pixel flow
+    // error, so slight misalignments are more likely to be rejected. Only affects the
+    // GUIDE-RES path (both upsample toggles off); the raw/merge-res paths already Dodgson-
+    // sample. Off by default (bicubic B-spline = the exact non-REJECTION_ONLY match).
+    // Requires robustness_gcam_enabled.
+    bool  gcam_sabre_rejection_only = false;
 
     // Edge-misalignment rejection. Attenuates the robustness weight ONLY where
     // the reference and the (flow-warped) comparison actually disagree at an

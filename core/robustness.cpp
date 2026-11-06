@@ -957,9 +957,14 @@ static inline void cubic_bspline_w(f32 a, f32 w[4]) {
     w[3] = (1.f / 6.f) * (a * a * a);
 }
 
-// Catmull-Rom cubic weights (a = -0.5 cubic convolution) -- the INTERPOLATING
-// bicubic GCam's SampleBicubic uses. Passes through the sample points, sums to
-// 1, can go slightly negative. Twin of cubic_catmull_w in HHSRKernels.metal.
+// Catmull-Rom cubic weights (a = -0.5 cubic convolution): the INTERPOLATING
+// bicubic that passes through the sample points, sums to 1, can go slightly
+// negative. NOTE: this is NOT GCam's SampleBicubic -- the recovered shader's
+// ComputeBicubicParameters uses the cubic B-SPLINE weights (cubic_bspline_w
+// above), which GCam's own comment calls "B-Spline bicubic". This Catmull helper
+// is retained only for experiments; the faithful GCam sampler is cubic_bspline_w
+// (bicubic) and sample_biquad_abs (the REJECTION_ONLY biquadratic variant).
+// Twin of cubic_catmull_w in HHSRKernels.metal.
 static inline void cubic_catmull_w(f32 a, f32 w[4]) {
     const f32 a2 = a * a, a3 = a2 * a;
     w[0] = 0.5f * (-a3 + 2.f * a2 - a);
@@ -2204,6 +2209,12 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
     const bool merge_res = cfg.gcam_sabre_merge_res;
     const bool raw_res = cfg.gcam_sabre_raw_res && !merge_res;
     const bool resample = raw_res || merge_res;   // Dodgson-sample both guides
+    // GCam REJECTION_ONLY: guide-res only -- swap the bicubic B-spline for the sharper
+    // SampleBiquadraticAbsolute (Dodgson) + the biquadratic kFilterVarianceScale pair.
+    // Ignored on the resample paths (they already Dodgson-sample).
+    const bool rej_only = cfg.gcam_sabre_rejection_only && !resample;
+    const f32 k_rgb_eff   = rej_only ? cfg.gcam_sabre_k_rgb_biquad   : cfg.gcam_sabre_k_rgb;
+    const f32 k_green_eff = rej_only ? cfg.gcam_sabre_k_green_biquad : cfg.gcam_sabre_k_green;
     // Prefilter BOTH guides identically (GCam builds every frame's guide the same way
     // via ComputeGuideImage -- no asymmetric blur). The reference guide
     // (ref_stats.gcam_guide) is always prefiltered, so the comparison guide must be too,
@@ -2314,16 +2325,22 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 // current_values SampleBicubicAbsolute) are cubic-B-spline-abs sampled.
                 // green-only flag from a POINT sample of the variance sign. Sharing the
                 // kernel (and prefiltering both guides) keeps identical frames at d==0.
+                // rej_only (GCam REJECTION_ONLY): SampleBiquadraticAbsolute in place of the
+                // B-spline -- sharper, more sensitive to sub-pixel misalignment.
+                auto gsamp = [&](const Image& g, f32 yy, f32 xx, int ch) -> f32 {
+                    return rej_only ? sample_biquad_abs(g, yy, xx, ch)
+                                    : sample_bicubic_abs(g, yy, xx, ch);
+                };
                 const int iy = std::min(std::max((int)std::lround(gy), 0), gh - 1);
                 const int ix = std::min(std::max((int)std::lround(gx), 0), gw - 1);
                 const bool green_pt = refg.at(iy, ix, 3) < 0.f;
-                const f32 ref_mag = std::fabs(sample_bicubic_abs(refg, gy, gx, 3));
+                const f32 ref_mag = std::fabs(gsamp(refg, gy, gx, 3));
                 ref_var_signed = green_pt ? -ref_mag : ref_mag;          // restore sign
                 for (int c = 0; c < 3; ++c) {
-                    refc[c] = sample_bicubic_abs(refg, gy, gx, c);
-                    curc[c] = sample_bicubic_abs(compg, sy, sx, c);
+                    refc[c] = gsamp(refg, gy, gx, c);
+                    curc[c] = gsamp(compg, sy, sx, c);
                 }
-                cur_a = sample_bicubic_abs(compg, sy, sx, 3);
+                cur_a = gsamp(compg, sy, sx, 3);
             }
             const bool green_only = ref_var_signed < 0.f;
             f32 ref_a = std::fabs(ref_var_signed);
@@ -2345,7 +2362,8 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
                 }
             }
             // §5.6 filter-variance scale on noise AND the measured variances.
-            const f32 k = green_only ? cfg.gcam_sabre_k_green : cfg.gcam_sabre_k_rgb;
+            // rej_only uses the biquadratic kFilterVarianceScale pair (k_*_eff).
+            const f32 k = green_only ? k_green_eff : k_rgb_eff;
             for (int c = 0; c < 3; ++c) { ref_noise[c] *= k; cur_noise[c] *= k; }
             ref_a *= k; cur_a *= k;
             // §5.7 variances.

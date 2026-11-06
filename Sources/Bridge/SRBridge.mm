@@ -642,6 +642,7 @@ static void ApplyTuningParams(NSDictionary<NSString *, NSNumber *> *tuning, Conf
         cfg.gcam_sabre_min_window = std::max(1, std::min(31, tuning[@"gcam_sabre_min_window"].intValue));
     if (tuning[@"gcam_sabre_noise_model"])    cfg.gcam_sabre_noise_model = tuning[@"gcam_sabre_noise_model"].boolValue;
     if (tuning[@"gcam_sabre_dilate_2x"])      cfg.gcam_sabre_dilate_2x = tuning[@"gcam_sabre_dilate_2x"].boolValue;
+    if (tuning[@"gcam_sabre_rejection_only"]) cfg.gcam_sabre_rejection_only = tuning[@"gcam_sabre_rejection_only"].boolValue;
     if (tuning[@"robustness_guide_res_bilinear"])
         cfg.robustness_guide_res_bilinear = tuning[@"robustness_guide_res_bilinear"].boolValue;
     if (tuning[@"merge_robustness_bilinear"])
