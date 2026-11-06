@@ -297,7 +297,8 @@ struct TuningParams: Equatable, Codable {
     /// CPU; only the per-pixel loop moves to the GPU. Falls back to CPU if the kernel
     /// is unavailable. Off by default — the kernel is unverified until a device build.
     var gcam_sabre_gpu: Bool = false
-    var gcam_sabre_raw_res: Bool = false
+    // DEFAULT ON: gcam stats are upsampled+warped to input-frame res; R + §7 run there.
+    var gcam_sabre_raw_res: Bool = true
     var gcam_sabre_bilinear_upscale: Bool = false
     var gcam_sabre_min5x5: Bool = false
     /// Size n of the gcam hard ComputeLocalMin window (n x n). 5 = paper's 5x5.

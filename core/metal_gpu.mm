@@ -3080,9 +3080,10 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
     [cmd waitUntilCompleted];
     if (cmd.status != MTLCommandBufferStatusCompleted) return Image();
 
-    // §7 refinement. Guide-res default (soft reject-grow): run it on the GPU too
-    // (rob_gcam_dilate reads the GPU R buffer -- no R readback, no host dilate), with a
-    // CPU fallback. Raw/merge-res (HARD min) and the extra n x n min stay on the host.
+    // §7 refinement = GCam soft reject-grow (DilateMask). Guide-res: run it on the GPU
+    // (rob_gcam_dilate reads the GPU R buffer -- no R readback, no host dilate), CPU
+    // fallback. Raw-res (soft dilate, 2x downsample off) and the opt-in extra n x n min
+    // run on the host below.
     const int min_win = std::max(1, cfg.gcam_sabre_min_window);  // n x n window (default 5)
     Image dil;
     id<MTLComputePipelineState> dpipe = c.pipe("rob_gcam_dilate");
@@ -3116,8 +3117,14 @@ Image compute_robustness_gcam_sabre_metal(const Image& comp_raw, const RefStats&
         // GPU dilate not taken (resample / extra-min / kernel absent / error) -> host §7.
         Image R_pre(th, tw, 1);
         memcpy(R_pre.data.data(), [b_R contents], mask_b);
-        dil = resample ? robustness_gcam_min_window(R_pre, min_win)
-                       : robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
+        // §7 = GCam soft DilateMask in both cases (twin of compute_robustness_gcam_sabre).
+        // Raw-res: the 2x guide->quarter downsample is forced OFF (already finer than guide).
+        if (resample) {
+            Config c2 = cfg; c2.gcam_sabre_dilate_2x = false;
+            dil = robustness_gcam_dilate(R_pre, c2);
+        } else {
+            dil = robustness_gcam_dilate(R_pre, cfg);  // §7 (verified CPU helpers)
+        }
         if (cfg.gcam_sabre_min5x5) dil = robustness_gcam_min_window(dil, min_win);
     }
     if (s_select_out) {

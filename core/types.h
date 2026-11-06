@@ -1804,9 +1804,13 @@ struct Config {
     // guide detail; the merge reads it through its existing raw-resolution path). compg
     // is prefiltered to match the reference guide (paper uses the same ComputeGuideImage
     // for G1/Gn) so the sharp Dodgson sampling + 5x5 keep aligned content at R=1. ~49MB
-    // mask/frame (12MP), fits the normal merge -- no band-streaming. Off by default
-    // (guide-res operator). Requires robustness_gcam_enabled.
-    bool  gcam_sabre_raw_res         = false;
+    // mask/frame (12MP), fits the normal merge -- no band-streaming. DEFAULT ON: when
+    // gcam robustness is enabled the statistics are upsampled+warped to the input-frame
+    // resolution and R + §7 run there (better-localized rejection at 4x the guide grid).
+    // Turn OFF to revert to the pure guide-res operator (R + dilate on the ~3MP guide,
+    // bilinear-upsampled by the merge). NOTE: forces the non-resident merge on device
+    // (metal_frames_begin refuses residency for raw-res). Requires robustness_gcam_enabled.
+    bool  gcam_sabre_raw_res         = true;
     // Like gcam_sabre_raw_res, but the guide statistics are Dodgson x2 upscaled +
     // flow-warped all the way to the MERGE-OUTPUT grid (scale x the input frame, e.g.
     // ~48MP at scale 2) and R + the 5x5 ComputeLocalMin are computed per OUTPUT pixel

@@ -2413,11 +2413,20 @@ Image compute_robustness_gcam_sabre(const Image& comp_raw, const RefStats& ref_s
         }
         return Image();
     }
-    // §7 refinement. Raw-res (paper Alg. 6): the HARD 5x5 ComputeLocalMin at raw res
-    // (R_hat = min over 5x5), now that R is computed per raw pixel. Guide-res (default):
-    // GCam's soft reject-grow (robustness_gcam_dilate), unchanged.
-    Image dil = resample ? robustness_gcam_min_window(R, min_win)
-                         : robustness_gcam_dilate(R, cfg);
+    // §7 refinement = GCam's soft reject-grow (DilateMask) in BOTH cases -- "gcam follows
+    // its computations". Guide-res: robustness_gcam_dilate honouring gcam_sabre_dilate_2x
+    // (the shader's guide->quarter 2x downsample). Raw-res: the SAME soft dilate at the
+    // input-frame grid, but with the 2x downsample forced OFF -- we are already finer than
+    // the guide, so downsampling raw->half-raw would throw away the localization the
+    // upsample bought. (The paper's hard ComputeLocalMin is still available as the opt-in
+    // extra-darkening pass gcam_sabre_min5x5 below.)
+    Image dil;
+    if (resample) {
+        Config c2 = cfg; c2.gcam_sabre_dilate_2x = false;
+        dil = robustness_gcam_dilate(R, c2);
+    } else {
+        dil = robustness_gcam_dilate(R, cfg);
+    }
     // Opt-in extra darkening: an additional HARD n x n ComputeLocalMin (R_hat = min over
     // the n-window) applied ON TOP of the §7 result. min(window) <= center always, so
     // turning this on can only darken the mask (grows each rejection into its neighbours),
